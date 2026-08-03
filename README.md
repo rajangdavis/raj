@@ -2,7 +2,7 @@
 
 A vibemaxxed TUI for editing code running on a forked version of ghostty.
 
-I wanted a low memory editor that could run in the terminal that has sublime text/VS Code keybindings.
+I wanted a low memory editor that could run in the terminal that has sublime text/VS Code style keybindings.
 
 I want to eventually build/integrate my own custom agent harness with integrations within the editor.
 
@@ -12,6 +12,23 @@ I am putting this up so I can test drive it; use at your own risk :)
 
 ## TODO
 - Test drive - this document was written with the raj editor, it seems pretty seamless so far.
-- Work within my $20 month limits to get this implemented
+- Work within my $20 month limits to get the rest of the TODO's implemented
 - Document differences from what is documented in TODO.md
   - Scrolling must not move the cursor -> I kind of like this
+- Mouse events would be sick
+- Multi-cursor all using Ibeams would be nice
+  - Click on editor puts cursor there
+  - Not sure if the highlighted text works the same as highlighting with the cursor
+  - Clicking on tabs changes tab
+  - Clicking on file in explorer/search opens the file unless binary, put a warning for that
+- Think about a way to pop focus from raj back into ghostty so we give control back
+- Paste doesn't work quite right, it gets blocked by ghostty warning
+- Need to move the box to only see checked items
+- Document what is supported, but need to finish implementing and confirm things
+- chroma, pinned at v2.14.0. -> this is wrong
+- Maybe some sort of text wrapping (especially on resizes :))
+- resizes totally add artifacts :) that persist even when the tabs are deleted
+- Add a cmd + esc binding to give focus back to ghostty? Need some sort of binding to as opposed to suspending
+- Debug still doesn't work but maybe that's not a bad thing...
+- Maybe bind cmd+shift+r to reopen old tabs and give cmd+shift+t back to ghostty
+- Think about small/split panes and resizing
