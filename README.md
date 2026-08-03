@@ -32,3 +32,4 @@ I am putting this up so I can test drive it; use at your own risk :)
 - Debug still doesn't work but maybe that's not a bad thing...
 - Maybe bind cmd+shift+r to reopen old tabs and give cmd+shift+t back to ghostty
 - Think about small/split panes and resizing
+- There's some slight spacing differences between files, TODO.md and README.md
