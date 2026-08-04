@@ -165,9 +165,137 @@ N-1 cursors doing nothing, which is not a useful outcome under any reading. The
 failure mode — a coincidental match producing an unwanted distribution — is rare
 and costs one cmd+z. Mismatched counts still insert whole.
 
+down), undo/redo, save,
+indent/outdent on selections, tabs with reopen, the explorer with a changed-only
+filter, search with include/exclude globs and collapsible per-file groups, the
+cmd+p picker, narrow-mode single-pane layout, agent-authored text rendering with
+a background tint, suspend/resume, and alt-screen behaviour.
+
+---
+
+## TODO
+
+### Fixed since the last session
+
+- [x] **cmd+z corruption.** Three stacked bugs, found by fuzzing rather than
+  inspection. (1) Rebase was not inverse-consistent at boundaries: a deletion
+  starting exactly at a point left the point alone while the matching
+  re-insertion shifted it, so undo drifted by the deleted length each time it
+  crossed a later edit. `rebase` takes a `
+
+### Terminals
+
+raj emits its own keybindings for every terminal it supports, from one measured
+table, and can measure any terminal it is run under:
+
+    raj --config ghostty       # Ghostty, macOS
+    raj --config ghostty-linux
+    raj --config iterm2        # an iTerm2 dynamic profile
+    raj --probe                # what does THIS terminal deliver?
+    raj --probe --checklist    # walk every binding, emit a measured keymap
+
+The probe is a flag on raj rather than a second binary, so testing a terminal
+needs no separate build: whatever raj you are running is the decoder being
+measured. `cmd/keyprobe` remains as a thin wrapper for building it alone.
+
+Terminals that do not speak the Kitty protocol send ctrl chords as C0 bytes,
+which raj decodes as the chords that produced them — iTerm2 answers the colour
+and device-attribute queries but not the KKP one, and before that was handled
+raj could not see ctrl+c at all.
+
+### iTerm2
+
+`raj --config iterm2` emits a dynamic profile. Install with:
+
+    raj --config iterm2 > "$HOME/Library/Application Support/iTerm2/DynamicProfiles/raj.json"
+
+iTerm2 picks it up without a restart; open a window with the "raj" profile.
+
+iTerm2 supports CSI u, but that is not the issue — cmd+w and friends are
+consumed by the menu layer before any protocol is consulted, exactly as in
+Ghostty. iTerm2's scoping mechanism is the profile rather than a KKP condition,
+which is weaker in one specific way: while the profile is in use, that window
+cannot close its own tab with cmd+w, and iTerm2 has no way to know raj has
+exited. Ghostty's gate releases the chord the moment raj stops asking for it.
+
+raj switches to that profile on startup and back on exit, so the mappings apply
+only while raj is running — the same effect as Ghostty's kkp_on gate, driven
+from raj's side rather than the terminal's. It uses OSC 1337 SetProfile, and
+reads ITERM_PROFILE to know what to restore. It runs through the same Enter and
+Leave that own raw mode and the KKP stack, so suspend, fatal signals and panics
+all restore correctly. SIGKILL does not, and nothing can fix that.
+
+Set RAJ_ITERM_PROFILE to use a different profile name, or to empty to disable
+switching if you put the mappings in your everyday profile instead.
+
+Verified against iTerm2's own preferences: the two-part "0xCHAR-0xMASK" form is
+correct, and mappings fire once the session actually uses the raj profile
+(Profiles menu, or cmd+i to check).
+
+One correction that cost an afternoon: AppKit's charactersIgnoringModifiers
+applies shift, so shift+L reports "L" and not "l". Generating the lowercase code
+made every shift+letter mapping silently miss while unshifted ones worked.
+
+Measured: 36 of 56 chords arrive, **including cmd+w** — so iTerm2 does yield
+menu chords to a key mapping, which was the open question. The failures were
+every shift+letter chord (the uppercase bug above) and cmd+1 through cmd+9.
+
+That measurement predates dropping cmd+1-9 from the table. They are no longer
+asked for, and the terminal keeping them is now the intended outcome rather than
+a failure — a re-measurement would report 36 of 47.
+
+### Reclaiming chords a terminal keeps
+
+The keymap binds 18 chords that are not in `Bindings`: tab, shift+tab, esc,
+enter, backspace, delete, the four arrows, their shift variants, pgup, pgdown,
+and shift+pgup/pgdown. Under Ghostty they arrive free, because `report_all`
+auto-encodes anything without a `kkp_on` line. iTerm2 has no such gate: the
+profile is exhaustive by omission, so a chord absent from `Bindings` is absent
+from the profile, and raj gets it only if iTerm2 both sends it and does not
+claim it first.
+
+Sixteen work by that accident. shift+pgup and shift+pgdown do not — iTerm2 binds
+them to scrollback paging, so shift+fn+up/down never reaches raj. Confirmed with
+`raj --probe`: nothing arrives.
+
+The gap is that this is undetectable. Nothing asserts the emitters cover what
+the keymap binds, so each new terminal rediscovers it one chord at a time. Wants
+a third table for chords some terminal claims and raj must reclaim, plus a test
+that every keymap chord is accounted for in exactly one of: `Bindings`, reclaim,
+or an explicit "terminals send this natively" list.
+
+### Fixed this session
+
+- [x] **Paste was never wired up.** `ui.Paste` existed and `app` handled it, but
+  nothing constructed one: mode 2004 was never enabled and the decoder had no
+  case for the markers, so a paste arrived as a burst of synthetic keystrokes —
+  and Ghostty warned about it, because raj never advertised that it handled
+  pastes itself. The payload is now claimed before `parseCSI`, since the bytes
+  between the markers are content rather than parameters: a pasted `5;3R` was
+  being read as a cursor-position reply. CR and CRLF fold to LF. An
+  unterminated paste surrenders its start marker past 16 MB rather than
+  buffering forever.
+- [x] **Paste follows focus.** It was gated on the editor, so pasting into the
+  search box or the picker vanished silently. Fields take the first line,
+  trimmed; the explorer still ignores pastes, since its only `keys.None` handler
+  reads a space as the changed-only toggle.
+- [x] **Fields have selections.** `widget.Input` had no anchor, so every
+  selecting chord was a silent no-op and cmd+a *emptied the field* — with
+  nothing to represent a selection, select-all did the destructive thing that
+  looked like it. Also: `WordLeft` was aliased to `prevBoundary`, which walks
+  one UTF-8 rune, so alt+left was character motion under another name. Adding
+  the anchor immediately panicked the find bar, which found three places
+  assigning `Text` directly and leaving offsets past the new end — `Fields.Trim`
+  had that bug for the cursor already.
+- [x] **cmd+1-9 handed back** to the terminal, so terminal tabs are reachable
+  without suspending. `GotoTab1-9` and `tabNumber` stay live but unbound.
+- [x] **chroma to v2.24.0** — the newest release still declaring `go 1.22`. The
+  wall is v2.25.0, which jumps to `go 1.26`, not v2.27/1.25 as recorded below.
+
 ### Next, highest priority
 
-- [ ] **Cursor/viewport spec.** Write down the invariants — offset ↔ line/column
+
+[ ] **Cursor/viewport spec.** Write down the invariants — offset ↔ line/column
   ↔ screen cell, what each edit does to each cursor, when the viewport may move
   — and assert them as properties rather than examples. Every cursor bug so far
   has been a disagreement between two of those three representations, and they
@@ -176,9 +304,70 @@ and costs one cmd+z. Mismatched counts still insert whole.
   the inserted span to count newlines, which dominates a large paste and
   allocates a full copy of it. Scanning the inserted pieces directly removes the
   allocation; keeping a newline count per piece would remove the scan.
-- [ ] **Scrolling must not move the cursor** in the editor.
-- [ ] **Terminal paste** should wrap rather than overflow.
+- [ ] **Text wrapping.** Long lines overflow rather than wrap, which is worst on
+  a resize. Blocked on the cursor/viewport spec above: wrapping breaks the
+  one-line-is-one-row assumption that `Viewport.Top`, `ScrollTo`, the render
+  loop and every viewport test bake in.
+<this needs to be cleaned up and prioritized>
+
+## TODO
+-- Document differences from what is documented in TODO.md
+-  - Scrolling must not move the cursor -> I kind of like this, keeping it
+-- Mouse events would be sick
+-- Multi-cursor all using Ibeams would be nice
+-  - Click on editor puts cursor there
+-  - Not sure if the highlighted text works the same as highlighting with the cursor
+-  - Clicking on tabs changes tab
+-  - Clicking on file in explorer/search opens the file unless binary, put a warning for that
+-- Text wrapping (especially on resizes :))
+-- resizes totally add artifacts :) that persist even when the tabs are deleted
+-- shift+tab doesn't get me back out of the explorer/search fields
+-- cmd+c / cmd+x in a search field copies from the editor instead of the field
+-- Need to move the box to only see checked items, and reach it with cmd+up/down
+-- Document what is supported, but need to finish implementing and confirm things
+-- Maybe bind cmd+shift+r to reopen old tabs and give cmd+shift+t back to ghostty
+-  - only worth it if ghostty actually binds cmd+shift+t; check +list-keybinds first
+-- Think about small/split panes and resizing
+-- There's some slight spacing differences between files, TODO.md and README.md
+-  - narrowed to two runes: check line 170 of TODO.md against a line with an em-dash
+-- shift+fn+up/down is eaten by iTerm2 before raj sees it; needs a reclaim mapping
+-
+-## Done
+-
+-- Paste works. It was never wired up: bracketed paste was neither enabled nor
+-  parsed, so pastes arrived as a key storm and Ghostty warned about it. Pasting
+-  into the search box and the picker works too.
+-- Search and picker fields have real selections: shift+alt+arrows by word,
+-  cmd+shift+arrows to the edges. cmd+a used to empty the field.
+-- cmd+1-9 went back to the terminal, so terminal tabs are reachable without
+-  suspending. raj's own tabs are cmd+alt+left/right.
+-- chroma is on v2.24.0, which is the newest release that still builds on Go 1.22.
+-- Debug pane works; leaving it on ctrl+shift+d.
+-- iTerm2 is supported via a dynamic profile, so a fork of ghostty is no longer
+-  the only way to run this.
+
+</this needs to be cleaned up and prioritized>
 - [ ] **Tabs as clickable tags** — visual now, clickable when mouse lands.
+
+(Scrolling moving the cursor is deliberate; see the README. Not a bug.)
+
+### Next, panes and fields
+
+- [ ] **shift+tab cannot leave a sidebar.** Both panes stop it at their first
+  component, so the only way back to the editor is tab all the way forward or a
+  chord. That was a deliberate choice — tab indents in the editor, so a one-key
+  return would make editing interruptible — but it makes the first field of each
+  pane a dead end. Decide between wrapping the ring and letting shift+tab exit
+  backwards.
+- [ ] **cut and copy hit the wrong buffer from a field.** `handleGlobal` claims
+  them before any pane sees them and `clip()` operates on `Tabs.Active()`, so
+  cmd+c in the search box copies from the editor and cmd+x edits the document
+  being searched. More visible now that fields have real selections. `app` needs
+  to ask the focused thing whether it owns a selection.
+- [ ] **The changed-only checkbox** is at the bottom of the explorer and only
+  reachable by tabbing through the tree. Move it under the heading and put it on
+  cmd+up/down, matching how the search pane already jumps between query and
+  results.
 
 ### Next, editor
 
@@ -215,6 +404,14 @@ and costs one cmd+z. Mismatched counts still insert whole.
 - [ ] Resize has no test coverage.
 - [ ] No Bubbletea adapter yet. The `ui.Host` interface is six methods.
 - [ ] Display width table is hand-rolled; suspect it first if the caret drifts.
-- [ ] chroma is pinned to v2.14.0 (v2.27 requires Go 1.25).
-- [ ] `raj --config macos` must be regenerated and Ghostty reloaded whenever the
-  binding table changes.
+  Narrowed: TODO.md holds three runes README.md does not — en-dash, em-dash, and
+  `↔` U+2194, all East Asian Ambiguous. raj calls all three narrow. The em-dash
+  is on 17 lines, `↔` on exactly two (170 and 171), so which lines drift says
+  which rune disagrees with the terminal. `↔` is the likely one: it is
+  emoji-capable without emoji presentation, which is the class fonts disagree
+  about.
+- [ ] `raj --config ghostty` must be regenerated and the terminal reloaded
+  whenever the binding table changes. Same for the iTerm2 profile.
+- [ ] Four actions are bound but unimplemented, so their chords are taken from
+  the terminal for nothing: `ToggleAgent` (cmd+alt+b), `CommandPalette`
+  (cmd+shift+p), `GotoLine` (ctrl+g), `GotoSymbol` (cmd+shift+o).

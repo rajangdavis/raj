@@ -184,6 +184,8 @@ func (h *NativeHost) dispatch(e keys.Event) {
 		h.emit(Focus{In: false})
 	case keys.OSCReply:
 		h.applyThemeReply(e.Raw)
+	case keys.PasteEvent:
+		h.emit(Paste{Text: e.Text})
 	case keys.KeyEvent:
 		if e.Type != keys.Release && !e.IsModifierKey() {
 			h.emit(Key{e})

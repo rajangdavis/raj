@@ -1,9 +1,13 @@
-// Command raj is a terminal editor that lives in Ghostty, inherits its theme,
-// and borrows VSCode's keybindings via the kkp_on gate.
+// Command raj is a terminal editor that borrows VSCode's keybindings.
 //
-//	raj file.go          open a file
-//	raj --tab 4 file.go  set the indent width
-//	raj --config macos   print the Ghostty keybindings to install, then exit
+//	raj                       open the workspace in the file explorer
+//	raj file.go               open a file
+//	raj some/dir              open a directory as the workspace
+//	raj --tab 4 file.go       set the indent width
+//	raj --config ghostty      print Ghostty keybindings to install
+//	raj --config iterm2       print an iTerm2 dynamic profile
+//	raj --probe               check which chords this terminal delivers
+//	raj --probe --checklist   walk every binding and emit a measured keymap
 package main
 
 import (
@@ -15,24 +19,59 @@ import (
 
 	"raj/internal/app"
 	"raj/internal/keys"
+	"raj/internal/probe"
 	"raj/internal/ui"
 )
 
 func main() {
 	var (
 		tab       = flag.Int("tab", 2, "indent width in spaces")
-		configFor = flag.String("config", "", "print Ghostty keybindings for macos|linux and exit")
+		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
+		runProbe  = flag.Bool("probe", false, "report what chords this terminal delivers")
+		checklist = flag.Bool("checklist", false, "with --probe: walk every binding in order")
+		kkpFlags  = flag.Int("kkp", 0, "with --probe: KKP flags to push (0 = raj's own)")
 	)
 	flag.Parse()
 
 	if *configFor != "" {
-		fmt.Print(keys.GhosttyConfig(*configFor))
+		out, err := config(*configFor)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Print(out)
+		return
+	}
+	if *runProbe {
+		// The probe lives behind a flag on raj rather than in its own binary so
+		// that testing a terminal needs no second build: whatever raj you are
+		// running is the decoder being measured.
+		if err := probe.Run(*kkpFlags, *checklist); err != nil {
+			fail(err)
+		}
 		return
 	}
 	if err := run(flag.Arg(0), *tab); err != nil {
-		fmt.Fprintln(os.Stderr, "raj:", err)
-		os.Exit(1)
+		fail(err)
 	}
+}
+
+// config renders the keybindings for a terminal. Every emitter reads the same
+// measured table, so they cannot disagree about what a chord should send.
+func config(target string) (string, error) {
+	switch target {
+	case "ghostty", "macos":
+		return keys.GhosttyConfig("macos"), nil
+	case "ghostty-linux", "linux":
+		return keys.GhosttyConfig("linux"), nil
+	case "iterm2":
+		return keys.ITerm2Profile("raj"), nil
+	}
+	return "", fmt.Errorf("unknown target %q: want ghostty, ghostty-linux, or iterm2", target)
+}
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, "raj:", err)
+	os.Exit(1)
 }
 
 func run(path string, tab int) error {
@@ -52,8 +91,7 @@ func run(path string, tab int) error {
 
 	a := app.New(host, root, tab)
 	// A named file takes the focus; otherwise raj opens in the explorer, since
-	// an editor with no file is not a useful place for the keys to be. Once
-	// session restore lands, a returning session takes precedence over both.
+	// an editor with no file is not a useful place for the keys to be.
 	if path != "" {
 		a.OpenFile(path)
 	}
@@ -61,8 +99,6 @@ func run(path string, tab int) error {
 }
 
 // resolve splits the argument into a workspace root and a file to open.
-// `raj .` and `raj some/dir` set the root and open nothing; `raj file.go` roots
-// at the working directory and opens the file.
 func resolve(arg string) (root, file string, err error) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -79,8 +115,7 @@ func resolve(arg string) (root, file string, err error) {
 		return workspace(abs), "", nil
 	}
 	// A file argument roots the workspace at the file's own project, not at
-	// wherever the shell happened to be. `raj ~/other/thing.go` should show
-	// that project in the explorer.
+	// wherever the shell happened to be.
 	return workspace(filepath.Dir(abs)), abs, nil
 }
 

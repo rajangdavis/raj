@@ -40,6 +40,14 @@ const (
 	hideCursor = "\x1b[?25l"
 	showCursor = "\x1b[?25h"
 
+	// Bracketed paste (DEC 2004). Enabling it is what makes a paste arrive as
+	// one delimited payload instead of as synthetic keystrokes, and it is also
+	// how raj advertises that it handles pastes itself — a terminal that sees
+	// the mode set has no reason to warn about multi-line or unsafe pastes on
+	// the application's behalf.
+	pasteOn  = "\x1b[?2004h"
+	pasteOff = "\x1b[?2004l"
+
 	// The alternate screen is what makes raj behave like a full-screen
 	// application rather than a very long shell command. Without it the editor
 	// is written into the scrollback: previous shell output stays visible above
@@ -54,11 +62,12 @@ const (
 // terminal left with KKP pushed swallows the host's own keybindings, so every
 // exit path has to run Leave.
 type Terminal struct {
-	in    *os.File
-	out   io.Writer
-	saved string // stty -g settings to restore
-	flags int
-	live  bool
+	in      *os.File
+	out     io.Writer
+	saved   string // stty -g settings to restore
+	flags   int
+	live    bool
+	profile profileSwitch
 }
 
 // New wraps a tty. in must be a real terminal; out is where control sequences
@@ -87,10 +96,15 @@ func (t *Terminal) Enter(flags int) error {
 		return fmt.Errorf("term: enter raw mode: %w", err)
 	}
 	t.saved, t.flags, t.live = strings.TrimSpace(saved), flags, true
+	t.profile = newProfileSwitch()
+	// Before the alt screen, so the profile change applies to the frames raj
+	// is about to draw.
+	t.profile.enter(t.out)
 	fmt.Fprint(t.out, altOn)
 	fmt.Fprint(t.out, hideCursor)
 	fmt.Fprintf(t.out, kkpPushFmt, flags)
 	fmt.Fprint(t.out, focusOn)
+	fmt.Fprint(t.out, pasteOn)
 	return nil
 }
 
@@ -100,10 +114,12 @@ func (t *Terminal) Leave() {
 	if t == nil || !t.live {
 		return
 	}
+	fmt.Fprint(t.out, pasteOff)
 	fmt.Fprint(t.out, focusOff)
 	fmt.Fprint(t.out, kkpPop)
 	fmt.Fprint(t.out, showCursor)
 	fmt.Fprint(t.out, altOff)
+	t.profile.leave(t.out)
 	if t.saved != "" {
 		t.stty(t.saved)
 	}

@@ -1,6 +1,9 @@
 package keys
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // mustParse decodes a full sequence or fails the test.
 func mustParse(t *testing.T, seq string) Event {
@@ -101,5 +104,72 @@ func TestBindNoneMasksGlobal(t *testing.T) {
 func TestShiftedAlternateNaming(t *testing.T) {
 	if got := mustParse(t, "\x1b[97:65;2u").Chord(); got != "shift+a" {
 		t.Errorf("chord = %q, want shift+a", got)
+	}
+}
+
+// The iTerm2 profile must cover the same chords as the Ghostty config and
+// encode the same sequences: one measured table, two emitters.
+func TestITerm2ProfileMatchesTable(t *testing.T) {
+	out := ITerm2Profile("raj")
+	for _, b := range Bindings {
+		key, ok := itermMappingKey(b.Chord)
+		if !ok {
+			t.Errorf("%s: chord %q has no iTerm2 mapping", b.Action, b.Chord)
+			continue
+		}
+		if !strings.Contains(out, key) {
+			t.Errorf("%s: mapping key %s missing from the profile", b.Action, key)
+		}
+		if !strings.Contains(out, `"[`+b.Seq+`"`) {
+			t.Errorf("%s: sequence %s missing from the profile", b.Action, b.Seq)
+		}
+	}
+}
+
+func TestITerm2MappingKeys(t *testing.T) {
+	cases := map[string]string{
+		"super+w":        "0x77-0x100000",
+		"shift+super+e":  "0x45-0x120000",
+		"alt+super+left": "0xf702-0x180000",
+		"ctrl+z":         "0x7a-0x40000",
+		"super+1":        "0x31-0x100000",
+		"shift+super+t":  "0x54-0x120000",
+		"shift+alt+i":    "0x49-0xa0000",
+	}
+	for chord, want := range cases {
+		got, ok := itermMappingKey(chord)
+		if !ok || got != want {
+			t.Errorf("%s -> %q (ok=%v), want %q", chord, got, ok, want)
+		}
+	}
+	// An unmodified key needs no mapping: iTerm2 already sends it.
+	if _, ok := itermMappingKey("tab"); ok {
+		t.Error("unmodified keys should not be mapped")
+	}
+}
+
+// Every shift+letter chord must map to the uppercase character code: AppKit
+// applies shift when reporting charactersIgnoringModifiers, so a lowercase
+// mapping never matches.
+func TestITerm2ShiftedLettersAreUppercase(t *testing.T) {
+	for _, b := range Bindings {
+		if !strings.HasPrefix(b.Chord, "shift+") {
+			continue
+		}
+		parts := strings.Split(b.Chord, "+")
+		key := parts[len(parts)-1]
+		if len(key) != 1 || key[0] < 'a' || key[0] > 'z' {
+			continue
+		}
+		got, ok := itermMappingKey(b.Chord)
+		if !ok {
+			t.Errorf("%s: no mapping", b.Chord)
+			continue
+		}
+		want := strings.ToUpper(key)[0]
+		if !strings.HasPrefix(got, "0x"+strings.ToLower(string("0123456789abcdef"[want>>4]))+
+			string("0123456789abcdef"[want&0xf])+"-") {
+			t.Errorf("%s -> %s, want the uppercase code 0x%x", b.Chord, got, want)
+		}
 	}
 }

@@ -42,7 +42,7 @@ func New(root string) *Picker {
 // Show opens the picker, reindexing so files created since last time appear.
 func (p *Picker) Show() {
 	p.Open = true
-	p.input.Text, p.input.Cursor = "", 0
+	p.input.SetText("")
 	p.input.Focused = true
 	p.index()
 	p.filter()

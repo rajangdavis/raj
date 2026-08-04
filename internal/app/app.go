@@ -4,6 +4,8 @@
 package app
 
 import (
+	"strings"
+
 	"raj/internal/editor"
 	"raj/internal/explorer"
 	"raj/internal/keys"
@@ -110,16 +112,7 @@ func (a *App) Handle(e ui.Event) {
 	case ui.Key:
 		a.handleKey(ev)
 	case ui.Paste:
-		// A bracketed paste is text from outside, so it cannot reuse pieces —
-		// unless it is byte-identical to what raj last copied, which is the
-		// common case of cmd+c then cmd+v and is worth catching.
-		if p := a.Tabs.Active(); p != nil && a.focus == FocusEditor {
-			clip := a.clipboard
-			if clip.Text != ev.Text || !clip.Internal() {
-				clip = editor.Clip{Text: ev.Text}
-			}
-			p.PasteClip(clip)
-		}
+		a.paste(ev.Text)
 	case ui.Resize:
 		// Invalidate here rather than only in the host: after a resize the
 		// terminal's contents outside the old geometry are undefined, and that
@@ -322,6 +315,64 @@ func (a *App) handleEditor(action keys.Action, text string) {
 	}
 	p.HandleText(text)
 	a.Explorer.Tree.MarkChanged(p.File.Path)
+}
+
+// paste routes a bracketed-paste payload to whatever has focus.
+//
+// Gating this on the editor meant a paste into the search box or the picker
+// vanished with no feedback — the payload arrives as one event rather than as
+// keystrokes, so the text fields never saw it at all and there was nothing for
+// them to fall back to.
+func (a *App) paste(text string) {
+	if text == "" {
+		return
+	}
+	if a.focus == FocusEditor {
+		a.pasteIntoBuffer(text)
+		return
+	}
+	// A single-line field takes the first line only. It has nowhere to put the
+	// rest, and inserting literal newlines gives a query box that renders as
+	// control-byte placeholders and searches for something no file contains.
+	line := firstLine(text)
+	if line == "" {
+		return
+	}
+	switch {
+	case a.focus == FocusPicker:
+		a.OpenFile(a.Picker.Handle(keys.None, line))
+	case a.focus == FocusSidebar && a.sidebar == SidebarSearch:
+		a.handleSidebar(keys.None, line)
+	}
+	// The explorer has no text field, so a paste there is deliberately ignored
+	// rather than routed: its only keys.None handler treats a space as the
+	// changed-only toggle, and a pasted space should not flip a filter.
+}
+
+// pasteIntoBuffer inserts into the active document. Text from outside cannot
+// reuse pieces — unless it is byte-identical to what raj last copied, which is
+// the common case of cmd+c then cmd+v and is worth catching.
+func (a *App) pasteIntoBuffer(text string) {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	clip := a.clipboard
+	if clip.Text != text || !clip.Internal() {
+		clip = editor.Clip{Text: text}
+	}
+	p.PasteClip(clip)
+	a.Explorer.Tree.MarkChanged(p.File.Path)
+}
+
+// firstLine is the payload up to its first newline, trimmed. A path pasted from
+// a shell arrives with a trailing newline, which would otherwise be searched for
+// literally.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 // jumpTo moves the active pane's cursor to a 1-based line and centres it.

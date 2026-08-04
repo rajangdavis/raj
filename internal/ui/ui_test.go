@@ -3,6 +3,8 @@ package ui
 import (
 	"strings"
 	"testing"
+
+	"raj/internal/keys"
 )
 
 func TestSetStringAndRow(t *testing.T) {
@@ -263,5 +265,46 @@ func TestDefaultIsNotRGB(t *testing.T) {
 	r, g, b, ok := RGBColor(1, 2, 3).RGB()
 	if !ok || r != 1 || g != 2 || b != 3 {
 		t.Errorf("round trip gave %d,%d,%d ok=%v", r, g, b, ok)
+	}
+}
+
+// The seam this closes: ui.Paste existed and app handled it, but nothing ever
+// constructed one. Bytes off the wire must now reach the application as a paste
+// rather than as a burst of synthetic keystrokes.
+func TestPasteBytesReachTheApplication(t *testing.T) {
+	h := &NativeHost{events: make(chan Event, 8)}
+	buf := []byte("\x1b[200~two\nlines\x1b[201~")
+	for len(buf) > 0 {
+		e, n := keys.Parse(buf)
+		if n == 0 {
+			t.Fatal("decoder wanted more bytes than the paste contains")
+		}
+		buf = buf[n:]
+		h.dispatch(e)
+	}
+	select {
+	case e := <-h.events:
+		p, ok := e.(Paste)
+		if !ok {
+			t.Fatalf("event = %T, want ui.Paste", e)
+		}
+		if p.Text != "two\nlines" {
+			t.Errorf("text = %q, want %q", p.Text, "two\nlines")
+		}
+	default:
+		t.Fatal("no event emitted")
+	}
+}
+
+// A paste must not also surface as key events, or the payload is inserted twice.
+func TestPasteEmitsExactlyOneEvent(t *testing.T) {
+	h := &NativeHost{events: make(chan Event, 8)}
+	e, n := keys.Parse([]byte("\x1b[200~abc\x1b[201~"))
+	if n == 0 {
+		t.Fatal("incomplete parse")
+	}
+	h.dispatch(e)
+	if got := len(h.events); got != 1 {
+		t.Errorf("emitted %d events, want 1", got)
 	}
 }

@@ -1,6 +1,7 @@
 package keys
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -16,6 +17,7 @@ const (
 	OSCReply
 	OtherReply
 	Partial
+	PasteEvent
 )
 
 // KKP modifier bits. caps_lock (64) and num_lock (128) are reported too and
@@ -55,6 +57,9 @@ func Parse(b []byte) (Event, int) {
 		return Event{Kind: Partial}, 0
 	}
 	if b[0] != 0x1b {
+		if e, ok := legacyControl(b[0]); ok {
+			return e, 1
+		}
 		r, n := utf8.DecodeRune(b)
 		if r == utf8.RuneError && n == 1 && len(b) < 4 {
 			return Event{Kind: Partial}, 0
@@ -66,6 +71,13 @@ func Parse(b []byte) (Event, int) {
 	}
 	switch b[1] {
 	case '[':
+		// Bracketed paste is claimed before parseCSI, because the payload
+		// between the markers is arbitrary bytes rather than parameters: a
+		// pasted "5;3R" would otherwise be read as a cursor-position reply,
+		// and every newline in the paste as a separate enter keypress.
+		if bytes.HasPrefix(b, pasteStart) {
+			return parsePaste(b)
+		}
 		return parseCSI(b)
 	case ']':
 		return parseTerminated(b, OSCReply)
@@ -78,6 +90,37 @@ func Parse(b []byte) (Event, int) {
 		return Event{Kind: Partial}, 0
 	}
 	return Event{Kind: KeyEvent, Raw: b[:1+n], Code: int(r), Mods: ModAlt, Type: Press}, 1 + n
+}
+
+// legacyControl decodes a C0 byte as the chord that produced it.
+//
+// Without the Kitty protocol a terminal sends ctrl+c as 0x03, not as
+// CSI 99;5u. Every terminal does this, and any that does not speak KKP does it
+// exclusively — so a decoder that only understands the modern encoding cannot
+// see ctrl+c at all. That is not a hypothetical: iTerm2 answers the colour and
+// device-attribute queries but not the KKP one, and raj was left unable to
+// quit.
+//
+// Tab, enter and escape keep their own identities rather than becoming ctrl+i,
+// ctrl+m and ctrl+[, because that is what the keys are called and what every
+// keymap binds.
+func legacyControl(b byte) (Event, bool) {
+	e := Event{Kind: KeyEvent, Type: Press, Raw: []byte{b}}
+	switch {
+	case b == 9 || b == 13 || b == 27 || b == 32:
+		return Event{}, false // named keys, handled as themselves
+	case b == 8 || b == 127:
+		e.Code = 127 // backspace
+	case b == 0:
+		e.Code, e.Mods = 32, ModCtrl // ctrl+space
+	case b >= 1 && b <= 26:
+		e.Code, e.Mods = int('a'+b-1), ModCtrl
+	case b >= 28 && b <= 31:
+		e.Code, e.Mods = int(`\]^_`[b-28]), ModCtrl
+	default:
+		return Event{}, false
+	}
+	return e, true
 }
 
 func parseCSI(b []byte) (Event, int) {
@@ -134,6 +177,57 @@ func parseCSI(b []byte) (Event, int) {
 		}
 	}
 	return e, n
+}
+
+// Bracketed paste markers (DEC mode 2004). The terminal wraps pasted text in
+// these so an application can tell it apart from typing.
+var (
+	pasteStart = []byte("\x1b[200~")
+	pasteEnd   = []byte("\x1b[201~")
+)
+
+// MaxPaste bounds how much is buffered while waiting for the end marker. A
+// paste whose terminator never arrives would otherwise grow the read buffer
+// without limit and raj would look hung, having consumed nothing. Past the cap
+// the start marker is surrendered as an ordinary reply, which drains the buffer
+// and lets the following bytes decode as keys — degraded, but not wedged.
+const MaxPaste = 16 << 20
+
+// parsePaste consumes a whole bracketed paste and returns its payload as Text.
+//
+// The payload is delivered in one event on purpose. Pasting a thousand lines as
+// a thousand key events is a thousand buffer edits, a thousand undo entries and
+// a thousand retokenises; as one event it is a single op the piece table stores
+// once.
+func parsePaste(b []byte) (Event, int) {
+	end := bytes.Index(b, pasteEnd)
+	if end < 0 {
+		if len(b) > MaxPaste {
+			return Event{Kind: OtherReply, Raw: b[:len(pasteStart)]}, len(pasteStart)
+		}
+		return Event{Kind: Partial}, 0
+	}
+	n := end + len(pasteEnd)
+	return Event{
+		Kind: PasteEvent,
+		Raw:  b[:n],
+		Text: normalizeNewlines(string(b[len(pasteStart):end])),
+	}, n
+}
+
+// normalizeNewlines folds CR and CRLF to LF.
+//
+// A terminal reports Enter inside a paste as CR, so a multi-line paste taken
+// literally is one buffer line containing control bytes the renderer draws as
+// placeholders. Line endings are a wire detail here, not content. Nothing else
+// is stripped: tabs are meaningful, and a paste containing ESC is the caller's
+// problem to sanitise, not the decoder's to silently alter.
+func normalizeNewlines(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
 }
 
 // parseTerminated consumes an OSC/DCS/APC string up to BEL or ST.

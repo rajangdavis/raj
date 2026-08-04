@@ -30,12 +30,15 @@ func (f *Find) Show(p *Pane) {
 	// Always start from the selection, or from empty. Retaining the previous
 	// query would mean the next thing typed silently appends to it, which is
 	// the kind of surprise that makes a search box feel broken.
-	f.input.Text = ""
+	seed := ""
 	if c := p.Cursors.Primary(); c.HasSelection() {
 		lo, hi := c.Range()
-		f.input.Text = p.File.Slice(lo, hi-lo)
+		seed = p.File.Slice(lo, hi-lo)
 	}
-	f.input.Cursor = len(f.input.Text)
+	// SetText rather than assigning Text: the field carries a selection anchor
+	// now, and leaving it pointing into the old contents indexes past the end
+	// of the new ones.
+	f.input.SetText(seed)
 	f.run(p)
 }
 

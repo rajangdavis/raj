@@ -247,9 +247,9 @@ func TestTabSwitching(t *testing.T) {
 	if !strings.HasSuffix(h.Pane().File.Path, "main.go") {
 		t.Errorf("prev tab landed on %s", h.Pane().File.Path)
 	}
-	h.press("super+2")
+	h.press("alt+super+right")
 	if !strings.HasSuffix(h.Pane().File.Path, "README.md") {
-		t.Errorf("cmd+2 landed on %s", h.Pane().File.Path)
+		t.Errorf("next tab landed on %s", h.Pane().File.Path)
 	}
 }
 
@@ -738,7 +738,9 @@ func TestUndoMovesCursorToTheChange(t *testing.T) {
 	}
 }
 
-// Switching tabs gives the editor focus, so cmd+1 from a sidebar is one step.
+// Switching tabs gives the editor focus, so reaching a tab from a sidebar is one
+// step. Both directions are checked: cmd+1-9 went back to the terminal, so the
+// cycling chords are now the only way in and carry the focus behaviour alone.
 func TestTabSwitchFocusesEditor(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
 	dir := h.Explorer.Tree.Root
@@ -748,9 +750,9 @@ func TestTabSwitchFocusesEditor(t *testing.T) {
 	if h.Focused() != FocusSidebar {
 		t.Fatal("setup: expected sidebar focus")
 	}
-	h.press("super+1")
+	h.press("alt+super+left")
 	if h.Focused() != FocusEditor {
-		t.Error("cmd+1 did not focus the editor")
+		t.Error("prev-tab did not focus the editor")
 	}
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.press("alt+super+right")
@@ -934,5 +936,58 @@ func TestDebugPaneRecordsKeys(t *testing.T) {
 	h.press("shift+ctrl+d")
 	if h.Debug.Open {
 		t.Error("the chord did not close the pane")
+	}
+}
+
+// A paste must reach whatever has focus. Gating it on the editor meant pasting
+// into the search box or the picker vanished silently: the payload arrives as
+// one event, so the text fields never saw it and had nothing to fall back to.
+func TestPasteIntoSearchField(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("shift+super+f")
+	if h.Focused() != FocusSidebar || h.SidebarMode() != SidebarSearch {
+		t.Fatal("setup: expected search focus")
+	}
+	h.Handle(ui.Paste{Text: "needle"})
+	h.drain()
+	if got := h.Search.Options().Text; got != "needle" {
+		t.Errorf("query = %q, want %q", got, "needle")
+	}
+}
+
+// A multi-line paste into a single-line field takes the first line: the field
+// has nowhere to put the rest, and literal newlines render as placeholders.
+func TestPasteIntoFieldTakesFirstLine(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("shift+super+f")
+	h.Handle(ui.Paste{Text: "first\nsecond\nthird"})
+	h.drain()
+	if got := h.Search.Options().Text; got != "first" {
+		t.Errorf("query = %q, want %q", got, "first")
+	}
+}
+
+// A path pasted from a shell carries a trailing newline, which must not be
+// searched for literally.
+func TestPasteTrimsTrailingNewline(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("shift+super+f")
+	h.Handle(ui.Paste{Text: "main.go\n"})
+	h.drain()
+	if got := h.Search.Options().Text; got != "main.go" {
+		t.Errorf("query = %q, want %q", got, "main.go")
+	}
+}
+
+// The explorer has no text field, and its only keys.None handler treats a space
+// as the changed-only toggle. A pasted space must not flip that filter.
+func TestPasteIntoExplorerIsIgnored(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("shift+super+e")
+	before := h.Explorer.Tree.ChangedOnly
+	h.Handle(ui.Paste{Text: " "})
+	h.drain()
+	if h.Explorer.Tree.ChangedOnly != before {
+		t.Error("a paste toggled the changed-only filter")
 	}
 }

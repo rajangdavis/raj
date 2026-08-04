@@ -1,9 +1,6 @@
 package keys
 
-import (
-	"fmt"
-	"strings"
-)
+import "strings"
 
 // Binding is one chord raj owns. Chord is what Parse+Chord produce after the
 // key reaches us; Seq is the CSI payload Ghostty emits (bytes are ESC '[' +
@@ -28,7 +25,15 @@ type Binding struct {
 // Bindings needs an explicit kkp_on line only for chords Ghostty already binds;
 // under report_all everything else is auto-encoded. The rest are listed so the
 // encoding is pinned rather than inferred, and so both platforms agree.
-var Bindings = append(tabDigits(), []Binding{
+//
+// cmd+1-9 are deliberately absent. They are the terminal's own tab-select
+// chords, and raj claiming them meant there was no way to reach another
+// terminal tab without suspending. Leaving them unbound hands them back:
+// Ghostty binds them by default, so dropping the kkp_on line restores its
+// action rather than sending the chord to nobody. raj's own tabs are reachable
+// with cmd+alt+left/right. GotoTab1-9 and app.tabNumber stay live but unbound,
+// so rebinding later is a one-line change.
+var Bindings = []Binding{
 	{"panes", ToggleSidebar, "super+b", "98;9u", "cmd+b", "ctrl+b", ""},
 	{"panes", FocusExplorer, "shift+super+e", "101;10u", "cmd+shift+e", "ctrl+shift+e", "linux default: new split down"},
 	{"panes", FocusSearch, "shift+super+f", "102;10u", "cmd+shift+f", "ctrl+shift+f", ""},
@@ -81,24 +86,6 @@ var Bindings = append(tabDigits(), []Binding{
 	{"nav", SelWordRight, "shift+alt+right", "1;4C", "shift+alt+right", "ctrl+shift+right", ""},
 	{"nav", GotoLine, "ctrl+g", "103;5u", "ctrl+g", "ctrl+g", ""},
 	{"nav", GotoSymbol, "shift+super+o", "111;10u", "cmd+shift+o", "ctrl+shift+o", ""},
-}...)
-
-// tabDigits generates goto_tab_1..9. Confirmed against `ghostty +list-keybinds`:
-// digit keys are digit_N, so the trigger is cmd+digit_1, not cmd+1.
-func tabDigits() []Binding {
-	actions := []Action{GotoTab1, GotoTab2, GotoTab3, GotoTab4, GotoTab5,
-		GotoTab6, GotoTab7, GotoTab8, GotoTab9}
-	out := make([]Binding, 0, 9)
-	for i, a := range actions {
-		n := i + 1
-		out = append(out, Binding{
-			Group: "tabs", Action: a,
-			Chord: fmt.Sprintf("super+%d", n), Seq: fmt.Sprintf("%d;9u", 48+n),
-			Mac: fmt.Sprintf("cmd+digit_%d", n), Linux: fmt.Sprintf("alt+digit_%d", n),
-			Note: "ghostty default: select tab",
-		})
-	}
-	return out
 }
 
 // GhosttyConfig renders the kkp_on keybind lines for a platform.
