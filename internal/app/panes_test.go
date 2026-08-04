@@ -991,3 +991,44 @@ func TestPasteIntoExplorerIsIgnored(t *testing.T) {
 		t.Error("a paste toggled the changed-only filter")
 	}
 }
+
+// Wrapping is on unless a caller turns it off. A line running off the right
+// edge is worse than one continuing below, so horizontal scrolling is the
+// fallback rather than the default — and there is no flag to remember.
+func TestWrapIsOnByDefault(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	if !h.WrapDefault {
+		t.Fatal("WrapDefault is off")
+	}
+	dir := h.Explorer.Tree.Root
+	h.OpenFile(filepath.Join(dir, "main.go"))
+	p := h.Tabs.Active()
+	if p == nil {
+		t.Fatal("no pane opened")
+	}
+	if !p.Wrap {
+		t.Error("an opened pane did not inherit the wrap default")
+	}
+}
+
+// A wrapped pane never scrolls horizontally: the line continues below instead,
+// so there is nothing off to the right to scroll to.
+func TestWrappedPaneDoesNotScrollHorizontally(t *testing.T) {
+	h := newWorkspace(t, 60, 12)
+	dir := h.Explorer.Tree.Root
+	path := filepath.Join(dir, "wide.md")
+	if err := os.WriteFile(path, []byte(strings.Repeat("word ", 200)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(path)
+	p := h.Tabs.Active()
+	p.Cursors.Set(p.File.Len()-1, p.File.Len()-1)
+	p.FollowCursor()
+	h.drain()
+	if p.Viewport.Left != 0 {
+		t.Errorf("Left = %d on a wrapped pane", p.Viewport.Left)
+	}
+	if got := p.RowsInLine(0); got < 2 {
+		t.Errorf("line occupies %d rows at %d cols; it should wrap", got, p.Viewport.Cols)
+	}
+}

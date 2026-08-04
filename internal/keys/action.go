@@ -14,6 +14,7 @@ const (
 
 	// panes
 	ToggleSidebar  Action = "toggle_sidebar"
+	ToggleWrap     Action = "toggle_wrap"
 	FocusExplorer  Action = "focus_explorer"
 	FocusSearch    Action = "focus_search"
 	ToggleAgent    Action = "toggle_agent"

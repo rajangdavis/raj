@@ -26,6 +26,7 @@ import (
 func main() {
 	var (
 		tab       = flag.Int("tab", 2, "indent width in spaces")
+		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
 		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
 		runProbe  = flag.Bool("probe", false, "report what chords this terminal delivers")
 		checklist = flag.Bool("checklist", false, "with --probe: walk every binding in order")
@@ -50,7 +51,7 @@ func main() {
 		}
 		return
 	}
-	if err := run(flag.Arg(0), *tab); err != nil {
+	if err := run(flag.Arg(0), *tab, *wrap); err != nil {
 		fail(err)
 	}
 }
@@ -74,7 +75,7 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func run(path string, tab int) error {
+func run(path string, tab int, wrap bool) error {
 	root, path, err := resolve(path)
 	if err != nil {
 		return err
@@ -92,6 +93,7 @@ func run(path string, tab int) error {
 	a := app.New(host, root, tab)
 	// A named file takes the focus; otherwise raj opens in the explorer, since
 	// an editor with no file is not a useful place for the keys to be.
+	a.WrapDefault = wrap
 	if path != "" {
 		a.OpenFile(path)
 	}

@@ -173,3 +173,24 @@ func TestITerm2ShiftedLettersAreUppercase(t *testing.T) {
 		}
 	}
 }
+
+// The wrap toggle must survive macOS. Option+letter composes into a character
+// there, so a bare alt+letter chord never reaches the application — which is
+// why every alt binding in the table is alt+super or alt+arrow.
+func TestWrapToggleChordIsNotBareAlt(t *testing.T) {
+	k := NewKeymap()
+	if got := k.Lookup(Global, "alt+z"); got == ToggleWrap {
+		t.Error("toggle_wrap is on alt+z, which macOS composes away")
+	}
+	if got := k.Lookup(Global, "ctrl+alt+w"); got != ToggleWrap {
+		t.Errorf("ctrl+alt+w resolves to %q, want toggle_wrap", got)
+	}
+	// It must also decode from the wire, not just from a chord string.
+	e := mustParse(t, "\x1b[119;7u")
+	if got := e.Chord(); got != "ctrl+alt+w" {
+		t.Errorf("119;7u decodes as %q, want ctrl+alt+w", got)
+	}
+	if a, _, _ := k.Resolve(Editor, e); a != ToggleWrap {
+		t.Errorf("editor scope resolves it to %q, want toggle_wrap", a)
+	}
+}

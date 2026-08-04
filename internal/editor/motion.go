@@ -22,6 +22,12 @@ func (p *Pane) MoveTo(fn func(Cursor, *File) int, extend bool) {
 
 // MoveVertical moves by whole lines, preserving each cursor's goal column.
 func (p *Pane) MoveVertical(delta int, extend bool) {
+	if p.Wrap {
+		// One visual row, not one line: moving by lines while the screen shows
+		// rows makes "down" jump a whole paragraph in wrapped prose.
+		p.moveVerticalWrapped(delta, extend)
+		return
+	}
 	p.Cursors.Apply(func(c Cursor) Cursor {
 		line, col := p.File.LineCol(c.Head)
 		if c.Goal > col {

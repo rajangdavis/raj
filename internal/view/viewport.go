@@ -10,8 +10,13 @@ package view
 type Viewport struct {
 	Top  int // first visible line
 	Left int // first visible display column
-	Cols int // visible width in columns
-	Rows int // visible height in lines
+
+	// TopRow is the visual row within Top that the pane starts at, so a
+	// wrapped line taller than the pane can be entered partway. Always 0 when
+	// wrapping is off, which is what keeps the unwrapped path unchanged.
+	TopRow int
+	Cols   int // visible width in columns
+	Rows   int // visible height in lines
 
 	// ScrollOff is how many lines of context to keep above and below the
 	// cursor. Zero lets the cursor sit on the very first and last rows.

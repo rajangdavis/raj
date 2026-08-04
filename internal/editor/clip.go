@@ -38,20 +38,37 @@ func (c Clip) Internal() bool { return len(c.Spans) > 0 }
 func (p *Pane) Copy() Clip {
 	var c Clip
 	parts := make([]string, 0, p.Cursors.Count())
+	// A whole-line copy publishes a trailing newline so the line pastes back as
+	// a line. The captured span has to cover that newline too, or the two
+	// representations describe different text and cmd+c then cmd+v depends on
+	// which path the paste takes: the internal splice dropped the newline while
+	// pasting the same clipboard externally kept it.
+	lineCopy := p.Cursors.Count() == 1 && !p.Cursors.Primary().HasSelection()
 	for _, cur := range p.Cursors.All() {
 		lo, hi := cur.Range()
+		snapHi := hi
 		if hi == lo {
 			// No selection: take the whole line, the way every editor does.
 			line := p.File.LineOf(cur.Head)
 			lo = p.File.LineStart(line)
 			hi = p.File.LineEnd(line)
+			snapHi = hi
+			if lineCopy && hi < p.File.Len() {
+				snapHi = hi + 1
+			}
 		}
 		parts = append(parts, p.File.Slice(lo, hi-lo))
-		c.Spans = append(c.Spans, p.File.Snapshot(lo, hi-lo))
+		c.Spans = append(c.Spans, p.File.Snapshot(lo, snapHi-lo))
 	}
+	// Text and Spans are deliberately NOT the same byte count with several
+	// cursors. The "\n" separators here are structural: they carry the cursor
+	// split to any other program that reads the clipboard, and PasteClip splits
+	// on them to distribute a foreign clipboard back across cursors. Folding
+	// the newline into each part instead breaks that — the part count no longer
+	// matches the cursor count and distribution silently stops firing.
 	c.Text = strings.Join(parts, "\n")
-	if p.Cursors.Count() == 1 && !p.Cursors.Primary().HasSelection() {
-		c.Text += "\n" // a whole-line copy carries its newline
+	if lineCopy {
+		c.Text += "\n"
 	}
 	return c
 }

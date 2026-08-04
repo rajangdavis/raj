@@ -11,7 +11,9 @@ func (a *App) Draw() {
 	cols, rows := a.syncSize()
 	a.screen.Clear()
 	if rows < 2 || cols < 4 {
-		a.host.Present(a.screen)
+		// The error is deliberately ignored here and only here: this is the
+		// too-small-to-draw path, and there is nothing useful to fall back to.
+		_ = a.host.Present(a.screen)
 		return
 	}
 
@@ -36,7 +38,13 @@ func (a *App) Draw() {
 	a.Debug.Render(a.screen, a, 0, l.TopY, cols, l.Rows, a.wth)
 	// The picker floats above everything, so it is drawn last.
 	a.Picker.Render(a.screen, cols, rows, a.wth)
-	a.host.Present(a.screen)
+	if err := a.host.Present(a.screen); err != nil {
+		// A failed or short write leaves the terminal holding part of a frame.
+		// The host has already marked itself dirty, so the next Draw repaints
+		// in full; surfacing it in the status line makes a repeating failure
+		// visible instead of looking like random corruption.
+		a.status = "display write failed: " + err.Error()
+	}
 }
 
 // syncSize adopts the host's size, since a resize can arrive between frames.

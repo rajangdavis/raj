@@ -20,6 +20,12 @@ type Pane struct {
 	Author   piecetable.Author
 	Find     Find
 
+	// Wrap makes long lines occupy several visual rows instead of scrolling
+	// horizontally. Off by default: turning it on changes what a "row" means
+	// for every viewport calculation, so it is opt-in per pane.
+	Wrap bool
+
+	wrapBuf []int // reused across lines and frames by the renderer
 	focused bool
 }
 
@@ -36,10 +42,20 @@ func NewPane(f *File) *Pane {
 // Resize sets the visible area in cells.
 func (p *Pane) Resize(cols, rows int) {
 	p.Viewport.Resize(cols, rows, p.File.Lines())
+	if p.Wrap {
+		// A width change alters how many rows the top line occupies. Clamping
+		// it is the whole cost of a resize under this design: there is no
+		// global line-to-row table to rebuild.
+		p.clampWrapTop()
+	}
 }
 
 // FollowCursor scrolls so the primary cursor is visible.
 func (p *Pane) FollowCursor() {
+	if p.Wrap {
+		p.followCursorWrapped()
+		return
+	}
 	line, col := p.File.LineCol(p.Cursors.Primary().Head)
 	p.Viewport.ScrollTo(line, col, p.File.Lines())
 }

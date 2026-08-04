@@ -33,13 +33,18 @@ type App struct {
 	theme   editor.Theme
 	wth     widget.Theme
 
-	Debug      debugLog
-	clipboard  editor.Clip
-	dark       bool
-	lastLayout Layout
-	status     string
-	focused    bool
-	quit       bool
+	Debug     debugLog
+	clipboard editor.Clip
+	// WrapDefault is applied to every pane as it opens, so the flag and the
+	// toggle do not disagree about newly opened files. On by default: a line
+	// running off the right edge is worse than one that continues below, and
+	// horizontal scrolling is the fallback rather than the norm.
+	WrapDefault bool
+	dark        bool
+	lastLayout  Layout
+	status      string
+	focused     bool
+	quit        bool
 }
 
 // New builds an application rooted at a directory.
@@ -57,9 +62,13 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		sidebar:  SidebarExplorer,
 		focus:    FocusSidebar,
 		theme:    editor.DefaultTheme(),
-		dark:     host.Theme().Dark(),
-		wth:      widget.DefaultTheme(),
-		focused:  true,
+		// On unless a caller turns it off, so an App built in a test or by a
+		// future entry point wraps too rather than depending on who remembered
+		// to set the field.
+		WrapDefault: true,
+		dark:        host.Theme().Dark(),
+		wth:         widget.DefaultTheme(),
+		focused:     true,
 	}
 }
 
@@ -88,6 +97,7 @@ func (a *App) OpenFile(path string) {
 		return
 	}
 	p.File.SetDark(a.host.Theme().Dark())
+	p.Wrap = a.WrapDefault
 	a.focus = FocusEditor
 	a.status = ""
 }
@@ -198,6 +208,18 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.openSidebar(SidebarExplorer)
 	case keys.FocusSearch:
 		a.openSidebar(SidebarSearch)
+	case keys.ToggleWrap:
+		if p := a.Tabs.Active(); p != nil {
+			p.Wrap = !p.Wrap
+			a.WrapDefault = p.Wrap
+			p.Viewport.Left, p.Viewport.TopRow = 0, 0
+			p.FollowCursor()
+			a.status = "wrap off"
+			if p.Wrap {
+				a.status = "wrap on"
+			}
+		}
+		return true
 	case keys.ToggleSidebar:
 		a.toggleSidebar()
 	case keys.FilePicker:

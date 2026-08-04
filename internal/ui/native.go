@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/base64"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,8 +20,12 @@ import (
 // framework would only be supplying the loop and a diffing renderer, which is
 // what this file is.
 type NativeHost struct {
-	t      *term.Terminal
-	out    *os.File
+	t   *term.Terminal
+	out *os.File
+	// w is where frames are written. Separate from out, which stays an
+	// *os.File because the size query needs the descriptor, so that tests can
+	// substitute a writer that fails or writes short.
+	w      io.Writer
 	events chan Event
 	prev   *Screen
 
@@ -40,7 +45,7 @@ func NewNativeHost(in, out *os.File, tickRate time.Duration) (*NativeHost, error
 	if err := t.Enter(0); err != nil {
 		return nil, err
 	}
-	h := &NativeHost{t: t, out: out, events: make(chan Event, 256)}
+	h := &NativeHost{t: t, out: out, w: out, events: make(chan Event, 256)}
 	h.stop = t.HandleFatalSignals()
 	h.readSize()
 	h.watchResize()
@@ -81,6 +86,35 @@ func (h *NativeHost) Present(s *Screen) error {
 	h.dirty = false
 	h.mu.Unlock()
 
+	cols, rows := h.trueSize()
+
+	// A frame built for a different terminal size must not be written.
+	//
+	// SIGWINCH updates the size from its own goroutine, so during a drag the
+	// frame in hand can be sized for a terminal that no longer exists. Writing
+	// it anyway is what produces the thrash: a frame WIDER than the terminal
+	// wraps at the real right edge, pushing every subsequent row down and
+	// scrolling the screen, while a frame NARROWER only leaves stale cells to
+	// the right — which is why growing a pane looks almost clean and shrinking
+	// one does not.
+	//
+	// Dropping the frame costs nothing: the size is already updated, so the
+	// next Draw builds at the correct one. dirty stays set, so that frame is a
+	// full repaint rather than a diff against a screen that was never written.
+	//
+	// The comparison is against the terminal's ACTUAL size, not the cached one.
+	// The cache is only refreshed by SIGWINCH, so after a suspend — where raj
+	// cannot service signals at all while stopped — it can disagree with
+	// reality, and a guard trusting it would wave the wrong-sized frame
+	// through. That is why the thrash survived on the resume path.
+	if sc, sr := s.Size(); sc != cols || sr != rows {
+		h.mu.Lock()
+		h.dirty = true
+		h.mu.Unlock()
+		h.prev = nil
+		return nil
+	}
+
 	out := ""
 	if dirty {
 		// Erase before the full repaint. Writing every cell is not enough on
@@ -97,12 +131,55 @@ func (h *NativeHost) Present(s *Screen) error {
 	} else if h.prev == nil || h.prev.CursorShown {
 		out += hideCursor
 	}
-	h.prev = s.Clone()
 	if out == "" {
+		h.prev = s.Clone()
 		return nil
 	}
-	_, err := h.out.WriteString(out)
-	return err
+	// Record the frame only once every byte of it has reached the terminal.
+	//
+	// Setting prev first was the bug behind the scroll thrash: a short write
+	// left the screen holding part of the previous frame while prev claimed
+	// the whole new one had landed, so every later diff skipped exactly the
+	// cells that never arrived. The result is two frames interleaved character
+	// by character, clearing itself at the next full repaint — which is what
+	// made it look transient rather than like corrupted state.
+	//
+	// A near-full-screen diff is thousands of bytes, and scrolling with wrap on
+	// produces one on every keystroke. os.File.Write does not loop on a partial
+	// write; it returns io.ErrShortWrite and leaves the rest unsent.
+	if err := writeAll(h.w, out); err != nil {
+		// The screen is now in an unknown state, so the next frame has to be a
+		// full repaint rather than a diff against something never drawn.
+		h.mu.Lock()
+		h.dirty = true
+		h.mu.Unlock()
+		h.prev = nil
+		return err
+	}
+	h.prev = s.Clone()
+	return nil
+}
+
+// writeAll writes every byte, retrying on short writes. A tty in raw mode can
+// accept less than it is given when its buffer is full.
+func writeAll(w io.Writer, s string) error {
+	b := []byte(s)
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if n > 0 {
+			b = b[n:]
+		}
+		if err == io.ErrShortWrite {
+			continue // n bytes went; go round again with the rest
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite // no progress; refuse to spin
+		}
+	}
+	return nil
 }
 
 // Suspend hands the terminal back, stops the process, and forces a full
@@ -110,6 +187,11 @@ func (h *NativeHost) Present(s *Screen) error {
 // writing to the screen.
 func (h *NativeHost) Suspend() error {
 	err := h.t.Suspend(func() {
+		// Re-read the size before anything else. A window resized while raj was
+		// stopped produced no SIGWINCH it could service, so the cache is only
+		// as good as the moment it went to sleep.
+		h.readSize()
+		h.prev = nil // the shell has been writing to this screen
 		h.Invalidate()
 		h.t.QueryTheme()
 	})
@@ -236,6 +318,22 @@ func (h *NativeHost) watchResize() {
 			h.emit(Resize{Cols: cols, Rows: rows})
 		}
 	}()
+}
+
+// trueSize asks the terminal rather than trusting the cache, and refreshes the
+// cache while it is there. A TIOCGWINSZ ioctl is sub-microsecond, so paying it
+// once a frame is cheaper than a single wrong-sized repaint.
+func (h *NativeHost) trueSize() (int, int) {
+	if h.out == nil {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.cols, h.rows // tests drive the size directly
+	}
+	cols, rows := term.WindowSize(h.out)
+	h.mu.Lock()
+	h.cols, h.rows = cols, rows
+	h.mu.Unlock()
+	return cols, rows
 }
 
 func (h *NativeHost) readSize() {
