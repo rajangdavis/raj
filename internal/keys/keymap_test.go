@@ -194,3 +194,100 @@ func TestWrapToggleChordIsNotBareAlt(t *testing.T) {
 		t.Errorf("editor scope resolves it to %q, want toggle_wrap", a)
 	}
 }
+
+// cmd+l must reach the editor as SelectLine rather than falling through as the
+// letter "l": the chord is claimed by the table, so the emitters carry it.
+func TestSelectLineChordResolves(t *testing.T) {
+	k := NewKeymap()
+	a, text, ok := k.Resolve(Editor, mustParse(t, "\x1b[108;9u"))
+	if !ok || a != SelectLine || text != "" {
+		t.Errorf("got (%q, %q, %v), want (select_line, \"\", true)", a, text, ok)
+	}
+	if got := k.Lookup(Editor, "shift+super+l"); got != SplitIntoLines {
+		t.Errorf("cmd+shift+l = %q, want split_into_lines", got)
+	}
+}
+
+// Sublime's split-into-lines owns cmd+shift+l, so find-all moves to ctrl+cmd+g
+// rather than sharing. Both halves are asserted together: dropping one is how a
+// working feature disappears silently.
+func TestFindAllMovedToCtrlCmdG(t *testing.T) {
+	k := NewKeymap()
+	a, _, ok := k.Resolve(Editor, mustParse(t, "\x1b[103;13u"))
+	if !ok || a != AllOccurrences {
+		t.Errorf("ctrl+cmd+g = (%q, %v), want all_occurrences", a, ok)
+	}
+	if got := mustParse(t, "\x1b[103;13u").Chord(); got != "ctrl+super+g" {
+		t.Errorf("chord = %q, want ctrl+super+g", got)
+	}
+}
+
+// Every chord the keymap resolves must be accounted for in exactly one table:
+// Bindings (the terminal binds it, so a config line takes it), Reclaim (the
+// terminal keeps it, so a config line takes it back), or Natives (nothing
+// claims it and report_all delivers it).
+//
+// This is the invariant that was missing. Without it, a chord could be bound in
+// the keymap and absent from both emitters, and the only way to find out was to
+// press it on a terminal that happened to claim it — which is how shift+pgup
+// went unnoticed under iTerm2.
+func TestEveryKeymapChordIsAccountedFor(t *testing.T) {
+	source := map[string]string{}
+	claim := func(chord, table string) {
+		if prev, dup := source[chord]; dup {
+			t.Errorf("chord %q is in both %s and %s; it must be in exactly one", chord, prev, table)
+		}
+		source[chord] = table
+	}
+	for _, b := range Bindings {
+		claim(b.Chord, "Bindings")
+	}
+	for _, b := range Reclaim {
+		claim(b.Chord, "Reclaim")
+	}
+	for _, n := range Natives {
+		claim(n.Chord, "Natives")
+	}
+
+	k := NewKeymap()
+	for chord := range k.global {
+		if _, ok := source[chord]; !ok {
+			t.Errorf("keymap binds %q but no table lists it: add it to Bindings, Reclaim or Natives", chord)
+		}
+	}
+	for chord, table := range source {
+		if k.Lookup(Global, chord) == None {
+			t.Errorf("%s lists %q but the keymap does not bind it", table, chord)
+		}
+	}
+}
+
+// A reclaimed chord must reach both emitters, or the table is a promise the
+// terminal never hears.
+func TestReclaimedChordsAreEmitted(t *testing.T) {
+	ghostty := GhosttyConfig("macos")
+	profile := ITerm2Profile("raj")
+	for _, b := range Reclaim {
+		if !strings.Contains(ghostty, b.Seq) {
+			t.Errorf("%s: %q missing from the Ghostty config", b.Action, b.Seq)
+		}
+		if !strings.Contains(profile, b.Seq) {
+			t.Errorf("%s: %q missing from the iTerm2 profile", b.Action, b.Seq)
+		}
+	}
+}
+
+// Reclaim entries decode back to the chord they claim, the same round trip
+// Bindings entries get.
+func TestReclaimRoundTrip(t *testing.T) {
+	for _, b := range Reclaim {
+		e, n := Parse([]byte("\x1b[" + b.Seq))
+		if n == 0 {
+			t.Errorf("%s: sequence %q does not parse", b.Action, b.Seq)
+			continue
+		}
+		if got := e.Chord(); got != b.Chord {
+			t.Errorf("%s: seq %q decodes to %q, table says %q", b.Action, b.Seq, got, b.Chord)
+		}
+	}
+}

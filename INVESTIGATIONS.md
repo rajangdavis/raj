@@ -152,6 +152,77 @@ already in hand.
 
 ## Root causes
 
+### Undo applied at the wrong offset, splitting runes
+
+- [x] **`rebase` left a range put when a later insertion landed at its start.**
+  The special case exists so that undoing a deletion composes with an insertion
+  at the same point, and for an empty range that is right. For a range with
+  width — the bytes some op inserted, which is exactly what `rebasedInverse`
+  rebases — it is wrong: the new text pushes those bytes along, so leaving the
+  range put makes the undo delete the *new* text instead of the old. With
+  multi-byte text the deleted span straddles a rune and the document ends up
+  holding half of one, which is invalid UTF-8 on disk if you then save. Fixed by
+  restricting the case to `start == end`.
+- [ ] **A resurrected op makes the rebase walk incoherent.** Still open, and the
+  reason `TestUndoRedoKeepsRunesIntact` stops at 500 seeds. The walk skips ops
+  that are not currently live, but an op's `Pos` is in the coordinates of the
+  version it was applied at, and liveness is a property of *now*. Redo can
+  resurrect an op that was dead when later ops were recorded, and those later
+  ops then have positions in a coordinate system the walk is no longer
+  reproducing. Traced at seed 578: op3 inserts 2 bytes at 0 and is undone by
+  op4; op5 and op6 are recorded without it; op7 redoes op3 by reversing op4.
+  Rebasing op2's position now counts op3 (live again) *before* op6, whose `Pos`
+  was recorded when op3 was absent — the point lands 2 bytes late, inside a
+  rune.
+
+  The obvious repair is to stop filtering by liveness and walk the journal as
+  the sequence it actually is, since undo and redo are committed as ordinary ops
+  and the document is the composition of all of them in order. Measured: that
+  makes 3000 seeds of the rune fuzz pass and breaks `undo_test` at seed 10,
+  where a pair that cancels out is then counted twice and reports a conflict
+  against a region neither half still touches — which is the case the liveness
+  filter was added for. Both models are right about one case and wrong about the
+  other, so the fix is not a flag: it wants the rebase to distinguish "this op's
+  bytes are in the document" from "this op's coordinates are in the frame I am
+  walking", which are currently the same test.
+
+### The line index and the document disagreed after a batch
+
+- [x] **`applyToIndex` read the inserted span back out of the document.** That
+  is correct for exactly one op — the last one applied. Every caller that
+  mirrors a batch (`ApplyDiff` over hunks, `reverse` over an undo or redo group,
+  a multi-cursor edit) applies all the ops first and mirrors them afterwards, so
+  reading at `op.Pos` returns whatever the *later* ops left there. The index
+  then recorded newlines at positions nothing had newlines at, and stayed wrong
+  until something rebuilt it. Ops carry their inserted pieces and the stores are
+  append-only, so the pieces still describe exactly what that op inserted; the
+  document does not. Scanning them is both correct and free of the copy.
+- [x] **`File.sync` mirrored only the most recent op.** Right when a session
+  call appends one op to the journal, wrong when it appends two, and `applied`
+  jumped to the new version either way — so the skipped op was never mirrored.
+  It now catches up on everything since `applied`.
+- [x] **`scanWord` compared bytes to `unicode.IsLetter`.** A continuation byte
+  is not a letter, so word motion stopped inside multi-byte runes and left the
+  cursor at an offset the rest of the editor cannot address. Both of these were
+  found by the properties in CURSOR-VIEWPORT-SPEC.md within seconds of writing
+  them, having survived every example test in the repository.
+
+### Escape never arrived without KKP
+
+- [x] **A lone ESC was held forever, so escape did nothing.** `Parse` returns
+  "need more bytes" for a one-byte buffer, which is correct — 0x1b is also the
+  first byte of every CSI, and consuming it eagerly would split every sequence.
+  Under KKP that never mattered: escape arrives as `CSI 27 u` and decodes like
+  any other chord. Under a terminal falling back to legacy encoding it is a bare
+  0x1b with nothing after it, so it sat in the buffer until the *next*
+  keypress — and then ESC+key decoded as alt+key, which is the second symptom:
+  escape appeared to do nothing and also ate the key after it. `Cursors.Clear`
+  was wired to `keys.Cancel` the whole time; the action simply never got there.
+  The fix is the standard one, a timeout: `ParseFinal` decodes a buffer the
+  reader has stopped waiting on, and it differs from `Parse` in exactly this one
+  case. 25 ms, ncurses' ESCDELAY. `decodeStream` is the seam that makes it
+  testable without a terminal.
+
 ### The undo/redo corruption
 
 - [x] **cmd+z corruption.** Three stacked bugs, found by fuzzing rather than

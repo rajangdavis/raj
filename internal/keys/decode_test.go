@@ -280,3 +280,28 @@ func TestUnterminatedPasteDoesNotWedge(t *testing.T) {
 		t.Errorf("got kind %v n=%d, want the start marker surrendered", e.Kind, n)
 	}
 }
+
+// A terminal without KKP sends escape as a single byte, which is also the first
+// byte of every sequence. Parse must hold it — splitting a CSI would be worse —
+// and ParseFinal must resolve it once the reader has waited.
+func TestLoneEscapeNeedsAFinalRead(t *testing.T) {
+	if _, n := Parse([]byte{0x1b}); n != 0 {
+		t.Errorf("Parse consumed %d bytes of a lone ESC, want 0 (wait for more)", n)
+	}
+	e, n := ParseFinal([]byte{0x1b})
+	if n != 1 || e.Kind != KeyEvent || e.Chord() != "esc" {
+		t.Fatalf("ParseFinal = (%v, %d), want the esc key in 1 byte", e.Chord(), n)
+	}
+}
+
+// ParseFinal must not steal anything else: a real sequence, and the legacy
+// alt+key form, decode identically either way.
+func TestParseFinalDefersToParse(t *testing.T) {
+	for _, seq := range []string{"\x1b[27u", "\x1b[97;9u", "\x1ba", "a"} {
+		want, wantN := Parse([]byte(seq))
+		got, gotN := ParseFinal([]byte(seq))
+		if gotN != wantN || got.Chord() != want.Chord() {
+			t.Errorf("%q: ParseFinal = (%q, %d), Parse = (%q, %d)", seq, got.Chord(), gotN, want.Chord(), wantN)
+		}
+	}
+}

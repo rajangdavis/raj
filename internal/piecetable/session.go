@@ -201,9 +201,15 @@ func (s *Session) rebase(start, end int, base Version, slide bool) (int, int, Ve
 		}
 		d := o.DelLen()
 		switch {
-		case d == 0 && o.Pos == start && !slide:
-			// A pure insertion exactly at the point: leave the point put, so
-			// this composes with the deletion whose inverse it is.
+		case d == 0 && o.Pos == start && start == end && !slide:
+			// A pure insertion exactly at an empty point: leave the point put,
+			// so this composes with the deletion whose inverse it is.
+			//
+			// Only when the range is empty. A range with width is the bytes
+			// some op inserted, and an insertion at its start pushes those
+			// bytes along with everything else — leaving the range put makes
+			// the undo delete the NEW text instead of the old, which is how a
+			// redo came to split a rune in half.
 		case o.Pos+d <= start:
 			start += o.Delta()
 			end += o.Delta()

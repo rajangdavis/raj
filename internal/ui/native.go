@@ -230,21 +230,75 @@ func (h *NativeHost) Close() error {
 	return nil
 }
 
+// escTimeout is how long the decoder waits for the rest of a sequence before
+// concluding that a lone ESC was the escape key. A terminal that does not speak
+// KKP sends escape as a single byte, which is also the first byte of every
+// other sequence — the only thing distinguishing them is the gap that follows.
+// 25 ms is ncurses' ESCDELAY: long enough that a CSI written in one go is never
+// split across the wait, short enough that escape does not feel sticky.
+const escTimeout = 25 * time.Millisecond
+
 // readLoop decodes bytes into events. Key releases and bare modifier presses
 // are dropped here so nothing above the host ever has to remember to filter
 // them — under KKP flag 2 every chord reports twice, and acting on both applies
 // every edit twice.
+//
+// Reading happens in its own goroutine so the decoder can wait on a clock as
+// well as on bytes, which is what the escape timeout needs.
 func (h *NativeHost) readLoop() {
-	var buf []byte
-	chunk := make([]byte, 4096)
-	for {
-		n, err := h.t.Read(chunk)
-		if n > 0 {
-			buf = append(buf, chunk[:n]...)
+	chunks := make(chan []byte, 8)
+	go func() {
+		defer close(chunks)
+		chunk := make([]byte, 4096)
+		for {
+			n, err := h.t.Read(chunk)
+			if n > 0 {
+				b := make([]byte, n)
+				copy(b, chunk[:n])
+				chunks <- b
+			}
+			if err != nil {
+				return
+			}
 		}
-		if err != nil {
-			h.emit(Quit{})
-			return
+	}()
+	h.decodeStream(chunks, escTimeout)
+}
+
+// decodeStream turns chunks of bytes into events, flushing a stalled partial
+// event after wait. Separate from readLoop so tests can drive it without a
+// terminal.
+func (h *NativeHost) decodeStream(chunks <-chan []byte, wait time.Duration) {
+	var buf []byte
+	for {
+		if len(buf) == 0 {
+			b, ok := <-chunks
+			if !ok {
+				h.emit(Quit{})
+				return
+			}
+			buf = append(buf, b...)
+		} else {
+			// Something is half-decoded. Wait for the rest, but not forever:
+			// a bare ESC is complete and only looks partial.
+			select {
+			case b, ok := <-chunks:
+				if !ok {
+					h.emit(Quit{})
+					return
+				}
+				buf = append(buf, b...)
+			case <-time.After(wait):
+				e, used := keys.ParseFinal(buf)
+				if used == 0 {
+					// Not resolvable even as a final read — a truncated
+					// sequence. Drop it rather than wedge the reader on it.
+					buf = nil
+					continue
+				}
+				buf = buf[used:]
+				h.dispatch(e)
+			}
 		}
 		for {
 			e, used := keys.Parse(buf)

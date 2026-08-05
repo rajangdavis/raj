@@ -1,9 +1,13 @@
 package editor
 
 import (
+	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+
+	"raj/internal/piecetable"
 )
 
 // pasteText is a realistic paste: a screenful of source.
@@ -93,3 +97,82 @@ func BenchmarkSpansAfterPastes(b *testing.B) {
 		p.File.Spans(0, 4000)
 	}
 }
+
+// A paste must not cost a copy of itself just to find its newlines. The number
+// that matters here is B/op: it was the size of the pasted text.
+func BenchmarkPasteIndexUpdate(b *testing.B) {
+	line := strings.Repeat("x", 79) + "\n"
+	for _, lines := range []int{100, 10000} {
+		text := strings.Repeat(line, lines)
+		b.Run(strconv.Itoa(lines)+"-lines", func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				p := newTestPane("")
+				b.StartTimer()
+				p.Paste(text)
+			}
+		})
+	}
+}
+
+// The index the fast path builds must match a rebuild from the text, or the
+// saving is bought with wrong line numbers.
+func TestIndexAfterPasteMatchesRebuild(t *testing.T) {
+	for _, text := range []string{
+		"no newlines",
+		"a\nb\nc\n",
+		"\n\n\n",
+		"trailing\n",
+		"\nleading",
+		strings.Repeat("line\n", 500),
+	} {
+		p := newTestPane("head\ntail")
+		p.Cursors.Set(5, 5) // between the two lines
+		p.Paste(text)
+
+		got := p.File.Lines()
+		want := len(strings.Split(p.File.Text(), "\n"))
+		if got != want {
+			t.Errorf("%q: index has %d lines, text has %d", text, got, want)
+		}
+		for line := 0; line < got; line++ {
+			start := p.File.LineStart(line)
+			if l := p.File.LineOf(start); l != line {
+				t.Errorf("%q: line %d starts at %d, which reports as line %d", text, line, start, l)
+			}
+		}
+	}
+}
+
+// The two ways to find the newlines in an inserted span, side by side. The old
+// path built a string of the whole insertion to scan it; the new one scans the
+// pieces where they lie. Both must agree, so the test below runs them together.
+func benchNewlines(b *testing.B, materialise bool) {
+	text := strings.Repeat(strings.Repeat("x", 79)+"\n", 10000)
+	p := newTestPane("")
+	p.Paste(text)
+	n := p.File.Len()
+	nl := []byte("\n")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		count := 0
+		if materialise {
+			s := p.File.Slice(0, n)
+			count = strings.Count(s, "\n")
+		} else {
+			op, _ := p.File.Session().LastOp()
+			store := p.File.Session().Store()
+			for _, rec := range op.Ins {
+				count += bytes.Count(store.Slice(piecetable.Author(rec.Buf), rec.Start, rec.Length), nl)
+			}
+		}
+		if count != 10000 {
+			b.Fatalf("counted %d newlines", count)
+		}
+	}
+}
+
+func BenchmarkNewlinesMaterialise(b *testing.B) { benchNewlines(b, true) }
+func BenchmarkNewlinesScan(b *testing.B)        { benchNewlines(b, false) }

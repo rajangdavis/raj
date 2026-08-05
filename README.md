@@ -40,6 +40,7 @@ internal/syntax      chroma tokens, cached per version, tokenised off-thread.
 - `COMPLETED.md` — what works, and what has been fixed
 - `BENCHMARKS.md` — measured numbers
 - `INVESTIGATIONS.md` — terminal findings, root causes, decisions
+- `CURSOR-VIEWPORT-SPEC.md` — the position invariants, and the properties that assert them
 
 ## Setup
 

@@ -45,7 +45,7 @@ func ITerm2Profile(name string) string {
 	type entry struct{ key, seq string }
 	var entries []entry
 
-	for _, b := range Bindings {
+	for _, b := range Emitted() {
 		key, ok := itermMappingKey(b.Chord)
 		if !ok {
 			continue

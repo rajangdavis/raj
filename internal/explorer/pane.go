@@ -16,30 +16,48 @@ import (
 type Pane struct {
 	Tree    *Tree
 	list    widget.List
-	spot    int // 0 = tree, 1 = the changed-files toggle
+	spot    int // 0 = the changed-files toggle, 1 = the tree
 	visited bool
 }
 
-// NewPane opens the tree at root.
-func NewPane(root string) *Pane { return &Pane{Tree: NewTree(root)} }
+// The focus stops, in the order they are drawn. The toggle used to be last and
+// at the bottom of the pane, which made it reachable only by tabbing through
+// the whole tree; putting it under the heading means tab order and reading
+// order are the same thing, and cmd+up/down jump between the two directly.
+const (
+	spotFilter = iota
+	spotTree
+	spotCount
+)
+
+// NewPane opens the tree at root, focused on the tree rather than the toggle:
+// the toggle is drawn first now, but it is not what you came to the pane for.
+func NewPane(root string) *Pane { return &Pane{Tree: NewTree(root), spot: spotTree} }
 
 // Focus restores the pane to wherever focus was when it was last left, so
 // returning after opening a file does not lose your place in the tree.
 func (p *Pane) Focus() {
 	if !p.visited {
-		p.spot = 0
+		p.spot = spotTree
 		p.visited = true
 	}
 }
-
-const components = 2
 
 // Handle applies an action. Exit reports that focus should leave for the
 // editor; open is a file to open, empty when nothing was chosen.
 func (p *Pane) Handle(a keys.Action, text string) (open string, exit bool) {
 	switch a {
+	// cmd+up/down jump between the toggle and the tree, the same shortcut the
+	// search pane uses to get between its query and its results. They are
+	// claimed before anything else, because a list would read them as "first
+	// entry" and "last entry" and the jump would do nothing where it is most
+	// useful.
+	case keys.DocStart:
+		p.spot = spotFilter
+	case keys.DocEnd:
+		p.spot = spotTree
 	case keys.CycleFocus:
-		if p.spot+1 >= components {
+		if p.spot+1 >= spotCount {
 			return "", true
 		}
 		p.spot++
@@ -48,22 +66,17 @@ func (p *Pane) Handle(a keys.Action, text string) (open string, exit bool) {
 			p.spot--
 		}
 	case keys.LineUp, keys.CharLeft:
-		if p.spot == 0 {
+		if p.spot == spotTree {
 			p.list.Move(-1, len(p.Tree.Entries()))
 		}
 	case keys.LineDown, keys.CharRight:
-		if p.spot == 0 {
+		if p.spot == spotTree {
 			p.list.Move(+1, len(p.Tree.Entries()))
 		}
-	case keys.DocStart:
-		p.list.Sel = 0
-		p.list.Follow(len(p.Tree.Entries()))
-	case keys.DocEnd:
-		p.list.Move(len(p.Tree.Entries()), len(p.Tree.Entries()))
 	case keys.Confirm:
 		return p.activate()
 	case keys.None:
-		if text == " " && p.spot == 1 {
+		if text == " " && p.spot == spotFilter {
 			p.toggleFilter()
 		}
 	}
@@ -72,7 +85,7 @@ func (p *Pane) Handle(a keys.Action, text string) (open string, exit bool) {
 
 // activate opens a file, or expands a directory.
 func (p *Pane) activate() (string, bool) {
-	if p.spot == 1 {
+	if p.spot == spotFilter {
 		p.toggleFilter()
 		return "", false
 	}
@@ -114,11 +127,12 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 	if p.Tree.ChangedOnly {
 		title = " EXPLORER — CHANGED "
 	}
-	s.SetString(x+1, y, widget.Truncate(title, w-2), th.Heading(focused && p.spot == 0), w-2)
+	s.SetString(x+1, y, widget.Truncate(title, w-2), th.Heading(focused && p.spot == spotTree), w-2)
 
-	p.renderFilter(s, x, y+h-1, w, th, focused)
+	p.renderFilter(s, x, y+1, w, th, focused)
+	p.renderPath(s, x, y+h-1, w, th)
 
-	rows := h - 2
+	rows := h - 3
 	p.list.Rows = rows
 	p.list.Follow(len(p.Tree.Entries()))
 	entries := p.Tree.Entries()
@@ -129,7 +143,7 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 			break
 		}
 		e := entries[i]
-		style := th.Focus(i == p.list.Sel, focused && p.spot == 0)
+		style := th.Focus(i == p.list.Sel, focused && p.spot == spotTree)
 		indent := 1 + e.Depth*2
 		marker := "  "
 		if e.Dir {
@@ -139,8 +153,8 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 			}
 		}
 		label := marker + e.Name
-		s.Fill(x, y+1+row, w, 1, ui.DefaultStyle)
-		s.SetString(x+indent, y+1+row, widget.Truncate(label, w-indent-1), style, w-indent-1)
+		s.Fill(x, y+2+row, w, 1, ui.DefaultStyle)
+		s.SetString(x+indent, y+2+row, widget.Truncate(label, w-indent-1), style, w-indent-1)
 	}
 }
 
@@ -150,9 +164,26 @@ func (p *Pane) renderFilter(s *ui.Screen, x, y, w int, th widget.Theme, focused 
 	if p.Tree.ChangedOnly {
 		box, style = "[x]", th.Text.Plus(ui.Bold)
 	}
-	if focused && p.spot == 1 {
+	if focused && p.spot == spotFilter {
 		style = th.Selected
 	}
 	s.Fill(x, y, w, 1, ui.DefaultStyle)
 	s.SetString(x+1, y, widget.Truncate(box+" changed only", w-2), style, w-2)
+}
+
+// renderPath spells out the selected entry on the last row. Rows are indented
+// and then truncated, so past three or four levels the name is cut before it
+// says anything and two files with the same tail look identical. The path is
+// truncated from the LEFT, because the end of a path is what disambiguates it.
+func (p *Pane) renderPath(s *ui.Screen, x, y, w int, th widget.Theme) {
+	s.Fill(x, y, w, 1, ui.DefaultStyle)
+	rel := p.Tree.Rel(p.Selected())
+	if rel == "" {
+		return
+	}
+	if avail := w - 2; len([]rune(rel)) > avail && avail > 1 {
+		r := []rune(rel)
+		rel = "…" + string(r[len(r)-(avail-1):])
+	}
+	s.SetString(x+1, y, rel, th.Dim, w-2)
 }

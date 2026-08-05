@@ -178,3 +178,32 @@ Roughly 100-300 MB/s, flat across policies. `WrapRows` walks without
 materialising anything; `AppendWrap` takes a caller-owned buffer for the drawn
 lines. A frame reusing one buffer allocates nothing. Appending fresh cost 1016
 bytes and 7 allocations on a 63-row line, which is why the buffer is passed in.
+
+## Workspace search
+
+`BenchmarkRun`, 400 files of 200 lines in 20 directories (Go 1.22, linux/amd64):
+
+| query | ns/op | what it does |
+| --- | --- | --- |
+| `handler7` | 9.0 M | matches early and often, so `MaxMatches` stops the walk |
+| `zzz_no_such_thing` | 74.2 M | matches nothing, so every file is opened and scanned |
+
+The second row is the one that mattered: a query that matches nothing is what
+you have typed most of the way through every query, and the old pane paid it
+once per keystroke on the event thread. The cap only bounds the queries that
+match a lot. Debouncing does not make the walk faster — it makes a six-character
+word cost one walk instead of six, off-thread, where a slow one delays a result
+rather than a frame.
+
+## Line index update
+
+Finding the newlines in an 800 KB insertion, `BenchmarkNewlines*`:
+
+| strategy | ns/op | B/op |
+| --- | --- | --- |
+| materialise the span, then scan the string | 224,167 | 802,816 |
+| scan the op's inserted pieces where they lie | 12,638 | 0 |
+
+The allocation is the point: it was a full copy of the pasted text, made to
+count a handful of newlines and thrown away immediately. Reading the pieces is
+also the only correct way to do it — see INVESTIGATIONS.md.

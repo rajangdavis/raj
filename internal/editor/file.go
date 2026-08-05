@@ -4,6 +4,7 @@
 package editor
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -31,6 +32,10 @@ type File struct {
 	// applied is the version whose ops have been mirrored into the line index.
 	applied piecetable.Version
 	newline piecetable.PieceRec
+
+	// nlBuf is scratch for applyToIndex: the offsets of the newlines in one
+	// insertion. Reused so a paste does not allocate one per op.
+	nlBuf []int
 }
 
 // Open reads a file from disk. A missing file is not an error — it opens empty,
@@ -183,24 +188,59 @@ func (f *File) reverse(ok bool) ([]piecetable.Op, bool) {
 	return ops, true
 }
 
-// sync catches the index up on the most recent op.
+// sync catches the index up on every op applied since it was last current.
+//
+// It used to mirror only the most recent one, which is right exactly when a
+// call appends a single op to the journal — and several do not. One session
+// call can append two (a replace is a delete and an insert), and every op past
+// the last was then dropped while `applied` still jumped to the new version, so
+// the index was silently wrong from that point on and the damage only surfaced
+// later, wherever a line number was next needed. Found by the spec properties
+// after a multi-cursor edit and an undo.
 func (f *File) sync() {
-	if op, ok := f.sess.LastOp(); ok {
+	for _, op := range f.sess.OpsSince(f.applied) {
 		f.applyToIndex(op)
 	}
 	f.applied = f.sess.Version()
 }
 
-// applyToIndex mirrors one op into the line index. The inserted text is read
-// back from the buffer after the fact rather than threaded through the op,
-// because ops carry piece records rather than strings — and reading InsLen
-// bytes is cheaper than making every op carry a copy.
+// applyToIndex mirrors one op into the line index by scanning the op's own
+// inserted pieces.
+//
+// It used to read the span back out of the document instead, which was both
+// slower and wrong. Slower because materialising the span to count its newlines
+// allocates a full copy of it and throws the copy away — a megabyte of garbage
+// on a megabyte paste, for a handful of integers. Wrong because a caller that
+// mirrors several ops at once (a multi-hunk diff, a redo of a multi-cursor
+// edit) does so after all of them have landed, so reading at op.Pos returns
+// whatever the LATER ops left there rather than what this op inserted, and
+// every op but the last got the wrong newline positions.
+//
+// Pieces do not have that problem: the stores are append-only, so a piece
+// records exactly the bytes that op inserted no matter what happened after.
 func (f *File) applyToIndex(op piecetable.Op) {
 	f.Syntax.Invalidate()
 	f.idx.Delete(op.Pos, op.DelLen())
-	if n := op.InsLen(); n > 0 {
-		f.idx.Insert(op.Pos, f.Slice(op.Pos, n))
+	n := op.InsLen()
+	if n == 0 {
+		return
 	}
+	f.nlBuf = f.nlBuf[:0]
+	at := op.Pos
+	store := f.sess.Store()
+	for _, rec := range op.Ins {
+		b := store.Slice(piecetable.Author(rec.Buf), rec.Start, rec.Length)
+		for i := 0; ; {
+			j := bytes.IndexByte(b[i:], '\n')
+			if j < 0 {
+				break
+			}
+			i += j + 1
+			f.nlBuf = append(f.nlBuf, at+i)
+		}
+		at += rec.Length
+	}
+	f.idx.InsertLen(op.Pos, n, f.nlBuf)
 }
 
 // Save writes the document to disk and marks the current version clean.

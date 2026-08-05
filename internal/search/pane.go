@@ -2,6 +2,8 @@ package search
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"raj/internal/keys"
 	"raj/internal/ui"
@@ -27,7 +29,35 @@ type Pane struct {
 	visited   bool
 	list      widget.List
 	spot      int
+
+	// Searching happens off the event thread: Run walks the whole tree, and a
+	// keystroke must never wait for it. The worker touches nothing the rest of
+	// this file touches — it parks its result in pending, and apply installs it
+	// on the event thread — so every field above stays single-threaded and only
+	// the four below need the lock.
+	//
+	// gen is what makes cancellation unnecessary. Each search carries the
+	// generation it was started for, and a result whose generation has moved on
+	// is dropped. Without it a slow search for "f" can land after a fast one for
+	// "func" and replace it.
+	mu          sync.Mutex
+	gen         int
+	inflight    int
+	timer       *time.Timer
+	pending     Result
+	havePending bool
+
+	// search is Run unless a test substitutes something slower or ordered.
+	// Debounce is the pause after the last keystroke before searching; zero
+	// means the default.
+	search   func(root string, q Query) Result
+	Debounce time.Duration
 }
+
+// DefaultDebounce is how long the pane waits after the last keystroke before
+// walking the tree. Typing is bursty and each character invalidates the last
+// query, so the pause is what turns a word into one search instead of four.
+const DefaultDebounce = 120 * time.Millisecond
 
 // Row is one line of the results list: either a file header or a match under
 // it. Grouping matters at sidebar width — repeating a truncated path on every
@@ -141,6 +171,7 @@ func (p *Pane) Focus() {
 // Handle applies an action. It returns a file to open with the line to jump to,
 // and whether focus should leave for the editor.
 func (p *Pane) Handle(a keys.Action, text string) (path string, line int, exit bool) {
+	p.apply()
 	// The jump actions are claimed before the focused input sees them: a text
 	// field treats cmd+up as "go to the start of the line", which would make
 	// the shortcut do nothing in the very place it is most useful.
@@ -258,13 +289,59 @@ func (p *Pane) selected() (Match, bool) {
 	return Match{}, false
 }
 
-// run re-searches. It is called on every keystroke in a field; the match cap
-// and the size limit are what keep that affordable.
+// run starts a search for the current field contents and returns immediately.
+// The walk happens on a worker after the debounce; apply installs the result.
+//
+// An empty query is answered here rather than deferred: clearing the box should
+// clear the results now, and there is nothing to walk for.
 func (p *Pane) run() {
 	p.q.Text = p.query.Text
 	p.q.Include = p.include.Text
 	p.q.Exclude = p.exclude.Text
-	p.Result = Run(p.Root, p.q)
+
+	p.mu.Lock()
+	p.gen++
+	gen := p.gen
+	// Stop reports whether it beat the timer. When it did, that search never
+	// started and must not be counted as in flight.
+	if p.timer != nil && p.timer.Stop() {
+		p.inflight--
+	}
+	if p.q.Text == "" {
+		p.pending, p.havePending = Result{}, true
+		p.mu.Unlock()
+		p.apply()
+		return
+	}
+	q, root, fn := p.q, p.Root, p.searcher()
+	p.inflight++
+	p.timer = time.AfterFunc(p.debounce(), func() { p.work(gen, root, q, fn) })
+	p.mu.Unlock()
+}
+
+// work runs one search off the event thread and parks the result if it is still
+// the one being waited for.
+func (p *Pane) work(gen int, root string, q Query, fn func(string, Query) Result) {
+	res := fn(root, q)
+	p.mu.Lock()
+	if gen == p.gen {
+		p.pending, p.havePending = res, true
+	}
+	p.inflight--
+	p.mu.Unlock()
+}
+
+// apply installs a finished search. Event thread only — Handle and Render both
+// call it, so a result is picked up on the next keystroke or the next tick.
+func (p *Pane) apply() {
+	p.mu.Lock()
+	res, ok := p.pending, p.havePending
+	p.pending, p.havePending = Result{}, false
+	p.mu.Unlock()
+	if !ok {
+		return
+	}
+	p.Result = res
 	p.group()
 	if p.Result.Files > CollapseThreshold {
 		p.CollapseAll()
@@ -272,8 +349,43 @@ func (p *Pane) run() {
 	p.list.Reset()
 }
 
+// Settle waits for any pending search to finish and installs it. Exported so
+// tests can drive the pane a step at a time; the application never needs it,
+// because the result arrives on the next tick on its own.
+func (p *Pane) Settle(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		p.apply()
+		p.mu.Lock()
+		busy := p.inflight > 0 || p.havePending
+		p.mu.Unlock()
+		if !busy {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (p *Pane) searcher() func(string, Query) Result {
+	if p.search != nil {
+		return p.search
+	}
+	return Run
+}
+
+func (p *Pane) debounce() time.Duration {
+	if p.Debounce > 0 {
+		return p.Debounce
+	}
+	return DefaultDebounce
+}
+
 // Render draws the pane.
 func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused bool) {
+	p.apply()
 	if w < 6 || h < 12 {
 		return
 	}

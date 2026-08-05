@@ -96,6 +96,34 @@ func (ix *Index) Insert(pos int, text string) {
 			added = append(added, pos+i+1)
 		}
 	}
+	ix.splice(first, added)
+}
+
+// InsertLen is Insert for a caller that has already found the newlines and does
+// not want to materialise the text to do it. starts holds the document offset of
+// each line begun by the insertion — that is, one past each newline — in
+// ascending order.
+//
+// The distinction matters on a large paste: reading the inserted span back as a
+// string to count its newlines allocates a full copy of it, and the copy is
+// discarded immediately. The buffer can be scanned in place instead.
+func (ix *Index) InsertLen(pos, n int, starts []int) {
+	if n == 0 {
+		return
+	}
+	first := sort.SearchInts(ix.starts, pos+1)
+	for i := first; i < len(ix.starts); i++ {
+		ix.starts[i] += n
+	}
+	ix.splice(first, starts)
+}
+
+// splice inserts already-shifted line starts at position first, keeping the
+// slice sorted.
+func (ix *Index) splice(first int, added []int) {
+	if len(added) == 0 {
+		return
+	}
 	ix.starts = append(ix.starts, added...)
 	copy(ix.starts[first+len(added):], ix.starts[first:len(ix.starts)-len(added)])
 	copy(ix.starts[first:], added)

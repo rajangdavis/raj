@@ -52,6 +52,20 @@ func NewTree(root string) *Tree {
 
 func (t *Tree) Entries() []Entry { return t.entries }
 
+// Rel is a path relative to the tree root, for display. An unrelated path is
+// returned as-is rather than as a chain of "..", which would be longer than the
+// absolute path it is trying to shorten.
+func (t *Tree) Rel(path string) string {
+	if path == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(t.Root, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return path
+	}
+	return rel
+}
+
 // MarkChanged records a file edited this session, so it shows under the filter
 // even when it has not been saved and git cannot see it yet.
 func (t *Tree) MarkChanged(path string) {

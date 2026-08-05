@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"raj/internal/ui"
 	"raj/internal/widget"
@@ -34,6 +35,7 @@ func newHarnessSize(t *testing.T, content string, cols, rows int) *harness {
 	host := ui.NewFakeHost(cols, rows)
 	t.Cleanup(func() { host.Close() })
 	a := New(host, dir, 2)
+	a.Search.Debounce = time.Nanosecond // tests wait on Settle, not on the clock
 	a.OpenFile(path)
 	return &harness{App: a, host: host}
 }
@@ -45,6 +47,9 @@ func (h *harness) drain() {
 		case e := <-h.host.Events():
 			h.Handle(e)
 		default:
+			// Search runs off the event thread now, so a test that types a
+			// query and asserts on the results has to wait for it.
+			h.Search.Settle(2 * time.Second)
 			h.Draw()
 			return
 		}
@@ -238,3 +243,21 @@ func TestScrollFollowsCursor(t *testing.T) {
 
 // widgetTheme exposes the shared theme to tests.
 func widgetTheme() widget.Theme { return widget.DefaultTheme() }
+
+// Escape must always be able to leave a multi-cursor state: a stuck set with no
+// way out is the fastest way to make an editor feel broken. Asserted through
+// the real key path, since the failure was never in Cursors.Clear.
+func TestEscapeCollapsesMultiCursor(t *testing.T) {
+	h := newHarness(t, "aaa\nbbb\nccc\n")
+	h.press("alt+super+down", "alt+super+down")
+	if got := h.Pane().Cursors.Count(); got != 3 {
+		t.Fatalf("cursor count = %d, want 3 before escape", got)
+	}
+	h.press("esc")
+	if got := h.Pane().Cursors.Count(); got != 1 {
+		t.Errorf("cursor count = %d, want 1 after escape", got)
+	}
+	if h.Pane().Cursors.Primary().HasSelection() {
+		t.Error("escape left a selection behind")
+	}
+}

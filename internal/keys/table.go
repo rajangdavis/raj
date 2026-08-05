@@ -57,6 +57,7 @@ var Bindings = []Binding{
 	{"edit", Cut, "super+x", "120;9u", "cmd+x", "ctrl+x", ""},
 	{"edit", Copy, "super+c", "99;9u", "cmd+c", "ctrl+shift+c", "ghostty default: copy. raj writes clipboard via OSC 52"},
 	{"edit", SelectAll, "super+a", "97;9u", "cmd+a", "ctrl+a", ""},
+	{"edit", SelectLine, "super+l", "108;9u", "cmd+l", "ctrl+l", "linux default: clear screen"},
 	{"edit", ToggleComment, "super+/", "47;9u", "cmd+slash", "ctrl+slash", ""},
 	{"edit", DeleteLine, "shift+super+k", "107;10u", "cmd+shift+k", "ctrl+shift+k", ""},
 	{"edit", LineBelow, "super+enter", "13;9u", "cmd+enter", "ctrl+enter", "ghostty default: toggle fullscreen"},
@@ -69,7 +70,8 @@ var Bindings = []Binding{
 	{"cursor", CursorAbove, "alt+super+up", "1;11A", "cmd+alt+up", "ctrl+alt+up", "ghostty default: focus split up"},
 	{"cursor", CursorBelow, "alt+super+down", "1;11B", "cmd+alt+down", "ctrl+alt+down", "ghostty default: focus split down"},
 	{"cursor", AddNextOccurrence, "super+d", "100;9u", "cmd+d", "ctrl+d", "ghostty default: split right"},
-	{"cursor", AllOccurrences, "shift+super+l", "108;10u", "cmd+shift+l", "ctrl+shift+l", ""},
+	{"cursor", SplitIntoLines, "shift+super+l", "108;10u", "cmd+shift+l", "ctrl+shift+l", "sublime: split selection into lines"},
+	{"cursor", AllOccurrences, "ctrl+super+g", "103;13u", "cmd+ctrl+g", "ctrl+alt+g", "sublime: find all. alt+f3 on linux, but f3 encodes inconsistently"},
 	{"cursor", CursorUndo, "super+u", "117;9u", "cmd+u", "ctrl+u", ""},
 
 	{"nav", LineStart, "super+left", "1;9D", "cmd+left", "home", ""},
@@ -85,8 +87,60 @@ var Bindings = []Binding{
 	{"nav", SelWordLeft, "shift+alt+left", "1;4D", "shift+alt+left", "ctrl+shift+left", ""},
 	{"nav", SelWordRight, "shift+alt+right", "1;4C", "shift+alt+right", "ctrl+shift+right", ""},
 	{"nav", GotoLine, "ctrl+g", "103;5u", "ctrl+g", "ctrl+g", ""},
+	{"nav", FindNext, "super+g", "103;9u", "cmd+g", "ctrl+alt+n", "macOS default: find next"},
+	{"nav", FindPrev, "shift+super+g", "103;10u", "cmd+shift+g", "ctrl+alt+p", "macOS default: find previous"},
 	{"nav", GotoSymbol, "shift+super+o", "111;10u", "cmd+shift+o", "ctrl+shift+o", ""},
 }
+
+// Reclaim holds chords a terminal keeps for itself, which raj therefore has to
+// take back explicitly. They are Bindings in every mechanical sense — same
+// struct, same emitters — and separate only because the reason they are listed
+// is different: a Bindings entry exists because Ghostty already binds the chord,
+// a Reclaim entry because the chord never reaches raj at all until the terminal
+// is told to hand it over.
+//
+// shift+pgup and shift+pgdown are iTerm2's scrollback keys. Under Ghostty they
+// arrive on their own; under iTerm2 they scroll the terminal and raj sees
+// nothing, which is why the keymap binding them was not enough.
+var Reclaim = []Binding{
+	{"nav", SelPageUp, "shift+pgup", "5;2~", "shift+page_up", "shift+page_up", "iTerm2 default: scroll back"},
+	{"nav", SelPageDown, "shift+pgdown", "6;2~", "shift+page_down", "shift+page_down", "iTerm2 default: scroll forward"},
+}
+
+// Native holds the chords the keymap binds that need no configuration at all:
+// no terminal claims them, so report_all delivers them untouched. They are
+// listed rather than left implicit so that every chord raj resolves is
+// accounted for in exactly one table — TestEveryKeymapChordIsAccountedFor is
+// what makes that a rule rather than an intention.
+type Native struct {
+	Chord  string
+	Action Action
+	Note   string
+}
+
+var Natives = []Native{
+	{"tab", CycleFocus, "editor scope overrides this to Indent"},
+	{"shift+tab", CycleFocusBack, "editor scope overrides this to Outdent"},
+	{"esc", Cancel, "one byte without KKP; see the escape timeout"},
+	{"enter", Confirm, "editor scope inserts a newline instead"},
+	{"left", CharLeft, ""},
+	{"right", CharRight, ""},
+	{"up", LineUp, ""},
+	{"down", LineDown, ""},
+	{"shift+left", SelCharLeft, ""},
+	{"shift+right", SelCharRight, ""},
+	{"shift+up", SelLineUp, ""},
+	{"shift+down", SelLineDown, ""},
+	{"ctrl+alt+w", ToggleWrap, "ctrl suppresses macOS option-composition"},
+	{"pgup", PageUp, ""},
+	{"pgdown", PageDown, ""},
+	{"backspace", Backspace, ""},
+	{"delete", Delete, ""},
+}
+
+// Emitted is every chord that needs a line in a terminal config: the ones the
+// terminal binds, plus the ones it keeps.
+func Emitted() []Binding { return append(append([]Binding{}, Bindings...), Reclaim...) }
 
 // GhosttyConfig renders the kkp_on keybind lines for a platform.
 //
@@ -100,7 +154,7 @@ func GhosttyConfig(platform string) string {
 	b.WriteString("# otherwise Ghostty's own bindings are untouched.\n")
 	for _, g := range []string{"panes", "tabs", "file", "edit", "cursor", "nav"} {
 		b.WriteString("\n# ===== " + g + " =====\n")
-		for _, bd := range Bindings {
+		for _, bd := range Emitted() {
 			if bd.Group != g {
 				continue
 			}

@@ -37,7 +37,9 @@ func newWorkspace(t *testing.T, cols, rows int) *harness {
 	t.Helper()
 	host := ui.NewFakeHost(cols, rows)
 	t.Cleanup(func() { host.Close() })
-	return &harness{App: New(host, workspace(t), 2), host: host}
+	a := New(host, workspace(t), 2)
+	a.Search.Debounce = time.Nanosecond // tests wait on Settle, not on the clock
+	return &harness{App: a, host: host}
 }
 
 // openSidebar puts focus on a sidebar without assuming where it started. The
@@ -84,7 +86,13 @@ func TestSidebarTabEscapesOneWay(t *testing.T) {
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 
-	h.press("tab") // tree -> changed-only toggle
+	// Focus lands on the tree, which is the last stop now that the toggle is
+	// drawn under the heading, so shift+tab is what reaches the toggle.
+	h.press("shift+tab") // tree -> changed-only toggle
+	if h.Focused() != FocusSidebar {
+		t.Fatal("shift+tab left the sidebar")
+	}
+	h.press("tab") // toggle -> tree
 	if h.Focused() != FocusSidebar {
 		t.Fatal("tab left the sidebar too early")
 	}
@@ -864,26 +872,66 @@ func TestPasteIsASingleEdit(t *testing.T) {
 	}
 }
 
-// Page motion moves the view with the cursor, so the caret keeps its place on
-// screen rather than the text jumping under a stationary caret.
-func TestPageMotion(t *testing.T) {
+// Paging scrolls the view and leaves every cursor where it was. Moving the
+// cursor with the view reads fine with one caret and badly with several: paging
+// to look at something else would collapse a multi-cursor set.
+func TestPageScrollsWithoutMovingCursors(t *testing.T) {
 	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
 	h.drain()
-	rows := h.Pane().Viewport.Rows
 	h.press("pgdown")
 
-	line := h.Pane().File.LineOf(h.Pane().Cursors.Primary().Head)
-	if line != rows-1 {
-		t.Errorf("cursor on line %d after page down, want %d", line, rows-1)
+	if line := h.Pane().File.LineOf(h.Pane().Cursors.Primary().Head); line != 0 {
+		t.Errorf("cursor moved to line %d; paging must not move it", line)
 	}
-	// The view follows, keeping the scrolloff context, so the exact top is the
-	// page step adjusted by that margin rather than the raw step.
-	if top := h.Pane().Viewport.Top; top == 0 || !h.Pane().Viewport.Visible(line) {
-		t.Errorf("viewport top = %d with cursor on line %d; the view did not follow", top, line)
+	if top := h.Pane().Viewport.Top; top == 0 {
+		t.Error("viewport did not scroll")
 	}
 	h.press("pgup")
-	if line := h.Pane().File.LineOf(h.Pane().Cursors.Primary().Head); line != 0 {
-		t.Errorf("page up landed on line %d, want 0", line)
+	if top := h.Pane().Viewport.Top; top != 0 {
+		t.Errorf("viewport top = %d after paging back, want 0", top)
+	}
+}
+
+// The view stays where it was scrolled to until something moves a cursor, and
+// then it snaps back — otherwise an edit would land off screen.
+func TestCursorMotionPullsTheViewBack(t *testing.T) {
+	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
+	h.drain()
+	h.press("pgdown", "pgdown")
+	if h.Pane().Viewport.Top == 0 {
+		t.Fatal("viewport did not scroll")
+	}
+	h.press("down")
+	line := h.Pane().File.LineOf(h.Pane().Cursors.Primary().Head)
+	if !h.Pane().Viewport.Visible(line) {
+		t.Errorf("cursor on line %d is off screen at top %d", line, h.Pane().Viewport.Top)
+	}
+}
+
+// A multi-cursor set must survive paging: this is the case the old behaviour
+// got wrong, since moving the cursor collapses the set to one.
+func TestPagePreservesMultiCursor(t *testing.T) {
+	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
+	h.drain()
+	h.press("alt+super+down", "alt+super+down")
+	before := h.Pane().Cursors.Count()
+	if before != 3 {
+		t.Fatalf("cursor count = %d, want 3", before)
+	}
+	h.press("pgdown")
+	if got := h.Pane().Cursors.Count(); got != before {
+		t.Errorf("cursor count = %d after paging, want %d", got, before)
+	}
+}
+
+// Shift+page still moves the cursor: it is a selection, and a selection needs
+// an end to move.
+func TestSelPageStillMovesTheCursor(t *testing.T) {
+	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
+	h.drain()
+	h.press("shift+pgdown")
+	if !h.Pane().Cursors.Primary().HasSelection() {
+		t.Error("shift+pgdown selected nothing")
 	}
 }
 
@@ -1030,5 +1078,60 @@ func TestWrappedPaneDoesNotScrollHorizontally(t *testing.T) {
 	}
 	if got := p.RowsInLine(0); got < 2 {
 		t.Errorf("line occupies %d rows at %d cols; it should wrap", got, p.Viewport.Cols)
+	}
+}
+
+// The changed-only toggle sits under the heading and is reachable with cmd+up,
+// with cmd+down going back to the tree — the same jump the search pane uses.
+func TestExplorerFilterIsReachableWithCmdUpDown(t *testing.T) {
+	h := newWorkspace(t, 120, 20)
+	h.openSidebar("shift+super+e", SidebarExplorer)
+
+	h.press("super+up", "enter") // jump to the toggle and flip it
+	if !h.Explorer.Tree.ChangedOnly {
+		t.Fatal("cmd+up then enter did not reach the changed-only toggle")
+	}
+	h.press("super+down", "enter") // back to the tree: enter expands pkg/
+	if !h.Explorer.Tree.ChangedOnly {
+		t.Error("cmd+down left focus on the toggle; enter flipped it back")
+	}
+}
+
+// Deep paths are truncated in the tree, so the selected one is spelled out on
+// the pane's last row.
+func TestExplorerShowsSelectedPath(t *testing.T) {
+	h := newWorkspace(t, 120, 20)
+	h.openSidebar("shift+super+e", SidebarExplorer)
+	h.press("enter")        // expand pkg/
+	h.press("down", "down") // into it
+	sel := h.Explorer.Tree.Rel(h.Explorer.Selected())
+	if sel == "" {
+		t.Fatal("nothing selected")
+	}
+	if !strings.Contains(h.host.Text(), sel) {
+		t.Errorf("selected path %q is not on screen:\n%s", sel, h.host.Text())
+	}
+}
+
+// cmd+g steps to the next match with the find bar closed: find something, keep
+// editing, then keep stepping without reopening anything.
+func TestFindNextWithTheBarClosed(t *testing.T) {
+	h := newHarness(t, "needle\nfiller\nneedle\nfiller\nneedle\n")
+	h.press("super+f")
+	h.typeText("needle")
+	h.press("esc") // close the bar, keep the query
+
+	// Incremental search left the cursor on the last match, so stepping forward
+	// wraps. Where it lands matters less than the two invariants: it moves, and
+	// stepping back undoes it exactly.
+	start := h.Pane().Cursors.Primary().Head
+	h.press("super+g")
+	next := h.Pane().Cursors.Primary().Head
+	if next == start {
+		t.Errorf("cmd+g did not move from %d", start)
+	}
+	h.press("shift+super+g")
+	if back := h.Pane().Cursors.Primary().Head; back != start {
+		t.Errorf("cmd+shift+g landed at %d, want back at %d", back, start)
 	}
 }

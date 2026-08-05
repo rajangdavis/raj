@@ -51,6 +51,18 @@ type Event struct {
 	Params  []string
 }
 
+// ParseFinal decodes b knowing that nothing more is coming — the reader waited
+// and no further bytes arrived. It differs from Parse in exactly one case, and
+// it is the case that matters: a lone ESC is the escape key rather than the
+// start of a sequence. Terminals without KKP send it that way, and Parse cannot
+// tell the difference from the bytes alone, only from the silence after them.
+func ParseFinal(b []byte) (Event, int) {
+	if len(b) == 1 && b[0] == 0x1b {
+		return Event{Kind: KeyEvent, Raw: b[:1], Code: 27, Type: Press}, 1
+	}
+	return Parse(b)
+}
+
 // parse decodes one event from the head of b. n == 0 means "need more bytes".
 func Parse(b []byte) (Event, int) {
 	if len(b) == 0 {

@@ -5,24 +5,22 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Highest priority
 
-- [ ] **Cursor/viewport spec.** Write down the invariants — offset ↔ line/column
-  ↔ screen cell, what each edit does to each cursor, when the viewport may move
-  — and assert them as properties rather than examples. Every cursor bug so far
-  has been a disagreement between two of those three representations, and they
-  are only caught today by tests that happen to look. Wrapping has now added a
-  fourth representation (visual row), which raises the stakes rather than
-  lowering them.
-- [ ] **Line index update is O(bytes) on insert.** `applyToIndex` materialises
-  the inserted span to count newlines, which dominates a large paste and
-  allocates a full copy of it. Scanning the inserted pieces directly removes the
-  allocation; keeping a newline count per piece would remove the scan.
-- [ ] **Reclaim table for chords a terminal keeps.** The keymap binds 18 chords
-  absent from `Bindings`; sixteen arrive by accident and shift+pgup/pgdown do
-  not, because iTerm2 claims them for scrollback. Nothing asserts the emitters
-  cover what the keymap binds, so each new terminal rediscovers this one chord
-  at a time. Wants a third table plus a test that every keymap chord is
-  accounted for in exactly one of: `Bindings`, reclaim, or "terminals send this
-  natively".
+- [ ] **Rebase counts a resurrected op in the wrong coordinate frame.** The
+  narrower half of the rune-splitting bug is fixed; this is what is left, and it
+  can still put a reversal at an offset that splits a rune. `Session.rebase`
+  skips ops that are not live, but an op's `Pos` belongs to the version it was
+  applied at, and redo can resurrect an op that was absent when later ops were
+  recorded — so the walk shifts by an op the later positions do not account for.
+  Full trace, and the measurement showing why the obvious repair does not work,
+  in INVESTIGATIONS.md. Reproduce by raising `undoRedoSeeds` in
+  `internal/piecetable/undo_utf8_test.go` to 3000: seed 578, step 12. Wants a
+  decision about what `rebase` is walking before it wants code.
+- [ ] **A finished search waits for the next tick.** The walk is off the event
+  thread now and the result is installed by `apply`, which runs from `Handle`
+  and `Render` — so a search that finishes while you are not typing shows up on
+  the 150 ms tick rather than immediately. Fixing it properly means a way for a
+  worker to post an event into the loop, which is the same seam the agent pane
+  will need. Do it once, for both.
 
 ## Panes and fields
 
@@ -37,10 +35,11 @@ findings and decisions live in INVESTIGATIONS.md.
   cmd+c in the search box copies from the editor and cmd+x edits the document
   being searched. More visible now that fields have real selections. `app` needs
   to ask the focused thing whether it owns a selection.
-- [ ] **The changed-only checkbox** is at the bottom of the explorer and only
-  reachable by tabbing through the tree. Move it under the heading and put it on
-  cmd+up/down, matching how the search pane already jumps between query and
-  results.
+- [ ] **Horizontal scroll in the explorer.** The selected path is now spelled
+  out on the pane's last row, which answers "which file is this" but not "what
+  is the rest of this name" for the rows around it. An offset that follows the
+  selection is the other half; it needs a rule for when it returns to zero, or
+  the tree jitters sideways as you arrow through mixed depths.
 - [ ] Small and split panes, and how they resize.
 
 ## Editor
@@ -48,9 +47,16 @@ findings and decisions live in INVESTIGATIONS.md.
 - [ ] **Mouse.** Click to position, drag to select, wheel to scroll, cmd-click
   for an extra cursor. Also: click a tab to switch, click a file in the explorer
   or search results to open it (refusing binaries loudly rather than in the
-  status line). `Viewport.ScrollBy` already exists and has one caller.
+  status line). The wheel is the easy half now: `Pane.ScrollPage` moves the view
+  without touching a cursor, so wheel events need a decode path and nothing
+  else.
 - [ ] go-to-line (ctrl+g), go-to-symbol (cmd+shift+o).
 - [ ] Bracket matching and auto-indent on newline.
+- [ ] **Blinking secondary carets.** The real caret blinks because the terminal
+  blinks it; a drawn one would need raj to redraw on a timer, which means a tick
+  fast enough to be a blink and a dirty-region pass small enough that blinking
+  costs one cell rather than a frame. Nice, and a long way down: the tick is
+  150 ms today and exists for idle work.
 - [ ] Tabs as clickable tags — visual now, clickable once the mouse lands.
 
 ## Workspace
@@ -79,6 +85,18 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Known rough edges
 
+- [ ] **The match cap makes a common query look narrow.** `MaxMatches` is 500
+  across the whole search and the walk is lexical, so a common term spends the
+  entire budget on whatever sorts first and `SkipAll` stops before the rest of
+  the tree is seen. Measured: `te` reports 500 results in 6 files, all of them at
+  the repository root, 200 from `LICENSE` alone; `testing` reports 361 in 34
+  files because it never hits the cap. The reported file count therefore says
+  more about walk order than about the query, and it is least informative
+  exactly when the term is most common. Wants a per-file cap — 20 or so, with
+  the header showing the true count — so no single file eats the budget, and a
+  global cap high enough that the walk usually finishes. Assert it with a
+  fixture where one early file holds more matches than the cap, and check that
+  later directories still appear.
 - [ ] **Resize still drops events.** `NativeHost.emit` discards on a full
   channel, which a drag burst produces. `Present` reads the true size every
   frame so the picture stays correct, but a dropped event means no redraw is
@@ -97,6 +115,22 @@ findings and decisions live in INVESTIGATIONS.md.
 - [ ] **Four actions are bound but unimplemented**, so their chords are taken
   from the terminal for nothing: `ToggleAgent` (cmd+alt+b), `CommandPalette`
   (cmd+shift+p), `GotoLine` (ctrl+g), `GotoSymbol` (cmd+shift+o).
+- [ ] **Wheel scroll does nothing in the alt screen on iTerm2.** raj never
+  enables mouse reporting, so iTerm2 sends wheel events to its own scrollback,
+  which the alt screen is not part of. iTerm2's translation of the wheel into
+  arrow keys is `AlternateMouseScroll`, an *application* default rather than a
+  profile key, so the generated dynamic profile cannot turn it on — that one is
+  a README line (`defaults write com.googlecode.iterm2 AlternateMouseScroll
+  -bool true`), not code. The fix that works on every terminal is raj asking
+  for mouse reporting itself (DECSET 1000/1006) and handling wheel events;
+  wheel-only is the smallest useful slice of the Mouse item under Editor, and
+  scrolling already moves the cursor by design, so it needs no new semantics.
+- [ ] **Profile switching in iTerm2 is not clean.** raj switches profile on
+  entry with OSC 1337 and restores on exit, but installing the profile is still
+  a manual step and the switch is visible. Autoloading — write the generated
+  profile into `DynamicProfiles/` on first run if it is absent or stale, keyed
+  off a hash of `Bindings` — would remove the setup step and keep the profile
+  from drifting when the table changes. Deferred: what is there works.
 - [ ] `raj --config ghostty` must be regenerated and the terminal reloaded
   whenever the binding table changes. Same for the iTerm2 profile.
 - [ ] **Document what is supported** — a keybinding table generated from
@@ -107,6 +141,5 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Deliberately not doing
 
-- Scrolling moves the cursor. This is intentional and preferred; not a bug.
 - Horizontal scrolling while wrapped. There is nothing off to the right to
   scroll to, so `Viewport.Left` is pinned at 0 when wrapping is on.

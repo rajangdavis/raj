@@ -61,11 +61,13 @@ func (p *Pane) Handle(a keys.Action) bool {
 	case keys.WordRight:
 		p.WordRight(false)
 	case keys.PageUp:
-		p.MovePage(-1, false)
+		p.ScrollPage(-1)
+		return true // the view moved, the cursors did not: do not follow
+	case keys.PageDown:
+		p.ScrollPage(+1)
+		return true
 	case keys.SelPageUp:
 		p.MovePage(-1, true)
-	case keys.PageDown:
-		p.MovePage(+1, false)
 	case keys.SelPageDown:
 		p.MovePage(+1, true)
 	case keys.SelWordRight:
@@ -88,6 +90,12 @@ func (p *Pane) Handle(a keys.Action) bool {
 		p.Outdent()
 	case keys.SelectAll:
 		p.SelectAll()
+	case keys.FindNext:
+		p.Find.Step(p, +1)
+	case keys.FindPrev:
+		p.Find.Step(p, -1)
+	case keys.SelectLine:
+		p.SelectLine()
 	case keys.MoveLineUp:
 		p.MoveLines(-1)
 	case keys.MoveLineDown:
@@ -114,6 +122,8 @@ func (p *Pane) Handle(a keys.Action) bool {
 		p.AddNextOccurrence()
 	case keys.AllOccurrences:
 		p.SelectAllOccurrences()
+	case keys.SplitIntoLines:
+		p.SplitIntoLines()
 	case keys.Cancel:
 		p.Cursors.Clear()
 

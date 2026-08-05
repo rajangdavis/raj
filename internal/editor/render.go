@@ -9,6 +9,19 @@ import (
 	"raj/internal/view"
 )
 
+// How a secondary cursor is drawn, arrived at by elimination. A cell holds one
+// rune, so anything drawn AS the caret is drawn INSTEAD of the character: a bar
+// glyph (U+258F) reads perfectly as an insertion point but rendered "Paste" as
+// "Pa|te". Reverse video keeps the glyph but reads as a selection, which is the
+// one thing a caret is not. Underline keeps the glyph and is unambiguous, but a
+// one-pixel line is the least visible mark a cell can carry, and finding four
+// carets in a screen of text is the whole job.
+//
+// So: a block of its own colour with the character still in it, dark text on a
+// light cell. Visible at a glance, and not the selection grey or either find
+// colour. The two theme fields are the only thing to change to try something
+// else; the tests assert the character survives rather than the exact styling.
+
 // Theme is the palette the pane draws with. Anything left as ui.Default
 // inherits the host terminal's own colour, which is how raj picks up a Ghostty
 // theme without being told about it.
@@ -21,6 +34,11 @@ type Theme struct {
 	CursorLine ui.Style
 	FindMatch  ui.Style
 	FindActive ui.Style
+
+	// Caret is the block a secondary cursor draws, CaretText the character
+	// left sitting in it.
+	Caret     ui.Color
+	CaretText ui.Color
 }
 
 // DefaultTheme names as little as possible: the terminal's foreground and
@@ -35,6 +53,8 @@ func DefaultTheme() Theme {
 		AgentTint:  ui.Ansi(22),
 		FindMatch:  ui.DefaultStyle.On(ui.Ansi(58)),
 		FindActive: ui.DefaultStyle.On(ui.Ansi(136)),
+		Caret:      ui.Ansi(12),
+		CaretText:  ui.Ansi(0),
 	}
 }
 
@@ -202,18 +222,19 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 			style = th.Selection
 		}
 		if heads[off] {
-			style = style.Plus(ui.Reverse)
+			// The character stays; the cell behind it becomes the caret.
+			style = style.On(th.Caret).With(th.CaretText).Plus(ui.Bold)
 		}
 		s.Set(screenX, y, r, style)
 		col++
 	}
 
-	// A secondary cursor at end of line has no character to invert, so draw it
-	// on the blank cell past the text.
+	// A secondary cursor at end of line has no character to sit on, so the
+	// caret is the blank cell past the text.
 	endCol := p.File.Cols.Width(text)
 	if hi == len(full) && heads[start+len(text)] && endCol >= p.Viewport.Left {
 		if sx := x + endCol - p.Viewport.Left; sx < x+w {
-			s.Set(sx, y, ' ', th.Text.Plus(ui.Reverse))
+			s.Set(sx, y, ' ', th.Text.On(th.Caret).With(th.CaretText))
 		}
 	}
 }

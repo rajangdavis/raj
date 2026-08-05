@@ -31,36 +31,14 @@ func NewKeymap() *Keymap {
 	for _, b := range Bindings {
 		k.global[b.Chord] = b.Action
 	}
-	// Chords Ghostty never claims, so they arrive via report_all with no
-	// keybind line and are not in the table.
-	for chord, a := range map[string]Action{
-		"tab":         CycleFocus,
-		"shift+tab":   CycleFocusBack,
-		"esc":         Cancel,
-		"enter":       Confirm,
-		"left":        CharLeft,
-		"right":       CharRight,
-		"up":          LineUp,
-		"down":        LineDown,
-		"shift+left":  SelCharLeft,
-		"shift+right": SelCharRight,
-		"shift+up":    SelLineUp,
-		"shift+down":  SelLineDown,
-		// Not alt+z, which is what vscode uses: on macOS Option+letter composes
-		// into a character, so a bare alt+letter chord never arrives. Every alt
-		// binding in the table is alt+super or alt+arrow for that reason.
-		// Holding ctrl suppresses composition, and neither terminal claims this
-		// chord, so report_all delivers it with no kkp_on line and the
-		// generated configs are unchanged.
-		"ctrl+alt+w":   ToggleWrap,
-		"pgup":         PageUp,
-		"pgdown":       PageDown,
-		"shift+pgup":   SelPageUp,
-		"shift+pgdown": SelPageDown,
-		"backspace":    Backspace,
-		"delete":       Delete,
-	} {
-		k.global[chord] = a
+	// Chords that need no Ghostty line, and chords a terminal keeps and must be
+	// told to hand over. Both live in table.go so that every chord raj resolves
+	// is in exactly one table and a test can say so.
+	for _, n := range Natives {
+		k.global[n.Chord] = n.Action
+	}
+	for _, b := range Reclaim {
+		k.global[b.Chord] = b.Action
 	}
 	// Tab indents in the editor and cycles focus everywhere else. This is what
 	// makes the sidebar focus ring one-way: tab can walk out of a sidebar into

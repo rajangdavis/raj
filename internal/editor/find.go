@@ -60,6 +60,12 @@ func (f *Find) Handle(p *Pane, a keys.Action, text string) {
 	case keys.Cancel:
 		f.Hide()
 		return
+	case keys.FindNext:
+		f.step(p, +1)
+		return
+	case keys.FindPrev:
+		f.step(p, -1)
+		return
 	case keys.Confirm, keys.FindInFile, keys.LineDown, keys.Indent:
 		// Tab arrives as Indent in the editor's scope. Stepping matches with it
 		// is what the hand expects from a search bar, and indentation is not
@@ -103,6 +109,23 @@ func (f *Find) run(p *Pane) {
 		}
 	}
 	f.jump(p)
+}
+
+// Step moves to the next or previous match whether or not the bar has focus,
+// which is what cmd+g and cmd+shift+g are for. Hide drops the matches but keeps
+// the query, so a closed bar recomputes rather than doing nothing — find, keep
+// editing, then step to the next hit without reopening anything.
+func (f *Find) Step(p *Pane, dir int) {
+	if f.input.Text == "" {
+		return
+	}
+	if len(f.matches) == 0 || f.term != f.input.Text {
+		f.run(p) // lands on the first match at or after the cursor
+		if dir > 0 {
+			return
+		}
+	}
+	f.step(p, dir)
 }
 
 // step moves to the next or previous match, wrapping at both ends.

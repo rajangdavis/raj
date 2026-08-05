@@ -53,6 +53,7 @@ const (
 	Cut           Action = "cut"
 	Copy          Action = "copy"
 	SelectAll     Action = "select_all"
+	SelectLine    Action = "select_line"
 	ToggleComment Action = "toggle_comment"
 	DeleteLine    Action = "delete_line"
 	LineBelow     Action = "line_below"
@@ -71,6 +72,7 @@ const (
 	CursorBelow       Action = "cursor_below"
 	AddNextOccurrence Action = "add_next_occurrence"
 	AllOccurrences    Action = "all_occurrences"
+	SplitIntoLines    Action = "split_into_lines"
 	CursorUndo        Action = "cursor_undo"
 
 	// navigation
@@ -99,5 +101,7 @@ const (
 	SelPageUp    Action = "sel_page_up"
 	SelPageDown  Action = "sel_page_down"
 	GotoLine     Action = "goto_line"
+	FindNext     Action = "find_next"
+	FindPrev     Action = "find_prev"
 	GotoSymbol   Action = "goto_symbol"
 )
