@@ -71,6 +71,19 @@ findings and decisions live in INVESTIGATIONS.md.
 - [ ] **Change gutter** versus git HEAD, distinct from the author tint. This is
   also where deletions get represented, since a deleted span leaves no piece.
 
+- [ ] **Search reads the disk, not the buffer.** A workspace search opens files
+  and scans them, so a match in an unsaved buffer is invisible and a match it
+  does report may be stale. Routing open documents through `Spans` instead of
+  `os.Open` is the fix, and it is the same seam an agent would need to search
+  what it has just edited.
+- [ ] **Parallel walk, if it is worth it.** Measured floors say a search is I/O
+  bound: 18 ms traversal, 90 ms to read 97 MB, 92 ms to read and scan it. A
+  worker pool is the only remaining lever, but it breaks `MaxMatches` — a pool
+  returned 509-517 results against a cap of 500, nondeterministically, because
+  workers in flight still append. Needs streaming results or deterministic
+  truncation first. Measure on a multicore box before building it; the numbers
+  in BENCHMARKS.md came from one core, where it showed nothing.
+
 ## Buffer
 
 - [ ] **Compaction.** Merge adjacent same-author pieces; only flatten spans that

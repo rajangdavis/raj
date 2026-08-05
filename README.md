@@ -27,7 +27,9 @@ internal/editor      file, cursors, motions, actions, render, binary sniffing.
 internal/widget      inputs, lists, boxes, the focus vocabulary.
 internal/tabs        open/close/reopen/switch.
 internal/explorer    lazy tree, git-status filter.
-internal/search      literal/regex engine, grouped collapsible results.
+internal/search      literal/regex engine, grouped collapsible results. Literal
+                     queries bypass regexp for bytes.Index; case-insensitive ones
+                     fold ASCII first. Checked against the regexp it replaced.
 internal/picker      cmd+p overlay with fuzzy ranking.
 internal/probe       what chords does this terminal actually deliver?
 internal/app         event loop, focus routing, layout, breakpoints, debug pane.

@@ -150,6 +150,75 @@ argument. The renderer lays each visible line out once while drawing it, and
 per call at 5 us a time — per frame and per keystroke work to recover something
 already in hand.
 
+## Why search does not use SIMD, and what it uses instead
+
+Prompted by GitHub's "Don't stop early: case-folding source code at memory
+speed", which reports case folding at >45 GiB/s by deleting the early exit from
+the ASCII loop so LLVM auto-vectorizes it. The technique does not port, and the
+reason is worth writing down because it will come up again.
+
+**Go's compiler has no auto-vectorizer.** Verified directly:
+`go build -gcflags=-S` emits zero vector instructions for every form of the
+loop. Without the vectorization payoff, the article's central move — dropping
+the early exit — is pure added work. Measured on 177 KB of ASCII, the ladder
+inverts against the article's:
+
+| variant | Go, this machine | the article, Rust/M4 |
+| --- | --- | --- |
+| naive: branch test + early exit | 311 MB/s | 3.1 GiB/s |
+| branchless body, keeps the break | 1,098 MB/s | 2.6 GiB/s (slower) |
+| branchless, no break (their winner) | 943 MB/s | >45 GiB/s |
+| SWAR, 8 bytes per word | 3,083 MB/s | n/a |
+
+Three inversions in one table. Dropping the break is a **regression** in Go.
+Branchless-with-break was *faster* than naive here, not slower — Go turns the
+range test into a conditional move where the ARM build kept a predicted branch.
+And writing the range test as arithmetic instead of a comparison made it slower
+still (813 MB/s): hand-rolled bit tricks lose to the compiler's cmov when there
+is no vectorizer to feed. The article's own caveat — that a branchless body is
+worth it *only* as an enabler for vectorization — turns out to be the operative
+sentence for Go rather than a footnote.
+
+So the portable answer is SWAR, and the real answer is usually "call the
+stdlib": `bytes.Index`, `bytes.IndexByte` and friends are hand-written assembly
+with runtime CPU dispatch. The literal fast path is 11x faster than `(?i)` not
+because of anything clever in raj but because it hands the work to
+`bytes.Index`.
+
+**Where the remaining headroom is not.** A separate experiment walked a 97 MB
+tree with the scan removed entirely: traversal alone is 18 ms, reading every
+byte into a reused buffer is 90 ms, and a full search with the fast matcher is
+92 ms. The scanning is ~2 ms of 92. Any further work on the matching loop —
+assembly, `simd/archsimd`, a smarter fold table — is chasing 2% of a search.
+The levers that remain are I/O shaped: not opening the file at all, overlapping
+the syscalls, or reading less.
+
+**On `simd/archsimd`.** Go 1.26 shipped it under `GOEXPERIMENT=simd` (amd64
+only), and 1.27 adds a portable size-agnostic API plus ARM64. It would let raj
+reach the article's numbers without assembly. It is still the wrong trade here
+for the reason above, and it carries a real cost: the intrinsics panic on
+hardware lacking the CPU features, so callers must feature-test. Revisit only if
+a profile ever shows the fold mattering, which on this corpus it cannot.
+
+**Parallelism and `MaxMatches` do not compose.** A worker pool over the same
+walk was measured at 509-517 matches against a cap of 500, varying run to run,
+because workers in flight when the cap trips still append. Worse than the
+overshoot: *which* 500 results you get becomes scheduling-dependent, so the same
+query returns different results on consecutive runs. Any future parallel walk
+has to either drop the cap in favour of streaming, or collect fully and then
+sort-and-truncate deterministically. This was not measurable as a speedup on the
+one-core box it was tested on, so it stays unimplemented rather than merged
+untested.
+
+**A bug the oracle caught and no benchmark would have.** The first reference
+folder used `if r-'A' < 26` on a `rune`. That idiom is correct on a `byte` —
+unsigned wraparound puts everything below `'A'` above 26 — and silently wrong on
+a signed `rune`, where every control character tests true. It only surfaced
+because the fold is fuzzed against an independent oracle. The equivalence test
+in `internal/search` exists for the same reason: the literal matcher is checked
+against the regexp it replaced, over real source and over random input, rather
+than trusted because it looks right.
+
 ## Root causes
 
 ### Undo applied at the wrong offset, splitting runes

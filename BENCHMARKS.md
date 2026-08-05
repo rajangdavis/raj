@@ -195,6 +195,50 @@ match a lot. Debouncing does not make the walk faster — it makes a six-charact
 word cost one walk instead of six, off-thread, where a slow one delays a result
 rather than a frame.
 
+### Literal fast path and the scan buffer
+
+Two changes, measured together on a 97.3 MB / 9,502-file tree (the Go 1.22
+source distribution, `REPO_CORPUS=`), warm page cache, Go 1.22 linux/amd64, one
+core. Baseline is the code as it was: every query compiled to a regexp, and a
+fresh 64 KB `bufio.Scanner` buffer per file.
+
+| query | baseline | after | speedup | B/op before | B/op after |
+| --- | --- | --- | --- | --- | --- |
+| literal, case-sensitive, no match | 328 ms | 176 ms | 1.9x | 578.8 M | 9.28 M |
+| literal, case-insensitive, no match | 1,473 ms | 246 ms | **6.0x** | 578.8 M | 9.55 M |
+| literal, case-insensitive, 25 hits | 1,584 ms | 258 ms | **6.1x** | 578.8 M | 9.55 M |
+| regexp (control, same path both ways) | 325 ms | 317 ms | 1.0x | 578.8 M | 9.29 M |
+
+Isolating the matcher from the walk and the I/O, over 20,000 real source lines:
+
+| matcher | throughput | allocs/op |
+| --- | --- | --- |
+| `regexp`, case-sensitive literal | 567 MB/s | 1 |
+| `bytes.Index` | 1,172 MB/s | 0 |
+| `regexp` with `(?i)` | 52 MB/s | 1 |
+| SWAR fold + `bytes.Index` | 588 MB/s | 2 |
+
+`(?i)` was the whole story: **11x** slower than folding the line and calling
+`bytes.Index`. A case-sensitive literal only gains 2x, because Go's regexp
+already has a literal-prefix path.
+
+The buffer was the whole allocation story: 64 KB per file over 9,502 files is
+608 MB of garbage per search, and hoisting one buffer out of the walk removed
+**62x** of the allocated bytes. It also accounts for most of the 1.9x on the
+case-sensitive row — matching was never the bottleneck there.
+
+### The fold, and why it is SWAR
+
+| fold of 20,000 source lines | throughput |
+| --- | --- |
+| naive byte loop | 960 MB/s |
+| SWAR, 8 bytes per word | 3,260 MB/s |
+| `strings.ToLower` (allocates 1.1 MB) | 271 MB/s |
+
+3.4x over the naive loop and 12x over the stdlib, zero allocations. Note the
+ceiling: `copy` on the same machine runs at 46 GB/s, so this is 14x short of
+memory bandwidth. See INVESTIGATIONS.md for why that gap is not worth closing.
+
 ## Line index update
 
 Finding the newlines in an 800 KB insertion, `BenchmarkNewlines*`:

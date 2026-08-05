@@ -3,6 +3,7 @@ package search
 
 import (
 	"bufio"
+	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -56,7 +57,14 @@ func Run(root string, q Query) Result {
 		res.Err = err
 		return res
 	}
+	m := matcher(regexMatcher{re})
+	if !forceRegexp {
+		m = newMatcher(q, re)
+	}
 	inc, exc := globs(q.Include), globs(q.Exclude)
+	// One scan buffer for the whole walk. Allocating 64 KB per file made the
+	// buffer, not the matching, the dominant cost of a search.
+	buf := make([]byte, 64*1024)
 
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -82,13 +90,18 @@ func Run(root string, q Query) Result {
 			res.Capped = true
 			return filepath.SkipAll
 		}
-		if n := scan(path, re, &res); n > 0 {
+		if n := scan(path, m, buf, &res); n > 0 {
 			res.Files++
 		}
 		return nil
 	})
 	return res
 }
+
+// forceRegexp disables the literal fast path. It exists so the benchmarks can
+// measure the fast path against the regexp path it replaced, in the same
+// process and over the same corpus.
+var forceRegexp = false
 
 // compile turns a query into a regexp. Literal searches are quoted rather than
 // matched by hand so that case-insensitivity and word boundaries work the same
@@ -108,7 +121,7 @@ func compile(q Query) (*regexp.Regexp, error) {
 }
 
 // scan searches one file, skipping anything that looks binary.
-func scan(path string, re *regexp.Regexp, res *Result) int {
+func scan(path string, m matcher, buf []byte, res *Result) int {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0
@@ -117,14 +130,16 @@ func scan(path string, re *regexp.Regexp, res *Result) int {
 
 	found := 0
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	sc.Buffer(buf, 1<<20)
+	// sc.Bytes avoids a string allocation for every line in the repository;
+	// only a line that actually matches is turned into one.
 	for line := 1; sc.Scan(); line++ {
-		text := sc.Text()
-		if strings.IndexByte(text, 0) >= 0 {
+		raw := sc.Bytes()
+		if bytes.IndexByte(raw, 0) >= 0 {
 			return found // NUL byte: binary, stop reading
 		}
-		loc := re.FindStringIndex(text)
-		if loc == nil {
+		start, end, ok := m.find(raw)
+		if !ok {
 			continue
 		}
 		if len(res.Matches) >= MaxMatches {
@@ -133,8 +148,8 @@ func scan(path string, re *regexp.Regexp, res *Result) int {
 		}
 		res.Matches = append(res.Matches, Match{
 			Path: path, Line: line,
-			Text: strings.TrimRight(text, " \t"),
-			Col:  loc[0], Len: loc[1] - loc[0],
+			Text: strings.TrimRight(string(raw), " \t"),
+			Col:  start, Len: end - start,
 		})
 		found++
 	}
