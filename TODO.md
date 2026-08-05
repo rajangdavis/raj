@@ -21,6 +21,9 @@ findings and decisions live in INVESTIGATIONS.md.
   the 150 ms tick rather than immediately. Fixing it properly means a way for a
   worker to post an event into the loop, which is the same seam the agent pane
   will need. Do it once, for both.
+  Cancellation landed first and is the larger half of the same problem: an
+  abandoned walk now stops instead of running to completion. What remains is
+  the other direction — a finished walk still waits for a tick to be shown.
 
 ## Panes and fields
 

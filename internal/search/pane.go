@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -36,10 +37,13 @@ type Pane struct {
 	// on the event thread — so every field above stays single-threaded and only
 	// the four below need the lock.
 	//
-	// gen is what makes cancellation unnecessary. Each search carries the
-	// generation it was started for, and a result whose generation has moved on
-	// is dropped. Without it a slow search for "f" can land after a fast one for
-	// "func" and replace it.
+	// gen keeps results ORDERED: each search carries the generation it was
+	// started for, and a result whose generation has moved on is dropped.
+	// Without it a slow search for "f" can land after a fast one for "func"
+	// and replace it.
+	//
+	// gen does not make the abandoned search stop, which is a separate and
+	// more expensive problem — see cancel.
 	mu          sync.Mutex
 	gen         int
 	inflight    int
@@ -47,17 +51,43 @@ type Pane struct {
 	pending     Result
 	havePending bool
 
-	// search is Run unless a test substitutes something slower or ordered.
-	// Debounce is the pause after the last keystroke before searching; zero
-	// means the default.
-	search   func(root string, q Query) Result
+	// cancel stops the walk that is currently running. Dropping a stale result
+	// is not the same as not computing it: on a large repository a search
+	// outlives several keystrokes, so without this the pane accumulates a full
+	// concurrent walk per character typed, each one reading every file for an
+	// answer that is already obsolete. The cost lands on the disk and the
+	// garbage collector, so the symptom is a laggy editor rather than a slow
+	// search.
+	cancel context.CancelFunc
+
+	// lastDur is how long the last completed search took, and abandoned counts
+	// the ones cancelled before finishing. Both are read by the debug pane:
+	// "why is this slow" is unanswerable without them.
+	lastDur   time.Duration
+	abandoned int
+
+	// search is RunContext unless a test substitutes something slower or
+	// ordered. Debounce pins the pause after the last keystroke; zero lets the
+	// pane choose one from how long searches here actually take.
+	search   func(ctx context.Context, root string, q Query) Result
 	Debounce time.Duration
 }
 
-// DefaultDebounce is how long the pane waits after the last keystroke before
-// walking the tree. Typing is bursty and each character invalidates the last
-// query, so the pause is what turns a word into one search instead of four.
-const DefaultDebounce = 120 * time.Millisecond
+// The debounce window adapts to the repository, because one constant cannot
+// serve both. At 120 ms on a tree that answers in 15 ms the pane feels sluggish
+// for no reason; on a tree that takes two seconds, 120 ms is indistinguishable
+// from no debounce at all, since the next keystroke lands long before the walk
+// returns.
+//
+// So the pause tracks the measured cost of searching this tree: half the last
+// search's duration, clamped. Half rather than all, because cancellation makes
+// an early start cheap to undo — the aim is to stop starting walks faster than
+// they can be thrown away, not to guarantee only one is ever in flight.
+const (
+	DefaultDebounce = 120 * time.Millisecond // before anything has been measured
+	MinDebounce     = 60 * time.Millisecond
+	MaxDebounce     = 500 * time.Millisecond
+)
 
 // Row is one line of the results list: either a file header or a match under
 // it. Grouping matters at sidebar width — repeating a truncated path on every
@@ -302,6 +332,11 @@ func (p *Pane) run() {
 	p.mu.Lock()
 	p.gen++
 	gen := p.gen
+	// Stop the walk that is already running, not just its result.
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
+	}
 	// Stop reports whether it beat the timer. When it did, that search never
 	// started and must not be counted as in flight.
 	if p.timer != nil && p.timer.Stop() {
@@ -314,17 +349,30 @@ func (p *Pane) run() {
 		return
 	}
 	q, root, fn := p.q, p.Root, p.searcher()
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
 	p.inflight++
-	p.timer = time.AfterFunc(p.debounce(), func() { p.work(gen, root, q, fn) })
+	p.timer = time.AfterFunc(p.debounce(), func() { p.work(ctx, gen, root, q, fn) })
 	p.mu.Unlock()
 }
 
 // work runs one search off the event thread and parks the result if it is still
 // the one being waited for.
-func (p *Pane) work(gen int, root string, q Query, fn func(string, Query) Result) {
-	res := fn(root, q)
+func (p *Pane) work(ctx context.Context, gen int, root string, q Query, fn func(context.Context, string, Query) Result) {
+	start := time.Now()
+	res := fn(ctx, root, q)
+	elapsed := time.Since(start)
+
 	p.mu.Lock()
-	if gen == p.gen {
+	if res.Stopped {
+		p.abandoned++
+	} else {
+		// Only a search that ran to completion says anything about how long
+		// searching this tree costs; a cancelled one stopped early by
+		// definition and would bias the window downwards.
+		p.lastDur = elapsed
+	}
+	if gen == p.gen && !res.Stopped {
 		p.pending, p.havePending = res, true
 	}
 	p.inflight--
@@ -369,18 +417,64 @@ func (p *Pane) Settle(timeout time.Duration) bool {
 	}
 }
 
-func (p *Pane) searcher() func(string, Query) Result {
+func (p *Pane) searcher() func(context.Context, string, Query) Result {
 	if p.search != nil {
 		return p.search
 	}
-	return Run
+	return RunContext
 }
 
+// debounce reports the pause to use before the next search. Callers hold mu.
 func (p *Pane) debounce() time.Duration {
 	if p.Debounce > 0 {
 		return p.Debounce
 	}
-	return DefaultDebounce
+	if p.lastDur == 0 {
+		return DefaultDebounce
+	}
+	d := p.lastDur / 2
+	if d < MinDebounce {
+		return MinDebounce
+	}
+	if d > MaxDebounce {
+		return MaxDebounce
+	}
+	return d
+}
+
+// stopForTest cancels any running search so a test does not leak a goroutine
+// blocked on a fake searcher.
+func (p *Pane) stopForTest() {
+	p.mu.Lock()
+	if p.cancel != nil {
+		p.cancel()
+		p.cancel = nil
+	}
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+	p.mu.Unlock()
+}
+
+// InFlight, LastDuration and Abandoned report what the pane is doing, for the
+// debug pane. A pile of in-flight searches is the signature of a repository
+// that searches slower than it is typed in.
+func (p *Pane) InFlight() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inflight
+}
+
+func (p *Pane) LastDuration() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastDur
+}
+
+func (p *Pane) Abandoned() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.abandoned
 }
 
 // Render draws the pane.

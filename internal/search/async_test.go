@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,7 +25,7 @@ func TestHandleDoesNotWaitForTheSearch(t *testing.T) {
 	p := NewPane(t.TempDir())
 	p.Debounce = time.Nanosecond
 	release := make(chan struct{})
-	p.search = func(string, Query) Result {
+	p.search = func(context.Context, string, Query) Result {
 		<-release
 		return Result{Files: 1}
 	}
@@ -45,7 +46,7 @@ func TestDebounceCoalescesABurst(t *testing.T) {
 	p := NewPane(t.TempDir())
 	p.Debounce = 40 * time.Millisecond
 	var searches int32
-	p.search = func(_ string, q Query) Result {
+	p.search = func(_ context.Context, _ string, q Query) Result {
 		atomic.AddInt32(&searches, 1)
 		return Result{Files: len(q.Text)}
 	}
@@ -69,7 +70,7 @@ func TestStaleResultIsDropped(t *testing.T) {
 	p := NewPane(t.TempDir())
 	p.Debounce = time.Nanosecond
 	slow := make(chan struct{})
-	p.search = func(_ string, q Query) Result {
+	p.search = func(_ context.Context, _ string, q Query) Result {
 		if q.Text == "f" {
 			<-slow // the first search finishes last
 		}
@@ -97,7 +98,7 @@ func TestStaleResultIsDropped(t *testing.T) {
 func TestEmptyQueryClearsImmediately(t *testing.T) {
 	p := NewPane(t.TempDir())
 	p.Debounce = time.Hour // any deferred work would never run
-	p.search = func(string, Query) Result { return Result{Files: 3} }
+	p.search = func(context.Context, string, Query) Result { return Result{Files: 3} }
 	p.Result = Result{Files: 3, Matches: []Match{{Path: "a.go"}}}
 
 	typeQuery(p, "x")

@@ -4,6 +4,7 @@ package search
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,13 +42,28 @@ type Result struct {
 	Matches []Match
 	Files   int
 	Capped  bool
+	// Stopped is set when the search was abandoned before finishing, which
+	// happens whenever the query changes while a walk is in progress.
+	Stopped bool
 	Err     error
 }
 
-// Run searches root. It walks the tree itself rather than shelling out to
-// ripgrep so raj has no runtime dependency, at the cost of being slower on very
-// large repositories — acceptable while matches are capped.
-func Run(root string, q Query) Result {
+// Run searches root with no way to stop it. Prefer RunContext: an interactive
+// search is abandoned far more often than it is read.
+func Run(root string, q Query) Result { return RunContext(context.Background(), root, q) }
+
+// RunContext searches root, stopping when ctx is cancelled.
+//
+// Cancellation is the difference between one walk and a pile of them. Every
+// keystroke starts a new search, and without a way to stop the old one a slow
+// repository accumulates a full concurrent walk per keystroke — each opening
+// and reading every file, none of whose results anyone will look at. The cost
+// lands on the disk and the garbage collector, which is why the symptom is a
+// laggy editor rather than a slow search.
+//
+// It walks the tree itself rather than shelling out to ripgrep so raj has no
+// runtime dependency.
+func RunContext(ctx context.Context, root string, q Query) Result {
 	var res Result
 	if q.Text == "" {
 		return res
@@ -85,6 +101,15 @@ func Run(root string, q Query) Result {
 		}
 		if info, err := d.Info(); err != nil || info.Size() > MaxFileSize {
 			return nil
+		}
+		// One non-blocking check per file. At tens of nanoseconds against an
+		// open and a read, this is free, and it bounds abandoned work at one
+		// file rather than one repository.
+		select {
+		case <-ctx.Done():
+			res.Stopped = true
+			return filepath.SkipAll
+		default:
 		}
 		if len(res.Matches) >= MaxMatches {
 			res.Capped = true

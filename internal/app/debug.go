@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"runtime"
+	"time"
 
 	"raj/internal/keys"
 	"raj/internal/ui"
@@ -103,6 +104,12 @@ func (d *debugLog) stats(a *App) []string {
 			bytes(d.mem.HeapAlloc), bytes(d.mem.Sys), d.mem.NumGC),
 		fmt.Sprintf("goroutines %d   tabs %d   focus %s",
 			runtime.NumGoroutine(), a.Tabs.Count(), a.focusName()),
+		// A search pile-up shows up here before it shows up anywhere else:
+		// inflight above one, or a last duration far past the frame budget,
+		// means the editor is competing with its own abandoned walks.
+		fmt.Sprintf("search %v   inflight %d   abandoned %d",
+			a.Search.LastDuration().Round(time.Millisecond),
+			a.Search.InFlight(), a.Search.Abandoned()),
 	}
 	p := a.Tabs.Active()
 	if p == nil {

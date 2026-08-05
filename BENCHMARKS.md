@@ -239,6 +239,29 @@ case-sensitive row — matching was never the bottleneck there.
 ceiling: `copy` on the same machine runs at 46 GB/s, so this is 14x short of
 memory bandwidth. See INVESTIGATIONS.md for why that gap is not worth closing.
 
+### Debounce and cancellation
+
+Not a throughput number: a concurrency one. Typing `handler` used to leave seven
+walks running, because `gen` drops a stale *result* without stopping the *work*
+that produces it. On a tree that searches slower than it is typed in, that is a
+full concurrent read of every file per keystroke, and the cost lands on the disk
+and the collector rather than on the search — so the symptom is a laggy editor.
+
+| keystrokes | peak concurrent walks, before | after |
+| --- | --- | --- |
+| 3 | 3 | 2 |
+| 24 | 24 | 2 |
+
+Two rather than one because cancelling is not instantaneous: a replacement can
+start while its predecessor is still noticing. The property that matters is that
+the number does not grow with typing.
+
+The debounce window now tracks measured cost — half the last completed search,
+clamped to [60 ms, 500 ms] — because one constant cannot serve both a tree that
+answers in 15 ms and one that takes two seconds. A cancelled search does not
+update the measurement, or the window would collapse to the floor after the
+first abandoned walk.
+
 ## Line index update
 
 Finding the newlines in an 800 KB insertion, `BenchmarkNewlines*`:
