@@ -38,6 +38,8 @@ func (a *App) Draw() {
 	a.Debug.Render(a.screen, a, 0, l.TopY, cols, l.Rows, a.wth)
 	// The picker floats above everything, so it is drawn last.
 	a.Picker.Render(a.screen, cols, rows, a.wth)
+	// A dialog is modal, so it floats above even the picker.
+	a.Prompt.Render(a.screen, cols, rows, a.wth)
 	if err := a.host.Present(a.screen); err != nil {
 		// A failed or short write leaves the terminal holding part of a frame.
 		// The host has already marked itself dirty, so the next Draw repaints
@@ -159,6 +161,8 @@ func (a *App) focusName() string {
 		return "explorer"
 	case FocusPicker:
 		return "go to file"
+	case FocusPrompt:
+		return a.Prompt.Title()
 	}
 	return "raj"
 }

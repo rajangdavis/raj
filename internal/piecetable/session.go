@@ -151,7 +151,7 @@ type Conflict struct {
 func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version, []Conflict) {
 	var conflicts []Conflict
 	for i, h := range hunks {
-		start, end, at, ok := s.rebase(h.Start, h.End, base, true)
+		start, end, at, ok := s.rebase(h.Start, h.End, base)
 		if !ok {
 			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, At: at})
 			continue
@@ -169,57 +169,182 @@ func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version,
 	return s.Version(), conflicts
 }
 
-// rebase carries [start, end) from version base to the present. It fails when
-// any intervening op touched the range's interior: a deletion overlapping it,
-// or an insertion strictly inside it.
+// rebase carries [start, end) from version base to the present, and reports the
+// op that made the range unrecoverable if one did.
 //
-// slide decides what an insertion landing exactly on start does. The two
-// callers genuinely want different answers:
+// The walk answers two questions that used to be one, which is what made it
+// wrong whenever undo and redo were in the window:
 //
-//   - A diff hunk slides (true): text typed at a hunk's first byte belongs
-//     before the hunk, so the hunk moves past it. Without this, adjacent hunks
-//     reject each other constantly.
-//   - An undo does not (false): it has to compose exactly with the deletion it
-//     reverses. A deletion starting at a point leaves the point alone, so the
-//     matching re-insertion must leave it alone too. Sliding there makes undo
-//     drift by the deleted length every time it crosses a later edit — which
-//     is precisely how undo used to mangle a buffer rather than restore it.
-func (s *Session) rebase(start, end int, base Version, slide bool) (int, int, Version, bool) {
+//   - WHERE the range is now is a question about the journal's order. Every op
+//     in the window counts, live or not, because each one's Pos is recorded in
+//     the frame its predecessors produced — skipping a dead op shifts every
+//     later op into a frame it was never written in.
+//   - WHETHER the range survived is a question about the document's contents.
+//     Only an ordinary edit still in effect can destroy it; a reversal composes
+//     with its target to nothing, and a dead op's bytes have already come back.
+//
+// The caller used to pass a `slide` flag to say what an insertion landing
+// exactly on start meant, because a diff hunk and an undo wanted opposite
+// answers. They no longer disagree: each end now records the deletions that
+// were flush against it and which side their bytes were on, so the reversal of
+// each is placed by what actually happened rather than by who is asking.
+func (s *Session) rebase(start, end int, base Version) (int, int, Version, bool) {
 	if int(base) > len(s.journal) {
 		return 0, 0, 0, false
 	}
+	lo, hi := point{at: start}, point{at: end}
 	for _, o := range s.journal[base:] {
-		// Skip ops that are no longer in effect, and the inverses that
-		// cancelled them. An op and its inverse compose to nothing, but walking
-		// both counts each separately: the pair reports a conflict against a
-		// region neither of them still touches, so undo refuses for no reason.
-		// Skip anything not currently in effect, and skip a live reversal whose
-		// target is already dead: the pair composes to nothing, but counting
-		// only one of them makes the rebase drift by the other's length.
-		if !s.live(o.Seq) || (o.Kind != KindEdit && !s.live(o.Undoes)) {
-			continue
+		// Damage is asked about first, because the question is about the range
+		// as it stood in the frame this op was recorded in.
+		if at, bad := s.damages(o, lo, hi); bad {
+			return 0, 0, at, false
 		}
-		d := o.DelLen()
-		switch {
-		case d == 0 && o.Pos == start && start == end && !slide:
-			// A pure insertion exactly at an empty point: leave the point put,
-			// so this composes with the deletion whose inverse it is.
-			//
-			// Only when the range is empty. A range with width is the bytes
-			// some op inserted, and an insertion at its start pushes those
-			// bytes along with everything else — leaving the range put makes
-			// the undo delete the NEW text instead of the old, which is how a
-			// redo came to split a rune in half.
-		case o.Pos+d <= start:
-			start += o.Delta()
-			end += o.Delta()
-		case o.Pos >= end:
-			// entirely after the range: no effect
-		default:
-			return 0, 0, o.Seq, false
+		// The two ends take opposite gravity where a range has an inside, which
+		// is what the interval form used to encode implicitly by testing start
+		// before end: text typed at the range's first byte belongs before it,
+		// so the start moves past; text typed at its last belongs after it, so
+		// the end stays and the range does not swallow it. An empty range has
+		// no inside to distinguish, so both ends follow the start.
+		empty := !lo.held && !hi.held && lo.at == hi.at
+		s.carry(&lo, o, true)
+		s.carry(&hi, o, empty)
+	}
+	if lo.held || hi.held {
+		// The reversal that would bring the bytes back is not in this window,
+		// so as far as this walk can see they are simply gone.
+		return 0, 0, lo.by, false
+	}
+	return lo.at, hi.at, 0, true
+}
+
+// point is one end of a rebased range.
+//
+// Ends are carried independently rather than as an interval, because an op can
+// remove the bytes under one of them and leave the other alone: a range
+// straddling a deletion has one end in the document and one end waiting to come
+// back, and an interval has nowhere to record that.
+type point struct {
+	at   int
+	held bool    // its bytes are out of the document
+	by   Version // the reversal that will restore them
+	off  int     // where inside that reversal's re-inserted span it lands
+
+	// anchored records the deletions that ended flush against this point, and
+	// which side of it their bytes were on.
+	//
+	// An offset cannot say whether it sits before or after text that is
+	// missing, and both neighbours look identical once the bytes are gone: a
+	// deletion beginning here left the point alone, one ending here dragged it
+	// left, and the reversal of either is an insertion at exactly this offset.
+	// Only the record says which way to move. Deriving it from one flag on the
+	// whole walk is what made undo compose correctly with a deletion at its own
+	// position and incorrectly with one just before it.
+	anchored []anchor
+}
+
+// anchor is a deletion flush against a point, and where its bytes go when it
+// comes back: to the point's right (the point stays) or its left (the point
+// moves past them).
+type anchor struct {
+	seq   Version
+	right bool
+}
+
+// damages reports whether an op destroyed bytes the range owns.
+//
+// This is the distinction the whole walk turns on. Whether an op's COORDINATES
+// belong to the frame being walked is a question about the journal's order, and
+// every op answers yes — which is why carry runs for all of them, live or not.
+// Whether an op DAMAGED the range is a different question, and only an ordinary
+// edit that is still in effect can. Conflating the two is what let a
+// resurrected op shift later ops that were recorded without it.
+//
+// A reversal is never damage. It only removes bytes its target added or
+// restores bytes its target removed, so it composes with that target to nothing
+// as far as any third party's range is concerned — including the case where the
+// target's insertion had split this range in two.
+func (s *Session) damages(o Op, lo, hi point) (Version, bool) {
+	if o.Kind != KindEdit || !s.live(o.Seq) {
+		return 0, false
+	}
+	if lo.held || hi.held {
+		return 0, false // the bytes are not in the document; nothing can reach them
+	}
+	if d := o.DelLen(); o.Pos+d > lo.at && o.Pos < hi.at {
+		return o.Seq, true
+	}
+	return 0, false
+}
+
+// carry moves one endpoint through one op. rightward says which way the point
+// leans when an insertion lands exactly on it, subject to its own anchors.
+func (s *Session) carry(p *point, o Op, rightward bool) {
+	if p.held {
+		if o.Seq == p.by {
+			p.at = o.Pos + p.off
+			p.held = false
+		}
+		return
+	}
+	d := o.DelLen()
+	switch {
+	case d == 0 && o.Pos == p.at:
+		// An insertion landing exactly here. If it is restoring bytes this
+		// point recorded, the record decides; otherwise gravity does.
+		if right, known := p.releases(o.Undoes); known {
+			if right {
+				return
+			}
+		} else if !rightward {
+			return
+		}
+		p.at += o.Delta()
+	case o.Pos+d <= p.at:
+		if d > 0 && o.Pos+d == p.at {
+			// A deletion ending flush against the point dragged it left, so
+			// the reversal that puts those bytes back must push it right again.
+			p.anchored = append(p.anchored, anchor{o.Seq, false})
+		}
+		p.at += o.Delta()
+	case o.Pos >= p.at:
+		if d > 0 && o.Pos == p.at {
+			// A deletion beginning exactly here left the point alone, so the
+			// reversal must leave it alone too.
+			p.anchored = append(p.anchored, anchor{o.Seq, true})
+		}
+	default:
+		// The point is inside bytes this op removed. If the op is still in
+		// effect the bytes are gone for good and damages has already refused;
+		// clamping is only so the walk ends with a defined value. If it was
+		// undone, park the point until the reversal brings them back.
+		if r, ok := s.liveReverser(o.Seq); ok {
+			p.held, p.by, p.off = true, r, p.at-o.Pos
+			return
+		}
+		p.at = o.Pos
+	}
+}
+
+// releases looks up an anchor for the op being undone, consuming it. right
+// reports that the restored bytes belong on the point's right, so it stays.
+func (p *point) releases(target Version) (right, known bool) {
+	for i, a := range p.anchored {
+		if a.seq == target {
+			p.anchored = append(p.anchored[:i], p.anchored[i+1:]...)
+			return a.right, true
 		}
 	}
-	return start, end, 0, true
+	return false, false
+}
+
+// liveReverser is the op currently holding o out of the document, if any.
+func (s *Session) liveReverser(seq Version) (Version, bool) {
+	for _, r := range s.reversers[seq] {
+		if s.live(r) {
+			return r, true
+		}
+	}
+	return 0, false
 }
 
 // Undo reverses author's most recent surviving action, and Redo reverses their
@@ -315,7 +440,7 @@ func (s *Session) live(seq Version) bool {
 // has to be replayed over it.
 func (s *Session) rebasedInverse(o Op) (Op, bool) {
 	inv := o.Inverse()
-	start, end, _, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1, false)
+	start, end, _, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
 	if !ok || end-start != o.InsLen() {
 		return Op{}, false
 	}

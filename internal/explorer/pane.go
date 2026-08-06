@@ -62,9 +62,20 @@ func (p *Pane) Handle(a keys.Action, text string) (open string, exit bool) {
 		}
 		p.spot++
 	case keys.CycleFocusBack:
-		if p.spot > 0 {
-			p.spot--
+		// Symmetric with tab walking off the last component: the pane is a
+		// segment of the ring with an exit at each end, and both lead to the
+		// editor. Wrapping round to the results instead would make backwards
+		// mean something different from forwards, and land focus on the far
+		// end of the pane rather than out of it.
+		//
+		// The original reason for stopping here does not apply to leaving. It
+		// was that tab indents in the editor, so a one-key route back IN would
+		// make editing interruptible — and that is untouched, since shift+tab
+		// outdents once focus is in the document.
+		if p.spot == 0 {
+			return "", true
 		}
+		p.spot--
 	case keys.LineUp, keys.CharLeft:
 		if p.spot == spotTree {
 			p.list.Move(-1, len(p.Tree.Entries()))

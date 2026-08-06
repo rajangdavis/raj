@@ -59,6 +59,13 @@ func NewNativeHost(in, out *os.File, tickRate time.Duration) (*NativeHost, error
 
 func (h *NativeHost) Events() <-chan Event { return h.events }
 
+// Post injects an event from a background goroutine. It is emit under another
+// name — the drop-if-full behaviour is the same — and exists as a separate
+// method because the contract differs: emit is the input path, where a dropped
+// event is a bug worth fixing, and Post is a notification whose payload lives
+// elsewhere, where a drop costs only the wait for the next tick.
+func (h *NativeHost) Post(e Event) { h.emit(e) }
+
 func (h *NativeHost) Size() (int, int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

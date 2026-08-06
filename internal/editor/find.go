@@ -49,6 +49,16 @@ func (f *Find) Hide() {
 }
 
 // Matches returns the match offsets, for highlighting and for tests.
+// ActiveInput is the find field while the bar is open. The bar sits inside the
+// editor pane, so without this cmd+c while typing a query would copy from the
+// document being searched.
+func (f *Find) ActiveInput() *widget.Input {
+	if !f.Open {
+		return nil
+	}
+	return &f.input
+}
+
 func (f *Find) Matches() []int { return f.matches }
 
 // Query is the current search text.

@@ -66,6 +66,21 @@ func (in *Input) deleteSelection() bool {
 	return true
 }
 
+// Copy returns the selected text, leaving the field alone. Empty when nothing
+// is selected — a field with no selection has no "current line" to fall back on
+// the way a document does.
+func (in *Input) Copy() string {
+	lo, hi := in.Selection()
+	return in.Text[lo:hi]
+}
+
+// Cut removes the selection and returns it.
+func (in *Input) Cut() string {
+	text := in.Copy()
+	in.deleteSelection()
+	return text
+}
+
 // Handle applies an action or literal text, reporting whether it was consumed.
 // Unconsumed keys fall through to the pane, which is how tab escapes a field.
 func (in *Input) Handle(a keys.Action, text string) bool {

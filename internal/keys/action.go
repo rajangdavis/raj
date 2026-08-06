@@ -45,7 +45,8 @@ const (
 	GotoTab9  Action = "goto_tab_9"
 
 	// file
-	Save Action = "save"
+	NewFile Action = "new_file"
+	Save    Action = "save"
 
 	// edit
 	Undo          Action = "undo"

@@ -44,6 +44,16 @@ type Tick struct{ Count uint64 }
 // terminal has already been rebuilt; the application should redraw everything.
 type Suspended struct{}
 
+// Wake says background work finished and the frame is stale. It carries no
+// payload: the worker has already parked its result where the event thread
+// looks, and this only says "look now" rather than waiting for the next tick.
+//
+// One event for all background work rather than one per producer. A search
+// finishing and an agent streaming a hunk want the identical thing from the
+// loop — another pass — and giving each its own event would make every future
+// producer a change to this file and to the switch in app.Handle.
+type Wake struct{}
+
 // Quit asks the loop to stop. Hosts emit it on unrecoverable input errors.
 type Quit struct{}
 
@@ -53,6 +63,7 @@ func (Focus) isEvent()     {}
 func (Paste) isEvent()     {}
 func (Tick) isEvent()      {}
 func (Suspended) isEvent() {}
+func (Wake) isEvent()      {}
 func (Quit) isEvent()      {}
 
 // Host drives one terminal-shaped surface.
@@ -62,6 +73,16 @@ func (Quit) isEvent()      {}
 type Host interface {
 	// Events delivers input. The channel closes when the host shuts down.
 	Events() <-chan Event
+
+	// Post injects an event from outside the input path. Safe to call from any
+	// goroutine, and the only supported way for background work to reach the
+	// event loop.
+	//
+	// It may drop the event if the loop is already saturated, which is why the
+	// only thing worth posting is a Wake: the payload is parked elsewhere, so a
+	// dropped notification costs latency until the next tick rather than a lost
+	// result. Anything carrying data of its own would need a different contract.
+	Post(Event)
 
 	// Size is the current surface size in cells.
 	Size() (cols, rows int)

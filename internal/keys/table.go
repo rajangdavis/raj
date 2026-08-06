@@ -50,6 +50,7 @@ var Bindings = []Binding{
 	{"tabs", NextTab, "alt+super+right", "1;11C", "cmd+alt+right", "ctrl+alt+right", "ghostty default: focus split right"},
 	{"tabs", PrevTab, "alt+super+left", "1;11D", "cmd+alt+left", "ctrl+alt+left", "ghostty default: focus split left"},
 
+	{"file", NewFile, "super+n", "110;9u", "cmd+n", "ctrl+n", "ghostty default: new window"},
 	{"file", Save, "super+s", "115;9u", "cmd+s", "ctrl+s", ""},
 
 	{"edit", Undo, "super+z", "122;9u", "cmd+z", "ctrl+z", ""},

@@ -31,6 +31,7 @@ internal/search      literal/regex engine, grouped collapsible results. Literal
                      queries bypass regexp for bytes.Index; case-insensitive ones
                      fold ASCII first. Checked against the regexp it replaced.
 internal/picker      cmd+p overlay with fuzzy ranking.
+internal/prompt      modal dialogs: ask a question, resume on the answer.
 internal/probe       what chords does this terminal actually deliver?
 internal/app         event loop, focus routing, layout, breakpoints, debug pane.
 internal/syntax      chroma tokens, cached per version, tokenised off-thread.

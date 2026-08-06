@@ -48,6 +48,14 @@ func (p *Picker) Show() {
 	p.filter()
 }
 
+// ActiveInput is the query field while the overlay is open.
+func (p *Picker) ActiveInput() *widget.Input {
+	if !p.Open {
+		return nil
+	}
+	return &p.input
+}
+
 // Hide closes it.
 func (p *Picker) Hide() { p.Open = false }
 

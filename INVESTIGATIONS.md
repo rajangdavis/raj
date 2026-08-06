@@ -232,28 +232,57 @@ than trusted because it looks right.
   multi-byte text the deleted span straddles a rune and the document ends up
   holding half of one, which is invalid UTF-8 on disk if you then save. Fixed by
   restricting the case to `start == end`.
-- [ ] **A resurrected op makes the rebase walk incoherent.** Still open, and the
-  reason `TestUndoRedoKeepsRunesIntact` stops at 500 seeds. The walk skips ops
-  that are not currently live, but an op's `Pos` is in the coordinates of the
+- [x] **A resurrected op made the rebase walk incoherent.** The walk skipped ops
+  that were not currently live, but an op's `Pos` is in the coordinates of the
   version it was applied at, and liveness is a property of *now*. Redo can
   resurrect an op that was dead when later ops were recorded, and those later
-  ops then have positions in a coordinate system the walk is no longer
+  ops then had positions in a coordinate system the walk was no longer
   reproducing. Traced at seed 578: op3 inserts 2 bytes at 0 and is undone by
   op4; op5 and op6 are recorded without it; op7 redoes op3 by reversing op4.
-  Rebasing op2's position now counts op3 (live again) *before* op6, whose `Pos`
-  was recorded when op3 was absent — the point lands 2 bytes late, inside a
-  rune.
+  Rebasing op2's position counted op3 (live again) *before* op6, whose `Pos` was
+  recorded when op3 was absent — the point landed 2 bytes late, inside a rune.
 
-  The obvious repair is to stop filtering by liveness and walk the journal as
-  the sequence it actually is, since undo and redo are committed as ordinary ops
-  and the document is the composition of all of them in order. Measured: that
-  makes 3000 seeds of the rune fuzz pass and breaks `undo_test` at seed 10,
-  where a pair that cancels out is then counted twice and reports a conflict
-  against a region neither half still touches — which is the case the liveness
-  filter was added for. Both models are right about one case and wrong about the
-  other, so the fix is not a flag: it wants the rebase to distinguish "this op's
-  bytes are in the document" from "this op's coordinates are in the frame I am
-  walking", which are currently the same test.
+  Both obvious models were measured and both are wrong. Keeping the liveness
+  filter fails the rune fuzz at seed 578. Dropping it and walking the journal as
+  the sequence it actually is passes 3000 rune seeds and breaks `undo_test` at
+  seed 10, where a pair that cancels out is counted twice and reports a conflict
+  against a region neither half still touches.
+
+  The resolution is that these are two questions, and `rebase` was asking one:
+
+  - **Where the range is now** is a question about the journal's *order*. Every
+    op in the window counts, live or not, because each op's `Pos` was recorded
+    in the frame its predecessors produced. Skipping any op shifts every later
+    one into a frame it was never written in — and skipping a cancelling *pair*
+    is no better, because the ops between them were recorded with the first one
+    present.
+  - **Whether the range survived** is a question about the document's
+    *contents*. Only an ordinary edit still in effect can destroy it. A reversal
+    is never damage to a third party: it removes only bytes its target added, or
+    restores only bytes its target removed, so it composes with that target to
+    nothing — including where the target's insertion had split the range in two.
+
+  Three mechanisms fell out of separating them, and each has a named test that
+  fails when it is broken (see `rebase_test.go`):
+
+  1. **Ends are carried independently.** A deletion can take the bytes under one
+     end of a range and leave the other, which an interval has nowhere to
+     record. A point whose bytes are removed by an op that was later undone is
+     *parked* against that op's reversal and restored at the offset it held
+     inside it, rather than clamped and lost.
+  2. **Anchors carry a direction.** An offset cannot say which side of a gap it
+     is on, and a deletion beginning at a point and one ending at a point look
+     identical once the bytes are gone — yet the reversal of each is an
+     insertion at the same offset, and they want opposite answers. Each end now
+     records the deletions flush against it and which side their bytes were on.
+  3. **The `slide` flag is gone.** It existed because a diff hunk and an undo
+     wanted opposite answers for an insertion landing exactly on `start`. With
+     anchors they no longer disagree: the placement comes from what actually
+     happened rather than from who is asking.
+
+  Verified at 40000 rune seeds and 20000 seeds of each undo/redo fuzzer, against
+  both the tree and the naive oracle. Standing budgets are lower; the numbers
+  above were walked by hand.
 
 ### The line index and the document disagreed after a batch
 

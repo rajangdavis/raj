@@ -12,6 +12,7 @@ const (
 	Search
 	Agent
 	Picker
+	Prompt
 )
 
 // Keymap resolves a chord to an Action. Zero value is unusable; use NewKeymap.
@@ -52,6 +53,12 @@ func NewKeymap() *Keymap {
 	// has nowhere to go.
 	k.Bind(Picker, "tab", None)
 	k.Bind(Picker, "shift+tab", None)
+
+	// A prompt is modal in the strongest sense: it is the only thing that can
+	// answer itself, so tab has nowhere to go and enter must mean "confirm"
+	// even though the editor underneath would insert a newline.
+	k.Bind(Prompt, "tab", None)
+	k.Bind(Prompt, "shift+tab", None)
 	return k
 }
 

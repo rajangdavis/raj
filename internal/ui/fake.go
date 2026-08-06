@@ -97,6 +97,9 @@ func (f *FakeHost) Send(e Event) {
 	}
 }
 
+// Post injects an event, as a worker goroutine would.
+func (f *FakeHost) Post(e Event) { f.Send(e) }
+
 // Type queues each rune of text as a keypress, the way a person typing would
 // produce them.
 func (f *FakeHost) Type(text string) {

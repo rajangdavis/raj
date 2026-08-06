@@ -3,41 +3,8 @@
 Open work only. Measured numbers live in BENCHMARKS.md; root causes, terminal
 findings and decisions live in INVESTIGATIONS.md.
 
-## Highest priority
-
-- [ ] **Rebase counts a resurrected op in the wrong coordinate frame.** The
-  narrower half of the rune-splitting bug is fixed; this is what is left, and it
-  can still put a reversal at an offset that splits a rune. `Session.rebase`
-  skips ops that are not live, but an op's `Pos` belongs to the version it was
-  applied at, and redo can resurrect an op that was absent when later ops were
-  recorded — so the walk shifts by an op the later positions do not account for.
-  Full trace, and the measurement showing why the obvious repair does not work,
-  in INVESTIGATIONS.md. Reproduce by raising `undoRedoSeeds` in
-  `internal/piecetable/undo_utf8_test.go` to 3000: seed 578, step 12. Wants a
-  decision about what `rebase` is walking before it wants code.
-- [ ] **A finished search waits for the next tick.** The walk is off the event
-  thread now and the result is installed by `apply`, which runs from `Handle`
-  and `Render` — so a search that finishes while you are not typing shows up on
-  the 150 ms tick rather than immediately. Fixing it properly means a way for a
-  worker to post an event into the loop, which is the same seam the agent pane
-  will need. Do it once, for both.
-  Cancellation landed first and is the larger half of the same problem: an
-  abandoned walk now stops instead of running to completion. What remains is
-  the other direction — a finished walk still waits for a tick to be shown.
-
 ## Panes and fields
 
-- [ ] **shift+tab cannot leave a sidebar.** Both panes stop it at their first
-  component, so the only way back to the editor is tab all the way forward or a
-  chord. That was deliberate — tab indents in the editor, so a one-key return
-  would make editing interruptible — but it makes the first field of each pane a
-  dead end. Decide between wrapping the ring and letting shift+tab exit
-  backwards.
-- [ ] **cut and copy hit the wrong buffer from a field.** `handleGlobal` claims
-  them before any pane sees them and `clip()` operates on `Tabs.Active()`, so
-  cmd+c in the search box copies from the editor and cmd+x edits the document
-  being searched. More visible now that fields have real selections. `app` needs
-  to ask the focused thing whether it owns a selection.
 - [ ] **Horizontal scroll in the explorer.** The selected path is now spelled
   out on the pane's last row, which answers "which file is this" but not "what
   is the rest of this name" for the rows around it. An offset that follows the
@@ -53,7 +20,7 @@ findings and decisions live in INVESTIGATIONS.md.
   status line). The wheel is the easy half now: `Pane.ScrollPage` moves the view
   without touching a cursor, so wheel events need a decode path and nothing
   else.
-- [ ] go-to-line (ctrl+g), go-to-symbol (cmd+shift+o).
+- [ ] go-to-symbol (cmd+shift+o). go-to-line landed on the dialog seam.
 - [ ] Bracket matching and auto-indent on newline.
 - [ ] **Blinking secondary carets.** The real caret blinks because the terminal
   blinks it; a drawn one would need raj to redraw on a timer, which means a tick
@@ -63,6 +30,16 @@ findings and decisions live in INVESTIGATIONS.md.
 - [ ] Tabs as clickable tags — visual now, clickable once the mouse lands.
 
 ## Workspace
+
+- [ ] **Save-as is a bare text field.** No completion, no directory listing, and
+  a path whose parent does not exist fails with the raw `os.WriteFile` error
+  rather than offering to create it. The picker one chord away already holds a
+  fuzzy index of every file in the tree; pointing the save-as field at the same
+  index would make it a real file dialog rather than a prompt with a default.
+
+- [ ] **Unnamed buffers have nowhere to persist to.** Session restore is keyed
+  on paths, so a scratch buffer from cmd+n is the one tab a restored session
+  cannot bring back. It needs the dirty-buffer journal below, not a path.
 
 - [ ] **Session persistence** — tabs, cursors, scroll, sidebar state, expanded
   directories, and the focused pane, so a returning session lands where it was
@@ -111,18 +88,6 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Known rough edges
 
-- [ ] **The match cap makes a common query look narrow.** `MaxMatches` is 500
-  across the whole search and the walk is lexical, so a common term spends the
-  entire budget on whatever sorts first and `SkipAll` stops before the rest of
-  the tree is seen. Measured: `te` reports 500 results in 6 files, all of them at
-  the repository root, 200 from `LICENSE` alone; `testing` reports 361 in 34
-  files because it never hits the cap. The reported file count therefore says
-  more about walk order than about the query, and it is least informative
-  exactly when the term is most common. Wants a per-file cap — 20 or so, with
-  the header showing the true count — so no single file eats the budget, and a
-  global cap high enough that the walk usually finishes. Assert it with a
-  fixture where one early file holds more matches than the cap, and check that
-  later directories still appear.
 - [ ] **Resize still drops events.** `NativeHost.emit` discards on a full
   channel, which a drag burst produces. `Present` reads the true size every
   frame so the picture stays correct, but a dropped event means no redraw is
@@ -138,9 +103,9 @@ findings and decisions live in INVESTIGATIONS.md.
   stops from its own start. Self-consistent between the wrap engine and the
   renderer, so the caret stays correct, but it looks slightly off when a line
   with mid-text tabs wraps.
-- [ ] **Four actions are bound but unimplemented**, so their chords are taken
+- [ ] **Three actions are bound but unimplemented**, so their chords are taken
   from the terminal for nothing: `ToggleAgent` (cmd+alt+b), `CommandPalette`
-  (cmd+shift+p), `GotoLine` (ctrl+g), `GotoSymbol` (cmd+shift+o).
+  (cmd+shift+p), `GotoSymbol` (cmd+shift+o). `GotoLine` was the fourth.
 - [ ] **Wheel scroll does nothing in the alt screen on iTerm2.** raj never
   enables mouse reporting, so iTerm2 sends wheel events to its own scrollback,
   which the alt screen is not part of. iTerm2's translation of the wheel into
@@ -158,7 +123,13 @@ findings and decisions live in INVESTIGATIONS.md.
   off a hash of `Bindings` — would remove the setup step and keep the profile
   from drifting when the table changes. Deferred: what is there works.
 - [ ] `raj --config ghostty` must be regenerated and the terminal reloaded
-  whenever the binding table changes. Same for the iTerm2 profile.
+  whenever the binding table changes. Same for the iTerm2 profile. **Outstanding
+  now**: cmd+n was added to `Bindings`, so both configs are stale until they are
+  regenerated, and until then the chord opens a Ghostty window rather than a raj
+  tab. Under the `kkp_on` gate it is claimed only while raj is focused, so
+  Ghostty's own cmd+n is untouched everywhere else; under the iTerm2 profile it
+  is claimed for the whole window, which is the same trade the profile already
+  makes for cmd+w.
 - [ ] **Document what is supported** — a keybinding table generated from
   `keys.Bindings` so it cannot drift, with the unimplemented actions marked.
 - [ ] No Bubbletea adapter yet. The `ui.Host` interface is six methods.

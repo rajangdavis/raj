@@ -33,8 +33,23 @@ type Query struct {
 
 // Limits keep an interactive search bounded. A search box that hangs the editor
 // on a large repository is worse than one that stops early and says so.
+// The two caps answer different questions. MaxPerFile stops one file eating the
+// budget: the walk is lexical, so a single early file with hundreds of hits
+// used to spend the whole allowance before the rest of the tree was seen —
+// measured, `te` reported 500 results in 6 files, all at the repository root
+// and 200 of them from LICENSE alone, while the rarer `testing` reported 361 in
+// 34 files simply because it never hit the cap. The file count therefore said
+// more about walk order than about the query, and it was least informative
+// exactly when the term was most common.
+//
+// MaxMatches is the hard stop that keeps the pane bounded, and is set high
+// enough that with a per-file cap in front of it the walk usually finishes.
+// Matching is around a thirtieth of a search's cost, so counting past the
+// per-file cap to report a true total is close to free; it is the opening and
+// reading that is expensive, and that happens either way.
 const (
-	MaxMatches  = 500
+	MaxMatches  = 2000
+	MaxPerFile  = 20
 	MaxFileSize = 2 << 20
 )
 
@@ -47,10 +62,29 @@ type Result struct {
 	// nothing, a file opened costs everything.
 	Considered int
 	Capped     bool
+
+	// Counts is the true number of matches per file, which is not the number
+	// reported: a file past MaxPerFile contributes twenty rows and its real
+	// total here, so the header can say "20 of 214" rather than quietly
+	// implying the file holds twenty.
+	Counts map[string]int
 	// Stopped is set when the search was abandoned before finishing, which
 	// happens whenever the query changes while a walk is in progress.
 	Stopped bool
 	Err     error
+}
+
+// Total is how many matches the search actually found, which is at least
+// len(Matches): files past MaxPerFile contribute more here than they do rows.
+func (r Result) Total() int {
+	if r.Counts == nil {
+		return len(r.Matches)
+	}
+	n := 0
+	for _, c := range r.Counts {
+		n += c
+	}
+	return n
 }
 
 // Run searches root with no way to stop it. Prefer RunContext: an interactive
@@ -121,8 +155,12 @@ func RunContext(ctx context.Context, root string, q Query) Result {
 			return filepath.SkipAll
 		}
 		res.Considered++
-		if n := scan(path, m, &buf, &res); n > 0 {
+		if _, total := scan(path, m, &buf, &res); total > 0 {
 			res.Files++
+			if res.Counts == nil {
+				res.Counts = map[string]int{}
+			}
+			res.Counts[path] = total
 		}
 		return nil
 	})
@@ -161,16 +199,19 @@ func compile(q Query) (*regexp.Regexp, error) {
 // the cost is paid per match rather than per line.
 //
 // MaxFileSize bounds the buffer, so "read it all" is bounded too.
-func scan(path string, m matcher, buf *[]byte, res *Result) int {
+// scan reports how many matches it recorded and how many the file actually
+// holds. The two differ once a file passes MaxPerFile, and the difference is
+// the whole point: the pane can then say how much it is not showing.
+func scan(path string, m matcher, buf *[]byte, res *Result) (found, total int) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
 	defer f.Close()
 
 	data, err := readAll(f, buf)
 	if err != nil || bytes.IndexByte(data, 0) >= 0 {
-		return 0 // unreadable, or a NUL byte somewhere: binary
+		return 0, 0 // unreadable, or a NUL byte somewhere: binary
 	}
 
 	hay, lineFallback := m.prepare(data)
@@ -178,7 +219,6 @@ func scan(path string, m matcher, buf *[]byte, res *Result) int {
 		return scanLines(path, lineFallback, data, res)
 	}
 
-	found := 0
 	line, lineStart, from := 1, 0, 0
 	for from <= len(data) {
 		start, end, ok := m.find(hay[from:])
@@ -204,17 +244,20 @@ func scan(path string, m matcher, buf *[]byte, res *Result) int {
 			lineEnd = start + nl
 		}
 
+		total++
 		if len(res.Matches) >= MaxMatches {
 			res.Capped = true
-			return found
+			return found, total
 		}
-		text := data[lineStart:lineEnd]
-		res.Matches = append(res.Matches, Match{
-			Path: path, Line: line,
-			Text: strings.TrimRight(string(text), " \t"),
-			Col:  start - lineStart, Len: end - start,
-		})
-		found++
+		if found < MaxPerFile {
+			text := data[lineStart:lineEnd]
+			res.Matches = append(res.Matches, Match{
+				Path: path, Line: line,
+				Text: strings.TrimRight(string(text), " \t"),
+				Col:  start - lineStart, Len: end - start,
+			})
+			found++
+		}
 
 		// At most one match is reported per line, as before.
 		if lineEnd >= len(data) {
@@ -224,7 +267,7 @@ func scan(path string, m matcher, buf *[]byte, res *Result) int {
 		lineStart = lineEnd + 1
 		from = lineStart
 	}
-	return found
+	return found, total
 }
 
 // readAll fills buf with the contents of f, growing it if needed and handing
@@ -255,8 +298,7 @@ func readAll(f *os.File, buf *[]byte) ([]byte, error) {
 // bytes under a case-insensitive query, where folding in place would change
 // byte offsets. Only such files pay the per-line regexp cost, and only for
 // themselves.
-func scanLines(path string, m matcher, data []byte, res *Result) int {
-	found := 0
+func scanLines(path string, m matcher, data []byte, res *Result) (found, total int) {
 	for line, off := 1, 0; off <= len(data); line++ {
 		end := len(data)
 		if nl := bytes.IndexByte(data[off:], '\n'); nl >= 0 {
@@ -264,23 +306,26 @@ func scanLines(path string, m matcher, data []byte, res *Result) int {
 		}
 		raw := data[off:end]
 		if start, stop, ok := m.find(raw); ok {
+			total++
 			if len(res.Matches) >= MaxMatches {
 				res.Capped = true
-				return found
+				return found, total
 			}
-			res.Matches = append(res.Matches, Match{
-				Path: path, Line: line,
-				Text: strings.TrimRight(string(raw), " \t"),
-				Col:  start, Len: stop - start,
-			})
-			found++
+			if found < MaxPerFile {
+				res.Matches = append(res.Matches, Match{
+					Path: path, Line: line,
+					Text: strings.TrimRight(string(raw), " \t"),
+					Col:  start, Len: stop - start,
+				})
+				found++
+			}
 		}
 		if end >= len(data) {
 			break
 		}
 		off = end + 1
 	}
-	return found
+	return found, total
 }
 
 var errTooBig = errors.New("file exceeds MaxFileSize")

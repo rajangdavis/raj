@@ -7,7 +7,7 @@ import (
 
 // Undoing every action must return the document exactly to its starting text.
 func TestFuzzUndoRestoresOriginal(t *testing.T) {
-	for seed := 0; seed < 200; seed++ {
+	for seed := 0; seed < 3000; seed++ {
 		rng := rand.New(rand.NewSource(int64(seed)))
 		const orig = "package main\n\nfunc main() {\n\tprintln(1)\n}\n"
 		s := NewSession(NewDoc(orig, 5))
@@ -45,7 +45,7 @@ func TestFuzzUndoRestoresOriginal(t *testing.T) {
 
 // Redoing everything must return to the final text.
 func TestFuzzRedoRestoresFinal(t *testing.T) {
-	for seed := 0; seed < 200; seed++ {
+	for seed := 0; seed < 3000; seed++ {
 		rng := rand.New(rand.NewSource(int64(seed)))
 		s := NewSession(NewDoc("abcdefghij\n", 5))
 		actions := rng.Intn(6) + 1
@@ -77,7 +77,7 @@ func TestFuzzRedoRestoresFinal(t *testing.T) {
 // Undo and redo must interleave: undo, redo, undo again all reach the states a
 // user would expect, in any order.
 func TestFuzzUndoRedoInterleaved(t *testing.T) {
-	for seed := 0; seed < 200; seed++ {
+	for seed := 0; seed < 3000; seed++ {
 		rng := rand.New(rand.NewSource(int64(seed)))
 		s := NewSession(NewDoc("hello world\n", 5))
 

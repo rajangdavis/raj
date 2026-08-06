@@ -9,7 +9,8 @@ repeated.
 
 ## Working
 
-Typing, motions, selections, multi-cursor (cmd+alt+up/down), undo/redo, save,
+Typing, motions, selections, multi-cursor (cmd+alt+up/down), undo/redo, new
+files (cmd+n), save and save-as,
 indent/outdent on selections, tabs with reopen, the explorer with a changed-only
 filter, search with include/exclude globs and collapsible per-file groups, the
 cmd+p picker, narrow-mode single-pane layout, agent-authored text rendering with
@@ -182,3 +183,95 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   SIGWINCH, and a stopped process services no signals.
 - [x] **chroma to v2.24.0** — the newest release still declaring `go 1.22`.
 - [x] **Documents split** — TODO, BENCHMARKS, INVESTIGATIONS, COMPLETED.
+- [x] **New file (cmd+n)** — an empty unnamed buffer in a new tab. Two presses
+  mean two buffers: `Tabs.Open` dedupes by path and an unnamed buffer has none.
+- [x] **cmd+w asks before discarding.** A dirty tab now stops for Save / Don't
+  Save / Cancel, and the Save answer closes the tab only once the bytes are
+  actually on disk — a cancelled save-as leaves the tab open rather than
+  discarding exactly the work the answer asked to keep.
+- [x] **Save-as.** cmd+s on an unnamed buffer asks where to put it, seeded with
+  the workspace root; a relative answer resolves against the root rather than
+  the process's working directory. An existing file gets an overwrite check
+  first. Naming the buffer rebuilds the highlighter, so a scratch file saved as
+  `.go` colours immediately.
+- [x] **`internal/prompt`** — the modal seam all three of the above needed. Two
+  shapes (a text question, a button choice) and a continuation rather than a
+  return value, because the interesting flows are chains: close asks whether to
+  save, which asks for a path, which may ask about overwriting, and only then
+  closes the tab. The dialog closes itself *before* delivering an answer, so the
+  next question in a chain does not open underneath the one it replaces.
+- [x] **The rebase coordinate frame.** `Session.rebase` was asking one question
+  where there were two: where a range is now (the journal's order, which counts
+  every op) and whether it survived (the document's contents, which only live
+  edits can damage). Splitting them fixed the last of the rune-splitting bug,
+  removed the `slide` flag as redundant, and replaced a fuzz seed with five
+  deterministic tests — one per mechanism, each verified to fail when its
+  mechanism is broken. Full account in INVESTIGATIONS.md.
+- [x] **A finished search no longer waits for the tick.** Results are installed
+  on the event thread, and nothing woke that thread, so a search finishing
+  during a typing pause sat on its answer for up to 150 ms. `Host.Post` and a
+  payload-free `ui.Wake` close it — one event for all background work rather
+  than one per producer, which is the seam the agent pane needs for the same
+  reason. A superseded walk stays quiet, since waking the loop to repaint an
+  answer that was thrown away is worse than not waking it at all.
+- [x] **cut and copy follow focus.** Both are global actions, claimed before any
+  pane sees the chord, so they always acted on `Tabs.Active()`: cmd+c in the
+  search box copied from the editor and cmd+x edited the document being
+  searched. `app.focusedInput` now asks the focused thing whether it owns a
+  field — including the find bar, which lives inside the editor pane and so is
+  invisible to focus alone, and the modal dialogs, which had to stop swallowing
+  the clipboard chords for it to reach them. Cut with nothing selected in a
+  field does nothing rather than emptying it: there is no "current line" to fall
+  back on the way a document has.
+- [x] **go-to-line (ctrl+g)**, on the dialog seam the save-as work added — which
+  is most of why it was cheap. It takes `120`, `12:4` and `:3`, because a
+  compiler, a linter and a stack trace all print line:column and pasting one in
+  should not need editing down; a bare column means the line already showing,
+  and the field is seeded with where the cursor is, so the dialog answers "where
+  am I" as well as asking "where to". Out-of-range clamps rather than refuses,
+  and the clamping is the view layer's — `LineStart`, `Center` and `OffsetAt`
+  all already do it, so repeating it here was deleted as untested duplication.
+- [x] **Quit asks about unsaved changes.** cmd+w already guarded one tab, which
+  made the guard a property of which chord you pressed rather than of the
+  buffer — and quit is the one with every unsaved tab behind it. One dialog:
+  the file is named when there is one and counted when there are several, since
+  a list of names does not fit and a bare count withholds the only useful detail
+  when only one thing is at stake. Save walks every dirty tab, focusing each
+  before saving so a save-as dialog is asking about the buffer on screen, and
+  recursing through the continuation rather than looping — a loop would have run
+  to the end before the first dialog was answered. Cancelling a path cancels the
+  quit. A second ctrl+c while the question is up forces the exit, because ctrl+c
+  is what people press when they want out now and answering it by asking again
+  is the wedge the modal was written to avoid.
+- [x] **shift+tab leaves a sidebar.** Both panes stopped it at their first
+  component, so the only way back to the editor from there was tabbing all the
+  way forward or a chord. Decided against wrapping the ring: forward already
+  exits, so wrapping would make backwards mean something different from forwards
+  and land focus at the far end of the pane rather than out of it. Each pane is
+  now a ring segment with an exit at both ends. The constraint the dead end was
+  protecting is untouched — tab indents in the document, so coming back is still
+  a chord, and shift+tab outdents once focus is in the editor.
+- [x] **The search pane no longer vanishes on a short terminal.** `Render`
+  returned early below twelve rows, so the sidebar opened onto nothing at all —
+  not even a border, which reads as a redraw bug rather than a size one. It now
+  sheds the glob fields and toggles first, since those are set once and left
+  alone while the query and its results are why the pane is open, and says
+  "too short" rather than nothing when even the query will not fit. The focus
+  ring agrees with the layout: tab skips components that are not drawn, and
+  shrinking pulls focus back to the query rather than leaving it on a field that
+  is no longer on screen.
+- [x] **A per-file match cap.** `MaxMatches` was 500 across the whole search and
+  the walk is lexical, so one early file could spend the entire budget before
+  the rest of the tree was seen: `te` reported 500 results in 6 files, all at the
+  repository root and 200 of them from LICENSE alone, while the rarer `testing`
+  reported 361 in 34 files purely because it never hit the cap. The file count
+  said more about walk order than about the query, and was least informative
+  exactly when the term was most common. Now `MaxPerFile` is 20 and the global
+  cap is 2000, so no single file eats the budget and the walk usually finishes.
+  Scanning continues past the per-file cap to count — matching is around a
+  thirtieth of a search's cost, so the true number is close to free, and the
+  pane reports it: "22 of 82 results in 3 files" at the top and "(20 of 80)" on
+  the file that was cut down. Without that the cap would have traded a
+  misleading number for a quietly missing one. Asserted against a fixture where
+  a lexically-first file holds four times the cap and the interesting content is
+  in a directory the walk reaches afterwards.

@@ -68,6 +68,17 @@ func (t *Tabs) Add(p *editor.Pane) {
 	t.active = len(t.panes) - 1
 }
 
+// NewFile opens an empty unnamed buffer in a new tab and focuses it.
+//
+// It never reuses an existing untitled tab. Open dedupes by path, and an unnamed
+// buffer has none — two cmd+n presses mean two scratch buffers, which is what
+// every editor that has the chord does.
+func (t *Tabs) NewFile() *editor.Pane {
+	p := editor.NewPane(editor.NewFile("", "", t.tab))
+	t.Add(p)
+	return p
+}
+
 // Close removes the active tab. It never closes raj itself: closing the last
 // tab leaves an empty editor, which is what you asked for and what stops a
 // stray cmd+w from ending the session.
@@ -127,6 +138,31 @@ func (t *Tabs) DirtyCount() (n int) {
 		}
 	}
 	return
+}
+
+// Dirty lists the panes with unsaved changes, in tab order, so a caller asking
+// about them can also name them.
+func (t *Tabs) Dirty() []*editor.Pane {
+	var out []*editor.Pane
+	for _, p := range t.panes {
+		if p.File.Dirty() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Focus makes p the active tab. Used when a caller has to visit tabs in turn —
+// asking about an unsaved buffer is meaningless if the buffer being asked about
+// is not the one on screen.
+func (t *Tabs) Focus(p *editor.Pane) bool {
+	for i, q := range t.panes {
+		if q == p {
+			t.active = i
+			return true
+		}
+	}
+	return false
 }
 
 // Paths lists the open files in order, for session persistence.

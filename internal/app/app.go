@@ -4,12 +4,15 @@
 package app
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 
 	"raj/internal/editor"
 	"raj/internal/explorer"
 	"raj/internal/keys"
 	"raj/internal/picker"
+	"raj/internal/prompt"
 	"raj/internal/search"
 	"raj/internal/tabs"
 	"raj/internal/ui"
@@ -26,6 +29,7 @@ type App struct {
 	Explorer *explorer.Pane
 	Search   *search.Pane
 	Picker   *picker.Picker
+	Prompt   *prompt.Prompt
 
 	root    string
 	sidebar Sidebar
@@ -42,15 +46,22 @@ type App struct {
 	WrapDefault bool
 	dark        bool
 	lastLayout  Layout
-	status      string
-	focused     bool
-	quit        bool
+	// promptReturn is where focus goes when a dialog closes. Captured when the
+	// first prompt in a chain opens, so an overwrite check answered three
+	// dialogs deep still lands back where the user was.
+	promptReturn Focus
+	status       string
+	focused      bool
+	quit         bool
+	// quitAsked is true while the quit confirmation is on screen, so a second
+	// Quit forces the exit instead of reopening the same question.
+	quitAsked bool
 }
 
 // New builds an application rooted at a directory.
 func New(host ui.Host, root string, tabWidth int) *App {
 	cols, rows := host.Size()
-	return &App{
+	a := &App{
 		host:     host,
 		keymap:   keys.NewKeymap(),
 		screen:   ui.NewScreen(cols, rows),
@@ -58,6 +69,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		Explorer: explorer.NewPane(root),
 		Search:   search.NewPane(root),
 		Picker:   picker.New(root),
+		Prompt:   prompt.New(),
 		root:     root,
 		sidebar:  SidebarExplorer,
 		focus:    FocusSidebar,
@@ -70,6 +82,12 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		wth:         widget.DefaultTheme(),
 		focused:     true,
 	}
+	// A finished search used to wait for the 150 ms tick, because the result is
+	// installed on the event thread and nothing woke that thread. Posting a
+	// Wake closes the gap for typing pauses, and it is the seam the agent pane
+	// needs for exactly the same reason.
+	a.Search.Notify = func() { host.Post(ui.Wake{}) }
+	return a
 }
 
 // syncTheme adopts the terminal's measured background once the OSC query has
@@ -135,6 +153,10 @@ func (a *App) Handle(e ui.Event) {
 	case ui.Suspended:
 		a.screen.Clear()
 		a.host.Invalidate()
+	case ui.Wake:
+		// Nothing to do here. Background work parks its result where the event
+		// thread already looks, and Run draws after every event — so the value
+		// of a Wake is entirely in having ended the wait for the next tick.
 	case ui.Tick:
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.
@@ -154,6 +176,14 @@ func (a *App) handleKey(k ui.Key) {
 		return
 	}
 	a.Debug.record(k, scope, action, text)
+	// A modal dialog gets first refusal, ahead of the globals: cmd+w while
+	// "save changes?" is on screen must not close the tab the question is
+	// about.
+	if a.Prompt.Open && !passesModal(action) {
+		a.Prompt.Handle(action, text)
+		a.settlePrompt()
+		return
+	}
 	if a.handleGlobal(action) {
 		return
 	}
@@ -172,10 +202,22 @@ func (a *App) handleKey(k ui.Key) {
 	}
 }
 
+// passesModal names the few actions a dialog must not swallow.
+//
+// Quit is here so a dialog can never wedge the session. Cut and copy are here
+// because the global handler is what knows how to reach a text field at all —
+// focusedInput asks the dialog first, so letting them through is what makes
+// cmd+c inside a save-as box copy the path rather than do nothing.
+func passesModal(a keys.Action) bool {
+	return a == keys.Quit || a == keys.Cut || a == keys.Copy
+}
+
 // scope is the keymap scope for the focused pane. It is what makes tab indent
 // in the editor and cycle focus everywhere else.
 func (a *App) scope() keys.Scope {
 	switch {
+	case a.focus == FocusPrompt:
+		return keys.Prompt
 	case a.focus == FocusPicker:
 		return keys.Picker
 	case a.focus == FocusSidebar && a.sidebar == SidebarSearch:
@@ -195,11 +237,11 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.Debug.Open = !a.Debug.Open
 		a.Debug.sample()
 	case keys.Quit:
-		a.quit = true
+		a.tryQuit()
 	case keys.Suspend:
 		a.host.Suspend()
 	case keys.Save:
-		a.save()
+		a.saveActive(nil)
 	case keys.Cut:
 		a.clip(true)
 	case keys.Copy:
@@ -236,8 +278,12 @@ func (a *App) handleGlobal(action keys.Action) bool {
 			return true
 		}
 		return false
+	case keys.GotoLine:
+		a.gotoLine()
+	case keys.NewFile:
+		a.newFile()
 	case keys.CloseTab:
-		a.Tabs.Close()
+		a.closeTab()
 	case keys.ReopenTab:
 		// Route through OpenFile so a reopened tab gets the same treatment as
 		// any other: theme, highlighting, focus.
@@ -291,9 +337,11 @@ func (a *App) toggleSidebar() {
 	a.focus = FocusEditor
 }
 
-// handleSidebar routes to the open sidebar pane. Both panes report when tab has
-// walked off their last component, at which point focus crosses to the editor —
-// and cannot come back with shift+tab, only with a chord.
+// handleSidebar routes to the open sidebar pane. Both panes report when focus
+// has walked off either end — tab past the last component or shift+tab back
+// past the first — at which point it crosses to the editor. Coming back is a
+// chord, deliberately: tab indents in the document, so a one-key route in would
+// make editing interruptible.
 func (a *App) handleSidebar(action keys.Action, text string) {
 	switch a.sidebar {
 	case SidebarExplorer:
@@ -361,6 +409,9 @@ func (a *App) paste(text string) {
 		return
 	}
 	switch {
+	case a.focus == FocusPrompt:
+		a.Prompt.Handle(keys.None, line)
+		a.settlePrompt()
 	case a.focus == FocusPicker:
 		a.OpenFile(a.Picker.Handle(keys.None, line))
 	case a.focus == FocusSidebar && a.sidebar == SidebarSearch:
@@ -397,6 +448,94 @@ func firstLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// gotoLine asks for a line number and jumps there.
+//
+// It accepts "12", "12:5" and ":5" — the line:column form because that is what
+// a compiler, a linter and a stack trace all print, and pasting one in should
+// work without editing it down. Out-of-range values clamp rather than refuse:
+// "go to line 9999" in a 300-line file means the end, and an error message
+// there would be pedantry.
+func (a *App) gotoLine() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	here, _ := p.File.LineCol(p.Cursors.Primary().Head)
+	a.ask("Go to line", itoa(here+1), func(answer string, ok bool) {
+		if !ok {
+			return
+		}
+		line, col, valid := parsePosition(answer)
+		if !valid {
+			a.status = "not a line number: " + answer
+			return
+		}
+		if line == 0 {
+			line = here + 1 // ":40" is a column on the line already showing
+		}
+		a.jumpTo(line)
+		if col > 0 {
+			a.jumpToColumn(line, col)
+		}
+	})
+}
+
+// parsePosition reads "line", "line:col" or ":col". A missing line means the
+// one the cursor is already on, which is what ":40" from a column-only
+// reference should mean.
+func parsePosition(text string) (line, col int, ok bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0, 0, false
+	}
+	lineText, colText := text, ""
+	if i := strings.IndexByte(text, ':'); i >= 0 {
+		lineText, colText = text[:i], text[i+1:]
+	}
+	if lineText != "" {
+		if line, ok = atoi(lineText); !ok {
+			return 0, 0, false
+		}
+	}
+	if colText != "" {
+		if col, ok = atoi(colText); !ok {
+			return 0, 0, false
+		}
+	}
+	return line, col, line > 0 || col > 0
+}
+
+// atoi accepts a non-negative decimal and nothing else. strconv would accept a
+// leading sign, and "go to line -3" is a typo rather than a request.
+func atoi(s string) (int, bool) {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(s[i]-'0')
+		if n > 1<<30 {
+			return 1 << 30, true // clamped below anyway
+		}
+	}
+	return n, len(s) > 0
+}
+
+// jumpToColumn places the cursor within a line already scrolled to.
+//
+// Out-of-range values need no guard here: Index.LineStart, Viewport.Center and
+// File.OffsetAt all clamp, which is where that invariant belongs. "Go to line
+// 9999" in a 300-line file lands on the end because the index says so, not
+// because this function checked.
+func (a *App) jumpToColumn(line, col int) {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	off := p.File.OffsetAt(line-1, col-1)
+	p.Cursors.Set(off, off)
+}
+
 // jumpTo moves the active pane's cursor to a 1-based line and centres it.
 func (a *App) jumpTo(line int) {
 	p := a.Tabs.Active()
@@ -408,16 +547,235 @@ func (a *App) jumpTo(line int) {
 	p.Viewport.Center(line-1, p.File.Lines())
 }
 
-func (a *App) save() {
+// ---------- file lifecycle ----------
+//
+// New, save and close are one story rather than three features, because the
+// interesting cases are where they meet: an unnamed buffer has nowhere to save
+// to, and a dirty buffer must not be closed without asking. Both answers arrive
+// from a dialog, so each step below takes a continuation and runs it only once
+// the previous question has actually been answered.
+
+// newFile opens an empty unnamed buffer.
+func (a *App) newFile() {
+	p := a.Tabs.NewFile()
+	p.File.SetDark(a.host.Theme().Dark())
+	p.Wrap = a.WrapDefault
+	a.focus = FocusEditor
+	a.status = ""
+}
+
+// closeTab closes the active tab, stopping to ask when it holds unsaved work.
+//
+// The guard lives here rather than in Tabs because Tabs is a container: it has
+// no way to ask a question, and no business deciding whether losing an edit is
+// acceptable.
+func (a *App) closeTab() {
 	p := a.Tabs.Active()
-	if p == nil {
+	if p == nil || !p.File.Dirty() {
+		a.Tabs.Close()
 		return
 	}
+	a.confirm("Unsaved changes", "Save changes to "+p.File.Name()+" before closing?",
+		prompt.SaveOptions(), func(answer string, ok bool) {
+			switch {
+			case !ok || answer == prompt.Cancel:
+				return
+			case answer == prompt.Discard:
+				a.Tabs.Close()
+			default:
+				// Close only once the bytes are on disk. A save-as can be
+				// cancelled, and closing anyway would discard exactly the work
+				// the answer asked to keep.
+				a.saveActive(func(saved bool) {
+					if saved {
+						a.Tabs.Close()
+					}
+				})
+			}
+		})
+}
+
+// saveActive writes the active buffer, asking where to put it when it has no
+// path yet. then reports whether the bytes reached the disk — "the user pressed
+// save" and "the file was saved" are different events, and a caller about to
+// close a tab needs the second.
+func (a *App) saveActive(then func(saved bool)) {
+	p := a.Tabs.Active()
+	if p == nil {
+		report(then, false)
+		return
+	}
+	if p.File.Path == "" {
+		a.saveAs(p, then)
+		return
+	}
+	a.writeTo(p, p.File.Path, then)
+}
+
+// saveAs asks where an unnamed buffer should go.
+//
+// The field is seeded with the workspace root and a separator so the common
+// answer is a bare file name, and a relative answer is resolved against the
+// root rather than the process's working directory — which is wherever raj
+// happened to be launched from and is not what "notes.md" means to someone
+// looking at this tree.
+func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
+	a.ask("Save as", a.root+string(filepath.Separator), func(answer string, ok bool) {
+		if !ok || answer == "" {
+			a.status = "save cancelled"
+			report(then, false)
+			return
+		}
+		path := answer
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(a.root, path)
+		}
+		// Stat rather than trusting the name: the picker and the tree both
+		// show what is already there, but a typed path does not, and silently
+		// replacing a file is the one outcome nobody recovers from.
+		if _, err := os.Stat(path); err == nil {
+			a.confirm("File exists", filepath.Base(path)+" already exists. Overwrite?",
+				[]string{prompt.Overwrite, prompt.Cancel}, func(ans string, ok bool) {
+					if !ok || ans != prompt.Overwrite {
+						a.status = "save cancelled"
+						report(then, false)
+						return
+					}
+					a.writeTo(p, path, then)
+				})
+			return
+		}
+		a.writeTo(p, path, then)
+	})
+}
+
+// writeTo names the buffer if needed and writes it.
+func (a *App) writeTo(p *editor.Pane, path string, then func(saved bool)) {
+	renamed := p.File.Path != path
+	p.File.SetPath(path)
 	if err := p.File.Save(); err != nil {
 		a.status = "save failed: " + err.Error()
+		report(then, false)
 		return
 	}
 	a.status = "saved " + p.File.Name()
+	if renamed {
+		// A rename is the only save that puts a file in the tree that was not
+		// there before. Refreshing on every save would walk the directory on
+		// the keystroke path for nothing.
+		a.Explorer.Tree.Refresh()
+	}
+	report(then, true)
+}
+
+func report(then func(bool), ok bool) {
+	if then != nil {
+		then(ok)
+	}
+}
+
+// tryQuit exits, stopping first if anything would be lost.
+//
+// cmd+w already guards one tab. Leaving quit unguarded made that a property of
+// which chord you happened to press rather than of the buffer, and quit is the
+// one with every unsaved tab behind it rather than one.
+//
+// A second Quit while the question is on screen forces the exit. ctrl+c is what
+// people press when they want out now, and a dialog that answers it by asking
+// again is the wedge the modal was written to avoid.
+func (a *App) tryQuit() {
+	if a.quitAsked {
+		a.quit = true
+		return
+	}
+	dirty := a.Tabs.Dirty()
+	if len(dirty) == 0 {
+		a.quit = true
+		return
+	}
+	a.quitAsked = true
+	a.confirm("Unsaved changes", quitMessage(dirty), prompt.SaveOptions(),
+		func(answer string, ok bool) {
+			a.quitAsked = false
+			switch {
+			case !ok || answer == prompt.Cancel:
+				return
+			case answer == prompt.Discard:
+				a.quit = true
+			default:
+				a.saveAllThenQuit(dirty)
+			}
+		})
+}
+
+// quitMessage names the file when there is one and counts them when there are
+// several. A list of names would not fit the dialog, and a bare count when only
+// one thing is at stake withholds the only detail that matters.
+func quitMessage(dirty []*editor.Pane) string {
+	if len(dirty) == 1 {
+		return "Save changes to " + dirty[0].File.Name() + " before quitting?"
+	}
+	return "Save changes to " + itoa(len(dirty)) + " files before quitting?"
+}
+
+// saveAllThenQuit walks the dirty tabs, saving each and quitting only if they
+// all land.
+//
+// It recurses through the continuation rather than looping, because any of them
+// may be unnamed and stop for a path — and a loop would have run to the end
+// before the first dialog was answered. Each tab is focused before it is saved,
+// so a save-as dialog is asking about the buffer on screen.
+func (a *App) saveAllThenQuit(dirty []*editor.Pane) {
+	if len(dirty) == 0 {
+		a.quit = true
+		return
+	}
+	p := dirty[0]
+	a.Tabs.Focus(p)
+	a.saveActive(func(saved bool) {
+		if !saved {
+			// Cancelling a path is cancelling the quit. Exiting anyway would
+			// discard exactly the work the answer asked to keep.
+			a.status = "quit cancelled"
+			return
+		}
+		a.saveAllThenQuit(dirty[1:])
+	})
+}
+
+// ---------- dialogs ----------
+
+// ask and confirm open a modal question and hand it focus. Both hide the file
+// picker: it is the other full-screen overlay, and two of them at once means
+// keys going somewhere invisible.
+func (a *App) ask(title, initial string, done func(string, bool)) {
+	a.beforePrompt()
+	a.Prompt.Ask(title, initial, done)
+}
+
+func (a *App) confirm(title, message string, options []string, done func(string, bool)) {
+	a.beforePrompt()
+	a.Prompt.Confirm(title, message, options, done)
+}
+
+func (a *App) beforePrompt() {
+	if a.focus != FocusPrompt {
+		a.promptReturn = a.focus
+	}
+	a.Picker.Hide()
+	if a.promptReturn == FocusPicker {
+		a.promptReturn = FocusEditor
+	}
+	a.focus = FocusPrompt
+}
+
+// settlePrompt restores focus once a dialog has closed for good. A continuation
+// is free to open the next question in a chain, so this checks whether one did
+// rather than assuming an answered dialog is the end of the story.
+func (a *App) settlePrompt() {
+	if !a.Prompt.Open && a.focus == FocusPrompt {
+		a.focus = a.promptReturn
+	}
 }
 
 // tabNumber maps the goto-tab actions to their index.
@@ -463,9 +821,39 @@ func (a *App) refreshSyntax() {
 	}
 }
 
+// focusedInput is the text field the keys are going into, or nil when they are
+// going into the document, a list, or a toggle.
+//
+// cut and copy are global actions — they are claimed before any pane sees the
+// chord — so without this they always acted on Tabs.Active(): cmd+c in the
+// search box copied from the editor, and cmd+x edited the document being
+// searched. Asking the focused thing whether it owns a selection is the fix,
+// and the find bar needs it as much as the sidebar does, because it lives
+// inside the editor pane rather than beside it.
+func (a *App) focusedInput() *widget.Input {
+	if in := a.Prompt.ActiveInput(); in != nil {
+		return in // modal: it owns the keys whatever focus says
+	}
+	switch {
+	case a.focus == FocusPicker:
+		return a.Picker.ActiveInput()
+	case a.focus == FocusSidebar && a.sidebar == SidebarSearch:
+		return a.Search.ActiveInput()
+	case a.focus == FocusEditor:
+		if p := a.Tabs.Active(); p != nil {
+			return p.Find.ActiveInput()
+		}
+	}
+	return nil
+}
+
 // clip copies or cuts to the system clipboard via OSC 52, and keeps an internal
 // copy so paste works even where the terminal refuses clipboard writes.
 func (a *App) clip(cut bool) {
+	if in := a.focusedInput(); in != nil {
+		a.clipField(in, cut)
+		return
+	}
 	p := a.Tabs.Active()
 	if p == nil {
 		return
@@ -484,6 +872,30 @@ func (a *App) clip(cut bool) {
 		verb = "cut"
 	}
 	a.status = verb + " " + itoa(len(clip.Text)) + " bytes"
+}
+
+// clipField copies or cuts inside a text field. A field carries no pieces, so
+// this is plain text rather than an editor.Clip with a snapshot — pasting it
+// back into a document costs a copy, which for a search query is nothing.
+func (a *App) clipField(in *widget.Input, cut bool) {
+	text := in.Copy()
+	if cut {
+		text = in.Cut()
+	}
+	if text == "" {
+		// Nothing selected. Deliberately not falling back to the whole field:
+		// cmd+x with no selection emptying the search box would be a
+		// destructive surprise, and the document behaviour it would be
+		// imitating (cut the current line) has no counterpart here.
+		return
+	}
+	a.clipboard = editor.Clip{Text: text}
+	a.host.SetClipboard(text)
+	verb := "copied"
+	if cut {
+		verb = "cut"
+	}
+	a.status = verb + " " + itoa(len(text)) + " bytes"
 }
 
 func itoa(n int) string {

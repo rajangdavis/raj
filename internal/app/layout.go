@@ -82,4 +82,5 @@ const (
 	FocusEditor Focus = iota
 	FocusSidebar
 	FocusPicker
+	FocusPrompt
 )

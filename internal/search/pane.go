@@ -28,8 +28,13 @@ type Pane struct {
 	rows      []Row
 	collapsed map[string]bool
 	visited   bool
-	list      widget.List
-	spot      int
+	// compact records the layout the last Render chose, so the focus ring can
+	// agree with it. Height is not known at Handle time and the alternative —
+	// threading it through every caller — would put a rendering concern into
+	// the key path.
+	compact bool
+	list    widget.List
+	spot    int
 
 	// Searching happens off the event thread: Run walks the whole tree, and a
 	// keystroke must never wait for it. The worker touches nothing the rest of
@@ -59,6 +64,16 @@ type Pane struct {
 	// garbage collector, so the symptom is a laggy editor rather than a slow
 	// search.
 	cancel context.CancelFunc
+
+	// Notify is called when a finished result has been parked, so the event
+	// loop can come back for it instead of waiting out the tick. Optional: a
+	// nil Notify simply means the result is picked up on the next pass, which
+	// is what tests that drive the pane directly want.
+	//
+	// It is a plain func rather than a ui.Host so that this package keeps
+	// knowing nothing about who is driving it, and it is called OFF the event
+	// thread — whatever it does must be safe from a worker goroutine.
+	Notify func()
 
 	// lastDur is how long the last completed search took, and abandoned counts
 	// the ones cancelled before finishing. Both are read by the debug pane:
@@ -94,7 +109,11 @@ const (
 // hit spends the columns that should be showing the matching text.
 type Row struct {
 	Path  string
-	Count int   // header only: matches in this file
+	Count int // header only: matches shown for this file
+	// Total is how many the file actually holds. It exceeds Count once the
+	// file passes MaxPerFile, and the header says so rather than letting the
+	// shown number pass for the real one.
+	Total int
 	Match Match // zero for a header
 	IsHdr bool
 	Open  bool // header only: whether its matches are showing
@@ -121,7 +140,11 @@ func (p *Pane) group() {
 			j++
 		}
 		open := !p.collapsed[path]
-		p.rows = append(p.rows, Row{Path: path, Count: j - i, IsHdr: true, Open: open})
+		total := j - i
+		if n, ok := p.Result.Counts[path]; ok && n > total {
+			total = n
+		}
+		p.rows = append(p.rows, Row{Path: path, Count: j - i, Total: total, IsHdr: true, Open: open})
 		if open {
 			for _, m := range p.Result.Matches[i:j] {
 				p.rows = append(p.rows, Row{Path: path, Match: m})
@@ -213,20 +236,44 @@ func (p *Pane) Handle(a keys.Action, text string) (path string, line int, exit b
 		p.spot = spotResults
 		return "", 0, false
 	}
-	if in := p.activeInput(); in != nil && in.Handle(a, text) {
+	if in := p.ActiveInput(); in != nil && in.Handle(a, text) {
 		p.run()
 		return "", 0, false
 	}
 	switch a {
 	case keys.CycleFocus:
-		if p.spot+1 >= spotCount {
-			return "", 0, true
+		n := p.spot
+		for {
+			if n++; n >= spotCount {
+				return "", 0, true
+			}
+			if p.visible(n) {
+				break
+			}
 		}
-		p.spot++
+		p.spot = n
 	case keys.CycleFocusBack:
-		if p.spot > 0 {
-			p.spot--
+		// Symmetric with tab walking off the last component: the pane is a
+		// segment of the ring with an exit at each end, and both lead to the
+		// editor. Wrapping round to the results instead would make backwards
+		// mean something different from forwards, and land focus on the far
+		// end of the pane rather than out of it.
+		//
+		// The original reason for stopping here does not apply to leaving. It
+		// was that tab indents in the editor, so a one-key route back IN would
+		// make editing interruptible — and that is untouched, since shift+tab
+		// outdents once focus is in the document.
+		n := p.spot
+		for {
+			if n == 0 {
+				return "", 0, true
+			}
+			n--
+			if p.visible(n) {
+				break
+			}
 		}
+		p.spot = n
 	case keys.LineUp:
 		p.list.Move(-1, len(p.rows))
 	case keys.LineDown:
@@ -291,7 +338,10 @@ func (p *Pane) toggleAt(spot int) bool {
 // Options exposes the current toggle state, for tests.
 func (p *Pane) Options() Query { return p.q }
 
-func (p *Pane) activeInput() *widget.Input {
+// ActiveInput is the field the pane is typing into, or nil when focus is on a
+// toggle or the results. The application asks so that cut and copy act on what
+// the eye is on rather than on the document underneath.
+func (p *Pane) ActiveInput() *widget.Input {
 	switch p.spot {
 	case spotQuery:
 		return &p.query
@@ -372,11 +422,20 @@ func (p *Pane) work(ctx context.Context, gen int, root string, q Query, fn func(
 		// definition and would bias the window downwards.
 		p.lastDur = elapsed
 	}
-	if gen == p.gen && !res.Stopped {
+	parked := gen == p.gen && !res.Stopped
+	if parked {
 		p.pending, p.havePending = res, true
 	}
 	p.inflight--
+	notify := p.Notify
 	p.mu.Unlock()
+
+	// Outside the lock: Notify reaches the event loop, and holding the pane's
+	// lock while doing that invites a deadlock the moment the loop calls back
+	// into the pane.
+	if parked && notify != nil {
+		notify()
+	}
 }
 
 // apply installs a finished search. Event thread only — Handle and Render both
@@ -477,21 +536,60 @@ func (p *Pane) Abandoned() int {
 	return p.abandoned
 }
 
+// Heights the two layouts need. A field is three rows with its border, so the
+// full pane is three fields, the toggle row and one line of results; the
+// compact one is the query and whatever is left.
+const (
+	fullRows    = 11
+	compactRows = 4
+)
+
 // Render draws the pane.
+//
+// It used to return early below twelve rows, so a short terminal opened the
+// sidebar onto nothing at all — not even a border, which reads as a redraw bug
+// rather than a size one. Now it sheds the parts it cannot fit, and says so
+// when it cannot fit any of them.
 func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused bool) {
 	p.apply()
-	if w < 6 || h < 12 {
+	if w < 6 || h < 1 {
 		return
 	}
+	p.compact = h < fullRows
+	if !p.visible(p.spot) {
+		// A resize can leave focus on a component that is no longer drawn,
+		// which would mean typing into something invisible.
+		p.spot = spotQuery
+	}
+	if h < compactRows {
+		s.SetString(x, y, widget.Truncate("search: pane too short", w), th.Dim, w)
+		return
+	}
+
 	p.query.Focused = focused && p.spot == spotQuery
+	p.query.Render(s, x, y, w, th)
+	if p.compact {
+		// The globs and toggles go first: they are set once and then left
+		// alone, while the query and its results are why the pane is open.
+		p.renderResults(s, x, y+3, w, h-3, th, focused)
+		return
+	}
 	p.include.Focused = focused && p.spot == spotInclude
 	p.exclude.Focused = focused && p.spot == spotExclude
-
-	p.query.Render(s, x, y, w, th)
 	p.include.Render(s, x, y+3, w, th)
 	p.exclude.Render(s, x, y+6, w, th)
 	p.renderToggles(s, x+1, y+9, w-2, th, focused)
 	p.renderResults(s, x, y+10, w, h-10, th, focused)
+}
+
+// visible reports whether a focus stop is drawn at the size last rendered. The
+// focus ring has to agree with the layout, or tab walks onto a component that
+// is not on screen and keystrokes disappear into it.
+func (p *Pane) visible(spot int) bool {
+	if !p.compact {
+		return true
+	}
+	return spot == spotQuery || spot == spotResults
 }
 
 // renderToggles draws the three options as separate focus stops, each
@@ -537,7 +635,14 @@ func (p *Pane) renderResults(s *ui.Screen, x, y, w, h int, th widget.Theme, focu
 	if h < 2 {
 		return
 	}
-	header := fmt.Sprintf("%d results in %d files", len(p.Result.Matches), p.Result.Files)
+	// The true total, not the number of rows. A per-file cap means the pane
+	// deliberately shows less than it found, and reporting the row count would
+	// turn that into an understatement of the search rather than of the display.
+	total := p.Result.Total()
+	header := fmt.Sprintf("%d results in %d files", total, p.Result.Files)
+	if shown := len(p.Result.Matches); shown < total {
+		header = fmt.Sprintf("%d of %d results in %d files", shown, total, p.Result.Files)
+	}
 	if p.Result.Err != nil {
 		header = "bad pattern: " + p.Result.Err.Error()
 	} else if p.Result.Capped {
@@ -566,8 +671,12 @@ func (p *Pane) renderResults(s *ui.Screen, x, y, w, h int, th widget.Theme, focu
 			if r.Open {
 				marker = "▾ "
 			}
-			label = marker + fmt.Sprintf("%s (%d)",
-				widget.TruncateLeft(relative(p.Root, r.Path), w-10), r.Count)
+			count := fmt.Sprintf("(%d)", r.Count)
+			if r.Total > r.Count {
+				count = fmt.Sprintf("(%d of %d)", r.Count, r.Total)
+			}
+			label = marker + fmt.Sprintf("%s %s",
+				widget.TruncateLeft(relative(p.Root, r.Path), w-10-len(count)), count)
 		} else {
 			indent = 4
 			label = fmt.Sprintf("%d: %s", r.Match.Line, trimIndent(r.Match.Text))

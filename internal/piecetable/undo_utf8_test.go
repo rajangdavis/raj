@@ -6,10 +6,13 @@ import (
 	"unicode/utf8"
 )
 
-// undoRedoSeeds is how many random undo/redo sequences this walks. 500 is
-// green; raising it to 3000 reproduces the remaining rebase bug filed in
-// TODO.md, at seed 578 step 12, which is how it was found.
-const undoRedoSeeds = 500
+// undoRedoSeeds is how many random undo/redo sequences this walks.
+//
+// It sat at 500 while the rebase walk still counted a resurrected op in the
+// wrong coordinate frame; 3000 reproduced that at seed 578 step 12, which is
+// how it was found and fixed. 5000 is the standing budget now — it runs in
+// about a second, and 40000 has been walked by hand without a failure.
+const undoRedoSeeds = 5000
 
 // Every edit here is rune-aligned, so the document can only end up holding a
 // partial rune if a reversal was applied at the wrong offset. That is worth

@@ -29,6 +29,10 @@ type File struct {
 	idx    *view.Index
 	saved  piecetable.Version
 
+	// dark is the background the highlighter was built for. Kept so a rename
+	// can rebuild it without asking the application which terminal it is in.
+	dark bool
+
 	// applied is the version whose ops have been mirrored into the line index.
 	applied piecetable.Version
 	newline piecetable.PieceRec
@@ -71,6 +75,7 @@ func NewFile(path, content string, tab int) *File {
 		Path:   path,
 		Cols:   view.NewColumns(tab),
 		Syntax: syntax.New(path, true),
+		dark:   true,
 		sess:   piecetable.NewSession(piecetable.NewDoc(content, 0)),
 		idx:    view.NewIndex(content),
 	}
@@ -266,8 +271,24 @@ func (f *File) RefreshSyntax() {
 // SetDark rebuilds the highlighter for the terminal's actual background, once
 // the OSC query has answered.
 func (f *File) SetDark(dark bool) {
+	f.dark = dark
 	f.Syntax = syntax.New(f.Path, dark)
 	f.Syntax.Invalidate()
+}
+
+// SetPath renames the buffer, which is what a save-as does: the text is
+// untouched but everything keyed on the name has to follow it. The highlighter
+// is the one that matters — an unnamed buffer has no language, so a scratch
+// file saved as .go stays uncoloured until it is rebuilt here.
+//
+// It deliberately does not mark the buffer clean or touch the saved version.
+// Naming a file is not writing it, and Save is still what decides that.
+func (f *File) SetPath(path string) {
+	if path == f.Path {
+		return
+	}
+	f.Path = path
+	f.SetDark(f.dark)
 }
 
 // Begin and End bracket an undo transaction. One user action is one undo step,
