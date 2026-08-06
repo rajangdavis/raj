@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // corpusRoot is the tree the benchmarks walk. It defaults to raj itself so the
@@ -26,6 +27,17 @@ func corpusRoot(tb testing.TB) string {
 // ---------------------------------------------------------------------------
 // Equivalence. The literal matcher must agree with the regexp it replaces on
 // every line it is asked about — that is the whole safety argument.
+
+// findVia runs the matcher the way scan does: prepare the haystack for this
+// content, then sweep it — or run the line fallback if prepare handed one back.
+// Calling find directly would skip the fold and test nothing real.
+func findVia(m matcher, line []byte) (int, int, bool) {
+	hay, fallback := m.prepare(line)
+	if fallback != nil {
+		return fallback.find(line)
+	}
+	return m.find(hay)
+}
 
 func matcherPair(q Query) (matcher, matcher) {
 	re, err := compile(q)
@@ -57,8 +69,8 @@ func TestLiteralMatcherAgreesWithRegexp(t *testing.T) {
 	for _, q := range queries {
 		fast, slow := matcherPair(q)
 		for _, ln := range lines {
-			gs, ge, gok := fast.find(ln)
-			ws, we, wok := slow.find(ln)
+			gs, ge, gok := findVia(fast, ln)
+			ws, we, wok := findVia(slow, ln)
 			if gok != wok || (gok && (gs != ws || ge != we)) {
 				t.Fatalf("query %+v line %q: fast=(%d,%d,%v) regexp=(%d,%d,%v)",
 					q, ln, gs, ge, gok, ws, we, wok)
@@ -91,8 +103,8 @@ func TestLiteralMatcherFuzz(t *testing.T) {
 		}
 		fast, slow := newMatcher(q, re), regexMatcher{re}
 		line := []byte(randStr(rng.Intn(40)))
-		gs, ge, gok := fast.find(line)
-		ws, we, wok := slow.find(line)
+		gs, ge, gok := findVia(fast, line)
+		ws, we, wok := findVia(slow, line)
 		if gok != wok || (gok && (gs != ws || ge != we)) {
 			t.Fatalf("q=%+v line=%q: fast=(%d,%d,%v) regexp=(%d,%d,%v)",
 				q, line, gs, ge, gok, ws, we, wok)
@@ -127,48 +139,71 @@ func TestRunEquivalence(t *testing.T) {
 	}
 }
 
-func TestFoldASCII(t *testing.T) {
+func TestFoldLower(t *testing.T) {
 	for _, tc := range []struct {
-		in    string
-		want  string
-		ascii bool
+		in      string
+		want    string
+		sawHigh bool
 	}{
-		{"", "", true},
-		{"Hello, World!", "hello, world!", true},
-		{"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", true},
-		{"\x00\x01\t\n [](){}", "\x00\x01\t\n [](){}", true},
-		{"@AZ[`az{", "@az[`az{", true}, // boundaries either side of A-Z
-		{"caf\u00e9", "", false},
+		{"", "", false},
+		{"Hello, World!", "hello, world!", false},
+		{"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", false},
+		{"\x00\x01\t\n [](){}", "\x00\x01\t\n [](){}", false},
+		{"@AZ[`az{", "@az[`az{", false}, // boundaries either side of A-Z
+		// The property that matters: high bytes survive untouched, so UTF-8
+		// stays valid and offsets keep meaning what they meant.
+		{"caf\u00e9 AU LAIT", "caf\u00e9 au lait", true},
+		{"\u00c9CLAIR", "\u00c9clair", true}, // É is not folded; that is the regexp's job
+		{"\u65e5\u672c\u8a9eABC", "\u65e5\u672c\u8a9eabc", true},
 	} {
 		b := []byte(tc.in)
-		if ok := foldASCII(b); ok != tc.ascii {
-			t.Fatalf("foldASCII(%q) ascii=%v want %v", tc.in, ok, tc.ascii)
-		} else if ok && string(b) != tc.want {
-			t.Fatalf("foldASCII(%q) = %q want %q", tc.in, b, tc.want)
+		if got := foldLower(b); got != tc.sawHigh {
+			t.Errorf("foldLower(%q) sawHigh=%v want %v", tc.in, got, tc.sawHigh)
+		}
+		if string(b) != tc.want {
+			t.Errorf("foldLower(%q) = %q want %q", tc.in, b, tc.want)
 		}
 	}
-	// Exhaustive over every byte, at every alignment, against the obvious loop.
+
+	// Exhaustive over every byte value, at every alignment, against the
+	// obvious loop. Alignment matters because the SWAR body handles eight
+	// bytes at a time and the tail handles the rest.
 	for off := 0; off < 16; off++ {
 		buf := make([]byte, off+256)
 		want := make([]byte, off+256)
 		for i := 0; i < 256; i++ {
-			buf[off+i] = byte(i)
 			c := byte(i)
+			buf[off+i] = c
 			if c >= 'A' && c <= 'Z' {
 				c += 32
 			}
 			want[off+i] = c
 		}
 		region := buf[off:]
-		if foldASCII(region) {
-			t.Fatalf("off=%d: reported ASCII on a buffer containing high bytes", off)
+		if !foldLower(region) {
+			t.Fatalf("off=%d: high bytes present but not reported", off)
 		}
-		// Only the ASCII half is guaranteed; check it.
-		for i := 0; i < 128; i++ {
+		for i := 0; i < 256; i++ {
 			if region[i] != want[off+i] {
-				t.Fatalf("off=%d byte %d: got %#x want %#x", off, i, region[i], want[off+i])
+				t.Fatalf("off=%d byte %#x: got %#x want %#x", off, i, region[i], want[off+i])
 			}
 		}
+	}
+
+	// Folding must never invalidate UTF-8: every rune round-trips.
+	var sb []byte
+	for r := rune(1); r < 0x2FFFF; r++ {
+		if utf8.ValidRune(r) {
+			sb = utf8.AppendRune(sb, r)
+		}
+	}
+	folded := append([]byte(nil), sb...)
+	foldLower(folded)
+	if !utf8.Valid(folded) {
+		t.Fatal("folding produced invalid UTF-8")
+	}
+	if len(folded) != len(sb) {
+		t.Fatal("folding changed the length")
 	}
 }
 
@@ -268,7 +303,7 @@ func benchMatcher(b *testing.B, q Query, regexpPath bool) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, l := range lines {
-			m.find(l)
+			findVia(m, l)
 		}
 	}
 }
@@ -307,7 +342,7 @@ func benchFold(b *testing.B, f func([]byte) bool) {
 }
 
 func BenchmarkFold_Naive(b *testing.B) { benchFold(b, foldNaive) }
-func BenchmarkFold_SWAR(b *testing.B)  { benchFold(b, foldASCII) }
+func BenchmarkFold_SWAR(b *testing.B)  { benchFold(b, foldLower) }
 func BenchmarkFold_Stdlib(b *testing.B) {
 	lines := corpusLines(b, corpusRoot(b), 20000)
 	var blob []byte

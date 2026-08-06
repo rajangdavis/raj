@@ -262,6 +262,48 @@ answers in 15 ms and one that takes two seconds. A cancelled search does not
 update the measurement, or the window would collapse to the floor after the
 first abandoned walk.
 
+### Where a search actually spends its time
+
+Measured against the ghostty checkout: 5,770 files opened, 43.3 MB read, 574,639
+lines, warm page cache, one core. Stages are cumulative, each adding one layer
+to the one above.
+
+| stage | cumulative | this stage |
+| --- | --- | --- |
+| walk + stat | 16.7 ms | 16.7 |
+| + open/close | 31.9 ms | 15.2 |
+| + read every byte | 44.4 ms | 12.5 |
+| + `bufio` line splitting | 61.5 ms | 17.1 |
+| + matching | 62.5 ms | 1.0 |
+
+Matching is one millisecond of sixty-two. Splitting the file into lines cost
+seventeen — spent turning 574,639 lines into slices in order to find nothing,
+since almost every file in a repository contains no match at all.
+
+So `scan` reads each file whole into a reused buffer and sweeps it with
+`bytes.Index`, counting newlines only across the span leading to a hit. A file
+with no matches never looks for a line boundary.
+
+| query on ghostty | before | after |
+| --- | --- | --- |
+| literal miss, case-sensitive | 62.5 ms | 43.5 ms |
+| literal miss, case-insensitive | 88.1 ms | 48.6 ms |
+| with 8 `Exclude` globs | 106.7 ms | 43.0 ms |
+| with 10 `Include` globs | 77.2 ms | 19.9 ms |
+
+The glob rows were the surprise: filtering made a search **slower** than not
+filtering, because `filepath.Match` ran once per pattern per file — 46,000 calls
+to avoid reading a hundred images. Patterns of the form `*.ext`, which is nearly
+all of them, are now answered by comparing the extension.
+
+Case-insensitive costs the same as case-sensitive now, where it used to cost 40%
+more. The fold leaves bytes above 0x7f untouched, so a file with one accented
+character in it is still swept rather than being handed to the regexp: 43 MB of
+folding disappears into the I/O it overlaps with.
+
+Remaining time is 51% syscalls (walk, open, close). That is what parallelism
+attacks, and nothing else does — see TODO.md.
+
 ## Line index update
 
 Finding the newlines in an 800 KB insertion, `BenchmarkNewlines*`:

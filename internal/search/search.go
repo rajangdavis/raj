@@ -2,9 +2,10 @@
 package search
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,7 +42,11 @@ const (
 type Result struct {
 	Matches []Match
 	Files   int
-	Capped  bool
+	// Considered counts the files opened and scanned. It is the number to look
+	// at when a search feels slow: a file skipped during enumeration costs
+	// nothing, a file opened costs everything.
+	Considered int
+	Capped     bool
 	// Stopped is set when the search was abandoned before finishing, which
 	// happens whenever the query changes while a walk is in progress.
 	Stopped bool
@@ -80,7 +85,7 @@ func RunContext(ctx context.Context, root string, q Query) Result {
 	inc, exc := globs(q.Include), globs(q.Exclude)
 	// One scan buffer for the whole walk. Allocating 64 KB per file made the
 	// buffer, not the matching, the dominant cost of a search.
-	buf := make([]byte, 64*1024)
+	buf := make([]byte, 0, 64*1024)
 
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -115,7 +120,8 @@ func RunContext(ctx context.Context, root string, q Query) Result {
 			res.Capped = true
 			return filepath.SkipAll
 		}
-		if n := scan(path, m, buf, &res); n > 0 {
+		res.Considered++
+		if n := scan(path, m, &buf, &res); n > 0 {
 			res.Files++
 		}
 		return nil
@@ -145,41 +151,139 @@ func compile(q Query) (*regexp.Regexp, error) {
 	return regexp.Compile(pattern)
 }
 
-// scan searches one file, skipping anything that looks binary.
-func scan(path string, m matcher, buf []byte, res *Result) int {
+// scan searches one file.
+//
+// The file is read whole into a reused buffer and swept with the matcher,
+// rather than split into lines and matched line by line. Almost every file in a
+// repository contains no match at all, and those files never need lines: on
+// ghostty, splitting 574,639 lines cost 17 ms of a 62 ms search to locate zero
+// matches. Line numbers are counted only across the span leading to a hit, so
+// the cost is paid per match rather than per line.
+//
+// MaxFileSize bounds the buffer, so "read it all" is bounded too.
+func scan(path string, m matcher, buf *[]byte, res *Result) int {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0
 	}
 	defer f.Close()
 
+	data, err := readAll(f, buf)
+	if err != nil || bytes.IndexByte(data, 0) >= 0 {
+		return 0 // unreadable, or a NUL byte somewhere: binary
+	}
+
+	hay, lineFallback := m.prepare(data)
+	if lineFallback != nil {
+		return scanLines(path, lineFallback, data, res)
+	}
+
 	found := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(buf, 1<<20)
-	// sc.Bytes avoids a string allocation for every line in the repository;
-	// only a line that actually matches is turned into one.
-	for line := 1; sc.Scan(); line++ {
-		raw := sc.Bytes()
-		if bytes.IndexByte(raw, 0) >= 0 {
-			return found // NUL byte: binary, stop reading
-		}
-		start, end, ok := m.find(raw)
+	line, lineStart, from := 1, 0, 0
+	for from <= len(data) {
+		start, end, ok := m.find(hay[from:])
 		if !ok {
-			continue
+			break
 		}
+		start, end = from+start, from+end
+
+		// Advance the line counter over everything skipped since the last hit.
+		// Across a whole file this visits each newline once, which is what the
+		// line-splitting loop did anyway — the difference is that a file with
+		// no matches never enters it.
+		for {
+			nl := bytes.IndexByte(data[lineStart:start], '\n')
+			if nl < 0 {
+				break
+			}
+			line++
+			lineStart += nl + 1
+		}
+		lineEnd := len(data)
+		if nl := bytes.IndexByte(data[start:], '\n'); nl >= 0 {
+			lineEnd = start + nl
+		}
+
 		if len(res.Matches) >= MaxMatches {
 			res.Capped = true
 			return found
 		}
+		text := data[lineStart:lineEnd]
 		res.Matches = append(res.Matches, Match{
 			Path: path, Line: line,
-			Text: strings.TrimRight(string(raw), " \t"),
-			Col:  start, Len: end - start,
+			Text: strings.TrimRight(string(text), " \t"),
+			Col:  start - lineStart, Len: end - start,
 		})
 		found++
+
+		// At most one match is reported per line, as before.
+		if lineEnd >= len(data) {
+			break
+		}
+		line++
+		lineStart = lineEnd + 1
+		from = lineStart
 	}
 	return found
 }
+
+// readAll fills buf with the contents of f, growing it if needed and handing
+// the new backing array back to the caller so the next file reuses it.
+func readAll(f *os.File, buf *[]byte) ([]byte, error) {
+	b := (*buf)[:0]
+	for {
+		if len(b) == cap(b) {
+			b = append(b, 0)[:len(b)]
+		}
+		n, err := f.Read(b[len(b):cap(b)])
+		b = b[:len(b)+n]
+		if err != nil {
+			*buf = b
+			if err == io.EOF {
+				return b, nil
+			}
+			return b, err
+		}
+		if len(b) > MaxFileSize {
+			*buf = b
+			return b, errTooBig
+		}
+	}
+}
+
+// scanLines handles the rare file the sweep cannot: one containing non-ASCII
+// bytes under a case-insensitive query, where folding in place would change
+// byte offsets. Only such files pay the per-line regexp cost, and only for
+// themselves.
+func scanLines(path string, m matcher, data []byte, res *Result) int {
+	found := 0
+	for line, off := 1, 0; off <= len(data); line++ {
+		end := len(data)
+		if nl := bytes.IndexByte(data[off:], '\n'); nl >= 0 {
+			end = off + nl
+		}
+		raw := data[off:end]
+		if start, stop, ok := m.find(raw); ok {
+			if len(res.Matches) >= MaxMatches {
+				res.Capped = true
+				return found
+			}
+			res.Matches = append(res.Matches, Match{
+				Path: path, Line: line,
+				Text: strings.TrimRight(string(raw), " \t"),
+				Col:  start, Len: stop - start,
+			})
+			found++
+		}
+		if end >= len(data) {
+			break
+		}
+		off = end + 1
+	}
+	return found
+}
+
+var errTooBig = errors.New("file exceeds MaxFileSize")
 
 func globs(spec string) []string {
 	var out []string
@@ -193,14 +297,37 @@ func globs(spec string) []string {
 
 // matches tests a filename against a glob list. An empty list means "no
 // constraint", which is why the caller passes what an empty list should mean.
+//
+// Patterns of the form *.ext — which is almost all of them in practice — are
+// answered by comparing the extension rather than by running the glob matcher.
+// filepath.Match costs more than the read it is meant to avoid: on ghostty,
+// eight exclude patterns turned a 62 ms search into a 107 ms one.
 func matches(name string, patterns []string, emptyResult bool) bool {
 	if len(patterns) == 0 {
 		return emptyResult
 	}
 	for _, p := range patterns {
+		if ext, ok := plainExt(p); ok {
+			if strings.EqualFold(filepath.Ext(name), ext) {
+				return true
+			}
+			continue
+		}
 		if ok, _ := filepath.Match(p, name); ok {
 			return true
 		}
 	}
 	return false
+}
+
+// plainExt reports whether a pattern is exactly "*.something" with no further
+// metacharacters, and if so the extension it selects.
+func plainExt(p string) (string, bool) {
+	if len(p) < 3 || p[0] != '*' || p[1] != '.' {
+		return "", false
+	}
+	if strings.ContainsAny(p[2:], "*?[\\") {
+		return "", false
+	}
+	return p[1:], true
 }

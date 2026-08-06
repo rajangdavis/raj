@@ -79,13 +79,23 @@ findings and decisions live in INVESTIGATIONS.md.
   does report may be stale. Routing open documents through `Spans` instead of
   `os.Open` is the fix, and it is the same seam an agent would need to search
   what it has just edited.
-- [ ] **Parallel walk, if it is worth it.** Measured floors say a search is I/O
-  bound: 18 ms traversal, 90 ms to read 97 MB, 92 ms to read and scan it. A
-  worker pool is the only remaining lever, but it breaks `MaxMatches` — a pool
-  returned 509-517 results against a cap of 500, nondeterministically, because
-  workers in flight still append. Needs streaming results or deterministic
-  truncation first. Measure on a multicore box before building it; the numbers
-  in BENCHMARKS.md came from one core, where it showed nothing.
+- [ ] **Parallel walk.** Now the only lever left, and no longer speculative:
+  measured on the ghostty checkout, a search is 51% syscalls — 16.7 ms of walk
+  and stat, 15.2 ms of open and close, against 1.0 ms of matching. The scanning
+  side is done; overlapping the syscalls is what remains.
+
+  It breaks `MaxMatches` as written. A worker pool returned 509-517 results
+  against a cap of 500, varying run to run, because workers in flight when the
+  cap trips still append — and *which* 500 you get becomes scheduling
+  dependent, so the same query returns different results on consecutive runs.
+  Needs streaming results or deterministic truncation first. Measure on a
+  multicore box: the figures above come from one core, where a pool shows
+  nothing.
+- [ ] **Skip known-binary extensions before opening.** Around 17 MB of ghostty
+  under the size cap is fonts and images, each costing an open and a 64 KB read
+  to discover a NUL byte. Cheap, but measure it rather than assuming: the glob
+  finding in BENCHMARKS.md is a standing reminder that a filter can cost more
+  than the read it avoids.
 
 ## Buffer
 

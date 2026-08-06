@@ -107,8 +107,9 @@ func (d *debugLog) stats(a *App) []string {
 		// A search pile-up shows up here before it shows up anywhere else:
 		// inflight above one, or a last duration far past the frame budget,
 		// means the editor is competing with its own abandoned walks.
-		fmt.Sprintf("search %v   inflight %d   abandoned %d",
+		fmt.Sprintf("search %v   scanned %d   inflight %d   abandoned %d",
 			a.Search.LastDuration().Round(time.Millisecond),
+			a.Search.Result.Considered,
 			a.Search.InFlight(), a.Search.Abandoned()),
 	}
 	p := a.Tabs.Active()
