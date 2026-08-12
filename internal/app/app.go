@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 
+	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/explorer"
 	"raj/internal/keys"
 	"raj/internal/picker"
 	"raj/internal/prompt"
 	"raj/internal/search"
+	"raj/internal/symbols"
 	"raj/internal/tabs"
 	"raj/internal/ui"
 	"raj/internal/widget"
@@ -30,6 +32,7 @@ type App struct {
 	Search   *search.Pane
 	Picker   *picker.Picker
 	Prompt   *prompt.Prompt
+	Complete complete.Popup
 
 	root    string
 	sidebar Sidebar
@@ -44,8 +47,13 @@ type App struct {
 	// running off the right edge is worse than one that continues below, and
 	// horizontal scrolling is the fallback rather than the norm.
 	WrapDefault bool
-	dark        bool
-	lastLayout  Layout
+
+	// AutoPairs is applied to every pane as it opens, for the same reason as
+	// WrapDefault: the setting lives on the application and panes inherit it,
+	// rather than each pane deciding for itself and drifting.
+	AutoPairs  bool
+	dark       bool
+	lastLayout Layout
 	// promptReturn is where focus goes when a dialog closes. Captured when the
 	// first prompt in a chain opens, so an overwrite check answered three
 	// dialogs deep still lands back where the user was.
@@ -78,6 +86,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		// future entry point wraps too rather than depending on who remembered
 		// to set the field.
 		WrapDefault: true,
+		AutoPairs:   true,
 		dark:        host.Theme().Dark(),
 		wth:         widget.DefaultTheme(),
 		focused:     true,
@@ -87,6 +96,24 @@ func New(host ui.Host, root string, tabWidth int) *App {
 	// Wake closes the gap for typing pauses, and it is the seam the agent pane
 	// needs for exactly the same reason.
 	a.Search.Notify = func() { host.Post(ui.Wake{}) }
+	// Search the buffers, not only the disk. Only dirty ones: a saved buffer
+	// and its file are the same bytes, so snapshotting it would copy a
+	// document to search it exactly as reading it would have. An unnamed
+	// buffer has no path to key on and is skipped — it is the one tab a search
+	// cannot reach, for the same reason session restore cannot bring it back.
+	a.Search.Buffers = func() search.Docs {
+		var open search.Docs
+		for _, p := range a.Tabs.All() {
+			if p.File.Path == "" || !p.File.Dirty() {
+				continue
+			}
+			if open == nil {
+				open = search.Docs{}
+			}
+			open[p.File.Path] = p.File.Text()
+		}
+		return open
+	}
 	return a
 }
 
@@ -116,8 +143,148 @@ func (a *App) OpenFile(path string) {
 	}
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
+	p.AutoPairs = a.AutoPairs
 	a.focus = FocusEditor
 	a.status = ""
+}
+
+// openFromPicker opens a chosen file and honours any position the query was
+// pasted with, so pasting a compiler line lands where the compiler pointed
+// rather than at the top of the file.
+//
+// It is separate from OpenFile because a position only makes sense for a choice
+// the picker made: nothing else in the app has a pasted `:line:col` to apply.
+func (a *App) openFromPicker(path string) {
+	if path == "" {
+		return
+	}
+	pos, ok := a.Picker.PositionFor(path)
+	a.OpenFile(path)
+	if !ok || a.Tabs.Active() == nil {
+		return
+	}
+	if pos.Line > 0 {
+		a.jumpTo(pos.Line)
+	}
+	if pos.Col > 0 {
+		a.jumpToColumn(pos.Line, pos.Col)
+	}
+}
+
+// wheelRows is how far one notch scrolls. Three is the near-universal default
+// and the number every terminal that translates the wheel into arrow keys
+// sends, so matching it means the feel does not change with the terminal.
+const wheelRows = 3
+
+// mouse handles a pointer event. Only the wheel does anything today.
+//
+// It scrolls whatever is under the pointer rather than whatever has focus,
+// because that is what a pointer is for: reaching something without first
+// going there. An overlay takes the wheel wherever the pointer is, since it is
+// drawn over everything and scrolling the pane behind it would be scrolling
+// something the user cannot see.
+func (a *App) mouse(ev ui.Mouse) {
+	if !ev.IsWheel {
+		return
+	}
+	delta := wheelRows
+	if ev.Button == keys.WheelUp {
+		delta = -wheelRows
+	}
+	if ev.Button != keys.WheelUp && ev.Button != keys.WheelDown {
+		return // horizontal wheels: nothing scrolls sideways yet
+	}
+
+	if a.Picker.Open {
+		a.Picker.Scroll(delta)
+		return
+	}
+	cols, rows := a.screen.Size()
+	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	if l.ShowSidebar && ev.Col >= l.SidebarX && ev.Col < l.SidebarX+l.SidebarW {
+		switch a.sidebar {
+		case SidebarExplorer:
+			a.Explorer.Scroll(delta)
+		case SidebarSearch:
+			a.Search.Scroll(delta)
+		}
+		return
+	}
+	if l.ShowEditor {
+		if p := a.Tabs.Active(); p != nil {
+			p.ScrollRows(delta)
+		}
+	}
+}
+
+// offerCompletion refreshes the popup for whatever word the cursor is now in.
+//
+// It is called after the edit rather than before, so the prefix is what is
+// actually on screen. Only typing and backspace offer anything; every other
+// action closes the popup, because a cursor that jumped somewhere is no longer
+// finishing the word it was on.
+//
+// Multiple cursors close it too. A completion is one word at one place, and
+// applying it at four cursors that are mid-word in four different identifiers
+// would replace text nobody looked at.
+func (a *App) offerCompletion(p *editor.Pane, typing bool) {
+	if !typing || a.Tabs.Active() != p || len(p.Cursors.All()) > 1 {
+		a.Complete.Hide()
+		return
+	}
+	head := p.Cursors.Primary().Head
+	if p.Cursors.Primary().HasSelection() {
+		a.Complete.Hide()
+		return
+	}
+	line := p.File.LineOf(head)
+	col := head - p.File.LineStart(line)
+	prefix := complete.PrefixAt(p.File.Line(line), col)
+	if len(prefix) < complete.MinPrefix {
+		a.Complete.Hide()
+		return
+	}
+	a.Complete.Show(prefix, a.completionSource(p).Candidates(prefix), line, col-len(prefix))
+}
+
+// completionSource is every open buffer plus the declarations raj can already
+// find in them. A language server becomes another Source here rather than a
+// change to the popup.
+func (a *App) completionSource(cur *editor.Pane) complete.Source {
+	b := complete.Buffers{
+		Current:  cur.File.Path,
+		Contents: map[string]string{},
+		Symbols:  map[string][]string{},
+	}
+	for _, p := range a.Tabs.All() {
+		path := p.File.Path
+		if path == "" {
+			path = p.File.Name()
+		}
+		text := p.File.Text()
+		b.Contents[path] = text
+		if symbols.Supported(path) {
+			var names []string
+			for _, s := range symbols.Find(path, text) {
+				names = append(names, s.Name)
+			}
+			b.Symbols[path] = names
+		}
+	}
+	return b
+}
+
+// acceptCompletion replaces the typed prefix with the chosen word.
+//
+// Replacing rather than appending the remainder, because the two differ when
+// the candidate and the prefix disagree in a way a prefix match still allows —
+// and one edit is one undo step, which appending plus fixing up would not be.
+func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candidate) {
+	if c.Word == "" || !strings.HasPrefix(c.Word, prefix) {
+		return
+	}
+	p.InsertText(c.Word[len(prefix):])
+	a.Explorer.Tree.MarkChanged(p.File.Path)
 }
 
 // Run processes events until the application quits or the host closes.
@@ -141,6 +308,8 @@ func (a *App) Handle(e ui.Event) {
 		a.handleKey(ev)
 	case ui.Paste:
 		a.paste(ev.Text)
+	case ui.Mouse:
+		a.mouse(ev)
 	case ui.Resize:
 		// Invalidate here rather than only in the host: after a resize the
 		// terminal's contents outside the old geometry are undefined, and that
@@ -191,7 +360,7 @@ func (a *App) handleKey(k ui.Key) {
 
 	switch a.focus {
 	case FocusPicker:
-		a.OpenFile(a.Picker.Handle(action, text))
+		a.openFromPicker(a.Picker.Handle(action, text))
 		if !a.Picker.Open && a.focus == FocusPicker {
 			a.focus = FocusEditor
 		}
@@ -280,6 +449,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		return false
 	case keys.GotoLine:
 		a.gotoLine()
+	case keys.GotoSymbol:
+		a.gotoSymbol()
 	case keys.NewFile:
 		a.newFile()
 	case keys.CloseTab:
@@ -377,14 +548,27 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		}
 		return
 	}
+	// The completion popup sees keys before the editor, but claims only the
+	// handful it navigates with. Everything else falls through and types,
+	// which is what keeps it from being modal: it can be ignored entirely.
+	// The prefix has to be read before Handle, which clears it on accept.
+	prefix := a.Complete.Prefix()
+	if c, accepted, consumed := a.Complete.Handle(action); consumed {
+		if accepted {
+			a.acceptCompletion(p, prefix, c)
+		}
+		return
+	}
 	if action != keys.None {
 		if !p.Handle(action) {
 			a.status = "unhandled: " + string(action)
 		}
+		a.offerCompletion(p, action == keys.Backspace)
 		return
 	}
 	p.HandleText(text)
 	a.Explorer.Tree.MarkChanged(p.File.Path)
+	a.offerCompletion(p, true)
 }
 
 // paste routes a bracketed-paste payload to whatever has focus.
@@ -413,7 +597,9 @@ func (a *App) paste(text string) {
 		a.Prompt.Handle(keys.None, line)
 		a.settlePrompt()
 	case a.focus == FocusPicker:
-		a.OpenFile(a.Picker.Handle(keys.None, line))
+		// Not Handle: the picker narrows a pasted path against its index
+		// rather than taking it verbatim, and a paste never chooses a file.
+		a.Picker.Paste(line)
 	case a.focus == FocusSidebar && a.sidebar == SidebarSearch:
 		a.handleSidebar(keys.None, line)
 	}
@@ -455,13 +641,37 @@ func firstLine(s string) string {
 // work without editing it down. Out-of-range values clamp rather than refuse:
 // "go to line 9999" in a 300-line file means the end, and an error message
 // there would be pedantry.
+// gotoSymbol lists the active file's declarations in the quick-open overlay.
+//
+// It reuses the picker rather than adding an overlay: a symbol answers with the
+// file it lives in and a line, which is the same shape a pasted path already
+// had, so opening and jumping is the path openFromPicker was already on.
+func (a *App) gotoSymbol() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	if !symbols.Supported(p.File.Path) {
+		a.status = "no symbols for this file type"
+		return
+	}
+	syms := symbols.Find(p.File.Path, p.File.Text())
+	if len(syms) == 0 {
+		a.status = "no symbols found"
+		return
+	}
+	a.Picker.ShowSymbols(p.File.Path, syms)
+	a.focus = FocusPicker
+	a.status = ""
+}
+
 func (a *App) gotoLine() {
 	p := a.Tabs.Active()
 	if p == nil {
 		return
 	}
 	here, _ := p.File.LineCol(p.Cursors.Primary().Head)
-	a.ask("Go to line", itoa(here+1), func(answer string, ok bool) {
+	a.askSuggestion("Go to line", itoa(here+1), func(answer string, ok bool) {
 		if !ok {
 			return
 		}
@@ -560,6 +770,7 @@ func (a *App) newFile() {
 	p := a.Tabs.NewFile()
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
+	p.AutoPairs = a.AutoPairs
 	a.focus = FocusEditor
 	a.status = ""
 }
@@ -751,6 +962,13 @@ func (a *App) saveAllThenQuit(dirty []*editor.Pane) {
 func (a *App) ask(title, initial string, done func(string, bool)) {
 	a.beforePrompt()
 	a.Prompt.Ask(title, initial, done)
+}
+
+// askSuggestion is ask with the seed selected: the field offers a default that
+// typing replaces rather than a prefix that typing extends.
+func (a *App) askSuggestion(title, suggestion string, done func(string, bool)) {
+	a.beforePrompt()
+	a.Prompt.AskSuggestion(title, suggestion, done)
 }
 
 func (a *App) confirm(title, message string, options []string, done func(string, bool)) {

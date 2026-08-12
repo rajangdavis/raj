@@ -86,6 +86,15 @@ type Pane struct {
 	// pane choose one from how long searches here actually take.
 	search   func(ctx context.Context, root string, q Query) Result
 	Debounce time.Duration
+
+	// Buffers supplies the contents of open documents, so a search sees what
+	// is on screen rather than what was last written to disk. Called on the
+	// event thread when a search is scheduled — never from the worker, where
+	// reading a buffer the user is typing into would be a race.
+	//
+	// nil means "search the disk", which is what the pane did before and what
+	// a test driving it directly wants.
+	Buffers func() Docs
 }
 
 // The debounce window adapts to the repository, because one constant cannot
@@ -124,6 +133,9 @@ func (p *Pane) Rows() []Row { return p.rows }
 
 // List exposes the selection state, for tests.
 func (p *Pane) List() *widget.List { return &p.list }
+
+// Scroll moves the results view without moving the selection, for the wheel.
+func (p *Pane) Scroll(delta int) { p.list.Scroll(delta, len(p.rows)) }
 
 // group flattens matches into headers followed by their matches, skipping the
 // matches of collapsed files. Run returns matches in walk order, so hits for
@@ -398,7 +410,10 @@ func (p *Pane) run() {
 		p.apply()
 		return
 	}
-	q, root, fn := p.q, p.Root, p.searcher()
+	// The snapshot is taken here, on the event thread, and handed to the
+	// worker by value. Taking it inside the worker would read a piece table
+	// concurrently with the keystrokes that are still editing it.
+	q, root, fn := p.q, p.Root, p.searcher(p.snapshot())
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.inflight++
@@ -476,11 +491,24 @@ func (p *Pane) Settle(timeout time.Duration) bool {
 	}
 }
 
-func (p *Pane) searcher() func(context.Context, string, Query) Result {
+// snapshot copies the open documents. Event thread only.
+func (p *Pane) snapshot() Docs {
+	if p.Buffers == nil {
+		return nil
+	}
+	return p.Buffers()
+}
+
+// searcher binds the snapshot to the search function, which keeps the
+// substitution seam a test uses at three arguments rather than four: a test
+// that replaces the search entirely has no disk to disagree with.
+func (p *Pane) searcher(open Docs) func(context.Context, string, Query) Result {
 	if p.search != nil {
 		return p.search
 	}
-	return RunContext
+	return func(ctx context.Context, root string, q Query) Result {
+		return RunDocs(ctx, root, q, open)
+	}
 }
 
 // debounce reports the pause to use before the next search. Callers hold mu.
@@ -652,8 +680,7 @@ func (p *Pane) renderResults(s *ui.Screen, x, y, w, h int, th widget.Theme, focu
 	s.SetString(x+1, y, widget.Truncate(header, w-2), th.Heading(focused && p.spot == spotResults), w-2)
 
 	rows := h - 1
-	p.list.Rows = rows
-	p.list.Follow(len(p.rows))
+	p.list.Settle(rows, len(p.rows))
 
 	for row := 0; row < rows; row++ {
 		i := p.list.Top + row

@@ -275,3 +275,299 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   misleading number for a quietly missing one. Asserted against a fixture where
   a lexically-first file holds four times the cap and the interesting content is
   in a directory the walk reaches afterwards.
+
+
+## Dialogs and paste
+
+- [x] **The go-to-line seed is a default, not a prefix.** ctrl+g seeded the
+  field with the current line and left the caret at the end, so typing
+  appended: on line 1, typing `30` asked for line 130 and clamped to the last
+  line. Every test that exercised the dialog pressed cmd+a first, which is
+  exactly the keystroke the seed was supposed to save, so nothing noticed. The
+  seed is now selected, so the first keystroke or paste replaces it and a bare
+  enter still accepts it. `Ask` keeps caret-at-end and `AskSuggestion` selects,
+  because the two callers want opposite things: save-as seeds a directory you
+  type the rest of, and selecting that would be wrong.
+- [x] **A pasted path finds the file.** Paste already reached the picker, so the
+  field filled — but the fuzzy score is a subsequence test, and one byte the
+  path does not contain empties the list. An absolute path, a `./` prefix or a
+  `:464:12` suffix from a compiler or `grep -n` all filled the field and matched
+  nothing, which reads as the paste having been dropped. `Picker.Paste` now
+  treats the payload as a hint and narrows it — as pasted, then without its
+  position suffix, then relative to the root, then the base name — stopping at
+  the first form that matches anything. When none match the original is
+  restored: a picker showing a base name that also matched nothing would
+  misreport what it searched for. Only an all-digit tail is taken as a position,
+  and at most two segments of one, because a colon is legal in a file name.
+  The picker had no paste coverage at all before this.
+- [x] **The picker opened a blank buffer.** Its index is relative to the
+  workspace root — that is what the list shows and what the fuzzy score is tuned
+  against, since an absolute prefix is the same bytes on every entry and only
+  dilutes the ranking. But the relative path was handed straight to `OpenFile`,
+  which resolves against the process working directory. Running `raj .` from the
+  root made the two the same and hid it; `raj ~/code/thing` from anywhere else
+  meant every pick opened an empty buffer named after the file, with no error,
+  and saving it would have written a new file next to the shell. `Picker.Resolve`
+  is the seam between the two representations. Found by a position test that
+  expected line 3 and got line 1 — the buffer was empty. The explorer and the
+  search pane were already handing over absolute paths, so the bug was the
+  picker's alone.
+- [x] **A pasted position is honoured, not just stripped.** The narrowing above
+  parses `:464:12` off a pasted path so the path can match, and then threw it
+  away — so pasting a compiler line found the file and opened it at the top,
+  which is the half of the job that is easy to mistake for the whole of it. The
+  picker now carries the position alongside the query and hands it back when the
+  chosen file is the one the paste named. That last clause is the fiddly part:
+  narrowing to a base name *widens* the query, so `app.go:464` in a tree with
+  two app.go files must offer 464 to either of them and to nothing else. The
+  rule is a suffix match, which is exact when the paste was already relative and
+  base-name when narrowing went that far. Typing detaches the position, because
+  what is being looked for is no longer what was pasted.
+- [x] **go-to-symbol (cmd+shift+o)**, on the same overlay as cmd+p rather than
+  beside it. The two are one widget with different rows: splitting them would
+  have meant a second overlay, a second focus state, a second keymap scope and a
+  second renderer, all to filter a list of strings as you type, and the two
+  would have drifted. What actually differs is where the rows come from and what
+  choosing one means, which is two fields. A chosen symbol answers with the file
+  it lives in and a line — the same shape a pasted path already had — so opening
+  and jumping reuses the path that was already there rather than adding one.
+
+  The scanner is a line scan over leading keywords per extension, not a parser:
+  Go restricted to column zero because a list containing every closure is a list
+  nobody reads, Python and Ruby not restricted because that is where their
+  methods live, longest keyword winning so `export default function f` is a
+  function rather than an export named "function", and the keyword required to
+  be a whole word so `constant` is not a `const`. Markdown gets its headings,
+  indented into an outline, since documents are where jumping to a named place
+  is most useful and where no declaration keyword exists. Fuzzed for the
+  invariants the overlay depends on — non-empty name, line in range, file order,
+  and the name actually present on the line it points at — because the failure
+  mode of a scanner like this is not a crash but a row that jumps somewhere it
+  did not promise. 0.42 ms on 188 KB, so it rescans on open rather than caching:
+  the invalidation logic would cost more than the scan it saves.
+- [x] **Search reads the buffers, not only the disk.** A workspace search
+  opened files and scanned them, so what was on screen and what was searched
+  were different documents: an unsaved edit was invisible, and a match the pane
+  did report could be stale — sending you to a line that no longer said that.
+  Both halves matter, and the second is the one easy to forget when the fix is
+  framed as "also search the buffers".
+
+  `search.Docs` is a snapshot of the dirty documents, keyed by absolute path,
+  taken on the event thread when a search is scheduled and handed to the worker
+  by value. A live view would have been a race by construction: the search runs
+  off the event thread, and reading a piece table while the keystrokes that
+  provoked the search are still editing it is exactly the bug the debounce
+  makes likely rather than rare. Only dirty buffers are snapshotted, since a
+  saved one and its file are the same bytes and copying it would cost what
+  reading it would have.
+
+  Two things fell out of it. A document with nothing on disk behind it is not
+  on the walk at all, so it is swept up afterwards, in sorted order — a result
+  list that reshuffles between identical searches is worse than one that is
+  merely incomplete. And an open document is filtered on the same terms as a
+  saved one: globs, hidden paths, `vendor`, `node_modules`, the size cap and
+  the NUL-byte binary rule all apply to a buffer too, or a glob would mean one
+  thing for the file being edited and another for its neighbours.
+
+  The substitution seam tests use stayed at three arguments: the snapshot is
+  bound by a closure rather than added to the signature, so the ten tests that
+  replace the search wholesale needed no change. Asserted with the race
+  detector as well as by behaviour.
+- [x] **The file picker misranked exact names.** Typing `buffer_test.go` put
+  `internal/app/search_buffer_test.go` above the file actually called
+  `buffer_test.go` — which is the single most common thing anyone does in a
+  picker, so it read as the matching being broken rather than as a ranking
+  detail.
+
+  The scan was greedy from the left over the whole path, so a query character
+  could be spent on a directory: the `b` of the query went to the `b` in
+  "piecetable", splitting the real name into a run of 1 and a run of 13, while
+  the other path had no `b` before "buffer" and matched as one clean run of 14.
+  Contiguity is quadratic and unbounded, so a longer accidental run outscored an
+  exact name no matter how large the name bonus was.
+
+  The match is now anchored to the file name whenever the query fits inside it,
+  and falls back to the whole path otherwise. That makes the comparison fair
+  rather than adding another bonus to outweigh it: both candidates are scored
+  over their names, both as one run, and the prefix and equality bonuses decide
+  it as they were always meant to. A query holding a separator, or one whose
+  letters are not all in the name, still matches across the path, which is what
+  keeps `picker/picker` and directory fragments working.
+
+  Measured rather than argued: typing each of the 125 file names in this
+  repository ranked the wrong file first once before and never after. The spec
+  is a fixture tree carrying the same collisions.
+- [x] **Auto-indent on newline, and brackets that close themselves.** The rule
+  everything here is held to: typing must never lose a keystroke. Every
+  behaviour either does the obvious thing or does nothing, and doing nothing
+  always means the plain character is inserted — a clever guess that eats a
+  bracket is worse than no guess, because the second is at least predictable.
+
+  A newline carries the current line's leading whitespace verbatim, so a file
+  indented with tabs stays that way, and the cursor lands after the indent
+  rather than before it. Between a bracket pair it opens a block: the closer
+  moves to its own line and the cursor waits on an indented line between them.
+
+  The pairing rules are all about ambiguity. Typing a closer where that closer
+  already sits moves over it, because otherwise auto-closing fights the muscle
+  memory of typing the closing bracket yourself. An opening bracket before a
+  word character does not close, since typing `(` in front of a name means
+  wrapping it and the closer would land mid-word. Quotes are stricter than
+  brackets because a quote is its own closer and cannot be told apart by
+  looking: a quote adjacent to a word character is an apostrophe and is left
+  alone, which is the difference between this feature being liked and hated —
+  `don't` and `it's` are far more common in a buffer than a single-quoted
+  string. A third quote in a row does not add a fourth, because that is a
+  docstring or a fence, not a pair. Backspacing over an empty pair removes both
+  halves, so a bracket typed and reconsidered costs one keystroke rather than
+  two. Typing a bracket or quote with a selection wraps it.
+
+  Only the keystroke path goes through any of this. A paste, a distributed
+  paste and an agent edit all keep their exact bytes: typing a bracket is a
+  keystroke, pasting one is data. The invariant is fuzzed rather than argued —
+  arbitrary buffers and arbitrary keystrokes, asserting the document never
+  shrinks, the typed character always survives, and the cursor stays
+  addressable, since an off-by-one here is a panic on the next keystroke.
+- [x] **Wheel scroll.** It did nothing in the alternate screen, and the reason
+  was that raj never asked for mouse reporting: a terminal that has not been
+  asked sends wheel notches to its own scrollback, which the alternate screen is
+  not part of. The iTerm2-specific workaround was an application default rather
+  than a profile key, so the generated profile could not reach it; asking for
+  reporting works everywhere and needs no setup step.
+
+  DECSET 1000 with 1006, not 1002 or 1003. Those add motion reports, which
+  arrive on every cell the pointer crosses and would be decoded and discarded
+  thousands of times a minute until drag-to-select exists. 1006 is the SGR
+  encoding, and it is the only one decoded: the original packs coordinates into
+  single bytes offset by 32, so column 224 is unrepresentable and the parameters
+  cannot be told apart from arbitrary text. A malformed report is rejected
+  rather than read as a click at the origin — mouse reports share the stream
+  with text, and misreading one would move the cursor on garbage.
+
+  The wheel scrolls whatever is under the pointer rather than whatever has
+  focus, which is what a pointer is for: reaching something without going there
+  first. An open overlay takes the wheel wherever the pointer is, since it is
+  drawn over everything and scrolling the pane behind it would be scrolling
+  something invisible. The cursor does not move — scrolling is looking, not
+  navigating, and dragging the cursor along would change what the next keystroke
+  edits.
+
+  The bug worth recording is the one the first routing test found. Every pane
+  called `list.Follow` when it drew, which pulls the view back to the selection
+  — so a wheel scroll was undone before it ever reached the screen, every frame,
+  invisibly from inside the list. `List.Scroll` now detaches the view until the
+  selection next moves, and render paths call `Settle` instead of `Follow`.
+  Moving the selection reattaches, because the keyboard is an explicit statement
+  about where attention is and it outranks wherever the wheel left the view.
+- [x] **Pasting did nothing, and it was the decoder all along.** The reader
+  waits when a sequence looks incomplete, because a lone ESC is the escape key
+  rather than the start of something — and a buffer that could not be resolved
+  even after waiting was dropped, so a truncated sequence could not wedge the
+  reader. A paste in progress landed on exactly that path and was discarded
+  whole, without a trace.
+
+  Which is why the symptom was so confusing. A paste small enough to arrive in
+  one read parsed immediately and worked; anything large enough to be split, or
+  slow enough to straddle the 25 ms wait, vanished. That made it look like the
+  picker, then like bracketed paste being off, then like the terminal.
+
+  The fix is one distinction the reader was missing: a paste start marker is
+  not ambiguous. Every other partial sequence can be resolved by silence, but
+  nothing except a paste begins with that marker, so waiting is always right
+  and giving up never is. `PastePending` says so, and the ceiling that already
+  bounded a runaway paste is what keeps waiting safe.
+
+  Confirmed by elimination rather than by guessing. The wheel work landed first
+  and worked, which proved the host, the decode loop and the event pipeline were
+  all sound — same reader, same dispatch, same channel — and left the fault
+  somewhere only pastes reach. Two earlier attempts had aimed at the picker and
+  at the narrowing, and reverting one of them changed nothing, which was the
+  first real evidence that the payload was never arriving at all.
+
+  This also makes the narrowing and the pasted-position work live for the first
+  time: pasting `app.go:464:12` into cmd+p now finds the file and opens it at
+  464:12, which is what those patches always claimed to do.
+- [x] **The picker rewrote the query under you.** Pasting `app.go:464:12` left
+  `app.go` in the field: narrowing was implemented as an edit to the input, so
+  the position disappeared as you watched and it looked as though the paste had
+  been mangled. The position was in fact still held and still applied on enter,
+  which made the behaviour worse rather than better — the editor was doing the
+  right thing while showing you that it had not.
+
+  Narrowing is a matching strategy, not an edit. It moved into `filter`, where
+  the query as typed is always tried first and the narrowed forms are only a
+  fallback when nothing matches at all. The field now shows exactly what
+  arrived.
+
+  Doing it in `filter` also means it no longer depends on how the bytes got
+  there. Typing `app.go:464:12` narrows the same way pasting it does, which
+  matters because a terminal that does not honour bracketed paste delivers a
+  pasted path as individual keystrokes and the editor cannot tell the
+  difference. A query that matches on its own is never narrowed, so a file whose
+  name genuinely contains a colon stays reachable.
+- [x] **Buffer-word completion.** Not IntelliSense, and the package says so:
+  a suggestion means "this string exists in a buffer you have open" and nothing
+  more. It knows nothing about types, scope or imports, and it will suggest a
+  word from a comment as readily as a function name. What it does know is that
+  the word being typed almost certainly appears nearby already, which is true
+  often enough to be worth a keystroke.
+
+  Ranking is the whole user-visible behaviour, so the scores are stated in one
+  place: a declaration beats a word that merely appears, and a word from the
+  file being edited beats the same word from elsewhere — locality is the best
+  signal available without types. Matching is a case-sensitive prefix test
+  rather than the fuzzy match the picker uses, because completion finishes a
+  word you have started and a candidate that does not begin with what you typed
+  would replace letters already on screen. Two characters minimum: one matches
+  most of a file and ranks it by nothing useful. The sort is total down to
+  alphabetical, since a list that reshuffles between identical keystrokes is
+  worse than one in a debatable order.
+
+  The popup is not a Picker mode. The picker is a centred modal that takes
+  focus and whose query is a field being edited; completion is anchored to the
+  caret, takes no focus, and its query is the buffer text behind the cursor.
+  Sharing them would mean a modal that is sometimes not modal. It claims five
+  keys — up, down, tab, enter, escape — and everything else falls through and
+  types, which is what keeps it ignorable; there is a test listing fifteen
+  actions that must reach the editor untouched. Several cursors close it,
+  because a completion is one word at one place and applying it at cursors
+  mid-word in different identifiers would replace text nobody looked at.
+
+  `Source` is the seam a language server plugs into later: the popup only needs
+  strings back, so LSP completion becomes another implementation rather than a
+  rewrite.
+
+  Measured rather than assumed, and the number is not flattering: 5.3 ms
+  against 2 MB of open buffers, on the keystroke path. Recorded in
+  BENCHMARKS.md with the caching fix in the TODO rather than quietly shipped.
+- [x] **LSP groundwork: position mapping and the wire format.** The two pieces
+  that carry the most risk and need no server to verify, done first for exactly
+  that reason.
+
+  Positions are the hard part, not the protocol. LSP counts characters in
+  UTF-16 code units and raj counts bytes; they agree for ASCII and disagree for
+  everything else, so one accented letter, one CJK character or one emoji
+  shifts every position after it in a response. The failure mode is not a crash
+  but a jump to the wrong column, which is why this is fuzzed rather than
+  argued about: 1.2 million executions asserting that a round trip never drifts
+  forward, always lands on a rune boundary, and always produces a position
+  inside the document. There is also a test that agrees with Go's own UTF-16
+  encoder rather than restating this package's arithmetic, since a bug repeated
+  in the test is invisible.
+
+  Naming the three coordinate systems is half the value: byte offsets (the
+  buffer and every edit), display columns (the renderer and the caret, where a
+  CJK character is two wide), and UTF-16 code units (LSP, where a CJK character
+  is one and an emoji is two). This package converts the first to the third and
+  never touches the second.
+
+  The framing is HTTP-style headers around a JSON body, and `Content-Length` is
+  in bytes. That is the one place where getting bytes-versus-characters wrong
+  desynchronises the stream permanently — every later frame is then read from
+  the middle of the previous one — so the body is read with `ReadFull` and there
+  is a test for a payload that contains the header delimiter inside a string.
+  Unknown headers are skipped rather than rejected, because failing against a
+  server that is merely chattier than expected is not a failure worth having. A
+  server error is data attached to one request rather than a connection
+  failure: a server that cannot answer a hover can still answer the next
+  completion.

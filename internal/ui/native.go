@@ -296,6 +296,21 @@ func (h *NativeHost) decodeStream(chunks <-chan []byte, wait time.Duration) {
 				}
 				buf = append(buf, b...)
 			case <-time.After(wait):
+				// A paste in progress is never resolved by waiting less. The
+				// timeout exists for one ambiguity — a bare ESC that is the
+				// escape key rather than the start of a sequence — and a
+				// paste has no such ambiguity: the start marker can only be a
+				// paste, so the rest is still coming.
+				//
+				// Treating it like any other stalled sequence dropped the
+				// whole buffer, which is why pasting into raj did nothing at
+				// all: a payload large enough to arrive in more than one read,
+				// or slow enough to straddle the wait, was discarded without a
+				// trace. Small pastes landed in one chunk and worked, which is
+				// what made it look like the picker rather than the decoder.
+				if keys.PastePending(buf) {
+					continue
+				}
 				e, used := keys.ParseFinal(buf)
 				if used == 0 {
 					// Not resolvable even as a final read — a truncated
@@ -329,6 +344,8 @@ func (h *NativeHost) dispatch(e keys.Event) {
 		h.applyThemeReply(e.Raw)
 	case keys.PasteEvent:
 		h.emit(Paste{Text: e.Text})
+	case keys.MouseEvent:
+		h.emit(Mouse{e.Mouse})
 	case keys.KeyEvent:
 		if e.Type != keys.Release && !e.IsModifierKey() {
 			h.emit(Key{e})

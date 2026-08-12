@@ -14,23 +14,33 @@ I am putting this up so I can test drive it; use at your own risk :)
 ## Layout
 
 ```
-internal/keys        bytes -> chord -> action, scope-aware. One measured table
-                     generates the Ghostty config, the iTerm2 profile and the keymap.
-internal/term        raw mode, KKP stack, alt screen, suspend, OSC queries.
+internal/keys        bytes -> chord -> action, scope-aware, plus SGR mouse
+                     reports. One measured table generates the Ghostty config,
+                     the iTerm2 profile and the keymap.
+internal/term        raw mode, KKP stack, alt screen, mouse reporting, suspend,
+                     OSC queries.
 internal/ui          Host seam: cell grid, frame diff, clipping, sanitisation.
                      NativeHost (real terminal) and FakeHost (headless tests).
 internal/piecetable  leaf-embedded B-tree from the benchmark harness, plus
                      per-author stores, Session, ApplyDiff, undo. Fuzzed
                      against a naive oracle.
 internal/view        line index (fuzzed vs rescan), columns, viewport, wrapping.
-internal/editor      file, cursors, motions, actions, render, binary sniffing.
+internal/editor      file, cursors, motions, actions, render, binary sniffing,
+                     auto-indent and bracket pairing on the keystroke path.
 internal/widget      inputs, lists, boxes, the focus vocabulary.
 internal/tabs        open/close/reopen/switch.
 internal/explorer    lazy tree, git-status filter.
-internal/search      literal/regex engine, grouped collapsible results. Literal
+internal/search      literal/regex engine over the tree and the open buffers,
+                     grouped collapsible results. Literal
                      queries bypass regexp for bytes.Index; case-insensitive ones
                      fold ASCII first. Checked against the regexp it replaced.
-internal/picker      cmd+p overlay with fuzzy ranking.
+internal/picker      quick-open overlay with fuzzy ranking, in two modes:
+                     cmd+p over the workspace, cmd+shift+o over one file.
+internal/symbols     declarations by leading keyword, per extension. Fuzzed.
+internal/complete    word completion from open buffers, ranked. The Source seam
+                     is where a language server will plug in.
+internal/lsp         JSON-RPC framing and byte <-> UTF-16 position mapping,
+                     both fuzzed. Lifecycle and requests still to come.
 internal/prompt      modal dialogs: ask a question, resume on the answer.
 internal/probe       what chords does this terminal actually deliver?
 internal/app         event loop, focus routing, layout, breakpoints, debug pane.

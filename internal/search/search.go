@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -87,6 +88,21 @@ func (r Result) Total() int {
 	return n
 }
 
+// Docs is the contents of documents that are open and may differ from what is
+// on disk, keyed by absolute path.
+//
+// A workspace search opened files and scanned them, so a match in an unsaved
+// buffer was invisible and a match it did report could be stale — the pane
+// would send you to a line that had moved, or say nothing about the edit you
+// just made. That is wrong for a person and disqualifying for an agent, which
+// would have to save before it could search what it had written.
+//
+// It is a snapshot rather than a live view on purpose. The search runs off the
+// event thread, and reading a piece table while the user is typing into it is a
+// race; the caller takes this on the event thread when the search is scheduled,
+// and the search reads bytes that cannot change under it.
+type Docs map[string]string
+
 // Run searches root with no way to stop it. Prefer RunContext: an interactive
 // search is abandoned far more often than it is read.
 func Run(root string, q Query) Result { return RunContext(context.Background(), root, q) }
@@ -103,6 +119,16 @@ func Run(root string, q Query) Result { return RunContext(context.Background(), 
 // It walks the tree itself rather than shelling out to ripgrep so raj has no
 // runtime dependency.
 func RunContext(ctx context.Context, root string, q Query) Result {
+	return RunDocs(ctx, root, q, nil)
+}
+
+// RunDocs searches root, preferring open contents over what is on disk.
+//
+// An open document is searched from memory rather than read, which also makes
+// it cheaper: the buffer is already in hand. One that has never been written —
+// a new file that exists only as a tab — is not on the walk at all, so it is
+// swept up afterwards rather than missed.
+func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 	var res Result
 	if q.Text == "" {
 		return res
@@ -120,6 +146,16 @@ func RunContext(ctx context.Context, root string, q Query) Result {
 	// One scan buffer for the whole walk. Allocating 64 KB per file made the
 	// buffer, not the matching, the dominant cost of a search.
 	buf := make([]byte, 0, 64*1024)
+
+	// pending tracks open documents the walk has not reached. Entries are
+	// removed as they are met on disk, so what is left afterwards is exactly
+	// the set that has no file behind it yet.
+	pending := make(map[string]bool, len(open))
+	for path := range open {
+		if eligible(root, path, inc, exc) {
+			pending[path] = true
+		}
+	}
 
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -155,16 +191,82 @@ func RunContext(ctx context.Context, root string, q Query) Result {
 			return filepath.SkipAll
 		}
 		res.Considered++
-		if _, total := scan(path, m, &buf, &res); total > 0 {
-			res.Files++
-			if res.Counts == nil {
-				res.Counts = map[string]int{}
-			}
-			res.Counts[path] = total
-		}
+		delete(pending, path)
+		record(path, scanOne(path, open, m, &buf, &res), &res)
 		return nil
 	})
+	if res.Stopped || res.Capped {
+		return res
+	}
+	// Documents with nothing on disk behind them, in a stable order: the walk
+	// is lexical, and a result list that reshuffles between identical searches
+	// is worse than one that is merely incomplete.
+	rest := make([]string, 0, len(pending))
+	for path := range pending {
+		rest = append(rest, path)
+	}
+	sort.Strings(rest)
+	for _, path := range rest {
+		select {
+		case <-ctx.Done():
+			res.Stopped = true
+			return res
+		default:
+		}
+		if len(res.Matches) >= MaxMatches {
+			res.Capped = true
+			return res
+		}
+		res.Considered++
+		record(path, scanOne(path, open, m, &buf, &res), &res)
+	}
 	return res
+}
+
+// record files a scan's true total under its path.
+func record(path string, total int, res *Result) {
+	if total <= 0 {
+		return
+	}
+	res.Files++
+	if res.Counts == nil {
+		res.Counts = map[string]int{}
+	}
+	res.Counts[path] = total
+}
+
+// scanOne searches a path from the open document if there is one, and from disk
+// otherwise.
+func scanOne(path string, open Docs, m matcher, buf *[]byte, res *Result) (total int) {
+	if text, ok := open[path]; ok {
+		_, total = scanData(path, []byte(text), m, res)
+		return total
+	}
+	_, total = scan(path, m, buf, res)
+	return total
+}
+
+// eligible applies the walk's own filters to a path that never reached the
+// walk, so an unsaved document is included or excluded on the same terms as a
+// saved one rather than on looser ones.
+func eligible(root, path string, inc, exc []string) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if strings.HasPrefix(part, ".") {
+			return false
+		}
+		if part == "node_modules" || part == "vendor" {
+			return false
+		}
+	}
+	name := filepath.Base(path)
+	return matches(name, inc, true) && !matches(name, exc, false)
 }
 
 // forceRegexp disables the literal fast path. It exists so the benchmarks can
@@ -210,8 +312,18 @@ func scan(path string, m matcher, buf *[]byte, res *Result) (found, total int) {
 	defer f.Close()
 
 	data, err := readAll(f, buf)
-	if err != nil || bytes.IndexByte(data, 0) >= 0 {
-		return 0, 0 // unreadable, or a NUL byte somewhere: binary
+	if err != nil {
+		return 0, 0
+	}
+	return scanData(path, data, m, res)
+}
+
+// scanData is the sweep itself, over bytes that are already in hand. It is
+// separate from scan because an open document arrives as memory rather than as
+// a file, and everything after the read is identical for both.
+func scanData(path string, data []byte, m matcher, res *Result) (found, total int) {
+	if len(data) > MaxFileSize || bytes.IndexByte(data, 0) >= 0 {
+		return 0, 0 // too big, or a NUL byte somewhere: binary
 	}
 
 	hay, lineFallback := m.prepare(data)

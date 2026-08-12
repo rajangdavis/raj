@@ -122,6 +122,15 @@ func (p *Pane) ScrollPage(dir int) {
 	p.Viewport.ScrollBy((rows-1)*dir, p.File.Lines())
 }
 
+// ScrollRows moves the view by rows without moving the cursor, for the wheel.
+//
+// The cursor deliberately stays put. Scrolling with the wheel is looking, not
+// navigating: dragging the cursor along would change what the next keystroke
+// edits, and the cursor would arrive somewhere the user never chose.
+func (p *Pane) ScrollRows(rows int) {
+	p.Viewport.ScrollBy(rows, p.File.Lines())
+}
+
 func (p *Pane) MovePage(dir int, extend bool) {
 	rows := p.Viewport.Rows
 	if rows < 2 {

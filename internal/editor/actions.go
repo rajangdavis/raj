@@ -137,12 +137,18 @@ func (p *Pane) Handle(a keys.Action) bool {
 // HandleText inserts literal text — a keypress with no action bound, or a
 // paste. Pastes arrive whole rather than as individual keys, so a large paste
 // is one buffer edit rather than thousands.
+// HandleText types text at every cursor.
+//
+// It routes through InsertRune, which is where auto-indent and bracket pairing
+// live, because this is the keystroke path. A paste goes through Paste and an
+// agent edit through InsertText, and neither should have its bytes second-
+// guessed: typing a bracket is a keystroke, pasting one is data.
 func (p *Pane) HandleText(text string) {
 	if text == "" {
 		return
 	}
 	p.File.Begin()
-	p.InsertText(text)
+	p.InsertRune(text)
 	p.File.End()
 	p.FollowCursor()
 }

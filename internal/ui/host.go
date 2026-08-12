@@ -36,6 +36,11 @@ type Focus struct{ In bool }
 // individual keys, so a large paste is one buffer edit instead of thousands.
 type Paste struct{ Text string }
 
+// Mouse is a decoded pointer event. Only wheel events are acted on today; the
+// rest are carried because the decoder produces them anyway and dropping them
+// here would mean re-deriving them when click and drag land.
+type Mouse struct{ keys.Mouse }
+
 // Tick drives time-based work: the coalescing window that batches streaming
 // agent hunks, cursor blink, and status refreshes.
 type Tick struct{ Count uint64 }
@@ -61,6 +66,7 @@ func (Key) isEvent()       {}
 func (Resize) isEvent()    {}
 func (Focus) isEvent()     {}
 func (Paste) isEvent()     {}
+func (Mouse) isEvent()     {}
 func (Tick) isEvent()      {}
 func (Suspended) isEvent() {}
 func (Wake) isEvent()      {}

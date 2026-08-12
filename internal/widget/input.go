@@ -45,6 +45,13 @@ func (in *Input) SetText(text string) {
 	in.Cursor, in.Anchor = len(text), len(text)
 }
 
+// SelectAll selects the whole field, caret at the end. Callers that seed a
+// field with a suggestion use this to make the first keystroke replace it,
+// which is the same thing the SelectAll action does by hand.
+func (in *Input) SelectAll() {
+	in.Anchor, in.Cursor = 0, len(in.Text)
+}
+
 // moveTo places the caret, dragging the anchor with it unless extending.
 func (in *Input) moveTo(pos int, extend bool) {
 	in.Cursor = pos
@@ -132,7 +139,7 @@ func (in *Input) Handle(a keys.Action, text string) bool {
 		// Previously this emptied the field. With no selection to represent,
 		// "select everything" had nowhere to put its result, so it did the one
 		// thing that looked similar and was destructive instead.
-		in.Anchor, in.Cursor = 0, len(in.Text)
+		in.SelectAll()
 	case keys.None:
 		if text == "" || text == "\n" {
 			return false

@@ -64,11 +64,26 @@ type Prompt struct {
 // New returns a closed prompt.
 func New() *Prompt { return &Prompt{} }
 
-// Ask opens a single-line question seeded with initial, caret at the end.
+// Ask opens a single-line question seeded with initial, caret at the end. Use
+// it when the seed is a prefix to keep typing after — a save-as path is the
+// directory, not the answer.
 func (p *Prompt) Ask(title, initial string, done func(answer string, ok bool)) {
 	*p = Prompt{Open: true, kind: ask, title: title, done: done}
 	p.input.Focused = true
 	p.input.SetText(initial)
+}
+
+// AskSuggestion opens the same question with the seed selected, so the first
+// keystroke replaces it.
+//
+// The distinction is the whole point: a seed is either context to build on or a
+// default to overwrite, and the field cannot tell which. Go-to-line seeds the
+// line you are on so the dialog says where you are — but nobody types 1 to mean
+// line 11, so leaving the caret at the end turned every jump into a select-all
+// first. Enter still accepts the suggestion untouched.
+func (p *Prompt) AskSuggestion(title, suggestion string, done func(answer string, ok bool)) {
+	p.Ask(title, suggestion, done)
+	p.input.SelectAll()
 }
 
 // Confirm opens a choice between labels, the first selected.

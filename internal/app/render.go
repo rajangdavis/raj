@@ -35,6 +35,13 @@ func (a *App) Draw() {
 	}
 	a.drawStatus(cols, rows-1)
 
+	// Completion sits over the editor but under the picker and any dialog: it
+	// is anchored to the caret, so it belongs with the text rather than with
+	// the overlays that take focus.
+	if l.ShowEditor && !a.Picker.Open && !a.Prompt.Open {
+		a.drawCompletion(l)
+	}
+
 	a.Debug.Render(a.screen, a, 0, l.TopY, cols, l.Rows, a.wth)
 	// The picker floats above everything, so it is drawn last.
 	a.Picker.Render(a.screen, cols, rows, a.wth)
@@ -80,6 +87,24 @@ func (a *App) drawSidebar(l Layout) {
 			a.screen.Set(l.SidebarX+l.SidebarW-1, y, '│', a.wth.Border)
 		}
 	}
+}
+
+// drawCompletion places the popup in the editor's coordinates, past the gutter
+// and offset by the find bar when it is open — the same origin the text itself
+// is drawn from, or the list would sit a column or a row away from the word it
+// is completing.
+func (a *App) drawCompletion(l Layout) {
+	p := a.Tabs.Active()
+	if p == nil || !a.Complete.Open {
+		return
+	}
+	top, rows := l.TopY, l.Rows
+	if p.Find.Open {
+		top, rows = top+1, rows-1
+	}
+	g := p.GutterWidth()
+	a.Complete.Render(a.screen, l.EditorX+g, top, l.EditorW-g, rows,
+		p.Viewport.Top, a.wth)
 }
 
 func (a *App) drawEditor(l Layout) {

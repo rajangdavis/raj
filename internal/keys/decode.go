@@ -18,6 +18,7 @@ const (
 	OtherReply
 	Partial
 	PasteEvent
+	MouseEvent
 )
 
 // KKP modifier bits. caps_lock (64) and num_lock (128) are reported too and
@@ -49,6 +50,7 @@ type Event struct {
 	Text    string
 	Final   byte
 	Params  []string
+	Mouse   Mouse
 }
 
 // ParseFinal decodes b knowing that nothing more is coming — the reader waited
@@ -154,6 +156,15 @@ func parseCSI(b []byte) (Event, int) {
 	n := i + 1
 
 	switch {
+	case (e.Final == 'M' || e.Final == 'm') && strings.HasPrefix(body, "<"):
+		// An SGR mouse report. Claimed before the key cases because 'M' is
+		// also a legacy key final, and a report misread as a key would type
+		// its coordinates into the buffer.
+		if parseMouse(&e) {
+			return e, n
+		}
+		e.Kind = OtherReply
+		return e, n
 	case e.Final == 'I':
 		e.Kind = FocusIn
 		return e, n
@@ -204,6 +215,21 @@ var (
 // the start marker is surrendered as an ordinary reply, which drains the buffer
 // and lets the following bytes decode as keys — degraded, but not wedged.
 const MaxPaste = 16 << 20
+
+// PastePending reports whether b is the start of a bracketed paste whose end
+// marker has not arrived yet.
+//
+// It exists so a reader can tell "still coming" from "stalled". Every other
+// partial sequence is ambiguous under silence — a lone ESC is the escape key —
+// but a paste start marker is not: nothing else begins that way, so waiting is
+// always right and giving up never is. The MaxPaste ceiling still applies, so a
+// terminal that sends a start marker and then dies cannot wedge the reader
+// forever.
+func PastePending(b []byte) bool {
+	return len(b) <= MaxPaste &&
+		bytes.HasPrefix(b, pasteStart) &&
+		bytes.Index(b, pasteEnd) < 0
+}
 
 // parsePaste consumes a whole bracketed paste and returns its payload as Text.
 //

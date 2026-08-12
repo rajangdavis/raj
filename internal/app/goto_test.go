@@ -3,6 +3,8 @@ package app
 import (
 	"strings"
 	"testing"
+
+	"raj/internal/ui"
 )
 
 func doc(n int) string {
@@ -49,7 +51,6 @@ func TestGotoLineJumps(t *testing.T) {
 func TestGotoLineSeedsTheCurrentLine(t *testing.T) {
 	h := newHarness(t, doc(50))
 	h.press("ctrl+g")
-	h.press("super+a")
 	h.typeText("30")
 	h.press("enter")
 	h.press("ctrl+g")
@@ -59,11 +60,62 @@ func TestGotoLineSeedsTheCurrentLine(t *testing.T) {
 	}
 }
 
+// The seed is a default, not a prefix. Typing replaces it, because nobody
+// presses ctrl+g on line 1 and types 30 meaning line 130.
+func TestGotoLineSeedIsReplacedByTyping(t *testing.T) {
+	h := newHarness(t, doc(200))
+	h.press("ctrl+g")
+	h.typeText("30")
+	if got := h.Prompt.Text(); got != "30" {
+		t.Fatalf("field = %q, want 30", got)
+	}
+	h.press("enter")
+	if got := cursorLine(h); got != 30 {
+		t.Errorf("cursor on line %d, want 30", got)
+	}
+}
+
+// A pasted "12:4" replaces the seed the same way typing does, so a position
+// copied out of a compiler needs no editing.
+func TestGotoLinePasteReplacesTheSeed(t *testing.T) {
+	h := newHarness(t, doc(200))
+	h.press("ctrl+g")
+	h.Handle(ui.Paste{Text: "12:4\n"})
+	h.drain()
+	if got := h.Prompt.Text(); got != "12:4" {
+		t.Fatalf("field = %q, want 12:4", got)
+	}
+	h.press("enter")
+	if got, want := cursorLine(h), 12; got != want {
+		t.Errorf("line = %d, want %d", got, want)
+	}
+	if got, want := cursorCol(h), 4; got != want {
+		t.Errorf("column = %d, want %d", got, want)
+	}
+}
+
+// Enter with nothing typed accepts the suggestion rather than clearing it, so
+// selecting the seed does not turn ctrl+g+enter into an error.
+func TestGotoLineAcceptsTheSeedUntouched(t *testing.T) {
+	h := newHarness(t, doc(80))
+	h.press("ctrl+g")
+	h.typeText("40")
+	h.press("enter")
+	h.press("ctrl+g")
+	h.press("enter")
+
+	if got := cursorLine(h); got != 40 {
+		t.Errorf("cursor moved to %d, want it left on 40", got)
+	}
+	if h.Status() != "" {
+		t.Errorf("accepting the seed reported %q", h.Status())
+	}
+}
+
 // A compiler prints line:column, and pasting one in should not need editing.
 func TestGotoLineAcceptsLineColon(t *testing.T) {
 	h := newHarness(t, doc(40))
 	h.press("ctrl+g")
-	h.press("super+a")
 	h.typeText("12:4")
 	h.press("enter")
 
@@ -80,7 +132,6 @@ func TestGotoLineClampsPastTheEnd(t *testing.T) {
 	h := newHarness(t, doc(20))
 	lines := h.Pane().File.Lines()
 	h.press("ctrl+g")
-	h.press("super+a")
 	h.typeText("9999")
 	h.press("enter")
 
@@ -96,7 +147,6 @@ func TestGotoLineRejectsNonsense(t *testing.T) {
 	for _, in := range []string{"abc", "-3", "1.5", "12x"} {
 		h := newHarness(t, doc(30))
 		h.press("ctrl+g")
-		h.press("super+a")
 		h.typeText(in)
 		h.press("enter")
 
@@ -114,12 +164,10 @@ func TestGotoLineRejectsNonsense(t *testing.T) {
 func TestGotoColumnOnTheCurrentLine(t *testing.T) {
 	h := newHarness(t, doc(40))
 	h.press("ctrl+g")
-	h.press("super+a")
 	h.typeText("15")
 	h.press("enter")
 
 	h.press("ctrl+g")
-	h.press("super+a")
 	h.typeText(":3")
 	h.press("enter")
 
@@ -134,7 +182,6 @@ func TestGotoColumnOnTheCurrentLine(t *testing.T) {
 func TestGotoLineCancelLeavesTheCursor(t *testing.T) {
 	h := newHarness(t, doc(60))
 	h.press("ctrl+g")
-	h.press("super+a")
 	h.typeText("45")
 	h.press("esc")
 

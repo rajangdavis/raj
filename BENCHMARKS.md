@@ -316,3 +316,36 @@ Finding the newlines in an 800 KB insertion, `BenchmarkNewlines*`:
 The allocation is the point: it was a full copy of the pasted text, made to
 count a handful of newlines and thrown away immediately. Reading the pieces is
 also the only correct way to do it — see INVESTIGATIONS.md.
+
+
+## Symbol scan
+
+go-to-symbol rescans the buffer each time the overlay opens rather than caching
+and invalidating, so the question was whether that is affordable on the
+keystroke path.
+
+| input | time | throughput |
+| --- | --- | --- |
+| 188 KB of Go, 2000 declarations | 0.42 ms | 444 MB/s |
+
+It is a byte scan over line prefixes with no allocation per non-matching line,
+so cost tracks file size rather than symbol count. At 0.42 ms for a file larger
+than anything in this repository, a cache would be invalidation logic bought
+with a third of a frame — the scan is cheaper than the bookkeeping to avoid it.
+
+
+## Word completion
+
+Candidates are recomputed on every keystroke, so the question is what that
+costs against realistic open buffers.
+
+| open buffers | time | throughput |
+| --- | --- | --- |
+| 5 files, 400 KB each (2 MB total) | 5.3 ms | 301 MB/s |
+
+Cost tracks the total bytes open, because every buffer is rescanned for words
+each time. At a more usual 50 KB a file that is well under a frame, but 5.3 ms
+is a third of one — and this is the keystroke path, which elsewhere in raj is
+held to a stricter standard than that (retokenising is deliberately kept off it
+for the same reason). The scan is not the problem; rescanning unchanged buffers
+is. See the TODO item on caching the word set per buffer version.

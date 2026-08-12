@@ -85,11 +85,20 @@ type List struct {
 	Sel  int
 	Top  int
 	Rows int
+
+	// detached records that the view was scrolled away from the selection and
+	// should stay there until the selection moves. Unexported because it is a
+	// consequence of calling Scroll rather than something a caller sets.
+	detached bool
 }
 
 // Move changes the selection by delta, clamped to n items, and scrolls to keep
 // it visible.
 func (l *List) Move(delta, n int) {
+	// Moving the selection reattaches the view to it: the keyboard is an
+	// explicit statement about where attention is, and it outranks wherever
+	// the wheel last left the view.
+	l.detached = false
 	if n == 0 {
 		l.Sel, l.Top = 0, 0
 		return
@@ -124,7 +133,49 @@ func (l *List) Follow(n int) {
 }
 
 // Reset returns to the top of the list, for when its contents change wholesale.
-func (l *List) Reset() { l.Sel, l.Top = 0, 0 }
+func (l *List) Reset() { l.Sel, l.Top, l.detached = 0, 0, false }
+
+// Scroll moves the view by delta rows without moving the selection, which is
+// what a wheel does: the pointer is not the keyboard, and a wheel notch that
+// dragged the selection with it would silently change what enter acts on.
+//
+// Scrolling detaches the view from the selection until the selection next
+// moves. Without that, a pane whose Render follows the selection every frame
+// undoes the scroll before it is ever drawn — which is exactly what happened,
+// and is invisible from inside the list.
+func (l *List) Scroll(delta, n int) {
+	if l.Rows <= 0 || n == 0 {
+		return
+	}
+	l.detached = true
+	l.Top += delta
+	l.clamp(n)
+}
+
+// Settle prepares the list for drawing into rows rows: it takes the geometry,
+// keeps Top in range, and pulls the view back to the selection unless the user
+// has scrolled away from it.
+//
+// Render paths call this rather than Follow. The difference is only visible
+// once something can move the view on its own, but then it is the whole
+// difference between a wheel that works and one that appears not to.
+func (l *List) Settle(rows, n int) {
+	l.Rows = rows
+	if l.detached {
+		l.clamp(n)
+		return
+	}
+	l.Follow(n)
+}
+
+func (l *List) clamp(n int) {
+	if max := n - l.Rows; l.Top > max {
+		l.Top = max
+	}
+	if l.Top < 0 {
+		l.Top = 0
+	}
+}
 
 // Truncate shortens text to w display columns, marking the cut with an ellipsis
 // so a clipped path is visibly clipped rather than looking like a shorter name.

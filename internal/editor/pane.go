@@ -25,6 +25,12 @@ type Pane struct {
 	// for every viewport calculation, so it is opt-in per pane.
 	Wrap bool
 
+	// AutoPairs completes brackets and quotes as they are typed. Auto-indent
+	// on newline is not gated by it: a newline that drops the indentation is
+	// not a convenience anyone declines, whereas an auto-closed bracket is a
+	// preference people genuinely differ on.
+	AutoPairs bool
+
 	wrapBuf []int // reused across lines and frames by the renderer
 	focused bool
 }
@@ -130,6 +136,12 @@ func (p *Pane) PasteDistributed(lines []string) {
 // DeleteBackward is backspace: remove the selection, or the character before
 // the cursor.
 func (p *Pane) DeleteBackward() {
+	// An empty pair the editor completed is removed whole, so auto-pairing
+	// does not quietly cost a keystroke every time a bracket is typed and
+	// then thought better of.
+	if p.deletePair() {
+		return
+	}
 	p.editEachCursor(func(c Cursor) (int, int, string) {
 		if c.HasSelection() {
 			lo, hi := c.Range()

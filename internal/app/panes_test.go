@@ -1027,6 +1027,101 @@ func TestPasteTrimsTrailingNewline(t *testing.T) {
 	}
 }
 
+// Picking a file must open the file, not a blank buffer named after it. The
+// index is relative to the workspace, so what the picker hands back has to be
+// resolved against the workspace rather than against the shell's cwd — which
+// is the same thing only when raj was started from the directory it is editing.
+func TestPickerOpensTheRealFile(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("super+p")
+	h.typeText("helper")
+	h.press("enter")
+
+	if h.Pane() == nil {
+		t.Fatal("nothing opened")
+	}
+	if got := h.Pane().File.Path; !filepath.IsAbs(got) {
+		t.Errorf("opened %q; a relative path resolves against the cwd", got)
+	}
+	if got := h.Pane().File.Text(); !strings.Contains(got, "func needle()") {
+		t.Errorf("opened an empty or wrong buffer: %q", got)
+	}
+	if h.Pane().File.Dirty() {
+		t.Error("a freshly picked file is dirty, so it was created rather than read")
+	}
+}
+
+// The picker had no paste coverage at all, which is how the field could hold a
+// pasted path while the list showed nothing without a test noticing.
+func TestPasteIntoPicker(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("super+p")
+	if h.Focused() != FocusPicker {
+		t.Fatal("setup: expected picker focus")
+	}
+	h.Handle(ui.Paste{Text: "main.go"})
+	h.drain()
+	if got := h.Picker.Query(); got != "main.go" {
+		t.Errorf("query = %q, want main.go", got)
+	}
+	if h.Picker.Results() == 0 {
+		t.Error("the pasted name matched nothing")
+	}
+	if !h.Picker.Open || h.Focused() != FocusPicker {
+		t.Error("a paste closed the picker")
+	}
+}
+
+// A path pasted from a shell or a compiler carries a prefix and a position the
+// index does not. The picker narrows it rather than searching for it literally.
+func TestPasteIntoPickerNarrowsAPath(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("super+p")
+	h.Handle(ui.Paste{Text: filepath.Join(h.root, "main.go") + ":12:4\n"})
+	h.drain()
+	if h.Picker.Results() == 0 {
+		t.Fatalf("pasted path matched nothing; query = %q", h.Picker.Query())
+	}
+	if got := h.Picker.Top(); got != "main.go" {
+		t.Errorf("top result = %q, want main.go", got)
+	}
+}
+
+// Pasting a compiler line into the picker and pressing enter opens the file
+// where the compiler was pointing. The position is parsed out to make the path
+// match; throwing it away afterwards would land at the top of the file.
+func TestPasteIntoPickerOpensAtThePosition(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("super+p")
+	h.Handle(ui.Paste{Text: filepath.Join(h.root, "pkg/helper.go") + ":3:6\n"})
+	h.drain()
+	h.press("enter")
+
+	if h.Pane() == nil {
+		t.Fatal("nothing opened")
+	}
+	if got := filepath.Base(h.Pane().File.Path); got != "helper.go" {
+		t.Fatalf("opened %q, want helper.go", got)
+	}
+	line, col := h.Pane().File.LineCol(h.Pane().Cursors.Primary().Head)
+	if line+1 != 3 || col+1 != 6 {
+		t.Errorf("cursor at %d:%d, want 3:6", line+1, col+1)
+	}
+}
+
+// A path with no position opens at the top, unchanged.
+func TestPickerWithoutAPositionOpensAtTheTop(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.press("super+p")
+	h.Handle(ui.Paste{Text: "pkg/helper.go"})
+	h.drain()
+	h.press("enter")
+
+	if line, _ := h.Pane().File.LineCol(h.Pane().Cursors.Primary().Head); line != 0 {
+		t.Errorf("cursor on line %d, want the top", line+1)
+	}
+}
+
 // The explorer has no text field, and its only keys.None handler treats a space
 // as the changed-only toggle. A pasted space must not flip that filter.
 func TestPasteIntoExplorerIsIgnored(t *testing.T) {

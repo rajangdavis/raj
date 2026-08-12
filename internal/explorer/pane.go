@@ -119,6 +119,12 @@ func (p *Pane) toggleFilter() {
 }
 
 // Selected is the highlighted entry's path, empty when the tree is empty.
+// List exposes the scroll state, so a caller can assert on where the view is.
+func (p *Pane) List() *widget.List { return &p.list }
+
+// Scroll moves the view without moving the selection, for the wheel.
+func (p *Pane) Scroll(delta int) { p.list.Scroll(delta, len(p.Tree.Entries())) }
+
 func (p *Pane) Selected() string {
 	entries := p.Tree.Entries()
 	if p.list.Sel < len(entries) {
@@ -144,8 +150,7 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 	p.renderPath(s, x, y+h-1, w, th)
 
 	rows := h - 3
-	p.list.Rows = rows
-	p.list.Follow(len(p.Tree.Entries()))
+	p.list.Settle(rows, len(p.Tree.Entries()))
 	entries := p.Tree.Entries()
 
 	for row := 0; row < rows; row++ {

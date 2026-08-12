@@ -56,6 +56,24 @@ const (
 	// invalidates every cell position the frame diff is tracking.
 	altOn  = "\x1b[?1049h"
 	altOff = "\x1b[?1049l"
+
+	// Mouse reporting: button events (1000) in the SGR encoding (1006).
+	//
+	// 1000 rather than 1002 or 1003 deliberately. Those add motion reports,
+	// which arrive on every cell the pointer crosses and are only worth their
+	// traffic once drag-to-select exists; until then they would be decoded and
+	// discarded thousands of times a minute. 1006 is what lifts the coordinate
+	// ceiling: the original encoding packs them into single bytes offset by
+	// 32, so column 224 is unrepresentable and the parameters cannot be told
+	// apart from arbitrary text.
+	//
+	// The reason to ask at all is the wheel. Without reporting, a terminal
+	// sends wheel notches to its own scrollback — which the alternate screen
+	// is not part of, so scrolling silently did nothing. Enabling this means
+	// the terminal stops handling the wheel and hands it over, which is only
+	// an improvement if raj then acts on it.
+	mouseOn  = "\x1b[?1000h\x1b[?1006h"
+	mouseOff = "\x1b[?1006l\x1b[?1000l"
 )
 
 // Terminal holds the state that must be unwound on exit, crash or suspend. A
@@ -105,6 +123,7 @@ func (t *Terminal) Enter(flags int) error {
 	fmt.Fprintf(t.out, kkpPushFmt, flags)
 	fmt.Fprint(t.out, focusOn)
 	fmt.Fprint(t.out, pasteOn)
+	fmt.Fprint(t.out, mouseOn)
 	return nil
 }
 
@@ -114,6 +133,9 @@ func (t *Terminal) Leave() {
 	if t == nil || !t.live {
 		return
 	}
+	// Reporting off before the alt screen goes away, so the terminal is
+	// handling its own wheel again by the time the shell is visible.
+	fmt.Fprint(t.out, mouseOff)
 	fmt.Fprint(t.out, pasteOff)
 	fmt.Fprint(t.out, focusOff)
 	fmt.Fprint(t.out, kkpPop)
