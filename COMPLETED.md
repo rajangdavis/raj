@@ -772,3 +772,73 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   answer look stale — silently, since the buffer words stay up and the server's
   answer simply never appears. Caught by a test that asserted the replacement
   rather than the absence of a crash.
+- [x] **Diagnostics.** The last piece of the staged LSP plan, and the only
+  feature here that arrives without being asked — which makes it the only one
+  that has to survive turning up at an arbitrary moment: while a file is being
+  edited, while it is closed, or for a file never opened this session.
+
+  They are absolute rather than incremental. Each publish is the complete set
+  for a document, so the newest replaces the previous one whole; merging would
+  accumulate problems that have already been fixed. An empty publish is
+  therefore meaningful and is stored as a clearing rather than ignored — it is
+  how a server says the problems are gone, and dropping it would leave them on
+  screen forever.
+
+  Stored in file order rather than by severity, because a warning on line 3
+  above an error on line 200 is what the file actually looks like. A line
+  carrying both is an error line: showing the warning because it was published
+  first would under-report it. A missing severity counts as an error, since the
+  protocol leaves that to the client and under-reporting a real problem is the
+  worse mistake.
+
+  The bug worth recording is a disagreement between two places that had to
+  agree. `severityRank` treated an unspecified severity as an error and `counts`
+  matched on the literal value, so such a diagnostic drew a red mark in the
+  gutter and was reported as no problems in the status line. Caught by testing
+  the counting against the ranking rather than against itself.
+
+  The marks go over the line numbers rather than beside them: widening the
+  gutter for a column that is empty most of the time costs every file a column
+  forever, and a number under a mark is still recoverable from the status line.
+  The channel is drained rather than read once per wake, because several
+  publishes can queue between wakes and only the last for each file matters.
+- [x] **Click and drag in the editor.** Click to position, drag to select,
+  double click for a word, triple click for a line, shift-click to extend,
+  cmd-click for another cursor. The panes and the fields are deliberately not
+  included: each needs its own hit-testing against what it drew, and doing them
+  together would have meant four half-tested mappings instead of one tested one.
+
+  `OffsetAt` is the exact inverse of `placeCaret`, and the two have to stay
+  inverses — a click that lands anywhere other than where the caret would be
+  drawn for that offset is a click that appears to miss. So the test asserts the
+  round trip across every offset in a buffer rather than either half separately.
+  Three coordinate systems meet here and the order is what makes it work: a
+  screen cell becomes a display column, a display column becomes a byte offset
+  within a line, and only then a document offset. Skipping the middle step is
+  what makes clicks land wrong on lines containing tabs or CJK, and `OffsetOf`
+  already resolved a column landing inside a tab to that tab's start.
+
+  DECSET 1002 replaces 1000, which is the change that makes dragging possible at
+  all: 1000 reports presses and releases, and every cell the pointer crosses in
+  between arrives only under 1002. Still not 1003 — that reports motion with no
+  button held, which is every cell the pointer crosses at all times, decoded and
+  discarded.
+
+  A click past the end of a line lands at the line's end rather than wrapping,
+  because dragging past the right edge is how a whole line gets selected and
+  wrapping would quietly take the next line's start too. A release ends the drag
+  wherever it happens, including outside the editor, since a button released
+  over the sidebar is still released. A drag that wanders out of the text area
+  clamps rather than stopping: losing the selection because the pointer moved a
+  cell too far is worse than extending it to the nearest edge.
+
+  The double-click threshold is time *and* position. Two presses far apart are
+  two clicks however fast they arrive, and treating them as a double click would
+  select a word the pointer never touched.
+
+  The test bug worth recording: the first click test failed by one row and one
+  column, and the cause was that a pane learns its width from being rendered — a
+  wrapped pane that has never been drawn wraps at the wrong column, so a click
+  resolved against it lands somewhere the user would never have seen. The real
+  app draws after every event, so the fixture was wrong about the state a
+  pointer always meets, not the code.

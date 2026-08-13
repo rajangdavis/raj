@@ -49,8 +49,17 @@ type App struct {
 	// superseded by later typing, not by a cursor move for a hover, and
 	// sharing one counter would make each cancel the other.
 	completeGen int
-	lspMu       sync.Mutex
-	lspAnswer   *lspAnswer
+
+	// diags is the current problems per file, published by servers rather than
+	// requested.
+	diags *diagnostics
+
+	// drag tracks a press-and-hold in the editor, and click counts a rapid
+	// sequence in one place so double and triple clicks can mean something.
+	drag      bool
+	click     clickTracker
+	lspMu     sync.Mutex
+	lspAnswer *lspAnswer
 
 	root    string
 	sidebar Sidebar
@@ -96,6 +105,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		Search:        search.NewPane(root),
 		completeCache: complete.NewCache(),
 		servers:       newServers(root),
+		diags:         newDiagnostics(),
 		Picker:        picker.New(root),
 		Prompt:        prompt.New(),
 		root:          root,
@@ -205,6 +215,7 @@ const wheelRows = 3
 // something the user cannot see.
 func (a *App) mouse(ev ui.Mouse) {
 	if !ev.IsWheel {
+		a.pointer(ev)
 		return
 	}
 	delta := wheelRows
@@ -376,6 +387,7 @@ func (a *App) Handle(e ui.Event) {
 		// mostly in having ended the wait for the next tick. A language server
 		// answer is parked the same way and collected here.
 		a.applyAnswer()
+		a.drainDiagnostics()
 	case ui.Tick:
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.

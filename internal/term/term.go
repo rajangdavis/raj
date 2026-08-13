@@ -57,23 +57,28 @@ const (
 	altOn  = "\x1b[?1049h"
 	altOff = "\x1b[?1049l"
 
-	// Mouse reporting: button events (1000) in the SGR encoding (1006).
+	// Mouse reporting: button and drag events (1002) in the SGR encoding (1006).
 	//
-	// 1000 rather than 1002 or 1003 deliberately. Those add motion reports,
-	// which arrive on every cell the pointer crosses and are only worth their
-	// traffic once drag-to-select exists; until then they would be decoded and
-	// discarded thousands of times a minute. 1006 is what lifts the coordinate
-	// ceiling: the original encoding packs them into single bytes offset by
-	// 32, so column 224 is unrepresentable and the parameters cannot be told
-	// apart from arbitrary text.
+	// 1002 rather than 1000: button-motion reporting, which sends a report for
+	// every cell the pointer crosses while a button is held. That traffic is
+	// what drag-to-select is made of, and it was deliberately not requested
+	// until something consumed it.
+	//
+	// Still not 1003, which reports motion with no button held — that is every
+	// cell the pointer crosses at all times, decoded and discarded, and nothing
+	// raj does needs to know where the pointer is when it is not being used.
+	//
+	// 1006 is what lifts the coordinate ceiling: the original encoding packs
+	// coordinates into single bytes offset by 32, so column 224 is
+	// unrepresentable and the parameters cannot be told apart from text.
 	//
 	// The reason to ask at all is the wheel. Without reporting, a terminal
 	// sends wheel notches to its own scrollback — which the alternate screen
 	// is not part of, so scrolling silently did nothing. Enabling this means
 	// the terminal stops handling the wheel and hands it over, which is only
 	// an improvement if raj then acts on it.
-	mouseOn  = "\x1b[?1000h\x1b[?1006h"
-	mouseOff = "\x1b[?1006l\x1b[?1000l"
+	mouseOn  = "\x1b[?1002h\x1b[?1006h"
+	mouseOff = "\x1b[?1006l\x1b[?1002l"
 )
 
 // Terminal holds the state that must be unwound on exit, crash or suspend. A

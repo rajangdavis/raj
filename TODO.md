@@ -14,14 +14,12 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Editor
 
-- [ ] **Mouse: everything except the wheel.** Click to position, drag to select,
-  cmd-click for an extra cursor, click a tab to switch, click a file in the
-  explorer or search results to open it (refusing binaries loudly rather than in
-  the status line). The reporting, the decoder and the position routing all
-  landed with the wheel, so what is left is mapping a cell to a document offset
-  and back. Drag needs DECSET 1002 as well, which is why it was left out: motion
-  reports arrive on every cell the pointer crosses and are pure traffic until
-  something consumes them.
+- [ ] **Mouse: the panes and the fields.** Click a tab to switch or close it,
+  click a file in the explorer or a hit in the search results to open it
+  (refusing binaries loudly rather than in the status line), click into a prompt
+  or a search field to place the caret. The editor is done; each of these needs
+  its own hit-testing against what it drew, which is why they were left out
+  rather than guessed at together.
 - [ ] **LSP: hover, go-to-definition, diagnostics, completion.** Staged, because
   each stage is independently useful and the risk is not evenly spread.
 
@@ -41,9 +39,8 @@ findings and decisions live in INVESTIGATIONS.md.
 
   Order: ~~position mapping~~, ~~JSON-RPC framing~~, ~~process lifecycle~~,
   ~~document synchronisation~~, ~~hover~~, ~~definition~~ and ~~completion~~
-  are done → **diagnostics next**, which is the last piece and mostly a
-  rendering job: they are already decoded and delivered on a channel, and what
-  is missing is a gutter mark and a pane to list them in.
+  and ~~diagnostics~~ are done. The staged plan is complete; what remains are
+  the follow-ons listed separately below.
 
   Hover currently lands in the status line, folded onto one line. That is
   enough to make the feature usable and to prove the request path, and it is
@@ -90,6 +87,19 @@ findings and decisions live in INVESTIGATIONS.md.
   incomplete is asking to be re-queried as the prefix grows, and raj asks once.
   For a large package the first answer is a truncated one that then never
   improves.
+- [ ] **A drag does not scroll.** Dragging to the top or bottom edge extends
+  the selection to the edge and stops there; every editor scrolls instead, and
+  without it a selection cannot exceed a screenful by pointer alone. It needs a
+  timer rather than an event, since the pointer sits still while the text moves.
+- [ ] **Diagnostics have no list pane.** They show as a gutter letter and a
+  count in the status line, with the message for the cursor's line. That is
+  enough to find a problem you are standing on and useless for finding the one
+  three files away. A pane listing them across the workspace is the missing
+  half, and the search pane is the shape to copy — grouped by file, collapsible,
+  enter to jump.
+- [ ] **Diagnostics are not cleared when a file is closed.** The store keeps
+  them keyed by path, so closing a tab leaves its problems counted in nothing
+  visible but held in memory. `clear` exists and nothing calls it.
 - [ ] **Hover has no panel.** It is folded onto the status line, which loses
   the shape of a signature and truncates anything long. A floating panel
   anchored to the cursor is the right home, and the completion popup already

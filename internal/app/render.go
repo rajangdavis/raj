@@ -32,6 +32,7 @@ func (a *App) Draw() {
 	}
 	if l.ShowEditor {
 		a.drawEditor(l)
+		a.drawDiagnosticMarks(l)
 	}
 	a.drawStatus(cols, rows-1)
 
@@ -93,6 +94,53 @@ func (a *App) drawSidebar(l Layout) {
 // and offset by the find bar when it is open — the same origin the text itself
 // is drawn from, or the list would sit a column or a row away from the word it
 // is completing.
+// drawDiagnosticMarks writes a severity letter into the gutter beside each
+// problem line.
+//
+// Drawn over the line numbers rather than beside them, because widening the
+// gutter for a column that is empty most of the time costs every file a column
+// forever. A number under a mark is still recoverable — the cursor position is
+// in the status line — and the mark only covers its first digit.
+func (a *App) drawDiagnosticMarks(l Layout) {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	items := a.diags.forPath(a.docPath(p))
+	if len(items) == 0 {
+		return
+	}
+	top, rows := l.TopY, l.Rows
+	if p.Find.Open {
+		top, rows = top+1, rows-1
+	}
+	first := p.Viewport.Top
+
+	// One mark per line, the most severe. A line with a warning and an error
+	// is an error line.
+	worst := map[int]int{}
+	for _, it := range items {
+		ln := it.Range.Start.Line
+		if ln < first || ln >= first+rows {
+			continue
+		}
+		if sev, seen := worst[ln]; !seen || severityRank(it.Severity) < severityRank(sev) {
+			worst[ln] = it.Severity
+		}
+	}
+	for ln, sev := range worst {
+		row := top + (ln - first)
+		st := a.theme.Gutter
+		switch severityRank(sev) {
+		case 0:
+			st = st.With(ui.Ansi(1)) // red
+		case 1:
+			st = st.With(ui.Ansi(3)) // yellow
+		}
+		a.screen.SetString(l.EditorX, row, severityMark(sev), st, 1)
+	}
+}
+
 func (a *App) drawCompletion(l Layout) {
 	p := a.Tabs.Active()
 	if p == nil || !a.Complete.Open {
@@ -167,8 +215,21 @@ func (a *App) drawStatus(cols, y int) {
 	// Always name the focused pane: on a narrow window only one pane is drawn,
 	// so the status line is the only thing that says where keys are going.
 	left += "  [" + a.focusName() + "]"
-	if a.status != "" {
+	if p := a.Tabs.Active(); p != nil {
+		if sum := a.diags.summary(a.docPath(p)); sum != "" {
+			left += "  " + sum
+		}
+	}
+	// A transient message outranks the diagnostic on the cursor's line: the
+	// status is something raj just did and the diagnostic is always there, so
+	// showing both would let a stale message be the thing that is buried.
+	switch {
+	case a.status != "":
 		left += "  " + a.status
+	default:
+		if d := a.diagnosticAtCursor(); d != "" {
+			left += "  " + d
+		}
 	}
 
 	a.screen.SetString(0, y, left, style, cols)
