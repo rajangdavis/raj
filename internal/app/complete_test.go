@@ -1,6 +1,7 @@
 package app
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -160,5 +161,75 @@ func TestCompletionClosesWithMultipleCursors(t *testing.T) {
 	h.typeText("d")
 	if h.Complete.Open {
 		t.Error("the popup opened with several cursors")
+	}
+}
+
+// The cache must not change what is suggested — it is a cost fix, and a stale
+// entry would show up as a suggestion for text that is no longer in the buffer.
+func TestCompletionStaysCorrectAcrossEdits(t *testing.T) {
+	h := newHarness(t, completeSrc)
+	h.press("ctrl+g")
+	h.typeText("8")
+	h.press("enter")
+
+	// A word that is not in the buffer yet offers nothing.
+	h.typeText("handbr")
+	if h.Complete.Open {
+		t.Fatal("suggested something for a word nothing matches")
+	}
+	// Finish it, so the buffer now contains it.
+	h.typeText("ake")
+	h.press("enter")
+
+	// Typing the same prefix again must now find it. It cannot, if the buffer
+	// is being served from a cache entry made before the edit.
+	h.typeText("handbr")
+	if !h.Complete.Open {
+		t.Fatal("a word typed a moment ago is not suggested")
+	}
+	found := false
+	for i := 0; i < h.Complete.Count(); i++ {
+		if c, ok := h.Complete.Selected(); ok && c.Word == "handbrake" {
+			found = true
+			break
+		}
+		h.press("down")
+	}
+	if !found {
+		t.Error("handbrake was not among the candidates")
+	}
+}
+
+// Closing a tab drops its words, or a long session suggests from every file
+// ever opened.
+func TestCompletionForgetsClosedBuffers(t *testing.T) {
+	h := newWorkspace(t, 120, 30)
+	h.OpenFile(filepath.Join(h.root, "pkg/helper.go"))
+	h.drain()
+	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.drain()
+
+	h.Pane().DocEnd(false)
+	h.typeText("\nnee")
+	if !h.Complete.Open {
+		t.Fatal("setup: expected candidates from the other buffer")
+	}
+	h.press("esc")
+
+	// Close the other tab and retype: needle lived in helper.go.
+	for _, p := range h.Tabs.All() {
+		if strings.HasSuffix(p.File.Path, "helper.go") {
+			h.Tabs.Focus(p)
+			h.Tabs.Close()
+			break
+		}
+	}
+	h.drain()
+	h.typeText("d")
+	for i := 0; i < h.Complete.Count(); i++ {
+		if c, ok := h.Complete.Selected(); ok && c.Detail == "helper.go" {
+			t.Error("suggested a word from a closed buffer")
+		}
+		h.press("down")
 	}
 }

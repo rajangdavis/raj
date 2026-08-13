@@ -63,6 +63,10 @@ func (p *Popup) Hide() {
 // know how much to replace when one is accepted.
 func (p *Popup) Prefix() string { return p.prefix }
 
+// Anchor is where the word being completed starts, so a caller replacing the
+// candidate list can put the popup back in the same place.
+func (p *Popup) Anchor() (line, col int) { return p.anchorLine, p.anchorCol }
+
 // Count is how many candidates are showing.
 func (p *Popup) Count() int { return len(p.items) }
 

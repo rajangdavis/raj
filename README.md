@@ -40,7 +40,9 @@ internal/symbols     declarations by leading keyword, per extension. Fuzzed.
 internal/complete    word completion from open buffers, ranked. The Source seam
                      is where a language server will plug in.
 internal/lsp         JSON-RPC framing and byte <-> UTF-16 position mapping,
-                     both fuzzed. Lifecycle and requests still to come.
+                     both fuzzed; process lifecycle, cancellation and restart
+                     backoff; document sync, hover, definition and completion.
+                     Tested against a fake server over pipes.
 internal/prompt      modal dialogs: ask a question, resume on the answer.
 internal/probe       what chords does this terminal actually deliver?
 internal/app         event loop, focus routing, layout, breakpoints, debug pane.

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"raj/internal/complete"
 	"raj/internal/editor"
@@ -33,6 +34,23 @@ type App struct {
 	Picker   *picker.Picker
 	Prompt   *prompt.Prompt
 	Complete complete.Popup
+
+	// completeCache holds each buffer's words, keyed by its version, so typing
+	// rescans only the buffer being typed into. Without it, completion cost
+	// 5.3 ms per keystroke against 2 MB of open buffers.
+	completeCache *complete.Cache
+
+	// servers is the language servers for this workspace, started on demand.
+	// lspGen is the cancellation generation: an answer whose generation has
+	// moved on describes a position the cursor has left, and is dropped.
+	servers *servers
+	lspGen  int
+	// completeGen is a separate generation from lspGen: a completion answer is
+	// superseded by later typing, not by a cursor move for a hover, and
+	// sharing one counter would make each cancel the other.
+	completeGen int
+	lspMu       sync.Mutex
+	lspAnswer   *lspAnswer
 
 	root    string
 	sidebar Sidebar
@@ -70,18 +88,20 @@ type App struct {
 func New(host ui.Host, root string, tabWidth int) *App {
 	cols, rows := host.Size()
 	a := &App{
-		host:     host,
-		keymap:   keys.NewKeymap(),
-		screen:   ui.NewScreen(cols, rows),
-		Tabs:     tabs.New(tabWidth),
-		Explorer: explorer.NewPane(root),
-		Search:   search.NewPane(root),
-		Picker:   picker.New(root),
-		Prompt:   prompt.New(),
-		root:     root,
-		sidebar:  SidebarExplorer,
-		focus:    FocusSidebar,
-		theme:    editor.DefaultTheme(),
+		host:          host,
+		keymap:        keys.NewKeymap(),
+		screen:        ui.NewScreen(cols, rows),
+		Tabs:          tabs.New(tabWidth),
+		Explorer:      explorer.NewPane(root),
+		Search:        search.NewPane(root),
+		completeCache: complete.NewCache(),
+		servers:       newServers(root),
+		Picker:        picker.New(root),
+		Prompt:        prompt.New(),
+		root:          root,
+		sidebar:       SidebarExplorer,
+		focus:         FocusSidebar,
+		theme:         editor.DefaultTheme(),
 		// On unless a caller turns it off, so an App built in a test or by a
 		// future entry point wraps too rather than depending on who remembered
 		// to set the field.
@@ -244,34 +264,57 @@ func (a *App) offerCompletion(p *editor.Pane, typing bool) {
 		a.Complete.Hide()
 		return
 	}
-	a.Complete.Show(prefix, a.completionSource(p).Candidates(prefix), line, col-len(prefix))
+	cands := a.completeCache.Rank(a.completionSnapshots(p), prefix)
+	a.Complete.Show(prefix, cands, line, col-len(prefix))
+	// Buffer words are on screen now; the server's answer replaces them when
+	// it arrives. Asking after showing rather than before is what keeps the
+	// popup instant.
+	if a.Complete.Open {
+		a.requestCompletion(p, prefix, line, col-len(prefix))
+	}
 }
 
 // completionSource is every open buffer plus the declarations raj can already
 // find in them. A language server becomes another Source here rather than a
 // change to the popup.
-func (a *App) completionSource(cur *editor.Pane) complete.Source {
-	b := complete.Buffers{
-		Current:  cur.File.Path,
-		Contents: map[string]string{},
-		Symbols:  map[string][]string{},
-	}
+func (a *App) completionSnapshots(cur *editor.Pane) []complete.Snapshot {
+	open := make(map[string]bool, len(a.Tabs.All()))
+	snaps := make([]complete.Snapshot, 0, len(a.Tabs.All()))
 	for _, p := range a.Tabs.All() {
 		path := p.File.Path
 		if path == "" {
 			path = p.File.Name()
 		}
-		text := p.File.Text()
-		b.Contents[path] = text
-		if symbols.Supported(path) {
-			var names []string
-			for _, s := range symbols.Find(path, text) {
-				names = append(names, s.Name)
-			}
-			b.Symbols[path] = names
-		}
+		open[path] = true
+		snaps = append(snaps, complete.Snapshot{
+			Path:    path,
+			Version: complete.Version(p.File.Session().Version()),
+			// A closure rather than the text: an unchanged buffer is never
+			// read, so materialising every piece table here would put back
+			// most of what the cache saves.
+			Text:    p.File.Text,
+			Symbols: a.completionSymbols(p, path),
+			Current: p == cur,
+		})
 	}
-	return b
+	a.completeCache.Retain(open)
+	return snaps
+}
+
+// completionSymbols is the declarations in a buffer, which rank above plain
+// words. Scanned every time rather than cached: the symbol scan is 0.42 ms on
+// a file larger than anything in this repository, and a second cache keyed the
+// same way would be more bookkeeping than it saves.
+func (a *App) completionSymbols(p *editor.Pane, path string) []string {
+	if !symbols.Supported(path) {
+		return nil
+	}
+	found := symbols.Find(path, p.File.Text())
+	names := make([]string, 0, len(found))
+	for _, s := range found {
+		names = append(names, s.Name)
+	}
+	return names
 }
 
 // acceptCompletion replaces the typed prefix with the chosen word.
@@ -289,6 +332,11 @@ func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candida
 
 // Run processes events until the application quits or the host closes.
 func (a *App) Run() error {
+	// Language servers are subprocesses, so they outlive the editor unless
+	// something stops them. An editor that leaves them running is a bug people
+	// find in their process list rather than in the editor.
+	defer a.servers.stopAll()
+
 	a.Draw()
 	for e := range a.host.Events() {
 		a.Handle(e)
@@ -323,9 +371,11 @@ func (a *App) Handle(e ui.Event) {
 		a.screen.Clear()
 		a.host.Invalidate()
 	case ui.Wake:
-		// Nothing to do here. Background work parks its result where the event
-		// thread already looks, and Run draws after every event — so the value
-		// of a Wake is entirely in having ended the wait for the next tick.
+		// Background work parks its result where the event thread already
+		// looks, and Run draws after every event — so the value of a Wake is
+		// mostly in having ended the wait for the next tick. A language server
+		// answer is parked the same way and collected here.
+		a.applyAnswer()
 	case ui.Tick:
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.
@@ -451,6 +501,10 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.gotoLine()
 	case keys.GotoSymbol:
 		a.gotoSymbol()
+	case keys.Hover:
+		a.hover()
+	case keys.GotoDef:
+		a.gotoDefinition()
 	case keys.NewFile:
 		a.newFile()
 	case keys.CloseTab:

@@ -143,14 +143,24 @@ func (b Buffers) Rank(prefix string) []Candidate {
 		}
 	}
 
+	return rankOut(best)
+}
+
+// rankOut orders the collected candidates and bounds the list.
+//
+// Sorted by score, then shortest, then alphabetically. Shortest first because
+// the shorter completion is the one more likely to be a prefix of the others,
+// and alphabetically last so the order is total — a list that reshuffles
+// between identical keystrokes is worse than one in a debatable order.
+//
+// Shared with the cached path so the two cannot drift: the ranking tests are
+// written against the uncached one, and a second copy of this would make them
+// stop covering what actually runs.
+func rankOut(best map[string]Candidate) []Candidate {
 	out := make([]Candidate, 0, len(best))
 	for _, c := range best {
 		out = append(out, c)
 	}
-	// Sorted by score, then shortest, then alphabetically. Shortest first
-	// because the shorter completion is the one more likely to be a prefix of
-	// the others, and alphabetically last so the order is total — a list that
-	// reshuffles between identical keystrokes is worse than a wrong order.
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].score != out[j].score {
 			return out[i].score > out[j].score

@@ -339,13 +339,18 @@ with a third of a frame — the scan is cheaper than the bookkeeping to avoid it
 Candidates are recomputed on every keystroke, so the question is what that
 costs against realistic open buffers.
 
-| open buffers | time | throughput |
-| --- | --- | --- |
-| 5 files, 400 KB each (2 MB total) | 5.3 ms | 301 MB/s |
+| open buffers | time |
+| --- | --- |
+| 5 files, 400 KB each (2 MB total), rescanned | 5.68 ms |
+| the same, cached by buffer version | 0.93 µs |
 
-Cost tracks the total bytes open, because every buffer is rescanned for words
-each time. At a more usual 50 KB a file that is well under a frame, but 5.3 ms
-is a third of one — and this is the keystroke path, which elsewhere in raj is
-held to a stricter standard than that (retokenising is deliberately kept off it
-for the same reason). The scan is not the problem; rescanning unchanged buffers
-is. See the TODO item on caching the word set per buffer version.
+Six thousand times cheaper, and the reason is not a faster scan — the scan was
+already 300 MB/s. It is that typing changes one buffer and leaves the others
+exactly as they were, so nearly every scan was recomputing a result that had not
+changed. Keying the word set on the buffer version turns the steady-state cost
+from "every open byte" into "the bytes that changed", which is zero on the
+keystrokes that do not cross a word boundary.
+
+The remaining 0.93 µs is ranking the cached words, which is bounded by the
+number of candidates rather than by file size. That is now well clear of the
+frame budget the rest of the keystroke path is held to.

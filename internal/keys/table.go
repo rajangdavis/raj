@@ -91,6 +91,17 @@ var Bindings = []Binding{
 	{"nav", FindNext, "super+g", "103;9u", "cmd+g", "ctrl+alt+n", "macOS default: find next"},
 	{"nav", FindPrev, "shift+super+g", "103;10u", "cmd+shift+g", "ctrl+alt+p", "macOS default: find previous"},
 	{"nav", GotoSymbol, "shift+super+o", "111;10u", "cmd+shift+o", "ctrl+shift+o", ""},
+	// cmd+i for hover, cmd+j to jump to a definition. F12 is what most editors
+	// use, but the function keys are not in the chord vocabulary here and
+	// adding them for two bindings would be a larger change than the bindings.
+	//
+	// Two earlier choices were wrong for reasons raj cannot detect at runtime,
+	// which is why the reserved tables below exist. cmd+alt+d never arrived at
+	// all: macOS hides the Dock with it. cmd+shift+d arrives, but iTerm2 and
+	// Ghostty both split a pane with it, and taking a chord someone uses for
+	// their terminal is a worse trade than picking a duller letter.
+	{"nav", Hover, "super+i", "105;9u", "cmd+i", "ctrl+i", ""},
+	{"nav", GotoDef, "super+j", "106;9u", "cmd+j", "ctrl+alt+j", ""},
 }
 
 // Reclaim holds chords a terminal keeps for itself, which raj therefore has to

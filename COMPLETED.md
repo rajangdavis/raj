@@ -571,3 +571,204 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   server error is data attached to one request rather than a connection
   failure: a server that cannot answer a hover can still answer the next
   completion.
+- [x] **Completion no longer rescans what has not changed.** It cost 5.68 ms per
+  keystroke against 2 MB of open buffers — a third of a frame, on the path this
+  codebase otherwise keeps clear on principle. Now 0.93 µs, six thousand times
+  cheaper.
+
+  The scan was never the problem; it was already running at 300 MB/s. The waste
+  was that typing changes one buffer and leaves every other one byte-identical,
+  so nearly every scan recomputed a result that had not moved. Keying the word
+  set on the buffer version turns the steady-state cost from "every open byte"
+  into "the bytes that changed".
+
+  Two details worth keeping. The text is passed as a closure rather than a
+  string, so an unchanged buffer is never read at all — materialising every
+  piece table to hand over text that is then discarded would have put back most
+  of what the cache saves. And version zero is a legitimate version, an
+  untouched buffer, so presence in the map marks an entry valid rather than a
+  zero check; there is a test for it because that mistake would silently
+  disable the cache for exactly the files nobody has typed in yet.
+
+  The cached and uncached rankings share their ordering code and are asserted
+  equal across several prefixes. They are two paths over the same rules, and the
+  ranking tests are written against the uncached one — if they drifted, those
+  tests would stop covering what actually runs.
+
+  This is also the key `textDocument/didChange` needs, which is why it was worth
+  doing before the LSP work rather than after: the cache and the language server
+  want the identical thing.
+- [x] **LSP lifecycle: spawn, handshake, cancellation, restart.** A language
+  server crashes, hangs, and spends ten seconds indexing before it answers
+  anything. All three are normal, and the rule the whole package is written to
+  is that a dead server degrades to no language features and never to a broken
+  editor — so every entry point either answers, fails, or times out, and none
+  of them can block the caller indefinitely.
+
+  Cancellation matters more than it looks. The answer to a hover is worthless
+  once the cursor has moved, and a completion computed three keystrokes ago is
+  worse than nothing because it will be shown as though it were current. A
+  cancelled call stops waiting immediately and sends `$/cancelRequest`, which is
+  advisory — servers are permitted to answer anyway, so the pending entry is
+  dropped regardless and there is a test that a late answer to a cancelled
+  request is not delivered to whoever asks next.
+
+  Restarting is deliberately neither automatic nor immediate. A server that
+  crashes during startup — missing toolchain, unreadable config, version
+  mismatch — crashes every time, and an editor that respawns on exit turns that
+  into a fork bomb that is almost impossible to diagnose from inside the editor.
+  So failures are counted, spaced by a doubling delay, and give up, with the
+  giving-up reported rather than silent.
+
+  **The deadlock is the finding worth recording.** Holding the state lock across
+  a write looked obviously correct and deadlocked under concurrent calls: the
+  write blocks until the server reads, the server blocks writing its reply
+  because the client's reader cannot take the state lock to dispatch it, and so
+  the server stops reading. Two locks with no ordering between them is the fix,
+  and it is only safe because nothing ever needs both. A fifty-goroutine test
+  found it; nothing about reading the code did, and a real server over real
+  pipes would have hit it under load rather than in a test.
+
+  A smaller one: a successful handshake cleared the failure count but left the
+  pending delay, so a crash hours later would have waited out a backoff earned
+  before the server ever worked. Found by a test asserting what "reset" ought to
+  mean rather than what the code did.
+
+  Stderr is discarded rather than merged into stdout, because servers log freely
+  there and one stray line on the protocol stream desynchronises the framing
+  permanently.
+- [x] **LSP document synchronisation.** Every request is answered against the
+  server's copy of a document, so a desynchronised copy does not produce an
+  error — it produces a confidently wrong answer at a position that no longer
+  means anything. That failure is silent and looks like the server being bad,
+  which is why the tracking is stricter than the protocol requires: a document
+  is opened exactly once, a change for a document that was never opened is
+  dropped rather than sent, and a version that has not moved is not a change.
+
+  Whole documents rather than incremental ranges, even where the server accepts
+  incremental. Incremental is what large files want and it is the obvious next
+  step, but it needs the edit ranges in UTF-16 for every edit since the last
+  notification, and one wrong range desynchronises the server's copy silently
+  and permanently. Whole-document sync cannot desynchronise by construction, the
+  cost is bounded by the file rather than the session, and the change is already
+  debounced upstream.
+
+  The bug worth recording is small and would have been invisible: `null`
+  unmarshals into an int without error and leaves it zero, so a server that
+  advertised no `textDocumentSync` at all was read as asking for *no change
+  notifications* — the one value that freezes every document at the moment it
+  was opened, making every feature answer from stale text with nothing to
+  suggest anything was wrong. It is excluded explicitly rather than relied on to
+  fail. The test that caught it asserts the direction of the guess (unknown
+  means full, never none) rather than the value, which is why it caught a case
+  the table did not enumerate.
+- [x] **Hover (cmd+i) and go-to-definition (cmd+alt+d).** The first language
+  features that are visible in the editor, and the first that meet a real
+  server.
+
+  The rule the integration follows is that no language feature may make the
+  editor worse when it is unavailable. A server that is missing, slow, crashed
+  or confused produces no answer and no interruption — never a stall, never an
+  error to dismiss, never a modal waiting on a subprocess. An unknown file type,
+  an uninstalled server and a server that has given up all arrive at the caller
+  the same way, as "no server", because none of them is worth treating
+  differently from the user's point of view.
+
+  Servers start on the first request that needs one rather than at launch. Most
+  sessions never ask for a hover, and paying gopls's startup on every launch to
+  serve the ones that do is the wrong trade; it also means a broken server costs
+  nothing until it is asked for. The first request after a start goes
+  unanswered, which is the honest behaviour — the handshake takes as long as it
+  takes, and blocking the keystroke that triggered it would be worse than
+  answering the next one.
+
+  Cancellation reuses the search pane's shape: a generation counter, and an
+  answer whose generation has moved on is dropped. That matters more for hover
+  than for search, because a hover for a position the cursor has left is not
+  merely stale — it is displayed as though it described where the cursor is now.
+
+  The decoding is deliberately permissive about shape and strict about meaning.
+  Hover contents has had three legal forms across versions of the protocol and
+  servers still send all of them; definition may be a location, an array, or a
+  link that names its target under different keys. The link case has a detail
+  worth keeping: it carries both the whole declaration and the identifier
+  within it, and jumping to the identifier is what someone asking "where is this
+  defined" means. Markdown is flattened rather than rendered, since raj draws
+  into a cell grid and a hover showing literal backticks is worse than one
+  showing the signature they wrapped.
+
+  Answers are parked and collected on the event thread rather than applied where
+  they arrive, because applying them directly would touch panes and the screen
+  from a goroutine that must not. `ui.Event` is sealed, so the search pane's
+  park-and-wake pattern was the fit rather than a new event type.
+- [x] **"no language server for this file", on a Go file.** Reported from a
+  screenshot, and the message was the bug: four different situations all
+  produced it, and on a supported file type it asserted the one thing that was
+  not true.
+
+  The four need four different reactions and only one of them is "nothing to be
+  done": the binary is not installed (install it), the server is still
+  handshaking (wait a moment — gopls takes seconds on a large repository and the
+  first press after startup was always going to be unanswered), it kept crashing
+  and has been given up on (find out why), or this language genuinely has no
+  server configured. They now say so separately, and a missing binary is named
+  so the fix is obvious rather than a guess. The binary is looked up before
+  spawning, so "not installed" is reported as itself rather than as a start
+  failure that burns a restart attempt first.
+
+  Found while fixing it: paths handed to LSP were not made absolute, so a pane
+  opened with a workspace-relative path produced `file://internal/editor/
+  actions.go` — a URI whose host is "internal" and which names nothing a server
+  can open. Every request would have failed silently against a server that was
+  otherwise working perfectly. Absolute paths are now the seam every LSP call
+  goes through, with a test that a URI has three slashes rather than two.
+- [x] **cmd+alt+d never arrived, because macOS hides the Dock with it.** Bound
+  to go-to-definition and swallowed system-wide before any terminal saw it, so
+  it fired exactly zero times and looked from inside raj like nothing at all —
+  no event, no keystroke, nothing to log. Moved to cmd+shift+d.
+
+  The interesting part is that no amount of testing raj could have caught it:
+  the key never reaches the process. So the check is a table of the chords macOS
+  reserves, asserted against the binding table — the only place the mistake is
+  visible is the place the choice is made. Verified by putting the original
+  chord back and watching the test name the Dock.
+
+  The replacement was wrong too, for a different reason: cmd+shift+d arrives
+  fine, but iTerm2 and Ghostty both split a pane with it, so nothing in raj
+  would ever have complained while the user quietly lost a terminal feature.
+  Now cmd+j, with a second table for the chords the terminal claims.
+
+  The two tables encode different rules, which is why they are separate. A macOS
+  chord is simply unusable — the key never reaches the process. A terminal chord
+  is usable but costs the user something, so a binding there is allowed when the
+  trade is deliberate: cmd+d takes Ghostty's split-right on purpose and says so
+  in the table's notes column. The test requires the note, not the absence of
+  the binding.
+- [x] **LSP-backed completion.** The buffer words show instantly and the
+  server's answer replaces them when it arrives. That ordering is the whole
+  design: a language server takes tens of milliseconds on a good day and
+  hundreds on a cold index, and a completion list that appears a noticeable beat
+  after you stop typing feels broken even when it is better. Buffer words are
+  instant and usually right; the server's answer is better and late, and both
+  are available in the order that makes each one useful.
+
+  The server's ordering is kept rather than re-ranked. Its sort keys encode
+  scope, type compatibility and usage — things the client cannot see — and
+  re-scoring the answer client-side would throw away the entire reason for
+  asking a language server rather than scanning the buffer. Only the prefix
+  filter is applied, and only to remove what the keystrokes since the request
+  excluded. Filtering uses the server's own filter text where it differs from
+  the label, which it does more often than it looks: gopls labels a method with
+  its signature and filters on the bare name, so matching the label would need a
+  parenthesis typed to keep the match alive.
+
+  Snippets are refused and the label inserted instead. A snippet is a template
+  with tab stops, and with no snippet engine raj would type `${1:format}` into
+  the buffer — worse than inserting a plain identifier. raj also advertises
+  `snippetSupport: false`, so a server sending one anyway is not being obliged.
+
+  Two generations, not one. A hover is superseded by a cursor move and a
+  completion by further typing, and sharing a counter made every completion
+  answer look stale — silently, since the buffer words stay up and the server's
+  answer simply never appears. Caught by a test that asserted the replacement
+  rather than the absence of a crash.

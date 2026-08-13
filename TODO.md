@@ -39,19 +39,21 @@ findings and decisions live in INVESTIGATIONS.md.
   emoji silently shifts every position in a response. Fuzz it against the byte
   offsets before anything depends on it.
 
-  Order: ~~position mapping, fuzzed~~ and ~~JSON-RPC framing~~ are done →
-  **process lifecycle next** (spawn, initialize handshake, shutdown, and the
-  three failure modes that matter: a server that crashes, one that hangs, and
-  one that takes ten seconds to index before answering anything) → document
-  synchronisation → hover → definition → diagnostics → completion.
+  Order: ~~position mapping~~, ~~JSON-RPC framing~~, ~~process lifecycle~~,
+  ~~document synchronisation~~, ~~hover~~, ~~definition~~ and ~~completion~~
+  are done → **diagnostics next**, which is the last piece and mostly a
+  rendering job: they are already decoded and delivered on a channel, and what
+  is missing is a gutter mark and a pane to list them in.
 
-  Lifecycle is where the design decisions are, not the protocol. A request has
-  to be cancellable, because the answer to a hover is worthless once the cursor
-  has moved — the search pane already solved this shape with a context per
-  generation, and it should be reused rather than reinvented. A server that
-  dies must degrade to no language features rather than to a broken editor, and
-  restarting it cannot be automatic without a backoff, or a server that crashes
-  on startup becomes a fork bomb.
+  Hover currently lands in the status line, folded onto one line. That is
+  enough to make the feature usable and to prove the request path, and it is
+  the wrong home for a paragraph of documentation — a floating panel anchored
+  to the cursor is right, and it is a renderer change rather than an LSP one.
+  The request layer does not care which is used.
+
+  Diagnostics are already decoded and delivered on a channel; what is missing
+  is somewhere to put them. They want a gutter mark, and the list wants to be a
+  pane, which makes them the first LSP feature that is mostly a rendering job.
 
   **Inlay type hints are deliberately not on that list.** They require drawing
   text that is not in the document, which perturbs column maths, caret
@@ -67,17 +69,43 @@ findings and decisions live in INVESTIGATIONS.md.
   dependency, already tokenising these buffers off-thread for highlighting, and
   it knows a keyword token from a string token, which is exactly the distinction
   the scanner is missing.
-- [ ] **Completion rescans every open buffer on every keystroke.** Measured at
-  5.3 ms against 2 MB of open buffers, which is a third of a frame on the
-  keystroke path — the same path retokenising is deliberately kept off. The scan
-  itself is fine (301 MB/s); rescanning buffers that have not changed is the
-  waste. Cache the word set per buffer keyed on `Session.Version()`, which is
-  the same key the LSP work will need for `textDocument/didChange`, so the two
-  want the same thing.
 - [ ] **Completion has no trigger key.** It appears on its own after two
   characters and cannot be summoned deliberately, so there is no way to ask for
   it after a cursor move or with a one-character prefix. `ctrl+space` is the
   conventional chord and is currently decoded but unbound.
+- [ ] **The reserved-chord tables are short.** They list what could be confirmed;
+  the real sets are longer and vary with the user's own keyboard settings and
+  terminal config, neither of which raj can see. A chord that never arrives is
+  invisible from inside the editor and a chord that steals a terminal feature is
+  invisible from inside raj entirely, so the tables are the only guard there is
+  — worth extending whenever another one is found the hard way. Both were, this
+  session.
+- [ ] **A completion `textEdit` is ignored.** The server may send an edit with
+  its own range instead of plain insert text, and honouring it means applying a
+  server-computed edit rather than typing a word — a different operation from
+  the one the popup performs. Ignoring it is right for the common case and
+  wrong for the ones where the range extends past the prefix, which is how
+  import-adding completions work.
+- [ ] **`isIncomplete` is decoded and then dropped.** A server that marks a list
+  incomplete is asking to be re-queried as the prefix grows, and raj asks once.
+  For a large package the first answer is a truncated one that then never
+  improves.
+- [ ] **Hover has no panel.** It is folded onto the status line, which loses
+  the shape of a signature and truncates anything long. A floating panel
+  anchored to the cursor is the right home, and the completion popup already
+  solved the placement problem — anchor, flip above when there is no room
+  below, slide left rather than clip.
+- [ ] **Only servers that run with no configuration are listed.** gopls,
+  rust-analyzer, pylsp, typescript-language-server, solargraph, clangd. A
+  server that needs a config file to start is a setup problem raj should not
+  pretend to solve silently, but there is no way to point raj at one either.
+  A per-workspace config file is the answer, and it does not exist yet.
+- [ ] **Document sync is whole-document, not incremental.** Every change sends
+  the whole file, which cannot desynchronise by construction but costs the file
+  size per change. Incremental sync needs the edit ranges in UTF-16 for every
+  edit since the last notification, and one wrong range desynchronises the
+  server's copy silently and permanently — so it is worth doing only with the
+  position fuzzing extended to cover ranges, not just points.
 - [ ] **Highlight the matching bracket under the cursor.** Auto-pairing landed;
   showing which bracket closes the one you are on did not. It is a render
   concern rather than an edit one — find the partner by counting depth outward

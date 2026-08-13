@@ -105,4 +105,6 @@ const (
 	FindNext     Action = "find_next"
 	FindPrev     Action = "find_prev"
 	GotoSymbol   Action = "goto_symbol"
+	Hover        Action = "hover"
+	GotoDef      Action = "goto_definition"
 )
