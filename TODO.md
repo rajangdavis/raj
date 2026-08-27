@@ -14,12 +14,6 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Editor
 
-- [ ] **Mouse: the panes and the fields.** Click a tab to switch or close it,
-  click a file in the explorer or a hit in the search results to open it
-  (refusing binaries loudly rather than in the status line), click into a prompt
-  or a search field to place the caret. The editor is done; each of these needs
-  its own hit-testing against what it drew, which is why they were left out
-  rather than guessed at together.
 - [ ] **LSP: hover, go-to-definition, diagnostics, completion.** Staged, because
   each stage is independently useful and the risk is not evenly spread.
 
@@ -66,10 +60,6 @@ findings and decisions live in INVESTIGATIONS.md.
   dependency, already tokenising these buffers off-thread for highlighting, and
   it knows a keyword token from a string token, which is exactly the distinction
   the scanner is missing.
-- [ ] **Completion has no trigger key.** It appears on its own after two
-  characters and cannot be summoned deliberately, so there is no way to ask for
-  it after a cursor move or with a one-character prefix. `ctrl+space` is the
-  conventional chord and is currently decoded but unbound.
 - [ ] **The reserved-chord tables are short.** They list what could be confirmed;
   the real sets are longer and vary with the user's own keyboard settings and
   terminal config, neither of which raj can see. A chord that never arrives is
@@ -83,23 +73,31 @@ findings and decisions live in INVESTIGATIONS.md.
   the one the popup performs. Ignoring it is right for the common case and
   wrong for the ones where the range extends past the prefix, which is how
   import-adding completions work.
-- [ ] **`isIncomplete` is decoded and then dropped.** A server that marks a list
-  incomplete is asking to be re-queried as the prefix grows, and raj asks once.
-  For a large package the first answer is a truncated one that then never
-  improves.
+
+  The blocker is layering, not protocol. `complete.Candidate` is deliberately
+  free of any LSP type — the package ranks buffer words and the server plugs in
+  through the same seam — so carrying a range means either a coordinate system
+  `complete` can express on its own, or moving the apply step out of
+  `acceptCompletion` entirely. Both are real designs; neither should be picked
+  by whoever happens to be decoding the JSON. Ranges are also not guaranteed
+  single-line, so the position fuzzing wants extending to ranges first, which is
+  the same prerequisite incremental sync has.
 - [ ] **A drag does not scroll.** Dragging to the top or bottom edge extends
   the selection to the edge and stops there; every editor scrolls instead, and
   without it a selection cannot exceed a screenful by pointer alone. It needs a
   timer rather than an event, since the pointer sits still while the text moves.
+  Now the only pointer gesture still missing: pressing works everywhere, and
+  dragging works only in the document.
+- [ ] **A press on a list does not drag it.** Clicking selects, and holding and
+  moving does nothing — neither rubber-band selection nor drag-to-reorder for
+  tabs. Both are real gestures a list can carry and neither has an obvious
+  meaning here yet, so nothing was guessed at.
 - [ ] **Diagnostics have no list pane.** They show as a gutter letter and a
   count in the status line, with the message for the cursor's line. That is
   enough to find a problem you are standing on and useless for finding the one
   three files away. A pane listing them across the workspace is the missing
   half, and the search pane is the shape to copy — grouped by file, collapsible,
   enter to jump.
-- [ ] **Diagnostics are not cleared when a file is closed.** The store keeps
-  them keyed by path, so closing a tab leaves its problems counted in nothing
-  visible but held in memory. `clear` exists and nothing calls it.
 - [ ] **Hover has no panel.** It is folded onto the status line, which loses
   the shape of a signature and truncates anything long. A floating panel
   anchored to the cursor is the right home, and the completion popup already
@@ -132,7 +130,6 @@ findings and decisions live in INVESTIGATIONS.md.
   fast enough to be a blink and a dirty-region pass small enough that blinking
   costs one cell rather than a frame. Nice, and a long way down: the tick is
   150 ms today and exists for idle work.
-- [ ] Tabs as clickable tags — visual now, clickable once the mouse lands.
 
 ## Workspace
 

@@ -173,6 +173,22 @@ func (f *Find) Highlight(off int) (match, current bool) {
 }
 
 // Render draws the bar as a single line across the top of the editor pane.
+// findPrefix is what the bar writes before the query. The renderer and the
+// pointer share it so the caret cannot land a column away from the character it
+// was aimed at.
+const findPrefix = " find: "
+
+// ClickAt places the caret from a press dx columns into the bar, reporting
+// whether the bar took it. A press on the prefix or the match count is still
+// the bar's — it is one row and there is nothing else it could mean.
+func (f *Find) ClickAt(dx int) bool {
+	if !f.Open {
+		return false
+	}
+	f.input.PlaceCaret(dx - len(findPrefix))
+	return true
+}
+
 func (f *Find) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 	if !f.Open || w < 12 {
 		return
@@ -184,7 +200,7 @@ func (f *Find) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 	} else if f.term == "" {
 		count = ""
 	}
-	label := " find: " + f.input.Text
+	label := findPrefix + f.input.Text
 	s.SetString(x, y, widget.Truncate(label, w-len(count)-2), th.Selected, w)
 	if count != "" {
 		s.SetString(x+w-len(count)-1, y, count, th.Selected, len(count)+1)

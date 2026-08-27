@@ -158,6 +158,66 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   syntax uses the bright half of the palette.
 
 
+## Mouse
+
+- [x] **Every pane hit-tests against what it drew.** The geometry was factored
+  out of each renderer and both halves now go through it: `Tabs.layout`,
+  `explorer.treeRows`, the search pane's row map and `toggles`, and a `box`
+  method on the picker and the prompt. A click can only land on the wrong row if
+  the pane also drew it there.
+- [x] **Click a tab to switch, middle-click to close.** No × is drawn: at
+  sidebar widths a one-column target is missed as often as hit, and every
+  browser already means close by middle-click. Closing goes through the same
+  unsaved-changes guard the chord uses, so the pointer is not a way round it.
+- [x] **Click a file in the explorer to open it, a directory to fold it**, and
+  the changed-only checkbox to flip it — one click each, since a tree in a
+  sidebar is a list of destinations and a double click would make the pointer
+  slower than the arrow keys it replaces.
+- [x] **Click a search hit to open it at its line, a header to fold it**, a
+  toggle to flip it, and a field to place the caret.
+- [x] **Binaries are refused out loud.** A status line under a tree still
+  showing the name it just declined reads as nothing having happened, so the
+  refusal is a dialog. Size refusals too; a permissions error stays in the
+  status line, being a transient condition rather than a statement about the
+  file.
+- [x] **Overlays are modal to the pointer.** A press anywhere is taken by an
+  open dialog rather than reaching the tab bar behind it; a press outside an
+  open picker dismisses it, the way clicking off a menu does.
+- [x] **Caret placement is fuzzed** against the renderer's own width function —
+  the caret sits on a rune boundary, never past the end, monotonic left to
+  right, and always inside the character drawn under the pointer. Byte offsets,
+  display columns and rune boundaries are three coordinate systems, and the
+  mistake they invite is invisible except on a line with a wide rune.
+
+## Completion and diagnostics
+
+- [x] **`isIncomplete` is honoured**, which turns one request per keystroke into
+  one per word. A list the server calls complete is everything that could go at
+  that point, so a longer prefix can only select a subset and filtering locally
+  gives the same answer as asking again. A list it calls incomplete is never
+  cached: that is the server saying it truncated the answer, and reusing a
+  truncated list would freeze its arbitrary cut, so a large package would show
+  a handful of results that never improve however much more is typed.
+- [x] **A cached list is anchored to a word, not to a string.** Same prefix,
+  different line or a word starting a column over, is a different question
+  computed against a different scope. Backspacing past what was asked for
+  invalidates it too, since the list may be missing what the longer prefix
+  excluded.
+- [x] **ctrl+space summons the popup.** Decoded but unbound before, so
+  completion could only ever arrive on its own after two characters. The chord
+  is claimed above the popup's own navigation keys, so pressing it while open
+  re-asks rather than being swallowed.
+- [x] **The two-character threshold moved from the ranker to the caller.** It is
+  a policy about unsolicited popups, not about ranking, and burying it in
+  `Rank` made a deliberate ask with a one-character prefix impossible to honour
+  without a second code path that would have ordered things differently. `Rank`
+  now refuses only an empty prefix, which is a property of the ranking.
+- [x] **Diagnostics are cleared when a file is closed**, and the server is told
+  to forget the document. Both outlived a closed tab: the store held the last
+  published set for the life of the session and resurrected it stale on
+  reopening, and the server kept publishing about a file nothing was showing.
+  Closing never starts a server to say so.
+
 ## This session
 
 - [x] **Bracketed paste.** `ui.Paste` existed and `app` handled it, but nothing

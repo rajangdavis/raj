@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/lsp"
 	"raj/internal/ui"
@@ -77,6 +76,24 @@ const (
 	serverNone                        // no server is configured for this language
 	serverGaveUp                      // it kept failing and will not be retried
 )
+
+// running returns the server already handling a path's language, without
+// starting one. Closing a document must not spawn a language server: the tab is
+// going away, there is nothing left to ask about it, and for_ would start one
+// only to be told immediately to forget the only file it had been given.
+func (s *servers) running(path string) *langServer {
+	id := lsp.LanguageID(path)
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls := s.byID[id]
+	if ls == nil || ls.sync == nil {
+		return nil
+	}
+	return ls
+}
 
 // for_ returns the server for a path's language, starting it if needed, along
 // with why it is or is not available.
@@ -251,6 +268,13 @@ type lspAnswer struct {
 	locs   []lsp.Location
 	items  []lsp.CompletionItem
 	prefix string
+	// incomplete is the server's isIncomplete flag, carried rather than dropped
+	// so the event thread can decide whether the answer is cacheable. A
+	// complete list is everything; a truncated one has to be asked for again.
+	incomplete bool
+	// line and col anchor the word the answer describes, so a cached list can
+	// be matched against a later keystroke's word rather than only its text.
+	line, col int
 }
 
 const (
@@ -303,6 +327,29 @@ func (a *App) applyAnswer() {
 	case answerCompletion:
 		a.applyCompletion(*ans)
 	}
+}
+
+// closeDoc forgets everything that was keyed on a pane's path.
+//
+// Two things outlive a closed tab if nothing does this. The server keeps the
+// document open and keeps publishing about it, and the diagnostics store keeps
+// the last set it published — counted in nothing visible, since the status line
+// only reports the active file, but held for as long as the session runs and
+// resurrected the moment the file is reopened, stale.
+//
+// It runs before the tab is removed rather than after, because the path is read
+// off the pane and a removed pane is one nobody can be asked about.
+func (a *App) closeDoc(p *editor.Pane) {
+	path := a.docPath(p)
+	if path == "" {
+		return // an unnamed buffer was never opened with a server
+	}
+	if ls := a.servers.running(path); ls != nil {
+		// Best effort: a server that has already exited has nothing to forget,
+		// and failing to tell it so is not something the user can act on.
+		_ = ls.sync.Close(path)
+	}
+	a.diags.clear(path)
 }
 
 // hover asks what is under the cursor.
@@ -427,12 +474,13 @@ func (a *App) requestCompletion(p *editor.Pane, prefix string, line, col int) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		items, _, err := lsp.Completions(ctx, conn, path, pos)
+		items, incomplete, err := lsp.Completions(ctx, conn, path, pos)
 		if err != nil || len(items) == 0 {
 			return
 		}
 		a.parkCompletion(lspAnswer{
 			gen: gen, kind: answerCompletion, items: items, prefix: prefix,
+			incomplete: incomplete, line: line, col: col,
 		})
 	}()
 }
@@ -463,22 +511,17 @@ func (a *App) applyCompletion(ans lspAnswer) {
 	if !strings.HasPrefix(prefix, ans.prefix) {
 		return // the prefix changed in a way this answer does not cover
 	}
-	items := lsp.FilterItems(ans.items, prefix)
-	if len(items) == 0 {
-		return // nothing left; the buffer words on screen are better than none
-	}
-	lsp.SortItems(items)
-
-	cands := make([]complete.Candidate, 0, len(items))
-	for i, it := range items {
-		if i >= complete.MaxResults {
-			break
-		}
-		cands = append(cands, complete.Candidate{
-			Word:   it.Insert,
-			Detail: it.Detail,
-		})
-	}
 	line, col := a.Complete.Anchor()
-	a.Complete.Show(prefix, cands, line, col)
+	if line != ans.line || col != ans.col {
+		return // the popup has moved to a different word since the request
+	}
+	// Cached only when the server called the list complete, and cached before
+	// showing so that a list which filters down to nothing right now is still
+	// there for the backspace that widens the prefix again.
+	if !ans.incomplete {
+		a.cached = completionCache{items: ans.items, prefix: ans.prefix, line: line, col: col}
+	}
+	// Nothing left after filtering: the buffer words already on screen are
+	// better than an empty popup.
+	a.showItems(prefix, ans.items, line, col)
 }

@@ -44,11 +44,18 @@ const (
 	scoreOther = 10
 )
 
-// MinPrefix is how much has to be typed before anything is offered.
+// MinPrefix is how much has to be typed before the popup appears ON ITS OWN.
 //
-// One character matches most of a file and ranks it by nothing useful, so the
-// list would be noise arriving on the first keystroke of every word. Two is
-// enough to be discriminating and still ahead of finishing the word by hand.
+// One character matches most of a file and ranks it by nothing useful, so an
+// unsolicited list would be noise arriving on the first keystroke of every
+// word. Two is enough to be discriminating and still ahead of finishing the
+// word by hand.
+//
+// It is enforced by the caller rather than by Rank, because it is a policy
+// about unsolicited popups rather than about ranking. A deliberate ask —
+// ctrl+space — is a statement that you want the list here regardless, and a
+// threshold buried in the ranker would make that impossible to honour without
+// a second code path producing a different order.
 const MinPrefix = 2
 
 // MaxResults bounds the list. Past a screenful nobody is reading, and the cost
@@ -107,7 +114,11 @@ type Buffers struct {
 // ones. Case is significant because in most languages it is: Foo and foo are
 // different identifiers.
 func (b Buffers) Rank(prefix string) []Candidate {
-	if len(prefix) < MinPrefix {
+	// An empty prefix is refused here rather than by the caller: everything
+	// matches it, so the "list" would be every word in every open buffer in an
+	// order that means nothing. That is a property of the ranking, not a
+	// policy about when to show it.
+	if prefix == "" {
 		return nil
 	}
 	best := map[string]Candidate{}

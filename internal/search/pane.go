@@ -572,6 +572,108 @@ const (
 	compactRows = 4
 )
 
+// Row offsets within the pane, in the order things are drawn. The two field
+// rows below the query only exist in the full layout; resultsRow is where the
+// results heading goes, and depends on which layout is in force.
+const (
+	queryRow    = 0
+	includeRow  = queryRow + widget.Height
+	excludeRow  = includeRow + widget.Height
+	toggleRow   = excludeRow + widget.Height
+	fullResults = toggleRow + 1
+	thinResults = queryRow + widget.Height
+)
+
+// resultsRow is the first row of the results section at the layout last drawn.
+func (p *Pane) resultsRow() int {
+	if p.compact {
+		return thinResults
+	}
+	return fullResults
+}
+
+// ClickAt handles a press at (dx, dy) relative to the pane's origin, in a pane
+// w by h. It returns a file and line to open, and reports whether the press
+// landed on anything.
+//
+// It resolves against the layout the last Render chose, for the same reason the
+// focus ring does: height is not known here, and the alternative is threading a
+// rendering concern through every caller.
+func (p *Pane) ClickAt(dx, dy, w, h int) (path string, line int, ok bool) {
+	p.apply()
+	if dx < 0 || dx >= w || dy < 0 || dy >= h || h < compactRows {
+		return "", 0, false
+	}
+	if in, spot := p.fieldAt(dy); in != nil {
+		p.spot = spot
+		if in.ClickAt(dx, dy-p.fieldTop(spot), w) {
+			return "", 0, true
+		}
+	}
+	if !p.compact && dy == toggleRow {
+		// The toggles are drawn inset by one column, so the press is measured
+		// from the same origin they were laid out against.
+		for _, it := range p.toggles(w - 2) {
+			if col := dx - 1; col >= it.col && col < it.col+len(it.text) {
+				p.spot = it.spot
+				p.toggleAt(it.spot)
+				return "", 0, true
+			}
+		}
+		return "", 0, true // the empty part of the toggle row is still the pane's
+	}
+
+	row := dy - p.resultsRow()
+	if row < 0 {
+		return "", 0, false
+	}
+	if row == 0 {
+		p.spot = spotResults // the results heading: focus, nothing more
+		return "", 0, true
+	}
+	i := p.list.Top + row - 1
+	if i >= len(p.rows) {
+		return "", 0, false
+	}
+	p.spot = spotResults
+	p.list.Sel = i
+	// A header folds and a match opens, which is what enter does on each. The
+	// marker is a disclosure triangle, so folding is what the row looks like it
+	// will do.
+	if p.rows[i].IsHdr {
+		p.toggle()
+		return "", 0, true
+	}
+	m := p.rows[i].Match
+	return m.Path, m.Line, true
+}
+
+// fieldAt returns the input drawn over a row, and its focus stop.
+func (p *Pane) fieldAt(dy int) (*widget.Input, int) {
+	switch {
+	case dy >= queryRow && dy < queryRow+widget.Height:
+		return &p.query, spotQuery
+	case p.compact:
+		return nil, 0
+	case dy >= includeRow && dy < includeRow+widget.Height:
+		return &p.include, spotInclude
+	case dy >= excludeRow && dy < excludeRow+widget.Height:
+		return &p.exclude, spotExclude
+	}
+	return nil, 0
+}
+
+// fieldTop is the row a field's box starts on.
+func (p *Pane) fieldTop(spot int) int {
+	switch spot {
+	case spotInclude:
+		return includeRow
+	case spotExclude:
+		return excludeRow
+	}
+	return queryRow
+}
+
 // Render draws the pane.
 //
 // It used to return early below twelve rows, so a short terminal opened the
@@ -595,19 +697,21 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 	}
 
 	p.query.Focused = focused && p.spot == spotQuery
-	p.query.Render(s, x, y, w, th)
+	p.query.Render(s, x, y+queryRow, w, th)
 	if p.compact {
 		// The globs and toggles go first: they are set once and then left
 		// alone, while the query and its results are why the pane is open.
-		p.renderResults(s, x, y+3, w, h-3, th, focused)
+		r := p.resultsRow()
+		p.renderResults(s, x, y+r, w, h-r, th, focused)
 		return
 	}
 	p.include.Focused = focused && p.spot == spotInclude
 	p.exclude.Focused = focused && p.spot == spotExclude
-	p.include.Render(s, x, y+3, w, th)
-	p.exclude.Render(s, x, y+6, w, th)
-	p.renderToggles(s, x+1, y+9, w-2, th, focused)
-	p.renderResults(s, x, y+10, w, h-10, th, focused)
+	p.include.Render(s, x, y+includeRow, w, th)
+	p.exclude.Render(s, x, y+excludeRow, w, th)
+	p.renderToggles(s, x+1, y+toggleRow, w-2, th, focused)
+	r := p.resultsRow()
+	p.renderResults(s, x, y+r, w, h-r, th, focused)
 }
 
 // visible reports whether a focus stop is drawn at the size last rendered. The
@@ -624,17 +728,7 @@ func (p *Pane) visible(spot int) bool {
 // highlighted individually. Labels are compact so the row survives a narrow
 // sidebar: .* regex, Aa case-sensitive, ab whole word.
 func (p *Pane) renderToggles(s *ui.Screen, x, y, w int, th widget.Theme, focused bool) {
-	items := []struct {
-		spot  int
-		on    bool
-		label string
-	}{
-		{spotRegex, p.q.Regex, ".*"},
-		{spotCase, p.q.Case, "Aa"},
-		{spotWord, p.q.Word, "ab"},
-	}
-	col := 0
-	for _, it := range items {
+	for _, it := range p.toggles(w) {
 		style := th.Dim
 		if it.on {
 			style = th.Text
@@ -642,12 +736,40 @@ func (p *Pane) renderToggles(s *ui.Screen, x, y, w int, th widget.Theme, focused
 		if focused && p.spot == it.spot {
 			style = th.Selected
 		}
-		text := check(it.on) + it.label
-		if col+len(text) > w {
+		s.SetString(x+it.col, y, it.text, style, w-it.col)
+	}
+}
+
+// toggle is one drawn option: which focus stop it is, its state, its label, and
+// the column it starts at within the toggle row.
+type toggle struct {
+	spot int
+	on   bool
+	text string
+	col  int
+}
+
+// toggles lays the three options out across w columns, dropping any that do not
+// fit. Both the renderer and the pointer go through it, so a toggle cannot be
+// drawn in one place and clicked in another.
+func (p *Pane) toggles(w int) []toggle {
+	all := []toggle{
+		{spot: spotRegex, on: p.q.Regex, text: ".*"},
+		{spot: spotCase, on: p.q.Case, text: "Aa"},
+		{spot: spotWord, on: p.q.Word, text: "ab"},
+	}
+	out := make([]toggle, 0, len(all))
+	col := 0
+	for _, it := range all {
+		it.text = check(it.on) + it.text
+		if col+len(it.text) > w {
 			break
 		}
-		col += s.SetString(x+col, y, text, style, w-col) + 1
+		it.col = col
+		out = append(out, it)
+		col += len(it.text) + 1
 	}
+	return out
 }
 
 func check(on bool) string {

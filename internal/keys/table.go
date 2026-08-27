@@ -144,6 +144,7 @@ var Natives = []Native{
 	{"shift+up", SelLineUp, ""},
 	{"shift+down", SelLineDown, ""},
 	{"ctrl+alt+w", ToggleWrap, "ctrl suppresses macOS option-composition"},
+	{"ctrl+space", Complete, "the conventional completion chord; nothing claims it"},
 	{"pgup", PageUp, ""},
 	{"pgdown", PageDown, ""},
 	{"backspace", Backspace, ""},

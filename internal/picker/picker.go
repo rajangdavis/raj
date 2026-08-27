@@ -531,25 +531,63 @@ func subsequence(s, query string) bool {
 // Render draws the overlay centred horizontally in the upper third, where
 // VSCode puts it — close to the top so results have room, but not so high it
 // looks like part of the tab bar.
+// box is where the overlay sits on a screen of the given size, and whether it
+// fits at all. Render and ClickAt share it so a click cannot resolve against a
+// rectangle other than the one that was drawn.
+func (p *Picker) box(cols, rows int) (x, y, w, h int, ok bool) {
+	w = cols * 2 / 3
+	if w < 30 {
+		w = cols - 4
+	}
+	h = 15
+	if h > rows-4 {
+		h = rows - 4
+	}
+	if w < 10 || h < 5 {
+		return 0, 0, 0, 0, false
+	}
+	return (cols - w) / 2, 2, w, h, true
+}
+
+// Rows above the list inside the overlay: the border, the three-row field.
+const listTop = 1 + widget.Height
+
+// ClickAt handles a press at a screen cell while the picker is open. It returns
+// a chosen path, and reports whether the press was inside the overlay — a press
+// outside it belongs to nothing, since the picker is modal and the panes behind
+// it are not accepting clicks.
+func (p *Picker) ClickAt(cols, rows, col, row int) (path string, inside bool) {
+	if !p.Open {
+		return "", false
+	}
+	x, y, w, h, ok := p.box(cols, rows)
+	if !ok || col < x || col >= x+w || row < y || row >= y+h {
+		return "", false
+	}
+	dx, dy := col-x, row-y
+	if p.input.ClickAt(dx-2, dy-1, w-4) {
+		return "", true
+	}
+	// Bounded by the rows the list was drawn with, not by the overlay: the
+	// last row inside the border is the result count, and a press on it is
+	// inside the picker but on nothing selectable.
+	listRow := dy - listTop
+	i := p.list.Top + listRow
+	if listRow < 0 || listRow >= p.list.Rows || i >= len(p.shown) {
+		return "", true
+	}
+	p.list.Sel = i
+	return p.choose(p.shown[i]), true
+}
+
 func (p *Picker) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 	if !p.Open {
 		return
 	}
-	w := cols * 2 / 3
-	if w < 30 {
-		w = cols - 4
-	}
-	if w < 10 {
+	x, y, w, h, ok := p.box(cols, rows)
+	if !ok {
 		return
 	}
-	h := 15
-	if h > rows-4 {
-		h = rows - 4
-	}
-	if h < 5 {
-		return
-	}
-	x, y := (cols-w)/2, 2
 
 	s.Fill(x, y, w, h, ui.DefaultStyle)
 	widget.Box(s, x, y, w, h, th.BorderFocus)
@@ -557,8 +595,8 @@ func (p *Picker) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 	// than doubling up on it.
 	p.input.Render(s, x+2, y+1, w-4, th)
 
-	top := y + 4
-	p.list.Settle(h-5, len(p.shown))
+	top := y + listTop
+	p.list.Settle(h-listTop-1, len(p.shown))
 	for row := 0; row < p.list.Rows; row++ {
 		i := p.list.Top + row
 		if i >= len(p.shown) {

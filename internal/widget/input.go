@@ -233,6 +233,59 @@ func (in *Input) renderSelection(s *ui.Screen, x, y, w int, th Theme) {
 	}
 }
 
+// Height is how many rows Render draws: a border, the text, a border.
+const Height = 3
+
+// ClickAt places the caret from a press at (dx, dy) relative to the field's
+// origin, reporting whether the press was inside the field at all.
+//
+// The border rows count as inside. A field is three rows tall and only the
+// middle one holds text, so refusing the other two would mean two thirds of a
+// visible box does nothing — and the only thing a press on the frame could
+// plausibly mean is the row it frames.
+//
+// It reads in.scroll, which Render sets. That is deliberate: the caret must
+// land on the character the pointer is over, and which character that is
+// depends on how far the field was scrolled when it was drawn.
+func (in *Input) ClickAt(dx, dy, w int) bool {
+	if w < 3 || dx < 0 || dx >= w || dy < 0 || dy >= Height {
+		return false
+	}
+	in.PlaceCaret(dx - 1)
+	return true
+}
+
+// PlaceCaret puts the caret at a display column measured from the first
+// character the field is showing, clearing any selection. Exported for fields
+// that draw themselves flat rather than in a box — the find bar is one row of
+// text with a prefix, not a widget.Input rendering.
+func (in *Input) PlaceCaret(col int) {
+	in.moveTo(in.offsetAt(col), false)
+}
+
+// offsetAt maps a display column inside the text area to a byte offset.
+// Columns before the start clamp to the scroll position and columns past the
+// last character clamp to the end, so clicking the empty space to the right of
+// a short query puts the caret after it rather than nowhere.
+func (in *Input) offsetAt(col int) int {
+	if col < 0 {
+		return in.scroll
+	}
+	// The caret goes before the character under the pointer, including for a
+	// wide rune's second cell — the same rule the document uses, so a click
+	// means the same thing in a field as it does in the text.
+	at := 0
+	for i := in.scroll; i < len(in.Text); {
+		n := nextBoundary(in.Text, i)
+		at += runeCols(in.Text[i:n])
+		if at > col {
+			return i
+		}
+		i = n
+	}
+	return len(in.Text)
+}
+
 // clip scrolls the field so the cursor stays visible.
 func (in *Input) clip(width int) {
 	if in.Cursor < in.scroll {

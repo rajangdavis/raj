@@ -173,25 +173,94 @@ func (p *Prompt) finish(answer string, ok bool) {
 // Render draws the dialog centred, since unlike the file picker it is a
 // question rather than a list: there is nothing below it that wants the room,
 // and the middle of the screen is where the eye already is.
-func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
-	if !p.Open {
-		return
-	}
-	w := cols * 2 / 3
+// box is where the dialog sits on a screen of the given size, and whether it
+// fits at all. Render and ClickAt share it so a press cannot resolve against a
+// rectangle other than the one that was drawn.
+func (p *Prompt) box(cols, rows int) (x, y, w, h int, ok bool) {
+	w = cols * 2 / 3
 	if w > 72 {
 		w = 72
 	}
 	if w > cols-4 {
 		w = cols - 4
 	}
-	h := 5
+	h = 5
 	if p.kind == ask {
-		h = 6 // the field draws its own three-row border
+		h = 1 + widget.Height + 2 // the field draws its own three-row border
 	}
 	if w < 24 || h > rows-2 {
+		return 0, 0, 0, 0, false
+	}
+	return (cols - w) / 2, (rows - h) / 2, w, h, true
+}
+
+// buttonRow is where Confirm draws its options, relative to the dialog's top.
+const buttonRow = 3
+
+// ClickAt handles a press at a screen cell while a dialog is open. It reports
+// whether the press was inside it — a dialog is modal, so a press outside is
+// swallowed rather than reaching whatever is drawn underneath.
+//
+// A press on a button answers the question rather than merely selecting it.
+// Selecting and then requiring a second press would make the pointer slower
+// than the keyboard, and the button is already the answer written out.
+func (p *Prompt) ClickAt(cols, rows, col, row int) bool {
+	if !p.Open {
+		return false
+	}
+	x, y, w, h, ok := p.box(cols, rows)
+	if !ok || col < x || col >= x+w || row < y || row >= y+h {
+		return false
+	}
+	dx, dy := col-x, row-y
+	if p.kind == ask {
+		p.input.ClickAt(dx-2, dy-1, w-4)
+		return true
+	}
+	if dy == buttonRow {
+		for i, sp := range p.buttons(w) {
+			if dx >= sp.Start && dx < sp.End {
+				p.sel = i
+				p.finish(p.options[i], true)
+				return true
+			}
+		}
+	}
+	return true
+}
+
+// span is a drawn button's columns, [Start, End), relative to the dialog.
+type span struct{ Start, End int }
+
+// buttons lays the options out across the dialog's width. Both the renderer and
+// the pointer go through it, so a button cannot be drawn in one place and
+// pressed in another.
+func (p *Prompt) buttons(w int) []span {
+	total := 0
+	for _, o := range p.options {
+		total += len(o) + 4
+	}
+	bx := (w - total) / 2
+	if bx < 1 {
+		bx = 1
+	}
+	out := make([]span, len(p.options))
+	for i, o := range p.options {
+		n := len(o) + 4
+		out[i] = span{Start: bx, End: bx + n}
+		bx += n
+	}
+	return out
+}
+
+func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
+	if !p.Open {
 		return
 	}
-	x, y := (cols-w)/2, (rows-h)/2
+	x, y, w, h, ok := p.box(cols, rows)
+	if !ok {
+		return
+	}
 
 	s.Fill(x, y, w, h, ui.DefaultStyle)
 	widget.Box(s, x, y, w, h, th.BorderFocus)
@@ -201,29 +270,19 @@ func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 		// Inset by one so the field's border sits inside the dialog's rather
 		// than doubling up on it.
 		p.input.Render(s, x+2, y+1, w-4, th)
-		s.SetString(x+2, y+4, "enter  save      esc  cancel", th.Dim, w-4)
+		s.SetString(x+2, y+1+widget.Height, "enter  save      esc  cancel", th.Dim, w-4)
 		return
 	}
 	s.SetString(x+2, y+1, widget.Truncate(p.message, w-4), th.Text, w-4)
-	p.renderButtons(s, x, y+3, w, th)
+	p.renderButtons(s, x, y+buttonRow, w, th)
 }
 
 func (p *Prompt) renderButtons(s *ui.Screen, x, y, w int, th widget.Theme) {
-	total := 0
-	for _, o := range p.options {
-		total += len(o) + 4
-	}
-	bx := x + (w-total)/2
-	if bx < x+1 {
-		bx = x + 1
-	}
-	for i, o := range p.options {
-		label := "  " + o + "  "
+	for i, sp := range p.buttons(w) {
 		style := th.Text
 		if i == p.sel {
 			style = th.Selected
 		}
-		s.SetString(bx, y, label, style, len(label))
-		bx += len(label)
+		s.SetString(x+sp.Start, y, "  "+p.options[i]+"  ", style, sp.End-sp.Start)
 	}
 }

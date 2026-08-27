@@ -27,8 +27,12 @@ internal/piecetable  leaf-embedded B-tree from the benchmark harness, plus
 internal/view        line index (fuzzed vs rescan), columns, viewport, wrapping.
 internal/editor      file, cursors, motions, actions, render, binary sniffing,
                      auto-indent and bracket pairing on the keystroke path.
-internal/widget      inputs, lists, boxes, the focus vocabulary.
-internal/tabs        open/close/reopen/switch.
+internal/widget      inputs, lists, boxes, the focus vocabulary. Caret
+                     placement from a display column is fuzzed against the
+                     renderer's own width function.
+internal/tabs        open/close/reopen/switch. One layout function serves both
+                     the renderer and the pointer, so a click cannot land on a
+                     tab other than the one drawn under it.
 internal/explorer    lazy tree, git-status filter.
 internal/search      literal/regex engine over the tree and the open buffers,
                      grouped collapsible results. Literal
@@ -38,12 +42,16 @@ internal/picker      quick-open overlay with fuzzy ranking, in two modes:
                      cmd+p over the workspace, cmd+shift+o over one file.
 internal/symbols     declarations by leading keyword, per extension. Fuzzed.
 internal/complete    word completion from open buffers, ranked. The Source seam
-                     is where a language server will plug in.
+                     is where a language server plugs in. Ranking refuses only
+                     an empty prefix; when to show a popup unasked is the
+                     caller's policy.
 internal/lsp         JSON-RPC framing and byte <-> UTF-16 position mapping,
                      both fuzzed; process lifecycle, cancellation and restart
                      backoff; document sync, hover, definition and completion.
                      Tested against a fake server over pipes.
 internal/prompt      modal dialogs: ask a question, resume on the answer.
+                     Modal to the pointer too: a press outside an open dialog
+                     is swallowed rather than reaching what is behind it.
 internal/probe       what chords does this terminal actually deliver?
 internal/app         event loop, focus routing, layout, breakpoints, debug pane.
 internal/syntax      chroma tokens, cached per version, tokenised off-thread.

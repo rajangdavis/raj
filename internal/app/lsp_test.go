@@ -222,6 +222,21 @@ func TestUnnamedBufferHasNoDocumentPath(t *testing.T) {
 	}
 }
 
+// parkAnswer delivers a completion answer as a server would, anchored to the
+// word the popup is currently showing.
+//
+// The anchor is part of an answer now: a list describes one word at one place,
+// and "hand" on line 2 is not the same question as "hand" on line 40. Tests go
+// through here so a fake answer carries what a real one does.
+func parkAnswer(h *harness, prefix string, items []lsp.CompletionItem) {
+	line, col := h.Complete.Anchor()
+	h.parkCompletion(lspAnswer{
+		gen: h.completeGen, kind: answerCompletion, prefix: prefix,
+		items: items, line: line, col: col,
+	})
+	h.applyAnswer()
+}
+
 // Buffer words show instantly and the server's answer replaces them. A
 // completion list that appears a beat after you stop typing feels broken even
 // when it is better, so the fast answer goes up first.
@@ -239,13 +254,9 @@ func TestLSPCompletionReplacesBufferWords(t *testing.T) {
 	}
 
 	h.completeGen++
-	h.parkCompletion(lspAnswer{
-		gen: h.completeGen, kind: answerCompletion, prefix: "hand",
-		items: []lsp.CompletionItem{
-			{Label: "handleRequest", Insert: "handleRequest", Detail: "func()"},
-		},
+	parkAnswer(h, "hand", []lsp.CompletionItem{
+		{Label: "handleRequest", Insert: "handleRequest", Detail: "func()"},
 	})
-	h.applyAnswer()
 
 	c, ok := h.Complete.Selected()
 	if !ok || c.Word != "handleRequest" {
@@ -286,11 +297,7 @@ func TestEmptyServerAnswerKeepsBufferWords(t *testing.T) {
 	h.typeText("hand")
 	before, _ := h.Complete.Selected()
 
-	h.parkCompletion(lspAnswer{
-		gen: h.completeGen, kind: answerCompletion, prefix: "hand",
-		items: []lsp.CompletionItem{{Label: "nomatch", Insert: "nomatch"}},
-	})
-	h.applyAnswer()
+	parkAnswer(h, "hand", []lsp.CompletionItem{{Label: "nomatch", Insert: "nomatch"}})
 
 	if c, _ := h.Complete.Selected(); c.Word != before.Word {
 		t.Errorf("selected %q, want the buffer words left alone", c.Word)
@@ -308,14 +315,10 @@ func TestServerOrderingSurvivesToThePopup(t *testing.T) {
 	h.press("enter")
 	h.typeText("hand")
 
-	h.parkCompletion(lspAnswer{
-		gen: h.completeGen, kind: answerCompletion, prefix: "hand",
-		items: []lsp.CompletionItem{
-			{Label: "handZebra", Insert: "handZebra"},
-			{Label: "handApple", Insert: "handApple"},
-		},
+	parkAnswer(h, "hand", []lsp.CompletionItem{
+		{Label: "handZebra", Insert: "handZebra"},
+		{Label: "handApple", Insert: "handApple"},
 	})
-	h.applyAnswer()
 
 	// Neither has a sort key, so the label orders — but the point is that the
 	// popup shows what the lsp package ordered rather than re-sorting by

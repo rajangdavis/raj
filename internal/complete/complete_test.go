@@ -89,14 +89,19 @@ var project = Buffers{
 	},
 }
 
-// Nothing is offered until enough has been typed to discriminate: one character
-// matches most of a file and ranks it by nothing useful.
-func TestMinPrefix(t *testing.T) {
-	if got := project.Rank("h"); got != nil {
-		t.Errorf("one character offered %v", words(got))
-	}
+// An empty prefix is refused: everything matches it, so the list would be every
+// word in every open buffer in an order that means nothing.
+//
+// One character is NOT refused here. The two-character threshold is about when
+// an unsolicited popup should appear and is enforced by the caller, so that a
+// deliberate ask can be honoured with a short prefix without a second ranking
+// path that would order things differently.
+func TestEmptyPrefixOffersNothing(t *testing.T) {
 	if got := project.Rank(""); got != nil {
 		t.Errorf("an empty prefix offered %v", words(got))
+	}
+	if got := project.Rank("h"); len(got) == 0 {
+		t.Error("one character offered nothing; the threshold is the caller's")
 	}
 	if got := project.Rank("ha"); len(got) == 0 {
 		t.Error("two characters offered nothing")

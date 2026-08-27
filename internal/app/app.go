@@ -4,6 +4,7 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"raj/internal/editor"
 	"raj/internal/explorer"
 	"raj/internal/keys"
+	"raj/internal/lsp"
 	"raj/internal/picker"
 	"raj/internal/prompt"
 	"raj/internal/search"
@@ -49,6 +51,19 @@ type App struct {
 	// superseded by later typing, not by a cursor move for a hover, and
 	// sharing one counter would make each cancel the other.
 	completeGen int
+
+	// cached is the last completion list a server returned, kept only when the
+	// server said the list was complete. A complete list is everything that
+	// could go at that point, so a longer prefix can only be a subset of it and
+	// filtering locally gives the same answer as asking again — instantly, and
+	// without a request per keystroke.
+	//
+	// An INCOMPLETE list is never cached. That is the server saying it
+	// truncated the answer and wants to be asked again as the prefix narrows;
+	// filtering a truncated list would keep the first answer's arbitrary cut
+	// forever, so a large package would show a handful of results that never
+	// improve however much more is typed.
+	cached completionCache
 
 	// diags is the current problems per file, published by servers rather than
 	// requested.
@@ -162,13 +177,28 @@ func (a *App) syncTheme() {
 }
 
 // OpenFile opens a path in a tab and focuses the editor.
+//
+// A refusal is a dialog rather than a status line when the reason is the file
+// itself. Clicking a name in the tree is a direct request for that file, and
+// answering it with a line of text at the bottom of the screen looks like
+// nothing happened — the tree still shows the name, the editor still shows the
+// last file, and the only evidence is somewhere the eye is not. A permissions
+// error stays in the status line: that is a transient condition rather than a
+// statement about what the file is.
 func (a *App) OpenFile(path string) {
 	if path == "" {
 		return
 	}
 	p, err := a.Tabs.Open(path)
 	if err != nil {
-		a.status = "cannot open: " + err.Error()
+		switch {
+		case errors.Is(err, editor.ErrBinary):
+			a.refuse(path, "is not a text file, so raj will not open it.")
+		case errors.Is(err, editor.ErrTooLarge):
+			a.refuse(path, "is larger than raj will open.")
+		default:
+			a.status = "cannot open: " + err.Error()
+		}
 		return
 	}
 	p.File.SetDark(a.host.Theme().Dark())
@@ -176,6 +206,13 @@ func (a *App) OpenFile(path string) {
 	p.AutoPairs = a.AutoPairs
 	a.focus = FocusEditor
 	a.status = ""
+}
+
+// refuse says why a file was not opened, and puts focus back where it came from
+// once the dialog is dismissed.
+func (a *App) refuse(path, because string) {
+	a.confirm("Cannot open", filepath.Base(path)+" "+because,
+		[]string{"OK"}, func(string, bool) {})
 }
 
 // openFromPicker opens a chosen file and honours any position the query was
@@ -248,41 +285,119 @@ func (a *App) mouse(ev ui.Mouse) {
 	}
 }
 
+// completionCache is a server's answer plus where it was asked for, so a later
+// keystroke can tell whether it still applies.
+type completionCache struct {
+	items  []lsp.CompletionItem
+	prefix string
+	// line and col anchor the word the list describes. A prefix that merely
+	// looks like an extension is not enough: typing "fmt" on one line and then
+	// "fmt" on another produces the same string at a different place, and the
+	// answers are not interchangeable.
+	line, col int
+}
+
+// covers reports whether a cached list still answers for a prefix at a place.
+func (c completionCache) covers(prefix string, line, col int) bool {
+	return c.items != nil && c.line == line && c.col == col &&
+		strings.HasPrefix(prefix, c.prefix)
+}
+
 // offerCompletion refreshes the popup for whatever word the cursor is now in.
 //
 // It is called after the edit rather than before, so the prefix is what is
 // actually on screen. Only typing and backspace offer anything; every other
 // action closes the popup, because a cursor that jumped somewhere is no longer
 // finishing the word it was on.
+func (a *App) offerCompletion(p *editor.Pane, typing bool) {
+	if !typing {
+		a.hideCompletion()
+		return
+	}
+	a.showCompletion(p, complete.MinPrefix)
+}
+
+// summonCompletion is the deliberate ask, on ctrl+space.
 //
-// Multiple cursors close it too. A completion is one word at one place, and
+// Two differences from the popup appearing on its own. There is no minimum
+// prefix, because asking explicitly is a statement that you want it here even
+// with one character or none; and the cache is dropped first, so pressing the
+// chord again re-asks rather than redisplaying the answer that is already on
+// screen. "Ask again" is the only thing a second press could reasonably mean.
+func (a *App) summonCompletion(p *editor.Pane) {
+	a.cached = completionCache{}
+	if !a.showCompletion(p, 0) {
+		a.status = "no completions here"
+	}
+}
+
+// hideCompletion closes the popup and forgets the server's answer, since the
+// answer described a word the cursor is no longer in.
+func (a *App) hideCompletion() {
+	a.Complete.Hide()
+	a.cached = completionCache{}
+}
+
+// showCompletion offers candidates for the word the cursor is in, reporting
+// whether anything was shown.
+//
+// Multiple cursors show nothing. A completion is one word at one place, and
 // applying it at four cursors that are mid-word in four different identifiers
 // would replace text nobody looked at.
-func (a *App) offerCompletion(p *editor.Pane, typing bool) {
-	if !typing || a.Tabs.Active() != p || len(p.Cursors.All()) > 1 {
-		a.Complete.Hide()
-		return
+func (a *App) showCompletion(p *editor.Pane, minPrefix int) bool {
+	if a.Tabs.Active() != p || len(p.Cursors.All()) > 1 ||
+		p.Cursors.Primary().HasSelection() {
+		a.hideCompletion()
+		return false
 	}
 	head := p.Cursors.Primary().Head
-	if p.Cursors.Primary().HasSelection() {
-		a.Complete.Hide()
-		return
-	}
 	line := p.File.LineOf(head)
 	col := head - p.File.LineStart(line)
 	prefix := complete.PrefixAt(p.File.Line(line), col)
-	if len(prefix) < complete.MinPrefix {
-		a.Complete.Hide()
-		return
+	if len(prefix) < minPrefix {
+		a.hideCompletion()
+		return false
 	}
+	anchor := col - len(prefix)
+
+	// A complete list already covering this word is the whole answer, so it is
+	// filtered rather than re-fetched. This is the difference the isIncomplete
+	// flag buys: one request per word instead of one per keystroke.
+	if a.cached.covers(prefix, line, anchor) {
+		return a.showItems(prefix, a.cached.items, line, anchor)
+	}
+
 	cands := a.completeCache.Rank(a.completionSnapshots(p), prefix)
-	a.Complete.Show(prefix, cands, line, col-len(prefix))
+	a.Complete.Show(prefix, cands, line, anchor)
 	// Buffer words are on screen now; the server's answer replaces them when
 	// it arrives. Asking after showing rather than before is what keeps the
 	// popup instant.
 	if a.Complete.Open {
-		a.requestCompletion(p, prefix, line, col-len(prefix))
+		a.requestCompletion(p, prefix, line, anchor)
 	}
+	return a.Complete.Open
+}
+
+// showItems renders a server list, filtered to a prefix. Shared by the fresh
+// answer and the cached one so the two cannot present the same items
+// differently.
+func (a *App) showItems(prefix string, items []lsp.CompletionItem, line, col int) bool {
+	items = lsp.FilterItems(items, prefix)
+	if len(items) == 0 {
+		return false
+	}
+	lsp.SortItems(items)
+	cands := make([]complete.Candidate, 0, len(items))
+	for i, it := range items {
+		if i >= complete.MaxResults {
+			break
+		}
+		cands = append(cands, complete.Candidate{
+			Word: it.Insert, Detail: it.Detail,
+		})
+	}
+	a.Complete.Show(prefix, cands, line, col)
+	return a.Complete.Open
 }
 
 // completionSource is every open buffer plus the declarations raj can already
@@ -614,6 +729,13 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		}
 		return
 	}
+	// Summoning the popup is claimed before the popup itself sees keys, so
+	// pressing the chord while it is already open re-asks rather than being
+	// swallowed as a navigation key it does not use.
+	if action == keys.Complete {
+		a.summonCompletion(p)
+		return
+	}
 	// The completion popup sees keys before the editor, but claims only the
 	// handful it navigates with. Everything else falls through and types,
 	// which is what keeps it from being modal: it can be ignored entirely.
@@ -841,31 +963,56 @@ func (a *App) newFile() {
 	a.status = ""
 }
 
-// closeTab closes the active tab, stopping to ask when it holds unsaved work.
+// closeTab closes the active tab.
+func (a *App) closeTab() { a.closeTabAt(a.Tabs.Index()) }
+
+// closeTabAt closes the nth tab, stopping to ask when it holds unsaved work.
 //
 // The guard lives here rather than in Tabs because Tabs is a container: it has
 // no way to ask a question, and no business deciding whether losing an edit is
 // acceptable.
-func (a *App) closeTab() {
-	p := a.Tabs.Active()
-	if p == nil || !p.File.Dirty() {
-		a.Tabs.Close()
+//
+// The question is asked about the tab that was clicked but answered later, by
+// which time tabs may have opened or closed and the index may name a different
+// file. So the continuation re-finds the pane rather than trusting the number
+// it was handed.
+func (a *App) closeTabAt(i int) {
+	panes := a.Tabs.All()
+	if i < 0 || i >= len(panes) {
 		return
 	}
+	p := panes[i]
+	if !p.File.Dirty() {
+		a.closeDoc(p)
+		a.Tabs.CloseIndex(i)
+		return
+	}
+	closePane := func() {
+		for j, q := range a.Tabs.All() {
+			if q == p {
+				a.closeDoc(p)
+				a.Tabs.CloseIndex(j)
+				return
+			}
+		}
+	}
+	// Focus what is being asked about: a dialog naming a file that is not the
+	// one on screen reads as a question about something else.
+	a.Tabs.Focus(p)
 	a.confirm("Unsaved changes", "Save changes to "+p.File.Name()+" before closing?",
 		prompt.SaveOptions(), func(answer string, ok bool) {
 			switch {
 			case !ok || answer == prompt.Cancel:
 				return
 			case answer == prompt.Discard:
-				a.Tabs.Close()
+				closePane()
 			default:
 				// Close only once the bytes are on disk. A save-as can be
 				// cancelled, and closing anyway would discard exactly the work
 				// the answer asked to keep.
 				a.saveActive(func(saved bool) {
 					if saved {
-						a.Tabs.Close()
+						closePane()
 					}
 				})
 			}

@@ -102,8 +102,8 @@ type Snapshot struct {
 // ordering, which is asserted rather than assumed: the two would otherwise
 // drift, and the uncached one is what the ranking tests are written against.
 func (c *Cache) Rank(snaps []Snapshot, prefix string) []Candidate {
-	if len(prefix) < MinPrefix {
-		return nil
+	if prefix == "" {
+		return nil // see Buffers.Rank
 	}
 	best := map[string]Candidate{}
 	keep := func(word, detail string, score int) {

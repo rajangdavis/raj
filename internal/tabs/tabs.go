@@ -82,22 +82,7 @@ func (t *Tabs) NewFile() *editor.Pane {
 // Close removes the active tab. It never closes raj itself: closing the last
 // tab leaves an empty editor, which is what you asked for and what stops a
 // stray cmd+w from ending the session.
-func (t *Tabs) Close() {
-	if len(t.panes) == 0 {
-		return
-	}
-	p := t.panes[t.active]
-	if p.File.Path != "" {
-		t.closed = append(t.closed, p.File.Path)
-	}
-	t.panes = append(t.panes[:t.active], t.panes[t.active+1:]...)
-	if t.active >= len(t.panes) {
-		t.active = len(t.panes) - 1
-	}
-	if t.active < 0 {
-		t.active = 0
-	}
-}
+func (t *Tabs) Close() { t.CloseIndex(t.active) }
 
 // PopClosed returns the most recently closed path, for the caller to reopen
 // through its usual path rather than bypassing it here.
@@ -174,20 +159,18 @@ func (t *Tabs) Paths() []string {
 	return out
 }
 
-// Render draws the tab bar, scrolling so the active tab is always visible.
-//
-// The active tab is reverse-video rather than merely bold: at a glance the eye
-// finds a filled block far faster than a weight difference, and in a terminal
-// theme with low contrast bold may not be distinguishable at all. Separators
-// keep adjacent names from reading as one string.
-func (t *Tabs) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
-	s.Fill(x, y, w, 1, th.Dim)
-	if len(t.panes) == 0 {
-		s.SetString(x+1, y, "no files open", th.Dim, w-1)
-		return
-	}
+// Span is where one tab was drawn, as columns [Start, End) relative to the
+// bar's own origin. Start may be negative when the bar has scrolled past it.
+type Span struct{ Start, End int }
 
-	labels := t.labels()
+// layout is where every tab lands in a bar w columns wide.
+//
+// Render and HitTest both go through here rather than each doing the arithmetic
+// themselves, because the two only have to disagree by one column — a
+// separator, a scroll offset — for a click to switch to the tab beside the one
+// under the pointer, and nothing on screen would show why.
+func (t *Tabs) layout(w int) (labels []string, spans []Span) {
+	labels = t.labels()
 	total := 0
 	for _, l := range labels {
 		total += len(l) + 1 // plus the separator
@@ -207,24 +190,81 @@ func (t *Tabs) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 	}
 
 	col := -start
+	spans = make([]Span, len(labels))
+	for i, label := range labels {
+		spans[i] = Span{Start: col, End: col + len(label)}
+		col += len(label) + 1 // the separator sits between tabs
+	}
+	return labels, spans
+}
+
+// HitTest returns the tab drawn at a screen column, given the bar's origin and
+// width. The separator between two tabs belongs to neither: it is one column
+// wide and claiming it for a neighbour would make the boundary between tabs a
+// column away from where it looks.
+func (t *Tabs) HitTest(x, w, col int) (int, bool) {
+	if len(t.panes) == 0 || col < x || col >= x+w {
+		return 0, false
+	}
+	dx := col - x
+	_, spans := t.layout(w)
+	for i, sp := range spans {
+		if dx >= sp.Start && dx < sp.End {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// CloseIndex removes the nth tab. Close is this with the active index, so the
+// two cannot drift over what closing means for the remembered path or for which
+// tab is left focused.
+func (t *Tabs) CloseIndex(i int) {
+	if i < 0 || i >= len(t.panes) {
+		return
+	}
+	p := t.panes[i]
+	if p.File.Path != "" {
+		t.closed = append(t.closed, p.File.Path)
+	}
+	t.panes = append(t.panes[:i], t.panes[i+1:]...)
+	if t.active > i || t.active >= len(t.panes) {
+		t.active--
+	}
+	if t.active < 0 {
+		t.active = 0
+	}
+}
+
+// Render draws the tab bar, scrolling so the active tab is always visible.
+//
+// The active tab is reverse-video rather than merely bold: at a glance the eye
+// finds a filled block far faster than a weight difference, and in a terminal
+// theme with low contrast bold may not be distinguishable at all. Separators
+// keep adjacent names from reading as one string.
+func (t *Tabs) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
+	s.Fill(x, y, w, 1, th.Dim)
+	if len(t.panes) == 0 {
+		s.SetString(x+1, y, "no files open", th.Dim, w-1)
+		return
+	}
+
+	labels, spans := t.layout(w)
 	for i, label := range labels {
 		style := th.Dim
 		if i == t.active {
 			style = th.Active
 		}
-		if col+len(label) > 0 && col < w {
-			at := col
-			text := label
+		if sp := spans[i]; sp.End > 0 && sp.Start < w {
+			at, text := sp.Start, label
 			if at < 0 {
 				text, at = clipLeft(label, -at), 0
 			}
 			s.SetString(x+at, y, text, style, w-at)
 		}
-		col += len(label)
-		if col >= 0 && col < w && i < len(labels)-1 {
-			s.Set(x+col, y, '│', th.Border)
+		if sep := spans[i].End; sep >= 0 && sep < w && i < len(labels)-1 {
+			s.Set(x+sep, y, '│', th.Border)
 		}
-		col++
 	}
 }
 

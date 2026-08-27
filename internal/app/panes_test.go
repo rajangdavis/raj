@@ -453,9 +453,13 @@ func TestLayoutChangeInvalidates(t *testing.T) {
 	}
 }
 
-// Opening a binary must be declined with a message, not rendered. Its bytes as
-// text are unreadable, unsaveable without corruption, and used to include
-// escape sequences the terminal executed.
+// Opening a binary must be declined out loud, not rendered. Its bytes as text
+// are unreadable, unsaveable without corruption, and used to include escape
+// sequences the terminal executed.
+//
+// The refusal is a dialog rather than a status line: opening a file is a direct
+// request, and answering it at the bottom of the screen looks like nothing
+// happened at all.
 func TestOpenBinaryIsDeclined(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
 	bin := filepath.Join(h.Explorer.Tree.Root, "a.out")
@@ -468,8 +472,11 @@ func TestOpenBinaryIsDeclined(t *testing.T) {
 	if h.Pane() != nil {
 		t.Fatal("a binary file was opened")
 	}
-	if !strings.Contains(h.Status(), "binary") {
-		t.Errorf("status = %q, want a binary-file message", h.Status())
+	if !h.Prompt.Open {
+		t.Fatal("no dialog explaining the refusal")
+	}
+	if !strings.Contains(h.host.Text(), "not a text file") {
+		t.Errorf("refusal not on screen:\n%s", h.host.Text())
 	}
 	if strings.ContainsAny(h.host.Text(), "\x1b\x00") {
 		t.Error("binary content reached the frame")

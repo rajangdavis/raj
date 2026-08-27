@@ -107,4 +107,8 @@ const (
 	GotoSymbol   Action = "goto_symbol"
 	Hover        Action = "hover"
 	GotoDef      Action = "goto_definition"
+	// Complete summons the completion popup deliberately. Without it the popup
+	// only ever appears on its own after MinPrefix characters, so there is no
+	// way to ask for it after a cursor move or with a one-character prefix.
+	Complete Action = "complete"
 )

@@ -133,6 +133,50 @@ func (p *Pane) Selected() string {
 	return ""
 }
 
+// Rows above and below the tree: the heading, the changed-only toggle, and the
+// selected-path line at the bottom. Render and ClickAt both measure from these
+// rather than from literals, so the tree cannot be drawn at one offset and hit
+// tested at another.
+const (
+	headRows = 2 // heading, filter toggle
+	footRows = 1 // the selected path
+)
+
+// treeRows is how many entries fit in a pane h rows tall.
+func treeRows(h int) int { return h - headRows - footRows }
+
+// ClickAt handles a press at (dy) rows below the pane's origin, in a pane h
+// rows tall. It returns a file to open, and reports whether the press landed on
+// anything at all.
+//
+// A directory toggles rather than opening, which is what enter does on one; a
+// file opens on the first click rather than the second, because a tree in a
+// sidebar is a list of destinations and requiring a double click would make the
+// pointer slower than the arrow keys it is meant to save.
+func (p *Pane) ClickAt(dy, h int) (open string, ok bool) {
+	if dy < 0 || dy >= h {
+		return "", false
+	}
+	if dy == 1 {
+		p.spot = spotFilter
+		p.toggleFilter()
+		return "", true
+	}
+	rows := treeRows(h)
+	row := dy - headRows
+	if row < 0 || row >= rows {
+		return "", false // the heading or the path line
+	}
+	entries := p.Tree.Entries()
+	i := p.list.Top + row
+	if i >= len(entries) {
+		return "", false // empty space below the last entry
+	}
+	p.spot = spotTree
+	p.list.Sel = i
+	return p.activate()
+}
+
 // Render draws the pane. focused dims the whole thing when the editor has
 // focus, so it is obvious where keystrokes are going.
 func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused bool) {
@@ -149,7 +193,7 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 	p.renderFilter(s, x, y+1, w, th, focused)
 	p.renderPath(s, x, y+h-1, w, th)
 
-	rows := h - 3
+	rows := treeRows(h)
 	p.list.Settle(rows, len(p.Tree.Entries()))
 	entries := p.Tree.Entries()
 
