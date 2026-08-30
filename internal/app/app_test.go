@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"raj/internal/keys"
 	"raj/internal/ui"
 	"raj/internal/widget"
 )
@@ -260,4 +261,26 @@ func TestEscapeCollapsesMultiCursor(t *testing.T) {
 	if h.Pane().Cursors.Primary().HasSelection() {
 		t.Error("escape left a selection behind")
 	}
+}
+
+// handleKeyAction drives an action straight into the key path, bypassing chord
+// resolution. Tests that walk the whole action set need this: going through a
+// chord would test the keymap as well, and a chord that resolves differently on
+// one platform would make the test platform-dependent for no reason.
+func (h *harness) handleKeyAction(a keys.Action) {
+	// The same order handleKey uses: globals get first refusal, then the
+	// focused pane. Routing straight to handleEditor would report every global
+	// action as unhandled, which is how the first version of this reported
+	// cmd+s as unimplemented.
+	if !h.App.handleGlobal(a) {
+		switch h.App.focus {
+		case FocusPicker:
+			h.App.openFromPicker(h.App.Picker.Handle(a, ""))
+		case FocusSidebar:
+			h.App.handleSidebar(a, "")
+		default:
+			h.App.handleEditor(a, "")
+		}
+	}
+	h.drain()
 }

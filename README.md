@@ -41,6 +41,10 @@ internal/search      literal/regex engine over the tree and the open buffers,
 internal/picker      quick-open overlay with fuzzy ranking, in two modes:
                      cmd+p over the workspace, cmd+shift+o over one file.
 internal/symbols     declarations by leading keyword, per extension. Fuzzed.
+internal/problems    the workspace-wide diagnostics list. A view over the
+                     store, with no query and no worker of its own.
+internal/hover       the floating panel for a language server's answer.
+                     Takes no focus and claims one key.
 internal/complete    word completion from open buffers, ranked. The Source seam
                      is where a language server plugs in. Ranking refuses only
                      an empty prefix; when to show a popup unasked is the
@@ -64,6 +68,9 @@ internal/syntax      chroma tokens, cached per version, tokenised off-thread.
 - `BENCHMARKS.md` — measured numbers
 - `INVESTIGATIONS.md` — terminal findings, root causes, decisions
 - `CURSOR-VIEWPORT-SPEC.md` — the position invariants, and the properties that assert them
+- `KEYBINDINGS.md` — every chord, generated from `keys.Bindings` so it cannot
+  drift. Regenerate with `raj --keys > KEYBINDINGS.md`; a test fails if the
+  checked-in copy is stale.
 
 ## Setup
 
@@ -77,4 +84,12 @@ And call it with:
 
 ```
 $ ./raj <file|directory>
+```
+
+Terminal configuration, since raj claims chords the terminal would otherwise
+take:
+
+```
+$ ./raj --config ghostty     # or ghostty-linux, or iterm2
+$ ./raj --keys               # the keybinding reference, as markdown
 ```

@@ -29,6 +29,15 @@ type NativeHost struct {
 	events chan Event
 	prev   *Screen
 
+	// resized is the coalescing buffer for window-size changes, capacity one.
+	// A resize is idempotent — only the latest size matters — so a full buffer
+	// means one is already on its way and dropping the duplicate loses
+	// nothing. See deliverResize for why this exists at all.
+	resized chan struct{}
+	// done is closed by Close, so the resize deliverer stops waiting on a
+	// consumer that will never read again.
+	done chan struct{}
+
 	mu     sync.Mutex
 	cols   int
 	rows   int
@@ -45,7 +54,12 @@ func NewNativeHost(in, out *os.File, tickRate time.Duration) (*NativeHost, error
 	if err := t.Enter(0); err != nil {
 		return nil, err
 	}
-	h := &NativeHost{t: t, out: out, w: out, events: make(chan Event, 256)}
+	h := &NativeHost{
+		t: t, out: out, w: out,
+		events:  make(chan Event, 256),
+		resized: make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
 	h.stop = t.HandleFatalSignals()
 	h.readSize()
 	h.watchResize()
@@ -230,6 +244,11 @@ func (h *NativeHost) Close() error {
 	if already {
 		return nil
 	}
+	// Nil in the zero-value hosts the tests build directly; those never start
+	// the deliverer, so there is nobody waiting to be released.
+	if h.done != nil {
+		close(h.done)
+	}
 	if h.stop != nil {
 		h.stop()
 	}
@@ -392,10 +411,49 @@ func (h *NativeHost) watchResize() {
 		for range ch {
 			h.readSize()
 			h.Invalidate()
-			cols, rows := h.Size()
-			h.emit(Resize{Cols: cols, Rows: rows})
+			// Non-blocking, into a buffer of one. A drag produces a burst of
+			// SIGWINCH and the signal handler must not be the thing that waits.
+			select {
+			case h.resized <- struct{}{}:
+			default:
+			}
 		}
 	}()
+	go h.deliverResize()
+}
+
+// deliverResize turns the coalescing buffer into events, blocking until the
+// consumer takes each one.
+//
+// emit drops on a full channel, which is right for input: a wedged render loop
+// must not also wedge the reader, or ctrl+c stops working. It is wrong for
+// resize. A drag produces a burst, the burst fills the channel, and the drop
+// means no redraw is triggered until the 150 ms tick — so the window snaps to
+// its new size a beat after you let go of the mouse.
+//
+// Blocking is safe here in a way it is not in emit, because this goroutine
+// does nothing else. The reader keeps reading and the ticker keeps ticking
+// while this one waits, so a stalled consumer costs a late resize rather than
+// a dead keyboard.
+//
+// An event that waited can carry a size the window has already left, and that
+// is fine on both counts: another SIGWINCH follows any further change, so a
+// fresh event is behind it, and Present reads the true size every frame anyway
+// — the event is a nudge to redraw, not the source of truth for what to draw.
+func (h *NativeHost) deliverResize() {
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-h.resized:
+			cols, rows := h.Size()
+			select {
+			case h.events <- Resize{Cols: cols, Rows: rows}:
+			case <-h.done:
+				return
+			}
+		}
+	}
 }
 
 // trueSize asks the terminal rather than trusting the cache, and refreshes the

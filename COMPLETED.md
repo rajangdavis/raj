@@ -218,6 +218,264 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   reopening, and the server kept publishing about a file nothing was showing.
   Closing never starts a server to say so.
 
+## Brackets
+
+- [x] **The matching bracket under the cursor is underlined.** Underline rather
+  than a recolour, so the bracket keeps its syntax colour and its selection or
+  find background — it is the one mark that coexists with all of them, which
+  matters because a bracket is frequently inside a selection.
+- [x] **Brackets in strings and comments are not counted.** `syntax.Span` now
+  carries a `Class` alongside its style, set from the chroma token the span came
+  from. Deriving it from the colour instead would tie the feature to the
+  palette: re-map comments to a different ANSI index and matching would quietly
+  start counting them. Where the lexer has nothing to say — an unknown
+  language, a file too large to highlight, the first frames before the
+  background pass lands — every bracket counts, which is plain depth counting
+  rather than no matching at all.
+- [x] **A stack, not a depth count.** Counting only the bracket you started on
+  pairs `(` with `)` in `([)]`, because the unclosed `[` between them is
+  invisible to a counter that only knows about parentheses. Reporting no match
+  is right: inventing a pair says the file nests in a way it does not.
+- [x] **The scan is bounded by lines and by bytes**, sized against a frame
+  rather than against "far past any real nesting" — see BENCHMARKS.md. The
+  worst case here is the common one, since an unmatched bracket is scanned in
+  full on every frame between typing an opener and typing its closer. Two
+  benchmark findings that no correctness test could have caught: reading bytes
+  through the piece table cost 10 ms per frame, and a 128 KB budget cost 5.4 ms
+  even after that was fixed. Now 0.13 ms unmatched, 0.54 µs matched.
+- [x] **Fuzzed for the properties, not for expected matches**, there being no
+  independent oracle short of writing the matcher twice: both offsets in
+  bounds, distinct, one of them at the cursor, an opener paired with its own
+  closer, and symmetric — standing on the partner finds the way back, so a lit
+  pair does not vanish when you step onto the other half of it.
+
+## Search
+
+- [x] **Known-binary extensions are skipped before opening**, checked before
+  `Info()` and before the open, since the whole point is to skip the syscalls.
+  Measured rather than assumed, as the TODO asked: 2.3x on a tree with assets
+  and free on one without. See BENCHMARKS.md, including the first cut of the
+  benchmark that was wrong and how the implausible number gave it away.
+- [x] **The list is conservative on purpose.** `.ts`, `.h`, `.m`, `.cs`, `.r`,
+  `.d` and `.s` all look binary and are source far more often, so none are on
+  it. Skipping a source file makes a search silently wrong; failing to skip an
+  asset only makes it slower.
+- [x] **Open documents are exempt.** An unsaved buffer is searched from memory
+  and never opened, so whatever the tab is called, its contents are text and
+  are on screen.
+
+## Hover
+
+- [x] **Hover has a floating panel**, anchored to the position that was asked
+  about rather than to the live cursor, so the box does not drift if anything
+  moves the cursor between the question and the answer.
+- [x] **The status line keeps the "nothing to say" case.** An empty box is
+  worse than a word, and most positions in most files have nothing to say
+  about them.
+- [x] **Markdown fences are stripped, their contents are not.** gopls returns
+  fenced code, and the fences read as three stray backticks in a terminal box.
+  What they contained is code, and code is the part whose spacing matters.
+  Nothing else about the markdown is interpreted: a half-rendered subset is
+  more confusing than none.
+- [x] **It claims exactly one key: escape.** Unlike the completion popup, this
+  panel can sit on screen while you carry on reading, so claiming arrows to
+  scroll it would steal navigation from the document underneath at the moment
+  it matters most. Content that does not fit says `+N more` instead — a label
+  kept terse because the panel is narrowest exactly when it is most likely to
+  overflow, and a truncated "… 31 more line" reads as a bug.
+- [x] **Any other action dismisses it.** A panel describes what the cursor was
+  on, so once the cursor moves it describes something that is no longer there
+  — and a stale box floating over the code is worse than the status line it
+  replaced, because it is bigger and looks more authoritative.
+- [x] **Placement is the completion popup's, restated rather than shared.**
+  Factoring it out would mean a common widget parameterised by anchor, size,
+  border and content, and the two differ in all four. What they share is three
+  lines of arithmetic and a reason worth repeating where it applies. They do
+  share `textArea`, so neither can disagree about where column zero is.
+
+## Problems pane
+
+- [x] **Diagnostics have a workspace-wide list pane**, on cmd+shift+m. The
+  gutter and the status line only answer "what is wrong with the line I am
+  standing on", which is enough to fix a problem you have already found and
+  useless for finding one three files away.
+- [x] **The search pane's shape, deliberately.** Grouped by file, collapsible,
+  enter to jump — a list of results across a workspace is a list of results
+  across a workspace, and two panes answering the same question in two shapes
+  is one shape too many to learn. It has no query and no worker, though:
+  diagnostics arrive unasked and are already in a store, so this is a view over
+  that store and nothing more.
+- [x] **The selection is kept by identity, not by index.** Diagnostics are
+  republished on every keystroke that reaches the server, so an index-based
+  selection would walk under the cursor while you read the list. When the
+  selected problem is fixed — the good case — the selection lands on its file's
+  heading rather than on whatever is now at the old index. Folds survive a
+  republish for the same reason.
+- [x] **The two severity rankings are asserted to agree.** The pane duplicates
+  the app's ranking rather than importing it, since the app imports the pane
+  and a shared package for two switch statements is more indirection than the
+  duplication costs. But two places deciding that an unspecified severity is an
+  error differently is exactly how a file shows a red mark in the gutter and
+  nothing in the list, so there is a test over every severity value.
+- [x] **Closing a file removes it from the pane** as well as from the store. A
+  list naming a file no tab is showing, with problems nothing will re-check, is
+  worse than an empty list.
+
+## Keybinding reference
+
+- [x] **KEYBINDINGS.md is generated from `keys.Bindings`**, via `raj --keys`,
+  with a test asserting the checked-in copy matches what the table produces.
+  That is what makes "cannot drift" true rather than aspirational: change a
+  chord without regenerating and the build fails, with the command to fix it.
+  Checked in rather than generated on demand, because a reference you have to
+  build the program to read is not a reference.
+- [x] **Unimplemented actions are marked rather than omitted.** The chord is
+  taken from the terminal either way, and an undocumented binding that does
+  nothing is indistinguishable from a broken one.
+- [x] **The list of them is kept honest by a test**, which is the part worth
+  having. It presses each listed action and fails if anything handles it, and
+  presses every other bound action and fails if nothing does — so drift in
+  either direction breaks the build. It found `CursorUndo` (cmd+u) immediately:
+  bound, taking a chord from the terminal, doing nothing, and listed in TODO.md
+  as neither.
+- [x] **Reclaimed chords get their own section.** "Why does cmd+1 not switch
+  raj tabs" is a real question with a real answer, and the answer was already
+  in the table.
+
+## Autoscroll
+
+- [x] **A drag held past the edge scrolls the document.** Without it a selection
+  could not exceed a screenful by pointer alone. It runs off the idle tick,
+  because the gesture is holding the pointer STILL outside the pane — the
+  terminal sends nothing while nothing moves, so there is no event to hang it
+  on and the scroll has to come from the only thing that happens on its own.
+- [x] **Speed is proportional to how far past the edge the pointer is held**,
+  capped at eight rows a tick. That is the convention everywhere and it is what
+  makes a 150 ms tick usable: a fixed one-line step would take a minute to
+  cross a large file, and pushing further is how you ask for faster.
+- [x] **`ExtendTo` is `DragTo` without following the cursor.** The edge row is
+  on screen by construction, so following would scroll a second time on top of
+  the step just taken — which made the cap not a cap: a step of eight rows
+  moved ten. Caught by the test asserting the cap, which is the only reason it
+  was noticed at all.
+- [x] **It stops when it should:** on release, at the ends of the document, and
+  for a drag inside the pane, where a creeping view would make an ordinary
+  selection impossible to place. An idle tick with no drag in progress touches
+  nothing, which matters because the tick also drives retokenising and runs
+  constantly.
+
+## Save-as
+
+- [x] **A missing parent directory is offered rather than failing.** Saving into
+  a directory that was not there gave the raw `os.WriteFile` error — "no such
+  file or directory" against a path just typed in full, which reads as the save
+  being rejected rather than as a folder you could make. It asks rather than
+  creating silently: everything else save-as does happens to a file the user
+  named, and this is the one step that puts something on disk they did not.
+- [x] **Tab completes a path**, to the longest common prefix rather than to the
+  first match, so repeated tabs converge instead of cycling. A single directory
+  match gets a trailing separator, so tab walks down a tree one press per level.
+  Hidden files are completed only when the prefix asks for them, the same rule
+  the tree and the search walk use.
+- [x] **The completer is a hook passed to `AskComplete`**, not a field on the
+  prompt: `Ask` resets the whole struct, which is right — a stale option list or
+  continuation would be far worse than a stale completer — and a field set
+  beforehand was silently wiped by that reset. The symptom looked like tab never
+  being delivered.
+- [x] **Tab in a prompt is `Indent` rather than `None`.** Bound to None it
+  resolved to nothing at all and the keystroke was simply lost. A one-line field
+  has nothing to indent, so the prompt uses it to complete.
+- [x] **A failed save puts the buffer's name back.** It was left pointing at the
+  path that had just failed, so the next plain save would write there without
+  asking — turning one visible failure into a silent one.
+
+## Explorer
+
+- [x] **The tree scrolls horizontally, following the selection.** A name too
+  deep and too long to fit is now readable once selected, rather than being
+  permanently cut off with only the bottom path line to say what it was.
+- [x] **The offset moves the minimum needed, and otherwise not at all.** That
+  is the whole rule, and it is what the TODO warned about: an offset that
+  recentres on the selection slides the tree sideways every time you arrow
+  between rows of different depth, which is worse than not scrolling — the
+  names move while your eye is on them. So it is a window the selected row has
+  to be inside, exactly like the document's own viewport.
+- [x] **It returns to zero on its own**, with no special case for "go back":
+  the selection reaching something shallow enough to sit left of the window is
+  what resets it, and for a tree that means the top level. Offsets of zero and
+  one are normalised together, since the first column is padding belonging to
+  no row and the two show the same thing.
+- [x] **A row too long to fit at all is aligned to its own start.** A name you
+  can read the front of is identifiable; one you can read the back of usually
+  is not.
+- [x] **Clipping is by display column, not by byte**, since the disclosure
+  marker is multi-byte and a byte clip would cut it in half.
+
+## Auto-indent
+
+- [x] **A line that opens a bracket and does not close it adds a level.** That
+  is the moment the previous line's whitespace stops being the right answer,
+  and it was the half the old rule could not reach.
+- [x] **A closer typed on a line of its own lines up with what opened it**, by
+  copying the partner's indent rather than subtracting a level from the current
+  one. Subtracting assumes the file is indented consistently and in raj's own
+  units; copying is right whatever the file does, including files that mix tabs
+  and spaces.
+- [x] **Brackets in strings and comments do not count**, via the token class
+  added for bracket matching. Without it `s := "{"` adds a level to everything
+  after it, which is the failure that makes naive auto-indent worse than none.
+  Where the lexer has nothing to say, every bracket counts — the behaviour this
+  would have had anyway.
+- [x] **It declines where it would be guessing:** a closer with code before it
+  is part of an expression rather than the end of a block; an unmatched closer
+  has nothing to line up with and is left alone rather than snapped to column
+  zero; and several cursors put closers on several lines wanting different
+  indents, so none are moved. Net depth is floored at zero and adds one level
+  however many brackets opened, since a line ending `{{` is still one block.
+
+## Problems pane filters
+
+- [x] **Severity and scope filters**, as two checkboxes on a filter row under
+  the heading — the explorer's shape, and drawn from a shared `toggles(w)` so a
+  box cannot be drawn in one place and clicked in another.
+- [x] **A file whose problems are all filtered out loses its heading.** A
+  heading reading "0E 0W" is a row that says nothing and still costs a line,
+  which on a filtered list is most of what you were trying to remove. Heading
+  counts describe what is shown rather than what was published, since a group
+  claiming two warnings while showing none is worse than no counts.
+- [x] **"No problems" under an active filter says so**, because otherwise it is
+  a lie: the workspace may be full of them.
+- [x] **Which files are open is pushed in, not asked for.** The pane is given
+  diagnostics and knows nothing about tabs; inverting that would make a list of
+  problems depend on the editor. An unchanged set does not dirty the rows,
+  which matters because it is handed over on every diagnostic refresh.
+- [x] **A filter change resets the selection to the top.** `Set` goes to some
+  trouble to keep it by identity, because diagnostics are republished under the
+  cursor while you read — but a filter change is the opposite case: you asked
+  for a different list, and landing at the top of it is what you meant.
+
+## Resize
+
+- [x] **Resize events are no longer dropped.** `emit` discards on a full
+  channel, which is right for input — a wedged render loop must not also wedge
+  the reader, or ctrl+c stops working — and wrong for resize: a drag fills the
+  channel, the drop means no redraw until the 150 ms tick, and the window snaps
+  to its new size a beat after you let go of the mouse.
+- [x] **A coalescing buffer of one, and a goroutine that blocks.** A resize is
+  idempotent, so a full buffer means one is already on its way and the
+  duplicate loses nothing. Blocking is safe there in a way it is not in `emit`,
+  because the deliverer does nothing else: the reader keeps reading while it
+  waits, so a stalled consumer costs a late resize rather than a dead keyboard.
+- [x] **`Close` releases a blocked deliverer** rather than leaking it, guarded
+  for the zero-value hosts the tests build directly.
+- [x] **Resize has test coverage now**, including the case that used to drop.
+  One of the tests caught a claim in my own comment that the code did not make
+  good: the size is read when the signal is taken, not at delivery, so a queued
+  event can carry a size the window has left. That is harmless for reasons
+  worth writing down rather than papering over — every further change signals
+  again, and `Present` reads the true size every frame, so the event is a nudge
+  to redraw rather than the source of truth for what to draw.
+
 ## This session
 
 - [x] **Bracketed paste.** `ui.Paste` existed and `app` handled it, but nothing

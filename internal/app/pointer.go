@@ -62,7 +62,7 @@ func (a *App) pointer(ev ui.Mouse) {
 	// drag flag set would make the next pointer movement extend a selection
 	// nobody is holding.
 	if !ev.Press {
-		a.drag = false
+		a.drag, a.autoscroll = false, 0
 		return
 	}
 	cols, rows := a.screen.Size()
@@ -76,6 +76,11 @@ func (a *App) pointer(ev ui.Mouse) {
 			if p := a.Tabs.Active(); p != nil {
 				x, y, _ := a.editorCell(l, p, ev.Col, ev.Row)
 				p.DragTo(x, y)
+				// Remembered so the tick can keep extending to a pointer that
+				// has stopped moving. Held outside the pane, that is the whole
+				// gesture: the hand is still and the text is what moves.
+				a.dragCol, a.dragRow = ev.Col, ev.Row
+				a.autoscroll = a.beyondEdge(l, p, ev.Row)
 			}
 		}
 		return
@@ -158,6 +163,11 @@ func (a *App) clickSidebar(l Layout, ev ui.Mouse) {
 			a.OpenFile(path)
 			a.jumpTo(line)
 		}
+	case SidebarProblems:
+		if path, line, _ := a.Problems.ClickAt(dx, dy, w, l.Rows); path != "" {
+			a.OpenFile(path)
+			a.jumpTo(line)
+		}
 	}
 }
 
@@ -197,6 +207,8 @@ func (a *App) clickEditor(l Layout, ev ui.Mouse) {
 			p.ClickAt(x, y, false)
 		}
 		a.drag = true
+		a.dragCol, a.dragRow = ev.Col, ev.Row
+		a.autoscroll = 0
 	}
 	a.status = ""
 }
@@ -231,4 +243,72 @@ func (a *App) editorCell(l Layout, p *editor.Pane, col, row int) (x, y int, ok b
 		y = rows - 1
 	}
 	return x, y, inside
+}
+
+// Autoscroll during a drag.
+//
+// Without it a selection cannot exceed a screenful by pointer alone: dragging
+// to the edge extends to the edge and stops, which every other editor treats as
+// a bug. It cannot be driven by mouse events, because the gesture is holding
+// the pointer still outside the pane — the terminal sends nothing while nothing
+// moves. So it comes from the tick, which is the only thing that happens on its
+// own.
+
+// maxAutoscrollRows caps the speed. Proportional to how far past the edge the
+// pointer is held, which is the convention everywhere and is what makes a
+// coarse tick usable: at 150 ms a fixed one-line step would take a minute to
+// cross a large file, and the way you ask for "faster" is to push further.
+const maxAutoscrollRows = 8
+
+// beyondEdge is how many rows past the text area a screen row is, signed, and
+// zero when it is inside.
+func (a *App) beyondEdge(l Layout, p *editor.Pane, row int) int {
+	top, rows := l.TopY, l.Rows
+	if p.Find.Open {
+		top, rows = top+1, rows-1
+	}
+	if rows < 1 {
+		return 0
+	}
+	switch {
+	case row < top:
+		return row - top
+	case row >= top+rows:
+		return row - (top + rows - 1)
+	}
+	return 0
+}
+
+// autoScrollStep runs one tick of a drag held outside the pane.
+//
+// Scroll first, then re-extend to the pointer. The pointer is outside the pane,
+// so editorCell clamps it to the nearest edge row — which after the scroll is a
+// different line, and that is exactly the line the selection should now reach.
+func (a *App) autoScrollStep() {
+	if !a.drag || a.autoscroll == 0 {
+		return
+	}
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	step := a.autoscroll
+	if step > maxAutoscrollRows {
+		step = maxAutoscrollRows
+	}
+	if step < -maxAutoscrollRows {
+		step = -maxAutoscrollRows
+	}
+	before := p.Viewport.Top
+	p.ScrollRows(step)
+	if p.Viewport.Top == before {
+		return // already at the end of the document; nothing to extend to
+	}
+	cols, rows := a.screen.Size()
+	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	x, y, _ := a.editorCell(l, p, a.dragCol, a.dragRow)
+	// ExtendTo rather than DragTo: the edge row is on screen by construction,
+	// and following the cursor would scroll a second time on top of the step
+	// just taken, making the speed cap not a cap.
+	p.ExtendTo(x, y)
 }

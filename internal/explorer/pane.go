@@ -14,8 +14,12 @@ import (
 // Returning is deliberately a chord (shift+cmd+e), so that editing is never one
 // stray keypress away from being interrupted.
 type Pane struct {
-	Tree    *Tree
-	list    widget.List
+	Tree *Tree
+	list widget.List
+	// left is the horizontal offset, in columns. See follow: it moves only
+	// when the selected row does not fit, which is what keeps the tree from
+	// sliding sideways every time the selection changes depth.
+	left    int
 	spot    int // 0 = the changed-files toggle, 1 = the tree
 	visited bool
 }
@@ -196,6 +200,7 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 	rows := treeRows(h)
 	p.list.Settle(rows, len(p.Tree.Entries()))
 	entries := p.Tree.Entries()
+	p.follow(w)
 
 	for row := 0; row < rows; row++ {
 		i := p.list.Top + row
@@ -204,18 +209,104 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 		}
 		e := entries[i]
 		style := th.Focus(i == p.list.Sel, focused && p.spot == spotTree)
-		indent := 1 + e.Depth*2
-		marker := "  "
-		if e.Dir {
-			marker = "▸ "
-			if e.Open {
-				marker = "▾ "
-			}
-		}
-		label := marker + e.Name
+		at, label := indentOf(e)-p.left, labelOf(e)
 		s.Fill(x, y+2+row, w, 1, ui.DefaultStyle)
-		s.SetString(x+indent, y+2+row, widget.Truncate(label, w-indent-1), style, w-indent-1)
+		if at < 0 {
+			// Scrolled past this row's start: drop the columns that are off to
+			// the left, so a deep row keeps the tail of its name rather than
+			// being drawn from column zero as though it were shallow.
+			label, at = clipLeft(label, -at), 0
+		}
+		if at >= w-1 || label == "" {
+			continue
+		}
+		s.SetString(x+at, y+2+row, widget.Truncate(label, w-at-1), style, w-at-1)
 	}
+}
+
+// indentOf is the column a row's marker starts at, before any offset.
+func indentOf(e Entry) int { return 1 + e.Depth*2 }
+
+// labelOf is the disclosure marker and the name.
+func labelOf(e Entry) string {
+	marker := "  "
+	if e.Dir {
+		marker = "▸ "
+		if e.Open {
+			marker = "▾ "
+		}
+	}
+	return marker + e.Name
+}
+
+// follow moves the horizontal offset the minimum needed to show the selected
+// row, and otherwise leaves it alone.
+//
+// "The minimum needed" is the whole rule, and it is what the TODO warned about:
+// an offset that recentres on the selection makes the tree slide sideways every
+// time you arrow between rows of different depth, which is far worse than not
+// scrolling at all — the names you are reading move while your eye is on them.
+//
+// So the offset is a window that the selected row has to be inside, exactly
+// like the document's own viewport. Arrowing between rows that both fit changes
+// nothing. It returns to zero on its own when the selection reaches something
+// shallow enough to sit left of the window, which for a tree means the top
+// level — a rule that needs no special case for "go back".
+//
+// Showing the start of a name beats showing the end: a row too long to fit at
+// all is left aligned to its own indent, because a name you can read the front
+// of is identifiable and one you can read the back of is usually not.
+func (p *Pane) follow(w int) {
+	entries := p.Tree.Entries()
+	if p.list.Sel < 0 || p.list.Sel >= len(entries) || w < 4 {
+		p.left = 0
+		return
+	}
+	e := entries[p.list.Sel]
+	start := indentOf(e)
+	end := start + cols(labelOf(e))
+	avail := w - 1 // the last column is left clear, as the renderer does
+
+	if end-p.left > avail {
+		p.left = end - avail
+	}
+	if p.left > start {
+		// Scrolling left goes to the row's own start rather than further:
+		// anything less would be more movement than the row needs, and
+		// movement is the thing to avoid.
+		p.left = start
+	}
+	// The first column is padding that belongs to no row, so an offset of one
+	// shows exactly what an offset of zero shows. Normalising means the top
+	// level reads as "not scrolled" rather than as scrolled by an amount with
+	// no visible effect.
+	if p.left <= indentOf(Entry{}) {
+		p.left = 0
+	}
+}
+
+// clipLeft drops n display columns from the front of a string.
+//
+// Columns rather than bytes, because the marker is a multi-byte rune and names
+// are arbitrary text: dropping bytes would cut one in half and put a
+// replacement character where the offset landed.
+func clipLeft(s string, n int) string {
+	at := 0
+	for i, r := range s {
+		if at >= n {
+			return s[i:]
+		}
+		at += ui.RuneWidth(r)
+	}
+	return ""
+}
+
+// cols is a string's display width, measured the way the renderer measures it.
+func cols(s string) (n int) {
+	for _, r := range s {
+		n += ui.RuneWidth(r)
+	}
+	return
 }
 
 // renderFilter draws the changed-files toggle as the pane's second focus stop.

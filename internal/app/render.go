@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 
+	"raj/internal/editor"
 	"raj/internal/ui"
 )
 
@@ -81,6 +82,8 @@ func (a *App) drawSidebar(l Layout) {
 		a.Explorer.Render(a.screen, l.SidebarX, l.TopY, w, l.Rows, a.wth, focused)
 	case SidebarSearch:
 		a.Search.Render(a.screen, l.SidebarX, l.TopY, w, l.Rows, a.wth, focused)
+	case SidebarProblems:
+		a.Problems.Render(a.screen, l.SidebarX, l.TopY, w, l.Rows, a.wth, focused)
 	}
 	restore()
 	if l.ShowEditor {
@@ -143,16 +146,29 @@ func (a *App) drawDiagnosticMarks(l Layout) {
 
 func (a *App) drawCompletion(l Layout) {
 	p := a.Tabs.Active()
-	if p == nil || !a.Complete.Open {
+	if p == nil {
 		return
 	}
+	x, top, w, rows := a.textArea(l, p)
+	// The hover panel first, so a completion popup that overlaps it is drawn
+	// on top. Completion is what you are doing; hover is what you were
+	// reading, and the one being typed into should not be buried.
+	a.Hover.Render(a.screen, x, top, w, rows, p.Viewport.Top, a.wth)
+	if a.Complete.Open {
+		a.Complete.Render(a.screen, x, top, w, rows, p.Viewport.Top, a.wth)
+	}
+}
+
+// textArea is the editor's text region, excluding the gutter and the find bar.
+// Both floating overlays are placed against it, so they cannot disagree about
+// where column zero of the document is.
+func (a *App) textArea(l Layout, p *editor.Pane) (x, y, w, h int) {
 	top, rows := l.TopY, l.Rows
 	if p.Find.Open {
 		top, rows = top+1, rows-1
 	}
 	g := p.GutterWidth()
-	a.Complete.Render(a.screen, l.EditorX+g, top, l.EditorW-g, rows,
-		p.Viewport.Top, a.wth)
+	return l.EditorX + g, top, l.EditorW - g, rows
 }
 
 func (a *App) drawEditor(l Layout) {

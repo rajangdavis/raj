@@ -33,6 +33,12 @@ const (
 
 	// Overwrite is the affirmative answer to an existing file.
 	Overwrite = "Overwrite"
+
+	// Create is the affirmative answer to a directory that does not exist yet.
+	// A separate word from Save because the question is not "save?" — it is
+	// "make this directory?", and answering it makes something on disk that the
+	// user did not explicitly ask for.
+	Create = "Create"
 )
 
 // SaveOptions is the standard three-way answer to unsaved changes. Cancel is
@@ -52,6 +58,9 @@ const (
 type Prompt struct {
 	Open bool
 
+	// Complete is the tab hook; see SetComplete.
+	Complete func(string) string
+
 	kind    kind
 	title   string
 	message string
@@ -68,7 +77,19 @@ func New() *Prompt { return &Prompt{} }
 // it when the seed is a prefix to keep typing after — a save-as path is the
 // directory, not the answer.
 func (p *Prompt) Ask(title, initial string, done func(answer string, ok bool)) {
-	*p = Prompt{Open: true, kind: ask, title: title, done: done}
+	p.AskComplete(title, initial, nil, done)
+}
+
+// AskComplete is Ask with a tab-completion hook.
+//
+// The hook is a parameter rather than a field set beforehand, because Ask
+// resets the whole struct — which is right, since a stale option list or a
+// stale continuation from the last question would be far worse than a stale
+// completer. A field set before the call was silently wiped by that reset, and
+// the failure looked like tab not being delivered at all.
+func (p *Prompt) AskComplete(title, initial string, complete func(string) string,
+	done func(answer string, ok bool)) {
+	*p = Prompt{Open: true, kind: ask, title: title, done: done, Complete: complete}
 	p.input.Focused = true
 	p.input.SetText(initial)
 }
@@ -101,6 +122,14 @@ func (p *Prompt) ActiveInput() *widget.Input {
 	return &p.input
 }
 
+// Complete is the tab-completion hook for an Ask field, given the current text
+// and returning what it should become. Nil, or a return of "" or of the text
+// unchanged, means no completion — which is also how "no matches" is said, so
+// a field with nothing to complete simply does nothing rather than beeping.
+//
+// A hook rather than a path completer built in, because prompt knows about
+// fields and dialogs and has no business knowing about directories. What can
+// be completed depends on what is being asked for. Set it through AskComplete.
 // Title is what the dialog is asking about, for the status line.
 func (p *Prompt) Title() string { return p.title }
 
@@ -128,6 +157,17 @@ func (p *Prompt) Handle(a keys.Action, text string) {
 		return
 	case keys.Confirm:
 		p.finish(p.answer(), true)
+		return
+	}
+	if p.kind == ask && a == keys.Indent {
+		// Tab completes rather than indenting. There is nothing to indent in a
+		// one-line field, and a path field that does not complete is the thing
+		// that made save-as feel like a text box rather than a file dialog.
+		if p.Complete != nil {
+			if done := p.Complete(p.input.Text); done != "" && done != p.input.Text {
+				p.input.SetText(done)
+			}
+		}
 		return
 	}
 	if p.kind == confirm {

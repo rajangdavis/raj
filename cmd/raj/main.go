@@ -6,6 +6,7 @@
 //	raj --tab 4 file.go       set the indent width
 //	raj --config ghostty      print Ghostty keybindings to install
 //	raj --config iterm2       print an iTerm2 dynamic profile
+//	raj --keys                print the keybinding reference as markdown
 //	raj --probe               check which chords this terminal delivers
 //	raj --probe --checklist   walk every binding and emit a measured keymap
 package main
@@ -28,12 +29,17 @@ func main() {
 		tab       = flag.Int("tab", 2, "indent width in spaces")
 		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
 		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
+		keyDoc    = flag.Bool("keys", false, "print the keybinding reference as markdown")
 		runProbe  = flag.Bool("probe", false, "report what chords this terminal delivers")
 		checklist = flag.Bool("checklist", false, "with --probe: walk every binding in order")
 		kkpFlags  = flag.Int("kkp", 0, "with --probe: KKP flags to push (0 = raj's own)")
 	)
 	flag.Parse()
 
+	if *keyDoc {
+		fmt.Print(keys.Doc())
+		return
+	}
 	if *configFor != "" {
 		out, err := config(*configFor)
 		if err != nil {

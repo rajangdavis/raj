@@ -55,9 +55,14 @@ func NewKeymap() *Keymap {
 	k.Bind(Picker, "shift+tab", None)
 
 	// A prompt is modal in the strongest sense: it is the only thing that can
-	// answer itself, so tab has nowhere to go and enter must mean "confirm"
+	// answer itself, so tab cannot cycle focus and enter must mean "confirm"
 	// even though the editor underneath would insert a newline.
-	k.Bind(Prompt, "tab", None)
+	//
+	// Tab means Indent rather than None, because a one-line field has nothing
+	// to indent and the prompt uses it to complete instead — which is what
+	// turns save-as from a text box into a file dialog. Bound to None it
+	// resolved to nothing at all and the keystroke was simply lost.
+	k.Bind(Prompt, "tab", Indent)
 	k.Bind(Prompt, "shift+tab", None)
 	return k
 }

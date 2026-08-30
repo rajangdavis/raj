@@ -132,6 +132,16 @@ func (p *Pane) DragTo(x, y int) {
 	p.FollowCursor()
 }
 
+// ExtendTo is DragTo without pulling the view to the cursor.
+//
+// For autoscroll, where the caller has just decided how far to scroll and the
+// point being extended to is already on screen by construction. Calling
+// FollowCursor there would scroll a second time on top of the step the caller
+// chose, so the speed cap would not be a cap: a step of eight rows moved ten.
+func (p *Pane) ExtendTo(x, y int) {
+	p.Cursors.Set(p.OffsetAt(x, y), p.Cursors.Primary().Anchor)
+}
+
 // SelectWordAt selects the word under the pointer, for a double click.
 func (p *Pane) SelectWordAt(x, y int) {
 	off := p.OffsetAt(x, y)

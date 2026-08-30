@@ -7,6 +7,7 @@ const (
 	SidebarNone Sidebar = iota
 	SidebarExplorer
 	SidebarSearch
+	SidebarProblems
 )
 
 // Breakpoints for how many panes fit. Below Narrow, only one pane shows — the

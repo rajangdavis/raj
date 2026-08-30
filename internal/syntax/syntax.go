@@ -21,10 +21,31 @@ import (
 // perfectly readable.
 const MaxSize = 1 << 20
 
+// Class is what kind of thing a span is, as opposed to what colour it is.
+//
+// It exists because more than one feature needs to know whether an offset is
+// inside a string or a comment, and none of them should have to infer it from
+// the colour. Bracket matching must not pair a brace in a comment with a real
+// one; the symbol scanner must not report a `func` at the start of a line
+// inside a block comment. Both are the same question, and the lexer has
+// already answered it by the time anything asks.
+//
+// Deriving it from Style instead would tie every such feature to the palette:
+// re-map comments to a different ANSI index and bracket matching would quietly
+// start counting them.
+type Class uint8
+
+const (
+	ClassCode Class = iota // anything the lexer did not call a string or a comment
+	ClassString
+	ClassComment
+)
+
 // Span is a run of one style within a line, in byte offsets from the line start.
 type Span struct {
 	Start, End int
 	Style      ui.Style
+	Class      Class
 }
 
 // Highlighter holds the tokens for one document.
@@ -147,6 +168,7 @@ func (h *Highlighter) tokenise(text string) {
 	line, col := []Span{}, 0
 	for _, tok := range it.Tokens() {
 		st := h.styleFor(tok.Type)
+		cl := classOf(tok.Type)
 		// A token may span newlines (comments, strings, whitespace), so each
 		// segment between newlines becomes a span on its own line.
 		for {
@@ -155,14 +177,14 @@ func (h *Highlighter) tokenise(text string) {
 				break
 			}
 			if i > 0 {
-				line = append(line, Span{col, col + i, st})
+				line = append(line, Span{col, col + i, st, cl})
 			}
 			out = append(out, line)
 			line, col = []Span{}, 0
 			tok.Value = tok.Value[i+1:]
 		}
 		if tok.Value != "" {
-			line = append(line, Span{col, col + len(tok.Value), st})
+			line = append(line, Span{col, col + len(tok.Value), st, cl})
 			col += len(tok.Value)
 		}
 	}
@@ -235,6 +257,37 @@ func (h *Highlighter) styleFor(t chroma.TokenType) ui.Style {
 		return st.Plus(ui.Bold)
 	}
 	return st // identifiers keep the terminal foreground
+}
+
+// classOf sorts a token into the three categories anything downstream cares
+// about. Everything that is not a string or a comment is code, including
+// whitespace and errors: a bracket in either is a real bracket.
+//
+// Character and escape literals fall under LiteralString in chroma, which is
+// what we want — a brace inside \'{\' is not structural either.
+func classOf(t chroma.TokenType) Class {
+	switch {
+	case t.InCategory(chroma.Comment):
+		return ClassComment
+	case t.InCategory(chroma.LiteralString):
+		return ClassString
+	}
+	return ClassCode
+}
+
+// ClassAt is what kind of token covers a byte offset within a line.
+//
+// Offsets no span claims are code. An unclaimed offset means either that
+// tokenising has not run yet or that the lexer emitted nothing there, and
+// treating an unknown offset as a string would make bracket matching silently
+// stop working on every freshly opened file.
+func ClassAt(spans []Span, off int) Class {
+	for _, s := range spans {
+		if off >= s.Start && off < s.End {
+			return s.Class
+		}
+	}
+	return ClassCode
 }
 
 // StyleAt resolves the style covering a byte offset within a line, falling back

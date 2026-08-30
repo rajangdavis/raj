@@ -48,43 +48,52 @@ func TestStaleAnswersAreDropped(t *testing.T) {
 	h.park(lspAnswer{gen: 4, kind: answerHover, text: "stale"})
 	h.applyAnswer()
 
-	if strings.Contains(h.Status(), "stale") {
-		t.Errorf("status = %q; a superseded answer was shown", h.Status())
+	if strings.Contains(h.Hover.Text(), "stale") {
+		t.Errorf("panel = %q; a superseded answer was shown", h.Hover.Text())
 	}
 
 	h.park(lspAnswer{gen: 5, kind: answerHover, text: "current"})
 	h.applyAnswer()
-	if !strings.Contains(h.Status(), "current") {
-		t.Errorf("status = %q, want the current answer", h.Status())
+	if !strings.Contains(h.Hover.Text(), "current") {
+		t.Errorf("panel = %q, want the current answer", h.Hover.Text())
 	}
 }
 
-// A hover with nothing in it clears rather than reporting a failure: most
-// positions in most files have nothing to say about them.
-func TestEmptyHoverIsNotAnError(t *testing.T) {
+// A hover with nothing in it opens no panel: an empty box is worse than a
+// word, and most positions in most files have nothing to say about them. The
+// status line is where that word goes.
+func TestEmptyHoverOpensNoPanel(t *testing.T) {
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerHover, text: ""})
 	h.applyAnswer()
-	if h.Status() != "" {
-		t.Errorf("status = %q, want it left clear", h.Status())
+	if h.Hover.Open {
+		t.Error("an empty answer opened a panel")
+	}
+	if h.Status() == "" {
+		t.Error("nothing happened and nothing said why")
 	}
 }
 
-// A multi-line hover is folded onto the status line rather than truncated at
-// the first newline, which would hide the signature under its doc comment.
-func TestMultiLineHoverIsFolded(t *testing.T) {
+// A multi-line hover keeps its lines. Folding them onto one row was the status
+// line's limitation and the reason the panel exists: a signature without its
+// line breaks is a signature that has lost its shape.
+func TestMultiLineHoverKeepsItsLines(t *testing.T) {
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerHover, text: "func F(x int) error\n\nDoes a thing."})
 	h.applyAnswer()
 
-	if strings.Contains(h.Status(), "\n") {
-		t.Error("a newline reached the status line")
+	if !h.Hover.Open {
+		t.Fatal("no panel opened")
+	}
+	got := h.Hover.Text()
+	if !strings.Contains(got, "\n") {
+		t.Error("the answer was folded onto one line")
 	}
 	for _, want := range []string{"func F(x int) error", "Does a thing."} {
-		if !strings.Contains(h.Status(), want) {
-			t.Errorf("status = %q, missing %q", h.Status(), want)
+		if !strings.Contains(got, want) {
+			t.Errorf("panel = %q, missing %q", got, want)
 		}
 	}
 }

@@ -94,6 +94,10 @@ func (p *Pane) RenderFocused(s *ui.Screen, x, y, w, h int, th Theme, focused boo
 		delete(heads, p.Cursors.Primary().Head)
 	}
 	curLine := p.File.LineOf(p.Cursors.Primary().Head)
+	// Once per frame, not once per row. The scan walks the document, so
+	// running it inside drawLine would repeat it for every visible row of a
+	// wrapped screen.
+	brackets := p.bracketMarks()
 
 	// Rows, not lines. When wrapping is off every line is one row and this
 	// degenerates to the old loop; when it is on, the first line starts above
@@ -109,7 +113,7 @@ func (p *Pane) RenderFocused(s *ui.Screen, x, y, w, h int, th Theme, focused boo
 				// continuation rows get a blank one, so the numbers still count
 				// lines rather than rows.
 				p.drawGutter(s, x, y+row, gut, line, curLine, th, k == 0)
-				p.drawLine(s, x+gut, y+row, textW, line, lo, hi, sel, heads, th)
+				p.drawLine(s, x+gut, y+row, textW, line, lo, hi, sel, heads, brackets, th)
 			}
 			row++
 		}
@@ -174,7 +178,7 @@ func (p *Pane) drawGutter(s *ui.Screen, x, y, w, line, curLine int, th Theme, nu
 
 // drawLine renders one document line, expanding tabs and applying selection
 // and authorship colours per display column.
-func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, heads map[int]bool, th Theme) {
+func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, heads, brackets map[int]bool, th Theme) {
 	// lo..hi is the byte range of this visual row within the line; without
 	// wrapping it is the whole line. Columns are measured from the row's own
 	// start, which is also how the wrap engine measures them — the two have to
@@ -220,6 +224,15 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 			}
 		} else if inAny(sel, off) {
 			style = th.Selection
+		}
+		if brackets[off] {
+			// Underline rather than recolour, and applied over whatever came
+			// before: the bracket keeps its syntax colour and its selection
+			// or find background, and the mark reads as an annotation rather
+			// than as another token type. It is also the one mark that can
+			// coexist with all of them, which matters because a bracket is
+			// frequently inside a selection.
+			style = style.Plus(ui.Underline)
 		}
 		if heads[off] {
 			// The character stays; the cell behind it becomes the caret.

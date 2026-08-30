@@ -13,9 +13,11 @@ import (
 	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/explorer"
+	"raj/internal/hover"
 	"raj/internal/keys"
 	"raj/internal/lsp"
 	"raj/internal/picker"
+	"raj/internal/problems"
 	"raj/internal/prompt"
 	"raj/internal/search"
 	"raj/internal/symbols"
@@ -36,6 +38,13 @@ type App struct {
 	Picker   *picker.Picker
 	Prompt   *prompt.Prompt
 	Complete complete.Popup
+	// Hover is the floating panel for a language server's answer. Separate
+	// from Complete because the two can be open at once and mean different
+	// things: one is what you are typing, the other what you are reading.
+	Hover hover.Panel
+	// Problems is the workspace-wide diagnostics list. A view over a.diags,
+	// refreshed when that changes rather than owning any state of its own.
+	Problems *problems.Pane
 
 	// completeCache holds each buffer's words, keyed by its version, so typing
 	// rescans only the buffer being typed into. Without it, completion cost
@@ -71,10 +80,19 @@ type App struct {
 
 	// drag tracks a press-and-hold in the editor, and click counts a rapid
 	// sequence in one place so double and triple clicks can mean something.
-	drag      bool
-	click     clickTracker
-	lspMu     sync.Mutex
-	lspAnswer *lspAnswer
+	drag bool
+	// autoscroll is how far outside the text area a drag is being held, in
+	// rows: negative above, positive below, zero inside. It is a held state
+	// rather than an event because the pointer sits still while the text
+	// moves — there is no second event to react to, so the scroll has to come
+	// from the tick.
+	autoscroll int
+	// dragCol and dragRow are where the pointer was last seen, so each tick
+	// can re-extend the selection to it after scrolling.
+	dragCol, dragRow int
+	click            clickTracker
+	lspMu            sync.Mutex
+	lspAnswer        *lspAnswer
 
 	root    string
 	sidebar Sidebar
@@ -118,6 +136,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		Tabs:          tabs.New(tabWidth),
 		Explorer:      explorer.NewPane(root),
 		Search:        search.NewPane(root),
+		Problems:      problems.New(),
 		completeCache: complete.NewCache(),
 		servers:       newServers(root),
 		diags:         newDiagnostics(),
@@ -504,6 +523,9 @@ func (a *App) Handle(e ui.Event) {
 		a.applyAnswer()
 		a.drainDiagnostics()
 	case ui.Tick:
+		// A drag held outside the pane scrolls from here, because the pointer
+		// is not moving and so there is no event to hang it on.
+		a.autoScrollStep()
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.
 		a.refreshSyntax()
@@ -596,6 +618,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.openSidebar(SidebarExplorer)
 	case keys.FocusSearch:
 		a.openSidebar(SidebarSearch)
+	case keys.FocusProblems:
+		a.openSidebar(SidebarProblems)
 	case keys.ToggleWrap:
 		if p := a.Tabs.Active(); p != nil {
 			p.Wrap = !p.Wrap
@@ -675,6 +699,9 @@ func (a *App) openSidebar(s Sidebar) {
 		a.Explorer.Focus()
 	case SidebarSearch:
 		a.Search.Focus()
+	case SidebarProblems:
+		a.refreshProblems()
+		a.Problems.Focus()
 	}
 }
 
@@ -713,6 +740,15 @@ func (a *App) handleSidebar(action keys.Action, text string) {
 		if exit {
 			a.focus = FocusEditor
 		}
+	case SidebarProblems:
+		path, line, exit := a.Problems.Handle(action)
+		if path != "" {
+			a.OpenFile(path)
+			a.jumpTo(line)
+		}
+		if exit {
+			a.focus = FocusEditor
+		}
 	}
 }
 
@@ -735,6 +771,19 @@ func (a *App) handleEditor(action keys.Action, text string) {
 	if action == keys.Complete {
 		a.summonCompletion(p)
 		return
+	}
+	// Escape closes the hover panel before anything else sees it, so the first
+	// escape dismisses the box rather than a selection underneath it.
+	if a.Hover.Handle(action) {
+		return
+	}
+	// Any other action dismisses it. A panel describes the thing the cursor
+	// was on, so the moment the cursor moves or the text changes it is
+	// describing something that is no longer there — and a stale box floating
+	// over the code is worse than the status line it replaced, because it is
+	// bigger and looks more authoritative. Asking again is one chord.
+	if action != keys.Hover {
+		a.Hover.Hide()
 	}
 	// The completion popup sees keys before the editor, but claims only the
 	// handful it navigates with. Everything else falls through and types,
@@ -985,6 +1034,7 @@ func (a *App) closeTabAt(i int) {
 	if !p.File.Dirty() {
 		a.closeDoc(p)
 		a.Tabs.CloseIndex(i)
+		a.refreshProblems() // the open-files filter just lost a file
 		return
 	}
 	closePane := func() {
@@ -1044,7 +1094,7 @@ func (a *App) saveActive(then func(saved bool)) {
 // happened to be launched from and is not what "notes.md" means to someone
 // looking at this tree.
 func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
-	a.ask("Save as", a.root+string(filepath.Separator), func(answer string, ok bool) {
+	a.askPath("Save as", a.root+string(filepath.Separator), func(answer string, ok bool) {
 		if !ok || answer == "" {
 			a.status = "save cancelled"
 			report(then, false)
@@ -1069,15 +1119,60 @@ func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
 				})
 			return
 		}
-		a.writeTo(p, path, then)
+		a.ensureParent(path, then, func() { a.writeTo(p, path, then) })
 	})
+}
+
+// ensureParent makes sure a path's directory exists, asking first.
+//
+// Without this, saving into a directory that is not there yet failed with the
+// raw os.WriteFile error — "no such file or directory" against a path the user
+// had just typed in full, which reads as though the save itself was rejected
+// rather than as a missing folder they could make.
+//
+// It asks rather than creating silently. Everything else save-as does happens
+// to a file the user named; creating directories is the one step that puts
+// something on disk they did not, and a typo in a path would otherwise leave a
+// stray tree behind with no indication it had been made.
+func (a *App) ensureParent(path string, then func(saved bool), cont func()) {
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); err == nil {
+		cont()
+		return
+	}
+	// The relative form, because the absolute one is usually too long for the
+	// dialog and the part that matters is what is new.
+	shown := dir
+	if rel, err := filepath.Rel(a.root, dir); err == nil && !strings.HasPrefix(rel, "..") {
+		shown = rel
+	}
+	a.confirm("Create directory", shown+" does not exist. Create it?",
+		[]string{prompt.Create, prompt.Cancel}, func(ans string, ok bool) {
+			if !ok || ans != prompt.Create {
+				a.status = "save cancelled"
+				report(then, false)
+				return
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				a.status = "cannot create directory: " + err.Error()
+				report(then, false)
+				return
+			}
+			a.Explorer.Tree.Refresh()
+			cont()
+		})
 }
 
 // writeTo names the buffer if needed and writes it.
 func (a *App) writeTo(p *editor.Pane, path string, then func(saved bool)) {
-	renamed := p.File.Path != path
+	was := p.File.Path
+	renamed := was != path
 	p.File.SetPath(path)
 	if err := p.File.Save(); err != nil {
+		// Put the name back. Leaving it set means the buffer claims a path it
+		// is not at, so the next plain save writes there without asking —
+		// which turns one visible failure into a silent one.
+		p.File.SetPath(was)
 		a.status = "save failed: " + err.Error()
 		report(then, false)
 		return
@@ -1174,7 +1269,73 @@ func (a *App) saveAllThenQuit(dirty []*editor.Pane) {
 // keys going somewhere invisible.
 func (a *App) ask(title, initial string, done func(string, bool)) {
 	a.beforePrompt()
-	a.Prompt.Ask(title, initial, done)
+	a.Prompt.Ask(title, initial, done) // a plain question completes nothing
+}
+
+// askPath is ask for a question whose answer is a file path, so tab completes.
+func (a *App) askPath(title, initial string, done func(string, bool)) {
+	a.beforePrompt()
+	a.Prompt.AskComplete(title, initial, a.completePath, done)
+}
+
+// completePath extends a partially typed path, for tab in a save-as field.
+//
+// It completes to the longest common prefix of the matches rather than to the
+// first one, which is what makes repeated tabs converge instead of cycling: a
+// directory of similar names fills in as far as they agree and then stops,
+// leaving the ambiguous part for you to resolve.
+//
+// A trailing separator is added when the single match is a directory, so tab
+// walks down a tree one press per level instead of needing a slash typed
+// between each.
+func (a *App) completePath(text string) string {
+	dir, base := filepath.Split(text)
+	abs := dir
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(a.root, dir)
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return "" // nothing to read: say nothing rather than guessing
+	}
+	var matches []os.DirEntry
+	for _, e := range entries {
+		// Hidden files are completed only when the prefix asks for them, the
+		// same rule the tree and the search walk use. Tab is a convenience,
+		// and offering a directory of dotfiles to somebody who typed nothing
+		// is not one.
+		if strings.HasPrefix(e.Name(), ".") && !strings.HasPrefix(base, ".") {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), base) {
+			matches = append(matches, e)
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	common := matches[0].Name()
+	for _, e := range matches[1:] {
+		common = sharedPrefix(common, e.Name())
+	}
+	if len(matches) == 1 && matches[0].IsDir() {
+		common += string(filepath.Separator)
+	}
+	return dir + common
+}
+
+// sharedPrefix is the longest prefix two names agree on, in bytes.
+//
+// Bytes rather than runes: a partial multi-byte rune cannot be produced here,
+// because both inputs are whole names and any shared prefix that splits a rune
+// would require them to differ inside it — which means they differ at the first
+// byte of that rune too, and the prefix stops before it.
+func sharedPrefix(a, b string) string {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return a[:n]
 }
 
 // askSuggestion is ask with the seed selected: the field offers a default that

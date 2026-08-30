@@ -350,6 +350,7 @@ func (a *App) closeDoc(p *editor.Pane) {
 		_ = ls.sync.Close(path)
 	}
 	a.diags.clear(path)
+	a.refreshProblems()
 }
 
 // hover asks what is under the cursor.
@@ -378,6 +379,10 @@ func (a *App) hover() {
 	head := p.Cursors.Primary().Head
 	pos := lsp.NewDocument(p.File.Text()).Position(head)
 	conn := ls.srv.Conn()
+	// Captured now rather than read when the answer lands, so the panel is
+	// pinned to the position that was asked about. Reading the cursor later
+	// would anchor the box to wherever it had got to.
+	line, col := p.File.LineCol(head)
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -387,7 +392,7 @@ func (a *App) hover() {
 		if err == nil && h != nil {
 			text = h.Text
 		}
-		a.park(lspAnswer{gen: gen, kind: answerHover, text: text})
+		a.park(lspAnswer{gen: gen, kind: answerHover, text: text, line: line, col: col})
 	}()
 }
 
@@ -422,15 +427,19 @@ func (a *App) gotoDefinition() {
 }
 
 // applyHover shows an answer, if it is still the answer to the current question.
+//
+// A floating panel rather than the status line. Folded onto one row, a
+// signature loses the shape that makes it readable and anything longer than the
+// terminal is simply cut; the status line remains where the "nothing to say"
+// case goes, since an empty box is worse than a word.
 func (a *App) applyHover(r lspAnswer) {
 	if r.text == "" {
-		a.status = ""
+		a.Hover.Hide()
+		a.status = "no hover information here"
 		return
 	}
-	// One line in the status bar. A floating panel is the better home for this
-	// and is a renderer change; the status line makes the feature usable now
-	// without one, and the request layer does not care which is used.
-	a.status = strings.ReplaceAll(r.text, "\n", "  ")
+	a.status = ""
+	a.Hover.Show(r.text, r.line, r.col)
 }
 
 // applyDefinition opens the first result.

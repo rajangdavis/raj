@@ -212,3 +212,64 @@ func TestPopupStillWaitsForTwoCharacters(t *testing.T) {
 		t.Error("the popup did not appear after two")
 	}
 }
+
+// ---------- the hover panel ----------
+
+// A panel describes the thing the cursor was on, so the moment the cursor moves
+// it is describing something that is no longer there. A stale box floating over
+// the code is worse than the status line it replaced, because it is bigger and
+// looks more authoritative.
+func TestHoverPanelClosesOnAnyAction(t *testing.T) {
+	for _, chord := range []string{"down", "right", "super+left", "backspace"} {
+		h := newHarness(t, "package main\n\nfunc F() {}\n")
+		h.lspGen = 1
+		h.park(lspAnswer{gen: 1, kind: answerHover, text: "func F()"})
+		h.applyAnswer()
+		if !h.Hover.Open {
+			t.Fatal("setup: no panel opened")
+		}
+
+		h.press(chord)
+		if h.Hover.Open {
+			t.Errorf("%s left the panel open", chord)
+		}
+	}
+}
+
+// Typing closes it too: the text under the cursor has changed, so the answer
+// describes a version of the line that no longer exists.
+func TestHoverPanelClosesOnTyping(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerHover, text: "func F()"})
+	h.applyAnswer()
+	if !h.Hover.Open {
+		t.Fatal("setup: no panel opened")
+	}
+
+	h.typeText("x")
+	if h.Hover.Open {
+		t.Error("typing left the panel open")
+	}
+}
+
+// Escape closes the panel before anything else sees it, so the first escape
+// dismisses the box rather than a selection underneath it.
+func TestEscapeClosesTheHoverPanelFirst(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.press("shift+right") // make a selection to compete with
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerHover, text: "func F()"})
+	h.applyAnswer()
+	if !h.Hover.Open {
+		t.Fatal("setup: no panel opened")
+	}
+
+	h.press("esc")
+	if h.Hover.Open {
+		t.Error("escape did not close the panel")
+	}
+	if !h.Pane().Cursors.Primary().HasSelection() {
+		t.Error("escape also cleared the selection; the panel should have claimed it")
+	}
+}

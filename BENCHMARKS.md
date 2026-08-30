@@ -304,6 +304,39 @@ folding disappears into the I/O it overlaps with.
 Remaining time is 51% syscalls (walk, open, close). That is what parallelism
 attacks, and nothing else does — see TODO.md.
 
+## Skipping binary extensions
+
+A search opens every eligible file and reads it to discover whether it is
+binary, so a checkout with a large asset directory spends most of its read
+budget on files that could never match. The TODO asked for this to be measured
+rather than assumed, on the grounds that a filter can cost more than the read
+it avoids — which the glob finding above is a standing example of.
+
+Corpus: 400 small Go files, plus 60 assets of 256 KB with binary extensions.
+
+| tree | filter off | filter on | change |
+| --- | --- | --- | --- |
+| with assets | 2.62 ms | 1.13 ms | 2.3x |
+| no assets | 1.12 ms | 1.08 ms | none |
+
+So it pays where it applies and is free where it does not, which is the shape
+the filter needed: every file pays the check and only assets benefit.
+
+**The first cut of this benchmark was wrong**, and worth recording because the
+error is easy to repeat. Filter-on and filter-off each built their own corpus,
+which made the two numbers differ in page-cache state and inode layout as well
+as in the filter — and reported the no-asset tree as 8% SLOWER with the filter
+on, a per-file cost of 225 ns for what is a `filepath.Ext` and a map lookup.
+The figure was implausible on its face, which is what prompted re-running both
+halves over one shared corpus. They then came out equal.
+
+The list is by extension, so a `.png` full of text would be skipped. That is
+the right trade for a workspace search and it is why the list is fixed and
+conservative: `.ts`, `.h`, `.m`, `.cs`, `.r`, `.d` and `.s` all look binary and
+are source far more often, and none are on it. Skipping a source file makes a
+search silently wrong; failing to skip an asset only makes it slower.
+
+
 ## Line index update
 
 Finding the newlines in an 800 KB insertion, `BenchmarkNewlines*`:
@@ -332,6 +365,38 @@ It is a byte scan over line prefixes with no allocation per non-matching line,
 so cost tracks file size rather than symbol count. At 0.42 ms for a file larger
 than anything in this repository, a cache would be invalidation logic bought
 with a third of a frame — the scan is cheaper than the bookkeeping to avoid it.
+
+
+## Bracket matching
+
+The matched pair is found once per frame on the render path, so the question
+was what an unmatched bracket costs — and that is the case that matters,
+because it is the common one: between typing `{` and typing `}` there is no
+partner, so every frame in between pays the full scan.
+
+| case | first cut | after | change |
+| --- | --- | --- | --- |
+| partner a few bytes away | 1.03 µs | 0.54 µs | — |
+| no partner, 128 KB budget, byte-at-a-time | 10.4 ms | — | — |
+| no partner, 128 KB budget, line-at-a-time | 5.4 ms | — | 1.9x |
+| no partner, 500-line budget | — | 0.13 ms | 80x |
+
+Two findings, and the benchmark is the only reason either was noticed — both
+cases pass their correctness tests at every one of these numbers.
+
+Reading each byte through the piece table cost 10 ms for a single unmatched
+brace, spent almost entirely on per-byte `Slice` calls. Walking a line at a time
+pays that once per line instead, and lets the syntax spans be fetched per line
+rather than per bracket.
+
+That still left 5.4 ms, because a 128 KB budget is ~21000 lines and the
+remaining cost is one piece-table read each. The budget was the real problem:
+it was sized as "far past any real nesting" when what it needed to be sized
+against is a frame. 500 lines is several times the tallest viewport, so a
+partner near enough for the highlight to be visible is inside it.
+
+The remaining 0.13 ms is one read per line. Chunking would cut it further and
+is not worth the line-boundary bookkeeping at this size.
 
 
 ## Word completion

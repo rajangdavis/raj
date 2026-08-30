@@ -207,8 +207,11 @@ func TestAutoPairsOff(t *testing.T) {
 	if got, want := body(p), `    x("`; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
+	// Six spaces, not four: the line left a bracket open, so auto-indent adds
+	// a level. That rule is not gated by AutoPairs either — pairing is about
+	// what gets typed for you, indenting is about where the caret starts.
 	typing(p, "\n")
-	if !strings.HasSuffix(body(p), "\n    ") {
+	if !strings.HasSuffix(body(p), "\n      ") {
 		t.Errorf("auto-indent should not be gated by AutoPairs: %q", body(p))
 	}
 }

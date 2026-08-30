@@ -174,6 +174,11 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 		if strings.HasPrefix(name, ".") || !matches(name, inc, true) || matches(name, exc, false) {
 			return nil
 		}
+		// Before Info() and before the open: the whole point is to skip the
+		// syscalls, so a check placed after either of them saves nothing.
+		if skipBinary(name) {
+			return nil
+		}
 		if info, err := d.Info(); err != nil || info.Size() > MaxFileSize {
 			return nil
 		}

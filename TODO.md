@@ -5,11 +5,6 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Panes and fields
 
-- [ ] **Horizontal scroll in the explorer.** The selected path is now spelled
-  out on the pane's last row, which answers "which file is this" but not "what
-  is the rest of this name" for the rows around it. An offset that follows the
-  selection is the other half; it needs a rule for when it returns to zero, or
-  the tree jitters sideways as you arrow through mixed depths.
 - [ ] Small and split panes, and how they resize.
 
 ## Editor
@@ -36,16 +31,6 @@ findings and decisions live in INVESTIGATIONS.md.
   and ~~diagnostics~~ are done. The staged plan is complete; what remains are
   the follow-ons listed separately below.
 
-  Hover currently lands in the status line, folded onto one line. That is
-  enough to make the feature usable and to prove the request path, and it is
-  the wrong home for a paragraph of documentation — a floating panel anchored
-  to the cursor is right, and it is a renderer change rather than an LSP one.
-  The request layer does not care which is used.
-
-  Diagnostics are already decoded and delivered on a channel; what is missing
-  is somewhere to put them. They want a gutter mark, and the list wants to be a
-  pane, which makes them the first LSP feature that is mostly a rendering job.
-
   **Inlay type hints are deliberately not on that list.** They require drawing
   text that is not in the document, which perturbs column maths, caret
   positioning and wrapping — the part of the codebase with the most open
@@ -60,6 +45,16 @@ findings and decisions live in INVESTIGATIONS.md.
   dependency, already tokenising these buffers off-thread for highlighting, and
   it knows a keyword token from a string token, which is exactly the distinction
   the scanner is missing.
+
+  Half of this now exists: `syntax.Span` carries a `Class`, so "is this offset
+  inside a string or a comment" is answerable from tokens the highlighter has
+  already computed, and bracket matching uses it. The scanner cannot reuse it
+  as it stands — it runs on the keystroke path at 0.42 ms and chroma costs
+  ~80 ms, and the highlighter's tokens are per-pane, asynchronous, and absent
+  for the first frames of a file. Either the scanner becomes asynchronous like
+  the highlighter, or it reuses that highlighter's output and accepts having
+  no answer until the first pass lands. Neither is a small change, which is why
+  this is still open.
 - [ ] **The reserved-chord tables are short.** They list what could be confirmed;
   the real sets are longer and vary with the user's own keyboard settings and
   terminal config, neither of which raj can see. A chord that never arrives is
@@ -82,27 +77,31 @@ findings and decisions live in INVESTIGATIONS.md.
   by whoever happens to be decoding the JSON. Ranges are also not guaranteed
   single-line, so the position fuzzing wants extending to ranges first, which is
   the same prerequisite incremental sync has.
-- [ ] **A drag does not scroll.** Dragging to the top or bottom edge extends
-  the selection to the edge and stops there; every editor scrolls instead, and
-  without it a selection cannot exceed a screenful by pointer alone. It needs a
-  timer rather than an event, since the pointer sits still while the text moves.
-  Now the only pointer gesture still missing: pressing works everywhere, and
-  dragging works only in the document.
+- [ ] **Autoscroll runs at the idle tick, which is 150 ms.** That is coarse for
+  a scroll: proportional speed makes it usable, since pushing further is how you
+  ask for faster, but the motion is visibly stepped rather than smooth. A faster
+  tick while a drag is held would fix it and means either a second timer or a
+  variable tick rate — the current one exists for idle work and 150 ms is right
+  for that.
 - [ ] **A press on a list does not drag it.** Clicking selects, and holding and
   moving does nothing — neither rubber-band selection nor drag-to-reorder for
   tabs. Both are real gestures a list can carry and neither has an obvious
   meaning here yet, so nothing was guessed at.
-- [ ] **Diagnostics have no list pane.** They show as a gutter letter and a
-  count in the status line, with the message for the cursor's line. That is
-  enough to find a problem you are standing on and useless for finding the one
-  three files away. A pane listing them across the workspace is the missing
-  half, and the search pane is the shape to copy — grouped by file, collapsible,
-  enter to jump.
-- [ ] **Hover has no panel.** It is folded onto the status line, which loses
-  the shape of a signature and truncates anything long. A floating panel
-  anchored to the cursor is the right home, and the completion popup already
-  solved the placement problem — anchor, flip above when there is no room
-  below, slide left rather than clip.
+- [ ] **The problems pane filters by severity and by open files, and nothing
+  else.** "Only the current package" is the third obvious one and needs a notion
+  of package the pane does not have — it is given paths, and grouping them by
+  directory is right for Go and wrong for most other layouts. A fourth row of
+  checkboxes is also where a filter row stops being a filter row, so the next
+  one probably wants the search pane's query field rather than another box.
+- [ ] **The hover panel does not scroll.** Content past its height is reported
+  as `+N more` rather than being reachable. Scrolling means claiming arrow keys
+  while a box sits over the document you are reading, which is exactly when
+  navigation matters most — so it needs a modal mode with a visible indication
+  that it is on, not a pair of extra bindings.
+- [ ] **Hover markdown is not rendered.** Fences are stripped because they mean
+  nothing in a terminal box; everything else — bold, links, lists — is left as
+  written. A half-rendered subset is more confusing than none, so this is only
+  worth doing properly or not at all.
 - [ ] **Only servers that run with no configuration are listed.** gopls,
   rust-analyzer, pylsp, typescript-language-server, solargraph, clangd. A
   server that needs a config file to start is a setup problem raj should not
@@ -114,17 +113,14 @@ findings and decisions live in INVESTIGATIONS.md.
   edit since the last notification, and one wrong range desynchronises the
   server's copy silently and permanently — so it is worth doing only with the
   position fuzzing extended to cover ranges, not just points.
-- [ ] **Highlight the matching bracket under the cursor.** Auto-pairing landed;
-  showing which bracket closes the one you are on did not. It is a render
-  concern rather than an edit one — find the partner by counting depth outward
-  from the cursor, and tint both cells. The scan has to stop somewhere on an
-  unbalanced file, and a bracket inside a string or a comment will be counted,
-  which is the same blind spot the symbol scanner has and has the same fix.
-- [ ] **Auto-indent does not read the language.** A newline carries the
-  previous line's whitespace, and a newline between brackets opens a block. It
-  does not add a level after `if x {` typed without a closer, and does not
-  outdent a line beginning with `}`. Both need to know what the line means, not
-  just what it starts with.
+- [ ] **Auto-indent knows brackets and nothing else.** Adding a level after an
+  unclosed opener and lining up a closer covers C-family languages and leaves
+  out everything indented another way: Python's colon, Ruby's `do`/`end`, YAML,
+  a `case` inside a `switch`. Each is a per-language rule, and the token class
+  the lexer gives us says what a token IS but not what it MEANS — a keyword is
+  a keyword whether or not it opens a block. This is where a real per-language
+  table starts, and it should wait until something needs it rather than being
+  guessed at from one language.
 - [ ] **Blinking secondary carets.** The real caret blinks because the terminal
   blinks it; a drawn one would need raj to redraw on a timer, which means a tick
   fast enough to be a blink and a dirty-region pass small enough that blinking
@@ -133,11 +129,13 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Workspace
 
-- [ ] **Save-as is a bare text field.** No completion, no directory listing, and
-  a path whose parent does not exist fails with the raw `os.WriteFile` error
-  rather than offering to create it. The picker one chord away already holds a
-  fuzzy index of every file in the tree; pointing the save-as field at the same
-  index would make it a real file dialog rather than a prompt with a default.
+- [ ] **Save-as has no directory listing.** Tab completes and a missing parent
+  is offered rather than failing, but there is still nothing showing what is
+  already in the directory being typed into — so completion tells you a name
+  exists only once you have typed enough of it. The picker one chord away holds
+  a fuzzy index of the whole tree, and the natural shape is the completion
+  popup: anchor it under the field and list the matches rather than only
+  filling in the common prefix.
 
 - [ ] **Unnamed buffers have nowhere to persist to.** Session restore is keyed
   on paths, so a scratch buffer from cmd+n is the one tab a restored session
@@ -172,11 +170,6 @@ findings and decisions live in INVESTIGATIONS.md.
   Needs streaming results or deterministic truncation first. Measure on a
   multicore box: the figures above come from one core, where a pool shows
   nothing.
-- [ ] **Skip known-binary extensions before opening.** Around 17 MB of ghostty
-  under the size cap is fonts and images, each costing an open and a 64 KB read
-  to discover a NUL byte. Cheap, but measure it rather than assuming: the glob
-  finding in BENCHMARKS.md is a standing reminder that a filter can cost more
-  than the read it avoids.
 
 ## Buffer
 
@@ -192,11 +185,6 @@ findings and decisions live in INVESTIGATIONS.md.
 
 ## Known rough edges
 
-- [ ] **Resize still drops events.** `NativeHost.emit` discards on a full
-  channel, which a drag burst produces. `Present` reads the true size every
-  frame so the picture stays correct, but a dropped event means no redraw is
-  triggered until the 150 ms tick — a lag rather than garbage.
-- [ ] Resize has no test coverage beyond `Present`'s size guard.
 - [ ] **Display width table is hand-rolled**; suspect it first if the caret
   drifts. Narrowed: TODO.md holds three runes README.md does not — en-dash,
   em-dash, and `↔` U+2194, all East Asian Ambiguous, and raj calls all three
@@ -207,9 +195,16 @@ findings and decisions live in INVESTIGATIONS.md.
   stops from its own start. Self-consistent between the wrap engine and the
   renderer, so the caret stays correct, but it looks slightly off when a line
   with mid-text tabs wraps.
-- [ ] **Two actions are bound but unimplemented**, so their chords are taken
-  from the terminal for nothing: `ToggleAgent` (cmd+alt+b) and `CommandPalette`
-  (cmd+shift+p). `GotoLine` and `GotoSymbol` were the other two.
+- [ ] **Three actions are bound but unimplemented**, so their chords are taken
+  from the terminal for nothing: `ToggleAgent` (cmd+alt+b), `CommandPalette`
+  (cmd+shift+p) and `CursorUndo` (cmd+u). `GotoLine` and `GotoSymbol` were
+  among the others and are done.
+
+  They are no longer invisible: `keys.Unimplemented` lists them, KEYBINDINGS.md
+  marks them, and a test in internal/app presses each one and fails if anything
+  handles it — so implementing one without unlisting it breaks the build, and
+  so does binding a fourth without noticing. `CursorUndo` was found that way
+  rather than by anyone noticing.
 - [ ] **Profile switching in iTerm2 is not clean.** raj switches profile on
   entry with OSC 1337 and restores on exit, but installing the profile is still
   a manual step and the switch is visible. Autoloading — write the generated
@@ -224,8 +219,6 @@ findings and decisions live in INVESTIGATIONS.md.
   Ghostty's own cmd+n is untouched everywhere else; under the iTerm2 profile it
   is claimed for the whole window, which is the same trade the profile already
   makes for cmd+w.
-- [ ] **Document what is supported** — a keybinding table generated from
-  `keys.Bindings` so it cannot drift, with the unimplemented actions marked.
 - [ ] No Bubbletea adapter yet. The `ui.Host` interface is six methods.
 - [ ] `cmd+shift+r` to reopen closed tabs, handing `cmd+shift+t` back — only
   worth doing if Ghostty actually binds it; check `+list-keybinds` first.

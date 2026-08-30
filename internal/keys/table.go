@@ -37,6 +37,7 @@ var Bindings = []Binding{
 	{"panes", ToggleSidebar, "super+b", "98;9u", "cmd+b", "ctrl+b", ""},
 	{"panes", FocusExplorer, "shift+super+e", "101;10u", "cmd+shift+e", "ctrl+shift+e", "linux default: new split down"},
 	{"panes", FocusSearch, "shift+super+f", "102;10u", "cmd+shift+f", "ctrl+shift+f", ""},
+	{"panes", FocusProblems, "shift+super+m", "109;10u", "cmd+shift+m", "ctrl+shift+m", "m for markers, as VS Code names the same pane"},
 	{"panes", ToggleAgent, "alt+super+b", "98;11u", "cmd+alt+b", "ctrl+alt+b", ""},
 	{"panes", FilePicker, "super+p", "112;9u", "cmd+p", "ctrl+p", ""},
 	{"panes", CommandPalette, "shift+super+p", "112;10u", "cmd+shift+p", "ctrl+shift+p", ""},

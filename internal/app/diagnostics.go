@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"raj/internal/lsp"
+	"raj/internal/problems"
 )
 
 // Diagnostics are the one thing a language server sends without being asked,
@@ -170,6 +171,12 @@ func (d *diagnostics) summary(path string) string {
 // the last for each file matters — reading one per wake would show a backlog
 // slowly rather than the current state immediately.
 func (a *App) drainDiagnostics() {
+	changed := false
+	defer func() {
+		if changed {
+			a.refreshProblems()
+		}
+	}()
 	a.servers.mu.Lock()
 	conns := make([]*lsp.Conn, 0, len(a.servers.byID))
 	for _, ls := range a.servers.byID {
@@ -184,12 +191,52 @@ func (a *App) drainDiagnostics() {
 			select {
 			case d := <-c.Diagnostics:
 				a.diags.set(lsp.Path(d.URI), d.Items)
+				changed = true
 			default:
 				goto next
 			}
 		}
 	next:
 	}
+}
+
+// all is every file with problems, for the problems pane.
+func (d *diagnostics) all() []problems.File {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]problems.File, 0, len(d.byPath))
+	for path, items := range d.byPath {
+		out = append(out, problems.File{Path: path, Items: items})
+	}
+	return out
+}
+
+// refreshProblems hands the store's current contents to the pane.
+//
+// Push rather than pull: the pane renders every frame and the store is behind a
+// mutex the render path should not be taking. Called when diagnostics change
+// and when the pane is opened, which are the only two moments its contents can
+// differ from what is on screen.
+func (a *App) refreshProblems() {
+	a.Problems.Set(a.diags.all())
+	a.Problems.SetOpenPaths(a.openPaths())
+}
+
+// openPaths is every tab's file, for the pane's "open files" filter.
+//
+// Pushed for the same reason the diagnostics are: the pane knows nothing about
+// tabs, and inverting that so it could ask would make a list of problems depend
+// on the editor. Unnamed buffers contribute nothing — they have no path for a
+// diagnostic to be keyed against either.
+func (a *App) openPaths() []string {
+	panes := a.Tabs.All()
+	out := make([]string, 0, len(panes))
+	for _, p := range panes {
+		if path := a.docPath(p); path != "" {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // diagnosticAtCursor is the problem on the cursor's line, for the status line.

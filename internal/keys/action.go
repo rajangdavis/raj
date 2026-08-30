@@ -17,6 +17,7 @@ const (
 	ToggleWrap     Action = "toggle_wrap"
 	FocusExplorer  Action = "focus_explorer"
 	FocusSearch    Action = "focus_search"
+	FocusProblems  Action = "focus_problems"
 	ToggleAgent    Action = "toggle_agent"
 	FilePicker     Action = "file_picker"
 	CommandPalette Action = "command_palette"

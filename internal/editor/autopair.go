@@ -66,6 +66,9 @@ func (p *Pane) InsertRune(text string) {
 		}
 	}
 	p.InsertText(text)
+	if _, ok := closers[b]; ok {
+		p.reindentCloser()
+	}
 }
 
 // typeOver advances every cursor that is sitting immediately before b, and
@@ -200,6 +203,12 @@ func (p *Pane) insertNewline() {
 				}
 			}
 			continue
+		}
+		// A line that opened a bracket and did not close it wants a level
+		// added: `if x {` with nothing after it is the moment the previous
+		// line's whitespace stops being the right answer.
+		if lo == hi && p.openDepth(lo) > 0 {
+			indent += unit
 		}
 		p.applyEdit(lo, hi-lo, "\n"+indent)
 	}
