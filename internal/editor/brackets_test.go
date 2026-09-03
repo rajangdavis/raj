@@ -15,7 +15,7 @@ import (
 func tokenised(t *testing.T, content string) *Pane {
 	t.Helper()
 	p := newTestPane(content)
-	p.File.Syntax.Ensure(content)
+	p.File.RefreshSyntax()
 	for i := 0; i < 200 && !p.File.Syntax.Ready(); i++ {
 		time.Sleep(5 * time.Millisecond)
 	}

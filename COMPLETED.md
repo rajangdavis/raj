@@ -249,6 +249,54 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   closer, and symmetric — standing on the partner finds the way back, so a lit
   pair does not vanish when you step onto the other half of it.
 
+## Dirty tracking
+
+- [x] **A file is dirty when its content differs from what was saved, not when
+  its version does.** Undo does not rewind the version — it appends the
+  reversing ops — so a buffer edited and put back stayed marked dirty and asked
+  to be saved on close, which is the one prompt that trains people to dismiss
+  the prompt. `Save` now records the length and a SHA-256 of what it wrote, and
+  `Dirty` compares against those.
+- [x] **The comparison is nearly free in the cases that matter.** An untouched
+  version answers without reading anything, a differing length answers without
+  reading anything, and only a buffer that is the right length at the wrong
+  version — which is exactly what undoing back to where you started looks like —
+  is digested. The result is memoised per version, because `Dirty` is asked once
+  per open tab per frame. Digesting runs at ~1.6 GB/s, and `MaxCleanCheck`
+  (8 MB, about 5 ms) bounds the worst case to inside a frame; past it an edited
+  buffer stays dirty rather than stalling.
+- [x] **Content, not history**, so typing a character and deleting it by hand
+  reads as clean too, not just undo.
+
+## Syntax highlighting
+
+- [x] **The token cache is keyed by document version, not by a stale flag.** A
+  flag cannot say which text it went stale against, so a pass finishing late
+  could install spans for older text on top of a newer result — and, having
+  cleared the flag on the way, schedule nothing to correct it. Colours then
+  described pre-edit text until the user happened to press another key. Root
+  cause in INVESTIGATIONS.md.
+- [x] **Edits are spliced into the cached spans instead of invalidating them.**
+  Chroma costs 7 ms on a 10 KB file and 41 ms on 47 KB, which is two to three
+  frames of drawing spans against text that has already moved: indent a line and
+  its colours sat a tab to the left, out-dent and they sat a tab to the right.
+  Each op now shifts the spans it displaced, using the same line-start splice the
+  line index does, so a colour may be a version out of date but is never on the
+  wrong characters. An edit landing inside a token grows the token, so typing
+  inside a string keeps the string colour.
+- [x] **Edits arriving mid-pass are replayed onto its result**, since the lexer
+  saw text that no longer exists by the time it finishes.
+- [x] **The cache holds exactly as many lines as the document.** Several chroma
+  lexers append a trailing newline the buffer does not have; line starts now come
+  from the text rather than from the token stream, so no splice lands a line off.
+- [x] **`enabled` is read and written under the lock.** The size and lexer-error
+  guards ran on the tokenise goroutine while the render path read the flag.
+- [x] **Specified by what a span covers, not by what colour it is.** The tests
+  record the substring each span claims and assert it is unchanged across an
+  indent, a comment toggle, a line split, a join, and an undo, driven through the
+  real editor actions; a fuzzer checks the cache stays consistent with the text
+  under random edit sequences.
+
 ## Search
 
 - [x] **Known-binary extensions are skipped before opening**, checked before

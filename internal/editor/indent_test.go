@@ -20,7 +20,7 @@ func indented(t *testing.T, text string) *Pane {
 func lexed(t *testing.T, text string) *Pane {
 	t.Helper()
 	p := indented(t, text)
-	p.File.Syntax.Ensure(text)
+	p.File.RefreshSyntax()
 	for i := 0; i < 200 && !p.File.Syntax.Ready(); i++ {
 		time.Sleep(5 * time.Millisecond)
 	}

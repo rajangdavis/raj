@@ -5,7 +5,9 @@ package editor
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -27,7 +29,22 @@ type File struct {
 	Syntax *syntax.Highlighter
 	sess   *piecetable.Session
 	idx    *view.Index
-	saved  piecetable.Version
+
+	// saved is the version at the last write, and savedLen/savedSum describe
+	// what was written. The version alone cannot answer "is this file
+	// changed?", because undo does not rewind the version — it appends the
+	// reversing ops — so a buffer edited and put back stayed marked dirty and
+	// asked to be saved on close. The digest is what makes "changed" mean
+	// changed content rather than changed history.
+	saved    piecetable.Version
+	savedLen int
+	savedSum [sha256.Size]byte
+
+	// cleanVer memoises the last content comparison, because Dirty is asked
+	// once per tab per frame and the comparison reads the whole document.
+	cleanVer  piecetable.Version
+	cleanKnow bool
+	cleanDirt bool
 
 	// dark is the background the highlighter was built for. Kept so a rename
 	// can rebuild it without asking the application which terminal it is in.
@@ -71,7 +88,7 @@ func Open(path string, tab int) (*File, error) {
 
 // NewFile wraps content that is already in memory.
 func NewFile(path, content string, tab int) *File {
-	return &File{
+	f := &File{
 		Path:   path,
 		Cols:   view.NewColumns(tab),
 		Syntax: syntax.New(path, true),
@@ -79,6 +96,8 @@ func NewFile(path, content string, tab int) *File {
 		sess:   piecetable.NewSession(piecetable.NewDoc(content, 0)),
 		idx:    view.NewIndex(content),
 	}
+	f.markSaved(content) // what was opened is what is on disk
+	return f
 }
 
 func (f *File) Len() int                           { return f.sess.Buffer().Len() }
@@ -89,9 +108,62 @@ func (f *File) Spans(pos, n int) []piecetable.Span { return f.sess.Buffer().Span
 func (f *File) Session() *piecetable.Session       { return f.sess }
 func (f *File) Pieces() int                        { return f.sess.Buffer().Pieces() }
 
-// Dirty reports unsaved changes. Comparing versions rather than tracking a flag
-// means undoing back to the saved state correctly clears it.
-func (f *File) Dirty() bool { return f.sess.Version() != f.saved }
+// MaxCleanCheck is the largest document raj will re-read to decide whether it
+// still matches what was saved. Digesting runs at ~1.6 GB/s, so 8 MB is about
+// 5 ms — inside a frame, and only ever paid on a version whose length happens
+// to match the saved length. Past it a buffer that has been edited stays marked
+// dirty even if it was put back, which costs one needless save prompt on a file
+// where the check would cost a visible stall.
+const MaxCleanCheck = 8 << 20
+
+// Dirty reports unsaved changes, by content rather than by history.
+//
+// The version is checked first because it settles the common cases for free: an
+// untouched buffer is clean, and the length differing from the saved length
+// means changed without reading a byte. Only a buffer that is the right length
+// but a different version — which is what undoing back to where you started
+// looks like — is worth digesting.
+func (f *File) Dirty() bool {
+	v := f.sess.Version()
+	if v == f.saved {
+		return false
+	}
+	if f.cleanKnow && f.cleanVer == v {
+		return f.cleanDirt
+	}
+	dirty := true
+	if n := f.Len(); n == f.savedLen && n <= MaxCleanCheck {
+		dirty = f.checksum() != f.savedSum
+	}
+	f.cleanVer, f.cleanKnow, f.cleanDirt = v, true, dirty
+	return dirty
+}
+
+// checksum digests the document without materialising it. Reading it as one
+// string would allocate a second copy of the file to hash and throw it away.
+func (f *File) checksum() [sha256.Size]byte {
+	h := sha256.New()
+	for pos, n := 0, f.Len(); pos < n; {
+		size := 64 << 10
+		if n-pos < size {
+			size = n - pos
+		}
+		io.WriteString(h, f.Slice(pos, size))
+		pos += size
+	}
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return sum
+}
+
+// markSaved records what is now on disk, so a later edit that puts the buffer
+// back to it reads as clean.
+func (f *File) markSaved(content string) {
+	f.saved = f.sess.Version()
+	f.savedLen = len(content)
+	f.savedSum = sha256.Sum256([]byte(content))
+	f.cleanKnow = false
+}
 
 // Name is the file's base name, or a placeholder for an unnamed buffer.
 func (f *File) Name() string {
@@ -224,28 +296,31 @@ func (f *File) sync() {
 // Pieces do not have that problem: the stores are append-only, so a piece
 // records exactly the bytes that op inserted no matter what happened after.
 func (f *File) applyToIndex(op piecetable.Op) {
-	f.Syntax.Invalidate()
 	f.idx.Delete(op.Pos, op.DelLen())
 	n := op.InsLen()
-	if n == 0 {
-		return
-	}
 	f.nlBuf = f.nlBuf[:0]
-	at := op.Pos
-	store := f.sess.Store()
-	for _, rec := range op.Ins {
-		b := store.Slice(piecetable.Author(rec.Buf), rec.Start, rec.Length)
-		for i := 0; ; {
-			j := bytes.IndexByte(b[i:], '\n')
-			if j < 0 {
-				break
+	if n > 0 {
+		at := op.Pos
+		store := f.sess.Store()
+		for _, rec := range op.Ins {
+			b := store.Slice(piecetable.Author(rec.Buf), rec.Start, rec.Length)
+			for i := 0; ; {
+				j := bytes.IndexByte(b[i:], '\n')
+				if j < 0 {
+					break
+				}
+				i += j + 1
+				f.nlBuf = append(f.nlBuf, at+i)
 			}
-			i += j + 1
-			f.nlBuf = append(f.nlBuf, at+i)
+			at += rec.Length
 		}
-		at += rec.Length
+		f.idx.InsertLen(op.Pos, n, f.nlBuf)
 	}
-	f.idx.InsertLen(op.Pos, n, f.nlBuf)
+	// The highlighter gets the same splice, so its spans stay on the
+	// characters they were computed for until the next pass replaces them.
+	// op.Seq is the version this op replaced, so the version it produced is
+	// one past it.
+	f.Syntax.Edit(op.Pos, op.DelLen(), n, f.nlBuf, uint64(op.Seq)+1)
 }
 
 // Save writes the document to disk and marks the current version clean.
@@ -253,10 +328,11 @@ func (f *File) Save() error {
 	if f.Path == "" {
 		return os.ErrInvalid
 	}
-	if err := os.WriteFile(f.Path, []byte(f.Text()), 0o644); err != nil {
+	content := f.Text()
+	if err := os.WriteFile(f.Path, []byte(content), 0o644); err != nil {
 		return err
 	}
-	f.saved = f.sess.Version()
+	f.markSaved(content)
 	return nil
 }
 
@@ -264,7 +340,7 @@ func (f *File) Save() error {
 // from the application's idle tick, never from rendering.
 func (f *File) RefreshSyntax() {
 	if f.Syntax.Enabled() {
-		f.Syntax.Ensure(f.Text())
+		f.Syntax.Ensure(f.Text(), uint64(f.sess.Version()))
 	}
 }
 
@@ -273,7 +349,6 @@ func (f *File) RefreshSyntax() {
 func (f *File) SetDark(dark bool) {
 	f.dark = dark
 	f.Syntax = syntax.New(f.Path, dark)
-	f.Syntax.Invalidate()
 }
 
 // SetPath renames the buffer, which is what a save-as does: the text is

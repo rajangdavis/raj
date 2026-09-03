@@ -221,6 +221,26 @@ than trusted because it looks right.
 
 ## Root causes
 
+### Syntax colours stuck describing pre-edit text
+
+- [x] **A boolean cannot say which version it went stale against.** The
+  highlighter tracked freshness with `stale`/`running` flags and a `pending`
+  text slot. An `Ensure` with nothing to do still filled that slot, so the next
+  real edit's pass finished, saw a non-empty `pending`, and re-tokenised that
+  older text on top of its own fresh result. It then went idle: the flag was
+  clear, the cache was wrong, and nothing was scheduled. The colours only came
+  right when the next keystroke happened to kick the cache again, which is
+  exactly the "comment it out, uncomment it, the colours are still wrong" report.
+  Versions fix it because they say what a cached result *is*, where a flag only
+  says whether someone thinks it is old.
+- [x] **Asynchronous tokenising means every frame between an edit and the pass
+  landing draws stale spans against current text.** That is fine for a colour
+  and not fine for an offset: a tab inserted at a line start shifts every token
+  on the line by one byte, and the eye reads a one-column colour shift
+  instantly. Marking the line unhighlighted instead would flicker for the two to
+  three frames a pass takes. Splicing the edit into the spans keeps them on
+  their characters, and lets the lag be purely a lag in colour.
+
 ### Undo applied at the wrong offset, splitting runes
 
 - [x] **`rebase` left a range put when a later insertion landed at its start.**
