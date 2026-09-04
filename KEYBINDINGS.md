@@ -20,7 +20,6 @@ rather than hidden.
 | focus_explorer | `shift+super+e` | cmd+shift+e | ctrl+shift+e | linux default: new split down |
 | focus_search | `shift+super+f` | cmd+shift+f | ctrl+shift+f | — |
 | focus_problems | `shift+super+m` | cmd+shift+m | ctrl+shift+m | m for markers, as VS Code names the same pane |
-| toggle_agent **(unimplemented)** | `alt+super+b` | cmd+alt+b | ctrl+alt+b | the agent pane does not exist yet |
 | file_picker | `super+p` | cmd+p | ctrl+p | — |
 | command_palette **(unimplemented)** | `shift+super+p` | cmd+shift+p | ctrl+shift+p | no palette yet; the file picker is cmd+p |
 | find_in_file | `super+f` | cmd+f | ctrl+f | macOS default: find |
@@ -56,6 +55,7 @@ rather than hidden.
 | select_line | `super+l` | cmd+l | ctrl+l | linux default: clear screen |
 | toggle_comment | `super+/` | cmd+slash | ctrl+slash | — |
 | delete_line | `shift+super+k` | cmd+shift+k | ctrl+shift+k | — |
+| delete_to_line_end | `super+k` | cmd+k | ctrl+k | ghostty and iTerm2 default: clear scrollback |
 | line_below | `super+enter` | cmd+enter | ctrl+enter | ghostty default: toggle fullscreen |
 | line_above | `shift+super+enter` | cmd+shift+enter | ctrl+shift+enter | ghostty default: split zoom |
 | move_line_up | `alt+up` | alt+up | alt+up | — |

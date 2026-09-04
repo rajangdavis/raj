@@ -80,6 +80,8 @@ func (p *Pane) Handle(a keys.Action) bool {
 		p.DeleteForward()
 	case keys.DeleteLine:
 		p.DeleteLine()
+	case keys.DeleteToLineEnd:
+		p.DeleteToLineEnd()
 	case keys.LineBelow:
 		p.OpenLineBelow()
 	case keys.LineAbove:

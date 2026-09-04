@@ -10,7 +10,6 @@ const (
 	Editor
 	Explorer
 	Search
-	Agent
 	Picker
 	Prompt
 )

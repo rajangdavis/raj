@@ -184,6 +184,26 @@ func (p *Pane) DeleteLine() {
 	})
 }
 
+// DeleteToLineEnd removes everything from the cursor to the end of its line.
+//
+// On an already-empty tail it takes the newline instead, so repeating the chord
+// pulls the next line up rather than doing nothing — which is what readline's
+// ctrl+k does and the only behaviour that makes pressing it twice sensible.
+// A selection is deleted as a selection, since that is what every other editing
+// action here does with one.
+func (p *Pane) DeleteToLineEnd() {
+	p.editEachCursor(func(c Cursor) (int, int, string) {
+		if lo, hi := c.Range(); lo != hi {
+			return lo, hi - lo, ""
+		}
+		end := p.File.LineEnd(p.File.LineOf(c.Head))
+		if end == c.Head && end < p.File.Len() {
+			end++ // nothing left on this line: join the next one
+		}
+		return c.Head, end - c.Head, ""
+	})
+}
+
 // OpenLineBelow inserts a newline after the current line and moves there,
 // regardless of where in the line the cursor sits.
 func (p *Pane) OpenLineBelow() {

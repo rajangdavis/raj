@@ -141,9 +141,16 @@ findings and decisions live in INVESTIGATIONS.md.
   on paths, so a scratch buffer from cmd+n is the one tab a restored session
   cannot bring back. It needs the dirty-buffer journal below, not a path.
 
-- [ ] **Session persistence** — tabs, cursors, scroll, sidebar state, expanded
-  directories, and the focused pane, so a returning session lands where it was
-  left rather than in the explorer. `.git/raj/session.json`, `--no-restore`.
+~~Session persistence~~ — tabs, cursors, scroll, expanded directories and the
+  focused pane are saved to `.git/raj/session.json` (or `.raj/` without a
+  repository) and restored on start; `--no-restore` disables both directions.
+  What is left of it:
+~~The session is written only on a clean exit~~ — it is now also written from
+  the idle tick, debounced to three seconds, and touched whenever a tab opens or
+  closes. A crash loses seconds rather than the session.
+- [ ] **Scroll is restored as a line number, not a proportion.** Reopening in a
+  differently sized terminal clamps rather than adapts, so the cursor can land
+  off screen until the first movement.
 - [ ] **Dirty-buffer restore** — persist the journal and add-buffers, validated
   by an orig-hash per buffer.
 - [ ] **Attribution across restarts** — tint is commit-scoped, so it must
@@ -177,11 +184,117 @@ findings and decisions live in INVESTIGATIONS.md.
   are both saved and committed.
 - [ ] **16 ms coalescing window** for streaming agent hunks.
 
-## Agents (deliberately last)
+## Control socket (replaces the in-editor agent)
 
-- [ ] Agent pane and the plumbing from a model's diff to `Session.ApplyDiff`.
-- [ ] Region leases to prevent conflicts rather than only detect them.
-- [ ] SQLite session store — the op log as the shareable, forkable artifact.
+The agent pane is not being built. An editor that hosts a model is an editor
+that owns a model's lifecycle, its configuration, its failure modes and its
+version skew, and none of that is editing. The seam is a socket instead: raj
+exposes the buffer over a Unix domain socket and whatever wants to drive it —
+an agent harness, a script, a test — is a separate process that can be
+restarted, replaced or written in another language without touching the editor.
+
+`Session.ApplyDiff`, the op log and the per-author stores were built for a
+writer that is not the user, so the hard part is already there. What is missing
+is the transport and the rules around it.
+
+~~The socket and the protocol~~, ~~writes landing on the event thread~~, ~~a
+mandatory base version~~ and ~~off by default~~ are done: `internal/control` is
+the transport, `internal/app/control.go` is what a request means, and the two
+cannot be collapsed because the transport package has no editor types to reach
+for. What remains:
+
+- [ ] **Attribution has no inverse.** An agent can see which spans are its own,
+  but there is no verb to drop them. Reverting its own work means computing a
+  reverse diff and applying it, which leaves both edits in the journal. A
+  `revert -author` that discards one writer's pieces is the natural companion
+  to tracking them, and the store's structure is what makes it cheap.
+- [ ] **Every agent shares one tint.** Distinguishable in the data, identical on
+  screen, so a user watching two connected agents cannot tell which wrote what.
+~~Author ids handed out per connection~~ — ids are now per identity, so a
+  harness reconnecting keeps the text it wrote and forty restarts cost one id.
+  Distinct identities still consume them and running out is an error rather
+  than a wrap.
+
+## Layered proposals
+
+The direction this is heading, not built. An agent change set becomes a
+*proposal* rather than an edit: in the document, tinted, but not composed into
+what would reach disk until accepted. Groups already exist (`Begin`/`End`), and
+undo is already `reverseGroup(group, author)` — so rejection is built. What is
+missing is addressing and state.
+
+~~Proposal state on groups~~ — `Session.Groups`, `MarkGroup`, `AcceptGroup`,
+  `RejectGroup`, and `groups`/`accept`/`reject` over the socket. An agent apply
+  is marked proposed; the user's typing is not. Rejection is undo addressed by
+  group, so an older change can go while newer ones stay. What is left:
+- [ ] **A rejected group can be wedged.** If a later edit overlaps it, the
+  members cannot be rebased out and the whole thing rolls back — correctly, but
+  the caller is told only that it failed. It should be told what overlapped, so
+  it can re-propose against the current text instead of guessing.
+- [ ] **Groups have no ranges.** The listing reports ops and net bytes, not
+  where. Rendering needs current-coordinate ranges, which means rebasing each
+  member forward — the same walk the gutter will need.
+- [ ] **Deferred deletions.** A proposed deletion is not performed: the pieces
+  stay, the range is marked, and acceptance is when the delete runs. This is
+  what makes a deletion visible at all — a deleted span leaves no piece — and it
+  replaces the change-gutter representation problem rather than solving it.
+- [ ] **Diff-style rendering.** Green for pending additions, red for pending
+  deletions, as in a git diff. Colour carries state; the gutter carries who,
+  from the participant table — with five agents everything is green and the
+  colour cannot also mean identity.
+- [ ] **Overlap reporting for swarms.** Two proposals whose rebased ranges
+  intersect is a mechanical fact. Report it to both with the other's author id
+  and the span. The editor must not arbitrate which is right: that is semantic,
+  and voting built in here would be wrong in ways nobody can debug.
+- [ ] **`claim` and `watch`.** An agent announces the files it is about to touch;
+  others are told. Streaming frames and cancellation already exist, so a pushed
+  event is nearly free and beats polling — this is the use case that justifies
+  the notifications item above.
+- [ ] **Which composition does `read` return?** Accepted-only is the argument:
+  an agent should propose against the agreed base, not against another agent's
+  unaccepted guesses, or overlap detection compares offsets in different
+  frames. A flag would ask for the annotated view.
+- [ ] **The sidebar does not use the streaming path yet.** `search.RunStream`
+  and the snapshot split exist and the socket uses them, so a search over the
+  socket runs off the event thread and reports as it goes. The pane still calls
+  `RunDocs` and waits. Moving it over is the other half of the seam this file
+  already names, and it is now a small change rather than a design.
+~~`exec`~~ — refuse-on-dirty, naming the files, with the counter. `raj ctl stats`
+  reports runs, blocks, and how many blocks were agent-authored only. What is
+  left:
+- [ ] **Nothing reads the counter yet.** `raj ctl stats` records runs against
+  stale files and how many were agent-authored only. When layered proposals
+  land, `exec` should materialise the accepted composition and run against
+  that, and the count says how much that is worth.
+- [ ] **A cancelled `exec` can orphan children.** CommandContext kills the
+  process it started; `sh -c "go test"` is two, and the test binary survives.
+  The run returns promptly, so this is invisible to the caller, but the work
+  keeps going. A process group and a group kill is the fix, and it is
+  platform-specific in a way nothing else here is.
+- [ ] **No flush mechanics.** When v2 lands it needs temp-file-plus-rename per
+  dirty file, so no subprocess reads a half-written file.
+- [ ] **Discovery is a directory listing.** A driver finds editors by listing
+  `$XDG_RUNTIME_DIR/raj/` and asking each socket for its root. That is one round
+  trip per editor and cannot go stale, but it also means a driver started
+  independently has to know that convention. A `--control-socket` at a path the
+  driver chooses is the escape hatch and is probably the common case.
+~~A stale socket from a killed process is only probed, not reaped~~ — discovery
+  now removes what it finds dead. A unix socket with no listener refuses
+  immediately, so a live but busy editor is never reaped.
+- [ ] **Region leases.** `apply` rejects a stale hunk after the fact; a lease
+  would stop the user and a driver being told they both own a span in the first
+  place. The conflict report carries the version that invalidated the range, so
+  the information a lease needs is already on the wire.
+- [ ] **No notifications.** The protocol is request/response only, so a driver
+  wanting to know the user has typed must poll `buffers`. A subscribe op would
+  need the event thread to push, which is the one direction the park-and-reply
+  shape does not cover.
+- [ ] **`apply` cannot create or reach an unopened file.** `open` puts a path in
+  a tab first, which also puts it in front of the user — deliberately, since an
+  editor silently editing files you cannot see is worse than one extra call.
+  Unnamed buffers stay unaddressable: there is no name to ask for.
+- [ ] **SQLite session store** — the op log as the shareable, forkable artifact.
+  Unchanged by the socket, and the socket makes it more useful rather than less.
 
 ## Known rough edges
 
@@ -195,10 +308,11 @@ findings and decisions live in INVESTIGATIONS.md.
   stops from its own start. Self-consistent between the wrap engine and the
   renderer, so the caret stays correct, but it looks slightly off when a line
   with mid-text tabs wraps.
-- [ ] **Three actions are bound but unimplemented**, so their chords are taken
-  from the terminal for nothing: `ToggleAgent` (cmd+alt+b), `CommandPalette`
-  (cmd+shift+p) and `CursorUndo` (cmd+u). `GotoLine` and `GotoSymbol` were
-  among the others and are done.
+- [ ] **Two actions are bound but unimplemented**, so their chords are taken
+  from the terminal for nothing: `CommandPalette` (cmd+shift+p) and `CursorUndo`
+  (cmd+u). `GotoLine` and `GotoSymbol` were among the others and are done.
+  `ToggleAgent` was a third; it was removed rather than implemented, so
+  cmd+alt+b goes back to the terminal.
 
   They are no longer invisible: `keys.Unimplemented` lists them, KEYBINDINGS.md
   marks them, and a test in internal/app presses each one and fails if anything
@@ -215,7 +329,9 @@ findings and decisions live in INVESTIGATIONS.md.
   whenever the binding table changes. Same for the iTerm2 profile. **Outstanding
   now**: cmd+n was added to `Bindings`, so both configs are stale until they are
   regenerated, and until then the chord opens a Ghostty window rather than a raj
-  tab. Under the `kkp_on` gate it is claimed only while raj is focused, so
+  tab. cmd+k was added and cmd+alt+b removed for the same reason, so both are
+  outstanding too — and until the config is regenerated cmd+k still clears the
+  terminal's scrollback. Under the `kkp_on` gate it is claimed only while raj is focused, so
   Ghostty's own cmd+n is untouched everywhere else; under the iTerm2 profile it
   is claimed for the whole window, which is the same trade the profile already
   makes for cmd+w.

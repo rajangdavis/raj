@@ -28,7 +28,6 @@ import (
 // reports it as unhandled, so implementing one without unlisting it fails the
 // build.
 var Unimplemented = map[Action]string{
-	ToggleAgent:    "the agent pane does not exist yet",
 	CommandPalette: "no palette yet; the file picker is cmd+p",
 	// Found by the test rather than by anyone noticing. cmd+u has been taking
 	// a chord from the terminal and doing nothing, and TODO.md listed only the

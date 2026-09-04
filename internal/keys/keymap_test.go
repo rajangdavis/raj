@@ -24,7 +24,7 @@ func TestResolveScoped(t *testing.T) {
 		want  Action
 	}{
 		{"global chord in editor", Editor, "\x1b[119;9u", CloseTab},
-		{"global chord in agent", Agent, "\x1b[119;9u", CloseTab},
+		{"global chord in the picker", Picker, "\x1b[119;9u", CloseTab},
 		{"tab indents in editor", Editor, "\x1b[9u", Indent},
 		{"tab cycles elsewhere", Explorer, "\x1b[9u", CycleFocus},
 		{"shift+tab outdents", Editor, "\x1b[9;2u", Outdent},

@@ -139,7 +139,31 @@ func RunContext(ctx context.Context, root string, q Query) Result {
 // a new file that exists only as a tab — is not on the walk at all, so it is
 // swept up afterwards rather than missed.
 func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
+	return RunStream(ctx, root, q, open, nil)
+}
+
+// RunStream is RunDocs with a callback, invoked with each file's new matches as
+// the walk reaches them.
+//
+// A multi-second walk that reports nothing until it finishes is unusable, and a
+// query will change mid-flight. The hook is per file rather than per match
+// because a file is already the unit the walk works in — the scan buffer, the
+// cancellation check and the cap are all checked there — so emitting at the
+// same boundary adds a call per file and no bookkeeping.
+//
+// emit may be nil. It is called on the walking goroutine, so a slow callback
+// slows the search; a caller that might block should hand off.
+func RunStream(ctx context.Context, root string, q Query, open Docs, emit func([]Match)) Result {
 	var res Result
+	// sent tracks how much of res.Matches the callback has seen, so each file
+	// emits only what it added.
+	sent := 0
+	flush := func() {
+		if emit != nil && len(res.Matches) > sent {
+			emit(res.Matches[sent:])
+			sent = len(res.Matches)
+		}
+	}
 	if q.Text == "" {
 		return res
 	}
@@ -213,6 +237,7 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 		res.Considered++
 		delete(pending, path)
 		record(path, scanOne(path, open, m, &buf, &res), &res)
+		flush()
 		return nil
 	})
 	if res.Stopped || res.Capped {
@@ -239,6 +264,7 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 		}
 		res.Considered++
 		record(path, scanOne(path, open, m, &buf, &res), &res)
+		flush()
 	}
 	return res
 }

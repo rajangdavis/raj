@@ -38,7 +38,6 @@ var Bindings = []Binding{
 	{"panes", FocusExplorer, "shift+super+e", "101;10u", "cmd+shift+e", "ctrl+shift+e", "linux default: new split down"},
 	{"panes", FocusSearch, "shift+super+f", "102;10u", "cmd+shift+f", "ctrl+shift+f", ""},
 	{"panes", FocusProblems, "shift+super+m", "109;10u", "cmd+shift+m", "ctrl+shift+m", "m for markers, as VS Code names the same pane"},
-	{"panes", ToggleAgent, "alt+super+b", "98;11u", "cmd+alt+b", "ctrl+alt+b", ""},
 	{"panes", FilePicker, "super+p", "112;9u", "cmd+p", "ctrl+p", ""},
 	{"panes", CommandPalette, "shift+super+p", "112;10u", "cmd+shift+p", "ctrl+shift+p", ""},
 	{"panes", FindInFile, "super+f", "102;9u", "cmd+f", "ctrl+f", "macOS default: find"},
@@ -62,6 +61,18 @@ var Bindings = []Binding{
 	{"edit", SelectLine, "super+l", "108;9u", "cmd+l", "ctrl+l", "linux default: clear screen"},
 	{"edit", ToggleComment, "super+/", "47;9u", "cmd+slash", "ctrl+slash", ""},
 	{"edit", DeleteLine, "shift+super+k", "107;10u", "cmd+shift+k", "ctrl+shift+k", ""},
+	// Claimed to STOP it reaching the terminal. Unbound, cmd+k clears the
+	// scrollback of the shell raj is running in — the buffer above raj, which
+	// the editor cannot redraw and the user cannot get back. That it does
+	// nothing to the document is exactly the problem: the damage is invisible
+	// from inside the editor and permanent outside it.
+	//
+	// Deleting to the end of the line is what fills it: it is readline's and
+	// emacs' ctrl+k, and Sublime and VS Code both put it on a cmd+k chord, so
+	// the letter already means this to most people who reach for it. It is
+	// also the natural sibling of cmd+shift+k above, which takes the whole
+	// line.
+	{"edit", DeleteToLineEnd, "super+k", "107;9u", "cmd+k", "ctrl+k", "ghostty and iTerm2 default: clear scrollback"},
 	{"edit", LineBelow, "super+enter", "13;9u", "cmd+enter", "ctrl+enter", "ghostty default: toggle fullscreen"},
 	{"edit", LineAbove, "shift+super+enter", "13;10u", "cmd+shift+enter", "ctrl+shift+enter", "ghostty default: split zoom"},
 	{"edit", MoveLineUp, "alt+up", "1;3A", "alt+up", "alt+up", ""},

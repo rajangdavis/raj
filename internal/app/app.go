@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"raj/internal/complete"
+	"raj/internal/control"
 	"raj/internal/editor"
 	"raj/internal/explorer"
 	"raj/internal/hidden"
@@ -126,6 +128,22 @@ type App struct {
 	// quitAsked is true while the quit confirmation is on screen, so a second
 	// Quit forces the exit instead of reopening the same question.
 	quitAsked bool
+
+	// NoRestore disables reading and writing the session file, for --no-restore
+	// and for tests that must not touch a workspace they did not create.
+	NoRestore bool
+
+	// sessionDirty and sessionSaved debounce writing the session file, so a
+	// crash loses seconds rather than the whole session.
+	sessionDirty bool
+	sessionSaved time.Time
+
+	// control is the Unix-socket server, nil unless --control was given. Its
+	// requests are executed in drainControl, on this thread.
+	control *control.Server
+	// guard is the validation chokepoint in front of the buffer host. One per
+	// app, so read-before-write is remembered across requests.
+	guard *control.Guard
 }
 
 // New builds an application rooted at a directory.
@@ -240,6 +258,9 @@ func (a *App) OpenFile(path string) {
 		a.status = w
 	}
 	a.focus = FocusEditor
+	// Opening a tab is the change most worth not losing to a crash: a cursor
+	// position is a scroll, a missing tab is a file you have to find again.
+	a.TouchSession()
 	a.status = ""
 }
 
@@ -497,6 +518,9 @@ func (a *App) Run() error {
 	// something stops them. An editor that leaves them running is a bug people
 	// find in their process list rather than in the editor.
 	defer a.servers.stopAll()
+	// The socket is a file in the filesystem; leaving it behind means the next
+	// process finds a path that answers nothing.
+	defer a.StopControl()
 
 	a.Draw()
 	for e := range a.host.Events() {
@@ -538,6 +562,7 @@ func (a *App) Handle(e ui.Event) {
 		// answer is parked the same way and collected here.
 		a.applyAnswer()
 		a.drainDiagnostics()
+		a.drainControl()
 	case ui.Tick:
 		// A drag held outside the pane scrolls from here, because the pointer
 		// is not moving and so there is no event to hang it on.
@@ -545,6 +570,7 @@ func (a *App) Handle(e ui.Event) {
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.
 		a.refreshSyntax()
+		a.sessionTick(time.Now())
 		a.Debug.sample()
 	case ui.Quit:
 		a.quit = true
@@ -1049,6 +1075,7 @@ func (a *App) closeTab() { a.closeTabAt(a.Tabs.Index()) }
 // file. So the continuation re-finds the pane rather than trusting the number
 // it was handed.
 func (a *App) closeTabAt(i int) {
+	a.TouchSession()
 	panes := a.Tabs.All()
 	if i < 0 || i >= len(panes) {
 		return

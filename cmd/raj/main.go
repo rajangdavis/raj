@@ -5,6 +5,9 @@
 //	raj some/dir              open a directory as the workspace
 //	raj --tab 4 file.go       set the indent width
 //	raj --tabs file.go        indent with tabs where the file does not say
+//	raj --control             listen on a control socket for buffer edits
+//	raj --no-restore          start fresh instead of where you left off
+//	raj ctl <cmd>             read and edit a running raj's buffers
 //	raj --config ghostty      print Ghostty keybindings to install
 //	raj --config iterm2       print an iTerm2 dynamic profile
 //	raj --keys                print the keybinding reference as markdown
@@ -20,15 +23,25 @@ import (
 	"time"
 
 	"raj/internal/app"
+	"raj/internal/control"
 	"raj/internal/keys"
 	"raj/internal/probe"
 	"raj/internal/ui"
 )
 
 func main() {
+	// `raj ctl ...` is a different program sharing a binary: it talks to a
+	// running editor over the control socket and never opens a terminal. It is
+	// handled before flag.Parse because its flags are its own.
+	if len(os.Args) > 1 && os.Args[1] == "ctl" {
+		os.Exit(control.CLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	var (
 		tab       = flag.Int("tab", 2, "indent width in spaces, and the display width of a tab")
 		useTabs   = flag.Bool("tabs", false, "indent with tabs in files that have no indentation to detect")
+		ctl       = flag.Bool("control", false, "listen on a Unix socket for buffer reads and edits")
+		ctlPath   = flag.String("control-socket", "", "path for --control; implies it")
+		noRestore = flag.Bool("no-restore", false, "do not reopen the previous session")
 		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
 		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
 		keyDoc    = flag.Bool("keys", false, "print the keybinding reference as markdown")
@@ -59,7 +72,7 @@ func main() {
 		}
 		return
 	}
-	if err := run(flag.Arg(0), *tab, *wrap, *useTabs); err != nil {
+	if err := run(flag.Arg(0), *tab, *wrap, *useTabs, *ctl || *ctlPath != "", *ctlPath, *noRestore); err != nil {
 		fail(err)
 	}
 }
@@ -83,7 +96,7 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func run(path string, tab int, wrap bool, useTabs bool) error {
+func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlPath string, noRestore bool) error {
 	root, path, err := resolve(path)
 	if err != nil {
 		return err
@@ -105,6 +118,23 @@ func run(path string, tab int, wrap bool, useTabs bool) error {
 	// Only a fallback: a file whose own indentation is readable keeps it, so
 	// this decides new buffers and blank ones and nothing else.
 	a.Tabs.IndentTabs = useTabs
+	a.NoRestore = noRestore
+	// Before any file named on the command line, so an explicitly requested
+	// file ends up focused rather than buried under restored tabs.
+	a.RestoreSession()
+	defer func() {
+		if err := a.SaveSession(); err != nil {
+			fmt.Fprintln(os.Stderr, "raj: could not save session:", err)
+		}
+	}()
+	if ctl {
+		if err := a.StartControl(ctlPath); err != nil {
+			return err
+		}
+		// Printed before the alternate screen is entered, so a harness that
+		// started raj can read the path from its output rather than guessing.
+		fmt.Fprintln(os.Stderr, "raj: control socket", a.ControlPath())
+	}
 	if path != "" {
 		a.OpenFile(path)
 	}

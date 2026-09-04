@@ -15,6 +15,9 @@ package piecetable
 type Session struct {
 	buf     pieceEditor
 	journal []Op
+	// groupState records decisions about change sets. Sparse: only groups that
+	// are not simply Accepted have an entry, so ordinary typing costs nothing.
+	groupState map[uint64]GroupState
 	// reversers maps an op to the ops that reverse it. Whether an op is in
 	// effect is DERIVED from this rather than tracked as a flag: op X is live
 	// exactly when no live op reverses it. A flag cannot express that, because

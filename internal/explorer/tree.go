@@ -91,6 +91,31 @@ func (t *Tree) Toggle(path string) {
 // Expanded reports a directory's state.
 func (t *Tree) Expanded(path string) bool { return t.expanded[path] }
 
+// ExpandedDirs lists the open directories, for a session to remember. Sorted so
+// a session file does not churn between saves that changed nothing.
+func (t *Tree) ExpandedDirs() []string {
+	out := make([]string, 0, len(t.expanded))
+	for p, open := range t.expanded {
+		if open && p != t.Root {
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Expand opens a directory without toggling, so restoring a session cannot
+// close something by replaying a path twice. Parents are opened too: a child
+// marked open under a closed parent would never be reached by the walk.
+func (t *Tree) Expand(path string) {
+	for p := filepath.Clean(path); len(p) >= len(t.Root); p = filepath.Dir(p) {
+		t.expanded[p] = true
+		if p == t.Root || filepath.Dir(p) == p {
+			break
+		}
+	}
+}
+
 // Refresh rebuilds the visible entries, re-reading git status when filtering.
 func (t *Tree) Refresh() {
 	if t.ChangedOnly {
