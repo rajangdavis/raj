@@ -4,6 +4,7 @@
 //	raj file.go               open a file
 //	raj some/dir              open a directory as the workspace
 //	raj --tab 4 file.go       set the indent width
+//	raj --tabs file.go        indent with tabs where the file does not say
 //	raj --config ghostty      print Ghostty keybindings to install
 //	raj --config iterm2       print an iTerm2 dynamic profile
 //	raj --keys                print the keybinding reference as markdown
@@ -26,7 +27,8 @@ import (
 
 func main() {
 	var (
-		tab       = flag.Int("tab", 2, "indent width in spaces")
+		tab       = flag.Int("tab", 2, "indent width in spaces, and the display width of a tab")
+		useTabs   = flag.Bool("tabs", false, "indent with tabs in files that have no indentation to detect")
 		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
 		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
 		keyDoc    = flag.Bool("keys", false, "print the keybinding reference as markdown")
@@ -57,7 +59,7 @@ func main() {
 		}
 		return
 	}
-	if err := run(flag.Arg(0), *tab, *wrap); err != nil {
+	if err := run(flag.Arg(0), *tab, *wrap, *useTabs); err != nil {
 		fail(err)
 	}
 }
@@ -81,7 +83,7 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func run(path string, tab int, wrap bool) error {
+func run(path string, tab int, wrap bool, useTabs bool) error {
 	root, path, err := resolve(path)
 	if err != nil {
 		return err
@@ -100,6 +102,9 @@ func run(path string, tab int, wrap bool) error {
 	// A named file takes the focus; otherwise raj opens in the explorer, since
 	// an editor with no file is not a useful place for the keys to be.
 	a.WrapDefault = wrap
+	// Only a fallback: a file whose own indentation is readable keeps it, so
+	// this decides new buffers and blank ones and nothing else.
+	a.Tabs.IndentTabs = useTabs
 	if path != "" {
 		a.OpenFile(path)
 	}

@@ -184,8 +184,9 @@ func TestEscapeCollapsesCursors(t *testing.T) {
 func TestIndentAndOutdent(t *testing.T) {
 	h := newHarness(t, "line")
 	h.press("tab")
-	if got := h.text(); got != "  line" {
-		t.Fatalf("after indent = %q, want two spaces", got)
+	// The harness file is test.go, and Go indents with tabs.
+	if got := h.text(); got != "\tline" {
+		t.Fatalf("after indent = %q, want a tab", got)
 	}
 	h.press("shift+tab")
 	if got := h.text(); got != "line" {

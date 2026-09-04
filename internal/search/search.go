@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"raj/internal/hidden"
 )
 
 // Match is one hit.
@@ -30,6 +32,14 @@ type Query struct {
 	Regex   bool
 	Case    bool
 	Word    bool
+
+	// Hidden is the visibility policy: which directories the walk refuses to
+	// descend into and which files it will not open, shared with the tree and
+	// the picker so all three agree on what exists. It sits beside Include and
+	// Exclude because it is the same kind of thing — a filter over the walk —
+	// differing only in that the user sets it once in a file rather than per
+	// search. Nil means the built-in defaults.
+	Hidden *hidden.Rules
 }
 
 // Limits keep an interactive search bounded. A search box that hangs the editor
@@ -143,6 +153,14 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 		m = newMatcher(q, re)
 	}
 	inc, exc := globs(q.Include), globs(q.Exclude)
+	hide := q.Hidden
+	if hide == nil {
+		// Load rather than Default: a search run through the pane arrives with
+		// the workspace's rules attached, and one run directly must not answer
+		// differently from the same search in the sidebar. Two stats against a
+		// whole-tree walk is not a cost worth a stale answer.
+		hide = hidden.Load(root)
+	}
 	// One scan buffer for the whole walk. Allocating 64 KB per file made the
 	// buffer, not the matching, the dominant cost of a search.
 	buf := make([]byte, 0, 64*1024)
@@ -152,7 +170,7 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 	// the set that has no file behind it yet.
 	pending := make(map[string]bool, len(open))
 	for path := range open {
-		if eligible(root, path, inc, exc) {
+		if eligible(root, path, inc, exc, hide) {
 			pending[path] = true
 		}
 	}
@@ -163,15 +181,12 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if strings.HasPrefix(name, ".") && path != root {
-				return filepath.SkipDir
-			}
-			if name == "node_modules" || name == "vendor" {
+			if path != root && hide.HiddenPath(root, path, true) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasPrefix(name, ".") || !matches(name, inc, true) || matches(name, exc, false) {
+		if hide.HiddenPath(root, path, false) || !matches(name, inc, true) || matches(name, exc, false) {
 			return nil
 		}
 		// Before Info() and before the open: the whole point is to skip the
@@ -254,7 +269,7 @@ func scanOne(path string, open Docs, m matcher, buf *[]byte, res *Result) (total
 // eligible applies the walk's own filters to a path that never reached the
 // walk, so an unsaved document is included or excluded on the same terms as a
 // saved one rather than on looser ones.
-func eligible(root, path string, inc, exc []string) bool {
+func eligible(root, path string, inc, exc []string, hide *hidden.Rules) bool {
 	if path == "" || !filepath.IsAbs(path) {
 		return false
 	}
@@ -262,11 +277,12 @@ func eligible(root, path string, inc, exc []string) bool {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		if strings.HasPrefix(part, ".") {
-			return false
-		}
-		if part == "node_modules" || part == "vendor" {
+	// Every component, not just the file: the walk skips a hidden directory
+	// whole, so a document inside one is unreachable there and must be
+	// unreachable here too.
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i := range parts {
+		if hide.Hidden(strings.Join(parts[:i+1], "/"), i < len(parts)-1) {
 			return false
 		}
 	}

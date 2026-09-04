@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"raj/internal/hidden"
 	"raj/internal/keys"
 	"raj/internal/symbols"
 	"raj/internal/ui"
@@ -36,8 +37,13 @@ const (
 
 // Picker is the floating quick-open overlay.
 type Picker struct {
-	Root  string
-	Open  bool
+	Root string
+	Open bool
+
+	// Hidden is the visibility policy, the same one the tree and the search
+	// use, so a file you can see in the sidebar is a file cmd+p can reach.
+	Hidden *hidden.Rules
+
 	mode  Mode
 	items []entry
 	shown []scored
@@ -76,7 +82,7 @@ type scored struct {
 
 // New builds a picker rooted at a directory.
 func New(root string) *Picker {
-	p := &Picker{Root: root}
+	p := &Picker{Root: root, Hidden: hidden.Load(root)}
 	p.input = widget.Input{Label: "Go to file"}
 	return p
 }
@@ -155,6 +161,17 @@ func (p *Picker) Query() string { return p.input.Text }
 
 // Results is how many files match the query.
 func (p *Picker) Results() int { return len(p.shown) }
+
+// Files returns the indexed paths, relative to the root, in walk order. It is
+// the index itself rather than the filtered rows, so a caller can ask what the
+// picker can reach without going through a query.
+func (p *Picker) Files() []string {
+	out := make([]string, 0, len(p.items))
+	for _, it := range p.items {
+		out = append(out, it.label)
+	}
+	return out
+}
 
 // Top is the highest-ranked match, or "" when nothing matches.
 func (p *Picker) Top() string {
@@ -336,16 +353,12 @@ func (p *Picker) index() {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if path != p.Root && strings.HasPrefix(name, ".") {
-				return filepath.SkipDir
-			}
-			if name == "node_modules" || name == "vendor" {
+			if path != p.Root && p.Hidden.HiddenPath(p.Root, path, true) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasPrefix(d.Name(), ".") {
+		if p.Hidden.HiddenPath(p.Root, path, false) {
 			return nil
 		}
 		if len(p.items) >= MaxFiles {

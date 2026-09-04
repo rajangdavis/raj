@@ -115,7 +115,7 @@ func TestSidebarTabEscapesOneWay(t *testing.T) {
 func TestTabIndentsInEditor(t *testing.T) {
 	h := newHarness(t, "line")
 	h.press("tab")
-	if got := h.text(); got != "  line" {
+	if got := h.text(); got != "\tline" {
 		t.Errorf("text = %q, want an indent", got)
 	}
 	if h.Focused() != FocusEditor {
@@ -663,7 +663,7 @@ func TestUndoGroupsMultiLineActions(t *testing.T) {
 	h := newHarness(t, "a\nb\nc")
 	h.press("super+a")
 	h.press("tab") // indents three lines
-	if got := h.text(); got != "  a\n  b\n  c" {
+	if got := h.text(); got != "\ta\n\tb\n\tc" {
 		t.Fatalf("after indent = %q", got)
 	}
 	h.press("super+z")

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"raj/internal/hidden"
 	"raj/internal/keys"
 	"raj/internal/ui"
 	"raj/internal/widget"
@@ -20,6 +21,11 @@ import (
 type Pane struct {
 	Root   string
 	Result Result
+
+	// Hidden is the visibility policy, loaded once from the workspace and
+	// attached to every query the pane runs, so the search and the sidebar
+	// disagree about no file.
+	Hidden *hidden.Rules
 
 	query     widget.Input
 	include   widget.Input
@@ -213,7 +219,7 @@ const (
 
 // NewPane returns a search pane rooted at a directory.
 func NewPane(root string) *Pane {
-	p := &Pane{Root: root, collapsed: map[string]bool{}}
+	p := &Pane{Root: root, collapsed: map[string]bool{}, Hidden: hidden.Load(root)}
 	p.query = widget.Input{Label: "Search"}
 	p.include = widget.Input{Label: "files to include"}
 	p.exclude = widget.Input{Label: "files to exclude"}
@@ -507,6 +513,9 @@ func (p *Pane) searcher(open Docs) func(context.Context, string, Query) Result {
 		return p.search
 	}
 	return func(ctx context.Context, root string, q Query) Result {
+		if q.Hidden == nil {
+			q.Hidden = p.Hidden
+		}
 		return RunDocs(ctx, root, q, open)
 	}
 }

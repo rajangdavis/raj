@@ -20,6 +20,11 @@ type Tabs struct {
 	active int
 	closed []string
 	tab    int
+
+	// IndentTabs is the fallback style for buffers with nothing to detect —
+	// a new file, or one with no indentation yet. A file that answers for
+	// itself is left alone, so this is a preference rather than an override.
+	IndentTabs bool
 }
 
 // New returns an empty tab set. tab is the indent width for files it opens.
@@ -56,6 +61,7 @@ func (t *Tabs) Open(path string) (*editor.Pane, error) {
 	if err != nil {
 		return nil, err
 	}
+	f.SetIndentDefault(editor.Indent{Tabs: t.IndentTabs, Width: t.tab})
 	pane := editor.NewPane(f)
 	t.panes = append(t.panes, pane)
 	t.active = len(t.panes) - 1
@@ -74,7 +80,9 @@ func (t *Tabs) Add(p *editor.Pane) {
 // buffer has none — two cmd+n presses mean two scratch buffers, which is what
 // every editor that has the chord does.
 func (t *Tabs) NewFile() *editor.Pane {
-	p := editor.NewPane(editor.NewFile("", "", t.tab))
+	f := editor.NewFile("", "", t.tab)
+	f.SetIndentDefault(editor.Indent{Tabs: t.IndentTabs, Width: t.tab})
+	p := editor.NewPane(f)
 	t.Add(p)
 	return p
 }

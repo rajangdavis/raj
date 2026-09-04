@@ -207,7 +207,7 @@ func (p *Pane) Indent() { p.reindent(true) }
 func (p *Pane) Outdent() { p.reindent(false) }
 
 func (p *Pane) reindent(add bool) {
-	unit := strings.Repeat(" ", p.File.Cols.Tab)
+	unit := p.File.Indent.Unit()
 	lines := p.touchedLines()
 	// Bottom-up: editing a later line cannot invalidate an earlier line's start.
 	for i := len(lines) - 1; i >= 0; i-- {

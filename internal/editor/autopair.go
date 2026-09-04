@@ -1,7 +1,5 @@
 package editor
 
-import "strings"
-
 // Auto-indent and bracket handling are typing conveniences, so the rule they
 // are all held to is that typing must never lose a keystroke. Every behaviour
 // here either does the obvious thing or does nothing, and "does nothing" always
@@ -181,7 +179,7 @@ func (p *Pane) insertNewline() {
 	p.File.Begin()
 	defer p.File.End()
 
-	unit := strings.Repeat(" ", p.File.Cols.Tab)
+	unit := p.File.Indent.Unit()
 	cursors := p.Cursors.All()
 	for i := len(cursors) - 1; i >= 0; i-- {
 		c := cursors[i]

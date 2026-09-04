@@ -9,7 +9,14 @@ import (
 )
 
 func newTestPane(content string) *Pane {
-	p := NewPane(NewFile("t.go", content, 2))
+	f := NewFile("t.go", content, 2)
+	// Pin the style. Every test in this package was written against "one level
+	// is two spaces", and detection would otherwise let a fixture's own
+	// indentation decide — a fixture indented by four would silently change
+	// what those tests assert. The detection itself is tested in
+	// indent_style_test.go, on fixtures written for it.
+	f.Indent = Indent{Width: 2}
+	p := NewPane(f)
 	p.Resize(40, 10)
 	return p
 }

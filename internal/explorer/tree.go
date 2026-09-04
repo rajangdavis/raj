@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"raj/internal/hidden"
 )
 
 // Entry is one visible row in the tree.
@@ -33,6 +35,11 @@ type Tree struct {
 	ChangedOnly bool
 	changed     map[string]bool
 	session     map[string]bool
+
+	// Hidden is the visibility policy. Shared shape with the search and the
+	// picker so a pattern written once applies to all three; never nil after
+	// NewTree, but nil is treated as "hide nothing" rather than panicking.
+	Hidden *hidden.Rules
 }
 
 // NewTree opens a directory.
@@ -45,6 +52,7 @@ func NewTree(root string) *Tree {
 		Root:     abs,
 		expanded: map[string]bool{abs: true},
 		session:  map[string]bool{},
+		Hidden:   hidden.Load(abs),
 	}
 	t.Refresh()
 	return t
@@ -105,10 +113,10 @@ func (t *Tree) walk(dir string, depth int) {
 	})
 	for _, it := range items {
 		name := it.Name()
-		if strings.HasPrefix(name, ".") && name != ".." {
-			continue // dotfiles stay hidden; .git especially
-		}
 		path := filepath.Join(dir, name)
+		if t.Hidden.HiddenPath(t.Root, path, it.IsDir()) {
+			continue
+		}
 		if it.IsDir() {
 			if t.ChangedOnly && !t.hasChanged(path) {
 				continue

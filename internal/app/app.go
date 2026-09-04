@@ -5,6 +5,7 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/explorer"
+	"raj/internal/hidden"
 	"raj/internal/hover"
 	"raj/internal/keys"
 	"raj/internal/lsp"
@@ -155,6 +157,13 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		wth:         widget.DefaultTheme(),
 		focused:     true,
 	}
+	// A bad line in .raj/hidden is skipped rather than fatal, but silently
+	// skipped is how a typo becomes "raj ignores my config". The status line is
+	// the only place it can be said at startup.
+	if bad := a.Explorer.Tree.Hidden.Bad; len(bad) > 0 {
+		a.status = fmt.Sprintf("%s: ignoring %d bad pattern(s): %s",
+			hidden.File, len(bad), strings.Join(bad, ", "))
+	}
 	// A finished search used to wait for the 150 ms tick, because the result is
 	// installed on the event thread and nothing woke that thread. Posting a
 	// Wake closes the gap for typing pauses, and it is the seam the agent pane
@@ -223,6 +232,13 @@ func (a *App) OpenFile(path string) {
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
+	// A Makefile whose recipe lines are indented with spaces is already broken,
+	// and make's own message names a line rather than the cause. Raj indents the
+	// next line correctly and leaves the rest alone, so without this the file
+	// stays broken silently.
+	if w := p.File.IndentWarning(); w != "" {
+		a.status = w
+	}
 	a.focus = FocusEditor
 	a.status = ""
 }
@@ -1008,6 +1024,13 @@ func (a *App) newFile() {
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
+	// A Makefile whose recipe lines are indented with spaces is already broken,
+	// and make's own message names a line rather than the cause. Raj indents the
+	// next line correctly and leaves the rest alone, so without this the file
+	// stays broken silently.
+	if w := p.File.IndentWarning(); w != "" {
+		a.status = w
+	}
 	a.focus = FocusEditor
 	a.status = ""
 }

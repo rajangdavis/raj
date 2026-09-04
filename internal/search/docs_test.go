@@ -134,7 +134,7 @@ func TestOpenDocumentsObeyTheSameFilters(t *testing.T) {
 		{"include glob", at("new.md"), Query{Text: "needle", Include: "*.go"}, 0},
 		{"include glob, matching", at("new.go"), Query{Text: "needle", Include: "*.go"}, 1},
 		{"exclude glob", at("new.go"), Query{Text: "needle", Exclude: "*.go"}, 0},
-		{"hidden file", at(".secret.go"), Query{Text: "needle"}, 0},
+		{"dotfile", at(".gitlab-ci.yml"), Query{Text: "needle"}, 1},
 		{"hidden directory", at(".git/x.go"), Query{Text: "needle"}, 0},
 		{"vendored", at("vendor/x.go"), Query{Text: "needle"}, 0},
 		{"outside the root", "/elsewhere/x.go", Query{Text: "needle"}, 0},

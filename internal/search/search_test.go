@@ -14,8 +14,9 @@ func fixture(t *testing.T) string {
 		"a.go":              "package a\nfunc Needle() {}\n",
 		"b.md":              "needle in markdown\n",
 		"sub/c.go":          "package sub\n// needle comment\n",
-		".hidden/d.go":      "needle hidden\n",
+		".git/d.go":         "needle hidden\n",
 		"node_modules/e.go": "needle vendored\n",
+		".gitlab-ci.yml":    "needle in CI config\n",
 		"bin.dat":           "needle\x00binary\n",
 	} {
 		p := filepath.Join(dir, name)
@@ -34,9 +35,21 @@ func TestRunLiteralIsCaseInsensitive(t *testing.T) {
 		t.Fatalf("got %d matches, want at least 3", len(res.Matches))
 	}
 	for _, m := range res.Matches {
-		if strings.Contains(m.Path, "node_modules") || strings.Contains(m.Path, ".hidden") {
+		if strings.Contains(m.Path, "node_modules") || strings.Contains(m.Path, ".git/") {
 			t.Errorf("should have skipped %s", m.Path)
 		}
+	}
+	// A dotfile is not automatically hidden: .gitlab-ci.yml, .github/ and the
+	// rest are files people edit, and a search that cannot see them is the bug
+	// this replaced.
+	var sawDotfile bool
+	for _, m := range res.Matches {
+		if strings.HasSuffix(m.Path, ".gitlab-ci.yml") {
+			sawDotfile = true
+		}
+	}
+	if !sawDotfile {
+		t.Error("dotfile .gitlab-ci.yml was not searched")
 	}
 }
 

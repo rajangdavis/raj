@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,8 +25,15 @@ import (
 // Letting a pane edit the session behind the file's back is how line numbers
 // silently drift.
 type File struct {
-	Path   string
-	Cols   view.Columns
+	Path string
+	Cols view.Columns
+
+	// Indent is what one press of Tab inserts, resolved at open from the
+	// format, the content and the language in that order. indentFrom records
+	// which of them answered, so a weaker default cannot contradict it.
+	Indent     Indent
+	indentFrom IndentSource
+
 	Syntax *syntax.Highlighter
 	sess   *piecetable.Session
 	idx    *view.Index
@@ -88,16 +96,62 @@ func Open(path string, tab int) (*File, error) {
 
 // NewFile wraps content that is already in memory.
 func NewFile(path, content string, tab int) *File {
+	// A tab still has to be drawn at some width, and the configured one is the
+	// only preference there is about that, so it rides along as the fallback.
+	style, from := IndentFor(path, content, Indent{Width: tab})
 	f := &File{
-		Path:   path,
-		Cols:   view.NewColumns(tab),
-		Syntax: syntax.New(path, true),
-		dark:   true,
-		sess:   piecetable.NewSession(piecetable.NewDoc(content, 0)),
-		idx:    view.NewIndex(content),
+		Path:       path,
+		Indent:     style,
+		indentFrom: from,
+		Cols:       view.NewColumns(tab),
+		Syntax:     syntax.New(path, true),
+		dark:       true,
+		sess:       piecetable.NewSession(piecetable.NewDoc(content, 0)),
+		idx:        view.NewIndex(content),
 	}
 	f.markSaved(content) // what was opened is what is on disk
 	return f
+}
+
+// SetIndentDefault applies a preference to files that had nothing to detect —
+// a new buffer, or one with no indentation yet. A file that answered for itself
+// keeps its own answer: a flag saying "tabs" must not turn a space-indented file
+// into a mixed one on the first keystroke.
+func (f *File) SetIndentDefault(i Indent) {
+	if f.indentFrom != IndentFromDefault {
+		return
+	}
+	if i.Width <= 0 {
+		i.Width = f.Indent.Width
+	}
+	f.Indent = i
+}
+
+// IndentDetected reports whether the style came from something stronger than
+// the configured default.
+func (f *File) IndentDetected() bool { return f.indentFrom != IndentFromDefault }
+
+// IndentSource reports what decided the style.
+func (f *File) IndentSource() IndentSource { return f.indentFrom }
+
+// IndentWarning describes a file whose existing indentation the format does not
+// accept. Raj indents the NEXT line correctly and leaves what is already there
+// alone — rewriting a file on open is not something an editor should do
+// unasked — so this is the only thing that tells you the rest is broken.
+func (f *File) IndentWarning() string {
+	if f.indentFrom != IndentFromFormat {
+		return ""
+	}
+	n := SpaceIndentedLines(f.Path, f.Text())
+	if n == 0 {
+		return ""
+	}
+	lines := "lines"
+	if n == 1 {
+		lines = "line"
+	}
+	return fmt.Sprintf("%s: %d %s indented with spaces; this format requires tabs",
+		filepath.Base(f.Path), n, lines)
 }
 
 func (f *File) Len() int                           { return f.sess.Buffer().Len() }
