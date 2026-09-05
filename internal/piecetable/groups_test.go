@@ -67,7 +67,7 @@ func TestRejectAnOlderGroup(t *testing.T) {
 		t.Fatalf("setup produced %q", before)
 	}
 
-	if !s.RejectGroup(first, Agent) {
+	if !s.RejectGroup(first) {
 		t.Fatal("rejecting the older group failed")
 	}
 	if got := text(s); got != "helloBBB\n" {
@@ -84,11 +84,11 @@ func TestRejectIsNotRepeatable(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "X")
 	id := s.LastGroup()
-	if !s.RejectGroup(id, Agent) {
+	if !s.RejectGroup(id) {
 		t.Fatal("first reject failed")
 	}
 	after := text(s)
-	if s.RejectGroup(id, Agent) {
+	if s.RejectGroup(id) {
 		t.Error("rejecting twice was allowed")
 	}
 	if got := text(s); got != after {
@@ -101,7 +101,7 @@ func TestAcceptDoesNotResurrectARejectedGroup(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "X")
 	id := s.LastGroup()
-	s.RejectGroup(id, Agent)
+	s.RejectGroup(id)
 	s.AcceptGroup(id)
 	if s.GroupState(id) != Rejected {
 		t.Errorf("state = %v, want it to stay rejected", s.GroupState(id))
@@ -117,7 +117,7 @@ func TestRejectedGroupsStayListed(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "X")
 	id := s.LastGroup()
-	s.RejectGroup(id, Agent)
+	s.RejectGroup(id)
 
 	var found bool
 	for _, g := range s.Groups() {
@@ -182,7 +182,7 @@ func TestPendingIgnoresRejectedGroups(t *testing.T) {
 	id := s.LastGroup()
 	s.MarkGroup(id, Proposed)
 
-	if !s.RejectGroup(id, User) {
+	if !s.RejectGroup(id) {
 		t.Fatal("reject failed")
 	}
 	if got := s.Pending(); len(got) != 0 {
@@ -211,5 +211,51 @@ func TestAcceptPendingClearsEverything(t *testing.T) {
 	}
 	if n := s.AcceptPending(); n != 0 {
 		t.Errorf("second call accepted %d, want 0", n)
+	}
+}
+
+// Rejecting is a decision about a proposal, not about a person, so it backs out
+// the whole change set — including the parts a second author contributed to it.
+//
+// This is the case the old author-selected form could not express: it took the
+// group's author and reversed only that author's members, so a group written by
+// two hands came half out.
+func TestRejectBacksOutTheWholeGroup(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Begin()
+	s.Insert(Agent, 0, "A")
+	s.Insert(User, 1, "B")
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	if got := text(s); got != "ABhello\n" {
+		t.Fatalf("setup produced %q", got)
+	}
+	if !s.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	if got := text(s); got != "hello\n" {
+		t.Errorf("after rejecting = %q, want the whole change set gone", got)
+	}
+	if got := s.Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v after rejecting, want none", got)
+	}
+}
+
+// Undo is the other half of that split, and it stays personal: pressing undo
+// must not back out a collaborator's op because it happens to share a group.
+func TestUndoInASharedGroupTouchesOnlyYourOwnOps(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Begin()
+	s.Insert(Agent, 0, "A")
+	s.Insert(User, 1, "B")
+	s.End()
+
+	if !s.Undo(User) {
+		t.Fatal("undo failed")
+	}
+	if got := text(s); got != "Ahello\n" {
+		t.Errorf("undo = %q, want only the user's insertion removed", got)
 	}
 }

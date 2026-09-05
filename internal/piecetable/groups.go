@@ -168,11 +168,18 @@ func (s *Session) AcceptPending() int {
 // It returns false when the group is not reversible — already rejected, or
 // wedged behind a later change it overlaps. False is not an error to retry: the
 // caller has to look at what happened since.
-func (s *Session) RejectGroup(id uint64, author Author) bool {
+//
+// It takes no author. It used to, and the parameter selected which members to
+// back out, which meant a caller had to already know who wrote the group and a
+// caller that passed the deciding author instead — the natural reading of
+// "reject" — silently selected nothing and got a bare false. Rejecting a change
+// set means the whole change set; who decided that is a fact about the
+// conversation, not about which ops come out of the document.
+func (s *Session) RejectGroup(id uint64) bool {
 	if s.GroupState(id) == Rejected {
 		return false
 	}
-	if !s.reverseGroup(id, author, KindUndo) {
+	if !s.reverseGroup(id, KindUndo, nil) {
 		return false
 	}
 	s.MarkGroup(id, Rejected)

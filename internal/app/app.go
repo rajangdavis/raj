@@ -1215,10 +1215,40 @@ func (a *App) ensureParent(path string, then func(saved bool), cont func()) {
 
 // writeTo names the buffer if needed and writes it.
 func (a *App) writeTo(p *editor.Pane, path string, then func(saved bool)) {
+	a.write(p, path, false, then)
+}
+
+// write is writeTo with the answer to the conflict question already given.
+// force is what an "Overwrite" answer turns into.
+func (a *App) write(p *editor.Pane, path string, force bool, then func(saved bool)) {
 	was := p.File.Path
 	renamed := was != path
 	p.File.SetPath(path)
-	if err := p.File.Save(); err != nil {
+	save := p.File.Save
+	if force {
+		save = p.File.SaveOver
+	}
+	if err := save(); err != nil {
+		// Something else wrote the file since raj read it. Saving anyway is a
+		// legitimate answer — it is often raj's own formatter or a git
+		// checkout of the same content — but it is not one to assume, because
+		// the bytes it discards are not recoverable from anywhere raj knows
+		// about. Ask, and remember the name so the retry does not re-prompt
+		// for a path.
+		if errors.Is(err, editor.ErrDiskChanged) {
+			p.File.SetPath(was)
+			a.confirm("Changed on disk",
+				filepath.Base(path)+" was modified by another program. Overwrite it with this buffer?",
+				[]string{prompt.Overwrite, prompt.Cancel}, func(ans string, ok bool) {
+					if !ok || ans != prompt.Overwrite {
+						a.status = "save cancelled — file on disk is newer"
+						report(then, false)
+						return
+					}
+					a.write(p, path, true, then)
+				})
+			return
+		}
 		// Put the name back. Leaving it set means the buffer claims a path it
 		// is not at, so the next plain save writes there without asking —
 		// which turns one visible failure into a silent one.

@@ -437,6 +437,50 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   path that had just failed, so the next plain save would write there without
   asking — turning one visible failure into a silent one.
 
+## Data loss
+
+- [x] **Saves are atomic.** `os.WriteFile` truncates before it writes, so an
+  interrupted save could leave a file that was neither the old contents nor the
+  new — usually a zero-byte one, the worst possible outcome for a save. It is
+  temp-file-and-rename now, fsynced, with the directory entry synced after. The
+  temp file goes in the target's own directory, because a rename across
+  filesystems fails and /tmp is a different filesystem often enough that saving
+  would have broken exactly on the machines that separate them.
+- [x] **A save preserves the file's mode.** A fresh temp file is 0600, so the
+  first version of the atomic write stripped the executable bit off every script
+  it saved.
+- [x] **A save follows a symlink.** Renaming onto one replaces the link with a
+  regular file, so a dotfile symlinked into a repository would have been broken
+  on its first save, leaving the real file stale.
+- [x] **A save refuses to clobber another writer.** A file rewritten under an
+  open tab by git, a formatter or an agent was silently replaced by the buffer
+  on the next cmd+s. `File` records the size and mtime it last read or wrote,
+  `Save` returns `ErrDiskChanged`, and the app asks. `SaveOver` is what the
+  affirmative answer takes.
+- [x] **Line endings and the BOM survive a save.** A CRLF file was edited as
+  though the carriage returns were text and written back with whatever mix the
+  editing produced; a UTF-8 BOM was lost on the first save. Both are silent
+  corruption of a file the user only meant to look at. Decode at open, encode at
+  save, buffer stays LF-only. The fuzz target asserting decode/encode is the
+  identity found the `\r\r\n` case in under a second: `strings.ReplaceAll` lets
+  the leftover CR join the LF it just produced and re-form a CRLF.
+- [x] **A panic on a background goroutine no longer wrecks the terminal.** Go
+  prints the trace and exits without running a single deferred call, so raj died
+  with its KKP flags still pushed and the alternate screen still up — the trace
+  printed into a screen the user could not get out of, into a shell where the
+  chords were still captured. `internal/safe` registers cleanups and recovers on
+  each background goroutine: the input decoder, the resize watcher and
+  deliverer, the tick, the tokeniser, the LSP readers, and the control server's
+  writer and handlers.
+- [x] **Rejecting a change set backs out the whole set.** `RejectGroup` took an
+  author and used it to select which members to reverse, so a caller had to
+  already know who wrote the group — and one that passed the deciding author
+  instead, which is the natural reading of "reject", matched no members and got
+  a bare false. Who decided is a fact about the conversation, not about which
+  ops leave the document. `reverseGroup` keeps the filter for undo and redo,
+  where it is load-bearing: undo is personal and must not back out a
+  collaborator's op just because it shares a group.
+
 ## Explorer
 
 - [x] **The tree scrolls horizontally, following the selection.** A name too

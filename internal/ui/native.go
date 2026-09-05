@@ -12,6 +12,8 @@ import (
 
 	"raj/internal/keys"
 	"raj/internal/term"
+
+	"raj/internal/safe"
 )
 
 // NativeHost drives a real terminal directly, owning the render loop rather
@@ -64,9 +66,9 @@ func NewNativeHost(in, out *os.File, tickRate time.Duration) (*NativeHost, error
 	h.readSize()
 	h.watchResize()
 	t.QueryTheme()
-	go h.readLoop()
+	safe.Go(h.readLoop)
 	if tickRate > 0 {
-		go h.tickLoop(tickRate)
+		safe.Go(func() { h.tickLoop(tickRate) })
 	}
 	return h, nil
 }
@@ -273,7 +275,7 @@ const escTimeout = 25 * time.Millisecond
 // well as on bytes, which is what the escape timeout needs.
 func (h *NativeHost) readLoop() {
 	chunks := make(chan []byte, 8)
-	go func() {
+	safe.Go(func() {
 		defer close(chunks)
 		chunk := make([]byte, 4096)
 		for {
@@ -287,7 +289,7 @@ func (h *NativeHost) readLoop() {
 				return
 			}
 		}
-	}()
+	})
 	h.decodeStream(chunks, escTimeout)
 }
 
@@ -407,7 +409,7 @@ func (h *NativeHost) tickLoop(d time.Duration) {
 func (h *NativeHost) watchResize() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
-	go func() {
+	safe.Go(func() {
 		for range ch {
 			h.readSize()
 			h.Invalidate()
@@ -418,8 +420,8 @@ func (h *NativeHost) watchResize() {
 			default:
 			}
 		}
-	}()
-	go h.deliverResize()
+	})
+	safe.Go(h.deliverResize)
 }
 
 // deliverResize turns the coalescing buffer into events, blocking until the

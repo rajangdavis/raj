@@ -58,6 +58,14 @@ type File struct {
 	// can rebuild it without asking the application which terminal it is in.
 	dark bool
 
+	// Enc is how the file's bytes are shaped around the text — line endings
+	// and byte order mark — so a save reproduces what was opened.
+	Enc Encoding
+
+	// disk is what the file looked like the last time raj read or wrote it,
+	// so a save can refuse to clobber another writer's work.
+	disk stamp
+
 	// applied is the version whose ops have been mirrored into the line index.
 	applied piecetable.Version
 	newline piecetable.PieceRec
@@ -91,7 +99,13 @@ func Open(path string, tab int) (*File, error) {
 	if IsBinary(string(data)) {
 		return nil, ErrBinary
 	}
-	return NewFile(path, string(data), tab), nil
+	// Decode before the file is built: indent detection, the line index and
+	// the highlighter should all see the text, not the encoding.
+	text, enc := decode(string(data))
+	f := NewFile(path, text, tab)
+	f.Enc = enc
+	f.stampDisk() // what was just read is what raj knows about
+	return f, nil
 }
 
 // NewFile wraps content that is already in memory.
@@ -378,15 +392,32 @@ func (f *File) applyToIndex(op piecetable.Op) {
 }
 
 // Save writes the document to disk and marks the current version clean.
+//
+// The write is atomic — see writeAtomic — so an interrupted save leaves the
+// previous file rather than a truncated one.
+//
+// It refuses with ErrDiskChanged if the file was written by something else
+// since raj last read or wrote it. Overwriting is still available through
+// SaveOver; what is not available is doing it without being asked.
 func (f *File) Save() error {
+	if f.DiskChanged() {
+		return ErrDiskChanged
+	}
+	return f.SaveOver()
+}
+
+// SaveOver writes unconditionally, discarding whatever else was written to the
+// file. Only for a caller that has asked and been told to go ahead.
+func (f *File) SaveOver() error {
 	if f.Path == "" {
 		return os.ErrInvalid
 	}
 	content := f.Text()
-	if err := os.WriteFile(f.Path, []byte(content), 0o644); err != nil {
+	if err := writeAtomic(f.Path, encode(content, f.Enc)); err != nil {
 		return err
 	}
 	f.markSaved(content)
+	f.stampDisk() // raj is now the last writer
 	return nil
 }
 

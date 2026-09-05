@@ -373,18 +373,35 @@ func (s *Session) reverseLatest(author Author, want OpKind) bool {
 		if (o.Kind == KindUndo) != (want == KindRedo) {
 			continue
 		}
-		return s.reverseGroup(o.Group, author, want)
+		// Only this author's members: undo is personal, and backing out a
+		// collaborator's op because it shares a group is not what the key
+		// means.
+		return s.reverseGroup(o.Group, want, byAuthor(author))
 	}
 	return false
+}
+
+// byAuthor is the member filter undo and redo use.
+func byAuthor(a Author) func(Author) bool {
+	return func(got Author) bool { return got == a }
 }
 
 // reverseGroup reverses every live member of a group, latest first so each
 // inverse lands on the document the next one expects. The inverses share one
 // group of their own, which is what lets redo reverse them as a unit.
-func (s *Session) reverseGroup(group uint64, author Author, want OpKind) bool {
+//
+// keep selects which members to reverse; nil means all of them. The two callers
+// want different things and the difference is not cosmetic. Undo is personal —
+// it must not back out an op that merely shares a group with yours — while
+// rejecting a change set means the whole set, which is the only reading under
+// which "reject" is a decision about a proposal rather than about a person.
+func (s *Session) reverseGroup(group uint64, want OpKind, keep func(Author) bool) bool {
 	var members []Op
 	for _, o := range s.journal {
-		if o.Group != group || o.Author != author || !s.live(o.Seq) {
+		if o.Group != group || !s.live(o.Seq) {
+			continue
+		}
+		if keep != nil && !keep(o.Author) {
 			continue
 		}
 		if (o.Kind == KindUndo) != (want == KindRedo) {

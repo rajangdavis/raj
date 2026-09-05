@@ -43,6 +43,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"raj/internal/safe"
 )
 
 // Hunk is a replacement of [Start,End) with Text, in bytes, against the version
@@ -481,14 +483,14 @@ func (s *Server) serve(conn net.Conn) {
 	// writes would interleave two frames into one unparseable stream.
 	out := make(chan outFrame, 64)
 	done := make(chan struct{})
-	go func() {
+	safe.Go(func() {
 		defer close(done)
 		for f := range out {
 			if WriteFrame(conn, f.h, f.body) != nil {
 				return
 			}
 		}
-	}()
+	})
 
 	c := &connection{srv: s, out: out, author: author, running: map[int]context.CancelFunc{}}
 	r := bufio.NewReader(conn)
@@ -547,7 +549,7 @@ func (s *Server) serve(conn net.Conn) {
 			req.Author = author
 		}
 		wg.Add(1)
-		go func() { defer wg.Done(); c.handle(req) }()
+		safe.Go(func() { defer wg.Done(); c.handle(req) })
 	}
 	c.cancelAll()
 	wg.Wait()

@@ -186,6 +186,36 @@ findings and decisions live in INVESTIGATIONS.md.
   multicore box: the figures above come from one core, where a pool shows
   nothing.
 
+## Saving and files
+
+The write path is atomic and refuses to clobber another writer; what is left is
+the follow-ups that were deliberately kept out of that change.
+
+- [ ] **Reload as a third answer to the conflict prompt.** Overwrite or Cancel
+  is what "changed on disk" offers today, and Cancel leaves the user holding a
+  buffer they still cannot save. Reload is the right third option and it is not
+  a one-liner: the pane's cursors are byte offsets into text that is about to be
+  replaced, so it needs the same carry-the-cursors treatment undo already has,
+  and a decision about what happens to the undo journal of a buffer whose
+  original is gone.
+- [ ] **Notice the change before the save.** `File.DiskChanged` is only consulted
+  when you press save, so a file rewritten under an open tab looks untouched
+  until then. The idle tick could ask — it is one stat per open tab — and mark
+  the tab, which is also what turns the prompt from a surprise into a
+  confirmation.
+- [ ] **Owner and group are not preserved.** The temp-and-rename write copies
+  the mode but not the uid or gid, so saving a file owned by someone else, as
+  root, silently reassigns it. Needs a `Chown` from the stat, and a decision
+  about the ordinary case where the chown will fail for want of privilege.
+- [ ] **Nothing is verified after the rename.** The write is atomic and fsynced,
+  so a torn file is not the failure mode, but a filesystem that reports success
+  and drops the bytes is not detected either. A read-back-and-compare on save is
+  cheap for the file sizes raj opens and would make "saved" mean it.
+- [ ] **Encoding is LF, CRLF and a BOM, and nothing else.** UTF-16 and the
+  legacy single-byte encodings are read as bytes and will be mangled on save.
+  The binary sniffer catches UTF-16 with NULs in it, which is most of it, but
+  that is a side effect rather than a decision.
+
 ## Buffer
 
 - [ ] **Compaction.** Merge adjacent same-author pieces; only flatten spans that
@@ -380,6 +410,11 @@ missing is addressing and state.
 
 ## Known rough edges
 
+- [ ] **No CI.** `go build`, `go vet`, `gofmt -l`, `go test ./...` and
+  `go test -race ./...` all pass, and nothing enforces that they keep passing.
+  `internal/control/mailbox.go` and `internal/control/wire.go` are unformatted
+  right now, which is exactly the class of thing a job would have caught the day
+  it landed.
 - [ ] **Display width table is hand-rolled**; suspect it first if the caret
   drifts. Narrowed: TODO.md holds three runes README.md does not — en-dash,
   em-dash, and `↔` U+2194, all East Asian Ambiguous, and raj calls all three

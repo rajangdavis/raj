@@ -28,6 +28,11 @@ internal/piecetable  leaf-embedded B-tree from the benchmark harness, plus
 internal/view        line index (fuzzed vs rescan), columns, viewport, wrapping.
 internal/editor      file, cursors, motions, actions, render, binary sniffing,
                      auto-indent and bracket pairing on the keystroke path.
+                     Atomic saves, a stat guard against another writer, and
+                     line-ending/BOM round tripping.
+internal/safe        cleanups that run when a background goroutine panics, so a
+                     crash off the main thread does not leave the terminal in
+                     the alternate screen with raj's key flags still pushed.
 internal/widget      inputs, lists, boxes, the focus vocabulary. Caret
                      placement from a display column is fuzzed against the
                      renderer's own width function.
@@ -91,6 +96,28 @@ A session is a hint, never an instruction. Every field is re-checked against the
 world as found — deleted files are dropped, a cursor past the end of a shrunken
 file is reset, paths outside the workspace are refused — because failing to
 start over a corrupt scratch file is a far worse outcome than a lost scroll.
+
+## Saving
+
+A save writes a temp file beside the target, fsyncs it, and renames over it, so
+an interrupted write leaves the previous file rather than a truncated one. The
+target's mode is copied onto the new file, so a script stays executable, and
+symlinks are resolved first, so editing a linked dotfile writes through the link
+instead of replacing it.
+
+A save is refused if the file changed on disk since raj read or wrote it — a git
+checkout, a formatter, an agent, a second editor — and you are asked before
+anything is overwritten. raj compares size and modification time, not a digest,
+because the check runs on every save.
+
+Line endings and a UTF-8 BOM survive a round trip. The buffer holds LF-only text
+so that nothing above it — the line index, the wrap engine, every column
+calculation — has to know an ending can be two bytes; the shape of the file is
+recorded at open and put back at save. A file with mixed endings cannot be
+reproduced byte for byte, so raj says which ending it will write rather than
+quietly rewriting half the lines.
+
+Buffer contents are still not persisted across a crash; see Sessions above.
 
 ## Control socket
 

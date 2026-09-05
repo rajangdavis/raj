@@ -29,6 +29,8 @@ import (
 	"raj/internal/keys"
 	"raj/internal/probe"
 	"raj/internal/ui"
+
+	"raj/internal/safe"
 )
 
 func main() {
@@ -118,6 +120,11 @@ func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlAddr string
 	// exits without popping the KKP flags leaves a shell where cmd+w does
 	// nothing and there is no obvious way out.
 	defer host.Close()
+	// And on a panic anywhere else. A panic on a background goroutine — the
+	// input decoder, the resize watcher, the tokeniser — skips every deferred
+	// call in the program, so without this the trace is printed into an
+	// alternate screen the user is then stuck in.
+	safe.OnPanic(func() { host.Close() })
 
 	a := app.New(host, root, tab)
 	// A named file takes the focus; otherwise raj opens in the explorer, since

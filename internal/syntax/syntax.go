@@ -27,6 +27,8 @@ import (
 	"github.com/alecthomas/chroma/v2/lexers"
 
 	"raj/internal/ui"
+
+	"raj/internal/safe"
 )
 
 // MaxSize is the largest document raj will highlight. Above it, tokenising
@@ -162,7 +164,7 @@ func (h *Highlighter) start(text string, ver uint64) {
 		}
 	}
 	h.replay = keep
-	go h.tokenise(text, ver)
+	safe.Go(func() { h.tokenise(text, ver) })
 }
 
 // Line returns the spans currently known for a line. It never blocks and never

@@ -349,17 +349,16 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 		sess.AcceptGroup(group)
 		return nil
 	}
-	var author piecetable.Author
 	var found bool
 	for _, g := range sess.Groups() {
 		if g.ID == group {
-			author, found = g.Author, true
+			found = true
 		}
 	}
 	if !found {
 		return fmt.Errorf("no change set %d in %s", group, path)
 	}
-	if !sess.RejectGroup(group, author) {
+	if !sess.RejectGroup(group) {
 		return fmt.Errorf("change set %d could not be backed out: later edits "+
 			"overlap it, so removing it would leave text nobody wrote", group)
 	}

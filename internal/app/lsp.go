@@ -11,6 +11,8 @@ import (
 	"raj/internal/editor"
 	"raj/internal/lsp"
 	"raj/internal/ui"
+
+	"raj/internal/safe"
 )
 
 // Language server integration.
@@ -384,7 +386,7 @@ func (a *App) hover() {
 	// would anchor the box to wherever it had got to.
 	line, col := p.File.LineCol(head)
 
-	go func() {
+	safe.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		h, err := lsp.RequestHover(ctx, conn, path, pos)
@@ -393,7 +395,7 @@ func (a *App) hover() {
 			text = h.Text
 		}
 		a.park(lspAnswer{gen: gen, kind: answerHover, text: text, line: line, col: col})
-	}()
+	})
 }
 
 // gotoDefinition jumps to where the thing under the cursor is defined.
@@ -418,12 +420,12 @@ func (a *App) gotoDefinition() {
 	pos := lsp.NewDocument(p.File.Text()).Position(head)
 	conn := ls.srv.Conn()
 
-	go func() {
+	safe.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		locs, _ := lsp.RequestDefinition(ctx, conn, path, pos)
 		a.park(lspAnswer{gen: gen, kind: answerDefinition, locs: locs})
-	}()
+	})
 }
 
 // applyHover shows an answer, if it is still the answer to the current question.
@@ -480,7 +482,7 @@ func (a *App) requestCompletion(p *editor.Pane, prefix string, line, col int) {
 	pos := lsp.NewDocument(p.File.Text()).Position(p.Cursors.Primary().Head)
 	conn := ls.srv.Conn()
 
-	go func() {
+	safe.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		items, incomplete, err := lsp.Completions(ctx, conn, path, pos)
@@ -491,7 +493,7 @@ func (a *App) requestCompletion(p *editor.Pane, prefix string, line, col int) {
 			gen: gen, kind: answerCompletion, items: items, prefix: prefix,
 			incomplete: incomplete, line: line, col: col,
 		})
-	}()
+	})
 }
 
 // parkCompletion stores a completion answer. It uses the same slot as the other
