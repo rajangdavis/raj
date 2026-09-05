@@ -128,6 +128,35 @@ func (s *Session) Groups() []Group {
 	return out
 }
 
+// Pending lists the change sets still awaiting a decision, oldest first.
+//
+// A proposed group whose members have all been reversed is not pending: there
+// is nothing left in the text to agree to, and reporting it would block a save
+// on a change that is not there.
+func (s *Session) Pending() []Group {
+	var out []Group
+	for _, g := range s.Groups() {
+		if g.State == Proposed && g.Ops > 0 {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// AcceptPending agrees to every change set awaiting a decision and reports how
+// many there were.
+//
+// This is the bulk form, for the one gesture that means "all of it": the user
+// saving the file. Accepting is not an edit — the text is already in the
+// document — so this cannot fail and cannot conflict.
+func (s *Session) AcceptPending() int {
+	pending := s.Pending()
+	for _, g := range pending {
+		s.AcceptGroup(g.ID)
+	}
+	return len(pending)
+}
+
 // RejectGroup backs a change set out and records the decision.
 //
 // This is undo addressed by group rather than by recency, which is what lets a

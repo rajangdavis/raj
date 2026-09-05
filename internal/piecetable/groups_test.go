@@ -148,3 +148,68 @@ func TestUndoOpsAreNotGroups(t *testing.T) {
 		t.Errorf("groups = %d after undo, want %d", got, before)
 	}
 }
+
+// Pending is what a save has to consult: the change sets still awaiting a
+// decision, and only those.
+func TestPendingListsOnlyUndecidedGroups(t *testing.T) {
+	s := groupSession(t, "hello\n")
+
+	s.Insert(User, 0, "A") // the user typing: accepted by default
+	s.Insert(Agent, 0, "B")
+	proposed := s.LastGroup()
+	s.MarkGroup(proposed, Proposed)
+
+	pending := s.Pending()
+	if len(pending) != 1 {
+		t.Fatalf("pending = %+v, want just the proposed group", pending)
+	}
+	if pending[0].ID != proposed {
+		t.Errorf("pending group = %d, want %d", pending[0].ID, proposed)
+	}
+
+	s.AcceptGroup(proposed)
+	if got := s.Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v after accepting, want none", got)
+	}
+}
+
+// A proposed group that has been rejected is no longer pending. Its ops are in
+// the journal — that is append-only — but they are not in the text, so blocking
+// a save on it would block on a change nobody can see.
+func TestPendingIgnoresRejectedGroups(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Insert(Agent, 0, "B")
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	if !s.RejectGroup(id, User) {
+		t.Fatal("reject failed")
+	}
+	if got := s.Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v after rejecting, want none", got)
+	}
+}
+
+// AcceptPending is the bulk form the user's save uses. It clears everything and
+// says how much it cleared, and it leaves the text alone.
+func TestAcceptPendingClearsEverything(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	for i := 0; i < 3; i++ {
+		s.Insert(Agent, 0, "x")
+		s.MarkGroup(s.LastGroup(), Proposed)
+	}
+	before := text(s)
+
+	if n := s.AcceptPending(); n != 3 {
+		t.Errorf("accepted %d, want 3", n)
+	}
+	if got := s.Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v, want none", got)
+	}
+	if got := text(s); got != before {
+		t.Errorf("accepting changed the text: %q, want %q", got, before)
+	}
+	if n := s.AcceptPending(); n != 0 {
+		t.Errorf("second call accepted %d, want 0", n)
+	}
+}

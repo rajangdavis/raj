@@ -235,3 +235,61 @@ func TestMoveLinesBlock(t *testing.T) {
 		t.Errorf("text = %q, want the block moved down", got)
 	}
 }
+
+// The selection has to survive the move. Collapsing it means the second press
+// sees one line where the block was, and the block comes apart.
+func TestMoveLinesKeepsSelection(t *testing.T) {
+	p := newTestPane("1\n2\n3\n4\n5")
+	p.Cursors.Set(3, 0) // lines 0 and 1
+
+	p.MoveLines(+1)
+	c := p.Cursors.Primary()
+	if !c.HasSelection() {
+		t.Fatal("selection collapsed after one move")
+	}
+	lo, hi := c.Range()
+	if got := p.File.Slice(lo, hi-lo); got != "1\n2" {
+		t.Fatalf("selection covers %q, want the block it started on", got)
+	}
+
+	p.MoveLines(+1)
+	if got := p.File.Text(); got != "3\n4\n1\n2\n5" {
+		t.Fatalf("text = %q, want the block moved twice", got)
+	}
+}
+
+// Moving down and back must be the identity, for the text and for the cursors.
+// This is the property that the tearing bug violated: the text was recoverable
+// but the selection was not, so the second round trip moved something else.
+func TestMoveLinesRoundTrip(t *testing.T) {
+	const start = "1\n2\n3\n4\n5\n6"
+	for _, n := range []int{1, 2, 3} {
+		p := newTestPane(start)
+		p.Cursors.Set(3, 0) // lines 0 and 1
+		before := p.Cursors.Primary()
+
+		for i := 0; i < n; i++ {
+			p.MoveLines(+1)
+		}
+		for i := 0; i < n; i++ {
+			p.MoveLines(-1)
+		}
+
+		if got := p.File.Text(); got != start {
+			t.Errorf("n=%d: text = %q, want %q", n, got, start)
+		}
+		if got := p.Cursors.Primary(); got.Head != before.Head || got.Anchor != before.Anchor {
+			t.Errorf("n=%d: cursor = %+v, want %+v", n, got, before)
+		}
+	}
+}
+
+// A single cursor with no selection still comes back collapsed.
+func TestMoveLinesBareCursorStaysCollapsed(t *testing.T) {
+	p := newTestPane("aaa\nbbb\nccc")
+	p.Cursors.Set(5, 5)
+	p.MoveLines(+1)
+	if p.Cursors.Primary().HasSelection() {
+		t.Error("a bare cursor grew a selection")
+	}
+}

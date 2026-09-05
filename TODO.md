@@ -83,6 +83,14 @@ findings and decisions live in INVESTIGATIONS.md.
   tick while a drag is held would fix it and means either a second timer or a
   variable tick rate — the current one exists for idle work and 150 ms is right
   for that.
+- [ ] **`touchedLines` includes a line the selection only touches at column 0.**
+  It calls `LineOf(hi)` unconditionally, so dragging from line 1 to the start of
+  line 3 reports three lines and `alt+down` moves a line the user never
+  highlighted. Sublime and VS Code exclude it. The condition is one line; what
+  makes it more than that is the blast radius — `touchedLines` also feeds
+  indent, comment-toggle and `CopyLines`, and the same exclusion is right for
+  all four, so it wants its own commit and its own tests rather than riding
+  along with a cursor fix.
 - [ ] **A press on a list does not drag it.** Clicking selects, and holding and
   moving does nothing — neither rubber-band selection nor drag-to-reorder for
   tabs. Both are real gestures a list can carry and neither has an obvious
@@ -228,6 +236,23 @@ missing is addressing and state.
   `RejectGroup`, and `groups`/`accept`/`reject` over the socket. An agent apply
   is marked proposed; the user's typing is not. Rejection is undo addressed by
   group, so an older change can go while newer ones stay. What is left:
+~~Proposed text could still reach disk~~ — `host.Save` refuses while any change
+  set in the buffer is proposed, and the user's own save accepts everything
+  pending in that file. So an agent cannot commit its own work, and the human
+  gesture that writes the file is the approval. Two things that leaves open:
+- [ ] **The user's save is all-or-nothing and silent.** cmd+s accepts every
+  pending change set in the buffer and says so afterwards in the status line,
+  which is approval by gesture rather than by review — the user is told what
+  they agreed to, not asked. A confirmation naming the count before writing is
+  the small version; per-hunk review is the real one, and it needs the ranges
+  below.
+- [ ] **There is no in-editor accept or reject.** `host.Decide` is reachable
+  only over the socket, so the only way to reject an agent's change from the
+  keyboard is undo, which is per-author and not addressed by group. This wants
+  an action pair in `keys`, which means chords, and the chord budget is the
+  scarce thing here — worth deciding alongside the diff-style rendering below
+  rather than separately, since a review UI with no way to see what is pending
+  is half a feature either way.
 - [ ] **A rejected group can be wedged.** If a later edit overlaps it, the
   members cannot be rebased out and the whole thing rolls back — correctly, but
   the caller is told only that it failed. It should be told what overlapped, so
@@ -325,10 +350,27 @@ missing is addressing and state.
   would stop the user and a driver being told they both own a span in the first
   place. The conflict report carries the version that invalidated the range, so
   the information a lease needs is already on the wire.
-- [ ] **No notifications.** The protocol is request/response only, so a driver
-  wanting to know the user has typed must poll `buffers`. A subscribe op would
-  need the event thread to push, which is the one direction the park-and-reply
-  shape does not cover.
+~~No way for the user to speak to a driver~~ — `recv` parks until there is
+  something to say, `Server.Send` and `App.Tell` post into a per-participant
+  mailbox, and messages keep across a reconnect because the mailbox is keyed on
+  the durable author id. No push and no subscription state: the request/response
+  shape holds, the request just does not answer yet. What is left of it:
+- [ ] **Nothing in the editor calls `App.Tell`.** The transport, the CLI and the
+  tests are there; the chord and the prompt are not. A binding is a claim on a
+  chord the terminal then stops delivering to anything else, so it belongs in
+  the same pass as the accept/reject bindings rather than being spent
+  separately — and the two want the same picker when more than one driver is
+  connected.
+- [ ] **A full mailbox is reported to nobody.** `Post` refuses the seventeenth
+  unread message and returns an error, which is right, but with no caller in
+  the editor there is nothing to put it in the status line. Same blocker as
+  above.
+- [ ] **Still no notifications for buffer changes.** A driver wanting to know
+  the user has typed must poll `buffers`. The mailbox deliberately does not
+  generalise to this: messages are discrete, rare, and must not be coalesced,
+  where buffer changes are none of those. A `subscribe` op wants a version
+  cursor and a recovery story for a slow reader, and `OpsSince` is the right
+  basis — push only "the version is now V" and let the client fetch.
 - [ ] **`apply` cannot create or reach an unopened file.** `open` puts a path in
   a tab first, which also puts it in front of the user — deliberately, since an
   editor silently editing files you cannot see is worse than one extra call.
@@ -359,6 +401,16 @@ missing is addressing and state.
   handles it — so implementing one without unlisting it breaks the build, and
   so does binding a fourth without noticing. `CursorUndo` was found that way
   rather than by anyone noticing.
+- [ ] **Every OSC raj sends is swallowed under tmux.** tmux terminates the
+  escape stream, so OSC 1337 SetProfile never reaches iTerm2 and OSC 52 never
+  reaches the clipboard — which means a tmux session gets none of the iTerm2 key
+  mappings, because the profile it needs is never switched to. The escape hatch
+  today is `RAJ_ITERM_PROFILE=` plus installing the mappings into the everyday
+  profile. The fix is DCS passthrough: with `$TMUX` set, wrap the payload as
+  `ESC P tmux; <ESCs doubled> ESC \`, which needs `allow-passthrough on` on the
+  tmux side. It belongs in one place — everything raj emits goes through `term`
+  and `ui.native` — and it should be a wrapper on the writer rather than a
+  condition at each call site, or the next OSC added will miss it.
 - [ ] **Profile switching in iTerm2 is not clean.** raj switches profile on
   entry with OSC 1337 and restores on exit, but installing the profile is still
   a manual step and the switch is visible. Autoloading — write the generated

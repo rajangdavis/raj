@@ -60,6 +60,33 @@ func (a *App) ControlPath() string {
 	return a.control.Path()
 }
 
+// Tell sends the user's message to a connected driver.
+//
+// Safe to call from the event thread, which is the only place it is called
+// from: posting to a mailbox never blocks, and the driver's parked recv is
+// woken on its own goroutine. Nothing here waits for the driver to read it.
+//
+// This is the whole editor-side surface, deliberately small. What is missing
+// above it is a chord and a prompt — see TODO.md — and leaving that out is not
+// an oversight: a binding is a claim on a chord the terminal then stops
+// delivering to anything else, and that is a decision about the keymap rather
+// than about messaging.
+func (a *App) Tell(to uint8, text string) error {
+	if a.control == nil {
+		return fmt.Errorf("no control listener; start raj with --control")
+	}
+	return a.control.Send(to, text)
+}
+
+// Drivers lists who can be told something. Empty when nothing has ever
+// connected, which is the case a prompt should refuse rather than ask about.
+func (a *App) Drivers() []control.Participant {
+	if a.control == nil {
+		return nil
+	}
+	return a.control.Drivers()
+}
+
 // StopControl stops listening, and removes the socket if there was one. Called on the way out.
 func (a *App) StopControl() {
 	if a.control != nil {
@@ -343,10 +370,25 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 
 // Save is deliberately its own verb: a caller that edits and saves in one step
 // gives the user no moment to look at what arrived before it is on disk.
+//
+// Being its own verb was not enough on its own. Two calls in a row is still no
+// moment at all, so a caller whose changes are still proposed is refused here.
+// The buffer keeps the text — it is in the document, tinted, exactly where the
+// user can see it — and only the user's own save writes it out.
+//
+// The refusal is deliberately not conditional on who is asking. An agent that
+// has had its work accepted can save; one that has not, cannot; and a human
+// second participant is subject to the same rule for the same reason. What
+// makes a save legitimate is that somebody agreed to the change, not which
+// table row the caller occupies.
 func (h host) Save(path string) (uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return 0, err
+	}
+	if pending := p.File.Session().Pending(); len(pending) > 0 {
+		return 0, fmt.Errorf("%d proposed change set(s) await the user's approval; "+
+			"the edit is in the buffer and will reach disk when they save", len(pending))
 	}
 	if err := p.File.Save(); err != nil {
 		return 0, err

@@ -38,6 +38,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -219,6 +220,9 @@ type Response struct {
 	Stats        ExecStats
 	Participants []Participant
 	Groups       []Group
+	// Messages is what recv returns: everything the user has said to this
+	// participant since it last asked.
+	Messages []Message
 	// Stream is output from a running command: 1 stdout, 2 stderr.
 	Stream uint8
 	// Out is the bytes of a Stream frame.
@@ -283,6 +287,14 @@ type Server struct {
 	// harness reconnecting is the same writer it was before.
 	Participants *Registry
 
+	// Mail carries messages from the user to a connected driver. It is on the
+	// server rather than behind the Host interface because nothing about it
+	// touches the document: the editor posts from the event thread and never
+	// blocks, and a parked recv reads on its own connection goroutine. Routing
+	// it through the event thread would mean parking a request there, which is
+	// the one thing that layer must never do.
+	Mail Mailbox
+
 	// AllowRemoteExec permits `exec` from a TCP client. Off by default, and
 	// deliberately: an agent in a container asking the editor to run a command
 	// gets it run in the editor's process, on the host, outside the sandbox
@@ -302,6 +314,43 @@ type Server struct {
 	anon   int
 	queue  []*Pending
 	closed bool
+}
+
+// Send queues a message from the person at the keyboard to a participant.
+//
+// The editor's half of the mailbox. It is here rather than on Mailbox so that
+// the checks live with the registry that can answer them: a message addressed
+// to an id nobody holds is a bug worth reporting, not an entry in a map that
+// nothing will ever read.
+//
+// A disconnected recipient is allowed on purpose. Its mailbox is keyed on the
+// author id, which is durable across reconnects, so telling a harness something
+// while it is restarting is delivered when it comes back rather than lost.
+func (s *Server) Send(to uint8, text string) error {
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("nothing to send")
+	}
+	p, ok := s.Participants.Get(to)
+	if !ok {
+		return fmt.Errorf("no participant with author id %d", to)
+	}
+	if p.Kind != KindAgent {
+		return fmt.Errorf("%s is not a driver", p.Name)
+	}
+	return s.Mail.Post(to, Message{From: AuthorUser, Text: text})
+}
+
+// Drivers lists the participants a message can be sent to, connected first.
+// The disconnected are still listed, because their mail keeps.
+func (s *Server) Drivers() []Participant {
+	var out []Participant
+	for _, p := range s.Participants.List() {
+		if p.Kind == KindAgent {
+			out = append(out, p)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Connected && !out[j].Connected })
+	return out
 }
 
 // DefaultPath is the Unix socket for this process: one per raj, so two editors do
@@ -574,10 +623,48 @@ func (c *connection) handle(req Request) {
 	case "exec":
 		c.exec(req)
 		return
+	case "recv":
+		c.recv(req)
+		return
 	}
 	res := c.srv.submit(req)
 	res.Final = true
 	c.send(res)
+}
+
+// recv parks until the user has something to say to this connection.
+//
+// It never reaches the event thread. There is nothing to ask the editor — the
+// mailbox is on the server and the editor writes into it — and a request that
+// parked on the event thread would park the editor with it.
+//
+// The recipient is the connection's own author id, read at the moment it parks.
+// A connection that says `hello` afterwards has changed identity, and the fix
+// for that is to say hello first, which every driver does anyway: rebinding a
+// request that is already waiting would deliver one participant's mail to
+// another.
+func (c *connection) recv(req Request) {
+	ctx, stop := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.running[req.ID] = stop
+	to := c.author
+	c.mu.Unlock()
+	defer func() {
+		stop()
+		c.mu.Lock()
+		delete(c.running, req.ID)
+		c.mu.Unlock()
+	}()
+
+	msgs, ok := c.srv.Mail.Wait(ctx, to)
+	if !ok {
+		// Cancelled, or the connection went away. Answered rather than
+		// dropped: a client that cancelled is waiting for the frame that says
+		// its id is finished, and one that hung up will never see this.
+		c.send(Response{ID: req.ID, Err: "cancelled", Final: true})
+		return
+	}
+	c.send(Response{ID: req.ID, OK: true, Final: true, Messages: msgs})
 }
 
 // exec runs a command, in the same two phases as search: the decision is made

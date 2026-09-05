@@ -107,7 +107,15 @@ type Header struct {
 	Stats        ExecStats     `json:"stats,omitempty"`
 	Participants []Participant `json:"participants,omitempty"`
 	Groups       []Group       `json:"groups,omitempty"`
-	Stream       uint8         `json:"stream,omitempty"`
+
+	// Messages is what a parked recv answers with. They stay in the header
+	// rather than moving to the body: a message is text a person typed into a
+	// prompt, not document bytes off a disk, so it is valid UTF-8 by
+	// construction and legible in a frame dump is worth more than a length
+	// prefix here.
+	Messages []Message `json:"messages,omitempty"`
+
+	Stream uint8 `json:"stream,omitempty"`
 	OutLen       int           `json:"out_len,omitempty"`
 
 	// Final marks the last frame of a response. A streamed result is several
@@ -298,7 +306,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Version: res.Version, Buffers: res.Buffers, Conflicts: res.Conflicts,
 		Files: res.Files, Capped: res.Capped, Final: res.Final, Author: res.Author,
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
-		Participants: res.Participants, Groups: res.Groups}
+		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages}
 	var body []byte
 	if res.Stream != 0 {
 		// Command output is bytes off a pipe: whatever the process wrote, not
@@ -326,7 +334,8 @@ func DecodeResponse(f Frame) (Response, error) {
 		Files: f.Header.Files, Capped: f.Header.Capped, Final: f.Header.Final,
 		Author: f.Header.Author, Exit: f.Header.Exit, Dirty: f.Header.Dirty,
 		Stats: f.Header.Stats, Stream: f.Header.Stream,
-		Participants: f.Header.Participants, Groups: f.Header.Groups}
+		Participants: f.Header.Participants, Groups: f.Header.Groups,
+		Messages: f.Header.Messages}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

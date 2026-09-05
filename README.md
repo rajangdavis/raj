@@ -102,10 +102,16 @@ crash in it is not a crash in the thing holding your unsaved work.
 Length-prefixed frames, a JSON header and a raw body — so document bytes cross
 unencoded and a frame is still readable in a dump. Ops: `ping`, `buffers`,
 `open`, `text`, `version`, `apply`, `save`, `search`, `exec`, `groups`,
-`accept`, `reject`, `hello`, `cancel`. The path defaults to
+`accept`, `reject`, `hello`, `cancel`, `recv`. The path defaults to
 `$XDG_RUNTIME_DIR/raj/<pid>.sock` and is printed on stderr at startup;
 `--control-socket PATH` puts it somewhere you choose. `raj ctl` is the
 command-line client.
+
+`recv` is the one op that goes the other way. The protocol has no push, so it
+is an ordinary request that parks until the user has something to say, and
+`raj ctl recv` blocks until they do. Messages are addressed to a participant
+rather than to a connection, so one sent while a driver was restarting is
+delivered when it comes back.
 
 `apply` requires the `base` version it was written against. Hunks are rebased
 onto the current buffer and rejected individually, so an edit written against a
@@ -210,6 +216,17 @@ You can build the cli with
 ```
 $ go build ./cmd/raj
 ```
+
+On macOS, use Go 1.24 or newer. Older toolchains omit `LC_UUID` when linking
+internally, and macOS identifies a binary by that UUID when it remembers a
+granted permission — so on macOS 15 and later the local-network access the
+`--control-addr` listener needs is asked for again every launch and never
+sticks. The symptom looks like a networking bug rather than a build one, which
+is what makes it worth stating here. `dwarfdump -u ./raj` should print a UUID;
+if it prints nothing, the toolchain is too old. Building with
+`-ldflags="-linkmode=external"` works around it on any version, and
+`CGO_ENABLED=0` makes it worse rather than better, since that forces the
+internal linking that drops the UUID in the first place.
 
 And call it with:
 

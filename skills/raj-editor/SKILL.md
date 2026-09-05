@@ -53,9 +53,41 @@ RAJ_CONTROL_TOKEN=<the token raj printed when it started>
 
 If `raj ctl buffers` fails with `no running raj found`, the address is not set
 and there is nothing you can guess — the port and the token are on the other
-side of the boundary. Say so, tell the user to start raj with
-`--control-addr tcp://0.0.0.0:7391` and pass the two variables into your
-sandbox, and use your normal file tools in the meantime.
+side of the boundary. Use your normal file tools in the meantime, and give the
+user the setup below rather than a vague instruction to "enable the socket".
+
+### The setup, to hand to the user
+
+No tmux, and no raj inside the container. raj stays in the user's own terminal
+because that is the only place its chords are delivered — a raj under tmux loses
+them, and a raj inside the container never sees them at all.
+
+On their machine, in the workspace:
+
+```
+export RAJ_CONTROL_TOKEN=$(openssl rand -hex 32)
+raj --control-addr tcp://127.0.0.1:7391 .
+```
+
+Then the sandbox, with the same token:
+
+```
+docker run --add-host=host.docker.internal:host-gateway \
+  -e RAJ_CONTROL_ADDR=tcp://host.docker.internal:7391 \
+  -e RAJ_CONTROL_TOKEN="$RAJ_CONTROL_TOKEN" \
+  -v "$PWD:/workspace" -w /workspace <image>
+```
+
+`--add-host` is what makes the host's loopback port reachable from inside; the
+container's own `127.0.0.1` is its own. If that still cannot connect, the bind
+has to widen to `tcp://0.0.0.0:7391`, and raj will warn that the port is no
+longer loopback-only. The warning is worth repeating to the user rather than
+talking them past: the frames carry their unsaved work in plaintext, which is a
+fine trade for a container bridge on a laptop and a bad one on a shared network.
+
+The token is printed to stderr once when raj starts and stored nowhere, so a
+user who has scrolled past it has to restart. Setting `RAJ_CONTROL_TOKEN`
+before starting raj, as above, is what makes it reproducible.
 
 **Use the paths you can see.** `raj ctl` translates between your filesystem and
 the editor's, so if the repository is `/workspace` to you and
@@ -182,6 +214,39 @@ restart makes you a different writer and orphans your earlier edits.
 `raj ctl who` lists everyone writing in this workspace. When more than one agent
 is connected, that is how you tell whose text is whose.
 
+## Listening for the user
+
+The user can send you a message from inside the editor while you are working.
+It arrives here:
+
+```
+raj ctl recv                 # waits until they say something, then prints it
+raj ctl recv -wait 5s        # gives up after five seconds; exit 3 means nothing
+raj ctl recv -json           # the messages as JSON
+```
+
+`recv` blocks. That is the point — there is no polling to do and no interval to
+pick. Exit 0 with output means they said something, exit 3 means the wait
+elapsed with nothing, and anything else is an ordinary failure.
+
+Check it at natural pauses: between steps of a long task, after a test run,
+before starting something expensive. A message is the user redirecting you, so
+read it before committing to the next thing rather than after.
+
+Two things to get right:
+
+- **Say `hello` with the same identity everywhere.** The mailbox belongs to your
+  participant, not to a connection. `raj ctl recv` does this for you from
+  `-as` or `RAJ_IDENTITY`; if those differ between calls you are a different
+  participant each time and will wait on an empty mailbox forever.
+- **Messages keep while you are gone.** Anything said while you were restarting
+  is delivered when you come back, so a `recv` after a reconnect may return
+  several at once, oldest first.
+
+If you are speaking the protocol directly rather than through `raj ctl`, park
+`recv` on a second connection: a client serialises its requests, so a parked
+recv on the same one blocks every other verb.
+
 ## Your edits are attributed, not merged in
 
 Text you write is stored as your own pieces in the editor's document, tagged
@@ -213,21 +278,35 @@ decide your own edit was wrong, rather than computing a reverse diff, which
 would leave both edits in the record. It can fail if a later edit overlaps
 yours; that is not retryable, so re-read and propose against the current text.
 
-Leave accepting to the user. It is their decision, and the text is already there
-either way.
+Leave accepting to the user. It is their decision, the text is already there
+either way, and it is what unlocks saving the file — see below.
 
 ## Saving
 
-Nothing you write reaches the file until this runs:
+**You cannot save your own unapproved work, and should not try.** While your
+change set is still proposed, `raj ctl save` is refused:
 
 ```
 raj ctl save /abs/path/to/file.go
+raj: 1 proposed change set(s) await the user's approval; the edit is in the
+     buffer and will reach disk when they save
 ```
 
-That is deliberate. The edit lives in the buffer, attributed and visible, where
-the user can look at it and reject it. Leave it unsaved unless the user asked
-you to save, or you need the bytes on disk to run something against them — an
-unsaved change they can reject beats a saved file they have to revert.
+That is the design, not a misconfiguration. The edit lives in the buffer,
+attributed and visible, and the user's own save is what puts it on disk — their
+save accepts everything pending in that file at once. Do not go looking for a
+way around it, and in particular do not accept your own change set to unblock a
+save: `accept` exists for the user's decision, and using it on your own work
+converts their review into a formality.
+
+Two cases where the save legitimately goes through, and both are worth naming
+rather than assuming:
+
+- The user accepted your change, in the editor or with `raj ctl accept`. Then
+  there is nothing pending and the save is ordinary.
+- You need the bytes on disk to run something against them. Say so and ask,
+  rather than saving; and remember `exec` already tells you which buffers are
+  stale, so you often do not need the save at all.
 
 ## Running commands
 
@@ -272,6 +351,7 @@ unchanged.
 | `is not under <root>` | The path or glob leaves the workspace. Not permitted. |
 | `unauthorized` | `RAJ_CONTROL_TOKEN` is unset or wrong. You cannot recover from this yourself; tell the user. |
 | `exec is refused over TCP` | Run the command with your own shell instead. |
+| `await the user's approval` | Your change is in the buffer and needs the user's decision. Do not accept it yourself; tell them it is ready and leave it. |
 
 ## Several editors
 

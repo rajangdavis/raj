@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 // `raj ctl` — the command-line face of the control socket.
@@ -47,6 +48,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   open <path>                open a file in the editor
   whoami                     the author id this connection writes as
   who                        everyone writing in this workspace
+  recv                       wait for the user to say something, then print it
   groups [path]              change sets in a buffer, and their state
   accept [path] -group N     agree to a change set
   reject [path] -group N     back one out
@@ -99,6 +101,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	oldFile := fs.String("old-file", "", "edit: read -old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read -new from a file, or - for stdin")
 	all := fs.Bool("all", false, "edit: replace every occurrence instead of requiring exactly one")
+	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
 	// Everything after "--" is another program's argv and must reach it intact:
 	// `raj ctl exec -- go test -run X` has to give go its own -run, not have it
 	// parsed as ours or shuffled by reorder.
@@ -197,6 +200,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "%d\t%s\t%s\t%s\n", p.ID, p.Kind, p.Name, state)
 		}
 		return 0
+	case "recv":
+		return recv(c, *identity, *name, *wait, stdout, stderr, *asJSON)
 	case "whoami":
 		res, err := c.Do(Request{Op: "ping"})
 		if code := fail(stderr, res, err); code != 0 {
@@ -663,4 +668,81 @@ func IndexAll(hay, needle string) []int {
 		out = append(out, off+i)
 		off += i + len(needle)
 	}
+}
+
+// recv waits for the user to say something and prints it.
+//
+// It says hello first, unconditionally. The mailbox is keyed on the author id,
+// and an anonymous connection gets a fresh id every time it dials — so a `recv`
+// that skipped the handshake would park on a mailbox nothing has ever been
+// posted to, and wait forever while the user watches their message go nowhere.
+// Binding the identity is what makes "the message I sent while it was
+// restarting" arrive.
+//
+// A driver wanting both this and ordinary requests needs two connections:
+// Client.Do holds a mutex for the length of a call, so a parked recv would
+// block every other verb on the same client. Two connections saying hello with
+// the same identity are the same participant and share one mailbox, which is
+// what makes that split free.
+func recv(c *Client, identity, name string, wait time.Duration,
+	stdout, stderr io.Writer, asJSON bool) int {
+	hi, err := c.Do(Request{Op: "hello", Identity: identityOf(identity), Name: name})
+	if code := fail(stderr, hi, err); code != 0 {
+		return code
+	}
+
+	if wait > 0 {
+		// Cancel rather than closing the connection: the server answers a
+		// cancelled recv with a frame, so the client leaves the conversation
+		// tidily instead of the editor discovering a dead socket.
+		//
+		// The retry is for a very short -wait: CancelCurrent needs the request
+		// to be in flight, and the timer is armed just before Do writes it. One
+		// re-arm covers the gap without a second synchronisation point.
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			t := time.NewTimer(wait)
+			defer t.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-t.C:
+					// CancelCurrent is a no-op when nothing is in flight, and
+					// reports no error for it, so the check is on the id.
+					if int(c.cur.Load()) != 0 {
+						_ = c.CancelCurrent()
+						return
+					}
+					t.Reset(10 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	res, err := c.Do(Request{Op: "recv"})
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl:", err)
+		return 1
+	}
+	if res.Err == "cancelled" {
+		// Nothing arrived in time. Distinguished from a refusal by the exit
+		// code: 3 means "no message", so a polling loop can tell "the user said
+		// nothing" from "the editor said no".
+		if asJSON {
+			return emit(stdout, []Message{})
+		}
+		return 3
+	}
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		return emit(stdout, res.Messages)
+	}
+	for _, m := range res.Messages {
+		fmt.Fprintln(stdout, m.Text)
+	}
+	return 0
 }

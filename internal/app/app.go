@@ -1228,6 +1228,18 @@ func (a *App) writeTo(p *editor.Pane, path string, then func(saved bool)) {
 		return
 	}
 	a.status = "saved " + p.File.Name()
+	// The user pressing save is the approval. Nothing else in the editor can
+	// write this file — an agent's own save is refused while its change sets
+	// are proposed — so reaching here means a human chose to put these bytes on
+	// disk, and leaving the marks set would make the next save refuse work that
+	// is already committed.
+	//
+	// All-or-nothing, and the status line says how much, because that is the
+	// only thing this gesture can honestly mean. Per-hunk review is a different
+	// gesture and wants its own binding.
+	if n := p.File.Session().AcceptPending(); n > 0 {
+		a.status += fmt.Sprintf(" (accepted %d proposed change set(s))", n)
+	}
 	if renamed {
 		// A rename is the only save that puts a file in the tree that was not
 		// there before. Refreshing on every save would walk the directory on

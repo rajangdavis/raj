@@ -12,6 +12,11 @@ import (
 // afterwards. Adjusting byte offsets instead looks simpler and is wrong: once
 // the lines have swapped, an old offset points into whatever text now occupies
 // that position, so the cursor ends up on the line that moved the other way.
+//
+// Both ends are recorded, not just the head. Restoring a collapsed cursor loses
+// the selection, and losing the selection is not cosmetic here: the next press
+// reads touchedLines() again and sees one line where the block was, so holding
+// the chord tears a highlighted block apart a line at a time.
 func (p *Pane) MoveLines(delta int) {
 	lines := p.touchedLines()
 	if len(lines) == 0 {
@@ -24,11 +29,12 @@ func (p *Pane) MoveLines(delta int) {
 		return
 	}
 
-	type where struct{ line, col int }
+	type where struct{ headLine, headCol, ancLine, ancCol int }
 	marks := make([]where, 0, p.Cursors.Count())
 	for _, c := range p.Cursors.All() {
-		l, col := p.File.LineCol(c.Head)
-		marks = append(marks, where{l, col})
+		hl, hc := p.File.LineCol(c.Head)
+		al, ac := p.File.LineCol(c.Anchor)
+		marks = append(marks, where{hl, hc, al, ac})
 	}
 
 	if delta > 0 {
@@ -42,9 +48,11 @@ func (p *Pane) MoveLines(delta int) {
 	}
 
 	restored := make([]Cursor, 0, len(marks))
+	last := p.File.Lines() - 1
 	for _, m := range marks {
-		off := p.File.OffsetAt(clamp(m.line+delta, 0, p.File.Lines()-1), m.col)
-		restored = append(restored, Cursor{Head: off, Anchor: off, Goal: m.col})
+		head := p.File.OffsetAt(clamp(m.headLine+delta, 0, last), m.headCol)
+		anchor := p.File.OffsetAt(clamp(m.ancLine+delta, 0, last), m.ancCol)
+		restored = append(restored, Cursor{Head: head, Anchor: anchor, Goal: m.headCol})
 	}
 	p.Cursors.Replace(restored)
 	p.FollowCursor()

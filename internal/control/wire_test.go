@@ -235,3 +235,26 @@ func TestServerAssignsAnAuthorPerConnection(t *testing.T) {
 		}
 	}
 }
+
+// Messages ride in the header rather than the body, so the one thing that can
+// go wrong is EncodeResponse or DecodeResponse forgetting the field — which
+// costs nothing at compile time and delivers an empty recv at runtime.
+func TestResponseCarriesMessages(t *testing.T) {
+	want := []Message{
+		{From: AuthorUser, Text: "stop what you are doing"},
+		{From: AuthorUser, Text: "second thoughts: carry on"},
+	}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Messages: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != len(want) {
+		t.Fatalf("messages = %+v, want %+v", got.Messages, want)
+	}
+	for i := range want {
+		if got.Messages[i] != want[i] {
+			t.Errorf("message %d = %+v, want %+v", i, got.Messages[i], want[i])
+		}
+	}
+}

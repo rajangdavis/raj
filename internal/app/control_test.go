@@ -112,6 +112,36 @@ func TestControlAppliesAnEdit(t *testing.T) {
 		t.Error("version did not advance")
 	}
 
+	// An agent's own save is refused while its change set is proposed: two
+	// calls in a row is not the moment to look that Save exists to provide.
+	s := c.do(h, control.Request{Op: "save"})
+	if s.OK {
+		t.Fatal("save succeeded with the change still proposed")
+	}
+	if !strings.Contains(s.Err, "approval") {
+		t.Errorf("refusal = %q, want it to say what is pending", s.Err)
+	}
+	if data, err := os.ReadFile(h.Tabs.Active().File.Path); err == nil && strings.Contains(string(data), "socket") {
+		t.Error("the proposed text reached disk anyway")
+	}
+
+	// Accepted, the same save goes through.
+	groups := c.do(h, control.Request{Op: "groups"})
+	if !groups.OK || len(groups.Groups) == 0 {
+		t.Fatalf("groups = %+v", groups)
+	}
+	var id uint64
+	for _, g := range groups.Groups {
+		if g.State == "proposed" {
+			id = g.ID
+		}
+	}
+	if id == 0 {
+		t.Fatalf("no proposed group in %+v", groups.Groups)
+	}
+	if a := c.do(h, control.Request{Op: "accept", Group: id}); !a.OK {
+		t.Fatalf("accept = %+v", a)
+	}
 	if s := c.do(h, control.Request{Op: "save"}); !s.OK {
 		t.Fatalf("save = %+v", s)
 	}
@@ -121,6 +151,45 @@ func TestControlAppliesAnEdit(t *testing.T) {
 	}
 	if string(data) != "hello socket\n" {
 		t.Errorf("on disk = %q", string(data))
+	}
+}
+
+// The user's own save is the approval gesture: it writes the file and clears
+// every pending mark, so a later agent save is not refused for work that is
+// already committed.
+func TestUserSaveAcceptsPendingChanges(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+
+	read := c.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := c.do(h, control.Request{
+		Op:    "apply",
+		Base:  &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}},
+	}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+
+	p := h.Tabs.Active()
+	if got := p.File.Session().Pending(); len(got) != 1 {
+		t.Fatalf("pending = %+v, want the agent's change set", got)
+	}
+
+	h.press("super+s")
+
+	if got := p.File.Session().Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v after the user saved, want none", got)
+	}
+	data, err := os.ReadFile(p.File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello socket\n" {
+		t.Errorf("on disk = %q", string(data))
+	}
+	if s := c.do(h, control.Request{Op: "save"}); !s.OK {
+		t.Errorf("save refused after the user accepted: %+v", s)
 	}
 }
 
