@@ -1,40 +1,67 @@
 package prog
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 )
 
-// Encode writes ops as a program, choosing the narrowest width that addresses
-// the largest payload in it.
+// Encode writes ops as a program.
 //
-// Width is per program rather than fixed at four bytes because that is what the
-// piece table does, and because the alternative was to guess: BenchmarkWidth in
-// this package measures both, so the choice is a number rather than a taste.
+// No width to choose any more: every length is a biased varint, so a short
+// payload costs one byte for its length and a long one costs as many as it
+// needs. That is the same saving the per-program width byte used to buy on a
+// batch of small ops, without the program-wide compromise a single width forced
+// — a batch that ends with one large apply no longer pays four bytes on each of
+// the forty-nine small ones before it.
 func Encode(ops []Op) []byte {
-	longest := 0
+	size := 2
 	for _, op := range ops {
-		if len(op.Payload) > longest {
-			longest = len(op.Payload)
-		}
-	}
-	w := WidthFor(longest)
-
-	size := 3
-	for _, op := range ops {
-		size += 1 + w + len(op.Payload)
+		size += 1 + VarintLen(len(op.Payload)) + len(op.Payload)
 	}
 	out := make([]byte, 0, size)
-	out = append(out, Magic, Version, byte(w))
-	buf := make([]byte, 8)
+	out = append(out, Magic, Version)
 	for _, op := range ops {
 		out = append(out, op.Code)
-		putUintW(buf, w, len(op.Payload))
-		out = append(out, buf[:w]...)
+		out = PutVarint(out, len(op.Payload))
 		out = append(out, op.Payload...)
 	}
 	return out
 }
+
+// Number encodes an integer as an op payload: a biased varint, the same
+// encoding lengths use, so a numeric argument never introduces a zero byte
+// either. A base of 256 as two fixed-width bytes would have been 00 01.
+func Number(v int) []byte { return PutVarint(nil, v) }
+
+// ReadNumber reads what Number wrote. A malformed or empty payload reads as
+// zero rather than erroring: a number is an argument, and the rule for an
+// argument that does not parse is the same as for one this build has never
+// heard of — carry out the request less precisely, do not refuse it.
+func ReadNumber(b []byte) int {
+	v, _, err := Varint(b)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// ReadPair reads two numbers from one payload, which is how a span carries its
+// start and end.
+func ReadPair(b []byte) (int, int) {
+	first, n, err := Varint(b)
+	if err != nil {
+		return 0, 0
+	}
+	second, _, err := Varint(b[n:])
+	if err != nil {
+		return first, 0
+	}
+	return first, second
+}
+
+// Pair encodes two numbers into one payload.
+func Pair(a, b int) []byte { return PutVarint(PutVarint(nil, a), b) }
 
 // Decode reads a program.
 //
@@ -48,7 +75,7 @@ func Encode(ops []Op) []byte {
 // passed in, which is the same contract the piece table's stores have, and it
 // means reading a megabyte of replacement text costs no copy.
 func Decode(b []byte, known map[byte]bool) ([]Op, error) {
-	if len(b) < 3 {
+	if len(b) < 2 {
 		return nil, ErrShort
 	}
 	if b[0] != Magic {
@@ -57,23 +84,25 @@ func Decode(b []byte, known map[byte]bool) ([]Op, error) {
 	if b[1] != Version {
 		return nil, fmt.Errorf("%w: %d", ErrVersion, b[1])
 	}
-	w := int(b[2])
-	if w < 1 || w > 8 {
-		return nil, fmt.Errorf("%w: %d", ErrWidth, w)
-	}
 
 	var ops []Op
-	for i := 3; i < len(b); {
+	for i := 2; i < len(b); {
 		code := b[i]
-		i++
-		if i+w > len(b) {
-			return nil, ErrShort
+		if code == 0 {
+			// Not reachable through Encode, and worth its own error rather
+			// than a generic one: a zero byte here usually means a program was
+			// carried through something that treats it as a C string.
+			return nil, ErrNulByte
 		}
-		n := getUintW(b[i:], w)
-		i += w
-		// n is attacker-controlled and w can express more than the frame holds,
-		// so this is a bounds check rather than an assertion. Checked as a
-		// remaining-length comparison, not i+n, because that sum can overflow.
+		i++
+		n, adv, err := Varint(b[i:])
+		if err != nil {
+			return nil, err
+		}
+		i += adv
+		// n comes off a socket, so this is a bounds check rather than an
+		// assertion. Written as a remaining-length comparison because i+n can
+		// overflow.
 		if n < 0 || n > len(b)-i {
 			return nil, ErrShort
 		}
@@ -91,6 +120,12 @@ func Decode(b []byte, known map[byte]bool) ([]Op, error) {
 	return ops, nil
 }
 
+// HasNul reports whether a program contains a zero byte anywhere, framing or
+// payload. The framing never does; a payload can, if a caller puts one there.
+// Callers that are about to hand a program to something which stops at NUL —
+// argv, most obviously — check this first and fall back to stdin.
+func HasNul(program []byte) bool { return bytes.IndexByte(program, 0) >= 0 }
+
 // Disasm renders a program as text.
 //
 // The JSON header this replaces was chosen for inspectability: "serialisation
@@ -100,10 +135,10 @@ func Decode(b []byte, known map[byte]bool) ([]Op, error) {
 // that fails while comparing programs should print this, not hex.
 func Disasm(b []byte) string {
 	var sb strings.Builder
-	if len(b) < 3 {
+	if len(b) < 2 {
 		return "<truncated program>"
 	}
-	fmt.Fprintf(&sb, "program v%d width=%d (%d bytes)\n", b[1], b[2], len(b))
+	fmt.Fprintf(&sb, "program v%d (%d bytes)\n", b[1], len(b))
 	ops, err := Decode(b, nil)
 	if err != nil {
 		fmt.Fprintf(&sb, "  !! %v\n", err)
@@ -120,11 +155,10 @@ func Disasm(b []byte) string {
 func describe(op Op) string {
 	switch op.Code {
 	case OpBase, OpGroup, OpID:
-		return fmt.Sprint(number(op.Payload))
+		return fmt.Sprint(ReadNumber(op.Payload))
 	case OpSpan:
-		if half := len(op.Payload) / 2; half > 0 {
-			return fmt.Sprintf("[%d,%d)", number(op.Payload[:half]), number(op.Payload[half:]))
-		}
+		start, end := ReadPair(op.Payload)
+		return fmt.Sprintf("[%d,%d)", start, end)
 	case OpAuthor, OpFlags:
 		if len(op.Payload) == 1 {
 			return fmt.Sprint(op.Payload[0])
@@ -134,8 +168,6 @@ func describe(op Op) string {
 	}
 	return excerpt(op.Payload)
 }
-
-func number(b []byte) int { return getUintW(b, len(b)) }
 
 // excerpt keeps a dump readable when a payload is a megabyte of replacement
 // text: enough to recognise, never enough to scroll.

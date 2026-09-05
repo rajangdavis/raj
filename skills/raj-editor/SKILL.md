@@ -208,28 +208,36 @@ one change. `raj ctl run` takes a *program* — a byte string of opcodes — and
 runs it in order in a single frame.
 
 ```
-raj ctl run -prog edits.bin      # or -prog - to read the program from stdin
-raj ctl disasm -prog edits.bin   # print it as text without sending it
+raj ctl run -prog "$(gen-edits)"   # the program itself, as an argument
+raj ctl run -prog @edits.bin       # from a file
+gen-edits | raj ctl run -prog -    # from stdin
+raj ctl disasm -prog "$PROGRAM"    # print it as text without sending it
 ```
+
+The program is passed as an ordinary argument. That works because no byte of
+the framing is ever zero — see below — and a command line carries every byte
+except zero. If a *payload* of yours contains a zero byte, which text raj will
+open never does, use `-hex` instead.
 
 The encoding, which you can emit directly:
 
 ```
-program := 'R' | version u8 | width u8 | op*
-op      := opcode u8 | length uW | payload[length]
+program := 'R' | version | op*
+op      := opcode | length | payload[length]
 ```
 
-`width` is the smallest number of bytes that can hold the largest payload in
-the program — 1 if nothing exceeds 255 bytes, 2 up to 65535, and so on. Lengths
-are little-endian and `width` bytes wide, everywhere in that program.
+Lengths are LEB128 varints of **the length plus one**, and numeric payloads are
+encoded the same way. The bias is what keeps zero bytes out: a varint of a
+value of at least one never emits a zero, so nothing in the framing can be
+mistaken for the end of a string. Encode `n+1`, decode `v-1`.
 
 Arguments come first and the verb consumes them:
 
 | op | code | payload |
 |---|---|---|
 | path | `0x01` | the file, as raw bytes |
-| base | `0x02` | version, from `read` or `version` |
-| span | `0x03` | two integers, start and end, each half the payload |
+| base | `0x02` | version as a varint, from `read` or `version` |
+| span | `0x03` | two varints, start then end |
 | text | `0x04` | replacement bytes |
 | group | `0x07` | change set id |
 | id | `0x0a` | request id, echoed back |

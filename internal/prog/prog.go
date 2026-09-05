@@ -20,24 +20,33 @@
 //
 // # The shape, and what it borrows
 //
-//	program := magic 'R' | version u8 | width u8 | op*
-//	op      := opcode u8 | length uW | payload[length]
+//	program := 'R' | version | op*
+//	op      := opcode | length | payload[length]
 //
-// The framing idea is MIDI SysEx's: a status byte selecting a payload, and a
-// stream of small parameter messages rather than one large struct. What is
-// deliberately NOT borrowed is SysEx's 7-bit data encoding and its EOX
-// terminator. Those exist because MIDI reserves the high bit for status and a
-// receiver on a lossy serial line has to resynchronise with no length
-// information. A Unix socket is a reliable ordered stream: length prefixes give
-// skip-ahead, cheap validation and no escaping, while 7-bit data would inflate
-// every document byte by a seventh — and document bytes are the bulk of this
-// wire.
+// The framing is MIDI SysEx's: a status byte selecting a payload, and a stream
+// of small parameter messages rather than one large struct.
 //
-// Width is flatpieces.WidthFor applied to the largest payload in the program,
-// so the offsets in a small file cost two bytes rather than eight. This is the
-// same fixed-width little-endian encoding the piece table already stores
-// records in, which is the point: the wire and the buffer agree about how a
-// span is written down.
+// It also borrows the property that makes SysEx passable anywhere — no byte of
+// the framing is ever zero. SysEx buys that with 7-bit data, because MIDI
+// reserves the high bit for status. Here it is bought with a bias instead:
+// every length and every number is a LEB128 varint of the value plus one, so
+// the encoded form is always at least 1 and no varint byte is ever 0x00. Full
+// eight-bit payloads are kept, and a program costs nothing per byte for the
+// property.
+//
+// That is what lets a whole program travel as an ordinary command-line
+// argument. argv carries every byte except NUL — the kernel delimits argv
+// strings with it — so a format with no zero bytes in its framing goes through
+// exec untouched, and `raj ctl run -prog "$(...)"` works without hex or a temp
+// file. The earlier fixed-width lengths could not: a length of 3 at width 2 is
+// 03 00, and every bare verb encoded its empty payload as a zero byte.
+//
+// Varints replaced fixed-width lengths to get this, which gives up the
+// symmetry with the piece table's flat records. The trade is worth naming: the
+// records are a storage format read by offset arithmetic, where fixed width is
+// what makes the arithmetic possible, and a program is a stream read
+// sequentially, where it buys nothing. They agreed by taste rather than by
+// need.
 //
 // # Forward compatibility
 //
@@ -61,7 +70,8 @@ import (
 	"fmt"
 )
 
-// Magic and Version head every program.
+// Magic and Version head every program. Both are non-zero, like everything
+// else in the framing.
 const (
 	Magic   = 'R'
 	Version = 1
@@ -138,34 +148,57 @@ var (
 	ErrShort       = errors.New("prog: truncated program")
 	ErrMagic       = errors.New("prog: not a program")
 	ErrVersion     = errors.New("prog: unsupported version")
-	ErrWidth       = errors.New("prog: width out of range")
+	ErrBadVarint   = errors.New("prog: malformed varint")
+	ErrNulByte     = errors.New("prog: zero byte in the framing")
 	ErrUnknownVerb = errors.New("prog: unknown verb")
 )
 
-// WidthFor picks the smallest byte width that can address n. Same rule as
-// piecetable.WidthFor, restated rather than imported: the wire should not
-// depend on the buffer's package, and the two agreeing is a property worth
-// asserting in a test rather than arranging by coupling.
-func WidthFor(n int) int {
-	w := 1
-	for w < 8 && (uint64(1)<<(8*w)) <= uint64(n) {
-		w++
+// PutVarint appends v as a LEB128 varint of v+1.
+//
+// The bias is the whole trick. LEB128 of a value of at least 1 never emits a
+// zero byte: continuation bytes have the high bit set, so they exceed 0x7f, and
+// the final byte holds the highest non-zero group. Encoding v+1 moves zero —
+// the one value that would produce 0x00 — out of range, at a cost of nothing
+// for values under 127 and one byte at each power-of-128 boundary.
+func PutVarint(dst []byte, v int) []byte {
+	u := uint64(v) + 1
+	for u >= 0x80 {
+		dst = append(dst, byte(u)|0x80)
+		u >>= 7
 	}
-	return w
+	return append(dst, byte(u))
 }
 
-func putUintW(b []byte, w int, v int) {
-	u := uint64(v)
-	for i := 0; i < w; i++ {
-		b[i] = byte(u)
-		u >>= 8
-	}
-}
-
-func getUintW(b []byte, w int) int {
+// Varint reads what PutVarint wrote, returning the value and the bytes
+// consumed. A zero byte where a varint is expected is malformed by
+// construction, which is a useful thing to be able to detect: it means someone
+// truncated a program at a NUL, which is exactly what a C string would do.
+func Varint(b []byte) (v int, n int, err error) {
 	var u uint64
-	for i := w - 1; i >= 0; i-- {
-		u = u<<8 | uint64(b[i])
+	for i := 0; i < len(b); i++ {
+		if i == 0 && b[i] == 0 {
+			return 0, 0, ErrNulByte
+		}
+		if i >= 9 {
+			return 0, 0, ErrBadVarint
+		}
+		u |= uint64(b[i]&0x7f) << (7 * i)
+		if b[i]&0x80 == 0 {
+			if u == 0 {
+				return 0, 0, ErrBadVarint // the bias makes zero unrepresentable
+			}
+			return int(u - 1), i + 1, nil
+		}
 	}
-	return int(u)
+	return 0, 0, ErrShort
+}
+
+// VarintLen is what PutVarint would append, without appending it.
+func VarintLen(v int) int {
+	n, u := 1, uint64(v)+1
+	for u >= 0x80 {
+		n++
+		u >>= 7
+	}
+	return n
 }

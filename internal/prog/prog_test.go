@@ -8,8 +8,6 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
-
-	"raj/internal/piecetable"
 )
 
 func allKnown() map[byte]bool {
@@ -22,10 +20,10 @@ func allKnown() map[byte]bool {
 
 func TestRoundTrip(t *testing.T) {
 	ops := []Op{
-		{OpID, []byte{7}},
+		{OpID, Number(7)},
 		{OpPath, []byte("/tmp/x.go")},
-		{OpBase, []byte{3}},
-		{OpSpan, []byte{0, 4}},
+		{OpBase, Number(3)},
+		{OpSpan, Pair(0, 4)},
 		{OpText, []byte("hello")},
 		{OpApply, nil},
 	}
@@ -79,7 +77,7 @@ func TestBatchOfApplies(t *testing.T) {
 	var ops []Op
 	for i := 0; i < 50; i++ {
 		ops = append(ops,
-			Op{OpSpan, []byte{byte(i), byte(i + 1)}},
+			Op{OpSpan, Pair(i, i+1)},
 			Op{OpText, []byte("x")},
 			Op{OpApply, nil})
 	}
@@ -119,30 +117,73 @@ func TestPathThatIsNotUTF8SurvivesIntact(t *testing.T) {
 	}
 }
 
-func TestWidthGrowsWithThePayload(t *testing.T) {
-	for _, n := range []int{0, 255, 256, 70000} {
-		b := Encode([]Op{{OpText, make([]byte, n)}})
-		if got, want := int(b[2]), WidthFor(n); got != want {
-			t.Errorf("payload %d: width = %d, want %d", n, got, want)
-		}
-		ops, err := Decode(b, allKnown())
+func TestVarintRoundTrip(t *testing.T) {
+	for _, v := range []int{0, 1, 126, 127, 128, 255, 16383, 16384, 1 << 20, 1 << 31} {
+		b := PutVarint(nil, v)
+		got, n, err := Varint(b)
 		if err != nil {
-			t.Fatalf("payload %d: %v", n, err)
+			t.Fatalf("%d: %v", v, err)
 		}
-		if len(ops[0].Payload) != n {
-			t.Errorf("payload %d: decoded %d bytes", n, len(ops[0].Payload))
+		if got != v || n != len(b) {
+			t.Errorf("%d round-tripped as %d in %d/%d bytes", v, got, n, len(b))
+		}
+		if n != VarintLen(v) {
+			t.Errorf("%d: VarintLen said %d, encoding took %d", v, VarintLen(v), n)
 		}
 	}
 }
 
-// The wire and the buffer should agree about how a span is written down. They
-// are separate functions on purpose — the wire must not depend on the piece
-// table's package — so the agreement is asserted rather than arranged.
-func TestWidthMatchesThePieceTable(t *testing.T) {
-	for _, n := range []int{0, 1, 255, 256, 65535, 65536, 1 << 24, 1 << 32} {
-		if got, want := WidthFor(n), piecetable.WidthFor(n); got != want {
-			t.Errorf("WidthFor(%d) = %d, piecetable says %d", n, got, want)
+// The property the encoding is shaped around: nothing in the framing is ever
+// zero, so a program travels through anything that stops at NUL — argv being
+// the one that matters.
+func TestFramingNeverContainsZero(t *testing.T) {
+	for _, n := range []int{0, 1, 126, 127, 128, 300, 70000} {
+		for _, code := range []byte{OpText, OpApply, OpPath} {
+			payload := bytes.Repeat([]byte("x"), n) // printable, so a zero is framing
+			b := Encode([]Op{{code, payload}})
+			if i := bytes.IndexByte(b, 0); i >= 0 {
+				t.Fatalf("%s with a %d-byte payload put a zero at %d", Name(code), n, i)
+			}
+			ops, err := Decode(b, allKnown())
+			if err != nil {
+				t.Fatalf("payload %d: %v", n, err)
+			}
+			if len(ops[0].Payload) != n {
+				t.Errorf("payload %d: decoded %d bytes", n, len(ops[0].Payload))
+			}
 		}
+	}
+}
+
+// Numbers are framing too, and a fixed-width 256 would have been 00 01.
+func TestNumbersNeverContainZero(t *testing.T) {
+	for _, v := range []int{0, 1, 127, 128, 255, 256, 65536, 1 << 24} {
+		b := Encode([]Op{{OpBase, Number(v)}, {OpApply, nil}})
+		if bytes.IndexByte(b, 0) >= 0 {
+			t.Errorf("base %d produced a zero byte: %x", v, b)
+		}
+		ops, _ := Decode(b, allKnown())
+		if got := ReadNumber(ops[0].Payload); got != v {
+			t.Errorf("base %d read back as %d", v, got)
+		}
+	}
+	if start, end := ReadPair(Pair(0, 70000)); start != 0 || end != 70000 {
+		t.Errorf("pair read back as (%d,%d)", start, end)
+	}
+}
+
+// A zero byte in the framing is what a C string does to a program, so it gets
+// its own error rather than a generic one.
+func TestZeroByteInFramingIsNamed(t *testing.T) {
+	b := []byte{Magic, Version, OpText, 0x00}
+	if _, err := Decode(b, allKnown()); !errors.Is(err, ErrNulByte) {
+		t.Errorf("Decode = %v, want ErrNulByte", err)
+	}
+	if !HasNul(b) {
+		t.Error("HasNul missed a zero byte")
+	}
+	if HasNul(Encode([]Op{{OpText, []byte("hi")}, {OpApply, nil}})) {
+		t.Error("HasNul flagged a program with no zero byte")
 	}
 }
 
@@ -170,7 +211,8 @@ func TestTruncatedProgramsAreRefused(t *testing.T) {
 // A length field can say more than the frame holds, and the frame comes off a
 // socket. This is a bounds check, not an assertion.
 func TestLengthPastTheEndIsRefused(t *testing.T) {
-	b := []byte{Magic, Version, 1, OpText, 200, 'h', 'i'}
+	b := PutVarint([]byte{Magic, Version, OpText}, 200)
+	b = append(b, 'h', 'i')
 	if _, err := Decode(b, allKnown()); !errors.Is(err, ErrShort) {
 		t.Fatalf("Decode = %v, want ErrShort", err)
 	}
@@ -179,8 +221,8 @@ func TestLengthPastTheEndIsRefused(t *testing.T) {
 func TestDisasmIsReadable(t *testing.T) {
 	b := Encode([]Op{
 		{OpPath, []byte("main.go")},
-		{OpBase, []byte{9}},
-		{OpSpan, []byte{4, 12}},
+		{OpBase, Number(9)},
+		{OpSpan, Pair(4, 12)},
 		{OpText, bytes.Repeat([]byte("x"), 500)},
 		{OpToken, []byte("hunter2")},
 		{OpApply, nil},
@@ -199,9 +241,9 @@ func TestDisasmIsReadable(t *testing.T) {
 // Decode must not panic, whatever arrives on the socket.
 func FuzzDecode(f *testing.F) {
 	f.Add(Encode([]Op{{OpPath, []byte("a")}, {OpOpen, nil}}))
-	f.Add([]byte{Magic, Version, 1})
-	f.Add([]byte{Magic, Version, 9})
-	f.Add([]byte("R\x01\x01\x84\xff"))
+	f.Add([]byte{Magic, Version})
+	f.Add([]byte{Magic, Version, OpText, 0x00})
+	f.Add([]byte("R\x01\x84\x01"))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		ops, err := Decode(b, allKnown())
 		if err != nil {
@@ -236,14 +278,14 @@ func programShapes(rng *rand.Rand) map[string][]Op {
 	var batch []Op
 	for i := 0; i < 50; i++ { // fifty small splices, the shape batching is for
 		batch = append(batch,
-			Op{OpSpan, []byte{byte(i), byte(i + 2)}},
+			Op{OpSpan, Pair(i, i+2)},
 			Op{OpText, []byte("fix")},
 			Op{OpApply, nil})
 	}
 	return map[string][]Op{
-		"small-open":  {{OpID, []byte{1}}, {OpPath, []byte("internal/app/app.go")}, {OpOpen, nil}},
+		"small-open":  {{OpID, Number(1)}, {OpPath, []byte("internal/app/app.go")}, {OpOpen, nil}},
 		"batch-apply": batch,
-		"large-apply": {{OpPath, []byte("main.go")}, {OpBase, []byte{4}}, {OpText, big}, {OpApply, nil}},
+		"large-apply": {{OpPath, []byte("main.go")}, {OpBase, Number(4)}, {OpText, big}, {OpApply, nil}},
 	}
 }
 
@@ -257,17 +299,16 @@ func encodeFixed(ops []Op) []byte {
 	}
 	out := make([]byte, 0, size)
 	out = append(out, Magic, Version, 4)
-	buf := make([]byte, 8)
 	for _, op := range ops {
 		out = append(out, op.Code)
-		putUintW(buf, 4, len(op.Payload))
-		out = append(out, buf[:4]...)
+		n := uint32(len(op.Payload))
+		out = append(out, byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
 		out = append(out, op.Payload...)
 	}
 	return out
 }
 
-// TestWidthCost reports what per-program width buys, in bytes, for each shape.
+// TestWidthCost reports what varint lengths buy, in bytes, for each shape.
 // Run with -v; it asserts only that the narrow form is never larger.
 func TestWidthCost(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
@@ -277,7 +318,7 @@ func TestWidthCost(t *testing.T) {
 		pct := 100 * float64(saved) / float64(fixed)
 		t.Logf("%-12s narrow=%-8d fixed=%-8d saved=%-6d (%.1f%%)", name, narrow, fixed, saved, pct)
 		if narrow > fixed {
-			t.Errorf("%s: per-program width was larger than fixed u32", name)
+			t.Errorf("%s: varint lengths were larger than fixed u32", name)
 		}
 	}
 }
@@ -330,8 +371,8 @@ func BenchmarkAgainstJSON(b *testing.B) {
 		text[i] = byte('a' + rng.Intn(26))
 	}
 	ops := []Op{
-		{OpID, []byte{1}}, {OpPath, []byte("internal/app/app.go")},
-		{OpBase, []byte{4}}, {OpSpan, []byte{0, 16}}, {OpText, text}, {OpApply, nil},
+		{OpID, Number(1)}, {OpPath, []byte("internal/app/app.go")},
+		{OpBase, Number(4)}, {OpSpan, Pair(0, 16)}, {OpText, text}, {OpApply, nil},
 	}
 	type header struct {
 		ID    int    `json:"id"`

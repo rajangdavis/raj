@@ -92,7 +92,7 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			sticky.Path = string(op.Payload)
 			pending.Path = sticky.Path
 		case prog.OpBase:
-			v := uint64(number(op.Payload))
+			v := uint64(prog.ReadNumber(op.Payload))
 			sticky.Base = &v
 			pending.Base = &v
 		case prog.OpAuthor:
@@ -101,24 +101,19 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 				pending.Author = op.Payload[0]
 			}
 		case prog.OpID:
-			pending.ID = number(op.Payload)
+			pending.ID = prog.ReadNumber(op.Payload)
 		case prog.OpToken:
 			sticky.Token = string(op.Payload)
 			pending.Token = sticky.Token
 		case prog.OpGroup:
-			pending.Group = uint64(number(op.Payload))
+			pending.Group = uint64(prog.ReadNumber(op.Payload))
 		case prog.OpQuery:
 			pending.Query = &SearchQuery{Text: string(op.Payload)}
 		case prog.OpSpan:
-			half := len(op.Payload) / 2
-			if half == 0 {
-				return nil, errors.New("span op is empty")
-			}
 			if hunk == nil {
 				hunk = &Hunk{}
 			}
-			hunk.Start = number(op.Payload[:half])
-			hunk.End = number(op.Payload[half:])
+			hunk.Start, hunk.End = prog.ReadPair(op.Payload)
 		case prog.OpText:
 			if hunk == nil {
 				hunk = &Hunk{}
@@ -131,14 +126,4 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 		return nil, errNoVerb
 	}
 	return out, nil
-}
-
-// number reads a little-endian fixed-width integer, the encoding prog writes
-// and the piece table stores records in.
-func number(b []byte) int {
-	var u uint64
-	for i := len(b) - 1; i >= 0; i-- {
-		u = u<<8 | uint64(b[i])
-	}
-	return int(u)
 }

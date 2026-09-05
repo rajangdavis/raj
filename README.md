@@ -147,22 +147,27 @@ is an ordinary request that parks until the user has something to say, and
 rather than to a connection, so one sent while a driver was restarting is
 delivered when it comes back.
 
-`raj ctl run -prog FILE` sends a *program* instead: a byte string of opcodes,
+`raj ctl run -prog BYTES` sends a *program* instead: a byte string of opcodes,
 run in order in one frame. Arguments are ops below `0x80` and verbs at or above
 it, so a reader that predates an opcode still knows from the byte whether to
 skip it or refuse the program — an argument it does not know costs precision, a
 verb it does not know would cost correctness. Path, base and author persist
-across verbs, so fifty splices into one file state them once; length widths are
-chosen per program by the same rule the piece table picks record widths, which
-is worth 45% of the bytes on a batch and nothing on a single large apply.
+across verbs, so fifty splices into one file state them once.
 
-The framing is MIDI SysEx's, without its 7-bit data encoding or its terminator:
-those exist because MIDI reserves the high bit and a receiver on a lossy serial
-line has to resynchronise with no length information, and neither is true of a
-socket. `raj ctl disasm -prog FILE` prints a program as text, offline, which is
-where the inspectability of the JSON header went rather than being spent. The
-flags are not going anywhere — one edit is easier to write as `apply -base N
--start N -end N` — but a batch is a program.
+The framing is MIDI SysEx's, including the property that makes SysEx passable
+anywhere: no byte of it is ever zero. SysEx buys that with 7-bit data, because
+MIDI reserves the high bit for status; here it is bought with a bias, so every
+length and number is a varint of the value plus one and full eight-bit payloads
+are kept. That is what lets a whole program travel as an ordinary command-line
+argument — argv carries every byte except zero — so `-prog` takes the bytes
+themselves, with `@FILE` and `-` for a file or stdin.
+
+Varints replaced fixed-width lengths to get this, giving up the symmetry with
+the piece table's flat records. The records are a storage format read by offset
+arithmetic, where fixed width is what makes the arithmetic work; a program is a
+stream read in order, where it buys nothing. They agreed by taste rather than by
+need. `raj ctl disasm -prog BYTES` prints a program as text, offline, which is
+where the inspectability of the JSON header went rather than being spent.
 
 `apply` requires the `base` version it was written against. Hunks are rebased
 onto the current buffer and rejected individually, so an edit written against a

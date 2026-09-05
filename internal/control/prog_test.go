@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
@@ -33,11 +34,11 @@ func TestProgramCompilesAVerb(t *testing.T) {
 func TestProgramBatchesApplies(t *testing.T) {
 	ops := []prog.Op{
 		{Code: prog.OpPath, Payload: []byte("/w/main.go")},
-		{Code: prog.OpBase, Payload: []byte{7}},
+		{Code: prog.OpBase, Payload: prog.Number(7)},
 	}
 	for i := 0; i < 50; i++ {
 		ops = append(ops,
-			prog.Op{Code: prog.OpSpan, Payload: []byte{byte(i), byte(i + 1)}},
+			prog.Op{Code: prog.OpSpan, Payload: prog.Pair(i, i+1)},
 			prog.Op{Code: prog.OpText, Payload: []byte("x")},
 			prog.Op{Code: prog.OpApply})
 	}
@@ -65,8 +66,8 @@ func TestProgramBatchesApplies(t *testing.T) {
 func TestProgramResetsHunksBetweenVerbs(t *testing.T) {
 	p := prog.Encode([]prog.Op{
 		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
-		{Code: prog.OpBase, Payload: []byte{1}},
-		{Code: prog.OpSpan, Payload: []byte{0, 4}},
+		{Code: prog.OpBase, Payload: prog.Number(1)},
+		{Code: prog.OpSpan, Payload: prog.Pair(0, 4)},
 		{Code: prog.OpText, Payload: []byte("hi")},
 		{Code: prog.OpApply},
 		{Code: prog.OpSave},
@@ -169,6 +170,30 @@ func TestEveryVerbNameIsKnown(t *testing.T) {
 		}
 		if _, ok := verbNames[code]; !ok {
 			t.Errorf("%s is a known verb with no op name", prog.Name(code))
+		}
+	}
+}
+
+// A program goes through argv, which is the reason its lengths and numbers are
+// biased varints rather than fixed-width fields. argv carries every byte except
+// NUL, so an encoding whose framing never emits one needs no hex and no temp
+// file. This is the test that keeps that true.
+func TestProgramFramingSurvivesArgv(t *testing.T) {
+	// Payloads across the varint boundaries, plus numbers that a fixed-width
+	// encoding would have written with a zero byte in them.
+	for _, n := range []int{0, 127, 128, 300, 70000} {
+		p := prog.Encode([]prog.Op{
+			{Code: prog.OpPath, Payload: bytes.Repeat([]byte("x"), n)},
+			{Code: prog.OpBase, Payload: prog.Number(256)},
+			{Code: prog.OpSpan, Payload: prog.Pair(0, 65536)},
+			{Code: prog.OpApply},
+		})
+		if prog.HasNul(p) {
+			t.Fatalf("payload %d produced a program with a zero byte, which argv "+
+				"would truncate", n)
+		}
+		if _, err := Requests(p, 1); err != nil {
+			t.Fatalf("payload %d: %v", n, err)
 		}
 	}
 }
