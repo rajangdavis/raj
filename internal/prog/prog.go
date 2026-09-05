@@ -82,16 +82,18 @@ const (
 // from the byte alone whether to skip it or refuse the program.
 const (
 	// arguments (0x00–0x7f): skipped when unknown
-	OpPath   = 0x01 // the file a verb acts on, as raw bytes
-	OpBase   = 0x02 // uW: the version an APPLY's offsets were measured in
-	OpSpan   = 0x03 // uW uW: start and end of the span to replace
-	OpText   = 0x04 // replacement bytes
-	OpAuthor = 0x05 // u8: the writer
-	OpToken  = 0x06 // shared secret, for a TCP listener
-	OpGroup  = 0x07 // uW: a change set id
-	OpQuery  = 0x08 // search pattern
-	OpFlags  = 0x09 // u8 bitfield: regex, case, word
-	OpID     = 0x0a // uW: request id, echoed in the response
+	OpPath    = 0x01 // the file a verb acts on, as raw bytes
+	OpBase    = 0x02 // uW: the version an APPLY's offsets were measured in
+	OpSpan    = 0x03 // uW uW: start and end of the span to replace
+	OpText    = 0x04 // replacement bytes
+	OpAuthor  = 0x05 // u8: the writer
+	OpToken   = 0x06 // shared secret, for a TCP listener
+	OpGroup   = 0x07 // uW: a change set id
+	OpQuery   = 0x08 // search pattern
+	OpFlags   = 0x09 // u8 bitfield: see FlagRegex, FlagCase, FlagWord
+	OpID      = 0x0a // varint: request id, echoed in the response
+	OpInclude = 0x0b // comma-separated globs a search is limited to
+	OpExclude = 0x0c // comma-separated globs a search skips
 
 	// verbs (0x80–0xff): refused when unknown
 	OpPing    = 0x80
@@ -106,6 +108,16 @@ const (
 	OpAccept  = 0x89
 	OpReject  = 0x8a
 	OpReload  = 0x8b
+	OpStats   = 0x8c
+)
+
+// Search flags, the bits of an OpFlags payload. A bitfield rather than three
+// argument ops because they are one setting with three switches, and because a
+// caller that sets none should send nothing at all.
+const (
+	FlagRegex = 1 << 0
+	FlagCase  = 1 << 1
+	FlagWord  = 1 << 2
 )
 
 // IsVerb reports which range an opcode is in. This is the whole of the
@@ -116,10 +128,11 @@ func IsVerb(op byte) bool { return op >= 0x80 }
 var names = map[byte]string{
 	OpPath: "path", OpBase: "base", OpSpan: "span", OpText: "text",
 	OpAuthor: "author", OpToken: "token", OpGroup: "group", OpQuery: "query",
-	OpFlags: "flags", OpID: "id",
+	OpFlags: "flags", OpID: "id", OpInclude: "include", OpExclude: "exclude",
 	OpPing: "ping", OpBuffers: "buffers", OpRead: "read", OpOpen: "open",
 	OpApply: "apply", OpSave: "save", OpVersion: "version", OpSearch: "search",
 	OpGroups: "groups", OpAccept: "accept", OpReject: "reject", OpReload: "reload",
+	OpStats: "stats",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

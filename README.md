@@ -166,8 +166,7 @@ Varints replaced fixed-width lengths to get this, giving up the symmetry with
 the piece table's flat records. The records are a storage format read by offset
 arithmetic, where fixed width is what makes the arithmetic work; a program is a
 stream read in order, where it buys nothing. They agreed by taste rather than by
-need. `raj ctl disasm -prog BYTES` prints a program as text, offline, which is
-where the inspectability of the JSON header went rather than being spent.
+need.
 
 `apply` requires the `base` version it was written against. Hunks are rebased
 onto the current buffer and rejected individually, so an edit written against a

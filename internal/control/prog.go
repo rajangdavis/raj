@@ -26,10 +26,12 @@ var knownOps = map[byte]bool{
 	prog.OpPath: true, prog.OpBase: true, prog.OpSpan: true, prog.OpText: true,
 	prog.OpAuthor: true, prog.OpToken: true, prog.OpGroup: true,
 	prog.OpQuery: true, prog.OpFlags: true, prog.OpID: true,
+	prog.OpInclude: true, prog.OpExclude: true,
 
 	prog.OpPing: true, prog.OpBuffers: true, prog.OpRead: true, prog.OpOpen: true,
 	prog.OpApply: true, prog.OpSave: true, prog.OpVersion: true,
 	prog.OpGroups: true, prog.OpAccept: true, prog.OpReject: true,
+	prog.OpSearch: true, prog.OpStats: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -41,7 +43,28 @@ var verbNames = map[byte]string{
 	prog.OpOpen: "open", prog.OpApply: "apply", prog.OpSave: "save",
 	prog.OpVersion: "version", prog.OpGroups: "groups",
 	prog.OpAccept: "accept", prog.OpReject: "reject",
+	prog.OpSearch: "search", prog.OpStats: "stats",
 }
+
+// Four verbs stay out of programs, and the reasons are different enough to be
+// worth separating.
+//
+//   - recv parks until the user says something, which could be hours. A batch
+//     runs in order, so a recv in the middle would hold every verb behind it —
+//     and a caller cannot see that it has, because the frames it is waiting for
+//     simply do not arrive.
+//   - hello and cancel act on the connection rather than on a document: one
+//     rebinds who this connection writes as, the other abandons a request by
+//     id. Both are answered on the reading goroutine, before dispatch, so that
+//     a cancel can arrive during the search it cancels. Putting either in a
+//     batch would mean a request queued behind the very thing it is meant to
+//     interrupt.
+//   - exec runs a command, and its argv is a list, which the opcode table has
+//     no repeated-argument shape for yet. It is also the one verb with a
+//     remote-execution gate on it, and widening its surface deserves its own
+//     change rather than arriving as part of a batching feature.
+//
+// raj ctl still reaches all four.
 
 var errNoVerb = errors.New("program ended with arguments and no verb")
 
@@ -108,7 +131,18 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 		case prog.OpGroup:
 			pending.Group = uint64(prog.ReadNumber(op.Payload))
 		case prog.OpQuery:
-			pending.Query = &SearchQuery{Text: string(op.Payload)}
+			pending.query().Text = string(op.Payload)
+		case prog.OpInclude:
+			pending.query().Include = string(op.Payload)
+		case prog.OpExclude:
+			pending.query().Exclude = string(op.Payload)
+		case prog.OpFlags:
+			if len(op.Payload) == 1 {
+				q := pending.query()
+				q.Regex = op.Payload[0]&prog.FlagRegex != 0
+				q.Case = op.Payload[0]&prog.FlagCase != 0
+				q.Word = op.Payload[0]&prog.FlagWord != 0
+			}
 		case prog.OpSpan:
 			if hunk == nil {
 				hunk = &Hunk{}
@@ -126,4 +160,14 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 		return nil, errNoVerb
 	}
 	return out, nil
+}
+
+// query returns the request's search query, creating it on first use. The four
+// search arguments can arrive in any order, and each of them is optional, so
+// none of them can be the one that allocates.
+func (r *Request) query() *SearchQuery {
+	if r.Query == nil {
+		r.Query = &SearchQuery{}
+	}
+	return r.Query
 }

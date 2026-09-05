@@ -3,7 +3,6 @@ package prog
 import (
 	"bytes"
 	"fmt"
-	"strings"
 )
 
 // Encode writes ops as a program.
@@ -125,59 +124,3 @@ func Decode(b []byte, known map[byte]bool) ([]Op, error) {
 // Callers that are about to hand a program to something which stops at NUL —
 // argv, most obviously — check this first and fall back to stdin.
 func HasNul(program []byte) bool { return bytes.IndexByte(program, 0) >= 0 }
-
-// Disasm renders a program as text.
-//
-// The JSON header this replaces was chosen for inspectability: "serialisation
-// is unmeasurable against a model round trip, so there is nothing to buy by
-// making it opaque." That reasoning still holds, so the property has to survive
-// somewhere — it survives here, in a tool, rather than in the encoding. A test
-// that fails while comparing programs should print this, not hex.
-func Disasm(b []byte) string {
-	var sb strings.Builder
-	if len(b) < 2 {
-		return "<truncated program>"
-	}
-	fmt.Fprintf(&sb, "program v%d (%d bytes)\n", b[1], len(b))
-	ops, err := Decode(b, nil)
-	if err != nil {
-		fmt.Fprintf(&sb, "  !! %v\n", err)
-		return sb.String()
-	}
-	for _, op := range ops {
-		fmt.Fprintf(&sb, "  %-8s %s\n", Name(op.Code), describe(op))
-	}
-	return sb.String()
-}
-
-// describe renders a payload the way that op means it: a number as a number, a
-// path as a path, document bytes as a quoted excerpt with a length.
-func describe(op Op) string {
-	switch op.Code {
-	case OpBase, OpGroup, OpID:
-		return fmt.Sprint(ReadNumber(op.Payload))
-	case OpSpan:
-		start, end := ReadPair(op.Payload)
-		return fmt.Sprintf("[%d,%d)", start, end)
-	case OpAuthor, OpFlags:
-		if len(op.Payload) == 1 {
-			return fmt.Sprint(op.Payload[0])
-		}
-	case OpToken:
-		return fmt.Sprintf("<%d bytes, redacted>", len(op.Payload))
-	}
-	return excerpt(op.Payload)
-}
-
-// excerpt keeps a dump readable when a payload is a megabyte of replacement
-// text: enough to recognise, never enough to scroll.
-func excerpt(b []byte) string {
-	const max = 48
-	if len(b) == 0 {
-		return `""`
-	}
-	if len(b) <= max {
-		return fmt.Sprintf("%q", b)
-	}
-	return fmt.Sprintf("%q… (%d bytes)", b[:max], len(b))
-}

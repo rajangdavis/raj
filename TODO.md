@@ -217,16 +217,24 @@ the follow-ups that were deliberately kept out of that change.
 
 ## Control socket (replaces the in-editor agent)
 
-- [ ] **Programs are an entry point, not yet the encoding.** `raj ctl run`
-  compiles a program into the same Requests a JSON frame produces, so the two
-  meet at the seam and everything downstream is shared — but the frame carrying
-  the program still has a JSON header, and responses are still JSON. Replacing
-  those is the rest of the work, and it is the half that has to answer what a
-  streamed search reply looks like as opcodes.
-- [ ] **Six verbs are unreachable from a program**: search, exec, recv, hello,
-  cancel and stats. The first three stream or park, which the batch loop's
-  one-response-per-verb shape does not model; the others want arguments the
-  opcode table has no room for yet. `raj ctl` still reaches all of them.
+- [ ] **Responses are still JSON.** The flat record layout they need now exists
+  — `prog.Writer` and `prog.Reader`, fields in a fixed order both ends read from
+  the same source file. What is left is the conversion: `Header` has 35 fields,
+  nine of them lists, `EncodeResponse` and `DecodeResponse` are the only two
+  places that build one, and `.Header.` appears at 26 call sites. Worth doing
+  verb by verb — ping, version, buffers, groups, read — with the header carrying
+  whatever has not moved yet, rather than as one change that cannot be tested
+  until all of it works.
+- [ ] **Then the request header can go too.** Every verb a program can reach
+  already ignores it; what keeps it alive is exec, recv, hello and cancel, which
+  are the four the batch loop deliberately does not model. They need opcodes of
+  their own first, or a decision that they stay on a JSON frame forever and the
+  two encodings coexist.
+- [ ] **exec is unreachable from a program.** Its argv is a list and the opcode
+  table has no repeated-argument shape yet — a `arg` op that accumulates would
+  do it. It is also the one verb with a remote-execution gate, so widening its
+  surface deserves its own change rather than arriving inside a batching one.
+  recv, hello and cancel stay out on purpose; see the note in control/prog.go.
 
 The agent pane is not being built. An editor that hosts a model is an editor
 that owns a model's lifecycle, its configuration, its failure modes and its
@@ -425,11 +433,6 @@ missing is addressing and state.
   editor already has a seam that would replace the sleeps — the control socket
   could answer "have you drained the queue?" — and until it does, the suite is
   slower and more fragile than it needs to be.
-- [ ] **No CI.** `go build`, `go vet`, `gofmt -l`, `go test ./...` and
-  `go test -race ./...` all pass, and nothing enforces that they keep passing.
-  `internal/control/mailbox.go` and `internal/control/wire.go` are unformatted
-  right now, which is exactly the class of thing a job would have caught the day
-  it landed.
 - [ ] **Display width table is hand-rolled**; suspect it first if the caret
   drifts. Narrowed: TODO.md holds three runes README.md does not — en-dash,
   em-dash, and `↔` U+2194, all East Asian Ambiguous, and raj calls all three

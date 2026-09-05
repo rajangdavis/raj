@@ -218,26 +218,6 @@ func TestLengthPastTheEndIsRefused(t *testing.T) {
 	}
 }
 
-func TestDisasmIsReadable(t *testing.T) {
-	b := Encode([]Op{
-		{OpPath, []byte("main.go")},
-		{OpBase, Number(9)},
-		{OpSpan, Pair(4, 12)},
-		{OpText, bytes.Repeat([]byte("x"), 500)},
-		{OpToken, []byte("hunter2")},
-		{OpApply, nil},
-	})
-	out := Disasm(b)
-	for _, want := range []string{"main.go", "base", "9", "[4,12)", "apply", "500 bytes"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("disassembly missing %q:\n%s", want, out)
-		}
-	}
-	if strings.Contains(out, "hunter2") {
-		t.Errorf("disassembly printed the token:\n%s", out)
-	}
-}
-
 // Decode must not panic, whatever arrives on the socket.
 func FuzzDecode(f *testing.F) {
 	f.Add(Encode([]Op{{OpPath, []byte("a")}, {OpOpen, nil}}))
@@ -264,7 +244,6 @@ func FuzzDecode(f *testing.F) {
 				t.Fatalf("op %d changed across a round trip", i)
 			}
 		}
-		_ = Disasm(b) // must not panic either
 	})
 }
 

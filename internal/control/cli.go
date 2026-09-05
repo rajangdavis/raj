@@ -10,8 +10,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"raj/internal/prog"
 )
 
 // `raj ctl` — the command-line face of the control socket.
@@ -65,7 +63,6 @@ const ctlUsage = `usage: raj ctl <command> [options]
   exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
   stats                      what the exec policy has cost this session
   run -prog BYTES            run a program of opcodes; @FILE or - for stdin
-  disasm -prog BYTES         print a program as text, without sending it
 
 Path may be omitted for the buffer the user is looking at.
 
@@ -101,8 +98,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	start := fs.Int("start", -1, "apply: first byte of the span to replace")
 	end := fs.Int("end", -1, "apply: one past the last byte of the span")
 	textArg := fs.String("text", "", "apply: replacement text")
-	progArg := fs.String("prog", "", "run/disasm: the program itself, or @FILE, or - for stdin")
-	progHex := fs.String("hex", "", "run/disasm: the program as hex, for one whose payloads contain a zero byte")
+	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
+	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
 	textFile := fs.String("text-file", "", "apply: read -text from a file, or - for stdin")
 	old := fs.String("old", "", "edit: the exact existing text to replace")
 	newText := fs.String("new", "", "edit: the replacement text")
@@ -128,13 +125,6 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	}
 	if cmd == "list" {
 		return list(stdout, stderr, *asJSON)
-	}
-	// disasm reads a file and prints it. Answered before the editor is located
-	// so that inspecting a program works when raj is not running — which is
-	// exactly when you are most likely to be looking at one, because something
-	// it did was wrong.
-	if cmd == "disasm" {
-		return disasmProgram(*progArg, *progHex, stdout, stderr)
 	}
 
 	cwd, _ := os.Getwd()
@@ -617,9 +607,8 @@ func runProgram(c *Client, file, hexed string, stdout, stderr io.Writer, asJSON 
 	}
 	res, err := c.Do(Request{Op: "prog", Program: program})
 	if code := fail(stderr, res, err); code != 0 {
-		// A compile error names the opcode, so the disassembly is the useful
-		// next thing to look at rather than a hex dump of the file.
-		fmt.Fprint(stderr, prog.Disasm(program))
+		// The error names the opcode it choked on, which is what a caller
+		// needs; the program itself is something they generated and can print.
 		return code
 	}
 	if asJSON {
@@ -629,34 +618,6 @@ func runProgram(c *Client, file, hexed string, stdout, stderr io.Writer, asJSON 
 	return 0
 }
 
-// disasmProgram prints a program without sending it.
-//
-// The JSON header this encoding replaces was chosen for inspectability —
-// serialisation is unmeasurable against a model round trip, so there was
-// nothing to buy by making it opaque. That reasoning did not stop being true,
-// so the property moved into a tool rather than being spent.
-func disasmProgram(file, hexed string, stdout, stderr io.Writer) int {
-	program, err := readProgram(file, hexed)
-	if err != nil {
-		fmt.Fprintln(stderr, "raj ctl disasm:", err)
-		return 2
-	}
-	fmt.Fprint(stdout, prog.Disasm(program))
-	return 0
-}
-
-// readProgram takes a program from wherever the caller has one.
-//
-// The bytes themselves are the ordinary case: `raj ctl run -prog "$(gen)"`.
-// That works because the encoding has no zero byte in its framing — see
-// internal/prog — and argv carries every byte except that one, since the kernel
-// delimits argv strings with it. A caller that wants a file says @FILE, and one
-// piping from a generator says -.
-//
-// -hex remains for the case the framing cannot help with: a payload that itself
-// contains a zero byte. Document text in a buffer raj will open never does, so
-// this is rare, and the error says which door to use rather than leaving it to
-// be worked out.
 func readProgram(arg, hexed string) ([]byte, error) {
 	switch {
 	case hexed != "" && arg != "":

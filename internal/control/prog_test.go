@@ -197,3 +197,104 @@ func TestProgramFramingSurvivesArgv(t *testing.T) {
 		}
 	}
 }
+
+// --- streaming inside a batch ------------------------------------------------
+
+// A streaming verb marks its own last frame Final, which is right when it is
+// the whole request and wrong when it is the first of two: a client that saw
+// Final would stop reading while a verb was still to come. The batch owns that
+// decision now, and this is the test that says so.
+func TestSearchInsideAProgramDoesNotEndTheBatch(t *testing.T) {
+	f := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	c, err := Dial(f.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpQuery, Payload: []byte("hello")},
+		{Code: prog.OpSearch},
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpRead},
+	})
+
+	var batches int
+	res, err := c.DoStream(Request{Op: "prog", Program: p}, func(m []SearchMatch) {
+		batches++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches == 0 {
+		t.Error("the search emitted no batches inside the program")
+	}
+	// The frame that ended the conversation is the read's, not the search's.
+	if got := res.Text(); got != "hello\n" {
+		t.Errorf("last response = %q, want the read's text — the search ended the batch early", got)
+	}
+}
+
+// The same search as the only verb still ends the batch, because then it is the
+// last one.
+func TestSearchAsTheLastVerbEndsTheBatch(t *testing.T) {
+	f := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	c, err := Dial(f.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpQuery, Payload: []byte("hello")},
+		{Code: prog.OpSearch},
+	})
+	var batches int
+	res, err := c.DoStream(Request{Op: "prog", Program: p}, func(m []SearchMatch) { batches++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches == 0 {
+		t.Error("no batches")
+	}
+	if !res.Final {
+		t.Error("the last frame of a program ending in a search was not Final")
+	}
+}
+
+// The search arguments are four optional ops that can arrive in any order, so
+// none of them can be the one that allocates the query.
+func TestSearchArgumentsCompileInAnyOrder(t *testing.T) {
+	ops := []prog.Op{
+		{Code: prog.OpFlags, Payload: []byte{prog.FlagRegex | prog.FlagWord}},
+		{Code: prog.OpExclude, Payload: []byte("vendor/**")},
+		{Code: prog.OpQuery, Payload: []byte("f.*o")},
+		{Code: prog.OpInclude, Payload: []byte("*.go")},
+		{Code: prog.OpSearch},
+	}
+	reqs, err := Requests(prog.Encode(ops), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := reqs[0].Query
+	if q == nil {
+		t.Fatal("no query compiled")
+	}
+	if q.Text != "f.*o" || q.Include != "*.go" || q.Exclude != "vendor/**" {
+		t.Errorf("query = %+v", q)
+	}
+	if !q.Regex || !q.Word || q.Case {
+		t.Errorf("flags = regex:%v case:%v word:%v", q.Regex, q.Case, q.Word)
+	}
+}
+
+// The four verbs that stay out, and the compiler refuses them by the ordinary
+// unknown-verb rule rather than by a special case.
+func TestVerbsThatStayOutOfPrograms(t *testing.T) {
+	for _, code := range []byte{0x8d, 0x8e, 0x8f} { // unallocated verb range
+		p := prog.Encode([]prog.Op{{Code: code}})
+		if _, err := Requests(p, 1); !errors.Is(err, prog.ErrUnknownVerb) {
+			t.Errorf("verb %#x = %v, want ErrUnknownVerb", code, err)
+		}
+	}
+}

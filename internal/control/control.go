@@ -621,23 +621,35 @@ func (c *connection) cancelAll() {
 // handle runs one request. A streaming one emits several frames; everything
 // else emits one.
 func (c *connection) handle(req Request) {
-	switch req.Op {
-	case "prog":
+	if req.Op == "prog" {
 		c.program(req)
 		return
+	}
+	c.one(req, c.send)
+}
+
+// one runs a single request and emits its responses through emit.
+//
+// The indirection exists for batching. A streaming verb marks its own last
+// frame Final, which is right when it is the whole request and wrong when it is
+// the third of five in a program — a client that saw Final would stop reading
+// while four verbs were still to come. So who gets to say Final is the caller's
+// decision, and the streaming handlers no longer reach for the socket directly.
+func (c *connection) one(req Request, emit func(Response)) {
+	switch req.Op {
 	case "search":
-		c.search(req)
+		c.search(req, emit)
 		return
 	case "exec":
-		c.exec(req)
+		c.exec(req, emit)
 		return
 	case "recv":
-		c.recv(req)
+		c.recv(req, emit)
 		return
 	}
 	res := c.srv.submit(req)
 	res.Final = true
-	c.send(res)
+	emit(res)
 }
 
 // program compiles a batch and runs it in order.
@@ -662,9 +674,14 @@ func (c *connection) program(req Request) {
 			sub.ID = req.ID
 		}
 		sub.Token = req.Token
-		res := c.srv.submit(sub)
-		res.Final = i == len(reqs)-1
-		c.send(res)
+		last := i == len(reqs)-1
+		c.one(sub, func(res Response) {
+			// Only the batch's last frame ends it. A streaming verb in the
+			// middle still emits every batch it found; what it does not get to
+			// do is tell the client the conversation is over.
+			res.Final = res.Final && last
+			c.send(res)
+		})
 	}
 }
 
@@ -679,7 +696,7 @@ func (c *connection) program(req Request) {
 // for that is to say hello first, which every driver does anyway: rebinding a
 // request that is already waiting would deliver one participant's mail to
 // another.
-func (c *connection) recv(req Request) {
+func (c *connection) recv(req Request, emit func(Response)) {
 	ctx, stop := context.WithCancel(context.Background())
 	c.mu.Lock()
 	c.running[req.ID] = stop
@@ -697,20 +714,20 @@ func (c *connection) recv(req Request) {
 		// Cancelled, or the connection went away. Answered rather than
 		// dropped: a client that cancelled is waiting for the frame that says
 		// its id is finished, and one that hung up will never see this.
-		c.send(Response{ID: req.ID, Err: "cancelled", Final: true})
+		emit(Response{ID: req.ID, Err: "cancelled", Final: true})
 		return
 	}
-	c.send(Response{ID: req.ID, OK: true, Final: true, Messages: msgs})
+	emit(Response{ID: req.ID, OK: true, Final: true, Messages: msgs})
 }
 
 // exec runs a command, in the same two phases as search: the decision is made
 // on the event thread, because it reads the buffers, and the command then runs
 // here so a slow one neither blocks the editor nor becomes uncancellable.
-func (c *connection) exec(req Request) {
+func (c *connection) exec(req Request, emit func(Response)) {
 	check := c.srv.submit(Request{ID: req.ID, Op: "execcheck", Argv: req.Argv, Dir: req.Dir})
 	if check.Err != "" {
 		check.ID, check.Final = req.ID, true
-		c.send(check)
+		emit(check)
 		return
 	}
 
@@ -726,7 +743,7 @@ func (c *connection) exec(req Request) {
 	}()
 
 	code, err := Run(ctx, req.Argv, req.Dir, func(stream uint8, b []byte) {
-		c.send(Response{ID: req.ID, OK: true, Stream: stream, Out: string(b)})
+		emit(Response{ID: req.ID, OK: true, Stream: stream, Out: string(b)})
 	})
 	// Dirty is carried to the result, not used to refuse: the caller needs it
 	// to judge whether a failure is about the code it is looking at.
@@ -738,7 +755,7 @@ func (c *connection) exec(req Request) {
 		final.Err = "cancelled"
 		final.OK = false
 	}
-	c.send(final)
+	emit(final)
 }
 
 // search is the streaming path, and the only op that leaves the event thread.
@@ -747,9 +764,9 @@ func (c *connection) exec(req Request) {
 // open buffers is reading the model. The walk then runs here, off it — which is
 // why a multi-second search does not freeze the editor, and why a cancel can be
 // serviced while it runs.
-func (c *connection) search(req Request) {
+func (c *connection) search(req Request, emit func(Response)) {
 	if req.Query == nil {
-		c.send(Response{ID: req.ID, Err: "search needs a query", Final: true})
+		emit(Response{ID: req.ID, Err: "search needs a query", Final: true})
 		return
 	}
 	snap := c.srv.submit(Request{ID: req.ID, Op: "snapshot"})
@@ -757,7 +774,7 @@ func (c *connection) search(req Request) {
 		if snap.Err == "" {
 			snap.Err = "search is not available"
 		}
-		c.send(Response{ID: req.ID, Err: snap.Err, Final: true})
+		emit(Response{ID: req.ID, Err: snap.Err, Final: true})
 		return
 	}
 
@@ -773,7 +790,7 @@ func (c *connection) search(req Request) {
 	}()
 
 	files, capped, err := snap.Searcher.Search(ctx, *req.Query, func(batch []SearchMatch) {
-		c.send(Response{ID: req.ID, OK: true, Matches: batch})
+		emit(Response{ID: req.ID, OK: true, Matches: batch})
 	})
 	final := Response{ID: req.ID, OK: err == nil, Files: files, Capped: capped, Final: true}
 	if err != nil {
@@ -783,7 +800,7 @@ func (c *connection) search(req Request) {
 		final.Err = "cancelled"
 		final.OK = false
 	}
-	c.send(final)
+	emit(final)
 }
 
 // The refusals a remote client can hit that a local one cannot. Both are

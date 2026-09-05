@@ -437,6 +437,21 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   path that had just failed, so the next plain save would write there without
   asking — turning one visible failure into a silent one.
 
+## Gates
+
+- [x] **`make check` is the gate**: fmt, vet, build, `go test ./...` and the race
+  detector, cheapest failure first. The commands live in the Makefile and the
+  workflow calls them, so what blocks a merge and what you can run before pushing
+  cannot drift.
+- [x] **`make smoke` drives the real binary** in a real process on a real pty,
+  sending the CSI-u sequences `internal/keys` pins and reading results back over
+  the control socket. It covers the seam every other test stubs — terminal
+  setup, decoding actual bytes, teardown — and is out of `check` because it
+  spawns processes and waits on wall-clock time. Mutation-checked: chmod'ing to
+  the wrong mode fails `TestSavePreservesMode`.
+- [x] **The two unformatted files in internal/control are formatted**, and
+  `fmt-check` is now what would catch the next ones.
+
 ## Data loss
 
 - [x] **Saves are atomic.** `os.WriteFile` truncates before it writes, so an

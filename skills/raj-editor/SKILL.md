@@ -211,7 +211,6 @@ runs it in order in a single frame.
 raj ctl run -prog "$(gen-edits)"   # the program itself, as an argument
 raj ctl run -prog @edits.bin       # from a file
 gen-edits | raj ctl run -prog -    # from stdin
-raj ctl disasm -prog "$PROGRAM"    # print it as text without sending it
 ```
 
 The program is passed as an ordinary argument. That works because no byte of
@@ -241,12 +240,17 @@ Arguments come first and the verb consumes them:
 | text | `0x04` | replacement bytes |
 | group | `0x07` | change set id |
 | id | `0x0a` | request id, echoed back |
+| include | `0x0b` | search: comma-separated globs to limit to |
+| exclude | `0x0c` | search: comma-separated globs to skip |
+| flags | `0x09` | search: bit 0 regex, bit 1 case, bit 2 whole word |
 | read | `0x82` | — |
 | open | `0x83` | — |
 | apply | `0x84` | — |
 | save | `0x85` | — |
 | version | `0x86` | — |
+| search | `0x87` | — |
 | groups / accept / reject | `0x88` / `0x89` / `0x8a` | — |
+| stats | `0x8c` | — |
 
 **`path`, `base` and `author` persist across verbs; everything else is consumed
 by the verb that follows it.** So fifty splices into one file at one version
@@ -259,6 +263,17 @@ particular you must still read the buffer before an apply in the same
 connection — put a `read` verb at the top of the program, or the applies are
 refused with the usual message about coordinates you have not seen. Your applies
 are still attributed to you and still arrive as a proposed change set.
+
+**A search inside a program streams.** Its matches arrive as they are found,
+and only the batch's last verb ends the conversation — so a program of
+`query, search, path, read` gives you match frames, then the read, then the
+frame marked final. Put the search last if you would rather not read past it.
+
+**exec, recv, hello and cancel are not available in a program.** recv parks
+until the user speaks, which would hold every verb behind it; hello and cancel
+act on the connection rather than a document, and a cancel queued behind the
+search it means to interrupt would never arrive in time. Use the flags for
+those.
 
 **A program is all-or-nothing at compile time and sequential at run time.** If
 any opcode fails to compile, nothing runs. Once it is running the verbs execute
@@ -275,9 +290,7 @@ when you emit an opcode this raj predates:
 
 The high bit is the difference: arguments are below `0x80`, verbs at or above.
 
-When a program is refused, `raj ctl run` prints the disassembly next to the
-error, so the failing opcode is visible without a hex dump. `raj ctl disasm`
-does the same offline and works when raj is not running.
+When a program is refused, the error names the opcode it choked on.
 
 **Prefer the flags for one edit.** `raj ctl apply -base 41 -start 120 -end 148
 -text '...'` is one round trip and is easier to get right. Reach for a program
