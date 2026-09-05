@@ -2,32 +2,37 @@ package control
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
-	"unicode/utf8"
 )
 
 // The wire: length-prefixed frames, an inspectable header, and a raw byte body.
 //
-//	frame  = u32 length | u32 headerLength | header JSON | body bytes
+//	frame  = u32 length | u32 crc | u32 headerLength | header program | body bytes
 //
-// HARNESS-BROKER-AGENT.md asks for two things that look opposed. Length-prefixed
-// frames, because the brittleness blamed on JSON-RPC is really newline-delimited
-// JSON over stdio and a length prefix removes the newline dependency. And
-// "optimise the wire for inspectability", because serialisation is unmeasurable
-// against a model round trip so there is nothing to buy by making it opaque.
+// Length-prefixed rather than newline-delimited, because the brittleness blamed
+// on JSON-RPC is really newline-delimited JSON over stdio, and a length prefix
+// removes the newline dependency.
 //
-// They are only opposed if the whole message has one encoding. Splitting the
-// frame resolves it: the header is JSON — an action with its arguments, which is
-// what you want to read when something is wrong — and the body is document bytes
-// that no encoder touches.
+// The header was JSON, on the grounds that serialisation is unmeasurable
+// against a model round trip so there was nothing to buy by making it opaque.
+// It is opcodes now — see header.go — because the argument had stopped holding.
+// Document bytes already bypassed JSON, so every header field that could hold
+// arbitrary bytes needed a special case to escape into the body; requests
+// already arrive as programs, so the frame carrying one was described in an
+// encoding nothing else used; and inspectability was worth paying for when a
+// header might be read off a socket by a stranger, which is not this. Both ends
+// build from one commit.
 //
-// # Why document bytes cannot go in the JSON
+// The split survives it. The header describes the frame, the body carries bytes
+// no encoder touches, and that boundary is the thing that matters.
 //
-// A buffer is a byte string. Go's encoder replaces anything that is not valid
-// UTF-8 with U+FFFD, so `caf\xe9` — one Latin-1 byte in an older source — goes
+// # Why document bytes cannot go in the header
+//
+// A buffer is a byte string. Go's JSON encoder replaces anything that is not
+// valid UTF-8 with U+FFFD, so `caf\xe9` — one Latin-1 byte in an older source — goes
 // in as 13 bytes and comes back as 15. Under a protocol that addresses text by
 // byte offset against a version, that is not a display problem: every offset
 // past it moves, so an apply computed from what was read lands on the wrong
@@ -48,98 +53,104 @@ import (
 // which are the user's, and which came from another agent.
 
 // Header is the action, and everything about it except the bytes.
+// No struct tags: nothing marshals a Header. Its fields cross the wire through
+// encodeHeader in header.go, and the codes live there beside the encoding
+// rather than here beside the declarations, so one file holds both halves of
+// the round trip. The types the header carries — Buffer, Group, Participant —
+// do keep their tags, because `raj ctl --json` marshals those for people and
+// scripts.
 type Header struct {
-	ID int    `json:"id"`
-	Op string `json:"op,omitempty"`
+	ID int
+	Op string
 
-	// Path is in the header when it is valid UTF-8, which is nearly always, so
-	// that a frame stays readable. When it is not — a filename on Linux is
-	// arbitrary bytes, and one written in Latin-1 is a real file — it moves to
-	// the body with everything else and PathLen says so. The alternative was to
-	// let JSON replace those bytes with U+FFFD and address a file that does not
-	// exist.
-	Path    string `json:"path,omitempty"`
-	PathLen int    `json:"path_len,omitempty"`
+	// Path is a byte string, like every other field here. It used to need a
+	// special case — a filename on Linux is arbitrary bytes, and Go's JSON
+	// encoder replaces anything that is not valid UTF-8 with U+FFFD, which
+	// addresses a file that does not exist — so an invalid path travelled in
+	// the body with a length beside it. The header is not JSON any more and
+	// the special case is gone.
+	Path string
 
 	// Author identifies the writer. 0 means unset; the editor assigns one per
 	// connection and refuses a request that names a different one.
-	Author uint8 `json:"author,omitempty"`
+	Author uint8
 
 	// Token is the shared secret a TCP client presents. It rides in the header
 	// on every request rather than in a handshake, so the server stays
 	// stateless about it and a reconnect needs no special case.
 	//
-	// It is therefore in the readable part of every frame, which is a real cost
-	// of having made frames readable: anything dumping this wire dumps the
-	// token with it. The alternative — an opaque handshake — buys nothing,
-	// since a dump of the connection would carry it either way.
-	Token string `json:"token,omitempty"`
+	// It is therefore in every frame, which is worth naming: anything dumping
+	// this wire dumps the token with it. The header being opcodes rather than
+	// JSON does not hide it — a byte string in a length-prefixed field is not
+	// encrypted, only unquoted. The alternative, an opaque handshake, buys
+	// nothing, since a dump of the connection would carry it either way.
+	Token string
 
 	// Base is a pointer so an apply against version 0 is distinguishable from
 	// an apply that forgot to say. The second is refused.
-	Base *uint64 `json:"base,omitempty"`
+	Base *uint64
 
 	// Hunks carry offsets and the LENGTH of their replacement text; the text
 	// itself is in the body, in this order.
-	Hunks []HunkMeta `json:"hunks,omitempty"`
+	Hunks []HunkMeta
 
 	// Query is a search. It is plain JSON: every field is a pattern the caller
 	// typed, so it is exactly what you want visible in a frame.
-	Query *SearchQuery `json:"query,omitempty"`
+	Query *SearchQuery
 
 	// Cancel names a request id to abandon. It is answered on the reading
 	// goroutine without touching the editor, which is what lets it arrive
 	// while the request it cancels is still running.
-	Cancel int `json:"cancel,omitempty"`
+	Cancel int
 
 	// Argv and Dir are exec's command. Plain JSON: a command line is exactly
 	// what you want legible in a frame.
-	Group    uint64   `json:"group,omitempty"`
-	Identity string   `json:"identity,omitempty"`
-	Name     string   `json:"name,omitempty"`
-	Argv     []string `json:"argv,omitempty"`
-	Dir      string   `json:"dir,omitempty"`
+	Group    uint64
+	Identity string
+	Name     string
+	Argv     []string
+	Dir      string
 
 	// Exit, Dirty and Stats are exec's answers. Stream marks an output frame:
 	// 1 stdout, 2 stderr, with the bytes in the body.
-	Exit         int           `json:"exit,omitempty"`
-	Dirty        []DirtyBuffer `json:"dirty,omitempty"`
-	Stats        ExecStats     `json:"stats,omitempty"`
-	Participants []Participant `json:"participants,omitempty"`
-	Groups       []Group       `json:"groups,omitempty"`
+	Exit         int
+	Dirty        []DirtyBuffer
+	Stats        ExecStats
+	Participants []Participant
+	Groups       []Group
 
 	// Messages is what a parked recv answers with. They stay in the header
 	// rather than moving to the body: a message is text a person typed into a
 	// prompt, not document bytes off a disk, so it is valid UTF-8 by
 	// construction and legible in a frame dump is worth more than a length
 	// prefix here.
-	Messages []Message `json:"messages,omitempty"`
+	Messages []Message
 
-	Stream uint8 `json:"stream,omitempty"`
-	OutLen int   `json:"out_len,omitempty"`
+	Stream uint8
+	OutLen int
 
 	// Final marks the last frame of a response. A streamed result is several
 	// frames sharing an id; everything else is one frame with Final set.
-	Final bool `json:"final,omitempty"`
+	Final bool
 
 	// Response fields.
-	OK      bool     `json:"ok,omitempty"`
-	Err     string   `json:"error,omitempty"`
-	Root    string   `json:"root,omitempty"`
-	PID     int      `json:"pid,omitempty"`
-	Version uint64   `json:"version,omitempty"`
-	Buffers []Buffer `json:"buffers,omitempty"`
-	Files   int      `json:"files,omitempty"`
-	Capped  bool     `json:"capped,omitempty"`
+	OK      bool
+	Err     string
+	Root    string
+	PID     int
+	Version uint64
+	Buffers []Buffer
+	Files   int
+	Capped  bool
 	// Matches carry their position in the header and their path and line text
 	// in the body, for the same reason document bytes are not in the JSON: a
 	// path is arbitrary bytes and a matched line is document content.
-	Matches   []MatchMeta `json:"matches,omitempty"`
-	Conflicts []Conflict  `json:"conflicts,omitempty"`
+	Matches   []MatchMeta
+	Conflicts []Conflict
 
 	// Spans describe the body of a read: one entry per authored run, in
 	// document order. Their lengths sum to the body that follows them.
-	Spans []SpanMeta `json:"spans,omitempty"`
+	Spans []SpanMeta
 }
 
 // HunkMeta is a hunk with its text moved to the body.
@@ -167,6 +178,24 @@ type SpanMeta struct {
 // MaxFrame bounds one message. A length field is a request to allocate, so it
 // is checked before it is used; 64 MiB is past the largest file raj will open
 // and far short of a denial of service.
+// crcTable is Castagnoli, which Go implements with the SSE4.2 instruction on
+// any machine raj runs on — so the check costs a few nanoseconds per frame
+// rather than a pass over the bytes.
+//
+// What it is for is worth being honest about. On a Unix socket, which is how
+// raj is normally driven, the kernel copies memory and there is no corruption
+// to catch; over TCP the transport has already checksummed the segment. This
+// does not meaningfully protect against a flipped bit on the wire.
+//
+// What it does catch is us. A frame whose length says one thing and whose
+// payload says another is an encoder bug — a field written with the wrong
+// width, a body assembled from runs that do not sum to their header — and
+// those are silent otherwise: the reader parses whatever bytes it was handed
+// and hands the caller a header that decoded cleanly and means something else.
+// The check turns that class of bug into a named error at the boundary where
+// it happened rather than into a wrong offset three calls later.
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
 const MaxFrame = 64 << 20
 
 var (
@@ -203,11 +232,8 @@ func (f Frame) Split(lengths []int) ([][]byte, error) {
 
 // WriteFrame emits one message.
 func WriteFrame(w io.Writer, h Header, body []byte) error {
-	head, err := json.Marshal(h)
-	if err != nil {
-		return err
-	}
-	total := 4 + len(head) + len(body)
+	head := encodeHeader(h)
+	total := 8 + len(head) + len(body)
 	if total > MaxFrame {
 		return errFrameTooLarge
 	}
@@ -215,10 +241,11 @@ func WriteFrame(w io.Writer, h Header, body []byte) error {
 	// blocked mid-frame, and on a socket two writes can be split by anything.
 	frame := make([]byte, 4+total)
 	binary.LittleEndian.PutUint32(frame, uint32(total))
-	binary.LittleEndian.PutUint32(frame[4:], uint32(len(head)))
-	copy(frame[8:], head)
-	copy(frame[8+len(head):], body)
-	_, err = w.Write(frame)
+	binary.LittleEndian.PutUint32(frame[8:], uint32(len(head)))
+	copy(frame[12:], head)
+	copy(frame[12+len(head):], body)
+	binary.LittleEndian.PutUint32(frame[4:], crc32.Checksum(frame[8:], crcTable))
+	_, err := w.Write(frame)
 	return err
 }
 
@@ -232,22 +259,29 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	if n > MaxFrame {
 		return Frame{}, errFrameTooLarge
 	}
-	if n < 4 {
-		return Frame{}, fmt.Errorf("%w: frame of %d bytes has no header length", errBadFrame, n)
+	if n < 8 {
+		return Frame{}, fmt.Errorf("%w: frame of %d bytes has no checksum and header length", errBadFrame, n)
 	}
 	payload := make([]byte, n)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return Frame{}, err
 	}
-	hn := binary.LittleEndian.Uint32(payload)
-	if uint64(hn)+4 > uint64(n) {
+	want := binary.LittleEndian.Uint32(payload)
+	if got := crc32.Checksum(payload[4:], crcTable); got != want {
+		return Frame{}, fmt.Errorf("%w: checksum %08x, computed %08x over %d bytes",
+			errBadFrame, want, got, n-4)
+	}
+	hn := binary.LittleEndian.Uint32(payload[4:])
+	if uint64(hn)+8 > uint64(n) {
 		return Frame{}, fmt.Errorf("%w: header of %d bytes in a frame of %d", errBadFrame, hn, n)
 	}
 	var f Frame
-	if err := json.Unmarshal(payload[4:4+hn], &f.Header); err != nil {
-		return Frame{}, fmt.Errorf("%w: %v", errBadFrame, err)
+	h, err := decodeHeader(payload[8 : 8+hn])
+	if err != nil {
+		return Frame{}, err
 	}
-	f.Body = payload[4+hn:]
+	f.Header = h
+	f.Body = payload[8+hn:]
 	return f, nil
 }
 
@@ -264,12 +298,7 @@ func EncodeRequest(req Request) (Header, []byte) {
 		// The whole body, unclaimed by any header length: see DecodeRequest.
 		return h, req.Program
 	}
-	if utf8.ValidString(req.Path) {
-		h.Path = req.Path
-	} else {
-		h.PathLen = len(req.Path)
-		body = append(body, req.Path...)
-	}
+	h.Path = req.Path
 	for _, x := range req.Hunks {
 		h.Hunks = append(h.Hunks, HunkMeta{Start: x.Start, End: x.End, Len: len(x.Text)})
 		body = append(body, x.Text...)
@@ -292,11 +321,7 @@ func DecodeRequest(f Frame) (Request, error) {
 		req.Program = f.Body
 		return req, nil
 	}
-	lengths := make([]int, 0, len(f.Header.Hunks)+1)
-	if f.Header.PathLen > 0 {
-		lengths = append(lengths, f.Header.PathLen)
-	}
-	pathRuns := len(lengths)
+	lengths := make([]int, 0, len(f.Header.Hunks))
 	for _, m := range f.Header.Hunks {
 		lengths = append(lengths, m.Len)
 	}
@@ -304,11 +329,8 @@ func DecodeRequest(f Frame) (Request, error) {
 	if err != nil {
 		return req, err
 	}
-	if pathRuns == 1 {
-		req.Path = string(runs[0])
-	}
 	for i, m := range f.Header.Hunks {
-		req.Hunks = append(req.Hunks, Hunk{Start: m.Start, End: m.End, Text: string(runs[pathRuns+i])})
+		req.Hunks = append(req.Hunks, Hunk{Start: m.Start, End: m.End, Text: string(runs[i])})
 	}
 	return req, nil
 }

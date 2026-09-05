@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -12,25 +11,32 @@ import (
 // readable when something is wrong. This asserts that rather than leaving it as
 // an intention — a future change that moved the op into a byte would pass every
 // other test in this file.
-func TestHeaderIsReadable(t *testing.T) {
+// The header describes the frame; the body carries the bytes. That split is
+// what keeps document text out of a field an encoder might rewrite, and it
+// outlived the JSON the header used to be written in.
+func TestDocumentBytesStayInTheBody(t *testing.T) {
 	base := uint64(41)
 	h, body := EncodeRequest(Request{ID: 3, Op: "apply", Path: "/w/a.go", Author: 2, Base: &base,
 		Hunks: []Hunk{{Start: 10, End: 20, Text: "hello"}}})
-	raw, err := json.Marshal(h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{`"op":"apply"`, `"path":"/w/a.go"`, `"base":41`, `"start":10`} {
-		if !strings.Contains(string(raw), want) {
-			t.Errorf("header %s does not contain %s", raw, want)
-		}
-	}
-	// ...and the text is in the body, not the header.
-	if strings.Contains(string(raw), "hello") {
-		t.Errorf("document bytes leaked into the header: %s", raw)
+
+	raw := encodeHeader(h)
+	if bytes.Contains(raw, []byte("hello")) {
+		t.Errorf("document bytes leaked into the header: %x", raw)
 	}
 	if string(body) != "hello" {
 		t.Errorf("body = %q", body)
+	}
+	// The header still says where in the body that text is, and how much of it
+	// belongs to which hunk.
+	back, err := decodeHeader(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Hunks) != 1 || back.Hunks[0].Start != 10 || back.Hunks[0].Len != len("hello") {
+		t.Errorf("hunk meta = %+v", back.Hunks)
+	}
+	if back.Op != "apply" || back.Path != "/w/a.go" || back.Base == nil || *back.Base != 41 {
+		t.Errorf("header = %+v", back)
 	}
 }
 
@@ -255,6 +261,60 @@ func TestResponseCarriesMessages(t *testing.T) {
 	for i := range want {
 		if got.Messages[i] != want[i] {
 			t.Errorf("message %d = %+v, want %+v", i, got.Messages[i], want[i])
+		}
+	}
+}
+
+// A frame carries a checksum, and a frame that fails it is refused rather than
+// parsed. The point is not bit rot on a Unix socket — there is none — it is
+// that an encoder bug becomes a named error here instead of a wrong offset
+// three calls later.
+func TestCorruptFrameIsRefused(t *testing.T) {
+	var buf bytes.Buffer
+	h, body := EncodeRequest(Request{ID: 1, Op: "apply", Path: "/w/a.go",
+		Hunks: []Hunk{{Start: 0, End: 4, Text: "hello"}}})
+	if err := WriteFrame(&buf, h, body); err != nil {
+		t.Fatal(err)
+	}
+	good := buf.Bytes()
+
+	// Flip one bit at every position past the length prefix. Every one of them
+	// must be caught: this is the assertion that the checksum covers the whole
+	// frame and not just the part that was convenient.
+	for i := 4; i < len(good); i++ {
+		corrupt := append([]byte{}, good...)
+		corrupt[i] ^= 0x01
+		if _, err := ReadFrame(bytes.NewReader(corrupt)); err == nil {
+			t.Errorf("a frame with byte %d flipped was accepted", i)
+		}
+	}
+}
+
+func TestChecksumSurvivesAnEmptyBody(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, Header{ID: 2, Op: "ping"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Header.Op != "ping" || len(f.Body) != 0 {
+		t.Errorf("frame = %+v", f.Header)
+	}
+}
+
+// A truncated frame is a different failure from a corrupt one, and both are
+// refused.
+func TestShortFrameIsRefused(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, Header{ID: 3, Op: "ping"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	good := buf.Bytes()
+	for cut := 1; cut < len(good); cut++ {
+		if _, err := ReadFrame(bytes.NewReader(good[:cut])); err == nil {
+			t.Errorf("a frame cut to %d bytes was accepted", cut)
 		}
 	}
 }
