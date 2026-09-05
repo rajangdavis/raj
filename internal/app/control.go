@@ -22,22 +22,36 @@ func pid() int            { return os.Getpid() }
 // internal/control can reach these types, so the unsafe version — editing from
 // the accept goroutine — is not merely discouraged, it is not expressible.
 
-// StartControl begins listening. Off unless asked for: a socket that exists
+// StartControl begins listening. Off unless asked for: a listener that exists
 // whenever raj runs is an attack surface for a feature most sessions do not
-// use, and the trust boundary is the filesystem.
-func (a *App) StartControl(path string) error {
-	if path == "" {
-		path = control.DefaultPath()
+// use, and on a Unix socket the trust boundary is the filesystem.
+//
+// addr is a socket path or `tcp://host:port`. remoteExec permits a TCP client
+// to run commands here — off by default, because a driver in a container
+// asking for that is asking to run outside its container.
+func (a *App) StartControl(addr string, remoteExec bool) error {
+	if addr == "" {
+		addr = control.DefaultPath()
 	}
-	srv, err := control.Listen(path, func() { a.host.Post(wakeEvent()) })
+	srv, err := control.Listen(addr, func() { a.host.Post(wakeEvent()) })
 	if err != nil {
 		return err
 	}
+	srv.AllowRemoteExec = remoteExec
 	a.control = srv
 	return nil
 }
 
-// ControlPath is where the socket is, or "" when there is none. Printed at
+// ControlToken is the secret a TCP client must present, and "" when the
+// listener is a Unix socket or absent.
+func (a *App) ControlToken() string {
+	if a.control == nil {
+		return ""
+	}
+	return a.control.Token()
+}
+
+// ControlPath is where the listener is, or "" when there is none. Printed at
 // startup so a harness does not have to guess.
 func (a *App) ControlPath() string {
 	if a.control == nil {
@@ -46,7 +60,7 @@ func (a *App) ControlPath() string {
 	return a.control.Path()
 }
 
-// StopControl removes the socket. Called on the way out.
+// StopControl stops listening, and removes the socket if there was one. Called on the way out.
 func (a *App) StopControl() {
 	if a.control != nil {
 		a.control.Close()

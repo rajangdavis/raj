@@ -60,7 +60,7 @@ internal/prompt      modal dialogs: ask a question, resume on the answer.
                      Modal to the pointer too: a press outside an open dialog
                      is swallowed rather than reaching what is behind it.
 internal/probe       what chords does this terminal actually deliver?
-internal/control     the Unix control socket: line-delimited JSON, requests
+internal/control     the control transport, over a Unix socket or TCP: requests
                      parked for the event thread. Holds no editor types, so it
                      cannot edit anything itself.
 internal/app         event loop, focus routing, layout, breakpoints, debug pane.
@@ -99,19 +99,13 @@ the open buffers. This is instead of an agent pane: the driver is a separate
 process that can be restarted, replaced or written in another language, and a
 crash in it is not a crash in the thing holding your unsaved work.
 
-Line-delimited JSON, one object per line each way. Ops: `ping`, `buffers`,
-`open`, `text`, `apply`, `save`. The path defaults to
+Length-prefixed frames, a JSON header and a raw body — so document bytes cross
+unencoded and a frame is still readable in a dump. Ops: `ping`, `buffers`,
+`open`, `text`, `version`, `apply`, `save`, `search`, `exec`, `groups`,
+`accept`, `reject`, `hello`, `cancel`. The path defaults to
 `$XDG_RUNTIME_DIR/raj/<pid>.sock` and is printed on stderr at startup;
-`--control-socket PATH` puts it somewhere you choose.
-
-```
-$ nc -U "$XDG_RUNTIME_DIR/raj/$(pgrep -n raj).sock"
-{"id":1,"op":"text","path":"/w/main.go"}
-{"id":1,"ok":true,"text":"package main\n","version":7}
-{"id":2,"op":"apply","path":"/w/main.go","base":7,
- "hunks":[{"start":8,"end":12,"text":"raj"}]}
-{"id":2,"ok":true,"version":8}
-```
+`--control-socket PATH` puts it somewhere you choose. `raj ctl` is the
+command-line client.
 
 `apply` requires the `base` version it was written against. Hunks are rebased
 onto the current buffer and rejected individually, so an edit written against a
@@ -122,6 +116,51 @@ swallow them.
 
 Off unless asked for. Authorisation is the socket's file mode, so anything
 running as you can drive the editor — the same trust boundary as your shell.
+
+### Over TCP, for a driver in a container
+
+The socket assumes both ends share a filesystem. Increasingly they do not: raj
+runs in the terminal on the host, because that is where a terminal actually
+delivers the chords — a raj inside a container is a raj whose keybindings never
+arrive — and the agent runs in a container, because that is where it is safe to
+let it run commands. A Unix socket cannot bridge that: it is a filesystem
+object, and bind-mounting one does not forward it.
+
+```
+$ raj --control-addr tcp://0.0.0.0:7391
+raj: control tcp://0.0.0.0:7391
+raj: RAJ_CONTROL_TOKEN=3f9c...
+```
+
+```
+$ docker run -e RAJ_CONTROL_ADDR=tcp://host.docker.internal:7391 \
+             -e RAJ_CONTROL_TOKEN=3f9c... \
+             -v "$PWD:/workspace" -w /workspace your-agent-image
+```
+
+Two things change, and both of them are about the boundary rather than about
+the protocol.
+
+**A token, because the filesystem is no longer doing the authorising.** A TCP
+listener mints one at startup and prints it, or takes `RAJ_CONTROL_TOKEN` from
+its own environment if you would rather pin it; every request carries it and
+anything else is refused and hung up on. `127.0.0.1` is not reachable from a
+container, so `0.0.0.0` is usually what you want and raj says so when you take
+one — the token is the only thing between that port and your unsaved work.
+
+**Paths are translated.** `/workspace/main.go` in the container is
+`/Users/you/src/proj/main.go` to the editor, so `raj ctl` rewrites paths
+outbound and back again: what `search` prints is something the agent can open
+with its own tools. The mapping is inferred — the editor's root does not exist
+on the container's filesystem, so the container's own workspace root stands in
+for it — and `RAJ_ROOT_MAP=/workspace=/Users/you/src/proj` overrides that for a
+mount layout the inference gets wrong. Nothing is ever inferred over a Unix
+socket: reaching one is proof the filesystem is shared.
+
+`exec` is refused over TCP unless `--control-exec` is passed. The command would
+run in the editor's process, on the host, outside the container that was the
+reason for the container — an agent that wants to run tests should run them
+with its own shell, in its own sandbox.
 
 ## Documents
 

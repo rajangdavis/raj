@@ -1,12 +1,13 @@
 ---
 name: raj-editor
-description: Read, search and edit the files open in the user's running raj editor, including their unsaved changes. Use this instead of the normal read, edit and grep tools whenever the user refers to what they are looking at, what is on their screen, their current buffer or tab, or asks for a change to a file they say they have open. Also use it when a normal read shows a file that does not match what the user is describing, because the difference is usually unsaved edits that exist only in the editor.
+description: Read, search and edit the files open in the user's running raj editor, including their unsaved changes. Use this instead of the normal read, edit and grep tools whenever the user refers to what they are looking at, what is on their screen, their current buffer or tab, or asks for a change to a file they say they have open. Also use it when a normal read shows a file that does not match what the user is describing, because the difference is usually unsaved edits that exist only in the editor. This works when you are running in a container and the editor is not: see the section on that below.
 ---
 
 # Working in the user's open buffers
 
-`raj` is the user's terminal editor. Run with `--control` it exposes a Unix
-socket, and `raj ctl` talks to it.
+`raj` is the user's terminal editor. Run with `--control` it exposes a control
+channel — a Unix socket, or a TCP port when you are somewhere that cannot reach
+a socket — and `raj ctl` talks to it.
 
 This matters for one reason: **a buffer open in raj can differ from the file on
 disk.** Reading the file with normal tools shows you the saved version. Writing
@@ -35,6 +36,45 @@ when you mean to, not to paper over a wrong path.
 
 Every command takes an optional path; omit it for the buffer the user is
 currently looking at. Add `-json` to any command for machine-readable output.
+
+## If you are in a container and the editor is not
+
+This is the normal arrangement, not an exotic one. raj runs in the terminal on
+the user's own machine, because that is the only place a terminal delivers its
+keybindings; you run in a sandbox, because that is where it is safe to let you
+run commands. There is no shared filesystem and no shared socket.
+
+Two variables are set for you, and if they are you need do nothing else:
+
+```
+RAJ_CONTROL_ADDR=tcp://host.docker.internal:7391
+RAJ_CONTROL_TOKEN=<the token raj printed when it started>
+```
+
+If `raj ctl buffers` fails with `no running raj found`, the address is not set
+and there is nothing you can guess — the port and the token are on the other
+side of the boundary. Say so, tell the user to start raj with
+`--control-addr tcp://0.0.0.0:7391` and pass the two variables into your
+sandbox, and use your normal file tools in the meantime.
+
+**Use the paths you can see.** `raj ctl` translates between your filesystem and
+the editor's, so if the repository is `/workspace` to you and
+`/Users/them/src/proj` to raj, you pass `/workspace/main.go` and that is what
+comes back from `buffers` and `search`. Do not try to construct the editor's
+paths yourself. `raj ctl whoami -json` prints `root_map` when a translation is
+in force, which is worth checking once if paths are being refused.
+
+If the mapping is wrong — an unusual mount layout — the user can set
+`RAJ_ROOT_MAP=/workspace=/Users/them/src/proj` in your environment. Ask; do not
+work around it by guessing at paths.
+
+**`raj ctl exec` does not work here, by design.** It is refused over TCP,
+because the command would run on the user's machine rather than in your sandbox
+— outside the isolation that is the reason you are in one. Run tests, builds
+and git with your own shell tool, in your own environment, as you normally
+would. The one thing you lose is the unsaved-buffer warning, so check
+`raj ctl buffers` yourself before you trust a test result: if a file you are
+about to test has unsaved changes, the command is reading older text.
 
 ## Searching
 
@@ -213,6 +253,9 @@ You may also use your own shell tool for commands. Prefer `raj ctl exec` when
 the command reads source files, for the staleness check; either is fine for
 things that do not, like `git log`.
 
+None of this applies if you are reaching the editor over TCP: `exec` is refused
+there and your own shell is the only option. See the container section above.
+
 ## When something is refused
 
 Every refusal is a non-zero exit with a reason on stderr. None should be retried
@@ -227,6 +270,8 @@ unchanged.
 | `hunks could not be placed` | The user typed while you worked; nothing was written. Re-read and redo against the new version. |
 | `no open buffer for ...` | `raj ctl open` it first, or check `buffers` for the exact path. |
 | `is not under <root>` | The path or glob leaves the workspace. Not permitted. |
+| `unauthorized` | `RAJ_CONTROL_TOKEN` is unset or wrong. You cannot recover from this yourself; tell the user. |
+| `exec is refused over TCP` | Run the command with your own shell instead. |
 
 ## Several editors
 
@@ -235,5 +280,9 @@ rather than guessing which to edit. Pick one:
 
 ```
 raj ctl list
-RAJ_SOCKET=/run/user/1000/raj/4821.sock raj ctl buffers
+RAJ_CONTROL_ADDR=/run/user/1000/raj/4821.sock raj ctl buffers
 ```
+
+`list` finds editors by looking in the socket directory, so it finds nothing
+when you are reaching one over TCP — there is no directory to look in. In that
+case `RAJ_CONTROL_ADDR` already names the one editor you can reach.

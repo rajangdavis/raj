@@ -65,7 +65,7 @@ func controlHarness(t *testing.T, content string) *harness {
 	t.Helper()
 	h := newHarness(t, content)
 	sock := filepath.Join(t.TempDir(), "c.sock")
-	if err := h.StartControl(sock); err != nil {
+	if err := h.StartControl(sock, false); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(h.StopControl)

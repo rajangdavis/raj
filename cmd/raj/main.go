@@ -6,6 +6,8 @@
 //	raj --tab 4 file.go       set the indent width
 //	raj --tabs file.go        indent with tabs where the file does not say
 //	raj --control             listen on a control socket for buffer edits
+//	raj --control-addr tcp://0.0.0.0:7391
+//	                          listen on TCP, for a driver in a container
 //	raj --no-restore          start fresh instead of where you left off
 //	raj ctl <cmd>             read and edit a running raj's buffers
 //	raj --config ghostty      print Ghostty keybindings to install
@@ -41,6 +43,8 @@ func main() {
 		useTabs   = flag.Bool("tabs", false, "indent with tabs in files that have no indentation to detect")
 		ctl       = flag.Bool("control", false, "listen on a Unix socket for buffer reads and edits")
 		ctlPath   = flag.String("control-socket", "", "path for --control; implies it")
+		ctlAddr   = flag.String("control-addr", "", "listen on tcp://host:port instead of a socket; implies --control")
+		ctlExec   = flag.Bool("control-exec", false, "with --control-addr: let a remote driver run commands on this machine")
 		noRestore = flag.Bool("no-restore", false, "do not reopen the previous session")
 		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
 		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
@@ -72,7 +76,11 @@ func main() {
 		}
 		return
 	}
-	if err := run(flag.Arg(0), *tab, *wrap, *useTabs, *ctl || *ctlPath != "", *ctlPath, *noRestore); err != nil {
+	addr := *ctlPath
+	if *ctlAddr != "" {
+		addr = *ctlAddr
+	}
+	if err := run(flag.Arg(0), *tab, *wrap, *useTabs, *ctl || addr != "", addr, *ctlExec, *noRestore); err != nil {
 		fail(err)
 	}
 }
@@ -96,7 +104,7 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlPath string, noRestore bool) error {
+func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlAddr string, ctlExec bool, noRestore bool) error {
 	root, path, err := resolve(path)
 	if err != nil {
 		return err
@@ -128,12 +136,24 @@ func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlPath string
 		}
 	}()
 	if ctl {
-		if err := a.StartControl(ctlPath); err != nil {
+		if err := a.StartControl(ctlAddr, ctlExec); err != nil {
 			return err
 		}
 		// Printed before the alternate screen is entered, so a harness that
-		// started raj can read the path from its output rather than guessing.
-		fmt.Fprintln(os.Stderr, "raj: control socket", a.ControlPath())
+		// started raj can read the address from its output rather than guessing.
+		fmt.Fprintln(os.Stderr, "raj: control", a.ControlPath())
+		if tok := a.ControlToken(); tok != "" {
+			// The token has to leave the process somehow, and stderr is where
+			// the address already goes. Not a file: a file the driver could
+			// read is a file on a filesystem the driver does not share, which
+			// is the situation TCP exists for.
+			fmt.Fprintf(os.Stderr, "raj: %s=%s\n", control.TokenEnv, tok)
+			if _, address := control.ParseAddr(a.ControlPath()); !control.Loopback(address) {
+				fmt.Fprintln(os.Stderr, "raj: warning — this port is open to the network, "+
+					"not just to this machine. Anything holding the token can read and "+
+					"write your unsaved buffers.")
+			}
+		}
 	}
 	if path != "" {
 		a.OpenFile(path)

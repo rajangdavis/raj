@@ -32,6 +32,7 @@ package control
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
@@ -79,6 +80,9 @@ type Request struct {
 	// Argv is the command for exec, and Dir the directory to run it in.
 	Argv []string
 	Dir  string
+	// Token authenticates a TCP client. Ignored on a Unix socket, where the
+	// filesystem permissions have already decided.
+	Token string
 }
 
 // Group is a change set: what one apply, or one user action, did. Reviewable as
@@ -279,8 +283,20 @@ type Server struct {
 	// harness reconnecting is the same writer it was before.
 	Participants *Registry
 
-	path string
-	ln   net.Listener
+	// AllowRemoteExec permits `exec` from a TCP client. Off by default, and
+	// deliberately: an agent in a container asking the editor to run a command
+	// gets it run in the editor's process, on the host, outside the sandbox
+	// that was the reason for the container. That is a sandbox escape wearing
+	// the clothes of a convenience, so it has to be asked for.
+	//
+	// It has no effect on a Unix socket, where the caller could already run
+	// the command itself.
+	AllowRemoteExec bool
+
+	path    string
+	network string
+	token   string
+	ln      net.Listener
 
 	mu     sync.Mutex
 	anon   int
@@ -288,7 +304,7 @@ type Server struct {
 	closed bool
 }
 
-// DefaultPath is the socket for this process: one per raj, so two editors do
+// DefaultPath is the Unix socket for this process: one per raj, so two editors do
 // not collide and neither inherits a dead one's path.
 //
 // Per-process rather than per-workspace because a workspace path has to be
@@ -306,14 +322,27 @@ func DefaultPath() string {
 	return filepath.Join(dir, strconv.Itoa(os.Getpid())+".sock")
 }
 
-// Listen starts a server. The directory is created 0700 and the socket 0600:
+// Listen starts a server on a Unix path or a `tcp://host:port` address.
+//
+// For a Unix socket the directory is created 0700 and the socket 0600:
 // authorisation is the filesystem, so anything the user can run can drive the
 // editor — the same trust boundary as the user's own shell, and the reason this
 // is off unless asked for.
-func Listen(path string, notify func()) (*Server, error) {
+//
+// A TCP listener has no filesystem to lean on, so it mints a token instead and
+// refuses any request that does not carry it. See addr.go for why that is the
+// same check rather than a new one.
+func Listen(addr string, notify func()) (*Server, error) {
 	if notify == nil {
 		return nil, errors.New("control: Notify is required")
 	}
+	if network, address := ParseAddr(addr); network == "tcp" {
+		return listenTCP(address, notify)
+	}
+	return listenUnix(addr, notify)
+}
+
+func listenUnix(path string, notify func()) (*Server, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -334,13 +363,45 @@ func Listen(path string, notify func()) (*Server, error) {
 		ln.Close()
 		return nil, err
 	}
-	s := &Server{Notify: notify, path: path, ln: ln, Participants: NewRegistry()}
+	s := &Server{Notify: notify, path: path, network: "unix", ln: ln, Participants: NewRegistry()}
 	go s.accept()
 	return s, nil
 }
 
-// Path is where the server is listening.
+func listenTCP(address string, notify func()) (*Server, error) {
+	// The environment wins so the token can be pinned: a container is started
+	// with its environment already fixed, and a token the editor invented after
+	// the fact cannot be got into one without restarting it.
+	token := os.Getenv(TokenEnv)
+	if token == "" {
+		var err error
+		if token, err = NewToken(); err != nil {
+			return nil, err
+		}
+	}
+	ln, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	// Path reports the resolved address, not the requested one, so a port of 0
+	// — which is what a test wants, and what avoids a collision — comes back as
+	// something a client can actually dial.
+	s := &Server{Notify: notify, path: TCPAddr(ln.Addr()), network: "tcp",
+		token: token, ln: ln, Participants: NewRegistry()}
+	go s.accept()
+	return s, nil
+}
+
+// Path is where the server is listening, in the form a client can dial.
 func (s *Server) Path() string { return s.path }
+
+// Token is the secret a TCP client must present, and empty for a Unix socket.
+func (s *Server) Token() string { return s.token }
+
+// Remote reports whether this server is reachable off this process's
+// filesystem, which is what makes a request untrusted enough to need a token
+// and an `exec` worth refusing.
+func (s *Server) Remote() bool { return s.network == "tcp" }
 
 func (s *Server) accept() {
 	for {
@@ -394,6 +455,18 @@ func (s *Server) serve(conn net.Conn) {
 			// than dropped: the client is waiting, and the id is readable even
 			// when the body is not.
 			c.send(Response{ID: f.Header.ID, Err: derr.Error(), Final: true})
+			continue
+		}
+		if !s.authorised(req) {
+			// One refusal, then the connection ends. The token is 32 random
+			// bytes, so this is not rate limiting against a guesser — it is
+			// refusing to stay in a conversation with something that cannot
+			// say who it is.
+			c.send(Response{ID: req.ID, Err: errUnauthorised, Final: true})
+			break
+		}
+		if req.Op == "exec" && s.Remote() && !s.AllowRemoteExec {
+			c.send(Response{ID: req.ID, Err: errRemoteExec, Final: true})
 			continue
 		}
 		if req.Op == "hello" {
@@ -590,6 +663,24 @@ func (c *connection) search(req Request) {
 	c.send(final)
 }
 
+// The refusals a remote client can hit that a local one cannot. Both are
+// strings a person will read at a terminal, and both say what to do.
+const (
+	errUnauthorised = "unauthorized: set " + TokenEnv + " to the token raj printed when it started"
+	errRemoteExec   = "exec is refused over TCP: the command would run on the editor's machine, " +
+		"outside your sandbox — run it with your own shell instead, or start raj with --control-exec"
+)
+
+// authorised checks a request's token against the server's. Constant time, so
+// the comparison does not leak the token a byte at a time; free, since it runs
+// once per request against 64 characters.
+func (s *Server) authorised(req Request) bool {
+	if s.token == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.token)) == 1
+}
+
 // nextAuthor hands out ids from Agent upward. Author 0 is the file as loaded
 // and 1 is the human, so a connection never gets either.
 // nextAuthor gives an unidentified connection a provisional id.
@@ -657,7 +748,9 @@ func (s *Server) Close() error {
 	s.mu.Unlock()
 
 	err := s.ln.Close()
-	os.Remove(s.path)
+	if s.network != "tcp" {
+		os.Remove(s.path)
+	}
 	for _, p := range parked {
 		p.Fail("editor is shutting down")
 	}

@@ -36,15 +36,70 @@ type Client struct {
 	// cur is the id being collected, readable without either lock so that
 	// CancelCurrent works from another goroutine.
 	cur atomic.Int64
+
+	// token is presented on every request; empty for a Unix socket.
+	token string
+	// remote records that this connection is TCP, which is the only case where
+	// the two ends can have different filesystems.
+	remote bool
+	// paths translates between this process's view of the tree and the
+	// editor's. Applied here, at the transport edge, rather than at each call
+	// site: there are a dozen fields carrying a path in either direction and a
+	// caller that forgot one would send an unmapped path that the editor
+	// refuses for a reason unrelated to what went wrong.
+	paths Mapper
 }
 
-// Dial connects to a socket.
-func Dial(path string) (*Client, error) {
-	conn, err := net.DialTimeout("unix", path, 2*time.Second)
+// Dial connects to a Unix path or a `tcp://host:port` address.
+func Dial(addr string) (*Client, error) {
+	network, address := ParseAddr(addr)
+	conn, err := net.DialTimeout(network, address, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn, r: bufio.NewReader(conn)}, nil
+	return &Client{conn: conn, r: bufio.NewReader(conn),
+		token: os.Getenv(TokenEnv), remote: network == "tcp"}, nil
+}
+
+// SetMapper installs a path translation. Nothing is rewritten by default.
+func (c *Client) SetMapper(m Mapper) { c.paths = m }
+
+// Mapper is the translation in force, for a caller that wants to report it.
+func (c *Client) Mapper() Mapper { return c.paths }
+
+// ResolveRoots settles how paths should be translated for this connection, and
+// returns the mapping it chose.
+//
+// RAJ_ROOT_MAP wins, on any transport. Otherwise inference runs only over TCP:
+// a Unix socket is a filesystem object, so reaching one is proof that both ends
+// share the filesystem and that every path already means the same thing. That
+// restriction is not a shortcut, it is the correctness argument — inferring on
+// a shared filesystem is how `raj ctl read /Users/x/proj/a.go`, run from the
+// home directory above it, becomes a path with the project name in it twice.
+//
+// Over TCP it asks the editor for its root and checks whether that path exists
+// here. If it does, nothing is rewritten. If it does not, this process is
+// somewhere else — a container — and its own workspace root stands in.
+//
+// One round trip, on a connection that is about to make several anyway.
+func (c *Client) ResolveRoots(cwd string) (Mapper, error) {
+	m, err := MapperFromEnv()
+	if err != nil {
+		return Mapper{}, err
+	}
+	if m.Active() {
+		c.paths = m
+		return m, nil
+	}
+	if !c.remote {
+		return Mapper{}, nil
+	}
+	res, err := c.Do(Request{Op: "ping"})
+	if err != nil {
+		return Mapper{}, err
+	}
+	c.paths = inferMapper(cwd, res.Root)
+	return c.paths, nil
 }
 
 func (c *Client) Close() error { return c.conn.Close() }
@@ -90,6 +145,11 @@ func (c *Client) DoStream(req Request, onBatch func([]SearchMatch)) (Response, e
 // write serialises one frame onto the socket. Separate from mu so a cancel can
 // overtake the request it cancels.
 func (c *Client) write(req Request) error {
+	if req.Token == "" {
+		req.Token = c.token
+	}
+	req.Path = c.paths.ToEditor(req.Path)
+	req.Dir = c.paths.ToEditor(req.Dir)
 	h, body := EncodeRequest(req)
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -145,6 +205,7 @@ func (c *Client) collectAll(id int, onBatch func([]SearchMatch),
 		if res.Author != 0 {
 			c.author.Store(uint32(res.Author))
 		}
+		c.localise(&res)
 		if res.ID != id {
 			// A cancel's own acknowledgement, or a reply to something else.
 			// Ignore rather than fail: ids are how frames are matched.
@@ -171,6 +232,28 @@ func (c *Client) collectAll(id int, onBatch func([]SearchMatch),
 	}
 }
 
+// localise rewrites every path in a response back into the caller's view, so
+// what comes out of `search` or `buffers` is something the caller can open with
+// its own tools.
+func (c *Client) localise(res *Response) {
+	if !c.paths.Active() {
+		return
+	}
+	res.Root = c.paths.FromEditor(res.Root)
+	for i := range res.Buffers {
+		res.Buffers[i].Path = c.paths.FromEditor(res.Buffers[i].Path)
+	}
+	for i := range res.Matches {
+		res.Matches[i].Path = c.paths.FromEditor(res.Matches[i].Path)
+	}
+	for i := range res.Dirty {
+		res.Dirty[i].Path = c.paths.FromEditor(res.Dirty[i].Path)
+	}
+	for i := range res.Groups {
+		res.Groups[i].Path = c.paths.FromEditor(res.Groups[i].Path)
+	}
+}
+
 // Author is the id this connection writes as, or 0 before the first exchange.
 // A caller compares span authors against it to tell its own text from the
 // user's and from another agent's.
@@ -184,7 +267,9 @@ type Instance struct {
 }
 
 // Discover finds running editors by listing the socket directory and asking
-// each one what it holds.
+// each one what it holds. Unix sockets only: a TCP editor is somewhere there is
+// no directory to list, which is why an address for one has to be given rather
+// than found.
 //
 // Asking is the point. A socket path cannot say which workspace is behind it —
 // a per-workspace naming scheme would have to encode one, and would be wrong the
@@ -227,7 +312,8 @@ func Discover() []Instance {
 
 // Locate picks the socket to talk to.
 //
-// Explicit beats implicit throughout: an argument, then RAJ_SOCKET, then
+// Explicit beats implicit throughout: an argument, then RAJ_CONTROL_ADDR or its
+// older spelling RAJ_SOCKET, then
 // discovery. Discovery prefers an editor whose root contains the working
 // directory, since a bridge is normally started inside the project it is meant
 // to drive. Several matches is an error rather than a guess — editing the wrong
@@ -236,6 +322,9 @@ func Locate(explicit, cwd string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
 	}
+	if env := os.Getenv(AddrEnv); env != "" {
+		return env, nil
+	}
 	if env := os.Getenv("RAJ_SOCKET"); env != "" {
 		return env, nil
 	}
@@ -243,7 +332,8 @@ func Locate(explicit, cwd string) (string, error) {
 	switch len(found) {
 	case 0:
 		return "", fmt.Errorf("no running raj found in %s; start one with --control, "+
-			"or set RAJ_SOCKET", filepath.Dir(DefaultPath()))
+			"or set %s (a path, or tcp://host:port for a raj on another machine "+
+			"or outside this container)", filepath.Dir(DefaultPath()), AddrEnv)
 	case 1:
 		return found[0].Socket, nil
 	}
@@ -260,7 +350,7 @@ func Locate(explicit, cwd string) (string, error) {
 	if len(matching) > 1 {
 		candidates = matching
 	}
-	msg := "several raj instances are running; set RAJ_SOCKET to one of:"
+	msg := "several raj instances are running; set " + AddrEnv + " to one of:"
 	for _, in := range candidates {
 		msg += "\n  " + in.Socket + "  " + in.Root
 	}

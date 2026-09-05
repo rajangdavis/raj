@@ -35,13 +35,20 @@ type fakeEditor struct {
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
 	t.Helper()
+	return newFakeEditorAt(t, filepath.Join(t.TempDir(), "c.sock"), docs)
+}
+
+// newFakeEditorAt is the same fixture on a named address, so the TCP tests
+// drive the shipped server rather than a second one written for them.
+func newFakeEditorAt(t *testing.T, addr string, docs map[string]string) *fakeEditor {
+	t.Helper()
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	f := &fakeEditor{docs: map[string]string{}, vers: map[string]uint64{}, stop: make(chan struct{})}
 	for k, v := range docs {
 		f.docs[k], f.vers[k] = v, 1
 	}
 	wake := make(chan struct{}, 64)
-	srv, err := Listen(filepath.Join(t.TempDir(), "c.sock"), func() {
+	srv, err := Listen(addr, func() {
 		select {
 		case wake <- struct{}{}:
 		default:
@@ -67,7 +74,7 @@ func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
 		}
 	}()
 	t.Cleanup(func() { close(f.stop); srv.Close() })
-	t.Setenv("RAJ_SOCKET", srv.Path())
+	t.Setenv("RAJ_CONTROL_ADDR", srv.Path())
 	return f
 }
 
@@ -287,6 +294,7 @@ func TestCLIUsage(t *testing.T) {
 func TestCLIWithNoEditorRunning(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	os.Unsetenv("RAJ_SOCKET")
+	os.Unsetenv("RAJ_CONTROL_ADDR")
 	_, errs, code := run(t, "buffers")
 	if code == 0 || !strings.Contains(errs, "--control") {
 		t.Errorf("code %d, stderr %q", code, errs)

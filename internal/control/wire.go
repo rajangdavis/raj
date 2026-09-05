@@ -65,6 +65,16 @@ type Header struct {
 	// connection and refuses a request that names a different one.
 	Author uint8 `json:"author,omitempty"`
 
+	// Token is the shared secret a TCP client presents. It rides in the header
+	// on every request rather than in a handshake, so the server stays
+	// stateless about it and a reconnect needs no special case.
+	//
+	// It is therefore in the readable part of every frame, which is a real cost
+	// of having made frames readable: anything dumping this wire dumps the
+	// token with it. The alternative — an opaque handshake — buys nothing,
+	// since a dump of the connection would carry it either way.
+	Token string `json:"token,omitempty"`
+
 	// Base is a pointer so an apply against version 0 is distinguishable from
 	// an apply that forgot to say. The second is refused.
 	Base *uint64 `json:"base,omitempty"`
@@ -238,7 +248,7 @@ func ReadFrame(r io.Reader) (Frame, error) {
 // EncodeRequest lays a request out as a header and a body: the path, then each
 // hunk's text, in order.
 func EncodeRequest(req Request) (Header, []byte) {
-	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base,
+	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group}
 	var body []byte
@@ -257,7 +267,7 @@ func EncodeRequest(req Request) (Header, []byte) {
 
 func DecodeRequest(f Frame) (Request, error) {
 	req := Request{ID: f.Header.ID, Op: f.Header.Op, Path: f.Header.Path,
-		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query,
+		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
 		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group}
 	lengths := make([]int, 0, len(f.Header.Hunks)+1)

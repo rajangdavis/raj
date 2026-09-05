@@ -191,7 +191,8 @@ that owns a model's lifecycle, its configuration, its failure modes and its
 version skew, and none of that is editing. The seam is a socket instead: raj
 exposes the buffer over a Unix domain socket and whatever wants to drive it —
 an agent harness, a script, a test — is a separate process that can be
-restarted, replaced or written in another language without touching the editor.
+restarted, replaced or written in another language without touching the editor,
+and increasingly on another machine or in a container.
 
 `Session.ApplyDiff`, the op log and the per-author stores were built for a
 writer that is not the user, so the hard part is already there. What is missing
@@ -278,6 +279,45 @@ missing is addressing and state.
   trip per editor and cannot go stale, but it also means a driver started
   independently has to know that convention. A `--control-socket` at a path the
   driver chooses is the escape hatch and is probably the common case.
+
+  **It finds nothing over TCP**, and cannot: there is no directory to list on
+  the other side of a boundary. `RAJ_CONTROL_ADDR` is the only way to name a
+  remote editor, which is fine for one and unhelpful for several.
+~~The socket assumes one filesystem~~ — `--control-addr tcp://host:port` is the
+  second transport, with a token in every request header standing in for the
+  file mode, and `raj ctl` translating paths between the caller's view of the
+  tree and the editor's. This exists because the useful arrangement is raj on
+  the host, where the terminal delivers its chords, and the driver in a
+  container, where it is safe to let it run commands. What is left of it:
+- [ ] **The token is printed and never stored.** It goes to stderr at startup
+  and nowhere else, so a user who has scrolled past it has to restart raj or
+  pin `RAJ_CONTROL_TOKEN` themselves. A file would be the obvious fix and is
+  the wrong one — a file the driver could read is a file on a filesystem the
+  driver does not share, which is the situation TCP exists for. `raj ctl token`
+  reading it out of the running process is the shape that might work, and needs
+  the socket to still be listening alongside the port, which it is not.
+- [ ] **One listener, not both.** `--control-addr` replaces the socket rather
+  than adding to it, so a session driven by a container cannot also be driven
+  by a script on the host. Two listeners sharing one queue is a small change;
+  what stops it is that `Path()` then has to return two things, and every
+  caller of it assumes one.
+- [ ] **Nothing is encrypted.** The token authenticates but the frames are
+  plaintext, so the buffer contents are readable to anything on the path. That
+  is the right trade for a loopback port and a container bridge and the wrong
+  one for anything further, and there is no way to tell raj which it has beyond
+  the warning it prints when the bind address is not loopback.
+- [ ] **Path inference is a single question.** `raj ctl` maps roots when the
+  editor's root does not exist on the caller's filesystem, which is right for a
+  bind mount of the whole repository and wrong for a mount of a subdirectory,
+  or two repositories mounted under one parent. `RAJ_ROOT_MAP` is the escape
+  hatch; a real answer would ask the editor to resolve paths relative to its
+  root and stop sending absolute ones at all.
+- [ ] **`exec` over TCP is refused, not sandboxed.** The refusal is correct —
+  the command would run on the editor's machine, outside the container the
+  driver was put in — and it costs the staleness check, which is the one thing
+  `exec` was for. A driver running tests in its own sandbox has no way to be
+  told it is testing files that do not match the buffers. `buffers` answers it
+  with a second round trip and nothing prompts the driver to make one.
 ~~A stale socket from a killed process is only probed, not reaped~~ — discovery
   now removes what it finds dead. A unix socket with no listener refuses
   immediately, so a live but busy editor is never reaped.

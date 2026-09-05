@@ -60,7 +60,10 @@ const ctlUsage = `usage: raj ctl <command> [options]
   stats                      what the exec policy has cost this session
 
 Path may be omitted for the buffer the user is looking at.
-The editor is found automatically, or named with RAJ_SOCKET or -socket.
+
+The editor is found automatically, or named with -addr or RAJ_CONTROL_ADDR:
+a socket path, or tcp://host:port for a raj outside this container. A TCP
+editor also wants RAJ_CONTROL_TOKEN set to the token it printed on startup.
 `
 
 // CLI runs one command and returns a process exit code.
@@ -74,6 +77,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("raj ctl "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	socket := fs.String("socket", "", "path to the editor's control socket")
+	addr := fs.String("addr", "", "the editor's control address: a socket path, or tcp://host:port")
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	group := fs.Uint64("group", 0, "accept/reject: the change set id, from `groups`")
 	identity := fs.String("as", "", "identity to write as; the same one reconnecting keeps its author id")
@@ -116,7 +120,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	}
 
 	cwd, _ := os.Getwd()
-	sock, err := Locate(*socket, cwd)
+	sock, err := Locate(firstOf(*addr, *socket), cwd)
 	if err != nil {
 		fmt.Fprintln(stderr, "raj ctl:", err)
 		return 1
@@ -127,6 +131,13 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer c.Close()
+	// Before anything with a path in it. The editor may be on the other side of
+	// a container boundary, where the paths this process can see are not the
+	// paths it has open.
+	if _, err := c.ResolveRoots(cwd); err != nil {
+		fmt.Fprintln(stderr, "raj ctl:", err)
+		return 1
+	}
 
 	switch cmd {
 	case "buffers":
@@ -192,7 +203,13 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return code
 		}
 		if *asJSON {
-			return emit(stdout, map[string]any{"author": res.Author, "root": res.Root})
+			out := map[string]any{"author": res.Author, "root": res.Root}
+			if m := c.Mapper(); m.Active() {
+				// Reported rather than assumed: if paths are being rewritten,
+				// the one thing a caller needs to be able to check is what to.
+				out["root_map"] = m.String()
+			}
+			return emit(stdout, out)
 		}
 		fmt.Fprintf(stdout, "%d\n", res.Author)
 		return 0
@@ -212,6 +229,16 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stderr, "raj ctl: unknown command %q\n\n%s", cmd, ctlUsage)
 	return 2
+}
+
+// firstOf picks the first non-empty of its arguments.
+func firstOf(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // identityOf falls back to the environment, so a harness sets RAJ_IDENTITY once
