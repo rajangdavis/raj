@@ -481,6 +481,34 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   where it is load-bearing: undo is personal and must not back out a
   collaborator's op just because it shares a group.
 
+## Reload
+
+- [x] **Reload is the third answer to a save conflict.** Overwrite or Cancel
+  left the user holding a buffer they could not save and no way forward but
+  closing the tab and losing the work anyway.
+- [x] **The undo journal ends at a reload**, deliberately. Reversals are offsets
+  into a document that is gone, so an undo across one would apply one file's
+  history to another file's text — the failure the rebase work exists to
+  prevent. The session is replaced rather than appended to.
+- [x] **The caret keeps its line and column, not its offset.** A formatter can
+  move every byte while leaving the line you were reading where it was. Extra
+  cursors and selections are dropped: a multi-cursor set is a claim about
+  several specific places in a document that no longer exists.
+- [x] **The dialog orders itself by what is at stake.** A clean buffer gets
+  Reload first, where it costs nothing. A dirty one gets Overwrite first and is
+  asked a second time before reloading, because that is the one answer that
+  destroys the only copy of something.
+- [x] **cmd+r reloads deliberately.** Reload used to be reachable only by
+  pressing save on a file that had changed underneath you, so the way to say
+  "give me what is on disk" was to attempt a save you did not want. cmd+r is
+  free in both terminals — iTerm2 clears the buffer on cmd+k, not cmd+r — so
+  claiming it costs the terminal nothing it was using. A clean buffer reloads
+  without a question, since there is nothing to lose and asking would train the
+  answer out of people; a dirty one is asked once.
+- [x] **A reload picks up the new encoding.** A file rewritten by a Windows tool
+  comes back CRLF, and without re-detecting it the next save would write LF into
+  a file that was CRLF when it was last read.
+
 ## Explorer
 
 - [x] **The tree scrolls horizontally, following the selection.** A name too

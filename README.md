@@ -117,6 +117,13 @@ recorded at open and put back at save. A file with mixed endings cannot be
 reproduced byte for byte, so raj says which ending it will write rather than
 quietly rewriting half the lines.
 
+If the file changed and you would rather have the disk version, Reload is the
+other answer to that prompt, and cmd+r takes it deliberately without going
+through a save first. It takes what is on disk and ends the buffer's undo
+history there, because reversals are offsets into a document that no longer
+exists. The caret keeps its line and column rather than its byte offset, so a
+file a formatter rewrote still lands you where you were reading.
+
 Buffer contents are still not persisted across a crash; see Sessions above.
 
 ## Control socket
@@ -139,6 +146,23 @@ is an ordinary request that parks until the user has something to say, and
 `raj ctl recv` blocks until they do. Messages are addressed to a participant
 rather than to a connection, so one sent while a driver was restarting is
 delivered when it comes back.
+
+`raj ctl run -prog FILE` sends a *program* instead: a byte string of opcodes,
+run in order in one frame. Arguments are ops below `0x80` and verbs at or above
+it, so a reader that predates an opcode still knows from the byte whether to
+skip it or refuse the program — an argument it does not know costs precision, a
+verb it does not know would cost correctness. Path, base and author persist
+across verbs, so fifty splices into one file state them once; length widths are
+chosen per program by the same rule the piece table picks record widths, which
+is worth 45% of the bytes on a batch and nothing on a single large apply.
+
+The framing is MIDI SysEx's, without its 7-bit data encoding or its terminator:
+those exist because MIDI reserves the high bit and a receiver on a lossy serial
+line has to resynchronise with no length information, and neither is true of a
+socket. `raj ctl disasm -prog FILE` prints a program as text, offline, which is
+where the inspectability of the JSON header went rather than being spent. The
+flags are not going anywhere — one edit is easier to write as `apply -base N
+-start N -end N` — but a batch is a program.
 
 `apply` requires the `base` version it was written against. Hunks are rebased
 onto the current buffer and rejected individually, so an edit written against a
@@ -194,6 +218,26 @@ socket: reaching one is proof the filesystem is shared.
 run in the editor's process, on the host, outside the container that was the
 reason for the container — an agent that wants to run tests should run them
 with its own shell, in its own sandbox.
+
+## Testing
+
+`make check` is the gate: fmt, vet, build, `go test ./...` and the race
+detector, cheapest failure first. CI runs the same target, so the thing that
+blocks a merge is the thing you can run before pushing.
+
+`make smoke` is separate and slower. It builds the binary and drives it in a
+real process on a real pty, sending the CSI-u sequences `internal/keys` says
+the terminal emits and reading the result back over the control socket — so a
+scenario reads as "press this, then the buffer holds that" without parsing a
+rendered screen. That covers the seam every other test stubs: terminal setup,
+decoding actual bytes, and whether the binary as shipped does what the packages
+severally claim.
+
+It is behind a build tag, so `go test ./...` cannot pick it up by accident, and
+it is not in `check` — it spawns processes and waits on wall-clock time, which
+makes it a pre-tag gate rather than a per-commit one. `internal/smoke/spec_test.go`
+is the behavioural spec: saving, the conflict prompt, reload, and the
+open-and-save byte round trip.
 
 ## Documents
 

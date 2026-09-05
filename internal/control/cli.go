@@ -2,12 +2,15 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"time"
+
+	"raj/internal/prog"
 )
 
 // `raj ctl` — the command-line face of the control socket.
@@ -60,6 +63,8 @@ const ctlUsage = `usage: raj ctl <command> [options]
   save [path]                write a buffer to disk
   exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
   stats                      what the exec policy has cost this session
+  run -prog F                run a program of opcodes; - for stdin
+  disasm -prog F             print a program as text, without sending it
 
 Path may be omitted for the buffer the user is looking at.
 
@@ -95,6 +100,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	start := fs.Int("start", -1, "apply: first byte of the span to replace")
 	end := fs.Int("end", -1, "apply: one past the last byte of the span")
 	textArg := fs.String("text", "", "apply: replacement text")
+	progFile := fs.String("prog", "", "run/disasm: file holding an opcode program, or - for stdin")
 	textFile := fs.String("text-file", "", "apply: read -text from a file, or - for stdin")
 	old := fs.String("old", "", "edit: the exact existing text to replace")
 	newText := fs.String("new", "", "edit: the replacement text")
@@ -120,6 +126,13 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	}
 	if cmd == "list" {
 		return list(stdout, stderr, *asJSON)
+	}
+	// disasm reads a file and prints it. Answered before the editor is located
+	// so that inspecting a program works when raj is not running — which is
+	// exactly when you are most likely to be looking at one, because something
+	// it did was wrong.
+	if cmd == "disasm" {
+		return disasmProgram(*progFile, stdout, stderr)
 	}
 
 	cwd, _ := os.Getwd()
@@ -157,6 +170,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return simple(c, Request{Op: "save", Path: path}, "saved", stdout, stderr, *asJSON)
 	case "exec":
 		return doExec(c, argv, *dir, stdout, stderr, *asJSON)
+	case "run":
+		return runProgram(c, *progFile, stdout, stderr, *asJSON)
 	case "stats":
 		res, err := c.Do(Request{Op: "stats"})
 		if code := fail(stderr, res, err); code != 0 {
@@ -584,6 +599,58 @@ func read(c *Client, path string, stdout, stderr io.Writer, asJSON bool) int {
 	}
 	io.WriteString(stdout, res.Text())
 	return 0
+}
+
+// runProgram sends a program and prints one line per verb it ran.
+//
+// The flags stay: `raj ctl apply -base N -start N -end N` is a human
+// affordance, and a person at a shell should not have to hand-assemble bytes.
+// This is the other door, for a caller that already thinks in programs — an
+// agent emitting a batch, or a test replaying a recorded one.
+func runProgram(c *Client, file string, stdout, stderr io.Writer, asJSON bool) int {
+	program, err := readProgram(file)
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl run:", err)
+		return 2
+	}
+	res, err := c.Do(Request{Op: "prog", Program: program})
+	if code := fail(stderr, res, err); code != 0 {
+		// A compile error names the opcode, so the disassembly is the useful
+		// next thing to look at rather than a hex dump of the file.
+		fmt.Fprint(stderr, prog.Disasm(program))
+		return code
+	}
+	if asJSON {
+		return emit(stdout, res)
+	}
+	fmt.Fprintln(stdout, "ok")
+	return 0
+}
+
+// disasmProgram prints a program without sending it.
+//
+// The JSON header this encoding replaces was chosen for inspectability —
+// serialisation is unmeasurable against a model round trip, so there was
+// nothing to buy by making it opaque. That reasoning did not stop being true,
+// so the property moved into a tool rather than being spent.
+func disasmProgram(file string, stdout, stderr io.Writer) int {
+	program, err := readProgram(file)
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl disasm:", err)
+		return 2
+	}
+	fmt.Fprint(stdout, prog.Disasm(program))
+	return 0
+}
+
+func readProgram(file string) ([]byte, error) {
+	switch file {
+	case "":
+		return nil, errors.New("needs -prog FILE, or -prog - for stdin")
+	case "-":
+		return io.ReadAll(os.Stdin)
+	}
+	return os.ReadFile(file)
 }
 
 func simple(c *Client, req Request, ok string, stdout, stderr io.Writer, asJSON bool) int {

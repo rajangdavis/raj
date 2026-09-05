@@ -34,6 +34,12 @@ const (
 	// Overwrite is the affirmative answer to an existing file.
 	Overwrite = "Overwrite"
 
+	// Reload takes what is on disk and drops the buffer. Its own word rather
+	// than a second Discard, because what is being discarded is the thing the
+	// user has in front of them rather than the thing on disk, and those two
+	// answers sit next to each other in the same dialog.
+	Reload = "Reload"
+
 	// Create is the affirmative answer to a directory that does not exist yet.
 	// A separate word from Save because the question is not "save?" — it is
 	// "make this directory?", and answering it makes something on disk that the

@@ -116,7 +116,7 @@ type Header struct {
 	Messages []Message `json:"messages,omitempty"`
 
 	Stream uint8 `json:"stream,omitempty"`
-	OutLen       int           `json:"out_len,omitempty"`
+	OutLen int   `json:"out_len,omitempty"`
 
 	// Final marks the last frame of a response. A streamed result is several
 	// frames sharing an id; everything else is one frame with Final set.
@@ -260,6 +260,10 @@ func EncodeRequest(req Request) (Header, []byte) {
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group}
 	var body []byte
+	if req.Op == "prog" {
+		// The whole body, unclaimed by any header length: see DecodeRequest.
+		return h, req.Program
+	}
 	if utf8.ValidString(req.Path) {
 		h.Path = req.Path
 	} else {
@@ -278,6 +282,16 @@ func DecodeRequest(f Frame) (Request, error) {
 		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
 		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group}
+	if f.Header.Op == "prog" {
+		// The program is the body, whole — and it is claimed here rather than
+		// through Split, which exists to cut a body into the runs a header
+		// names and would call an unnamed one unclaimed. It goes in the body
+		// for the same reason document bytes do: it is bytes, and an encoder
+		// that rewrote anything invalid in it would move every offset it
+		// contains.
+		req.Program = f.Body
+		return req, nil
+	}
 	lengths := make([]int, 0, len(f.Header.Hunks)+1)
 	if f.Header.PathLen > 0 {
 		lengths = append(lengths, f.Header.PathLen)

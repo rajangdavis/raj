@@ -47,6 +47,7 @@ const (
 	// file
 	NewFile Action = "new_file"
 	Save    Action = "save"
+	Reload  Action = "reload"
 
 	// edit
 	Undo            Action = "undo"

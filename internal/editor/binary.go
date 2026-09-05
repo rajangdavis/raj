@@ -13,6 +13,12 @@ var ErrBinary = errors.New("binary file")
 // ErrTooLarge is returned for files past MaxFileSize.
 var ErrTooLarge = errors.New("file too large")
 
+// ErrIsDir is returned when a path that should be a file is a directory. Its
+// own value because a reload has to distinguish it from a read error: a file
+// replaced by a directory is a statement about the path, not a transient
+// failure to retry.
+var ErrIsDir = errors.New("is a directory")
+
 // MaxFileSize is the largest file raj will open. The piece table handles far
 // more, but reading it means holding the whole file in memory, and a stray
 // return on a disk image should not be how you find that out.

@@ -200,6 +200,81 @@ and repeat it in `-new` — there is no insert-at-position for `edit`,
 deliberately, since a line you can quote is one you have actually read. Use
 `apply` with `-start N -end N` for a true insertion at an offset.
 
+## Batching: one frame instead of fifty
+
+Every command above is one round trip. When you have many edits for one file,
+that is fifty frames, fifty rebases and fifty replies for what is conceptually
+one change. `raj ctl run` takes a *program* — a byte string of opcodes — and
+runs it in order in a single frame.
+
+```
+raj ctl run -prog edits.bin      # or -prog - to read the program from stdin
+raj ctl disasm -prog edits.bin   # print it as text without sending it
+```
+
+The encoding, which you can emit directly:
+
+```
+program := 'R' | version u8 | width u8 | op*
+op      := opcode u8 | length uW | payload[length]
+```
+
+`width` is the smallest number of bytes that can hold the largest payload in
+the program — 1 if nothing exceeds 255 bytes, 2 up to 65535, and so on. Lengths
+are little-endian and `width` bytes wide, everywhere in that program.
+
+Arguments come first and the verb consumes them:
+
+| op | code | payload |
+|---|---|---|
+| path | `0x01` | the file, as raw bytes |
+| base | `0x02` | version, from `read` or `version` |
+| span | `0x03` | two integers, start and end, each half the payload |
+| text | `0x04` | replacement bytes |
+| group | `0x07` | change set id |
+| id | `0x0a` | request id, echoed back |
+| read | `0x82` | — |
+| open | `0x83` | — |
+| apply | `0x84` | — |
+| save | `0x85` | — |
+| version | `0x86` | — |
+| groups / accept / reject | `0x88` / `0x89` / `0x8a` | — |
+
+**`path`, `base` and `author` persist across verbs; everything else is consumed
+by the verb that follows it.** So fifty splices into one file at one version
+state the path and base once, then repeat `span`, `text`, `apply`. That is what
+makes the batch short.
+
+**The rules you already know still apply, because a program runs through the
+same path a flag does.** It cannot reach anything the flags cannot. In
+particular you must still read the buffer before an apply in the same
+connection — put a `read` verb at the top of the program, or the applies are
+refused with the usual message about coordinates you have not seen. Your applies
+are still attributed to you and still arrive as a proposed change set.
+
+**A program is all-or-nothing at compile time and sequential at run time.** If
+any opcode fails to compile, nothing runs. Once it is running the verbs execute
+in order, and an individual verb can still fail on its own merits — so read the
+replies rather than assuming a zero exit meant every verb succeeded.
+
+Two forward-compatibility rules worth knowing, because they decide what happens
+when you emit an opcode this raj predates:
+
+- An **argument** it does not recognise is silently skipped. Your request is
+  carried out less precisely than you meant, not refused.
+- A **verb** it does not recognise refuses the whole program. Skipping a verb
+  would mean silently not doing what you asked.
+
+The high bit is the difference: arguments are below `0x80`, verbs at or above.
+
+When a program is refused, `raj ctl run` prints the disassembly next to the
+error, so the failing opcode is visible without a hex dump. `raj ctl disasm`
+does the same offline and works when raj is not running.
+
+**Prefer the flags for one edit.** `raj ctl apply -base 41 -start 120 -end 148
+-text '...'` is one round trip and is easier to get right. Reach for a program
+when you have a batch, or when you are replaying one you recorded.
+
 ## Say who you are
 
 ```

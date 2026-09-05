@@ -652,6 +652,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.host.Suspend()
 	case keys.Save:
 		a.saveActive(nil)
+	case keys.Reload:
+		a.reloadActive()
 	case keys.Cut:
 		a.clip(true)
 	case keys.Copy:
@@ -1173,6 +1175,105 @@ func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
 	})
 }
 
+// reloadActive takes the version on disk deliberately, rather than as an answer
+// to a save that failed.
+//
+// Without it the only route to a reload was to press save on a file you did not
+// want to save and pick the third button, which is a strange thing to have to
+// do to say "give me what is on disk". The common case is not a conflict at
+// all: something rewrote the file, you have typed nothing, and you want to see
+// it.
+//
+// A clean buffer reloads without a question — there is nothing to lose, and
+// asking would train the answer out of people. A dirty one asks, because this
+// is the gesture that throws away the only copy of something.
+func (a *App) reloadActive() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	if p.File.Path == "" {
+		a.status = "nothing to reload: this buffer has never been saved"
+		return
+	}
+	if !p.File.Dirty() {
+		a.reload(p, nil)
+		return
+	}
+	a.confirm("Discard your changes",
+		"Reloading "+p.File.Name()+" will throw away your unsaved changes. Continue?",
+		[]string{prompt.Discard, prompt.Cancel}, func(ans string, ok bool) {
+			if !ok || ans != prompt.Discard {
+				a.status = "reload cancelled"
+				return
+			}
+			a.reload(p, nil)
+		})
+}
+
+// conflict is the dialog for a file that changed underneath the buffer.
+//
+// Three answers, because two were not enough: Cancel left the user holding a
+// buffer they still could not save and no way forward except closing the tab
+// and losing the work anyway. Reload is the way forward that takes the other
+// writer's version.
+//
+// Reload is offered first when the buffer is clean, because then it is
+// lossless and almost always what was meant — the file moved and you had not
+// touched it. On a dirty buffer it is destructive in the same way Overwrite is,
+// just pointed the other way, so it sits in the middle and asks again.
+func (a *App) conflict(p *editor.Pane, path string, then func(saved bool)) {
+	dirty := p.File.Dirty()
+	options := []string{prompt.Overwrite, prompt.Reload, prompt.Cancel}
+	question := filepath.Base(path) + " was modified by another program. " +
+		"Overwrite it with this buffer, or reload and lose your changes?"
+	if !dirty {
+		options = []string{prompt.Reload, prompt.Overwrite, prompt.Cancel}
+		question = filepath.Base(path) + " was modified by another program. " +
+			"This buffer has no unsaved changes, so reloading costs nothing."
+	}
+	a.confirm("Changed on disk", question, options, func(ans string, ok bool) {
+		switch {
+		case !ok || ans == prompt.Cancel:
+			a.status = "save cancelled — the file on disk is newer"
+			report(then, false)
+		case ans == prompt.Overwrite:
+			a.write(p, path, true, then)
+		case !dirty:
+			a.reload(p, then)
+		default:
+			// A second question, because this is the one answer that destroys
+			// work that exists nowhere else. Overwrite discards bytes that are
+			// still in git, or in whatever wrote them; this discards the only
+			// copy.
+			a.confirm("Discard your changes",
+				"Reloading "+filepath.Base(path)+" will throw away your unsaved changes. Continue?",
+				[]string{prompt.Discard, prompt.Cancel}, func(ans string, ok bool) {
+					if !ok || ans != prompt.Discard {
+						a.status = "save cancelled — the file on disk is newer"
+						report(then, false)
+						return
+					}
+					a.reload(p, then)
+				})
+		}
+	})
+}
+
+// reload takes the version on disk. It reports the save as not having happened,
+// which is true: the caller that asked to save — closing a tab, quitting — must
+// not treat a reload as permission to carry on and drop the buffer.
+func (a *App) reload(p *editor.Pane, then func(saved bool)) {
+	name := p.File.Name()
+	if err := p.Reload(); err != nil {
+		a.status = "cannot reload: " + err.Error()
+		report(then, false)
+		return
+	}
+	a.status = "reloaded " + name + " from disk"
+	report(then, false)
+}
+
 // ensureParent makes sure a path's directory exists, asking first.
 //
 // Without this, saving into a directory that is not there yet failed with the
@@ -1237,16 +1338,7 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 		// for a path.
 		if errors.Is(err, editor.ErrDiskChanged) {
 			p.File.SetPath(was)
-			a.confirm("Changed on disk",
-				filepath.Base(path)+" was modified by another program. Overwrite it with this buffer?",
-				[]string{prompt.Overwrite, prompt.Cancel}, func(ans string, ok bool) {
-					if !ok || ans != prompt.Overwrite {
-						a.status = "save cancelled — file on disk is newer"
-						report(then, false)
-						return
-					}
-					a.write(p, path, true, then)
-				})
+			a.conflict(p, path, then)
 			return
 		}
 		// Put the name back. Leaving it set means the buffer claims a path it

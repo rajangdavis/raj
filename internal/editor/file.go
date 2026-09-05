@@ -6,7 +6,6 @@ package editor
 import (
 	"bytes"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -86,7 +85,7 @@ type File struct {
 func Open(path string, tab int) (*File, error) {
 	if info, err := os.Stat(path); err == nil {
 		if info.IsDir() {
-			return nil, errors.New("is a directory")
+			return nil, ErrIsDir
 		}
 		if info.Size() > MaxFileSize {
 			return nil, ErrTooLarge

@@ -86,6 +86,9 @@ type Request struct {
 	// Token authenticates a TCP client. Ignored on a Unix socket, where the
 	// filesystem permissions have already decided.
 	Token string
+	// Program is a batch of requests encoded as opcodes; see prog.go. Present
+	// only on the "prog" op, which compiles it and runs the results.
+	Program []byte
 }
 
 // Group is a change set: what one apply, or one user action, did. Reviewable as
@@ -619,6 +622,9 @@ func (c *connection) cancelAll() {
 // else emits one.
 func (c *connection) handle(req Request) {
 	switch req.Op {
+	case "prog":
+		c.program(req)
+		return
 	case "search":
 		c.search(req)
 		return
@@ -632,6 +638,34 @@ func (c *connection) handle(req Request) {
 	res := c.srv.submit(req)
 	res.Final = true
 	c.send(res)
+}
+
+// program compiles a batch and runs it in order.
+//
+// Each sub-request goes through the ordinary path, so a program cannot reach
+// anything a JSON frame could not and needs no second set of handlers. They run
+// sequentially rather than concurrently, which is the whole reason to batch:
+// fifty splices against one version have to land in the order they were written
+// or the offsets in the later ones mean nothing.
+//
+// One response per verb, with Final on the last, so a client can match answers
+// to verbs positionally. A compile error is one response and nothing runs:
+// half a batch is the outcome a caller can neither detect nor undo.
+func (c *connection) program(req Request) {
+	reqs, err := Requests(req.Program, req.Author)
+	if err != nil {
+		c.send(Response{ID: req.ID, Err: err.Error(), Final: true})
+		return
+	}
+	for i, sub := range reqs {
+		if sub.ID == 0 {
+			sub.ID = req.ID
+		}
+		sub.Token = req.Token
+		res := c.srv.submit(sub)
+		res.Final = i == len(reqs)-1
+		c.send(res)
+	}
 }
 
 // recv parks until the user has something to say to this connection.

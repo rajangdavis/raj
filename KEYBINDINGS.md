@@ -42,6 +42,7 @@ rather than hidden.
 | --- | --- | --- | --- | --- |
 | new_file | `super+n` | cmd+n | ctrl+n | ghostty default: new window |
 | save | `super+s` | cmd+s | ctrl+s | — |
+| reload | `super+r` | cmd+r | ctrl+r | free in both terminals: iTerm2 clears the buffer on cmd+k, not cmd+r |
 
 ## edit
 

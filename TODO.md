@@ -191,13 +191,6 @@ findings and decisions live in INVESTIGATIONS.md.
 The write path is atomic and refuses to clobber another writer; what is left is
 the follow-ups that were deliberately kept out of that change.
 
-- [ ] **Reload as a third answer to the conflict prompt.** Overwrite or Cancel
-  is what "changed on disk" offers today, and Cancel leaves the user holding a
-  buffer they still cannot save. Reload is the right third option and it is not
-  a one-liner: the pane's cursors are byte offsets into text that is about to be
-  replaced, so it needs the same carry-the-cursors treatment undo already has,
-  and a decision about what happens to the undo journal of a buffer whose
-  original is gone.
 - [ ] **Notice the change before the save.** `File.DiskChanged` is only consulted
   when you press save, so a file rewritten under an open tab looks untouched
   until then. The idle tick could ask — it is one stat per open tab — and mark
@@ -223,6 +216,17 @@ the follow-ups that were deliberately kept out of that change.
 - [ ] **16 ms coalescing window** for streaming agent hunks.
 
 ## Control socket (replaces the in-editor agent)
+
+- [ ] **Programs are an entry point, not yet the encoding.** `raj ctl run`
+  compiles a program into the same Requests a JSON frame produces, so the two
+  meet at the seam and everything downstream is shared — but the frame carrying
+  the program still has a JSON header, and responses are still JSON. Replacing
+  those is the rest of the work, and it is the half that has to answer what a
+  streamed search reply looks like as opcodes.
+- [ ] **Six verbs are unreachable from a program**: search, exec, recv, hello,
+  cancel and stats. The first three stream or park, which the batch loop's
+  one-response-per-verb shape does not model; the others want arguments the
+  opcode table has no room for yet. `raj ctl` still reaches all of them.
 
 The agent pane is not being built. An editor that hosts a model is an editor
 that owns a model's lifecycle, its configuration, its failure modes and its
@@ -410,6 +414,17 @@ missing is addressing and state.
 
 ## Known rough edges
 
+- [ ] **The smoke suite is Linux and macOS only, and only Linux is proven.**
+  `internal/smoke` opens a pty through the ioctls rather than taking a
+  dependency for it, and the two platforms do it differently enough to need
+  separate files. The darwin path is written from the documented ioctls but has
+  not been run — if `make smoke` cannot get a pty on your machine, that is the
+  first place to look.
+- [ ] **Smoke scenarios wait on wall-clock time.** 400 ms after each chord,
+  which is generous on a fast machine and may not be on a loaded one. The
+  editor already has a seam that would replace the sleeps — the control socket
+  could answer "have you drained the queue?" — and until it does, the suite is
+  slower and more fragile than it needs to be.
 - [ ] **No CI.** `go build`, `go vet`, `gofmt -l`, `go test ./...` and
   `go test -race ./...` all pass, and nothing enforces that they keep passing.
   `internal/control/mailbox.go` and `internal/control/wire.go` are unformatted

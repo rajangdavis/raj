@@ -52,6 +52,7 @@ var Bindings = []Binding{
 
 	{"file", NewFile, "super+n", "110;9u", "cmd+n", "ctrl+n", "ghostty default: new window"},
 	{"file", Save, "super+s", "115;9u", "cmd+s", "ctrl+s", ""},
+	{"file", Reload, "super+r", "114;9u", "cmd+r", "ctrl+r", "free in both terminals: iTerm2 clears the buffer on cmd+k, not cmd+r"},
 
 	{"edit", Undo, "super+z", "122;9u", "cmd+z", "ctrl+z", ""},
 	{"edit", Redo, "shift+super+z", "122;10u", "cmd+shift+z", "ctrl+shift+z", ""},

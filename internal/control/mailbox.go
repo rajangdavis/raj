@@ -47,7 +47,7 @@ type Message struct {
 	// nothing else can reach Post — but recorded rather than assumed, because
 	// a second human is an ordinary participant and this should not be the
 	// place that has to change when one arrives.
-	From uint8 `json:"from"`
+	From uint8  `json:"from"`
 	Text string `json:"text"`
 }
 

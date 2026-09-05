@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Newer than the go directive in go.mod on purpose: the README asks
+          # for 1.24 or newer on macOS, because older toolchains omit LC_UUID
+          # when linking internally and macOS then re-asks for local-network
+          # permission on every launch. Building here with what the docs tell
+          # people to use is the only way that stays true.
+          go-version: '1.24'
+          cache: true
+
+      # Each step is its own line in the log, so a red build says which of the
+      # five gates failed without anyone opening the output. They are the same
+      # commands `make check` runs locally — see the Makefile, which is the one
+      # place they are written down.
+      - run: make fmt-check
+      - run: make vet
+      - run: make build
+      - run: make test
+      - run: make race
