@@ -12,22 +12,27 @@
 //	raj ctl <cmd>             read and edit a running raj's buffers
 //	raj --config ghostty      print Ghostty keybindings to install
 //	raj --config iterm2       print an iTerm2 dynamic profile
+//	raj --config iterm2 --install
+//	                          write it where the terminal reads it
 //	raj --keys                print the keybinding reference as markdown
 //	raj --probe               check which chords this terminal delivers
 //	raj --probe --checklist   walk every binding and emit a measured keymap
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"raj/internal/app"
 	"raj/internal/control"
 	"raj/internal/keys"
 	"raj/internal/probe"
+	"raj/internal/termconf"
 	"raj/internal/ui"
 
 	"raj/internal/safe"
@@ -50,6 +55,7 @@ func main() {
 		noRestore = flag.Bool("no-restore", false, "do not reopen the previous session")
 		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
 		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
+		install   = flag.Bool("install", false, "with --config: write the file where the terminal reads it, instead of to stdout")
 		keyDoc    = flag.Bool("keys", false, "print the keybinding reference as markdown")
 		runProbe  = flag.Bool("probe", false, "report what chords this terminal delivers")
 		checklist = flag.Bool("checklist", false, "with --probe: walk every binding in order")
@@ -62,12 +68,21 @@ func main() {
 		return
 	}
 	if *configFor != "" {
-		out, err := config(*configFor)
+		target, err := termconf.ParseTarget(*configFor)
 		if err != nil {
 			fail(err)
 		}
-		fmt.Print(out)
+		if *install {
+			if err := installConfig(target); err != nil {
+				fail(err)
+			}
+			return
+		}
+		fmt.Print(termconf.Render(target))
 		return
+	}
+	if *install {
+		fail(errors.New("--install needs --config to say which terminal"))
 	}
 	if *runProbe {
 		// The probe lives behind a flag on raj rather than in its own binary so
@@ -87,18 +102,31 @@ func main() {
 	}
 }
 
-// config renders the keybindings for a terminal. Every emitter reads the same
-// measured table, so they cannot disagree about what a chord should send.
-func config(target string) (string, error) {
-	switch target {
-	case "ghostty", "macos":
-		return keys.GhosttyConfig("macos"), nil
-	case "ghostty-linux", "linux":
-		return keys.GhosttyConfig("linux"), nil
-	case "iterm2":
-		return keys.ITerm2Profile("raj"), nil
+// installConfig writes a config and says what the user still has to do.
+//
+// Printing where the file went is the point: an install that succeeds silently
+// is indistinguishable from one that wrote somewhere nothing reads, which is
+// the failure this whole path exists to end.
+func installConfig(target termconf.Target) error {
+	path, err := termconf.Install(target)
+	if err != nil {
+		return err
 	}
-	return "", fmt.Errorf("unknown target %q: want ghostty, ghostty-linux, or iterm2", target)
+	fmt.Println("raj: wrote", path)
+	switch target {
+	case termconf.ITerm2:
+		fmt.Println("raj: iTerm2 picks this up without a restart.")
+	default:
+		// A generated file nothing includes is the other way this fails
+		// silently, and it is the one an install can check for free.
+		included, err := termconf.IncludedBy(path)
+		if err == nil && !included {
+			fmt.Printf("raj: add this line to your Ghostty config, then reload it with cmd+shift+,:\n\n    config-file = %s\n", path)
+			return nil
+		}
+		fmt.Println("raj: reload Ghostty with cmd+shift+, to pick it up.")
+	}
+	return nil
 }
 
 func fail(err error) {
@@ -127,6 +155,14 @@ func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlAddr string
 	safe.OnPanic(func() { host.Close() })
 
 	a := app.New(host, root, tab)
+	// A stale terminal config fails invisibly — the chord reaches the
+	// terminal, the terminal does what it always did, and raj never hears it.
+	// The status line is the only place that can be said, and it is said only
+	// for a file raj generated and can prove is out of date.
+	if stale := termconf.StaleTargets(); len(stale) > 0 {
+		a.Notice(fmt.Sprintf("%s is out of date — run: raj --config %s --install",
+			strings.Join(stale, " and "), termconf.HostTarget()))
+	}
 	// A named file takes the focus; otherwise raj opens in the explorer, since
 	// an editor with no file is not a useful place for the keys to be.
 	a.WrapDefault = wrap

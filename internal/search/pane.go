@@ -481,7 +481,7 @@ func (p *Pane) apply() {
 // tests can drive the pane a step at a time; the application never needs it,
 // because the result arrives on the next tick on its own.
 func (p *Pane) Settle(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(timeout * raceScale)
 	for {
 		p.apply()
 		p.mu.Lock()

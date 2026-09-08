@@ -71,7 +71,7 @@ func TestSupersededSearchDoesNotNotify(t *testing.T) {
 	}
 
 	typeQuery(p, "a")
-	waitFor(t, func() bool { return atomic.LoadInt32(&calls) == 1 })
+	waitFor(t, "the first walk to start", func() bool { return atomic.LoadInt32(&calls) == 1 })
 	typeQuery(p, "b")
 	close(gate)
 	p.Settle(2 * time.Second)
@@ -87,12 +87,17 @@ func TestSupersededSearchDoesNotNotify(t *testing.T) {
 	}
 }
 
-func waitFor(t *testing.T, cond func() bool) {
+// waitFor polls a condition until it holds. The deadline is a backstop against
+// a hang rather than a performance assertion, so it is generous and scaled for
+// the race detector, which makes the walk this waits on roughly an order of
+// magnitude slower. A real failure is a hang, and Go's own test timeout reports
+// that with the stack of whatever is stuck.
+func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(Slow(5 * time.Second))
 	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the first walk to start")
+			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(time.Millisecond)
 	}

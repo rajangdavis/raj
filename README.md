@@ -313,6 +313,29 @@ Terminal configuration, since raj claims chords the terminal would otherwise
 take:
 
 ```
-$ ./raj --config ghostty     # or ghostty-linux, or iterm2
-$ ./raj --keys               # the keybinding reference, as markdown
+$ ./raj --config ghostty --install   # or ghostty-linux, or iterm2
+$ ./raj --keys                       # the keybinding reference, as markdown
 ```
+
+`--install` writes the file where the terminal reads it and prints where it
+went. Without it, `--config` prints to stdout, which still works if you would
+rather place the file yourself.
+
+For Ghostty this writes `raj.conf` next to your own config rather than into it,
+so raj can never overwrite a setting it did not write. Include it once:
+
+```
+config-file = ~/.config/ghostty/raj.conf
+```
+
+`--install` prints that line if it is not there yet, and reloading Ghostty with
+`cmd+shift+,` picks up a change. For iTerm2 it writes a dynamic profile, which
+iTerm2 loads without a restart. If either file lives somewhere raj would not
+guess — a custom iTerm2 settings folder, say — `RAJ_GHOSTTY_CONF` and
+`RAJ_ITERM2_PROFILE_PATH` name it.
+
+Both generated files carry a hash of the binding table, and raj checks it at
+startup: when the table has changed and the installed config has not, the status
+line says so. That matters because a stale config fails invisibly — the chord
+reaches the terminal, the terminal does what it always did, and raj never hears
+about it.

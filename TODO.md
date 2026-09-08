@@ -465,21 +465,10 @@ missing is addressing and state.
   and `ui.native` — and it should be a wrapper on the writer rather than a
   condition at each call site, or the next OSC added will miss it.
 - [ ] **Profile switching in iTerm2 is not clean.** raj switches profile on
-  entry with OSC 1337 and restores on exit, but installing the profile is still
-  a manual step and the switch is visible. Autoloading — write the generated
-  profile into `DynamicProfiles/` on first run if it is absent or stale, keyed
-  off a hash of `Bindings` — would remove the setup step and keep the profile
-  from drifting when the table changes. Deferred: what is there works.
-- [ ] `raj --config ghostty` must be regenerated and the terminal reloaded
-  whenever the binding table changes. Same for the iTerm2 profile. **Outstanding
-  now**: cmd+n was added to `Bindings`, so both configs are stale until they are
-  regenerated, and until then the chord opens a Ghostty window rather than a raj
-  tab. cmd+k was added and cmd+alt+b removed for the same reason, so both are
-  outstanding too — and until the config is regenerated cmd+k still clears the
-  terminal's scrollback. Under the `kkp_on` gate it is claimed only while raj is focused, so
-  Ghostty's own cmd+n is untouched everywhere else; under the iTerm2 profile it
-  is claimed for the whole window, which is the same trade the profile already
-  makes for cmd+w.
+  entry with OSC 1337 and restores on exit, and the switch is visible. Installing
+  the profile is no longer manual — `raj --config iterm2 --install` writes it and
+  startup warns when it is stale — so what is left is the visible switch itself.
+  Deferred: what is there works.
 - [ ] No Bubbletea adapter yet. The `ui.Host` interface is six methods.
 - [ ] `cmd+shift+r` to reopen closed tabs, handing `cmd+shift+t` back — only
   worth doing if Ghostty actually binds it; check `+list-keybinds` first.

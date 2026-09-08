@@ -1295,3 +1295,42 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   resolved against it lands somewhere the user would never have seen. The real
   app draws after every event, so the fixture was wrong about the state a
   pointer always meets, not the code.
+
+## Terminal configs install themselves, and say when they are stale
+
+`raj --config <target> --install` writes the generated file where the terminal
+reads it, replacing a shell redirect whose path the user had to get right by
+hand and which said nothing when they did not.
+
+The two targets are not symmetric. The iTerm2 dynamic profile is an artifact raj
+owns end to end — drop-in directory, whole file, reloaded without a restart — so
+overwriting it destroys nothing. A Ghostty config is one user-owned file holding
+font, theme and shaders, while raj emits only keybind lines, so raj writes
+`raj.conf` beside it and the user includes it once with `config-file`. After
+that raj can rewrite its own file forever without touching a setting it did not
+write. Path resolution refuses to guess: it follows whichever config actually
+exists, errors when neither does, and errors when both macOS locations do, since
+Ghostty reads both and being included from the other one is indistinguishable
+from working.
+
+The convenience was never the point. The reason both configs went stale is that
+nothing said so — cmd+n opened a Ghostty window, cmd+k cleared the scrollback
+raj cannot redraw, and neither is visible from inside the editor. Both emitters
+now stamp a hash of the emitted binding table into what they generate, and
+startup compares it. Only a file raj generated and can prove is out of date gets
+a warning: a missing config is somebody who uses the other terminal, and an
+unstamped one may be hand-written.
+
+## Two async tests were passing for the wrong reason
+
+Both failed under `go test -race` on a loaded runner and passed everywhere else,
+and neither was slow — twenty-second deadlines failed the same way.
+
+`TestStaleResultIsDropped` waited on `Settle`, which waits for every search
+including the one it deliberately blocks forever. On an unloaded machine the
+blocked search never started, so the stale result it was asserting about was
+never produced and the test passed vacuously; when the timer won instead, the
+same test could only ever time out. `TestFinishedSearchPostsAWake` assumed
+`drain` would leave the worker's Wake in the queue, but `drain` reads every
+queued event before settling, so the event under test was sometimes eaten by the
+harness. Both now wait on the thing they are actually about.

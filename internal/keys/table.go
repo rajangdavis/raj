@@ -176,6 +176,7 @@ func Emitted() []Binding { return append(append([]Binding{}, Bindings...), Recla
 func GhosttyConfig(platform string) string {
 	var b strings.Builder
 	b.WriteString("# raj keybindings — generated, do not edit by hand.\n")
+	b.WriteString("# " + HashMarker + Hash() + "\n")
 	b.WriteString("# Applies only while the focused app has KKP report_all set;\n")
 	b.WriteString("# otherwise Ghostty's own bindings are untouched.\n")
 	for _, g := range []string{"panes", "tabs", "file", "edit", "cursor", "nav"} {

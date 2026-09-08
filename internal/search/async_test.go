@@ -70,23 +70,39 @@ func TestStaleResultIsDropped(t *testing.T) {
 	p := NewPane(t.TempDir())
 	p.Debounce = time.Nanosecond
 	slow := make(chan struct{})
+	started := make(chan struct{})
 	p.search = func(_ context.Context, _ string, q Query) Result {
 		if q.Text == "f" {
+			close(started)
 			<-slow // the first search finishes last
 		}
 		return Result{Files: len(q.Text)}
 	}
 
 	typeQuery(p, "f")
+	// Waiting for the first search to be RUNNING, not merely scheduled, is
+	// what makes this test test anything. run() stops the pending timer when
+	// the next keystroke arrives, so on an unloaded machine the "f" search is
+	// normally discarded before it ever starts — and then there is no stale
+	// result, close(slow) releases nobody, and the assertion at the bottom
+	// passes against a case that never happened.
+	<-started
 	typeQuery(p, "unc") // query is now "func"
-	if !p.Settle(2 * time.Second) {
-		t.Fatal("later search never settled")
-	}
-	if p.Result.Files != 4 {
-		t.Fatalf("result is for a %d-character query, want 4", p.Result.Files)
-	}
+
+	// Settle is the wrong wait here. It waits for every search to finish,
+	// including the one deliberately blocked above, so once the first search
+	// really starts Settle can only ever time out — which is what it did on a
+	// loaded runner while passing everywhere else.
+	waitFor(t, "the later result to arrive", func() bool {
+		p.apply()
+		return p.Result.Files == 4
+	})
+
+	// Now let the stale result land. Waiting for the walk to finish rather
+	// than sleeping for a plausible interval is what keeps this deterministic
+	// when the machine is busy.
 	close(slow)
-	time.Sleep(50 * time.Millisecond)
+	waitFor(t, "the stale search to finish", func() bool { return p.InFlight() == 0 })
 	p.apply()
 	if p.Result.Files != 4 {
 		t.Errorf("the stale result replaced the current one: %d", p.Result.Files)

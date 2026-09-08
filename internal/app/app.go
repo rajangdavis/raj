@@ -1569,6 +1569,16 @@ func tabNumber(a keys.Action) (int, bool) {
 // Status returns the current status message, for tests.
 func (a *App) Status() string { return a.status }
 
+// Notice puts a startup message in the status line, for a caller that knows
+// something the App does not — a stale terminal config, say. It yields to a
+// status the App set itself: those are about the document in front of the
+// user, and this is about their setup.
+func (a *App) Notice(msg string) {
+	if a.status == "" {
+		a.status = msg
+	}
+}
+
 // Focused reports which pane has focus, for tests.
 func (a *App) Focused() Focus { return a.focus }
 
