@@ -82,6 +82,14 @@ const (
 	hCol          = 0x35 // 1-based column for goto
 	hStart        = 0x36 // byte offset for read span; absent means read whole file
 	hEnd          = 0x37 // byte offset for read span; absent means read whole file
+	hBytes        = 0x38 // buffer size in bytes, on a version response
+	hLines        = 0x39 // buffer size in lines, on a version response
+	hLineStart    = 0x3a // read: 1-based first line of the range
+	hLineEnd      = 0x3b // read: 1-based last line of the range
+	hDump         = 0x3c // patch: snapshot id to replace; dump: the id it returns
+	hHash         = 0x3d // dump: hash of the snapshot text
+	hLSPMode      = 0x3e // lsp: hover, definition, completion or diagnostics
+	hLSPJSON      = 0x3f // lsp: the JSON-encoded answer
 
 )
 
@@ -108,6 +116,8 @@ var verbCodes = map[string]byte{
 	"recv": 17, "snapshot": 18, "prog": 19, "reload": 20, "whoami": 21,
 	"who": 22, "send": 23,
 	"goto": 24, "close": 25,
+	"dump": 26, "patch": 27,
+	"lsp": 28, "lspprep": 29,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -191,6 +201,12 @@ func encodeHeader(h Header) []byte {
 	if h.End != nil {
 		num(hEnd, *h.End)
 	}
+	if h.LineStart != nil {
+		num(hLineStart, *h.LineStart)
+	}
+	if h.LineEnd != nil {
+		num(hLineEnd, *h.LineEnd)
+	}
 
 	num(hGroup, int(h.Group))
 	str(hIdentity, h.Identity)
@@ -205,8 +221,14 @@ func encodeHeader(h Header) []byte {
 	str(hRoot, h.Root)
 	num(hPID, h.PID)
 	num(hVersion, int(h.Version))
+	num(hBytes, h.Bytes)
+	num(hLines, h.Lines)
 	num(hFiles, h.Files)
 	flag(hCapped, h.Capped)
+	num(hDump, int(h.DumpID))
+	str(hHash, h.Hash)
+	str(hLSPMode, h.LSPMode)
+	str(hLSPJSON, h.LSPJSON)
 
 	if len(h.Argv) > 0 {
 		var w prog.Writer
@@ -356,6 +378,12 @@ func decodeHeader(b []byte) (Header, error) {
 		case hEnd:
 			v := prog.ReadNumber(op.Payload)
 			h.End = &v
+		case hLineStart:
+			v := prog.ReadNumber(op.Payload)
+			h.LineStart = &v
+		case hLineEnd:
+			v := prog.ReadNumber(op.Payload)
+			h.LineEnd = &v
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
@@ -383,10 +411,22 @@ func decodeHeader(b []byte) (Header, error) {
 			h.PID = prog.ReadNumber(op.Payload)
 		case hVersion:
 			h.Version = uint64(prog.ReadNumber(op.Payload))
+		case hBytes:
+			h.Bytes = prog.ReadNumber(op.Payload)
+		case hLines:
+			h.Lines = prog.ReadNumber(op.Payload)
 		case hFiles:
 			h.Files = prog.ReadNumber(op.Payload)
 		case hCapped:
 			h.Capped = true
+		case hDump:
+			h.DumpID = uint64(prog.ReadNumber(op.Payload))
+		case hHash:
+			h.Hash = string(op.Payload)
+		case hLSPMode:
+			h.LSPMode = string(op.Payload)
+		case hLSPJSON:
+			h.LSPJSON = string(op.Payload)
 
 		case hArgv:
 			r := prog.NewReader(op.Payload)

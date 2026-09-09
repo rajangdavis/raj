@@ -161,3 +161,48 @@ func TestSaveIsAtomic(t *testing.T) {
 		t.Errorf("got %+v", st)
 	}
 }
+
+// The ratio survives a round trip, and is omitted when zero — both so a
+// session written by an older build still reads (Ratio 0, plain Top) and so
+// this build's files stay readable by one.
+func TestRatioRoundTrip(t *testing.T) {
+	root := workspace(t, "a.go")
+	path := filepath.Join(root, "a.go")
+
+	Save(root, State{Tabs: []Tab{{Path: path, Cursor: 3, Top: 10, Ratio: 0.5}}})
+	data, _ := os.ReadFile(File(root))
+	if !strings.Contains(string(data), "ratio") {
+		t.Error("a nonzero ratio was omitted from the saved JSON")
+	}
+	st := Load(root)
+	if len(st.Tabs) != 1 || st.Tabs[0].Ratio != 0.5 || st.Tabs[0].Top != 10 {
+		t.Errorf("tabs = %+v, want ratio 0.5, top 10", st.Tabs)
+	}
+
+	// Zero ratio is the same as no ratio: omitted from the JSON, read back
+	// as zero.
+	Save(root, State{Tabs: []Tab{{Path: path, Cursor: 3, Top: 10}}})
+	data, _ = os.ReadFile(File(root))
+	if strings.Contains(string(data), "ratio") {
+		t.Error("a zero ratio was written into the JSON")
+	}
+	if st := Load(root); len(st.Tabs) != 1 || st.Tabs[0].Ratio != 0 {
+		t.Errorf("zero-ratio round trip = %+v", st.Tabs)
+	}
+}
+
+// A session file written before the ratio existed loads with Ratio 0 and its
+// plain Top intact: restore falls back to the line number.
+func TestLegacyJSONWithoutRatio(t *testing.T) {
+	root := workspace(t, "a.go")
+	path := filepath.Join(root, "a.go")
+	p := File(root)
+	os.MkdirAll(filepath.Dir(p), 0o700)
+	body := `{"version":1,"tabs":[{"path":"` + path + `","cursor":3,"top":7,"wrap":true}],"active":0}`
+	os.WriteFile(p, []byte(body), 0o644)
+
+	st := Load(root)
+	if len(st.Tabs) != 1 || st.Tabs[0].Top != 7 || st.Tabs[0].Ratio != 0 {
+		t.Errorf("legacy tab = %+v, want top 7, ratio 0", st.Tabs)
+	}
+}

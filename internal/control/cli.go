@@ -58,6 +58,9 @@ const ctlUsage = `usage: raj ctl <command> [options]
   reject [path] -group N     back one out
   search -q PATTERN          search the workspace, unsaved edits included
   version [path]             the version a later apply bases on
+  dump [path]                snapshot a span (or the whole file) for later patch
+  patch [path] -dump N       replace a snapshot's text; the editor diffs and applies
+  lsp MODE [path] LINE:COL   hover, definition, completion, or diagnostics [path]
   apply [path] -base N -start N -end N [-text S | -text-file F]
                              replace bytes [start,end) with text
   edit [path] -old S -new S  replace an exact string (convenience over apply)
@@ -87,6 +90,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	addr := fs.String("addr", "", "the editor's control address: a socket path, or tcp://host:port")
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	group := fs.Uint64("group", 0, "accept/reject: the change set id, from `groups`")
+	dumpID := fs.Uint64("dump", 0, "patch: the snapshot id, from `dump`")
 	identity := fs.String("as", "", "identity to write as; the same one reconnecting keeps its author id")
 	name := fs.String("name", "", "display name for this participant")
 	dir := fs.String("dir", "", "exec: directory to run in, inside the workspace")
@@ -96,9 +100,11 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	regex := fs.Bool("regex", false, "search: treat the pattern as a regular expression")
 	matchCase := fs.Bool("case", false, "search: match case")
 	word := fs.Bool("word", false, "search: whole words only")
+	jsonl := fs.Bool("jsonl", false, "search: print each hit as one JSON object per line, as it arrives")
 	base := fs.Uint64("base", 0, "apply: the version the offsets were measured in")
 	start := fs.Int("start", -1, "apply/read: first byte of the span")
 	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
+	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
 	textArg := fs.String("text", "", "apply: replacement text")
 	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
 	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
@@ -108,6 +114,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	oldFile := fs.String("old-file", "", "edit: read -old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read -new from a file, or - for stdin")
 	all := fs.Bool("all", false, "edit: replace every occurrence instead of requiring exactly one")
+	mine := fs.Bool("mine", false, "groups: only the connection's own change sets")
 	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
 	// Everything after "--" is another program's argv and must reach it intact:
 	// `raj ctl exec -- go test -run X` has to give go its own -run, not have it
@@ -153,7 +160,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "buffers":
 		return buffers(c, stdout, stderr, *asJSON)
 	case "read":
-		return read(c, path, *start, *end, stdout, stderr, *asJSON)
+		return read(c, path, *start, *end, *lines, stdout, stderr, *asJSON)
 	case "open":
 		if path == "" {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
@@ -213,6 +220,15 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		if code := fail(stderr, res, err); code != 0 {
 			return code
 		}
+		if *mine {
+			var mineOnly []Group
+			for _, g := range res.Groups {
+				if g.Author == c.Author() {
+					mineOnly = append(mineOnly, g)
+				}
+			}
+			res.Groups = mineOnly
+		}
 		if *asJSON {
 			return emit(stdout, res.Groups)
 		}
@@ -260,9 +276,26 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "search":
 		return doSearch(c, SearchQuery{Text: *query, Include: *include, Exclude: *exclude,
-			Regex: *regex, Case: *matchCase, Word: *word}, stdout, stderr, *asJSON)
+			Regex: *regex, Case: *matchCase, Word: *word}, *jsonl, *asJSON, stdout, stderr)
 	case "version":
-		return simple(c, Request{Op: "version", Path: path}, "", stdout, stderr, *asJSON)
+		res, err := c.Do(Request{Op: "version", Path: path})
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		if *asJSON {
+			return emit(stdout, map[string]any{
+				"ok": true, "version": res.Version,
+				"bytes": res.Bytes, "lines": res.Lines,
+			})
+		}
+		fmt.Fprintln(stdout, res.Version) // the number is the answer
+		return 0
+	case "dump":
+		return dumpCmd(c, path, *start, *end, stdout, stderr, *asJSON)
+	case "patch":
+		return patchCmd(c, path, *dumpID, *textArg, *textFile, stdout, stderr, *asJSON)
+	case "lsp":
+		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), stdout, stderr, *asJSON)
 	case "apply":
 		return apply(c, path, *base, *start, *end, *textArg, *textFile, fs, stdout, stderr, *asJSON)
 	case "edit":
@@ -349,6 +382,27 @@ func isBool(fs *flag.FlagSet, name string) bool {
 	}
 	b, ok := f.Value.(interface{ IsBoolFlag() bool })
 	return ok && b.IsBoolFlag()
+}
+
+// ctlLines parses a read line range: "A" reads from line A to the end, and
+// "A,B" reads the inclusive 1-based range. hasEnd is false for the bare "A"
+// form, so the editor reads to the end of the file.
+func ctlLines(s string) (start, end int, hasEnd, ok bool) {
+	a, b, found := strings.Cut(s, ",")
+	if a == "" {
+		return 0, 0, false, false
+	}
+	var e int
+	if start, ok = ctlAtoi(strings.TrimSpace(a)); !ok || start < 1 {
+		return 0, 0, false, false
+	}
+	if !found {
+		return start, 0, false, true
+	}
+	if e, ok = ctlAtoi(strings.TrimSpace(b)); !ok || e < start {
+		return 0, 0, false, false
+	}
+	return start, e, true, true
 }
 
 // ctlPosition reads "line", "line:col" or ":col" for goto. A missing part is
@@ -490,13 +544,25 @@ func doExec(c *Client, argv []string, dir string, stdout, stderr io.Writer, asJS
 // path:line:col:text. The overlay means a hit can be in a buffer the user has
 // not saved, which is the point — an agent that grepped the filesystem would
 // see stale text and edit against it.
-func doSearch(c *Client, q SearchQuery, stdout, stderr io.Writer, asJSON bool) int {
+func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Writer) int {
 	// Print as they arrive rather than at the end. A walk over a large tree
 	// takes seconds, and a caller — a person at a terminal or an agent reading
 	// a pipe — should not wait for the last file to see the first hit.
 	// Ctrl+C closes the connection, which cancels the walk in the editor.
 	n := 0
 	stream := func(batch []SearchMatch) {
+		if jsonl {
+			// NDJSON: one object per line, as each hit arrives.
+			enc := json.NewEncoder(stdout)
+			for _, m := range batch {
+				enc.Encode(map[string]any{
+					"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
+					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "text": m.Text,
+				})
+				n++
+			}
+			return
+		}
 		if asJSON {
 			return // JSON is emitted whole, so it stays parseable
 		}
@@ -509,7 +575,7 @@ func doSearch(c *Client, q SearchQuery, stdout, stderr io.Writer, asJSON bool) i
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
-	if asJSON {
+	if !jsonl && asJSON {
 		return emit(stdout, map[string]any{
 			"matches": res.Matches, "files": res.Files, "capped": res.Capped})
 	}
@@ -556,12 +622,144 @@ func apply(c *Client, path string, base uint64, start, end int, textArg, textFil
 	}
 	res, err := c.Do(Request{Op: "apply", Path: path, Base: &base,
 		Hunks: []Hunk{{Start: start, End: end, Text: text}}})
-	return reportApply(res, err, 1, stdout, stderr, asJSON)
+	return reportApply(res, err, 1, []hunkEcho{{Start: start, End: end, Text: text}},
+		stdout, stderr, asJSON)
+}
+
+// dumpCmd captures a span (or the whole file) as an editable snapshot. The text
+// goes to stdout, exactly as read prints it; the id, version and hash go to
+// stderr so a driver that only wants the bytes is not handed a stray line.
+func dumpCmd(c *Client, path string, start, end int, stdout, stderr io.Writer, asJSON bool) int {
+	var sp, ep *int
+	if start >= 0 {
+		sp = &start
+	}
+	if end >= 0 {
+		ep = &end
+	}
+	res, err := c.Do(Request{Op: "dump", Path: path, Start: sp, End: ep})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		spans := make([]map[string]any, 0, len(res.Spans))
+		for _, sp := range res.Spans {
+			spans = append(spans, map[string]any{
+				"text": sp.Text, "author": sp.Author,
+				"mine": sp.Mine(c.Author()), "by_user": sp.ByUser(),
+			})
+		}
+		return emit(stdout, map[string]any{
+			"id": res.DumpID, "version": res.Version, "hash": res.Hash,
+			"text": res.Text(), "spans": spans,
+		})
+	}
+	io.WriteString(stdout, res.Text())
+	fmt.Fprintf(stderr, "note: snapshot id %d, version %d, hash %s\n", res.DumpID, res.Version, res.Hash)
+	return 0
+}
+
+// patchCmd replaces a snapshot text with the whole edited text, and the editor
+// diffs and rebases — the caller never states an offset or matches old text, so
+// there is no anchor to get wrong.
+func patchCmd(c *Client, path string, dumpID uint64, textArg, textFile string, stdout, stderr io.Writer, asJSON bool) int {
+	if dumpID == 0 {
+		fmt.Fprintln(stderr, "raj ctl patch: -dump is required; get an id from dump")
+		return 2
+	}
+	text := textArg
+	if textFile != "" {
+		if textArg != "" {
+			fmt.Fprintln(stderr, "raj ctl patch: -text and -text-file are alternatives")
+			return 2
+		}
+		var data []byte
+		var err error
+		if textFile == "-" {
+			data, err = io.ReadAll(os.Stdin)
+		} else {
+			data, err = os.ReadFile(textFile)
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "raj ctl patch:", err)
+			return 1
+		}
+		text = string(data)
+	}
+	res, err := c.Do(Request{Op: "patch", Path: path, DumpID: dumpID, PatchText: text})
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl patch:", err)
+		return 1
+	}
+	if len(res.Conflicts) > 0 {
+		fmt.Fprintf(stderr, "raj ctl patch: %d change(s) could not be placed on the current\n"+
+			"version — the buffer moved further than a rebase could carry them. Dump\n"+
+			"again and redo the edit.\n", len(res.Conflicts))
+		return 1
+	}
+	if res.Err != "" {
+		fmt.Fprintln(stderr, "raj ctl patch:", res.Err)
+		return 1
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "version": res.Version})
+	}
+	fmt.Fprintf(stdout, "patched snapshot %d at version %d; the buffer has unsaved changes\n", dumpID, res.Version)
+	return 0
+}
+
+// doLSP asks the language server for hover text, a definition, completions, or
+// the cached diagnostics for a path. The answer is JSON already; -json prints
+// it whole and the plain path pretty-prints it, so a script and a person read
+// the same result.
+func doLSP(c *Client, mode, path, pos string, stdout, stderr io.Writer, asJSON bool) int {
+	switch mode {
+	case "hover", "definition", "completion", "diagnostics":
+	default:
+		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, completion or diagnostics")
+		return 2
+	}
+	line, col := 0, 0
+	if mode != "diagnostics" {
+		if pos == "" {
+			fmt.Fprintln(stderr, "raj ctl lsp: needs a position, LINE:COL")
+			return 2
+		}
+		l, cl, ok := ctlPosition(pos)
+		if !ok || l < 1 || cl < 1 {
+			fmt.Fprintln(stderr, "raj ctl lsp: needs a position, LINE:COL")
+			return 2
+		}
+		line, col = l, cl
+	}
+	res, err := c.Do(Request{Op: "lsp", Path: path, Line: line, Col: col, LSPMode: mode})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		fmt.Fprintln(stdout, res.LSPJSON)
+		return 0
+	}
+	var v any
+	if err := json.Unmarshal([]byte(res.LSPJSON), &v); err != nil {
+		fmt.Fprintln(stdout, res.LSPJSON)
+		return 0
+	}
+	return emit(stdout, v)
 }
 
 // reportApply is shared by apply and edit so the two cannot describe the same
 // outcome differently.
-func reportApply(res Response, err error, hunks int, stdout, stderr io.Writer, asJSON bool) int {
+// hunkEcho is what an apply or edit reports it wrote, so the -json reply is
+// itself the check that the hunk landed where the caller meant — the
+// "applied 1 hunk(s)" that says nothing about what changed.
+type hunkEcho struct {
+	Start, End int
+	Old        string // the text that was matched, when known (edit)
+	Text       string // the replacement that was written
+}
+
+func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, stderr io.Writer, asJSON bool) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "raj ctl apply:", err)
 		return 1
@@ -578,7 +776,22 @@ func reportApply(res Response, err error, hunks int, stdout, stderr io.Writer, a
 		return 1
 	}
 	if asJSON {
-		return emit(stdout, map[string]any{"ok": true, "applied": hunks, "version": res.Version})
+		out := map[string]any{"ok": true, "applied": hunks, "version": res.Version}
+		if len(echo) > 0 {
+			spans := make([]map[string]any, 0, len(echo))
+			for _, h := range echo {
+				m := map[string]any{"start": h.Start, "end": h.End}
+				if h.Old != "" {
+					m["matched"] = h.Old
+				}
+				if h.Text != "" {
+					m["text"] = h.Text
+				}
+				spans = append(spans, m)
+			}
+			out["spans"] = spans
+		}
+		return emit(stdout, out)
 	}
 	fmt.Fprintf(stdout, "applied %d hunk(s) at version %d; the buffer has unsaved changes\n",
 		hunks, res.Version)
@@ -643,7 +856,7 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 	return 0
 }
 
-func read(c *Client, path string, start, end int, stdout, stderr io.Writer, asJSON bool) int {
+func read(c *Client, path string, start, end int, lines string, stdout, stderr io.Writer, asJSON bool) int {
 	var sp, ep *int
 	if start >= 0 {
 		sp = &start
@@ -651,7 +864,15 @@ func read(c *Client, path string, start, end int, stdout, stderr io.Writer, asJS
 	if end >= 0 {
 		ep = &end
 	}
-	res, err := c.Do(Request{Op: "text", Path: path, Start: sp, End: ep})
+	var lsp, lep *int
+	if a, b, hasEnd, ok := ctlLines(lines); ok {
+		lsp, lep = &a, nil
+		if hasEnd {
+			lep = &b
+		}
+	}
+	res, err := c.Do(Request{Op: "text", Path: path, Start: sp, End: ep,
+		LineStart: lsp, LineEnd: lep})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -757,12 +978,14 @@ func edit(c *Client, path, old, newText string, all bool, stdout, stderr io.Writ
 	}
 
 	hunks := make([]Hunk, 0, len(offsets))
+	echo := make([]hunkEcho, 0, len(offsets))
 	for _, off := range offsets {
 		hunks = append(hunks, Hunk{Start: off, End: off + len(old), Text: newText})
+		echo = append(echo, hunkEcho{Start: off, End: off + len(old), Old: old, Text: newText})
 	}
 	base := res.Version
 	ap, err := c.Do(Request{Op: "apply", Path: path, Base: &base, Hunks: hunks})
-	return reportApply(ap, err, len(hunks), stdout, stderr, asJSON)
+	return reportApply(ap, err, len(hunks), echo, stdout, stderr, asJSON)
 }
 
 // fail turns a transport error or an editor refusal into an exit code. They are

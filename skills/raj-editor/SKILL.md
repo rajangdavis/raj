@@ -479,7 +479,10 @@ Offsets for `apply` are BYTES in the editor's own byte model, and nothing else
 counts. Character-count indexing silently disagrees: any multi-byte character
 before the anchor — an em-dash in a comment, a non-ASCII name — shifts the
 numbers, and `apply` happily splices at the wrong byte because it validates the
-range, not the text.
+range, not the text. A LINE number is not an offset either: feeding the output
+of a `grep -n` dump to `-start`/`-end` lands in the wrong place — a small line
+number reads the top of the file. Take offsets from `read -json` or
+`search -json`, never from a line count.
 
 The two verbs that make offsets unnecessary in the common case are `raj ctl
 edit -old S -new S`, the exact-string replacement, and `raj ctl search -q
@@ -542,17 +545,26 @@ both are where mistakes live. Fingerprints:
   you already consumed makes the next line climb into the previous one.
   Anchor whole lines: span start at the line start, span end at the line end
   INCLUDING its newline.
+- `edit -old` that ends one line short of the block applies cleanly and leaves
+  the tail as a dangling line — the reply says "applied 1 hunk(s)" and nothing
+  warns you. Replacing a bullet up to its second-to-last line left its final
+  line behind, reading as a duplicate of the replacement's last line. Quote the
+  WHOLE block including its final line; only a re-read of the seam catches it.
 
 The one check that catches all of these and the encoding trap above: after
 every hunk, read the file and print the lines AROUND the edit — one function
 before through one after — and study the seams, not the center. Splitting the
 read on "\n" is encoding-safe even when byte offsets are not.
 
-### include/exclude globs match basenames, not paths
-`raj ctl search -include 'internal/control/*.go'` matches NOTHING: the glob is
-matched against each file's basename. Use `-include '*.go'` for a whole-repo Go
-search. Making the globs match the path is the in-progress Stream B item in the
-project's TODO.md.
+### include/exclude globs match the relative path, not the basename
+
+Globs are matched against each file's path relative to the search root, so a
+path-scoped glob works: `-include 'internal/control/*.go'` matches only files
+under `internal/control/`. The flip side: a bare filename is no longer a valid
+scope — `-include 'search.go'` matches nothing, because no relative path is
+exactly `search.go`. The extension fast path and `filepath.Match`'s `*`
+crossing separators keep `-include '*.go'` matching a whole-repo Go search.
+(Stream B, done; `TestRunGlobsMatchPath` in internal/search covers it.)
 
 ### -q is the pattern; -regex is a flag
 
@@ -593,14 +605,26 @@ verification step. State that contract out loud every session that hits it.
 
 After an agent applies a hunk, the human is left to find it themselves. The
 buffer shows the change tinted, but the editor's viewport does not jump to it,
-and the user may be looking at an unrelated part of the file.
+and the user may be looking at an unrelated part of the file. Two conventions
+make the review surface what actually changed:
 
-`raj ctl goto <path> LINE[:COL]` already moves the editor's cursor; an agent
-that knows the line it edited can jump the user there immediately after the
-apply. What is missing is a way to reveal a *span* or to make the jump automatic:
-either `raj ctl reveal <path> -start N -end N`, or an option on `apply`/`edit`
-that returns or jumps to the affected line, would make reviewing agent changes
-feel direct rather than archaeological.
+- **Goto the change, always.** When a batch of edits is done, run
+  `raj ctl goto <path> LINE` for every file with changes, so the viewport
+  jumps to where the user needs to look. Several hunks in one file: jump to
+  the first (or the most consequential); the user scrolls from there. `goto`
+  confirms with "moved ... cursor to LINE", so a landed jump is verifiable
+  rather than assumed.
+- **Close the files that have no changes.** Files opened for the work but left
+  with nothing to show get `raj ctl close <path>`, so the tab bar ends up
+  listing exactly the files awaiting review. This is safe by construction:
+  `close` is refused while a buffer has unsaved work, so a file with pending
+  proposals cannot be closed — only change-free files actually close. Check
+  `raj ctl buffers` before closing that a file really has nothing pending.
+
+What is still missing is a way to reveal a *span* or to make the jump
+automatic: either `raj ctl reveal <path> -start N -end N`, or an option on
+`apply`/`edit` that returns or jumps to the affected line, would make reviewing
+agent changes feel direct rather than archaeological.
 
 This matters most when the agent is making several small edits across a large
 file: without a reveal step, each change set is invisible until the user
@@ -615,19 +639,28 @@ the image is hardened. Every file inspection should go through a native raj ctl
 verb, and when one is missing the right move is to propose it rather than to
 reach for a shell workaround.
 
+A delegated subagent starts with no skill context, so the same rule has to be
+written into its brief: "use only raj ctl verbs — no node, no jq, no grep or
+sed over files, no /tmp scratch." The workarounds this kills are the ones that
+drift: parsing `read -json` with node re-implements the editor's JSON by hand,
+and grepping a `/tmp` dump reads text that is already stale. If a verb is
+genuinely missing, the subagent should stop and report the gap — that is how
+this list grows — rather than reach for a host tool.
+
 Concrete gaps today:
 
-- **Reading a line range.** `raj ctl read -start/-end` now covers byte spans, but
-  line ranges are still missing. Agents inspecting a known line still pipe
-  through `sed -n` or `head -n | tail -n`. A `read -line N` or
-  `read -lines START,END` flag would remove that dependency.
-- **Counting bytes or lines.** `wc -c` and `wc -l` are used to size apply spans
-  or find the end of a file. A `raj ctl stats` per-file mode, or returning the
-  buffer length and line count in `read -json`, would cover it.
+- **Reading a line range.** `raj ctl read -lines A,B` (1-based inclusive; a
+  bare `A` reads to the end) is implemented in the control surface, awaiting
+  host verification. Until that build is what a driver talks to, agents still
+  pipe through `sed -n` or `head -n | tail -n` — and the seam to re-check is
+  the one this rule is about.
+- **Counting bytes or lines.** `wc -c` and `wc -l` used to be needed to size
+  apply spans or find the end of a file; `raj ctl version -json` now returns
+  `bytes` and `lines` alongside the version, which closes it.
 - **Pretty-printing JSON.** `jq` is the usual suspect. `raj ctl ... -json` is
   already the answer for machine-readable output; the agent should consume that
   directly.
 
-Rule of thumb: if an agent command contains a pipe to anything other than
-`raj ctl`, it is a candidate for a new flag or verb. Document the gap and keep
-the container surface small.
+Rule of thumb: if an agent — or a subagent it spawned — pipes anything other
+than `raj ctl`, it is a candidate for a new flag or verb. Document the gap and
+keep the container surface small.

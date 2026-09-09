@@ -19,7 +19,7 @@ func fullHeader() Header {
 		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Regex: true, Word: true},
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
-		Root: "/w", PID: 4242, Version: 70000, Files: 12, Capped: true,
+		Root: "/w", PID: 4242, Version: 70000, Bytes: 12345, Lines: 678, Files: 12, Capped: true,
 		Dirty:        []DirtyBuffer{{Path: "/w/a.go", AgentOnly: true}, {Path: "/w/b.go"}},
 		Stats:        ExecStats{Runs: 5, Stale: 1, AgentOnly: 2},
 		Participants: []Participant{{ID: 1, Identity: "i", Name: "n", Kind: KindAgent, Connected: true}},
@@ -73,7 +73,9 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"stream", got.Stream, want.Stream}, {"outlen", got.OutLen, want.OutLen},
 		{"final", got.Final, want.Final}, {"ok", got.OK, want.OK}, {"err", got.Err, want.Err},
 		{"root", got.Root, want.Root}, {"pid", got.PID, want.PID},
-		{"version", got.Version, want.Version}, {"files", got.Files, want.Files},
+		{"version", got.Version, want.Version},
+		{"bytes", got.Bytes, want.Bytes}, {"lines", got.Lines, want.Lines},
+		{"files", got.Files, want.Files},
 		{"capped", got.Capped, want.Capped}, {"stats", got.Stats, want.Stats},
 	} {
 		if c.got != c.want {

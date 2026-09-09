@@ -1,6 +1,7 @@
 package app
 
 import (
+	"math"
 	"time"
 
 	"raj/internal/editor"
@@ -57,6 +58,7 @@ func (a *App) SessionState() session.State {
 			Path:   p.File.Path,
 			Cursor: p.Cursors.Primary().Head,
 			Top:    p.Viewport.Top,
+			Ratio:  scrollRatio(p),
 			Wrap:   p.Wrap,
 		})
 	}
@@ -67,6 +69,18 @@ func (a *App) SessionState() session.State {
 		st.Expanded = a.Explorer.Tree.ExpandedDirs()
 	}
 	return st
+}
+
+// scrollRatio is the scroll position as a proportion of the document, so a
+// restored session lands at the same place in a file that has grown. Zero for
+// an empty file: there is nothing to be proportional to, and the saved Top is
+// then exactly right.
+func scrollRatio(p *editor.Pane) float64 {
+	lines := p.File.Lines()
+	if lines <= 1 {
+		return 0
+	}
+	return float64(p.Viewport.Top) / float64(lines)
 }
 
 // activeAmong maps the live tab index onto the saved list.
@@ -127,6 +141,17 @@ func (a *App) RestoreSession() {
 		}
 		p.Cursors.Set(at, at)
 		p.Viewport.Top = t.Top
+		if t.Ratio > 0 {
+			// Proportional restore: keep the same place in the document rather
+			// than the same line number, so a file that has grown opens where
+			// the work was. Clamped against the file as it is now, like the
+			// cursor above; the first resize would clamp it too, but the
+			// authority is the buffer that just opened.
+			p.Viewport.Top = int(math.Round(t.Ratio * float64(p.File.Lines())))
+			if max := p.File.Lines() - 1; p.Viewport.Top > max {
+				p.Viewport.Top = max
+			}
+		}
 		restored++
 	}
 	if restored == 0 {

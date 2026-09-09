@@ -114,6 +114,11 @@ type Header struct {
 	Start *int
 	End   *int
 
+	// LineStart and LineEnd carry a read by 1-based inclusive line numbers,
+	// which the host translates to bytes. Nil means the byte span decides.
+	LineStart *int
+	LineEnd   *int
+
 	// Argv and Dir are exec's command. Plain JSON: a command line is exactly
 	// what you want legible in a frame.
 	Group    uint64
@@ -121,6 +126,18 @@ type Header struct {
 	Name     string
 	Argv     []string
 	Dir      string
+
+	// DumpID rides both directions: a patch names the snapshot a prior dump
+	// returned, and a dump's reply carries the id it just minted. Hash is the
+	// dump's answer, so a caller can verify the bytes it holds.
+	DumpID uint64
+	Hash   string
+
+	// LSPMode names the lsp sub-operation on a request; LSPJSON carries the
+	// JSON-encoded answer back on a response. Neither needs the body: they are
+	// text by construction, valid UTF-8, not document bytes.
+	LSPMode string
+	LSPJSON string
 
 	// Exit, Dirty and Stats are exec's answers. Stream marks an output frame:
 	// 1 stdout, 2 stderr, with the bytes in the body.
@@ -150,6 +167,8 @@ type Header struct {
 	Root    string
 	PID     int
 	Version uint64
+	Bytes   int
+	Lines   int
 	Buffers []Buffer
 	Files   int
 	Capped  bool
@@ -305,18 +324,29 @@ func ReadFrame(r io.Reader) (Frame, error) {
 func EncodeRequest(req Request) (Header, []byte) {
 	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
-		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col}
+		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
+		DumpID: req.DumpID, LSPMode: req.LSPMode}
 	if req.Start != nil {
 		h.Start = req.Start
 	}
 	if req.End != nil {
 		h.End = req.End
 	}
+	if req.LineStart != nil {
+		h.LineStart = req.LineStart
+	}
+	if req.LineEnd != nil {
+		h.LineEnd = req.LineEnd
+	}
 
 	var body []byte
 	if req.Op == "prog" {
 		// The whole body, unclaimed by any header length: see DecodeRequest.
 		return h, req.Program
+	}
+	if req.Op == "patch" {
+		// The whole edited text is the body, unclaimed: see DecodeRequest.
+		return h, []byte(req.PatchText)
 	}
 	h.Path = req.Path
 	for _, x := range req.Hunks {
@@ -331,7 +361,9 @@ func DecodeRequest(f Frame) (Request, error) {
 		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
 		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
-		Start: f.Header.Start, End: f.Header.End}
+		Start: f.Header.Start, End: f.Header.End,
+		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
+		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -341,6 +373,12 @@ func DecodeRequest(f Frame) (Request, error) {
 		// that rewrote anything invalid in it would move every offset it
 		// contains.
 		req.Program = f.Body
+		return req, nil
+	}
+	if f.Header.Op == "patch" {
+		// The whole edited text is the body; claimed here for the same reason
+		// as a program.
+		req.PatchText = string(f.Body)
 		return req, nil
 	}
 	lengths := make([]int, 0, len(f.Header.Hunks))
@@ -361,10 +399,12 @@ func DecodeRequest(f Frame) (Request, error) {
 // carries authorship in the shape the store holds it.
 func EncodeResponse(res Response) (Header, []byte) {
 	h := Header{ID: res.ID, OK: res.OK, Err: res.Err, Root: res.Root, PID: res.PID,
-		Version: res.Version, Buffers: res.Buffers, Conflicts: res.Conflicts,
+		Version: res.Version, Bytes: res.Bytes, Lines: res.Lines,
+		Buffers: res.Buffers, Conflicts: res.Conflicts,
 		Files: res.Files, Capped: res.Capped, Final: res.Final, Author: res.Author,
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
-		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages}
+		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
+		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON}
 	var body []byte
 	if res.Stream != 0 {
 		// Command output is bytes off a pipe: whatever the process wrote, not
@@ -389,12 +429,14 @@ func EncodeResponse(res Response) (Header, []byte) {
 func DecodeResponse(f Frame) (Response, error) {
 	res := Response{ID: f.Header.ID, OK: f.Header.OK, Err: f.Header.Err, Root: f.Header.Root,
 		PID: f.Header.PID, Version: f.Header.Version,
+		Bytes: f.Header.Bytes, Lines: f.Header.Lines,
 		Buffers: f.Header.Buffers, Conflicts: f.Header.Conflicts,
 		Files: f.Header.Files, Capped: f.Header.Capped, Final: f.Header.Final,
 		Author: f.Header.Author, Exit: f.Header.Exit, Dirty: f.Header.Dirty,
 		Stats: f.Header.Stats, Stream: f.Header.Stream,
 		Participants: f.Header.Participants, Groups: f.Header.Groups,
-		Messages: f.Header.Messages}
+		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
+		LSPJSON: f.Header.LSPJSON}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

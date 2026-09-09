@@ -1,8 +1,10 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -228,5 +230,172 @@ func TestSessionTickRespectsNoRestore(t *testing.T) {
 	a.sessionTick(time.Now())
 	if _, err := os.Stat(session.File(root)); !os.IsNotExist(err) {
 		t.Error("--no-restore wrote a session file")
+	}
+}
+
+// writeLines writes n lines so a test can grow and shrink the file between
+// sessions.
+func writeLines(t *testing.T, path string, n int) {
+	t.Helper()
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Same file, same terminal: a proportional restore lands exactly on the saved
+// line, so nothing about the old behaviour is lost.
+func TestScrollRestoresSameSize(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	writeLines(t, f, 100)
+
+	first := newHarnessAt(t, root)
+	first.OpenFile(f)
+	first.Tabs.Active().Viewport.Top = 40
+	if err := first.SaveSession(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := newHarnessAt(t, root)
+	second.RestoreSession()
+	second.drain()
+	p := second.Tabs.Active()
+	if p == nil {
+		t.Fatal("nothing restored")
+	}
+	if p.Viewport.Top != 40 {
+		t.Errorf("same-size restore top = %d, want 40", p.Viewport.Top)
+	}
+}
+
+// A file that grew between sessions must reopen at the same place in the
+// document, not at the same line number — the line number is the top of a
+// now much larger file.
+func TestScrollRestoresProportionallyWhenFileGrows(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	writeLines(t, f, 100)
+
+	first := newHarnessAt(t, root)
+	first.OpenFile(f)
+	first.Tabs.Active().Viewport.Top = 40
+	first.SaveSession()
+
+	// Overnight, the file doubles.
+	writeLines(t, f, 200)
+
+	second := newHarnessAt(t, root)
+	second.RestoreSession()
+	second.drain()
+	p := second.Tabs.Active()
+	if p == nil {
+		t.Fatal("nothing restored")
+	}
+	if got, want := p.Viewport.Top, 80; got != want {
+		t.Errorf("top = %d, want %d (40/100 of 200 lines, not the saved 40)",
+			got, want)
+	}
+}
+
+// A file that shrank clamps at its end rather than pointing past it.
+func TestScrollRestoresClampedWhenFileShrinks(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	writeLines(t, f, 100)
+
+	// 100 content lines are 101 document lines (the trailing newline leaves an
+	// empty last line). Top = 100 is the very last line, so the saved ratio
+	// is 100/101 — a position that, recomputed against 11 lines, rounds to 11
+	// and must be clamped to the new last line, 10.
+	first := newHarnessAt(t, root)
+	first.OpenFile(f)
+	first.Tabs.Active().Viewport.Top = 100
+	first.SaveSession()
+
+	writeLines(t, f, 10)
+
+	second := newHarnessAt(t, root)
+	second.RestoreSession()
+	second.drain()
+	p := second.Tabs.Active()
+	if p == nil {
+		t.Fatal("nothing restored")
+	}
+	if got, want := p.Viewport.Top, 10; got != want {
+		t.Errorf("top = %d, want %d (clamped to the last line)", got, want)
+	}
+}
+
+// An empty file has nothing to be proportional to: the ratio is zero, restore
+// lands at the top, and nothing divides by zero.
+func TestScrollRestoresEmptyFile(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	os.WriteFile(f, []byte(""), 0o644)
+
+	first := newHarnessAt(t, root)
+	first.OpenFile(f)
+	first.SaveSession()
+	if st := session.Load(root); len(st.Tabs) != 1 || st.Tabs[0].Ratio != 0 {
+		t.Fatalf("empty file saved ratio = %+v, want 0", st.Tabs)
+	}
+
+	second := newHarnessAt(t, root)
+	second.RestoreSession()
+	second.drain()
+	if p := second.Tabs.Active(); p == nil || p.Viewport.Top != 0 {
+		t.Errorf("empty-file restore top = %v, want 0", second.Tabs.Active())
+	}
+}
+
+// A taller terminal must not change the restored position: the ratio is
+// document-relative, so the same file opens at the same line no matter the
+// pane height.
+func TestScrollRestoresIndependentOfTerminalSize(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	writeLines(t, f, 100)
+
+	first := newHarnessAt(t, root)
+	first.OpenFile(f)
+	first.Tabs.Active().Viewport.Top = 40
+	first.SaveSession()
+
+	host := ui.NewFakeHost(120, 48)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, root, 2)
+	a.Search.Debounce = time.Nanosecond
+	a.RestoreSession()
+	(&harness{App: a, host: host}).drain()
+	p := a.Tabs.Active()
+	if p == nil {
+		t.Fatal("nothing restored")
+	}
+	if p.Viewport.Top != 40 {
+		t.Errorf("taller-terminal top = %d, want 40", p.Viewport.Top)
+	}
+}
+
+// A session written before the ratio existed restores by its plain Top, so a
+// saved position from an older build still lands where it used to.
+func TestScrollRestoresLegacyJSONByTop(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	writeLines(t, f, 100)
+
+	p := session.File(root)
+	os.MkdirAll(filepath.Dir(p), 0o700)
+	body := `{"version":1,"tabs":[{"path":"` + f + `","cursor":0,"top":40}],"active":0}`
+	os.WriteFile(p, []byte(body), 0o600)
+
+	second := newHarnessAt(t, root)
+	second.RestoreSession()
+	second.drain()
+	if got := second.Tabs.Active().Viewport.Top; got != 40 {
+		t.Errorf("legacy restore top = %d, want 40", got)
 	}
 }

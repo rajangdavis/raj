@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,10 +18,23 @@ type memHost struct {
 	opens  []string
 	dirty  []DirtyBuffer
 	groups []Group
+	snaps  map[uint64]snapEntry
+	seq    uint64
+}
+
+// snapEntry is memHost's dump record: the text captured, and where it was.
+type snapEntry struct {
+	author  uint8
+	path    string
+	version uint64
+	start   int
+	end     int
+	text    string
 }
 
 func newMemHost(root string, docs map[string]string) *memHost {
-	h := &memHost{root: root, docs: map[string]string{}, vers: map[string]uint64{}}
+	h := &memHost{root: root, docs: map[string]string{}, vers: map[string]uint64{},
+		snaps: map[uint64]snapEntry{}}
 	for k, v := range docs {
 		h.docs[k], h.vers[k] = v, 1
 	}
@@ -32,7 +46,8 @@ func (h *memHost) Root() string { return h.root }
 func (h *memHost) Buffers() []Buffer {
 	var out []Buffer
 	for p, t := range h.docs {
-		out = append(out, Buffer{Path: p, Version: h.vers[p], Bytes: len(t)})
+		out = append(out, Buffer{Path: p, Version: h.vers[p],
+			Bytes: len(t), Lines: strings.Count(t, "\n") + 1})
 	}
 	return out
 }
@@ -58,10 +73,32 @@ func (h *memHost) Open(path string) (uint64, error) {
 	return h.vers[path], nil
 }
 
-func (h *memHost) Read(path string, start, end int) ([]Span, uint64, error) {
+func (h *memHost) Read(path string, start, end, lineStart, lineEnd int) ([]Span, uint64, error) {
 	t, ok := h.docs[path]
 	if !ok {
 		return nil, 0, ErrNoBuffer
+	}
+	if lineStart > 0 {
+		starts := []int{0}
+		for i := 0; i < len(t); i++ {
+			if t[i] == '\n' {
+				starts = append(starts, i+1)
+			}
+		}
+		lines := len(starts)
+		first := lineStart - 1
+		if first < 0 {
+			first = 0
+		}
+		if first >= lines {
+			first = lines - 1
+		}
+		start = starts[first]
+		if lineEnd > 0 && lineEnd < lines {
+			end = starts[lineEnd]
+		} else {
+			end = len(t)
+		}
 	}
 	if start < 0 {
 		start, end = 0, len(t)
@@ -103,6 +140,57 @@ func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (u
 }
 
 func (h *memHost) Save(path string) (uint64, error) { return h.vers[path], nil }
+
+func (h *memHost) Dump(path string, start, end int, author uint8) (uint64, uint64, string, string, error) {
+	t, ok := h.docs[path]
+	if !ok {
+		return 0, 0, "", "", ErrNoBuffer
+	}
+	if start < 0 {
+		start, end = 0, len(t)
+	} else {
+		if end < 0 || end > len(t) {
+			end = len(t)
+		}
+		if start > len(t) {
+			start = len(t)
+		}
+		if start > end {
+			start = end
+		}
+	}
+	h.seq++
+	h.snaps[h.seq] = snapEntry{author: author, path: path, version: h.vers[path],
+		start: start, end: end, text: t[start:end]}
+	return h.seq, h.vers[path], t[start:end], "", nil
+}
+
+func (h *memHost) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, error) {
+	snap, ok := h.snaps[id]
+	if !ok || snap.author != author {
+		return 0, nil, fmt.Errorf("no snapshot %d for this writer", id)
+	}
+	t, ok := h.docs[path]
+	if !ok {
+		return 0, nil, ErrNoBuffer
+	}
+	diffs := DiffLines(snap.text, newText)
+	if len(diffs) == 0 {
+		return h.vers[path], nil, nil
+	}
+	// The memHost has no journal, so it can only rebase what is still current;
+	// the real host replays the journal from the snapshot's version forward.
+	for i := len(diffs) - 1; i >= 0; i-- {
+		d := diffs[i]
+		s, e := snap.start+d.Start, snap.start+d.End
+		if e > len(t) {
+			return h.vers[path], []Conflict{{Index: i, At: h.vers[path], Hunk: d}}, nil
+		}
+		t = t[:s] + d.Text + t[e:]
+	}
+	h.docs[path], h.vers[path] = t, h.vers[path]+1
+	return h.vers[path], nil, nil
+}
 
 // Goto is a cursor move, and memHost has no cursor: the state it keeps is
 // whether the buffer exists, which is also the one thing the real host can get
@@ -149,7 +237,7 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		if _, err := g.Open(p); err == nil {
 			t.Errorf("Open(%q) was allowed", p)
 		}
-		if _, _, err := g.Read(p, -1, -1); err == nil {
+		if _, _, err := g.Read(p, -1, -1, 0, 0); err == nil {
 			t.Errorf("Read(%q) was allowed", p)
 		}
 		if _, _, err := g.Apply(p, FirstAgent, 1, []Hunk{{}}); err == nil {
@@ -175,7 +263,7 @@ func TestGuardRequiresAReadBeforeAWrite(t *testing.T) {
 		t.Fatalf("buffer changed anyway: %q", h.docs[path])
 	}
 
-	if _, _, err := g.Read(path, -1, -1); err != nil {
+	if _, _, err := g.Read(path, -1, -1, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
@@ -203,7 +291,7 @@ func TestVersionCountsAsARead(t *testing.T) {
 func TestGuardRejectsMalformedSpans(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	g.Read(path, -1, -1)
+	g.Read(path, -1, -1, 0, 0)
 	for _, hk := range []Hunk{{Start: -1, End: 0}, {Start: 5, End: 2}} {
 		if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{hk}); err == nil {
 			t.Errorf("%+v was allowed", hk)
@@ -238,8 +326,12 @@ func TestDispatchVerbs(t *testing.T) {
 	if h.docs[path] != "hello socket\n" {
 		t.Errorf("buffer = %q", h.docs[path])
 	}
-	if v := Dispatch(g, Request{Op: "version", Path: path}); !v.OK || v.Version != res.Version {
-		t.Errorf("version = %+v, want %d", v, res.Version)
+	v := Dispatch(g, Request{Op: "version", Path: path})
+	if !v.OK || v.Version != res.Version {
+		t.Fatalf("version = %+v, want %d", v, res.Version)
+	}
+	if wantB, wantL := len(h.docs[path]), strings.Count(h.docs[path], "\n")+1; v.Bytes != wantB || v.Lines != wantL {
+		t.Errorf("version = %+v, want bytes %d lines %d", v, wantB, wantL)
 	}
 	// goto moves a cursor the host can verify; a position on a buffer that is
 	// not open is refused rather than silently parked.
@@ -261,6 +353,35 @@ func TestDispatchVerbs(t *testing.T) {
 	}
 	if u := Dispatch(g, Request{Op: "frobnicate"}); u.OK || !strings.Contains(u.Err, "unknown op") {
 		t.Errorf("unknown op = %+v", u)
+	}
+}
+
+// A read can be asked for by 1-based line numbers instead of bytes: the host
+// translates, so a driver holding a compiler's or a search's line never
+// re-derives byte offsets.
+func TestDispatchReadsByLines(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.docs[path] = "one\ntwo\nthree\n"
+	h.vers[path] = 1
+
+	one, three := 1, 3
+	if res := Dispatch(g, Request{Op: "text", Path: path, LineStart: &one, LineEnd: &three}); !res.OK || res.Text() != "one\ntwo\nthree\n" {
+		t.Fatalf("lines 1,3 = %q", res.Text())
+	}
+	two := 2
+	if res := Dispatch(g, Request{Op: "text", Path: path, LineStart: &two, LineEnd: &two}); !res.OK || res.Text() != "two\n" {
+		t.Fatalf("line 2 = %q, want %q", res.Text(), "two\n")
+	}
+	// A missing end reads to the end of the file.
+	if res := Dispatch(g, Request{Op: "text", Path: path, LineStart: &two}); !res.OK || res.Text() != "two\nthree\n" {
+		t.Fatalf("line 2.. = %q", res.Text())
+	}
+	// A line past the document clamps to the (empty) phantom last line rather
+	// than failing or wrapping around.
+	late := 99
+	if res := Dispatch(g, Request{Op: "text", Path: path, LineStart: &late}); !res.OK || res.Text() != "" {
+		t.Fatalf("line 99 = %q, want empty", res.Text())
 	}
 }
 
@@ -323,7 +444,7 @@ func TestDispatchEmptyApplyIsAVersionQuery(t *testing.T) {
 func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	g.Read(path, -1, -1)
+	g.Read(path, -1, -1, 0, 0)
 	for _, a := range []uint8{0, 1} {
 		if _, _, err := g.Apply(path, a, 1, []Hunk{{Start: 0, End: 1, Text: "x"}}); err == nil {
 			t.Errorf("author %d was accepted", a)
@@ -341,7 +462,7 @@ func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 // text from the user's without a second call.
 func TestReadCarriesAuthorship(t *testing.T) {
 	g, h := guarded(t)
-	spans, _, err := g.Read(filepath.Join(h.root, "a.go"), -1, -1)
+	spans, _, err := g.Read(filepath.Join(h.root, "a.go"), -1, -1, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,6 +479,13 @@ func TestReadCarriesAuthorship(t *testing.T) {
 }
 
 func (h *memHost) Snapshot() Searcher { return h }
+
+// LSP has no language server to talk to in a memory host, so the caller is
+// nil and the error is the clean "no server" answer a driver would see. The
+// real host's implementation is exercised on the editor's machine.
+func (h *memHost) LSP(path string, line, col int, mode string) (LSPCaller, error) {
+	return nil, fmt.Errorf("no language server for this file type")
+}
 
 func (h *memHost) Dirty() []DirtyBuffer { return h.dirty }
 
@@ -449,7 +577,7 @@ func TestSnapshotSearcherValidates(t *testing.T) {
 func TestReadOfActiveBufferAuthorisesWriteByName(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	if _, _, err := g.Read("", -1, -1); err != nil {
+	if _, _, err := g.Read("", -1, -1, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
@@ -563,5 +691,85 @@ func TestDispatchGroups(t *testing.T) {
 	}
 	if res := Dispatch(g, Request{Op: "reject", Path: "/etc/passwd", Group: 7}); res.OK {
 		t.Error("a path outside the workspace was accepted")
+	}
+}
+
+// A dump hands back a whole chunk and an id; a patch returns the edited whole
+// text and the editor diffs and applies it, so a driver never derives offsets
+// nor matches old text.
+func TestDumpAndPatchRoundTrip(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.docs[path] = "one\ntwo\nthree\nfour\n"
+	h.vers[path] = 1
+
+	s, e := 4, 14 // "two\nthree\n"
+	res := Dispatch(g, Request{Op: "dump", Path: path, Author: FirstAgent, Start: &s, End: &e})
+	if !res.OK || res.DumpID == 0 || res.Text() != "two\nthree\n" {
+		t.Fatalf("dump = %+v", res)
+	}
+	id := res.DumpID
+
+	patched := Dispatch(g, Request{Op: "patch", Path: path, Author: FirstAgent,
+		DumpID: id, PatchText: "TWO\nthree\n"})
+	if !patched.OK {
+		t.Fatalf("patch = %+v", patched)
+	}
+	if h.docs[path] != "one\nTWO\nthree\nfour\n" {
+		t.Errorf("buffer = %q", h.docs[path])
+	}
+
+	// A patch naming a snapshot another writer holds is refused, not applied.
+	other := Dispatch(g, Request{Op: "patch", Path: path, Author: FirstAgent + 1,
+		DumpID: id, PatchText: "x"})
+	if other.OK {
+		t.Errorf("a foreign snapshot was patched: %+v", other)
+	}
+
+	// A dump without a span captures the whole file.
+	whole := Dispatch(g, Request{Op: "dump", Path: path, Author: FirstAgent})
+	if !whole.OK || whole.Text() != "one\nTWO\nthree\nfour\n" {
+		t.Errorf("whole-file dump = %q", whole.Text())
+	}
+}
+
+// An lsp request reaches the host, which in a memory host has no server — a
+// clean error rather than a hang. The real host's blocking path is exercised
+// only on the editor's machine, where a language server can run.
+func TestDispatchLSPNoServer(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	if res := Dispatch(g, Request{Op: "lspprep", Path: path, Line: 1, Col: 1, LSPMode: "hover"}); res.OK {
+		t.Errorf("lsp without a server was OK: %+v", res)
+	}
+	_ = h
+}
+
+// DiffLines turns old text into new as byte hunks; the round trip through the
+// memHost is the same code the real host's Patch runs, so this pins the diff
+// before any LSP or diff verb leans on it.
+func TestDiffLines(t *testing.T) {
+	for _, tc := range []struct{ a, b string }{
+		{"a\nb\nc\n", "a\nB\nc\n"},
+		{"a\nb\nc\n", "a\nX\nY\nc\n"},
+		{"a\nb\n", "a\n"},
+		{"a\nb\n", "a\nb\nc\n"},
+		{"", "x\n"},
+		{"x\n", ""},
+		{"same\n", "same\n"},
+		{"func f() {\n\treturn 1\n}\n", "func f() {\n\treturn 2\n}\n"},
+	} {
+		hunks := DiffLines(tc.a, tc.b)
+		// Hunks are non-overlapping and in ascending byte order, so a forward
+		// apply works, but only if they do not overlap. Apply in reverse to be
+		// safe, mirroring how Apply diff is written.
+		got := tc.a
+		for i := len(hunks) - 1; i >= 0; i-- {
+			h := hunks[i]
+			got = got[:h.Start] + h.Text + got[h.End:]
+		}
+		if got != tc.b {
+			t.Errorf("DiffLines(%q, %q): applied to %q, want %q (hunks %+v)", tc.a, tc.b, got, tc.b, hunks)
+		}
 	}
 }

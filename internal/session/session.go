@@ -40,7 +40,13 @@ type Tab struct {
 	Path   string `json:"path"`
 	Cursor int    `json:"cursor"` // byte offset of the primary cursor
 	Top    int    `json:"top"`    // first visible line
-	Wrap   bool   `json:"wrap"`
+	// Ratio is Top/Lines() at save time: the scroll position as a proportion
+	// of the document, so a restore lands at the same place in a file that
+	// has grown and in a terminal that has resized. Zero when there is
+	// nothing to be proportional to (an empty file), and omitted from the
+	// JSON so a session written by an older build still reads as Ratio 0.
+	Ratio float64 `json:"ratio,omitempty"`
+	Wrap  bool    `json:"wrap"`
 }
 
 // State is a whole workspace's remembered position.

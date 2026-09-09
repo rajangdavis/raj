@@ -2,12 +2,17 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"raj/internal/control"
 	"raj/internal/editor"
+	"raj/internal/lsp"
 	"raj/internal/piecetable"
 	"raj/internal/search"
 	"raj/internal/ui"
@@ -260,12 +265,32 @@ func (h host) Close(path string) error {
 // Read hands back the document as authored runs, straight off the piece table:
 // Spans already reports an author per run, so this is a projection rather than
 // an analysis.
-func (h host) Read(path string, start, end int) ([]control.Span, uint64, error) {
+func (h host) Read(path string, start, end, lineStart, lineEnd int) ([]control.Span, uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return nil, 0, err
 	}
 	text := p.File.Text()
+	if lineStart > 0 {
+		// A 1-based inclusive line range, translated by the editor's own index
+		// so a driver reads the line a compiler or a search reports without
+		// re-implementing the byte model. A missing lineEnd reads to the end;
+		// a line past the document clamps to the last one.
+		lines := p.File.Lines()
+		first := lineStart - 1
+		if first < 0 {
+			first = 0
+		}
+		if first >= lines {
+			first = lines - 1
+		}
+		start = p.File.LineStart(first)
+		if lineEnd > 0 && lineEnd < lines {
+			end = p.File.LineStart(lineEnd) // exclusive: the start of the next line
+		} else {
+			end = len(text)
+		}
+	}
 	if start < 0 {
 		start, end = 0, len(text)
 	} else {
@@ -324,6 +349,108 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	// and visible, but marked as awaiting a decision. Marked here rather than
 	// in the piece table because only this layer knows which authors are
 	// agents — and a second human's edits must not be marked.
+	if h.isAgent(author) {
+		p.File.Session().MarkGroup(p.File.Session().LastGroup(), piecetable.Proposed)
+	}
+	p.Cursors.Normalize()
+	h.a.Explorer.Tree.MarkChanged(p.File.Path)
+
+	var out []control.Conflict
+	for _, c := range conflicts {
+		out = append(out, control.Conflict{
+			Index: c.Index,
+			At:    uint64(c.At),
+			Hunk:  control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
+		})
+	}
+	return uint64(p.File.Session().Version()), out, nil
+}
+
+// snapshot is a dump's editor-side copy: the text captured, and the version and
+// byte range it was taken at, so a patch can diff old against new and rebase
+// onto whatever the document is now.
+type snapshot struct {
+	author  uint8
+	path    string
+	version uint64
+	start   int
+	end     int
+	text    string
+	hash    string
+}
+
+// snapshotHash is a short, content-derived tag a driver can echo back to verify
+// it edited the text it was handed rather than a stale copy.
+func snapshotHash(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:8])
+}
+
+// Dump captures [start,end) as a snapshot the same writer can patch back. The
+// span is clamped the way read's is: a missing start means the whole file, a
+// missing end reads to the end.
+func (h host) Dump(path string, start, end int, author uint8) (uint64, uint64, string, string, error) {
+	p, err := h.find(path)
+	if err != nil {
+		return 0, 0, "", "", err
+	}
+	text := p.File.Text()
+	if start < 0 {
+		start, end = 0, len(text)
+	} else {
+		if end < 0 || end > len(text) {
+			end = len(text)
+		}
+		if start > len(text) {
+			start = len(text)
+		}
+		if start > end {
+			start = end
+		}
+	}
+	chunk := text[start:end]
+	h.a.snapSeq++
+	id := h.a.snapSeq
+	if h.a.snapshots == nil {
+		h.a.snapshots = make(map[uint64]snapshot)
+	}
+	h.a.snapshots[id] = snapshot{
+		author: author, path: p.File.Path,
+		version: uint64(p.File.Session().Version()),
+		start:   start, end: end, text: chunk, hash: snapshotHash(chunk),
+	}
+	return id, uint64(p.File.Session().Version()), chunk, snapshotHash(chunk), nil
+}
+
+// Patch diffs the snapshot's text against newText and rebases the change onto
+// the current document, so concurrent edits elsewhere in the file are preserved
+// and only the chunk's own change is applied. It refuses a snapshot this writer
+// does not own, or one whose buffer has moved on to a different name.
+func (h host) Patch(path string, author uint8, id uint64, newText string) (uint64, []control.Conflict, error) {
+	snap, ok := h.a.snapshots[id]
+	if !ok || snap.author != author {
+		return 0, nil, fmt.Errorf("no snapshot %d for this writer (snapshots are per-writer and evicted on restart)", id)
+	}
+	p, err := h.find(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	if snap.path != p.File.Path {
+		return 0, nil, fmt.Errorf("snapshot %d is of %s, not %s", id, snap.path, p.File.Path)
+	}
+	diffs := control.DiffLines(snap.text, newText)
+	if len(diffs) == 0 {
+		// The caller returned the text unchanged; there is no change set to
+		// record, and no group to mark.
+		return uint64(p.File.Session().Version()), nil, nil
+	}
+	pt := make([]piecetable.Hunk, 0, len(diffs))
+	for _, d := range diffs {
+		pt = append(pt, piecetable.Hunk{Start: snap.start + d.Start, End: snap.start + d.End, Text: d.Text})
+	}
+	p.File.Begin()
+	conflicts := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(snap.version), pt)
+	p.File.End()
 	if h.isAgent(author) {
 		p.File.Session().MarkGroup(p.File.Session().LastGroup(), piecetable.Proposed)
 	}
@@ -483,4 +610,137 @@ func (h host) Save(path string) (uint64, error) {
 		return 0, err
 	}
 	return uint64(p.File.Session().Version()), nil
+}
+
+// LSP prepares a blocking language-server request for a 1-based line and
+// column. Diagnostics returns the cached state without touching the server; the
+// others sync the document and capture the server connection and position so
+// the request runs off the event thread. A nil caller with a non-nil error is
+// a clean "no server" or "not ready" answer the driver can retry.
+func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, error) {
+	switch mode {
+	case "hover", "definition", "completion", "diagnostics":
+	default:
+		return nil, fmt.Errorf("unknown lsp mode %q (want hover, definition, completion or diagnostics)", mode)
+	}
+	p, err := h.find(path)
+	if err != nil {
+		return nil, err
+	}
+	lpath := h.a.docPath(p)
+	if lpath == "" {
+		return nil, fmt.Errorf("no path for this buffer")
+	}
+	if mode == "diagnostics" {
+		// The cached state, never a request: a diagnostic set is what the server
+		// last published, and the plan's rule is that this mode never blocks.
+		return lspCaller{mode: "diagnostics", diags: h.a.diags.forPath(lpath)}, nil
+	}
+	if line < 1 || col < 1 {
+		return nil, fmt.Errorf("lsp %s needs a 1-based line and column", mode)
+	}
+
+	ls, st := h.a.servers.for_(lpath, func() { h.a.host.Post(ui.Wake{}) })
+	if ls == nil {
+		if msg := st.message(lpath); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, fmt.Errorf("language server not available")
+	}
+	if !h.a.syncDoc(ls, p) {
+		return nil, fmt.Errorf("could not synchronise the document with the server")
+	}
+	conn := ls.srv.Conn()
+	if conn == nil {
+		return nil, fmt.Errorf("language server not ready")
+	}
+	off := p.File.OffsetAt(line-1, col-1)
+	pos := lsp.NewDocument(p.File.Text()).Position(off)
+	return lspCaller{mode: mode, conn: conn, path: lpath, pos: pos}, nil
+}
+
+// lspCaller runs one blocking language-server request off the event thread. It
+// is what host.LSP hands the connection, so a slow server blocks the driver's
+// request, not the editor.
+type lspCaller struct {
+	mode  string
+	conn  *lsp.Conn
+	path  string
+	pos   lsp.Position
+	diags []lsp.Diagnostic
+}
+
+func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
+	var out control.LSPResult
+	switch c.mode {
+	case "diagnostics":
+		out.Diags = make([]control.LSPDiag, 0, len(c.diags))
+		for _, d := range c.diags {
+			out.Diags = append(out.Diags, control.LSPDiag{
+				Line: d.Range.Start.Line + 1, Col: d.Range.Start.Character + 1,
+				Severity: d.Severity, Message: d.Message,
+			})
+		}
+		return json.Marshal(out)
+	case "hover":
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		h, err := lsp.RequestHover(ctx, c.conn, c.path, c.pos)
+		if err != nil {
+			return nil, err
+		}
+		if h != nil {
+			out.Text = h.Text
+		}
+		return json.Marshal(out)
+	case "definition":
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		locs, err := lsp.RequestDefinition(ctx, c.conn, c.path, c.pos)
+		if err != nil {
+			return nil, err
+		}
+		out.Locations = make([]control.LSPLocation, 0, len(locs))
+		for _, l := range locs {
+			out.Locations = append(out.Locations, control.LSPLocation{
+				Path: l.Path, Line: l.Range.Start.Line + 1, Col: l.Range.Start.Character + 1,
+			})
+		}
+		return json.Marshal(out)
+	case "completion":
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		items, _, err := lsp.Completions(ctx, c.conn, c.path, c.pos)
+		if err != nil {
+			return nil, err
+		}
+		out.Items = make([]control.LSPItem, 0, len(items))
+		for _, it := range items {
+			out.Items = append(out.Items, control.LSPItem{
+				Label: it.Label, Detail: it.Detail, Kind: completionKindName(it.Kind),
+			})
+		}
+		return json.Marshal(out)
+	}
+	return nil, fmt.Errorf("unknown lsp mode %q", c.mode)
+}
+
+// completionKindName folds the protocol's kind number down to the handful a
+// driver would switch on.
+func completionKindName(k int) string {
+	switch k {
+	case lsp.KindMethod:
+		return "method"
+	case lsp.KindFunction:
+		return "function"
+	case lsp.KindField:
+		return "field"
+	case lsp.KindVariable:
+		return "variable"
+	case lsp.KindKeyword:
+		return "keyword"
+	case lsp.KindSnippet:
+		return "snippet"
+	}
+	return ""
 }

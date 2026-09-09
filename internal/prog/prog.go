@@ -96,6 +96,8 @@ const (
 	OpExclude = 0x0c // comma-separated globs a search skips
 	OpLine    = 0x0d // varint: 1-based line for goto
 	OpCol     = 0x0e // varint: 1-based column for goto
+	OpDumpID  = 0x0f // varint: a snapshot id from a prior dump, for patch
+	OpLSPMode = 0x10 // string: hover, definition, completion or diagnostics
 
 	// verbs (0x80–0xff) are the driver verbs, refused when unknown
 	OpPing    = 0x80
@@ -113,6 +115,9 @@ const (
 	OpStats   = 0x8c
 	OpGoto    = 0x8d // move the cursor to a line and column
 	OpClose   = 0x8e // close a buffer; unsaved work is refused
+	OpDump    = 0x8f // capture a named snapshot of a span, for later patch
+	OpPatch   = 0x90 // replace a snapshot's text; the editor diffs and rebases
+	OpLSP     = 0x91 // ask the language server: hover, definition, completion, diagnostics
 
 )
 
@@ -139,6 +144,8 @@ var names = map[byte]string{
 	OpGroups: "groups", OpAccept: "accept", OpReject: "reject", OpReload: "reload",
 	OpStats: "stats",
 	OpGoto:  "goto", OpClose: "close", OpLine: "line", OpCol: "col",
+	OpDumpID: "dump-id", OpDump: "dump", OpPatch: "patch",
+	OpLSPMode: "lsp-mode", OpLSP: "lsp",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

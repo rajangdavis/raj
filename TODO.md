@@ -158,15 +158,15 @@ findings and decisions live in INVESTIGATIONS.md.
 ~~The session is written only on a clean exit~~ — it is now also written from
   the idle tick, debounced to three seconds, and touched whenever a tab opens or
   closes. A crash loses seconds rather than the session.
-- [ ] **Scroll is restored as a line number, not a proportion.** Reopening in a
-  differently sized terminal clamps rather than adapts, so the cursor can land
-  off screen until the first movement.
-  Planned (Stream C): `session.Tab` gains `Ratio float64`
-  (`json:"ratio,omitempty"`); the save side records `Top/Lines()` while still
-  writing `Top` for old-session compat, and restore uses `Ratio` when > 0 —
-  the pane's first-resize clamp bounds it, and `validate` keeps clamping plain
-  `Top` for legacy JSON. Tests: same size, resized larger, empty file
-  (ratio 0), legacy JSON without `ratio`.
+- ~~**Scroll is restored as a line number, not a proportion.**~~ Implemented
+  (Stream C): `session.Tab` gains `Ratio float64` (`json:"ratio,omitempty"`);
+  the save side records `Top/Lines()` via `scrollRatio` in `app/session.go`
+  while still writing `Top` for old-session compat, and restore uses `Ratio`
+  when > 0, computed against the just-opened buffer and clamped to its last
+  line — the pane's first-resize clamp bounds it too, and `validate` keeps
+  clamping plain `Top` for legacy JSON. Tests: same size, resized larger,
+  empty file (ratio 0), legacy JSON without `ratio`. Host-side verification
+  pending: `go test ./internal/session/ ./internal/app/`.
 - [ ] **Dirty-buffer restore** — persist the journal and add-buffers, validated
   by an orig-hash per buffer.
 - [ ] **Attribution across restarts** — tint is commit-scoped, so it must
@@ -271,17 +271,15 @@ is the transport and the rules around it.
   be collapsed because the transport package has no editor types to reach for,
   and the Stream D additions ride the same eight layers. What remains:
 
-- [ ] **`search` reports line:col, never byte offsets.** A driver turning a
-  line back into bytes re-implements the editor's byte model outside it — the
-  step that drifts first (UTF-16 vs bytes, multi-byte characters) when the
-  editor already knows both. Have `search -json` include `byteStart`/`byteEnd`
-  per hit so "locate an anchor, then `apply` at its offset" is one pipeline of
-  editor-computed coordinates.
-- [ ] **`read` returns only the whole buffer.** A driver verifying the seam
-  after an `apply` needs a byte range, not the whole file to re-slice.
-  `raj ctl read [path] -start N -end N` returning one span closes that, and
-  `edit` reporting the span it replaced would let a follow-up `apply` build on
-  the same coordinates.
+- ~~**`search` reports line:col, never byte offsets.**~~ Done and verified:
+  `search -json` now reports `byteStart`/`byteEnd` per hit, so "locate an
+  anchor, then `apply` at its offset" is one pipeline of editor-computed
+  coordinates and a driver no longer re-implements the byte model outside the
+  editor.
+- ~~**`read` returns only the whole buffer.**~~ `raj ctl read [path] -start N -end N`
+  is done and verified, so a driver can check a splice seam without re-slicing
+  the whole file. The other half of the bullet — `edit` reporting the span it
+  replaced — is still open, tracked by "A hunk lands unverified" below.
 - [ ] **A `find` step in the opcode pipeline.** `run -prog` cannot ask "where
   is this text" and get an offset back in the same program, so a batched driver
   round (find → read → apply) is several round trips today. A `find` op
@@ -440,15 +438,12 @@ missing is addressing and state.
   or two repositories mounted under one parent. `RAJ_ROOT_MAP` is the escape
   hatch; a real answer would ask the editor to resolve paths relative to its
   root and stop sending absolute ones at all.
-- [ ] **`raj ctl search` include/exclude globs match the basename, not the
-  path.** `-include 'internal/tabs/*.go'` and `'app/*.go'` match nothing where
-  `-include '*.go'` matches everything, so a search cannot be scoped to a
-  package — the single most useful fix for an agent driving the editor. Feed
-  `matches()` the relative path instead of `filepath.Base` at both sites — the
-  walk filter and the open-doc eligibility check; `filepath.Match`'s `*`
-  crosses separators, so `*.go` keeps matching, and the `plainExt` fast path
-  is unchanged. The pane and the socket share the engine, so one fix covers
-  both. (Stream B)
+- ~~**`raj ctl search` include/exclude globs match the basename, not the
+  path.**~~ Done and verified: `matches()` now receives the relative path from
+  `filepath.Rel(root, path)` at both sites — the walk filter and the open-doc
+  eligibility check; `filepath.Match`'s `*` crosses separators, so `*.go`
+  keeps matching, and the `plainExt` fast path is unchanged.
+  `TestRunGlobsMatchPath` covers it. (Stream B)
 - [ ] **`exec` over TCP is refused, not sandboxed.** The refusal is correct —
   the command would run on the editor's machine, outside the container the
   driver was put in — and it costs the staleness check, which is the one thing
@@ -541,6 +536,69 @@ missing is addressing and state.
 - [ ] No Bubbletea adapter yet. The `ui.Host` interface is six methods.
 - [ ] `cmd+shift+r` to reopen closed tabs, handing `cmd+shift+t` back — only
   worth doing if Ghostty actually binds it; check `+list-keybinds` first.
+
+## Notes from driving `raj ctl` as an agent
+
+One session's worth of friction, recorded where the next driver will find it.
+Each item is cheap relative to what it cost to work around.
+
+- **Version skew between host binary and container CLI is invisible.** The
+  running editor predated `read -start/-end` in its own source: the request
+  fields were silently ignored and the whole buffer came back, with no hint
+  that anything had been dropped. Two things would have caught it in one
+  round trip: `whoami -json` (or an `about` verb) reporting a build version
+  or commit the driver can compare against the source tree it sees, and a
+  `-strict` mode where a request carrying fields the server does not know is
+  refused rather than served degraded. Decode-silently-ignores is the right
+  default for forward compatibility; an opt-in refusal is the mode an agent
+  wants, because its workaround for a missing feature is always worse than
+  the error.
+- **No way to read a line range.** `read -start/-end` covers bytes, but an
+  agent holding a line number from a compiler or a search hit still pipes the
+  full text through host shell tools. A `read -lines A,B` flag removes the
+  last reason to reach past the buffer.
+- ~~**No way to learn a document's length without reading it.**~~ `version -json`
+  now returns bytes and lines alongside the version, so sizing an apply span or
+  finding the end of a file is one cheap call on the buffer you already have.
+  The `stats [path]` alternative is unnecessary. Host-side verification
+  pending: `go test ./internal/control/`.
+- **`edit`'s refusal does not quote what it saw.** "does not appear in the
+  buffer" against a 40-line `-old` leaves the driver diffing blind.
+  Reporting the longest common prefix of the miss (or the offset of the
+  nearest match) would turn the retry into a targeted fix instead of a
+  re-read of the whole file.
+- **A streamed search cannot be consumed incrementally as JSON.** Batches
+  are suppressed until the end so the document stays parseable — right for
+  correctness, but a driver wanting early hits gets nothing for the whole
+  walk. An NDJSON mode (`-jsonl`, one object per line) keeps both halves.
+- **A driver cannot ask for its own outstanding proposals.** `groups` lists
+  every change set in the buffer; filtering by author is client-side and the
+  client has to already know its id. `groups -mine`, matched against the
+  connection's own author id, is the common case.
+- **Container ergonomics: no shared filesystem means stale-file checks are
+  manual.** `exec` is correctly refused over TCP, but then nothing warns the
+  driver that the bytes it is about to compile in its own sandbox do not
+  match the buffers. `buffers -json` answers it with a second round trip;
+  what is missing is the prompt to make one. A client-side flag (`exec
+  -warn-stale`, refusing locally if any buffer is dirty) would move the
+  check into the driver's own sandbox where it belongs.
+- **Path mapping is applied inconsistently across verbs.** After an editor
+  restart with `RAJ_ROOT_MAP=/work=/Users/.../raj` in force, `buffers`
+  reported `/work/TODO.md` and `open`/`version` accepted it, but `read
+  /work/TODO.md` answered "no open buffer for that path" while `read
+  /Users/.../raj/TODO.md` succeeded — the same string the editor itself had
+  just reported. The `text` op resolves the path without translating it,
+  where `open` translates first; a driver should never see the editor's
+  internal paths at all, and the ones it is handed should round-trip through
+  every verb.
+- **An editor restart orphans the driver's read-before-write state.** The
+  rebuilt editor kept the buffers open but reset every version to 0, so a
+  driver holding offsets from before the restart has coordinates against a
+  document that no longer exists. That is correct — anything else would be
+  worse — but nothing says so. A connection-scoped "editor restarted" marker
+  (a generation counter on `whoami`, bumped per listen) would let a driver
+  bin its cached versions instead of discovering staleness one refused
+  apply at a time.
 
 ## Deliberately not doing
 

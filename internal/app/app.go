@@ -144,6 +144,13 @@ type App struct {
 	// guard is the validation chokepoint in front of the buffer host. One per
 	// app, so read-before-write is remembered across requests.
 	guard *control.Guard
+
+	// snapshots holds dump results keyed by id, and snapSeq mints the ids. They
+	// are per-author (Patch checks the writer owns the id), and the map lives
+	// only for the process, so a restart evicts them — a patch by id never
+	// crosses a restart.
+	snapshots map[uint64]snapshot
+	snapSeq   uint64
 }
 
 // New builds an application rooted at a directory.

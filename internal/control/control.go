@@ -83,6 +83,17 @@ type Request struct {
 	// file; a missing End (but present Start) reads to the end.
 	Start *int
 	End   *int
+	// LineStart and LineEnd select a read by 1-based inclusive line numbers
+	// instead of bytes, for the line a compiler or a search reports. Nil means
+	// the byte span decides; the host translates lines to bytes so a driver
+	// never re-implements the editor's byte model.
+	LineStart *int
+	LineEnd   *int
+
+	// LSPMode is the sub-operation of an lsp request: hover, definition,
+	// completion or diagnostics. Line and Col name the position to ask about
+	// (1-based), which the host maps to the server's UTF-16 coordinates.
+	LSPMode string
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
@@ -90,6 +101,12 @@ type Request struct {
 	Name     string
 	// Group addresses a change set for accept and reject.
 	Group uint64
+	// DumpID addresses a snapshot for patch: the id a prior dump returned.
+	// PatchText is the whole edited text the caller hands back, which the
+	// editor diffs against the snapshot and rebases onto the current document,
+	// so a driver never re-derives offsets from old text.
+	DumpID    uint64
+	PatchText string
 	// Argv is the command for exec, and Dir the directory to run it in.
 	Argv []string
 	Dir  string
@@ -206,21 +223,74 @@ type Conflict struct {
 	Hunk  Hunk   `json:"hunk"`
 }
 
+// LSPResult is one language-server answer, exactly one field set per mode. Its
+// JSON tags matter: the CLI marshals it straight to a driver, so the field
+// names are the protocol a script reads.
+type LSPResult struct {
+	Text      string        `json:"text,omitempty"`      // hover
+	Locations []LSPLocation `json:"locations,omitempty"` // definition
+	Items     []LSPItem     `json:"items,omitempty"`     // completion
+	Diags     []LSPDiag     `json:"diagnostics,omitempty"`
+}
+
+// LSPLocation is a file and a 1-based line and column — the editor's own
+// coordinates rather than the server's UTF-16 ones.
+type LSPLocation struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Col  int    `json:"col"`
+}
+
+// LSPItem is one completion suggestion.
+type LSPItem struct {
+	Label  string `json:"label"`
+	Detail string `json:"detail,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+}
+
+// LSPDiag is one problem in a file.
+type LSPDiag struct {
+	Line     int    `json:"line"`
+	Col      int    `json:"col"`
+	Severity int    `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// LSPCaller runs one blocking language-server request. The editor hands one
+// back after it has synced the document and located the server — both
+// event-thread operations — and the caller runs on the connection's goroutine,
+// off the event thread, so a slow server never stalls the editor. It never
+// crosses the wire, like Searcher.
+type LSPCaller interface {
+	// Run performs the request and returns the JSON-encoded LSPResult. May
+	// block for the server's answer.
+	Run(ctx context.Context) (json []byte, err error)
+}
+
 // Response is one line out. Err is a string rather than a code because the
 // consumer is a human at a socket at least as often as it is a program.
 type Response struct {
-	ID        int
-	OK        bool
-	Err       string
-	Root      string
-	PID       int
-	Buffers   []Buffer
-	Matches   []SearchMatch
-	Files     int
-	Capped    bool
-	Spans     []Span
-	Version   uint64
+	ID      int
+	OK      bool
+	Err     string
+	Root    string
+	PID     int
+	Buffers []Buffer
+	Matches []SearchMatch
+	Files   int
+	Capped  bool
+	Spans   []Span
+	Version uint64
+	// Bytes and Lines describe the buffer a version answers for, so a driver
+	// can size an apply span or find the end of a file without a read.
+	Bytes     int
+	Lines     int
 	Conflicts []Conflict
+	// DumpID is the snapshot id a dump returned, and Hash the hash of the
+	// snapshot's text, so a caller can verify the bytes it holds before editing
+	// them and name them back to a patch.
+	DumpID uint64
+	Hash   string
 	// Author is the id the editor assigned this connection. It rides on every
 	// response, not just a handshake, because a client that reconnects or is
 	// restarted mid-session would otherwise be holding a stale one — and an
@@ -248,6 +318,12 @@ type Response struct {
 	// Final marks the last frame of a response. Callers that do not stream can
 	// ignore it; Client.Do reads until it is set.
 	Final bool
+
+	// LSPJSON is the JSON-encoded answer an lsp request returns, and LSP is the
+	// blocking caller the internal "lspprep" op hands the connection so the
+	// request can run off the event thread. LSP never crosses the wire.
+	LSPJSON string
+	LSP     LSPCaller
 }
 
 // Text flattens the spans, for callers that do not care who wrote what.
@@ -659,6 +735,9 @@ func (c *connection) one(req Request, emit func(Response)) {
 	case "recv":
 		c.recv(req, emit)
 		return
+	case "lsp":
+		c.lsp(req, emit)
+		return
 	}
 	res := c.srv.submit(req)
 	res.Final = true
@@ -769,6 +848,41 @@ func (c *connection) exec(req Request, emit func(Response)) {
 		final.OK = false
 	}
 	emit(final)
+}
+
+// lsp asks the language server. Two phases, like search: the event thread syncs
+// the document and locates the server, handing back a blocking caller, and the
+// request then runs here, off it. Diagnostics never blocks the server — the
+// caller already carries the cached state, so its Run returns without asking.
+func (c *connection) lsp(req Request, emit func(Response)) {
+	prep := c.srv.submit(Request{ID: req.ID, Op: "lspprep", Path: req.Path,
+		Line: req.Line, Col: req.Col, LSPMode: req.LSPMode})
+	if prep.Err != "" {
+		emit(Response{ID: req.ID, Err: prep.Err, Final: true})
+		return
+	}
+	if prep.LSP == nil {
+		emit(Response{ID: req.ID, Err: "no language server for this file type", Final: true})
+		return
+	}
+
+	ctx, stop := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.running[req.ID] = stop
+	c.mu.Unlock()
+	defer func() {
+		stop()
+		c.mu.Lock()
+		delete(c.running, req.ID)
+		c.mu.Unlock()
+	}()
+
+	data, err := prep.LSP.Run(ctx)
+	if err != nil {
+		emit(Response{ID: req.ID, Err: err.Error(), Final: true})
+		return
+	}
+	emit(Response{ID: req.ID, OK: true, LSPJSON: string(data), Final: true})
 }
 
 // search is the streaming path, and the only op that leaves the event thread.

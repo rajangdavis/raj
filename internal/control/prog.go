@@ -34,6 +34,9 @@ var knownOps = map[byte]bool{
 	prog.OpGroups: true, prog.OpAccept: true, prog.OpReject: true,
 	prog.OpSearch: true, prog.OpStats: true,
 	prog.OpGoto: true, prog.OpClose: true,
+	prog.OpDump: true, prog.OpPatch: true,
+	prog.OpDumpID: true,
+	prog.OpLSP:    true, prog.OpLSPMode: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -47,6 +50,8 @@ var verbNames = map[byte]string{
 	prog.OpAccept: "accept", prog.OpReject: "reject",
 	prog.OpSearch: "search", prog.OpStats: "stats",
 	prog.OpGoto: "goto", prog.OpClose: "close",
+	prog.OpDump: "dump", prog.OpPatch: "patch",
+	prog.OpLSP: "lsp",
 }
 
 // Four verbs stay out of programs, and the reasons are different enough to be
@@ -102,8 +107,24 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			}
 			req := pending
 			req.Op = name
-			if hunk != nil {
-				req.Hunks = []Hunk{*hunk}
+			switch name {
+			case "dump":
+				// A span selects the chunk to snapshot; no text rides the
+				// request, the chunk comes back in the reply.
+				if hunk != nil {
+					s, e := hunk.Start, hunk.End
+					req.Start, req.End = &s, &e
+				}
+			case "patch":
+				// The text op carries the whole edited chunk; the id op names
+				// the snapshot to replace.
+				if hunk != nil {
+					req.PatchText = hunk.Text
+				}
+			default:
+				if hunk != nil {
+					req.Hunks = []Hunk{*hunk}
+				}
 			}
 			out = append(out, req)
 			// Reset everything the verb consumed; keep what describes the
@@ -133,6 +154,10 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			pending.Token = sticky.Token
 		case prog.OpGroup:
 			pending.Group = uint64(prog.ReadNumber(op.Payload))
+		case prog.OpDumpID:
+			pending.DumpID = uint64(prog.ReadNumber(op.Payload))
+		case prog.OpLSPMode:
+			pending.LSPMode = string(op.Payload)
 		case prog.OpLine:
 			pending.Line = prog.ReadNumber(op.Payload)
 		case prog.OpCol:
