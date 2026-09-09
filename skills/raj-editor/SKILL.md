@@ -479,6 +479,11 @@ range, not the text.
 The two verbs that make offsets unnecessary in the common case are `raj ctl
 edit -old S -new S`, the exact-string replacement, and `raj ctl search -q
 PATTERN`, which locates text in the editor's own coordinates. Use them first.
+
+For the search path, `raj ctl search -q PATTERN -json` now reports
+`byte_start` and `byte_end` per hit, so an agent can turn a search result
+directly into an `apply` span without recomputing offsets itself.
+
 Only a structural hunk — a whole function, a comment block — genuinely wants
 `apply`, and then the offsets are measured against the bytes the `read`
 returned; deriving them is left to the driver, out of scope for this skill.
@@ -578,3 +583,46 @@ When the repo lives only on the editor's machine, nothing in the container can
 compile. The contract is: proposals in the buffers, the user accepts and saves,
 and `gofmt -w && go test ./... && make check` run on the host is the
 verification step. State that contract out loud every session that hits it.
+
+### Revealing the agent's edits to the user
+
+After an agent applies a hunk, the human is left to find it themselves. The
+buffer shows the change tinted, but the editor's viewport does not jump to it,
+and the user may be looking at an unrelated part of the file.
+
+`raj ctl goto <path> LINE[:COL]` already moves the editor's cursor; an agent
+that knows the line it edited can jump the user there immediately after the
+apply. What is missing is a way to reveal a *span* or to make the jump automatic:
+either `raj ctl reveal <path> -start N -end N`, or an option on `apply`/`edit`
+that returns or jumps to the affected line, would make reviewing agent changes
+feel direct rather than archaeological.
+
+This matters most when the agent is making several small edits across a large
+file: without a reveal step, each change set is invisible until the user
+remembers to search for it. The span is already known to the editor when the
+hunk lands, so the transport cost is small.
+
+### Prefer raj ctl verbs over container tools
+
+A locked-down container will not have `sed`, `head`, `tail`, `grep`, `awk`, or
+`cat` available, and an agent that relies on them will stop working the moment
+the image is hardened. Every file inspection should go through a native raj ctl
+verb, and when one is missing the right move is to propose it rather than to
+reach for a shell workaround.
+
+Concrete gaps today:
+
+- **Reading a line range.** `raj ctl read` returns the whole buffer. To inspect a
+  known region, agents pipe it through `sed -n` or `head -n | tail -n`. A
+  `read -line N` or `read -lines START,END` flag would remove that dependency.
+  (Byte-range `read -start/-end` is on the TODO list for a different use case.)
+- **Counting bytes or lines.** `wc -c` and `wc -l` are used to size apply spans
+  or find the end of a file. A `raj ctl stats` per-file mode, or returning the
+  buffer length and line count in `read -json`, would cover it.
+- **Pretty-printing JSON.** `jq` is the usual suspect. `raj ctl ... -json` is
+  already the answer for machine-readable output; the agent should consume that
+  directly.
+
+Rule of thumb: if an agent command contains a pipe to anything other than
+`raj ctl`, it is a candidate for a new flag or verb. Document the gap and keep
+the container surface small.

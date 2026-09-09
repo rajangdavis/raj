@@ -456,3 +456,61 @@ Three stacked causes, all in `Present`:
   disambiguate shared base names; workspace root walks up to the nearest .git;
   syntax uses the bright half of the palette.
 
+
+## Agent/raj ctl usage feedback (2026-09-09)
+
+Notes from an agent driving raj through the control socket, with an eye on
+what makes the tool intuitive and where it fights back.
+
+- **Path mapping over TCP is transparent once you trust it.** `raj ctl buffers`
+  reports `/work/...` because that is the caller-side root, while the editor
+  itself holds `/Users/.../projects/raj/...`. The translation works, but the
+  first few commands feel like they are addressing a different filesystem. A
+  note at startup or in the first `buffers` output would save the "is this the
+  right file?" hesitation.
+- **Closed files cannot be read without opening them first.** `raj ctl search`
+  happily inspects any file in the workspace, but `raj ctl read` refuses a path
+  that is not already an open buffer. The fix is `raj ctl open`, which also
+  surfaces the file in the editor — a deliberate coupling, but surprising
+  when you come from tools where search and read have the same reach.
+- **`-include`/`-exclude` globs match basenames, which is the wrong default
+  for an agent.** Scoping a search to one package (`-include "internal/tabs/*.go"`)
+  silently returns nothing; the only pattern that works is a file extension.
+  This is explicitly the TODO item being fixed this session, and it is the
+  single biggest friction point so far.
+- **There is no `-path`/`-dir` flag for search.** When you only want hits in one
+  directory, the only lever is include/exclude globs, and because they are
+  basename-only today that lever does not exist. A `-dir` flag would be simpler
+  than path globbing for the common "search under X" case.
+- **Error messages are good.** "no open buffer for that path" and the refusal
+  reasons in the skill doc are concrete enough to recover from without guessing.
+- **Byte offsets in `apply` are powerful but unforgiving.** They are the right
+  seam for structural edits, but every hunk needs a fresh `read` and a `-base`
+  version, which makes multi-file changes verbose. `raj ctl run -prog` is the
+  intended batching answer; learning its opcode encoding is the next hill.
+- **`search -json` now carries byte offsets.** Implemented during this session:
+  `Match` gained `ByteStart`/`ByteEnd`, set in both the fast scanner and the
+  non-ASCII fallback, threaded through `control.SearchMatch` and the wire
+  `MatchMeta`, and emitted by `raj ctl search -json`. A driver can now turn a
+  hit directly into an `apply` span without recomputing line:col itself.
+- **`raj ctl read` has no range.** Reading a whole buffer to verify one splice is
+  wasteful; a `-start`/`-end` span would let a driver read the seam it just
+  wrote. Also on the TODO list.
+
+- **Multi-line `raj ctl edit` is fragile through shell quoting.** Passing long
+  `-old`/`-new` strings on the command line failed on the first attempt;
+  `-old-file` / `-new-file` with heredocs was reliable. If an agent harness is
+  generating edits, writing them to temp files and referencing by path is the
+  practical path.
+- **Every `raj ctl apply` bumps the version.** The first edit landed at version
+  1, the next at 2, and so on. For sequential edits to the same file, either
+  batch them with `run -prog` or use `edit` (string replacement) which does not
+  require a `-base`. For structural edits that need offsets, re-reading between
+  hunks is the safe pattern.
+- **`raj ctl open` is required before `read` or `apply`.** Search can inspect any
+  file, but reading and editing need an explicit open. That makes sense for a
+  UI editor, but for an agent it is an extra round trip per file.
+- **Line-range reading wants a native flag.** To inspect a specific region I
+  repeatedly piped `raj ctl read` through `sed -n`. A locked-down container
+  will not have `sed`; `raj ctl read -line N` or `-lines START,END` would remove
+  the dependency entirely and is a better fit for an agent than byte offsets.

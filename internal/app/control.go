@@ -386,7 +386,8 @@ func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 		out := make([]control.SearchMatch, 0, len(batch))
 		for _, m := range batch {
 			out = append(out, control.SearchMatch{
-				Path: m.Path, Line: m.Line, Col: m.Col, Len: m.Len, Text: m.Text})
+				Path: m.Path, Line: m.Line, Col: m.Col, Len: m.Len,
+				ByteStart: m.ByteStart, ByteEnd: m.ByteEnd, Text: m.Text})
 		}
 		emit(out)
 	})

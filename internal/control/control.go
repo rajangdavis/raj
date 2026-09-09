@@ -146,11 +146,13 @@ type SearchQuery struct {
 
 // SearchMatch is one hit. Text is the whole line it was found on.
 type SearchMatch struct {
-	Path string
-	Line int // 1-based
-	Col  int // byte offset of the match within Text
-	Len  int
-	Text string
+	Path      string
+	Line      int // 1-based
+	Col       int // byte offset of the match within Text
+	Len       int
+	ByteStart int // byte offset of the match within the file
+	ByteEnd   int // one past the last byte of the match within the file
+	Text      string
 }
 
 // Span is one authored run of the document. Reads come back as spans rather

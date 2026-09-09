@@ -97,6 +97,36 @@ func TestRunGlobs(t *testing.T) {
 	}
 }
 
+// Path-scoped globs match relative to the search root, not just the filename.
+func TestRunGlobsMatchPath(t *testing.T) {
+	dir := fixture(t)
+	got := Run(dir, Query{Text: "needle", Include: "sub/*.go"})
+	if len(got.Matches) != 1 || !strings.HasSuffix(got.Matches[0].Path, "sub/c.go") {
+		t.Errorf("include sub/*.go gave %v", got.Matches)
+	}
+	exc := Run(dir, Query{Text: "needle", Exclude: "sub/*.go"})
+	for _, m := range exc.Matches {
+		if strings.HasSuffix(m.Path, "sub/c.go") {
+			t.Errorf("exclude sub/*.go let %s through", m.Path)
+		}
+	}
+	// A bare extension glob still reaches files in subdirectories because it
+	// is answered by the extension, not by the glob matcher.
+	allGo := Run(dir, Query{Text: "needle", Include: "*.go"})
+	want := map[string]bool{"a.go": true, "sub/c.go": true}
+	gotNames := map[string]bool{}
+	for _, m := range allGo.Matches {
+		for base := range want {
+			if strings.HasSuffix(m.Path, base) {
+				gotNames[base] = true
+			}
+		}
+	}
+	if len(gotNames) != len(want) {
+		t.Errorf("*.go matched %v, want both %v", gotNames, want)
+	}
+}
+
 func TestRunWholeWord(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "x.txt"), []byte("needles\nneedle\n"), 0o644)
@@ -115,6 +145,27 @@ func TestRunReportsMatchColumn(t *testing.T) {
 	}
 	if m := res.Matches[0]; m.Col != 3 || m.Len != 6 {
 		t.Errorf("col=%d len=%d, want 3 and 6", m.Col, m.Len)
+	}
+}
+
+// Byte offsets count from the start of the file, not the start of the line.
+func TestRunReportsMatchByteOffsets(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "x.txt"), []byte("line one\nneedle here\nline three\n"), 0o644)
+	res := Run(dir, Query{Text: "needle"})
+	if len(res.Matches) != 1 {
+		t.Fatalf("got %d matches", len(res.Matches))
+	}
+	m := res.Matches[0]
+	if m.Line != 2 {
+		t.Errorf("line=%d, want 2", m.Line)
+	}
+	if m.Col != 0 || m.Len != 6 {
+		t.Errorf("col=%d len=%d, want 0 and 6", m.Col, m.Len)
+	}
+	// "line one\n" is 9 bytes; line 2 starts at byte 9.
+	if m.ByteStart != 9 || m.ByteEnd != 15 {
+		t.Errorf("byte_start=%d byte_end=%d, want 9 and 15", m.ByteStart, m.ByteEnd)
 	}
 }
 

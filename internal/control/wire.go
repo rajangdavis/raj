@@ -168,11 +168,13 @@ type HunkMeta struct {
 
 // MatchMeta is a search hit with its path and line text moved to the body.
 type MatchMeta struct {
-	Line    int `json:"line"`
-	Col     int `json:"col"`
-	Len     int `json:"len"`
-	PathLen int `json:"path_len"`
-	TextLen int `json:"text_len"`
+	Line      int `json:"line"`
+	Col       int `json:"col"`
+	Len       int `json:"len"`
+	PathLen   int `json:"path_len"`
+	TextLen   int `json:"text_len"`
+	ByteStart int `json:"byte_start"`
+	ByteEnd   int `json:"byte_end"`
 }
 
 // SpanMeta is one authored run of the document.
@@ -360,7 +362,8 @@ func EncodeResponse(res Response) (Header, []byte) {
 	}
 	for _, m := range res.Matches {
 		h.Matches = append(h.Matches, MatchMeta{Line: m.Line, Col: m.Col, Len: m.Len,
-			PathLen: len(m.Path), TextLen: len(m.Text)})
+			PathLen: len(m.Path), TextLen: len(m.Text),
+			ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
 		body = append(body, m.Path...)
 		body = append(body, m.Text...)
 	}
@@ -402,7 +405,8 @@ func DecodeResponse(f Frame) (Response, error) {
 	for i, m := range f.Header.Matches {
 		res.Matches = append(res.Matches, SearchMatch{
 			Path: string(runs[outRuns+2*i]), Text: string(runs[outRuns+2*i+1]),
-			Line: m.Line, Col: m.Col, Len: m.Len})
+			Line: m.Line, Col: m.Col, Len: m.Len,
+			ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
 	}
 	for i, m := range f.Header.Spans {
 		res.Spans = append(res.Spans, Span{Text: string(runs[matchRuns+i]), Author: m.Author})

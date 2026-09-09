@@ -274,7 +274,8 @@ func encodeHeader(h Header) []byte {
 	if len(h.Matches) > 0 {
 		var w prog.Writer
 		for _, m := range h.Matches {
-			w.Num(m.Line).Num(m.Col).Num(m.Len).Num(m.PathLen).Num(m.TextLen)
+			w.Num(m.Line).Num(m.Col).Num(m.Len).Num(m.PathLen).Num(m.TextLen).
+				Num(m.ByteStart).Num(m.ByteEnd)
 		}
 		ops = append(ops, Op8{hMatches, w.Done()})
 	}
@@ -441,7 +442,8 @@ func decodeHeader(b []byte) (Header, error) {
 			for r.More() {
 				h.Matches = append(h.Matches, MatchMeta{
 					Line: r.Num(), Col: r.Num(), Len: r.Num(),
-					PathLen: r.Num(), TextLen: r.Num()})
+					PathLen: r.Num(), TextLen: r.Num(),
+					ByteStart: r.Num(), ByteEnd: r.Num()})
 			}
 		case hConflicts:
 			r := prog.NewReader(op.Payload)

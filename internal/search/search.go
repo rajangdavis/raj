@@ -17,11 +17,13 @@ import (
 
 // Match is one hit.
 type Match struct {
-	Path string
-	Line int    // 1-based
-	Text string // the whole line, trimmed of trailing space
-	Col  int    // byte offset of the match within Text
-	Len  int
+	Path      string
+	Line      int    // 1-based
+	Text      string // the whole line, trimmed of trailing space
+	Col       int    // byte offset of the match within Text
+	Len       int
+	ByteStart int // byte offset of the match within the file
+	ByteEnd   int // one past the last byte of the match within the file
 }
 
 // Query describes a search.
@@ -210,7 +212,11 @@ func RunStream(ctx context.Context, root string, q Query, open Docs, emit func([
 			}
 			return nil
 		}
-		if hide.HiddenPath(root, path, false) || !matches(name, inc, true) || matches(name, exc, false) {
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		if hide.HiddenPath(root, path, false) || !matches(rel, inc, true) || matches(rel, exc, false) {
 			return nil
 		}
 		// Before Info() and before the open: the whole point is to skip the
@@ -312,8 +318,7 @@ func eligible(root, path string, inc, exc []string, hide *hidden.Rules) bool {
 			return false
 		}
 	}
-	name := filepath.Base(path)
-	return matches(name, inc, true) && !matches(name, exc, false)
+	return matches(rel, inc, true) && !matches(rel, exc, false)
 }
 
 // forceRegexp disables the literal fast path. It exists so the benchmarks can
@@ -414,6 +419,7 @@ func scanData(path string, data []byte, m matcher, res *Result) (found, total in
 				Path: path, Line: line,
 				Text: strings.TrimRight(string(text), " \t"),
 				Col:  start - lineStart, Len: end - start,
+				ByteStart: start, ByteEnd: end,
 			})
 			found++
 		}
@@ -475,6 +481,7 @@ func scanLines(path string, m matcher, data []byte, res *Result) (found, total i
 					Path: path, Line: line,
 					Text: strings.TrimRight(string(raw), " \t"),
 					Col:  start, Len: stop - start,
+					ByteStart: off + start, ByteEnd: off + stop,
 				})
 				found++
 			}
@@ -499,25 +506,25 @@ func globs(spec string) []string {
 	return out
 }
 
-// matches tests a filename against a glob list. An empty list means "no
+// matches tests a path against a glob list. An empty list means "no
 // constraint", which is why the caller passes what an empty list should mean.
 //
 // Patterns of the form *.ext — which is almost all of them in practice — are
 // answered by comparing the extension rather than by running the glob matcher.
 // filepath.Match costs more than the read it is meant to avoid: on ghostty,
 // eight exclude patterns turned a 62 ms search into a 107 ms one.
-func matches(name string, patterns []string, emptyResult bool) bool {
+func matches(path string, patterns []string, emptyResult bool) bool {
 	if len(patterns) == 0 {
 		return emptyResult
 	}
 	for _, p := range patterns {
 		if ext, ok := plainExt(p); ok {
-			if strings.EqualFold(filepath.Ext(name), ext) {
+			if strings.EqualFold(filepath.Ext(path), ext) {
 				return true
 			}
 			continue
 		}
-		if ok, _ := filepath.Match(p, name); ok {
+		if ok, _ := filepath.Match(p, path); ok {
 			return true
 		}
 	}
