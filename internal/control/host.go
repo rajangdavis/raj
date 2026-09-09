@@ -68,7 +68,11 @@ type BufferHost interface {
 	// which are the user's, and which belong to another agent — for free, in
 	// the shape the store already holds. That is what the exec dirty-state
 	// policy needs, and what stops an agent reverting text a human just typed.
-	Read(path string) (spans []Span, version uint64, err error)
+	//
+	// Start and End select a byte span; both -1 means the whole file, and a
+	// missing End with a present Start reads to the end. The returned spans are
+	// still in document order and may be clipped at the boundaries.
+	Read(path string, start, end int) (spans []Span, version uint64, err error)
 
 	// Version is what a later Apply bases on, without moving the bytes.
 	Version(path string) (uint64, error)
@@ -202,12 +206,12 @@ func (g *Guard) Close(path string) error {
 	return g.Host.Close(name)
 }
 
-func (g *Guard) Read(path string) ([]Span, uint64, error) {
+func (g *Guard) Read(path string, start, end int) ([]Span, uint64, error) {
 	name, err := g.canonical(path)
 	if err != nil {
 		return nil, 0, err
 	}
-	spans, v, err := g.Host.Read(name)
+	spans, v, err := g.Host.Read(name, start, end)
 	if err == nil {
 		g.mu.Lock()
 		g.read[name] = true
@@ -433,7 +437,14 @@ func Dispatch(g *Guard, req Request) Response {
 
 	case "text":
 
-		spans, v, err := g.Read(req.Path)
+		start, end := -1, -1
+		if req.Start != nil {
+			start = *req.Start
+		}
+		if req.End != nil {
+			end = *req.End
+		}
+		spans, v, err := g.Read(req.Path, start, end)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}

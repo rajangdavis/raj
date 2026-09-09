@@ -109,6 +109,11 @@ type Header struct {
 	Line int
 	Col  int
 
+	// Start and End carry a read span in byte offsets. Both nil means read the
+	// whole file; a missing End with a present Start reads to the end.
+	Start *int
+	End   *int
+
 	// Argv and Dir are exec's command. Plain JSON: a command line is exactly
 	// what you want legible in a frame.
 	Group    uint64
@@ -301,6 +306,12 @@ func EncodeRequest(req Request) (Header, []byte) {
 	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col}
+	if req.Start != nil {
+		h.Start = req.Start
+	}
+	if req.End != nil {
+		h.End = req.End
+	}
 
 	var body []byte
 	if req.Op == "prog" {
@@ -319,7 +330,8 @@ func DecodeRequest(f Frame) (Request, error) {
 	req := Request{ID: f.Header.ID, Op: f.Header.Op, Path: f.Header.Path,
 		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
-		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col}
+		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
+		Start: f.Header.Start, End: f.Header.End}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than

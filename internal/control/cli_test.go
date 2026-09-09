@@ -127,7 +127,24 @@ func (f *fakeEditor) run(req Request) Response {
 		if !ok {
 			return Response{Err: "no open buffer for " + path}
 		}
-		return Response{OK: true, Spans: []Span{{Text: text, Author: FirstAgent}}, Version: f.vers[path]}
+		start, end := -1, -1
+		if req.Start != nil {
+			start = *req.Start
+		}
+		if req.End != nil {
+			end = *req.End
+		}
+		if start < 0 {
+			start, end = 0, len(text)
+		} else {
+			if end < 0 || end > len(text) {
+				end = len(text)
+			}
+			if start > len(text) {
+				start = len(text)
+			}
+		}
+		return Response{OK: true, Spans: []Span{{Text: text[start:end], Author: FirstAgent}}, Version: f.vers[path]}
 	case "open":
 		if _, ok := f.docs[path]; !ok {
 			f.docs[path], f.vers[path] = "", 1
@@ -176,6 +193,15 @@ func TestCLIReads(t *testing.T) {
 	out, _, code = run(t, "read", "/w/a.go")
 	if code != 0 || out != "package a\n\nfunc f() {}\n" {
 		t.Errorf("read = %q, code %d", out, code)
+	}
+}
+
+func TestCLIReadSpan(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
+
+	out, _, code := run(t, "read", "-start", "11", "-end", "17", "/w/a.go")
+	if code != 0 || out != "func f" {
+		t.Errorf("read span = %q, code %d", out, code)
 	}
 }
 

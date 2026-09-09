@@ -260,21 +260,34 @@ func (h host) Close(path string) error {
 // Read hands back the document as authored runs, straight off the piece table:
 // Spans already reports an author per run, so this is a projection rather than
 // an analysis.
-func (h host) Read(path string) ([]control.Span, uint64, error) {
+func (h host) Read(path string, start, end int) ([]control.Span, uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return nil, 0, err
 	}
 	text := p.File.Text()
+	if start < 0 {
+		start, end = 0, len(text)
+	} else {
+		if end < 0 || end > len(text) {
+			end = len(text)
+		}
+		if start > len(text) {
+			start = len(text)
+		}
+		if start > end {
+			start = end
+		}
+	}
 	var out []control.Span
-	for _, s := range p.File.Spans(0, len(text)) {
+	for _, s := range p.File.Spans(start, end-start) {
 		if s.Len <= 0 || s.Off < 0 || s.Off+s.Len > len(text) {
 			continue
 		}
 		out = append(out, control.Span{Text: text[s.Off : s.Off+s.Len], Author: uint8(s.Author)})
 	}
-	if len(out) == 0 && text != "" {
-		out = []control.Span{{Text: text, Author: uint8(piecetable.Original)}}
+	if len(out) == 0 && start < end {
+		out = []control.Span{{Text: text[start:end], Author: uint8(piecetable.Original)}}
 	}
 	return out, uint64(p.File.Session().Version()), nil
 }

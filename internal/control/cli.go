@@ -46,7 +46,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
 
   list                       running editors and their workspaces
   buffers                    files open in the editor
-  read [path]                full text of a buffer, unsaved changes included
+  read [path]                full text of a buffer, unsaved changes included; use -start/-end for a span
   open <path>                open a file in the editor
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
   close [path]                close a buffer; refused while it has unsaved work
@@ -97,8 +97,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	matchCase := fs.Bool("case", false, "search: match case")
 	word := fs.Bool("word", false, "search: whole words only")
 	base := fs.Uint64("base", 0, "apply: the version the offsets were measured in")
-	start := fs.Int("start", -1, "apply: first byte of the span to replace")
-	end := fs.Int("end", -1, "apply: one past the last byte of the span")
+	start := fs.Int("start", -1, "apply/read: first byte of the span")
+	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
 	textArg := fs.String("text", "", "apply: replacement text")
 	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
 	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
@@ -153,7 +153,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "buffers":
 		return buffers(c, stdout, stderr, *asJSON)
 	case "read":
-		return read(c, path, stdout, stderr, *asJSON)
+		return read(c, path, *start, *end, stdout, stderr, *asJSON)
 	case "open":
 		if path == "" {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
@@ -643,8 +643,15 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 	return 0
 }
 
-func read(c *Client, path string, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "text", Path: path})
+func read(c *Client, path string, start, end int, stdout, stderr io.Writer, asJSON bool) int {
+	var sp, ep *int
+	if start >= 0 {
+		sp = &start
+	}
+	if end >= 0 {
+		ep = &end
+	}
+	res, err := c.Do(Request{Op: "text", Path: path, Start: sp, End: ep})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}

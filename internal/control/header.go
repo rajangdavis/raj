@@ -80,6 +80,8 @@ const (
 	hSpans        = 0x33
 	hLine         = 0x34 // 1-based line for goto
 	hCol          = 0x35 // 1-based column for goto
+	hStart        = 0x36 // byte offset for read span; absent means read whole file
+	hEnd          = 0x37 // byte offset for read span; absent means read whole file
 
 )
 
@@ -183,6 +185,12 @@ func encodeHeader(h Header) []byte {
 	num(hCancel, h.Cancel)
 	num(hLine, h.Line)
 	num(hCol, h.Col)
+	if h.Start != nil {
+		num(hStart, *h.Start)
+	}
+	if h.End != nil {
+		num(hEnd, *h.End)
+	}
 
 	num(hGroup, int(h.Group))
 	str(hIdentity, h.Identity)
@@ -342,6 +350,12 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Line = prog.ReadNumber(op.Payload)
 		case hCol:
 			h.Col = prog.ReadNumber(op.Payload)
+		case hStart:
+			v := prog.ReadNumber(op.Payload)
+			h.Start = &v
+		case hEnd:
+			v := prog.ReadNumber(op.Payload)
+			h.End = &v
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))

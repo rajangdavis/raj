@@ -493,9 +493,10 @@ what makes the tool intuitive and where it fights back.
   non-ASCII fallback, threaded through `control.SearchMatch` and the wire
   `MatchMeta`, and emitted by `raj ctl search -json`. A driver can now turn a
   hit directly into an `apply` span without recomputing line:col itself.
-- **`raj ctl read` has no range.** Reading a whole buffer to verify one splice is
-  wasteful; a `-start`/`-end` span would let a driver read the seam it just
-  wrote. Also on the TODO list.
+- **`raj ctl read -start/-end` now returns a byte span.** Implemented during this
+  session: the request carries start/end through Header and Request, the host
+  clips the piece-table spans to the range, and the CLI accepts the same flags.
+  Line ranges are still a gap for locked-down containers.
 
 - **Multi-line `raj ctl edit` is fragile through shell quoting.** Passing long
   `-old`/`-new` strings on the command line failed on the first attempt;

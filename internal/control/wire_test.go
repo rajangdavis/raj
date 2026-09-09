@@ -40,6 +40,22 @@ func TestDocumentBytesStayInTheBody(t *testing.T) {
 	}
 }
 
+func TestReadSpanRoundTripsThroughHeader(t *testing.T) {
+	start, end := 10, 20
+	h, _ := EncodeRequest(Request{Op: "text", Path: "/w/a.go", Start: &start, End: &end})
+	raw := encodeHeader(h)
+	back, err := decodeHeader(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Op != "text" || back.Path != "/w/a.go" {
+		t.Errorf("header = %+v", back)
+	}
+	if back.Start == nil || *back.Start != 10 || back.End == nil || *back.End != 20 {
+		t.Errorf("span = %v..%v, want 10..20", back.Start, back.End)
+	}
+}
+
 // The reason document bytes are not in the JSON.
 //
 // A buffer is a byte string. Go's encoder replaces anything that is not valid

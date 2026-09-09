@@ -130,14 +130,19 @@ Exit is non-zero when there are no matches, as with grep.
 ## Read before you edit, every time
 
 ```
-raj ctl read /abs/path/to/file.go            # the text
-raj ctl read -json /abs/path/to/file.go      # text, version, and authorship
+raj ctl read /abs/path/to/file.go                  # the text
+raj ctl read -start 120 -end 148 /abs/path/to/file.go  # a byte span
+raj ctl read -json /abs/path/to/file.go            # text, version, and authorship
 ```
 
 Do this even if you read the same file a moment ago: the user is typing in it.
 The editor refuses a write from a caller that has not read the buffer, because
 byte offsets only mean something in the coordinates of a version somebody has
 actually seen.
+
+`-start` and `-end` are byte offsets, half-open like `apply`: `-start 120
+-end 148` returns the 28 bytes starting at offset 120. Use them to verify a
+splice without reading the whole file.
 
 If you only need coordinates and not the whole document — appending, say —
 `raj ctl version` is enough and satisfies that check too.
@@ -612,10 +617,10 @@ reach for a shell workaround.
 
 Concrete gaps today:
 
-- **Reading a line range.** `raj ctl read` returns the whole buffer. To inspect a
-  known region, agents pipe it through `sed -n` or `head -n | tail -n`. A
-  `read -line N` or `read -lines START,END` flag would remove that dependency.
-  (Byte-range `read -start/-end` is on the TODO list for a different use case.)
+- **Reading a line range.** `raj ctl read -start/-end` now covers byte spans, but
+  line ranges are still missing. Agents inspecting a known line still pipe
+  through `sed -n` or `head -n | tail -n`. A `read -line N` or
+  `read -lines START,END` flag would remove that dependency.
 - **Counting bytes or lines.** `wc -c` and `wc -l` are used to size apply spans
   or find the end of a file. A `raj ctl stats` per-file mode, or returning the
   buffer length and line count in `read -json`, would cover it.

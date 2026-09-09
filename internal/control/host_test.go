@@ -58,12 +58,22 @@ func (h *memHost) Open(path string) (uint64, error) {
 	return h.vers[path], nil
 }
 
-func (h *memHost) Read(path string) ([]Span, uint64, error) {
+func (h *memHost) Read(path string, start, end int) ([]Span, uint64, error) {
 	t, ok := h.docs[path]
 	if !ok {
 		return nil, 0, ErrNoBuffer
 	}
-	return []Span{{Text: t, Author: FirstAgent}}, h.vers[path], nil
+	if start < 0 {
+		start, end = 0, len(t)
+	} else {
+		if end < 0 || end > len(t) {
+			end = len(t)
+		}
+		if start > len(t) {
+			start = len(t)
+		}
+	}
+	return []Span{{Text: t[start:end], Author: FirstAgent}}, h.vers[path], nil
 }
 
 func (h *memHost) Version(path string) (uint64, error) {
@@ -139,7 +149,7 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		if _, err := g.Open(p); err == nil {
 			t.Errorf("Open(%q) was allowed", p)
 		}
-		if _, _, err := g.Read(p); err == nil {
+		if _, _, err := g.Read(p, -1, -1); err == nil {
 			t.Errorf("Read(%q) was allowed", p)
 		}
 		if _, _, err := g.Apply(p, FirstAgent, 1, []Hunk{{}}); err == nil {
@@ -165,7 +175,7 @@ func TestGuardRequiresAReadBeforeAWrite(t *testing.T) {
 		t.Fatalf("buffer changed anyway: %q", h.docs[path])
 	}
 
-	if _, _, err := g.Read(path); err != nil {
+	if _, _, err := g.Read(path, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
@@ -193,7 +203,7 @@ func TestVersionCountsAsARead(t *testing.T) {
 func TestGuardRejectsMalformedSpans(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	g.Read(path)
+	g.Read(path, -1, -1)
 	for _, hk := range []Hunk{{Start: -1, End: 0}, {Start: 5, End: 2}} {
 		if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{hk}); err == nil {
 			t.Errorf("%+v was allowed", hk)
@@ -313,7 +323,7 @@ func TestDispatchEmptyApplyIsAVersionQuery(t *testing.T) {
 func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	g.Read(path)
+	g.Read(path, -1, -1)
 	for _, a := range []uint8{0, 1} {
 		if _, _, err := g.Apply(path, a, 1, []Hunk{{Start: 0, End: 1, Text: "x"}}); err == nil {
 			t.Errorf("author %d was accepted", a)
@@ -331,7 +341,7 @@ func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 // text from the user's without a second call.
 func TestReadCarriesAuthorship(t *testing.T) {
 	g, h := guarded(t)
-	spans, _, err := g.Read(filepath.Join(h.root, "a.go"))
+	spans, _, err := g.Read(filepath.Join(h.root, "a.go"), -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +449,7 @@ func TestSnapshotSearcherValidates(t *testing.T) {
 func TestReadOfActiveBufferAuthorisesWriteByName(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	if _, _, err := g.Read(""); err != nil {
+	if _, _, err := g.Read("", -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {

@@ -79,6 +79,10 @@ type Request struct {
 	// the one the cursor is already on, and a missing column to the margin.
 	Line int
 	Col  int
+	// Start and End are a read span in byte offsets. Nil means read the whole
+	// file; a missing End (but present Start) reads to the end.
+	Start *int
+	End   *int
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
