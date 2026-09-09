@@ -48,6 +48,8 @@ const ctlUsage = `usage: raj ctl <command> [options]
   buffers                    files open in the editor
   read [path]                full text of a buffer, unsaved changes included
   open <path>                open a file in the editor
+  goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
+  close [path]                close a buffer; refused while it has unsaved work
   whoami                     the author id this connection writes as
   who                        everyone writing in this workspace
   recv                       wait for the user to say something, then print it
@@ -158,7 +160,38 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return simple(c, Request{Op: "open", Path: path}, "opened "+path, stdout, stderr, *asJSON)
+	case "goto":
+		if pos := fs.Arg(1); pos != "" {
+			line, col, ok := ctlPosition(pos)
+			if !ok {
+				fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
+				return 2
+			}
+			res, err := c.Do(Request{Op: "goto", Path: path, Line: line, Col: col})
+			if code := fail(stderr, res, err); code != 0 {
+				return code
+			}
+			if *asJSON {
+				return emit(stdout, map[string]any{"ok": true, "line": line, "col": col})
+			}
+			where := firstOf(path, "active buffer")
+			if line > 0 {
+				colText := ""
+				if col > 0 {
+					colText = fmt.Sprintf(":%d", col)
+				}
+				fmt.Fprintf(stdout, "moved %s cursor to %d%s\n", where, line, colText)
+			} else {
+				fmt.Fprintf(stdout, "moved %s cursor to column %d\n", where, col)
+			}
+			return 0
+		}
+		fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
+		return 2
+	case "close":
+		return simple(c, Request{Op: "close", Path: path}, "closed", stdout, stderr, *asJSON)
 	case "save":
+
 		return simple(c, Request{Op: "save", Path: path}, "saved", stdout, stderr, *asJSON)
 	case "exec":
 		return doExec(c, argv, *dir, stdout, stderr, *asJSON)
@@ -316,6 +349,43 @@ func isBool(fs *flag.FlagSet, name string) bool {
 	}
 	b, ok := f.Value.(interface{ IsBoolFlag() bool })
 	return ok && b.IsBoolFlag()
+}
+
+// ctlPosition reads "line", "line:col" or ":col" for goto. A missing part is
+// 0, meaning "the editor decides": a bare ":40" is a column on the line the
+// cursor is already on, exactly as in the editor's own goto-line prompt.
+func ctlPosition(s string) (line, col int, ok bool) {
+	lineText, colText := s, ""
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		lineText, colText = s[:i], s[i+1:]
+	}
+	if lineText != "" {
+		if line, ok = ctlAtoi(lineText); !ok {
+			return 0, 0, false
+		}
+	}
+	if colText != "" {
+		if col, ok = ctlAtoi(colText); !ok {
+			return 0, 0, false
+		}
+	}
+	return line, col, line > 0 || col > 0
+}
+
+// ctlAtoi accepts a non-negative decimal and nothing else, like the prompt
+// parser it mirrors.
+func ctlAtoi(s string) (int, bool) {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(s[i]-'0')
+		if n > 1<<30 {
+			return 1 << 30, true // clamped below anyway
+		}
+	}
+	return n, len(s) > 0
 }
 
 // editText resolves -old/-new against their file forms. Flags carry a one-line
@@ -563,7 +633,12 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 		if b.Dirty {
 			state = "unsaved-changes"
 		}
-		fmt.Fprintf(stdout, "%s\t%d bytes\t%d lines\t%s\n", name, b.Bytes, b.Lines, state)
+		mark := ""
+		if b.Active {
+			mark = "\tactive"
+		}
+		fmt.Fprintf(stdout, "%s\t%d bytes\t%d lines\t%s%s\n", name, b.Bytes, b.Lines, state, mark)
+
 	}
 	return 0
 }

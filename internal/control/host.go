@@ -46,6 +46,16 @@ type BufferHost interface {
 	// Open puts a path in a tab and returns its version.
 	Open(path string) (uint64, error)
 
+	// Goto moves the cursor in a buffer to a 1-based line and column. Zero
+	// means "the editor decides": a missing line keeps the cursor's own, a
+	// missing column the margin.
+	Goto(path string, line, col int) error
+
+	// Close removes a buffer. One with unsaved changes is refused: a silent
+	// close is a silent data loss, and the editor's close-anyway prompt has no
+	// machine form.
+	Close(path string) error
+
 	// Read returns the document as authored spans AND the version they were
 	// read at.
 	//
@@ -170,6 +180,26 @@ func (g *Guard) Open(path string) (uint64, error) {
 		return 0, err
 	}
 	return g.Host.Open(path)
+}
+
+// Goto routes a cursor move through the same resolution every other verb
+// uses, so "goto 40" and "goto /w/a.go 40" cannot mean different buffers.
+func (g *Guard) Goto(path string, line, col int) error {
+	name, err := g.canonical(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.Goto(name, line, col)
+}
+
+// Close refuses a dirty buffer before the host is asked, so the refusal
+// reads the same for every implementation of BufferHost.
+func (g *Guard) Close(path string) error {
+	name, err := g.canonical(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.Close(name)
 }
 
 func (g *Guard) Read(path string) ([]Span, uint64, error) {
@@ -382,7 +412,27 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		v, err := g.Open(req.Path)
 		return done(v, err)
+	case "goto":
+		name, err := g.canonical(req.Path)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		if err := g.Goto(name, req.Line, req.Col); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "close":
+		name, err := g.canonical(req.Path)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		if err := g.Close(name); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+
 	case "text":
+
 		spans, v, err := g.Read(req.Path)
 		if err != nil {
 			return Response{Err: err.Error()}

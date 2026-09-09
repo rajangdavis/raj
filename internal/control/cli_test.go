@@ -35,7 +35,22 @@ type fakeEditor struct {
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
 	t.Helper()
-	return newFakeEditorAt(t, filepath.Join(t.TempDir(), "c.sock"), docs)
+	return newFakeEditorAt(t, controlSock(t, "c.sock"), docs)
+}
+
+// controlSock returns a unix socket address short enough on every platform.
+// filepath.Join(t.TempDir(), "c.sock") crosses the 104-byte sockaddr_un
+// sun_path limit on macOS, where TMPDIR is long and t.TempDir() appends the
+// whole test name; bind then fails with "invalid argument". A single short
+// component under os.TempDir() stays well under it.
+func controlSock(t *testing.T, id string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "raj-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, id)
 }
 
 // newFakeEditorAt is the same fixture on a named address, so the TCP tests
@@ -797,22 +812,34 @@ func TestAnonymousConnectionsStillGetAnID(t *testing.T) {
 // Discovery reaps what it finds dead rather than letting them accumulate and
 // making every later listing slower and noisier.
 func TestDiscoverReapsDeadSockets(t *testing.T) {
-	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
-	dir := filepath.Dir(DefaultPath())
-	os.MkdirAll(dir, 0o700)
+	// The discovery directory is deliberately short. macOS rejects unix
+	// socket paths past sun_path (104 bytes), and the temp dir under a long
+	// test name drifts past it the moment the machine or temp volume changes.
+	scan, err := os.MkdirTemp("", "raj-disc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(scan) })
+	t.Setenv("XDG_RUNTIME_DIR", scan)
+	dir := filepath.Join(scan, "raj")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	// A file that looks like a socket but answers nothing.
 	dead := filepath.Join(dir, "9999.sock")
 	if err := os.WriteFile(dead, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// And a live one, in the same directory discovery scans.
-	live := filepath.Join(dir, "live.sock")
-	os.Remove(live)
-	if err := os.Symlink(ed.srv.Path(), live); err != nil {
-		t.Skipf("cannot link a live socket into the scan directory: %v", err)
-	}
-	t.Cleanup(func() { os.Remove(live) })
+	// And a live one, in the same directory discovery scans. It is a real
+	// listener here rather than a symlink to a socket elsewhere: discovery
+	// scans for real listeners, and threading one in by symlink assumes the
+	// platform dials a socket through a symlink.
+	ed := newFakeEditorAt(t, filepath.Join(dir, "live.sock"), map[string]string{"/w/a.go": "x\n"})
+	live := ed.srv.Path()
+	// newFakeEditorAt points XDG_RUNTIME_DIR at its own temp dir; that would
+	// send discovery elsewhere, so pin it back where the fixtures live.
+	t.Setenv("XDG_RUNTIME_DIR", scan)
 
 	found := Discover()
 	if _, err := os.Stat(dead); !os.IsNotExist(err) {

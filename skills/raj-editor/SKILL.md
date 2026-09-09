@@ -460,5 +460,121 @@ RAJ_CONTROL_ADDR=/run/user/1000/raj/4821.sock raj ctl buffers
 ```
 
 `list` finds editors by looking in the socket directory, so it finds nothing
-when you are reaching one over TCP — there is no directory to look in. In that
-case `RAJ_CONTROL_ADDR` already names the one editor you can reach.
+when you are reaching one over TCP — there is no directory to look in.
+
+## Field notes: agent-driving raj ctl
+
+Things that cost a real session when an agent, not a human, drove `raj ctl`
+from inside a container against an editor on the other side of a network
+boundary. These are notes, not new rules: the reference above is the rules.
+
+### Byte offsets, not string offsets
+
+Offsets for `apply` are BYTES in the editor's own byte model, and nothing else
+counts. Character-count indexing silently disagrees: any multi-byte character
+before the anchor — an em-dash in a comment, a non-ASCII name — shifts the
+numbers, and `apply` happily splices at the wrong byte because it validates the
+range, not the text.
+
+The two verbs that make offsets unnecessary in the common case are `raj ctl
+edit -old S -new S`, the exact-string replacement, and `raj ctl search -q
+PATTERN`, which locates text in the editor's own coordinates. Use them first.
+Only a structural hunk — a whole function, a comment block — genuinely wants
+`apply`, and then the offsets are measured against the bytes the `read`
+returned; deriving them is left to the driver, out of scope for this skill.
+Read-gate the `apply`, and re-read the seam after it lands.
+
+### Read-gate every apply, and let -base do the rebasing
+
+A chain that never writes blind is: read the file, and only if that succeeds
+apply against the version you just read, with the replacement piped in on
+stdin:
+
+```
+raj ctl read F >/dev/null && raj ctl apply F -base N -start S -end E -text-file -
+```
+
+`-base` is the version the offsets were measured against — almost always the
+version you just read. After a hunk lands the version moves, but applying the
+next hunk with the SAME base still works: the tool rebases later hunks on top
+of whatever the buffer has become, exactly like the edit path agents use.
+Re-reading between hunks is equally fine; just carry the new version forward.
+
+### A heredoc ends with a newline
+
+`-text-file -` reads stdin to EOF, so replacement text carries a trailing
+newline. If your anchor was a single line followed by an empty line, the result
+is a doubled blank line. Fix by anchoring the line AND what follows it when
+spacing matters, then re-read the edited region — the same check catches the
+worse failure: an anchor that is only a prefix of its line splits a comment or
+a declaration in two and will not compile. A final gotcha in the same family:
+do not put a bare delimiter line (the word that ends your shell heredoc) inside
+the replacement text, or the shell ends the heredoc early and the rest of your
+text runs as commands.
+
+### Replacing code: verify both ends of the hunk
+
+Every structural hunk — a function, a comment block — has two boundaries, and
+both are where mistakes live. Fingerprints:
+
+- An offset shift added by hand between hunks (an estimated 40 when the earlier
+  edit really added 37) makes the hunk start inside a token — `funfunc (h host)
+  Open...` — and end past the function, eating the following comment's `//` so
+  a doc line becomes bare source. Recompute offsets from a FRESH read after
+  every hunk; never add shift estimates by arithmetic.
+- A hunk whose span ends short of the next comment produces exactly the
+  complaint "a line in the comment that is uncommented": the `//` is what got
+  eaten or split off. Same family: replace a substring that is only the PREFIX
+  of its line and the tail glues onto your replacement (`return case "text":`
+  from editing `done(v, err)\n\tcase "text":` but leaving `\t\treturn `).
+- A hunk that ends on a `}` which belongs to the following function leaves a
+  duplicate brace (`}\n}\n`) between funcs; ending it on a line whose newline
+  you already consumed makes the next line climb into the previous one.
+  Anchor whole lines: span start at the line start, span end at the line end
+  INCLUDING its newline.
+
+The one check that catches all of these and the encoding trap above: after
+every hunk, read the file and print the lines AROUND the edit — one function
+before through one after — and study the seams, not the center. Splitting the
+read on "\n" is encoding-safe even when byte offsets are not.
+
+### include/exclude globs match basenames, not paths
+`raj ctl search -include 'internal/control/*.go'` matches NOTHING: the glob is
+matched against each file's basename. Use `-include '*.go'` for a whole-repo Go
+search. Making the globs match the path is the in-progress Stream B item in the
+project's TODO.md.
+
+### -q is the pattern; -regex is a flag
+
+`raj ctl search -regex 'x'` reads `-regex` as an operand and fails: the search
+pattern lives under `-q` only. Patterns are literal and case-sensitive unless
+`-regex` or `-case` is given.
+
+### Every apply is a proposal, and the version moves
+
+Each applied hunk bumps the buffer version and is an attributed but UNACCEPTED
+proposal. Do not accept your own proposals; tell the user it is ready and leave
+the decision to them. A version taken before an apply describes the pre-edit
+text — if later offsets build on the edit, re-read first.
+
+### New verbs touch eight layers
+
+Adding one verb means touching: the opcode table in internal/prog/prog.go; the
+knownOps and verbNames maps and the Requests compiler in
+internal/control/prog.go; the Header struct and EncodeRequest/DecodeRequest in
+internal/control/wire.go; the request-field codes, verbCodes, encodeHeader and
+decodeHeader in internal/control/header.go; the Request and Buffer structs in
+internal/control/control.go; the BufferHost interface, Guard pass-throughs and
+Dispatch in internal/control/host.go; the real host in internal/app/control.go;
+and the CLI in internal/control/cli.go. Wire fields are sent only when nonzero,
+which is what keeps an old client talking to a new server. And anything
+implementing BufferHost — test fakes included, such as memHost in
+internal/control/host_test.go — must gain the new method or the package stops
+compiling.
+
+### No shared filesystem means host-side verification
+
+When the repo lives only on the editor's machine, nothing in the container can
+compile. The contract is: proposals in the buffers, the user accepts and saves,
+and `gofmt -w && go test ./... && make check` run on the host is the
+verification step. State that contract out loud every session that hits it.

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/big-pickle",
+  "small_model": "opencode/big-pickle",
+  "plugin": ["./plugin/raj-gate.ts"],
+  "tools": {
+    "read": false,
+    "write": false,
+    "edit": false,
+    "apply_patch": false,
+    "grep": false,
+    "glob": false,
+    "lsp": false
+  },
+  "permission": {
+    "read": "deny",
+    "edit": "deny",
+    "grep": "deny",
+    "glob": "deny"
+  }
+}

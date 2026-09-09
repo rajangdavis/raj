@@ -17,6 +17,19 @@ import (
 // the selection, and losing the selection is not cosmetic here: the next press
 // reads touchedLines() again and sees one line where the block was, so holding
 // the chord tears a highlighted block apart a line at a time.
+//
+// The touched set can leave a gap at the far end: touchedLines() drops a line
+// the selection only meets at column 0, so it stays where it is while the block
+// moves past it. Moving DOWN would push that line into its own block, which
+// displaces the very text the exclusion promised to spare, so such a move is
+// refused rather than made. Moving UP restores an end that sat on that line to
+// the block's new far edge, so the selection keeps covering the same text.
+//
+// Restoring a mark is a line permutation, not a uniform shift: the swap
+// sequence is simulated over the only lines it can touch, and each mark is
+// mapped through the result. A uniform line+delta shift collapses the cursor on
+// the block's far boundary — both ends land on the same line and the selection
+// is gone — where the permutation parks each end on the text it was watching.
 func (p *Pane) MoveLines(delta int) {
 	lines := p.touchedLines()
 	if len(lines) == 0 {
@@ -25,7 +38,7 @@ func (p *Pane) MoveLines(delta int) {
 	if delta < 0 && lines[0] == 0 {
 		return
 	}
-	if delta > 0 && lines[len(lines)-1] >= p.File.Lines()-1 {
+	if delta > 0 && (lines[len(lines)-1] >= p.File.Lines()-1 || p.boundaryBlocksDown(lines)) {
 		return
 	}
 
@@ -47,15 +60,76 @@ func (p *Pane) MoveLines(delta int) {
 		}
 	}
 
+	// The permutation the swap sequence just performed, over the only lines it
+	// can have moved: the block, the line below it, and — for an upward move —
+	// the line above it that falls into the vacated slot. The array says which
+	// old line now sits at each position, so a mark's new line is found where
+	// the mark's old line sits.
+	lo := lines[0]
+	hi := lines[len(lines)-1] + 1
+	if delta < 0 {
+		lo = lines[0] - 1
+		hi = lines[len(lines)-1]
+	}
+	at := make([]int, hi-lo+1)
+	for i := range at {
+		at[i] = lo + i
+	}
+	atSwap := func(a, b int) { at[a-lo], at[b-lo] = at[b-lo], at[a-lo] }
+	if delta > 0 {
+		for i := len(lines) - 1; i >= 0; i-- {
+			atSwap(lines[i], lines[i]+1)
+		}
+	} else {
+		for _, l := range lines {
+			atSwap(l-1, l)
+		}
+	}
+	moved := make([]int, len(at))
+	for k, old := range at {
+		moved[old-lo] = lo + k
+	}
+
 	restored := make([]Cursor, 0, len(marks))
-	last := p.File.Lines() - 1
 	for _, m := range marks {
-		head := p.File.OffsetAt(clamp(m.headLine+delta, 0, last), m.headCol)
-		anchor := p.File.OffsetAt(clamp(m.ancLine+delta, 0, last), m.ancCol)
+		head := p.followLine(moved, lo, hi, delta, lines, m.headLine, m.headCol)
+		anchor := p.followLine(moved, lo, hi, delta, lines, m.ancLine, m.ancCol)
 		restored = append(restored, Cursor{Head: head, Anchor: anchor, Goal: m.headCol})
 	}
 	p.Cursors.Replace(restored)
 	p.FollowCursor()
+}
+
+// boundaryBlocksDown reports whether a selection ends at column 0 of the line
+// a downward move would push into its own block. touchedLines() left that line
+// out so it stays in place, and a downward move cannot both happen and keep
+// that promise.
+func (p *Pane) boundaryBlocksDown(lines []int) bool {
+	below := lines[len(lines)-1] + 1
+	for _, c := range p.Cursors.All() {
+		lo, hi := c.Range()
+		if p.File.LineOf(lo) < below && hi == p.File.LineStart(below) {
+			return true
+		}
+	}
+	return false
+}
+
+// followLine maps one recorded end through the move's permutation to the offset
+// it now points at.
+//
+// The only exception is the far end of an upward-moving block: an end that sat
+// at column 0 of the line below the block lands on the block's new far edge
+// rather than on that line itself, or the selection reaches past the block into
+// the line the move deliberately left behind.
+func (p *Pane) followLine(moved []int, lo, hi, delta int, lines []int, line, col int) int {
+	if delta < 0 && line == lines[len(lines)-1]+1 && col == 0 {
+		return p.File.LineStart(lines[len(lines)-1] + delta + 1)
+	}
+	if line < lo || line > hi {
+		return p.File.OffsetAt(line, col)
+	}
+	return p.File.OffsetAt(moved[line-lo], col)
 }
 
 // swapLines exchanges two adjacent lines, a before b.

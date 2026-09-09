@@ -29,11 +29,6 @@ import (
 // build.
 var Unimplemented = map[Action]string{
 	CommandPalette: "no palette yet; the file picker is cmd+p",
-	// Found by the test rather than by anyone noticing. cmd+u has been taking
-	// a chord from the terminal and doing nothing, and TODO.md listed only the
-	// two above — which is the whole argument for generating this from the
-	// table and checking it against the running application.
-	CursorUndo: "cursor history is not recorded yet",
 }
 
 // Doc renders the keybinding reference as markdown.

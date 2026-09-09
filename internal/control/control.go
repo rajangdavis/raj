@@ -74,6 +74,12 @@ type Request struct {
 	Query  *SearchQuery
 	// Cancel names an in-flight request id to abandon.
 	Cancel int
+	// Line and Col are a goto: the 1-based position the editor's cursor
+	// should move to. Zero means absent; the editor defaults a missing line to
+	// the one the cursor is already on, and a missing column to the margin.
+	Line int
+	Col  int
+
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
 	Identity string
@@ -181,6 +187,7 @@ type Buffer struct {
 	Dirty   bool   `json:"dirty"`
 	Bytes   int    `json:"bytes"`
 	Lines   int    `json:"lines"`
+	Active  bool   `json:"active"`
 }
 
 // Conflict is a hunk that could not be rebased onto the current version. At is

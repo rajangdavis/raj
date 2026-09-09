@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"raj/internal/control"
 	"raj/internal/editor"
@@ -138,6 +139,7 @@ func (h host) Buffers() []control.Buffer {
 			Dirty:   p.File.Dirty(),
 			Bytes:   p.File.Len(),
 			Lines:   p.File.Lines(),
+			Active:  p == h.a.Tabs.Active(),
 		})
 	}
 	return out
@@ -171,6 +173,17 @@ func (h host) Resolve(path string) (string, error) {
 }
 
 func (h host) Open(path string) (uint64, error) {
+	// A path names a file on disk, and a file can be spelled several ways —
+	// through a symlink, through .., through the tab's own form. Reopening one
+	// that is already open should focus its tab rather than stack a duplicate:
+	// the identity comparison is by file, not by string.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		for _, p := range h.a.Tabs.All() {
+			if sameFile(resolved, p.File.Path) && h.a.Tabs.Focus(p) {
+				return uint64(p.File.Session().Version()), nil
+			}
+		}
+	}
 	h.a.OpenFile(path)
 	p, err := h.find(path)
 	if err != nil {
@@ -179,6 +192,69 @@ func (h host) Open(path string) (uint64, error) {
 		return 0, fmt.Errorf("could not open %s", path)
 	}
 	return uint64(p.File.Session().Version()), nil
+}
+
+// sameFile reports whether two paths name one file. Both are resolved first:
+// a symlink is a different name for the same inode, and a brand-new buffer
+// does not exist on disk yet, in which case the string form is the best it
+// can do.
+func sameFile(a, b string) bool {
+	if r, err := filepath.EvalSymlinks(a); err == nil {
+		a = r
+	}
+	if r, err := filepath.EvalSymlinks(b); err == nil {
+		b = r
+	}
+	if a == b {
+		return true
+	}
+	sa, ea := os.Stat(a)
+	sb, eb := os.Stat(b)
+	return ea == nil && eb == nil && os.SameFile(sa, sb)
+}
+
+// Goto moves the cursor in a buffer, clamping the way the editor's own
+// goto-line prompt does: line 9999 in a 300-line file is the end, not an
+// error. The line and column are 1-based, or zero when the caller left them
+// out — ":40" from a compiler means a column on the line already showing, and
+// a missing column means the margin.
+func (h host) Goto(path string, line, col int) error {
+	p, err := h.find(path)
+	if err != nil {
+		return err
+	}
+	if line <= 0 {
+		line, _ = p.File.LineCol(p.Cursors.Primary().Head)
+		line++
+	}
+	if col <= 0 {
+		col = 1
+	}
+	off := p.File.OffsetAt(line-1, col-1)
+	p.Cursors.Set(off, off)
+	p.Viewport.Center(line-1, p.File.Lines())
+	return nil
+}
+
+// Close removes a buffer's tab. A buffer with unsaved changes is refused, and
+// that refusal is the machine form of the editor's "save first?" prompt: the
+// text stays, the driver gets an error, and nobody loses work to a socket
+// call.
+func (h host) Close(path string) error {
+	p, err := h.find(path)
+	if err != nil {
+		return err
+	}
+	if p.File.Dirty() {
+		return fmt.Errorf("%s has unsaved changes; save or reject them first", p.File.Path)
+	}
+	for i, q := range h.a.Tabs.All() {
+		if q == p {
+			h.a.Tabs.CloseIndex(i)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", control.ErrNoBuffer, path)
 }
 
 // Read hands back the document as authored runs, straight off the piece table:

@@ -83,14 +83,16 @@ findings and decisions live in INVESTIGATIONS.md.
   tick while a drag is held would fix it and means either a second timer or a
   variable tick rate — the current one exists for idle work and 150 ms is right
   for that.
-- [ ] **`touchedLines` includes a line the selection only touches at column 0.**
-  It calls `LineOf(hi)` unconditionally, so dragging from line 1 to the start of
-  line 3 reports three lines and `alt+down` moves a line the user never
-  highlighted. Sublime and VS Code exclude it. The condition is one line; what
-  makes it more than that is the blast radius — `touchedLines` also feeds
-  indent, comment-toggle and `CopyLines`, and the same exclusion is right for
-  all four, so it wants its own commit and its own tests rather than riding
-  along with a cursor fix.
+- ~~**`touchedLines` includes a line the selection only touches at column 0.**~~
+  Fixed and verified (go test green): the guard mirrors `motion.go`'s
+  `SplitIntoLines` — `last := LineOf(hi); if last > LineOf(lo) && hi ==
+  LineStart(last) { last-- }` — downward boundary-block moves are refused
+  rather than displacing the spared line, an upward move parks the end on the
+  block's new far edge, and the fuzz oracle mirrors both
+  (`TestMoveLinesExcludesLineTouchedAtColumn0`,
+  `TestMoveLinesWontPushTheExcludedBoundary`). `CopyLines`, indent and
+  comment-toggle share the function and keep the original caution: the same
+  exclusion is right for them too and wants its own commit each.
 - [ ] **A press on a list does not drag it.** Clicking selects, and holding and
   moving does nothing — neither rubber-band selection nor drag-to-reorder for
   tabs. Both are real gestures a list can carry and neither has an obvious
@@ -159,6 +161,12 @@ findings and decisions live in INVESTIGATIONS.md.
 - [ ] **Scroll is restored as a line number, not a proportion.** Reopening in a
   differently sized terminal clamps rather than adapts, so the cursor can land
   off screen until the first movement.
+  Planned (Stream C): `session.Tab` gains `Ratio float64`
+  (`json:"ratio,omitempty"`); the save side records `Top/Lines()` while still
+  writing `Top` for old-session compat, and restore uses `Ratio` when > 0 —
+  the pane's first-resize clamp bounds it, and `validate` keeps clamping plain
+  `Top` for legacy JSON. Tests: same size, resized larger, empty file
+  (ratio 0), legacy JSON without `ratio`.
 - [ ] **Dirty-buffer restore** — persist the journal and add-buffers, validated
   by an orig-hash per buffer.
 - [ ] **Attribution across restarts** — tint is commit-scoped, so it must
@@ -191,15 +199,22 @@ findings and decisions live in INVESTIGATIONS.md.
 The write path is atomic and refuses to clobber another writer; what is left is
 the follow-ups that were deliberately kept out of that change.
 
-- [ ] **Notice the change before the save.** `File.DiskChanged` is only consulted
-  when you press save, so a file rewritten under an open tab looks untouched
-  until then. The idle tick could ask — it is one stat per open tab — and mark
-  the tab, which is also what turns the prompt from a surprise into a
-  confirmation.
+- ~~**Notice the change before the save.**~~ Done and verified (go test green):
+  `Pane.diskStale` with `MarkDiskStale`/`ClearDiskStale`/`DiskStale`,
+  `App.diskCheck()` on the idle tick — one stat per open tab, skipping
+  already-marked and unnamed buffers — cleared on save and reload, and the tab
+  bar marks the tab with `" !"` (ASCII, so the hand-rolled width table cannot
+  shift hit-testing). First save press is no longer the first the editor knows
+  about; the tick moves that stat onto the idle path. Tests:
+  `TestIdleTickMarksDiskChangedTab`, `TestSaveClearsDiskChangedMark`.
 - [ ] **Owner and group are not preserved.** The temp-and-rename write copies
   the mode but not the uid or gid, so saving a file owned by someone else, as
   root, silently reassigns it. Needs a `Chown` from the stat, and a decision
   about the ordinary case where the chown will fail for want of privilege.
+  Decision: ignore `EPERM` so an unprivileged save still succeeds. The fix only
+  matters for root saves and was untestable at uid 501, so implementation is
+  deferred to a root-capable machine: `tmp.Chown(uid, gid)` from the stat,
+  `EPERM` ignored, plus a root-gated test in `write_test.go`.
 - [ ] **Nothing is verified after the rename.** The write is atomic and fsynced,
   so a torn file is not the failure mode, but a filesystem that reports success
   and drops the bytes is not detected either. A read-back-and-compare on save is
@@ -249,10 +264,29 @@ writer that is not the user, so the hard part is already there. What is missing
 is the transport and the rules around it.
 
 ~~The socket and the protocol~~, ~~writes landing on the event thread~~, ~~a
-mandatory base version~~ and ~~off by default~~ are done: `internal/control` is
-the transport, `internal/app/control.go` is what a request means, and the two
-cannot be collapsed because the transport package has no editor types to reach
-for. What remains:
+  mandatory base version~~, ~~off by default~~, ~~the driver round: `goto` and
+  `close` verbs, the `buffers` active flag, canonicalized `open`~~ and ~~the
+  short socket-path / Discover fixture~~ are done: `internal/control` is the
+  transport, `internal/app/control.go` is what a request means, the two cannot
+  be collapsed because the transport package has no editor types to reach for,
+  and the Stream D additions ride the same eight layers. What remains:
+
+- [ ] **`search` reports line:col, never byte offsets.** A driver turning a
+  line back into bytes re-implements the editor's byte model outside it — the
+  step that drifts first (UTF-16 vs bytes, multi-byte characters) when the
+  editor already knows both. Have `search -json` include `byteStart`/`byteEnd`
+  per hit so "locate an anchor, then `apply` at its offset" is one pipeline of
+  editor-computed coordinates.
+- [ ] **`read` returns only the whole buffer.** A driver verifying the seam
+  after an `apply` needs a byte range, not the whole file to re-slice.
+  `raj ctl read [path] -start N -end N` returning one span closes that, and
+  `edit` reporting the span it replaced would let a follow-up `apply` build on
+  the same coordinates.
+- [ ] **A `find` step in the opcode pipeline.** `run -prog` cannot ask "where
+  is this text" and get an offset back in the same program, so a batched driver
+  round (find → read → apply) is several round trips today. A `find` op
+  answering with a byte span is the single-round-trip version of the two
+  bullets above.
 
 - [ ] **Attribution has no inverse.** An agent can see which spans are its own,
   but there is no verb to drop them. Reverting its own work means computing a
@@ -265,6 +299,33 @@ for. What remains:
   harness reconnecting keeps the text it wrote and forty restarts cost one id.
   Distinct identities still consume them and running out is an error rather
   than a wrap.
+
+What a driver round actually hits when the editor is the checker, learned the
+hard way: each failure below had a cheap structural remedy on the `raj ctl`
+surface, and all three would have caught the byte-drift corruption before a
+compiler hand-off.
+
+- [ ] **A hunk lands unverified.** `edit` and `apply` reply "applied 1 hunk(s)"
+  without echoing what they matched or wrote, so confirming a splice means
+  re-reading the whole file. This round the only silent corruption was that
+  hole: a shell mangling of `edit -new` applied cleanly and survived a sparse
+  dump. Echoing the matched `-old` text and the written span in the `-json`
+  reply makes the reply itself the check — the hunk-echo half of the
+  `read -start/-end` bullet above.
+- [ ] **`buffers` reports size, not health.** A missing `}` and a stray ` }`
+  both survived text-level reads, and gofmt masks the real break behind
+  cascading "expected declaration" echoes at later clean lines (one real splice
+  produced four echoes). A per-file brace/paren tally, string- and
+  comment-aware (ten lines, proven sufficient this round), in `buffers -json`
+  would have flagged both files immediately — the editor checking itself, no
+  toolchain needed on the driver side. Cheap enough to grow into the proposed
+  `lint` verb.
+- [ ] **`exec` is refused over TCP.** The verify-after-save loop (`raj ctl
+  exec -- make check` once buffers land) is blocked unless raj starts with
+  `--control-exec`, so the user hand-off is the only gate today. If the refusal
+  is deliberate, the two bullets above are the driver-side substitute. If not,
+  `--control-exec` on the canonical start line turns the gate into a
+  self-service loop and this bullet disappears.
 
 ## Layered proposals
 
@@ -379,6 +440,15 @@ missing is addressing and state.
   or two repositories mounted under one parent. `RAJ_ROOT_MAP` is the escape
   hatch; a real answer would ask the editor to resolve paths relative to its
   root and stop sending absolute ones at all.
+- [ ] **`raj ctl search` include/exclude globs match the basename, not the
+  path.** `-include 'internal/tabs/*.go'` and `'app/*.go'` match nothing where
+  `-include '*.go'` matches everything, so a search cannot be scoped to a
+  package — the single most useful fix for an agent driving the editor. Feed
+  `matches()` the relative path instead of `filepath.Base` at both sites — the
+  walk filter and the open-doc eligibility check; `filepath.Match`'s `*`
+  crosses separators, so `*.go` keeps matching, and the `plainExt` fast path
+  is unchanged. The pane and the socket share the engine, so one fix covers
+  both. (Stream B)
 - [ ] **`exec` over TCP is refused, not sandboxed.** The refusal is correct —
   the command would run on the editor's machine, outside the container the
   driver was put in — and it costs the staleness check, which is the one thing
@@ -443,17 +513,16 @@ missing is addressing and state.
   stops from its own start. Self-consistent between the wrap engine and the
   renderer, so the caret stays correct, but it looks slightly off when a line
   with mid-text tabs wraps.
-- [ ] **Two actions are bound but unimplemented**, so their chords are taken
-  from the terminal for nothing: `CommandPalette` (cmd+shift+p) and `CursorUndo`
-  (cmd+u). `GotoLine` and `GotoSymbol` were among the others and are done.
-  `ToggleAgent` was a third; it was removed rather than implemented, so
-  cmd+alt+b goes back to the terminal.
+- [ ] **One action is bound but unimplemented**, so its chord is taken from the
+  terminal for nothing: `CommandPalette` (cmd+shift+p). `GotoLine` and
+  `GotoSymbol` were among the others and are done, and `CursorUndo` (cmd+u)
+  joined them this session. `ToggleAgent` was a third; it was removed rather
+  than implemented, so cmd+alt+b goes back to the terminal.
 
-  They are no longer invisible: `keys.Unimplemented` lists them, KEYBINDINGS.md
-  marks them, and a test in internal/app presses each one and fails if anything
-  handles it — so implementing one without unlisting it breaks the build, and
-  so does binding a fourth without noticing. `CursorUndo` was found that way
-  rather than by anyone noticing.
+  It is no longer invisible: `keys.Unimplemented` lists it, KEYBINDINGS.md
+  marks it, and a test in internal/app presses it and fails if anything
+  handles it — so implementing it without unlisting it would break the build,
+  and so would binding another without noticing.
 - [ ] **Every OSC raj sends is swallowed under tmux.** tmux terminates the
   escape stream, so OSC 1337 SetProfile never reaches iTerm2 and OSC 52 never
   reaches the clipboard — which means a tmux session gets none of the iTerm2 key

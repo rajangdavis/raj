@@ -73,7 +73,7 @@ rather than hidden.
 | add_next_occurrence | `super+d` | cmd+d | ctrl+d | ghostty default: split right |
 | split_into_lines | `shift+super+l` | cmd+shift+l | ctrl+shift+l | sublime: split selection into lines |
 | all_occurrences | `ctrl+super+g` | cmd+ctrl+g | ctrl+alt+g | sublime: find all. alt+f3 on linux, but f3 encodes inconsistently |
-| cursor_undo **(unimplemented)** | `super+u` | cmd+u | ctrl+u | cursor history is not recorded yet |
+| cursor_undo | `super+u` | cmd+u | ctrl+u | — |
 
 ## nav
 

@@ -94,8 +94,10 @@ const (
 	OpID      = 0x0a // varint: request id, echoed in the response
 	OpInclude = 0x0b // comma-separated globs a search is limited to
 	OpExclude = 0x0c // comma-separated globs a search skips
+	OpLine    = 0x0d // varint: 1-based line for goto
+	OpCol     = 0x0e // varint: 1-based column for goto
 
-	// verbs (0x80–0xff): refused when unknown
+	// verbs (0x80–0xff) are the driver verbs, refused when unknown
 	OpPing    = 0x80
 	OpBuffers = 0x81
 	OpRead    = 0x82
@@ -109,6 +111,9 @@ const (
 	OpReject  = 0x8a
 	OpReload  = 0x8b
 	OpStats   = 0x8c
+	OpGoto    = 0x8d // move the cursor to a line and column
+	OpClose   = 0x8e // close a buffer; unsaved work is refused
+
 )
 
 // Search flags, the bits of an OpFlags payload. A bitfield rather than three
@@ -133,6 +138,7 @@ var names = map[byte]string{
 	OpApply: "apply", OpSave: "save", OpVersion: "version", OpSearch: "search",
 	OpGroups: "groups", OpAccept: "accept", OpReject: "reject", OpReload: "reload",
 	OpStats: "stats",
+	OpGoto:  "goto", OpClose: "close", OpLine: "line", OpCol: "col",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

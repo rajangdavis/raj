@@ -78,6 +78,9 @@ const (
 	hMatches      = 0x31
 	hConflicts    = 0x32
 	hSpans        = 0x33
+	hLine         = 0x34 // 1-based line for goto
+	hCol          = 0x35 // 1-based column for goto
+
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -102,6 +105,7 @@ var verbCodes = map[string]byte{
 	"exec": 12, "execcheck": 13, "stats": 14, "hello": 15, "cancel": 16,
 	"recv": 17, "snapshot": 18, "prog": 19, "reload": 20, "whoami": 21,
 	"who": 22, "send": 23,
+	"goto": 24, "close": 25,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -177,6 +181,9 @@ func encodeHeader(h Header) []byte {
 		ops = append(ops, Op8{hBase, prog.Number(int(*h.Base))})
 	}
 	num(hCancel, h.Cancel)
+	num(hLine, h.Line)
+	num(hCol, h.Col)
+
 	num(hGroup, int(h.Group))
 	str(hIdentity, h.Identity)
 	str(hName, h.Name)
@@ -259,7 +266,8 @@ func encodeHeader(h Header) []byte {
 	if len(h.Buffers) > 0 {
 		var w prog.Writer
 		for _, b := range h.Buffers {
-			w.Str(b.Path).Num(int(b.Version)).Bool(b.Dirty).Num(b.Bytes).Num(b.Lines)
+			w.Str(b.Path).Num(int(b.Version)).Bool(b.Dirty).Num(b.Bytes).Num(b.Lines).Bool(b.Active)
+
 		}
 		ops = append(ops, Op8{hBuffers, w.Done()})
 	}
@@ -329,6 +337,11 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Base = &v
 		case hCancel:
 			h.Cancel = prog.ReadNumber(op.Payload)
+		case hLine:
+			h.Line = prog.ReadNumber(op.Payload)
+		case hCol:
+			h.Col = prog.ReadNumber(op.Payload)
+
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
 		case hIdentity:
@@ -420,7 +433,8 @@ func decodeHeader(b []byte) (Header, error) {
 			for r.More() {
 				h.Buffers = append(h.Buffers, Buffer{
 					Path: r.Str(), Version: uint64(r.Num()), Dirty: r.Bool(),
-					Bytes: r.Num(), Lines: r.Num()})
+					Bytes: r.Num(), Lines: r.Num(), Active: r.Bool()})
+
 			}
 		case hMatches:
 			r := prog.NewReader(op.Payload)

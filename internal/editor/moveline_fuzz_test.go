@@ -1,6 +1,7 @@
 package editor
 
 import (
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -56,7 +57,13 @@ func FuzzMoveLines(f *testing.F) {
 			}
 
 			lines := p.touchedLines()
-			moveOracle(oracle, lines, delta)
+			// A downward move that would push the excluded column-0 boundary
+			// line into its own block is refused, so the oracle must not move
+			// those lines either.
+			refused := len(lines) > 0 && delta > 0 && p.boundaryBlocksDown(lines)
+			if !refused {
+				moveOracle(oracle, lines, delta)
+			}
 			p.MoveLines(delta)
 
 			if got := p.File.Text(); got != strings.Join(oracle, "\n") {
@@ -116,5 +123,44 @@ func TestMoveLinesPermutation(t *testing.T) {
 	sort.Strings(want)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("lines = %v, want a permutation of %v", got, want)
+	}
+}
+
+// TestMoveLinesExcludesLineTouchedAtColumn0 pins the column-0 exclusion: a
+// selection ending at column 0 of line 3 covers only lines 1-2, so moving up
+// must leave line 3's text in place.
+func TestMoveLinesExcludesLineTouchedAtColumn0(t *testing.T) {
+	const start = "a\nb\nc\nd\ne\nf"
+	p := newTestPane(start)
+	p.Cursors.Set(p.File.OffsetAt(3, 0), p.File.OffsetAt(1, 0))
+
+	if got := p.touchedLines(); !reflect.DeepEqual(got, []int{1, 2}) {
+		t.Fatalf("touchedLines = %v, want [1 2]", got)
+	}
+
+	p.MoveLines(-1)
+	if want := "b\nc\na\nd\ne\nf"; p.File.Text() != want {
+		t.Errorf("move up = %q, want %q", p.File.Text(), want)
+	}
+}
+
+// TestMoveLinesWontPushTheExcludedBoundary pins the downward guard: moving the
+// same selection down would push the column-0 boundary line into its own block,
+// so MoveLines refuses rather than displace text the selection spared.
+func TestMoveLinesWontPushTheExcludedBoundary(t *testing.T) {
+	const start = "a\nb\nc\nd\ne\nf"
+	p := newTestPane(start)
+	p.Cursors.Set(p.File.OffsetAt(3, 0), p.File.OffsetAt(1, 0))
+
+	if got := p.touchedLines(); !reflect.DeepEqual(got, []int{1, 2}) {
+		t.Fatalf("touchedLines = %v, want [1 2]", got)
+	}
+
+	p.MoveLines(1)
+	if got := p.File.Text(); got != start {
+		t.Errorf("move down = %q, want %q (the boundary must stay where it is)", got, start)
+	}
+	if got := selectedText(p); got != "b\nc\n" {
+		t.Errorf("selection = %q, want still %q", got, "b\nc\n")
 	}
 }

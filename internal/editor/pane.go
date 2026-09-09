@@ -33,7 +33,79 @@ type Pane struct {
 
 	wrapBuf []int // reused across lines and frames by the renderer
 	focused bool
+	// diskStale records the file changed on disk since raj read or wrote it,
+	// set by the app idle tick and cleared by save or reload.
+	diskStale bool
+
+	// cursorHistory records where the cursors were before each movement, so
+	// cmd+u can put them back. A snapshot of a place rather than of an action:
+	// cursor undo returns to a position, which is what undo means for a cursor.
+	cursorHistory []cursorSnapshot
 }
+
+// cursorSnapshot is one recorded cursor position: the whole set and which of
+// them was primary. Primary matters because it is what the viewport follows
+// and the status line reports.
+type cursorSnapshot struct {
+	cursor  []Cursor
+	primary int
+}
+
+// cursorHistoryLimit bounds the undo ring. Fifty positions is enough to move
+// around a long file without losing the earlier places.
+const cursorHistoryLimit = 50
+
+// pushCursorHistory records the current position unless it is the same as the
+// last one recorded, so holding a movement key does not fill the ring with
+// duplicates.
+func (p *Pane) pushCursorHistory() {
+	list, primary := p.Cursors.State()
+	if n := len(p.cursorHistory); n > 0 {
+		top := p.cursorHistory[n-1]
+		if top.primary == primary && sameCursors(top.cursor, list) {
+			return
+		}
+	}
+	p.cursorHistory = append(p.cursorHistory, cursorSnapshot{cursor: list, primary: primary})
+	if len(p.cursorHistory) > cursorHistoryLimit {
+		p.cursorHistory = p.cursorHistory[len(p.cursorHistory)-cursorHistoryLimit:]
+	}
+}
+
+// popCursorHistory restores the most recently recorded position, reporting
+// whether there was one. An empty history is a no-op rather than an error:
+// stepping back before anything has moved should just do nothing.
+func (p *Pane) popCursorHistory() bool {
+	if len(p.cursorHistory) == 0 {
+		return false
+	}
+	s := p.cursorHistory[len(p.cursorHistory)-1]
+	p.cursorHistory = p.cursorHistory[:len(p.cursorHistory)-1]
+	p.Cursors.Restore(s.cursor, s.primary)
+	p.FollowCursor()
+	return true
+}
+
+func sameCursors(a, b []Cursor) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// MarkDiskStale records the file changed on disk behind this tab.
+func (p *Pane) MarkDiskStale() { p.diskStale = true }
+
+// ClearDiskStale resets the disk-changed mark after a save or reload.
+func (p *Pane) ClearDiskStale() { p.diskStale = false }
+
+// DiskStale reports whether the file changed on disk since raj read or wrote it.
+func (p *Pane) DiskStale() bool { return p.diskStale }
 
 // NewPane wraps a file for editing.
 func NewPane(f *File) *Pane {
@@ -250,7 +322,11 @@ func (p *Pane) touchedLines() []int {
 	var out []int
 	for _, c := range p.Cursors.All() {
 		lo, hi := c.Range()
-		for line := p.File.LineOf(lo); line <= p.File.LineOf(hi); line++ {
+		last := p.File.LineOf(hi)
+		if last > p.File.LineOf(lo) && hi == p.File.LineStart(last) {
+			last--
+		}
+		for line := p.File.LineOf(lo); line <= last; line++ {
 			if !seen[line] {
 				seen[line] = true
 				out = append(out, line)

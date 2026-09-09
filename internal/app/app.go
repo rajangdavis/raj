@@ -570,6 +570,7 @@ func (a *App) Handle(e ui.Event) {
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.
 		a.refreshSyntax()
+		a.diskCheck()
 		a.sessionTick(time.Now())
 		a.Debug.sample()
 	case ui.Quit:
@@ -1270,6 +1271,7 @@ func (a *App) reload(p *editor.Pane, then func(saved bool)) {
 		report(then, false)
 		return
 	}
+	p.ClearDiskStale()
 	a.status = "reloaded " + name + " from disk"
 	report(then, false)
 }
@@ -1350,6 +1352,7 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 		return
 	}
 	a.status = "saved " + p.File.Name()
+	p.ClearDiskStale()
 	// The user pressing save is the approval. Nothing else in the editor can
 	// write this file — an agent's own save is refused while its change sets
 	// are proposed — so reaching here means a human chose to put these bytes on
@@ -1604,6 +1607,20 @@ func (a *App) focusEditor() {
 func (a *App) refreshSyntax() {
 	if p := a.Tabs.Active(); p != nil {
 		p.File.RefreshSyntax()
+	}
+}
+
+// diskCheck marks a tab when its file changed on disk since raj read or wrote
+// it, so the prompt on save stops being a surprise. One stat per open tab, on
+// the idle tick; panes already marked are skipped until the user acts.
+func (a *App) diskCheck() {
+	for _, p := range a.Tabs.All() {
+		if p.DiskStale() {
+			continue
+		}
+		if p.File.Path != "" && p.File.DiskChanged() {
+			p.MarkDiskStale()
+		}
 	}
 }
 

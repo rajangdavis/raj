@@ -295,6 +295,9 @@ func (t *Tabs) labels() []string {
 		if p.File.Dirty() {
 			name += " •"
 		}
+		if p.DiskStale() {
+			name += " !"
+		}
 		out[i] = " " + name + " "
 	}
 	return out

@@ -94,6 +94,30 @@ func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (u
 
 func (h *memHost) Save(path string) (uint64, error) { return h.vers[path], nil }
 
+// Goto is a cursor move, and memHost has no cursor: the state it keeps is
+// whether the buffer exists, which is also the one thing the real host can get
+// wrong before the position is even considered.
+func (h *memHost) Goto(path string, line, col int) error {
+	if _, ok := h.docs[path]; !ok {
+		return ErrNoBuffer
+	}
+	return nil
+}
+
+// Close removes the buffer. A memHost is never dirty, so the unsaved-work
+// refusal — which lives in the real host, where the piece table can answer —
+// has nothing to test against here.
+// The Guard's dirty check is what
+// tests exercise (see TestGuardRefusesCloseOfDirtyBuffer).
+func (h *memHost) Close(path string) error {
+	if _, ok := h.docs[path]; !ok {
+		return ErrNoBuffer
+	}
+	delete(h.docs, path)
+	delete(h.vers, path)
+	return nil
+}
+
 func guarded(t *testing.T) (*Guard, *memHost) {
 	t.Helper()
 	root := filepath.Join(string(filepath.Separator), "w")
@@ -206,6 +230,24 @@ func TestDispatchVerbs(t *testing.T) {
 	}
 	if v := Dispatch(g, Request{Op: "version", Path: path}); !v.OK || v.Version != res.Version {
 		t.Errorf("version = %+v, want %d", v, res.Version)
+	}
+	// goto moves a cursor the host can verify; a position on a buffer that is
+	// not open is refused rather than silently parked.
+	if r := Dispatch(g, Request{Op: "goto", Path: path, Line: 2, Col: 3}); !r.OK {
+		t.Errorf("goto = %+v", r)
+	}
+	if r := Dispatch(g, Request{Op: "goto", Path: filepath.Join(h.root, "gone.go"), Line: 1}); r.OK {
+		t.Errorf("goto on a missing buffer was allowed: %+v", r)
+	}
+	// close removes the tab; the second close finds nothing to remove.
+	if c := Dispatch(g, Request{Op: "close", Path: path}); !c.OK {
+		t.Errorf("close = %+v", c)
+	}
+	if _, ok := h.docs[path]; ok {
+		t.Error("close left the buffer open")
+	}
+	if c := Dispatch(g, Request{Op: "close", Path: path}); c.OK {
+		t.Errorf("second close was allowed: %+v", c)
 	}
 	if u := Dispatch(g, Request{Op: "frobnicate"}); u.OK || !strings.Contains(u.Err, "unknown op") {
 		t.Errorf("unknown op = %+v", u)

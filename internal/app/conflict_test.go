@@ -2,10 +2,12 @@ package app
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"raj/internal/prompt"
+	"raj/internal/ui"
 )
 
 // rewriteOnDisk stands in for git, a formatter or another editor: it changes
@@ -191,5 +193,57 @@ func TestReloadBindingOnAnUnnamedBuffer(t *testing.T) {
 	}
 	if got := h.Pane().File.Text(); got != "scratch" {
 		t.Errorf("buffer = %q, want it untouched", got)
+	}
+}
+
+// The idle tick asks each open tab whether its file changed on disk, so the
+// save prompt stops being a surprise: the tab is marked before the user presses
+// save, and a reload clears the mark.
+func TestIdleTickMarksDiskChangedTab(t *testing.T) {
+	h := newHarness(t, "original\n")
+	rewriteOnDisk(t, h, "theirs\n")
+	if h.Pane().DiskStale() {
+		t.Fatal("tab marked before any tick ran")
+	}
+
+	h.Handle(ui.Tick{})
+	h.Draw()
+	if !h.Pane().DiskStale() {
+		t.Fatal("tab not marked after the file changed on disk")
+	}
+	if !strings.Contains(h.host.Text(), "!") {
+		t.Errorf("changed-on-disk mark missing from the tab bar:\n%s", h.host.Text())
+	}
+
+	h.press("super+r")
+	if h.Pane().DiskStale() {
+		t.Error("mark still set after reload")
+	}
+	if got := h.Pane().File.Text(); got != "theirs\n" {
+		t.Errorf("buffer = %q, want the disk version", got)
+	}
+}
+
+// Saving the buffer clears the mark: the bytes now match what the tab shows.
+func TestSaveClearsDiskChangedMark(t *testing.T) {
+	h := newHarness(t, "original\n")
+	h.typeText("mine ")
+	rewriteOnDisk(t, h, "theirs\n")
+	h.Handle(ui.Tick{})
+	if !h.Pane().DiskStale() {
+		t.Fatal("setup: tab not marked")
+	}
+
+	// A dirty buffer's conflict defaults to Overwrite; a second enter takes it.
+	h.press("super+s", "enter")
+	if h.Pane().DiskStale() {
+		t.Error("mark not cleared after save")
+	}
+	data, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "mine original\n" {
+		t.Errorf("on disk = %q, want the buffer", data)
 	}
 }

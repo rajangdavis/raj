@@ -20,6 +20,13 @@ func (p *Pane) Handle(a keys.Action) bool {
 	p.File.Begin()
 	defer p.File.End()
 
+	// Movements record where the cursors were before they moved, so cmd+u can
+	// step back through them. Everything else — typing, text undo, selection
+	// tricks — is answered by another mechanism or changes nothing to undo.
+	if isMotion(a) {
+		p.pushCursorHistory()
+	}
+
 	switch a {
 	// movement
 	case keys.CharLeft:
@@ -114,6 +121,10 @@ func (p *Pane) Handle(a keys.Action) bool {
 		p.history(p.File.Undo(p.Author))
 	case keys.Redo:
 		p.history(p.File.Redo(p.Author))
+	case keys.CursorUndo:
+		// Cursor undo returns to a recorded position; an empty history is a
+		// no-op, not an error — see popCursorHistory.
+		p.popCursorHistory()
 
 	// multi-cursor
 	case keys.CursorAbove:
@@ -134,6 +145,24 @@ func (p *Pane) Handle(a keys.Action) bool {
 	}
 	p.FollowCursor()
 	return true
+}
+
+// isMotion reports whether a is one of the cursor-moving actions. Only these
+// push onto the cursor history: typing is undone by the text undo, and
+// page-scrolling leaves the cursors where they were. The multi-cursor
+// additions are their own thing rather than movements — sed is how they name
+// themselves, and their undo is a collapse, not a return.
+func isMotion(a keys.Action) bool {
+	switch a {
+	case keys.CharLeft, keys.SelCharLeft, keys.CharRight, keys.SelCharRight,
+		keys.LineUp, keys.SelLineUp, keys.LineDown, keys.SelLineDown,
+		keys.LineStart, keys.SelLineStart, keys.LineEnd, keys.SelLineEnd,
+		keys.DocStart, keys.SelDocStart, keys.DocEnd, keys.SelDocEnd,
+		keys.WordLeft, keys.SelWordLeft, keys.WordRight, keys.SelWordRight,
+		keys.SelPageUp, keys.SelPageDown:
+		return true
+	}
+	return false
 }
 
 // HandleText inserts literal text — a keypress with no action bound, or a

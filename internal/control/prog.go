@@ -27,11 +27,13 @@ var knownOps = map[byte]bool{
 	prog.OpAuthor: true, prog.OpToken: true, prog.OpGroup: true,
 	prog.OpQuery: true, prog.OpFlags: true, prog.OpID: true,
 	prog.OpInclude: true, prog.OpExclude: true,
+	prog.OpLine: true, prog.OpCol: true,
 
 	prog.OpPing: true, prog.OpBuffers: true, prog.OpRead: true, prog.OpOpen: true,
 	prog.OpApply: true, prog.OpSave: true, prog.OpVersion: true,
 	prog.OpGroups: true, prog.OpAccept: true, prog.OpReject: true,
 	prog.OpSearch: true, prog.OpStats: true,
+	prog.OpGoto: true, prog.OpClose: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -44,6 +46,7 @@ var verbNames = map[byte]string{
 	prog.OpVersion: "version", prog.OpGroups: "groups",
 	prog.OpAccept: "accept", prog.OpReject: "reject",
 	prog.OpSearch: "search", prog.OpStats: "stats",
+	prog.OpGoto: "goto", prog.OpClose: "close",
 }
 
 // Four verbs stay out of programs, and the reasons are different enough to be
@@ -130,6 +133,11 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			pending.Token = sticky.Token
 		case prog.OpGroup:
 			pending.Group = uint64(prog.ReadNumber(op.Payload))
+		case prog.OpLine:
+			pending.Line = prog.ReadNumber(op.Payload)
+		case prog.OpCol:
+			pending.Col = prog.ReadNumber(op.Payload)
+
 		case prog.OpQuery:
 			pending.query().Text = string(op.Payload)
 		case prog.OpInclude:

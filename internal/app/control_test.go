@@ -64,12 +64,27 @@ func (c *client) do(h *harness, req control.Request) control.Response {
 func controlHarness(t *testing.T, content string) *harness {
 	t.Helper()
 	h := newHarness(t, content)
-	sock := filepath.Join(t.TempDir(), "c.sock")
+	sock := controlSock(t, "c.sock")
 	if err := h.StartControl(sock, false); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(h.StopControl)
 	return h
+}
+
+// controlSock returns a unix socket address short enough on every platform.
+// filepath.Join(t.TempDir(), "c.sock") crosses the 104-byte sockaddr_un
+// sun_path limit on macOS, where TMPDIR is long and t.TempDir() appends the
+// whole test name; bind then fails with "invalid argument". A single short
+// component under os.TempDir() stays well under it.
+func controlSock(t *testing.T, id string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "raj-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, id)
 }
 
 func TestControlReadsBuffers(t *testing.T) {

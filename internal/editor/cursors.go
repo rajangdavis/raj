@@ -75,6 +75,25 @@ func (cs *Cursors) Replace(list []Cursor) {
 	cs.Normalize()
 }
 
+// State records the cursor set and which of them is primary, for snapshotting.
+// The list is a copy, so the caller keeps a stable record of what was here.
+func (cs *Cursors) State() ([]Cursor, int) {
+	return append([]Cursor(nil), cs.list...), cs.primary
+}
+
+// Restore swaps back a snapshot taken by State, keeping its primary identity.
+// The list is assumed to be normalized, as every set is by the time State runs.
+func (cs *Cursors) Restore(list []Cursor, primary int) {
+	if len(list) == 0 {
+		return
+	}
+	cs.list = list
+	if primary < 0 || primary >= len(list) {
+		primary = 0
+	}
+	cs.primary = primary
+}
+
 // Clear collapses to just the primary cursor, dropping its selection. This is
 // escape's job, and it must always be reachable — a stuck multi-cursor state
 // with no way out is the fastest way to make an editor feel broken.
