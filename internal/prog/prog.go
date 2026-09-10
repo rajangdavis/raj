@@ -118,6 +118,7 @@ const (
 	OpDump    = 0x8f // capture a named snapshot of a span, for later patch
 	OpPatch   = 0x90 // replace a snapshot's text; the editor diffs and rebases
 	OpLSP     = 0x91 // ask the language server: hover, definition, completion, diagnostics
+	OpDiff    = 0x92 // pending change sets as old→new text, for review
 
 )
 
@@ -145,7 +146,7 @@ var names = map[byte]string{
 	OpStats: "stats",
 	OpGoto:  "goto", OpClose: "close", OpLine: "line", OpCol: "col",
 	OpDumpID: "dump-id", OpDump: "dump", OpPatch: "patch",
-	OpLSPMode: "lsp-mode", OpLSP: "lsp",
+	OpLSPMode: "lsp-mode", OpLSP: "lsp", OpDiff: "diff",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

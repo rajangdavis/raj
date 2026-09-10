@@ -1334,3 +1334,106 @@ same test could only ever time out. `TestFinishedSearchPostsAWake` assumed
 `drain` would leave the worker's Wake in the queue, but `drain` reads every
 queued event before settling, so the event under test was sometimes eaten by the
 harness. Both now wait on the thing they are actually about.
+
+## Control socket and agent driving
+
+- [x] **`touchedLines` includes a line the selection only touches at column 0.**
+  Fixed and verified (go test green): the guard mirrors `motion.go`'s
+  `SplitIntoLines` — `last := LineOf(hi); if last > LineOf(lo) && hi ==
+  LineStart(last) { last-- }` — downward boundary-block moves are refused
+  rather than displacing the spared line, an upward move parks the end on the
+  block's new far edge, and the fuzz oracle mirrors both
+  (`TestMoveLinesExcludesLineTouchedAtColumn0`,
+  `TestMoveLinesWontPushTheExcludedBoundary`). `CopyLines`, indent and
+  comment-toggle share the function and keep the original caution: the same
+  exclusion is right for them too and wants its own commit each.
+- [x] **Scroll is restored as a line number, not a proportion.** Implemented
+  (Stream C): `session.Tab` gains `Ratio float64` (`json:"ratio,omitempty"`);
+  the save side records `Top/Lines()` via `scrollRatio` in `app/session.go`
+  while still writing `Top` for old-session compat, and restore uses `Ratio`
+  when > 0, computed against the just-opened buffer and clamped to its last
+  line — the pane's first-resize clamp bounds it too, and `validate` keeps
+  clamping plain `Top` for legacy JSON. Tests: same size, resized larger,
+  empty file (ratio 0), legacy JSON without `ratio`. Host-side verification
+  pending: `go test ./internal/session/ ./internal/app/`.
+- [x] **Notice the change before the save.** Done and verified (go test green):
+  `Pane.diskStale` with `MarkDiskStale`/`ClearDiskStale`/`DiskStale`,
+  `App.diskCheck()` on the idle tick — one stat per open tab, skipping
+  already-marked and unnamed buffers — cleared on save and reload, and the tab
+  bar marks the tab with `" !"` (ASCII, so the hand-rolled width table cannot
+  shift hit-testing). First save press is no longer the first the editor knows
+  about; the tick moves that stat onto the idle path. Tests:
+  `TestIdleTickMarksDiskChangedTab`, `TestSaveClearsDiskChangedMark`.
+- [x] **`search` reports line:col, never byte offsets.** Done and verified:
+  `search -json` now reports `byteStart`/`byteEnd` per hit, so "locate an
+  anchor, then `apply` at its offset" is one pipeline of editor-computed
+  coordinates and a driver no longer re-implements the byte model outside the
+  editor.
+- [x] **`read` returns only the whole buffer.** `raj ctl read [path] -start N -end N`
+  is done and verified, so a driver can check a splice seam without re-slicing
+  the whole file. The other half of the bullet — `edit` reporting the span it
+  replaced — is done too: see "A hunk lands unverified" below.
+- [x] **Editor-side scratch: `dump` and `patch`.** Implemented: `raj ctl dump
+  <path> [-start -end]` returns a named, hashed snapshot `{id, version,
+  text}`; `raj ctl patch <path> -dump <id> -text-file -` takes the whole
+  edited text back and the editor computes the old→new diff itself, rebases
+  and applies — the driver never computes offsets or matches text, which
+  retires the `-old` prefix traps, the heredoc-newline gotchas and the offset
+  arithmetic. Decisions taken where the plan was silent: the dump hash is
+  informational and drift detection is delegated to `ApplyDiff` conflict
+  reporting; snapshots are a plain in-memory map keyed by a monotonic id,
+  per-author by construction, evicted on restart. Span-scoped dumps keep it
+  to the structural chunk being changed; shares the rebase walk with the
+  `diff` verb. Host-side verification pending.
+- [x] **The `lsp` verb family over the socket.** Implemented: `raj ctl lsp
+  hover <path> <line:col>`, `lsp definition`, `lsp completion` and `lsp
+  diagnostics <path>` let a driver ask the editor's own LSP client
+  directly. Hover, definition and completion are blocking request/response;
+  diagnostics return the last-known cached state and never block on the
+  server, and "no server for this file type" is a clean error rather than a
+  hang. Shipped as a JSON string header field rather than per-field opcodes —
+  a deliberate retreat from the no-JSON-in-the-header rule, taken because the
+  result is text by construction. Complement to the Reading-A shell/LSP
+  front-end, which becomes a client of this. Host-side verification pending.
+- [x] **A hunk lands unverified.** Implemented: the `edit`/`apply`
+  `-json` reply now carries `spans` with `start`/`end`, the matched `-old`
+  text (edit) and the written replacement (both), so the reply itself is the
+  check. Host-side verification pending. The hole this closed: `edit` and
+  `apply` replied "applied 1 hunk(s)" without echoing what they matched or
+  wrote, so confirming a splice meant re-reading the whole file — and the one
+  silent corruption that round was exactly that hole, a shell mangling of
+  `edit -new` that applied cleanly and survived a sparse dump.
+- [x] **Core `raj ctl diff [path]` (no git).** Exists and confirmed live
+  over the socket: pending change sets as old→new text, pure editor state —
+  group spans plus the rebase walk — the review surface the hunk-echo and
+  group-ranges bullets ask for. Host-side test verification pending.
+- [x] **`raj ctl search` include/exclude globs match the basename, not the
+  path.** Done and verified: `matches()` now receives the relative path from
+  `filepath.Rel(root, path)` at both sites — the walk filter and the open-doc
+  eligibility check; `filepath.Match`'s `*` crosses separators, so `*.go`
+  keeps matching, and the `plainExt` fast path is unchanged.
+  `TestRunGlobsMatchPath` covers it. (Stream B)
+- [x] **A stale socket from a killed process is only probed, not reaped** —
+  discovery now removes what it finds dead. A unix socket with no listener
+  refuses immediately, so a live but busy editor is never reaped.
+- [x] **No way to read a line range.** `raj ctl read -lines A,B` (1-based,
+  inclusive; a bare `A` reads to the end) is implemented: the `text` op
+  accepts line numbers (`hLineStart`/`hLineEnd` on the wire) and the host
+  translates to bytes via its own index, so a driver never re-implements the
+  byte model. Covers `Request`/`Header`/encode/decode, Dispatch, the real
+  host, `memHost`, the CLI flag and `TestDispatchReadsByLines`. Verified live
+  over the socket; host-side `go test ./internal/control/` still pending.
+- [x] **No way to learn a document's length without reading it.** `version -json`
+  now returns bytes and lines alongside the version, so sizing an apply span or
+  finding the end of a file is one cheap call on the buffer you already have.
+  The `stats [path]` alternative is unnecessary. Host-side verification
+  pending: `go test ./internal/control/`.
+- [x] **A streamed search cannot be consumed incrementally as JSON.** A
+  `-jsonl` NDJSON mode is implemented: one JSON object per line per hit as it
+  arrives, the whole-buffer emit is gated off in jsonl mode, and the no-hits
+  exit-1 is preserved. Implemented by a raj subagent; host-side verification
+  pending.
+- [x] **A driver cannot ask for its own outstanding proposals.** `groups
+  -mine` is implemented: the flag filters the listing to the connection's
+  own author id, before both the JSON and text paths. Implemented by a raj
+  subagent; host-side verification pending.

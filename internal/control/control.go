@@ -131,6 +131,28 @@ type Group struct {
 	Last   uint64 `json:"last"`
 }
 
+// DiffGroup is one pending change set rendered for review: the Group as
+// `groups` lists it, plus one hunk per member op that still sits where it was
+// written. Moved counts members the buffer has moved past — later edits
+// reached inside their text, so no honest span exists and they are omitted
+// rather than shown where they are not.
+type DiffGroup struct {
+	Group
+	Hunks []DiffHunk `json:"hunks"`
+	Moved int        `json:"moved"`
+}
+
+// DiffHunk is one member of a change set as old→new text. Start and End are
+// byte offsets in the buffer's current coordinates, locating the replacement
+// now; Old is the text the op removed and New the text it added. A pure
+// insertion has Old empty; a pure deletion has New empty and Start == End.
+type DiffHunk struct {
+	Start int    `json:"start"`
+	End   int    `json:"end"`
+	Old   string `json:"old"`
+	New   string `json:"new"`
+}
+
 // DirtyBuffer is an unsaved buffer, and whether every unsaved run in it was
 // written by an agent rather than by the human.
 type DirtyBuffer struct {
@@ -324,6 +346,10 @@ type Response struct {
 	// request can run off the event thread. LSP never crosses the wire.
 	LSPJSON string
 	LSP     LSPCaller
+	// DiffJSON is the JSON-encoded []DiffGroup a diff request returns: the
+	// pending change sets as old→new text. Nested like LSPJSON, so it
+	// crosses the wire as one header string rather than as flat records.
+	DiffJSON string
 }
 
 // Text flattens the spans, for callers that do not care who wrote what.

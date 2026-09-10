@@ -551,6 +551,34 @@ func (h host) Groups(path string) ([]control.Group, error) {
 	return out, nil
 }
 
+// Diff hands the pending change sets back as old→new hunks. The session owns
+// the rendering: the spans come from the same rebase walk that applies and
+// reverses edits, so what a reviewer sees is where the change sits now, not
+// where it was written.
+func (h host) Diff(path string) ([]control.DiffGroup, error) {
+	p, err := h.find(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []control.DiffGroup
+	for _, g := range p.File.Session().DiffPending() {
+		dg := control.DiffGroup{
+			Group: control.Group{
+				ID: g.Group.ID, Path: p.File.Path, Author: uint8(g.Group.Author),
+				State: g.Group.State.String(), Ops: g.Group.Ops, Bytes: g.Group.Bytes,
+				First: uint64(g.Group.First), Last: uint64(g.Group.Last),
+			},
+			Moved: g.Moved,
+		}
+		for _, hk := range g.Hunks {
+			dg.Hunks = append(dg.Hunks, control.DiffHunk{
+				Start: hk.Start, End: hk.End, Old: hk.Old, New: hk.New})
+		}
+		out = append(out, dg)
+	}
+	return out, nil
+}
+
 // Decide accepts or rejects a change set.
 //
 // Rejection can fail without being an error to retry: a group wedged behind a

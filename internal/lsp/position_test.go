@@ -220,3 +220,87 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// The range form of the round trip above. Everything that carries a span — a
+// diagnostic, a completion textEdit, an incremental change — converts a pair
+// of positions, and a pair has its own ways to fail: the ends can come back
+// crossed, outside the document, mid-rune, or wider than they went.
+func FuzzRangeRoundTrip(f *testing.F) {
+	// One seed per tricky shape: an ordinary span, the ends the other way
+	// round, a caret, a mid-rune end that must round down, a span flush
+	// around a surrogate pair, an empty document, and newline boundaries.
+	f.Add("hello world", 2, 8)
+	f.Add(mixed, 5, 60)
+	f.Add(mixed, 60, 5)
+	f.Add(mixed, 40, 40)
+	f.Add("日本語\n😀", 7, 7)
+	f.Add("a😀b", 1, 5)
+	f.Add("", 0, 0)
+	f.Add("\n\n\n", 1, 3)
+
+	f.Fuzz(func(t *testing.T, text string, a, b int) {
+		if len(text) > 8000 || !utf8.ValidString(text) {
+			return
+		}
+		d := NewDocument(text)
+
+		ca, cb := a, b
+		if ca < 0 {
+			ca = 0
+		}
+		if ca > len(text) {
+			ca = len(text)
+		}
+		if cb < 0 {
+			cb = 0
+		}
+		if cb > len(text) {
+			cb = len(text)
+		}
+		mn, mx := ca, cb
+		if mn > mx {
+			mn, mx = mx, mn
+		}
+
+		lo, hi := d.Span(Range{Start: d.Position(a), End: d.Position(b)})
+
+		// Ordered, however the ends arrived: an inverted span handed to an
+		// edit deletes backwards.
+		if lo > hi {
+			t.Fatalf("Span crossed: (%d,%d) from offsets (%d,%d) in %q", lo, hi, a, b, text)
+		}
+		// Inside the document.
+		if lo < 0 || hi > len(text) {
+			t.Fatalf("Span (%d,%d) outside the document (%d bytes)", lo, hi, len(text))
+		}
+		// On rune boundaries: anything that slices at the span assumes them.
+		if lo < len(text) && !utf8.RuneStart(text[lo]) {
+			t.Fatalf("lo %d is mid-rune in %q", lo, text)
+		}
+		if hi < len(text) && !utf8.RuneStart(text[hi]) {
+			t.Fatalf("hi %d is mid-rune in %q", hi, text)
+		}
+		// Never wider than asked. An end can round down to a rune boundary,
+		// but neither may move forward: a textEdit that removes more than it
+		// named is not a rounding error, it is data loss.
+		if lo > mn || hi > mx {
+			t.Fatalf("Span (%d,%d) moved an end forward of (%d,%d) in %q", lo, hi, mn, mx, text)
+		}
+		// On real boundaries the pair conversion is exact. This is the
+		// property incremental sync stands on: a byte range must survive the
+		// trip through UTF-16 and back unchanged, or the copy the server
+		// holds desynchronises one edit at a time.
+		aligned := func(off int) bool {
+			return off == len(text) || utf8.RuneStart(text[off])
+		}
+		if aligned(ca) && aligned(cb) && (lo != mn || hi != mx) {
+			t.Fatalf("aligned range (%d,%d) came back (%d,%d) in %q", mn, mx, lo, hi, text)
+		}
+		// Converting an already-mapped span is a fixed point, so a response
+		// mapped and mapped again does not drift.
+		lo2, hi2 := d.Span(Range{Start: d.Position(lo), End: d.Position(hi)})
+		if lo2 != lo || hi2 != hi {
+			t.Fatalf("reconverting (%d,%d) gave (%d,%d) in %q", lo, hi, lo2, hi2, text)
+		}
+	})
+}

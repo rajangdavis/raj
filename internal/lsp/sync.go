@@ -14,6 +14,13 @@ import (
 // stricter than the protocol requires: a document is opened exactly once,
 // changes are refused for a document that was never opened, and the version on
 // every change is the buffer's own.
+//
+// A server that advertises incremental sync is sent only the changed ranges.
+// That is safe here for one reason: the tracker pins the exact text the server
+// was last told about, replays the recorded edits onto a copy of it, and only
+// sends ranges when the replay reproduces the buffer byte for byte. Any doubt
+// — history unavailable, an edit that does not fit, a replay that disagrees —
+// sends the whole document instead, which cannot desynchronise by construction.
 
 // SyncKind is how a server wants to be told about changes, as advertised in its
 // capabilities.
@@ -28,6 +35,26 @@ const (
 	SyncIncremental SyncKind = 2
 )
 
+// Edit is one buffer change: replace the bytes in [Start, End) with Text.
+//
+// The coordinates are byte offsets in the frame the previous edits in the
+// batch produced, which is both how the journal records an op (OpsSince hands
+// them out) and how the server applies a content change, so a batch converts
+// one edit at a time, in order.
+type Edit struct {
+	Start, End int
+	Text       string
+}
+
+// tracked is what the server was last told about one document: the version,
+// and the full text of its copy. The text is the pin incremental sync checks
+// its work against — a range computed against anything else would move the
+// server's copy to somewhere the buffer has never been.
+type tracked struct {
+	version int
+	text    string
+}
+
 // Sync tracks which documents the server knows about and at what version.
 //
 // It is not safe for concurrent use: every caller is the event thread, which is
@@ -35,7 +62,7 @@ const (
 type Sync struct {
 	conn *Conn
 	kind SyncKind
-	open map[string]int // URI to the version the server last saw
+	open map[string]tracked
 	mu   sync.Mutex
 }
 
@@ -46,7 +73,7 @@ type Sync struct {
 // but one that asked for none and is sent anything may not, so the advertised
 // value is honoured rather than assumed.
 func NewSync(conn *Conn, kind SyncKind) *Sync {
-	return &Sync{conn: conn, kind: kind, open: map[string]int{}}
+	return &Sync{conn: conn, kind: kind, open: map[string]tracked{}}
 }
 
 // Open tells the server about a document. Opening one that is already open is a
@@ -60,7 +87,7 @@ func (s *Sync) Open(path, languageID, text string, version int) error {
 	s.mu.Lock()
 	_, already := s.open[uri]
 	if !already {
-		s.open[uri] = version
+		s.open[uri] = tracked{version: version, text: text}
 	}
 	s.mu.Unlock()
 	if already {
@@ -76,16 +103,22 @@ func (s *Sync) Open(path, languageID, text string, version int) error {
 	})
 }
 
-// Change tells the server a document has new contents.
+// Change tells the server a document has new contents. edits are the buffer's
+// changes since the version the server last saw, in application order, and may
+// be nil when that history is unavailable — nil never disables sync, it just
+// costs the ranges.
 //
 // A change for a document the server was never told about is dropped rather
 // than sent. The server would reject it, and worse, some accept it and build a
 // phantom document that answers every later request from nothing.
 //
-// A version that has not moved is also dropped: the buffer is unchanged, and a
-// didChange claiming otherwise makes the server redo work for nothing on every
-// keystroke that does not edit.
-func (s *Sync) Change(path, text string, version int) error {
+// A change is sent when the version moved OR the text no longer matches what
+// the server holds. The second condition is not redundant: a version only
+// counts journal entries, and a session replaced by a reload starts counting
+// from zero again, so an old version — even a smaller or equal one — can sit
+// on new text. Dropping it would leave the server's copy frozen at whatever
+// it held before the reload.
+func (s *Sync) Change(path, text string, version int, edits []Edit) error {
 	if s.conn == nil {
 		return ErrClosed
 	}
@@ -95,27 +128,74 @@ func (s *Sync) Change(path, text string, version int) error {
 	uri := URI(path)
 	s.mu.Lock()
 	last, known := s.open[uri]
-	if known && version > last {
-		s.open[uri] = version
+	moved := known && (version != last.version || text != last.text)
+	if moved {
+		s.open[uri] = tracked{version: version, text: text}
 	}
 	s.mu.Unlock()
-	if !known || version <= last {
+	if !moved {
 		return nil
 	}
-	// Whole documents, even where the server accepts incremental changes.
-	//
-	// Incremental is what large files want, and it is the obvious next step —
-	// but it requires the edit ranges, in UTF-16, for every edit since the last
-	// notification, and getting one of them wrong desynchronises the server's
-	// copy silently and permanently. Whole-document sync cannot desynchronise
-	// by construction. The cost is bounded by the file, not the session, and
-	// the change is already debounced by the caller.
+	changes := []map[string]any{{"text": text}}
+	if s.kind == SyncIncremental && version > last.version {
+		if ranged, ok := incrementalChanges(last.text, edits, text); ok {
+			if len(ranged) == 0 {
+				return nil // the version moved; the text did not
+			}
+			changes = ranged
+		}
+	}
 	return s.conn.Notify("textDocument/didChange", map[string]any{
-		"textDocument": map[string]any{"uri": uri, "version": version},
-		"contentChanges": []map[string]any{
-			{"text": text},
-		},
+		"textDocument":   map[string]any{"uri": uri, "version": version},
+		"contentChanges": changes,
 	})
+}
+
+// maxIncrementalEdits bounds the batch converted to ranges. The conversion
+// replays every edit over the pinned text, so its cost is edits × document;
+// past the cap the whole document is the cheaper message as well as the
+// simpler one. Typing and single actions produce a handful of edits between
+// notifications; the cap is for the day an agent lands a thousand-hunk diff.
+const maxIncrementalEdits = 64
+
+// incrementalChanges converts a batch of edits to ranged content changes, each
+// range in UTF-16 against the document its predecessors produced — exactly the
+// document the server applies them to.
+//
+// ok is false, and the caller sends the whole document instead, whenever the
+// batch cannot be proven right: the history is missing (nil edits), an edit
+// does not fit the text it claims to describe, the batch is over the cap, or
+// the replayed result disagrees with the buffer by a single byte. The check is
+// the feature: a range is only ever sent after the bytes it produces have been
+// seen to be the bytes the buffer holds, so incremental sync cannot
+// desynchronise by construction either.
+func incrementalChanges(old string, edits []Edit, new string) ([]map[string]any, bool) {
+	if edits == nil || len(edits) > maxIncrementalEdits {
+		return nil, false
+	}
+	working := old
+	var changes []map[string]any
+	for _, e := range edits {
+		if e.Start == e.End && e.Text == "" {
+			continue // a journal op that changed nothing is not a change
+		}
+		if e.Start < 0 || e.End < e.Start || e.End > len(working) {
+			return nil, false
+		}
+		d := NewDocument(working)
+		r := Range{Start: d.Position(e.Start), End: d.Position(e.End)}
+		changes = append(changes, map[string]any{"range": r, "text": e.Text})
+		// Replay the change the way the server applies it: the range converted
+		// back to bytes. A mid-rune edge would convert back to a rune boundary
+		// and splice different bytes than the edit named — the final check
+		// refuses the batch for it, and the whole document goes out instead.
+		lo, hi := d.Span(r)
+		working = working[:lo] + e.Text + working[hi:]
+	}
+	if working != new {
+		return nil, false
+	}
+	return changes, true
 }
 
 // Save tells the server a document was written, which some servers use to run
@@ -172,8 +252,8 @@ func (s *Sync) IsOpen(path string) bool {
 func (s *Sync) Version(path string) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v, ok := s.open[URI(path)]
-	return v, ok
+	t, ok := s.open[URI(path)]
+	return t.version, ok
 }
 
 // Count is how many documents the server is tracking.

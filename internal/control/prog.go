@@ -37,6 +37,7 @@ var knownOps = map[byte]bool{
 	prog.OpDump: true, prog.OpPatch: true,
 	prog.OpDumpID: true,
 	prog.OpLSP:    true, prog.OpLSPMode: true,
+	prog.OpDiff: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -51,7 +52,7 @@ var verbNames = map[byte]string{
 	prog.OpSearch: "search", prog.OpStats: "stats",
 	prog.OpGoto: "goto", prog.OpClose: "close",
 	prog.OpDump: "dump", prog.OpPatch: "patch",
-	prog.OpLSP: "lsp",
+	prog.OpLSP: "lsp", prog.OpDiff: "diff",
 }
 
 // Four verbs stay out of programs, and the reasons are different enough to be

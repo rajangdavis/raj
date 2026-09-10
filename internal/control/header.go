@@ -90,6 +90,7 @@ const (
 	hHash         = 0x3d // dump: hash of the snapshot text
 	hLSPMode      = 0x3e // lsp: hover, definition, completion or diagnostics
 	hLSPJSON      = 0x3f // lsp: the JSON-encoded answer
+	hDiffJSON     = 0x40 // diff: the JSON-encoded pending change sets
 
 )
 
@@ -118,6 +119,7 @@ var verbCodes = map[string]byte{
 	"goto": 24, "close": 25,
 	"dump": 26, "patch": 27,
 	"lsp": 28, "lspprep": 29,
+	"diff": 30,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -229,6 +231,7 @@ func encodeHeader(h Header) []byte {
 	str(hHash, h.Hash)
 	str(hLSPMode, h.LSPMode)
 	str(hLSPJSON, h.LSPJSON)
+	str(hDiffJSON, h.DiffJSON)
 
 	if len(h.Argv) > 0 {
 		var w prog.Writer
@@ -427,6 +430,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.LSPMode = string(op.Payload)
 		case hLSPJSON:
 			h.LSPJSON = string(op.Payload)
+		case hDiffJSON:
+			h.DiffJSON = string(op.Payload)
 
 		case hArgv:
 			r := prog.NewReader(op.Payload)

@@ -205,7 +205,36 @@ and repeat it in `-new` — there is no insert-at-position for `edit`,
 deliberately, since a line you can quote is one you have actually read. Use
 `apply` with `-start N -end N` for a true insertion at an offset.
 
+## Editor-side scratch: dump and patch
+
+For a structural rewrite — a whole function, a comment block, a config stanza —
+`apply` makes you compute byte offsets and `edit -old` makes you quote the
+exact text. `dump`/`patch` removes both: the editor holds the snapshot and
+computes the diff itself.
+
+```
+raj ctl dump /abs/path/to/file.go                          # whole buffer
+raj ctl dump -start 120 -end 1480 /abs/path/to/file.go     # one structural span
+# -> {"DumpID": 7, "Hash": "...", "text": "...", ...}
+
+# edit the text locally, then hand the whole thing back:
+raj ctl patch /abs/path/to/file.go -dump 7 -text-file /tmp/new.go
+raj ctl patch /abs/path/to/file.go -dump 7 -text-file -    # from stdin
+```
+
+`dump` returns a snapshot id, a hash of the text, and the text. You edit that
+text — freely, with no offset bookkeeping — and `patch` sends the whole edited
+version back. The editor diffs old against new, rebases onto whatever the
+buffer has become, and applies; if the buffer has moved past the snapshot it
+reports the conflict rather than guessing. You never re-derive an offset from
+stale text, which is the mistake that corrupts a file while looking like it
+worked.
+
+Snapshots are per-author and evaporate on restart. Prefer a span-scoped `dump`
+for one function; dump the whole buffer only for a genuinely file-wide change.
+
 ## Batching: one frame instead of fifty
+
 
 Every command above is one round trip. When you have many edits for one file,
 that is fifty frames, fifty rebases and fifty replies for what is conceptually
@@ -382,6 +411,30 @@ yours; that is not retryable, so re-read and propose against the current text.
 Leave accepting to the user. It is their decision, the text is already there
 either way, and it is what unlocks saving the file — see below.
 
+## Reviewing the agent's changes
+
+An agent's edits land as attributed *proposals*, not committed text. Reviewing
+them is a short loop; run through it before saving, and the agent should have
+already jumped you to the first change and closed the files that have none.
+
+- **See every pending change set.** `raj ctl groups <path>` lists them with
+  author, state and size. `groups -mine` filters to the agent's own. This is
+  the list, not the first hunk in the file.
+- **Read the actual edits, not just the summary.** `raj ctl diff <path>`
+  renders each pending group as old→new text with byte-offset anchors. Read
+  this; do not accept on the group's one-line size summary alone.
+- **Jump to each change.** `raj ctl goto <path> LINE` moves the cursor to
+  where the review matters. Ask the agent to goto its hunks as it makes them;
+  if it did not, the group's byte offsets in `diff` tell you where.
+- **Accept deliberately, or back out.** `raj ctl accept <path> -group N`
+  approves one change set; `raj ctl reject <path> -group N` backs it out like
+  it was never written. The plain `save` accepts everything pending in that
+  file at once — use it when the whole pending set is reviewed, not as the
+  discovery step.
+- **When it's wrong, reject rather than edit-over.** `reject` removes the
+  proposal from the record; editing over it leaves both your fix and the
+  original diff in the history.
+
 ## Saving
 
 **You cannot save your own unapproved work, and should not try.** While your
@@ -409,7 +462,30 @@ rather than assuming:
   rather than saving; and remember `exec` already tells you which buffers are
   stale, so you often do not need the save at all.
 
+## Asking the language server
+
+The editor already runs an LSP client for the open buffers. `raj ctl lsp` asks
+it directly, so a driver gets hover, definitions, completion and diagnostics
+without standing up its own server:
+
+```
+raj ctl lsp hover       /abs/path/to/file.go 42:17
+raj ctl lsp definition  /abs/path/to/file.go 42:17
+raj ctl lsp completion  /abs/path/to/file.go 42:17
+raj ctl lsp diagnostics /abs/path/to/file.go
+```
+
+Positions are 1-based `line:col` in the editor's own coordinates; the host maps
+them to the server's UTF-16 grid for you. Hover, definition and completion
+block for the server's answer; `diagnostics` returns the last-known cached
+state and never blocks. A file type with no server is a clean error, not a
+hang. Results come back as JSON — add `-json` to read the structured form.
+
+Use this rather than parsing compiler output or grepping for a definition: the
+answer reflects the buffer as it is now, unsaved edits included.
+
 ## Running commands
+
 
 ```
 raj ctl exec -- go test ./...
@@ -647,19 +723,29 @@ and grepping a `/tmp` dump reads text that is already stale. If a verb is
 genuinely missing, the subagent should stop and report the gap — that is how
 this list grows — rather than reach for a host tool.
 
-Concrete gaps today:
+Concrete gaps, current as of the live server (commit `42f9c653`; verify with
+`raj ctl version` rather than trusting this list's age):
+
+- **Pretty-printing JSON.** `jq` is the usual suspect, and is absent from a
+  hardened container. `raj ctl ... -json` is already machine-readable, but it
+  is one object per reply, not pretty-printed; consume it directly rather than
+  re-formatting it. A driver that needs byte offsets uses `search -json`
+  (`ByteStart`/`ByteEnd` per hit) instead of recomputing them.
+
+Closed gaps — kept here so a stale skills file does not send an agent back to
+a shell tool for something `raj ctl` already does:
 
 - **Reading a line range.** `raj ctl read -lines A,B` (1-based inclusive; a
-  bare `A` reads to the end) is implemented in the control surface, awaiting
-  host verification. Until that build is what a driver talks to, agents still
-  pipe through `sed -n` or `head -n | tail -n` — and the seam to re-check is
-  the one this rule is about.
-- **Counting bytes or lines.** `wc -c` and `wc -l` used to be needed to size
-  apply spans or find the end of a file; `raj ctl version -json` now returns
-  `bytes` and `lines` alongside the version, which closes it.
-- **Pretty-printing JSON.** `jq` is the usual suspect. `raj ctl ... -json` is
-  already the answer for machine-readable output; the agent should consume that
-  directly.
+  bare `A` reads to the end) is live. Use it instead of `sed -n` / `head | tail`.
+- **Counting bytes or lines.** `raj ctl version -json` returns `bytes` and
+  `lines` alongside the version. Use it instead of `wc`.
+- **Editor-side scratch.** `raj ctl dump <path> [-start -end]` snapshots a span
+  and `raj ctl patch <path> -dump <id> -text-file -` takes the edited text back
+  and lets the editor diff and rebase it — the agent never re-derives offsets.
+  Use these instead of a `/tmp` copy plus hand-computed `apply` spans.
+- **Language-server queries.** `raj ctl lsp hover|definition|completion
+  <path> <line:col>` and `lsp diagnostics <path>` ask the editor's own LSP
+  client over the socket. Diagnostics return the cached state and never block.
 
 Rule of thumb: if an agent — or a subagent it spawned — pipes anything other
 than `raj ctl`, it is a candidate for a new flag or verb. Document the gap and

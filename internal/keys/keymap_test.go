@@ -291,3 +291,23 @@ func TestReclaimRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// The proposal review chords are commands, not typed text. They live in
+// Natives — no terminal claims a ctrl+alt+letter — so the only thing to pin is
+// that the keymap resolves them in the editor scope.
+func TestProposalReviewChordsResolve(t *testing.T) {
+	k := NewKeymap()
+	cases := []struct {
+		chord string
+		want  Action
+	}{
+		{"ctrl+alt+a", AcceptProposed},
+		{"ctrl+alt+x", RejectProposed},
+		{"ctrl+alt+v", ReviewProposed},
+	}
+	for _, c := range cases {
+		if got := k.Lookup(Editor, c.chord); got != c.want {
+			t.Errorf("%s = %q, want %q", c.chord, got, c.want)
+		}
+	}
+}

@@ -75,24 +75,22 @@ findings and decisions live in INVESTIGATIONS.md.
   `complete` can express on its own, or moving the apply step out of
   `acceptCompletion` entirely. Both are real designs; neither should be picked
   by whoever happens to be decoding the JSON. Ranges are also not guaranteed
-  single-line, so the position fuzzing wants extending to ranges first, which is
-  the same prerequisite incremental sync has.
+  single-line, so the position fuzzing wanted extending to ranges first — the
+  same prerequisite incremental sync has — and that extension now exists in
+  source: `FuzzRangeRebaseAgainstOracle` (piecetable) carries byte ranges
+  through a random op soup of insert/delete/undo/redo/reject asserting
+  doc-oracle agreement, and `FuzzRangeRoundTrip` (lsp) fuzzes `Document.Span`.
+  Host-side verification pending: `go test ./internal/piecetable/
+  ./internal/lsp/` plus a short `-fuzz` run of each. Decision: deferred,
+  subsumed by the announce/reconciliation design under `claim` and `watch` —
+  the textEdit range is one more announced span flowing through the same
+  reconciliation, so no LSP-specific coordinate decision until that lands.
 - [ ] **Autoscroll runs at the idle tick, which is 150 ms.** That is coarse for
   a scroll: proportional speed makes it usable, since pushing further is how you
   ask for faster, but the motion is visibly stepped rather than smooth. A faster
   tick while a drag is held would fix it and means either a second timer or a
   variable tick rate — the current one exists for idle work and 150 ms is right
   for that.
-- ~~**`touchedLines` includes a line the selection only touches at column 0.**~~
-  Fixed and verified (go test green): the guard mirrors `motion.go`'s
-  `SplitIntoLines` — `last := LineOf(hi); if last > LineOf(lo) && hi ==
-  LineStart(last) { last-- }` — downward boundary-block moves are refused
-  rather than displacing the spared line, an upward move parks the end on the
-  block's new far edge, and the fuzz oracle mirrors both
-  (`TestMoveLinesExcludesLineTouchedAtColumn0`,
-  `TestMoveLinesWontPushTheExcludedBoundary`). `CopyLines`, indent and
-  comment-toggle share the function and keep the original caution: the same
-  exclusion is right for them too and wants its own commit each.
 - [ ] **A press on a list does not drag it.** Clicking selects, and holding and
   moving does nothing — neither rubber-band selection nor drag-to-reorder for
   tabs. Both are real gestures a list can carry and neither has an obvious
@@ -121,8 +119,10 @@ findings and decisions live in INVESTIGATIONS.md.
   the whole file, which cannot desynchronise by construction but costs the file
   size per change. Incremental sync needs the edit ranges in UTF-16 for every
   edit since the last notification, and one wrong range desynchronises the
-  server's copy silently and permanently — so it is worth doing only with the
-  position fuzzing extended to cover ranges, not just points.
+  server's copy silently and permanently — so it was gated on the position
+  fuzzing covering ranges, not just points. That gate is now met in source
+  (`FuzzRangeRebaseAgainstOracle`, `FuzzRangeRoundTrip`; host-side verification
+  pending), so this is unblocked.
 - [ ] **Auto-indent knows brackets and nothing else.** Adding a level after an
   unclosed opener and lining up a closer covers C-family languages and leaves
   out everything indented another way: Python's colon, Ruby's `do`/`end`, YAML,
@@ -131,6 +131,15 @@ findings and decisions live in INVESTIGATIONS.md.
   a keyword whether or not it opens a block. This is where a real per-language
   table starts, and it should wait until something needs it rather than being
   guessed at from one language.
+- [ ] **Tree-sitter is the decided direction for the syntactic layer.**
+  Auto-indent, symbol navigation and string/comment classification move to
+  tree-sitter — in-process, synchronous and deterministic, never a missing
+  server — while semantic queries (hover, definition, completion, diagnostics)
+  stay on LSP. The grammar-management question — one compiled grammar per
+  language, and a C or WASM dependency in a terminal editor — is answered as
+  its own milestone before the feature, not slipped in behind another. This
+  replaces the per-language table the auto-indent bullet defers to, and
+  outranks the chroma half-step on the symbols bullet.
 - [ ] **Blinking secondary carets.** The real caret blinks because the terminal
   blinks it; a drawn one would need raj to redraw on a timer, which means a tick
   fast enough to be a blink and a dirty-region pass small enough that blinking
@@ -158,15 +167,6 @@ findings and decisions live in INVESTIGATIONS.md.
 ~~The session is written only on a clean exit~~ — it is now also written from
   the idle tick, debounced to three seconds, and touched whenever a tab opens or
   closes. A crash loses seconds rather than the session.
-- ~~**Scroll is restored as a line number, not a proportion.**~~ Implemented
-  (Stream C): `session.Tab` gains `Ratio float64` (`json:"ratio,omitempty"`);
-  the save side records `Top/Lines()` via `scrollRatio` in `app/session.go`
-  while still writing `Top` for old-session compat, and restore uses `Ratio`
-  when > 0, computed against the just-opened buffer and clamped to its last
-  line — the pane's first-resize clamp bounds it too, and `validate` keeps
-  clamping plain `Top` for legacy JSON. Tests: same size, resized larger,
-  empty file (ratio 0), legacy JSON without `ratio`. Host-side verification
-  pending: `go test ./internal/session/ ./internal/app/`.
 - [ ] **Dirty-buffer restore** — persist the journal and add-buffers, validated
   by an orig-hash per buffer.
 - [ ] **Attribution across restarts** — tint is commit-scoped, so it must
@@ -199,14 +199,6 @@ findings and decisions live in INVESTIGATIONS.md.
 The write path is atomic and refuses to clobber another writer; what is left is
 the follow-ups that were deliberately kept out of that change.
 
-- ~~**Notice the change before the save.**~~ Done and verified (go test green):
-  `Pane.diskStale` with `MarkDiskStale`/`ClearDiskStale`/`DiskStale`,
-  `App.diskCheck()` on the idle tick — one stat per open tab, skipping
-  already-marked and unnamed buffers — cleared on save and reload, and the tab
-  bar marks the tab with `" !"` (ASCII, so the hand-rolled width table cannot
-  shift hit-testing). First save press is no longer the first the editor knows
-  about; the tick moves that stat onto the idle path. Tests:
-  `TestIdleTickMarksDiskChangedTab`, `TestSaveClearsDiskChangedMark`.
 - [ ] **Owner and group are not preserved.** The temp-and-rename write copies
   the mode but not the uid or gid, so saving a file owned by someone else, as
   root, silently reassigns it. Needs a `Chown` from the stat, and a decision
@@ -239,7 +231,9 @@ the follow-ups that were deliberately kept out of that change.
   places that build one, and `.Header.` appears at 26 call sites. Worth doing
   verb by verb — ping, version, buffers, groups, read — with the header carrying
   whatever has not moved yet, rather than as one change that cannot be tested
-  until all of it works.
+  until all of it works. Caveat from the last driver session: the request side
+  already rides opcodes, so what this conversion should now target wants the
+  user's definition before it is worth implementing.
 - [ ] **Then the request header can go too.** Every verb a program can reach
   already ignores it; what keeps it alive is exec, recv, hello and cancel, which
   are the four the batch loop deliberately does not model. They need opcodes of
@@ -271,20 +265,18 @@ is the transport and the rules around it.
   be collapsed because the transport package has no editor types to reach for,
   and the Stream D additions ride the same eight layers. What remains:
 
-- ~~**`search` reports line:col, never byte offsets.**~~ Done and verified:
-  `search -json` now reports `byteStart`/`byteEnd` per hit, so "locate an
-  anchor, then `apply` at its offset" is one pipeline of editor-computed
-  coordinates and a driver no longer re-implements the byte model outside the
-  editor.
-- ~~**`read` returns only the whole buffer.**~~ `raj ctl read [path] -start N -end N`
-  is done and verified, so a driver can check a splice seam without re-slicing
-  the whole file. The other half of the bullet — `edit` reporting the span it
-  replaced — is still open, tracked by "A hunk lands unverified" below.
+- [ ] **`patch` (and `prog`) dropped their path on the wire.** `EncodeRequest`
+  returned early for `patch` and `prog` before setting `h.Path`, so a patch
+  request arrived pathless and the host resolved it against the active tab —
+  refused when the snapshot named another file, silently misapplied if it
+  happened to match. Found while driving dump/patch over TCP. Fix proposed:
+  `Path` moved into the header literal in wire.go, with a regression case in
+  `TestFrameRoundTrip`; verification pending with the rest.
 - [ ] **A `find` step in the opcode pipeline.** `run -prog` cannot ask "where
   is this text" and get an offset back in the same program, so a batched driver
   round (find → read → apply) is several round trips today. A `find` op
-  answering with a byte span is the single-round-trip version of the two
-  bullets above.
+  answering with a byte span is the single-round-trip version of the
+  `search` and `read` bullets above.
 
 - [ ] **Attribution has no inverse.** An agent can see which spans are its own,
   but there is no verb to drop them. Reverting its own work means computing a
@@ -303,13 +295,6 @@ hard way: each failure below had a cheap structural remedy on the `raj ctl`
 surface, and all three would have caught the byte-drift corruption before a
 compiler hand-off.
 
-- [ ] **A hunk lands unverified.** `edit` and `apply` reply "applied 1 hunk(s)"
-  without echoing what they matched or wrote, so confirming a splice means
-  re-reading the whole file. This round the only silent corruption was that
-  hole: a shell mangling of `edit -new` applied cleanly and survived a sparse
-  dump. Echoing the matched `-old` text and the written span in the `-json`
-  reply makes the reply itself the check — the hunk-echo half of the
-  `read -start/-end` bullet above.
 - [ ] **`buffers` reports size, not health.** A missing `}` and a stray ` }`
   both survived text-level reads, and gofmt masks the real break behind
   cascading "expected declaration" echoes at later clean lines (one real splice
@@ -324,6 +309,13 @@ compiler hand-off.
   is deliberate, the two bullets above are the driver-side substitute. If not,
   `--control-exec` on the canonical start line turns the gate into a
   self-service loop and this bullet disappears.
+
+- [ ] **`dump -start 0` returns the whole file.** Absent-means-zero on the
+  wire header: an explicit `-start 0` is indistinguishable from no flag, so a
+  span dump from byte zero comes back as the whole buffer. Either a presence
+  bit on the wire, or document the quirk in `--help` and the skill.
+- [ ] **`search` has no `-path`/root flag.** `-include` globs suffice; noted
+  by a driver for completeness.
 
 ## Layered proposals
 
@@ -361,6 +353,14 @@ missing is addressing and state.
 - [ ] **Groups have no ranges.** The listing reports ops and net bytes, not
   where. Rendering needs current-coordinate ranges, which means rebasing each
   member forward — the same walk the gutter will need.
+- [ ] **`raj ctl diff -vs HEAD` (git, stretch).** The accepted composition
+  versus git HEAD, distinct from the pending-set view. Depends on the
+  range-rebase walk, deferred deletions (a deleted span leaves no piece) and
+  the base: raj runs read-only `git show HEAD:<path>` on the host — no
+  checkout, no apply, a far smaller surface than `exec` — then diffs
+  internally. The programmatic twin of the change gutter versus git HEAD and
+  of diff-style rendering; one rebase walk feeds all three. The git half is
+  untestable from the container (no shared filesystem).
 - [ ] **Deferred deletions.** A proposed deletion is not performed: the pieces
   stay, the range is marked, and acceptance is when the delete runs. This is
   what makes a deletion visible at all — a deleted span leaves no piece — and it
@@ -376,7 +376,16 @@ missing is addressing and state.
 - [ ] **`claim` and `watch`.** An agent announces the files it is about to touch;
   others are told. Streaming frames and cancellation already exist, so a pushed
   event is nearly free and beats polling — this is the use case that justifies
-  the notifications item above.
+  the notifications item above. The fuller design from the last driver
+  session: an agent declares intent (file, optional spans) before writing; the
+  editor records the claim, makes it queryable over the socket, and reconciles
+  overlapping edits through the rebase walk — conflict, not clamp. It
+  generalises the dump/patch version-pin to a shared coordination surface and
+  derives its span record from the same group-ranges work as the proposals
+  remainder. Open design questions for the user: span granularity (file plus
+  refineable spans?), advisory versus enforced overlap, and claim lifetime
+  (tie to connection liveness). Design doc and verb spec before
+  implementation.
 - [ ] **Which composition does `read` return?** Accepted-only is the argument:
   an agent should propose against the agreed base, not against another agent's
   unaccepted guesses, or overlap detection compares offsets in different
@@ -438,21 +447,63 @@ missing is addressing and state.
   or two repositories mounted under one parent. `RAJ_ROOT_MAP` is the escape
   hatch; a real answer would ask the editor to resolve paths relative to its
   root and stop sending absolute ones at all.
-- ~~**`raj ctl search` include/exclude globs match the basename, not the
-  path.**~~ Done and verified: `matches()` now receives the relative path from
-  `filepath.Rel(root, path)` at both sites — the walk filter and the open-doc
-  eligibility check; `filepath.Match`'s `*` crosses separators, so `*.go`
-  keeps matching, and the `plainExt` fast path is unchanged.
-  `TestRunGlobsMatchPath` covers it. (Stream B)
+- [ ] **Version handshake on the control connection.** The concrete answer to
+  the version skew the notes section leads with, spec against the wire
+  (`internal/control/control.go`). Server side: read `vcs.revision` from
+  `debug.ReadBuildInfo()` at startup — embedded automatically from a VCS
+  checkout, confirmed present in both `bin/raj` and `bin/raj-linux`, so no
+  `-ldflags` stamp is needed — add `SrcVersion string` to `Response`,
+  populate it in the `hello` reply, and stamp it on every response in
+  `connection.send` so a reconnecting client learns it without
+  re-handshaking. Client side: read its own revision the same way and on
+  mismatch print a one-line warning naming both commits — warn, not refuse: a
+  stale pair still works for the verbs that did not change, and the user
+  decides. Wire-compatible: `Response` fields are sent only when nonzero, so
+  an old client ignores the new field and an old server omits it; empty means
+  "unknown" and the check stays silent. What this catches that
+  `go version -m <file>` cannot: the running process reports its own commit,
+  so "rebuilt `./bin/raj` but never restarted the editor" surfaces at connect
+  time instead of mid-session. Open sub-question for the user: also expose it
+  as `raj ctl version` with no path (server build info rather than buffer
+  version), or keep it handshake-only so there is exactly one place the
+  comparison lives?
+- [ ] **Server-minted agent identity, in the same handshake.** Same `hello`
+  wire change as the version handshake, shipped as one proposal — both are
+  metadata the handshake should carry. Verified live: one session of `raj ctl`
+  over TCP minted **253 anonymous author ids** (each invocation is a fresh
+  process that mints an id and abandons it), the `uint8` space caps at 256,
+  and pending proposals end up attributed to a dead `anon-N`, so "who wrote
+  this" is meaningless and `nextAuthor()` drifts toward its `FirstAgent`
+  fallback — silent misattribution. The durable-identity mechanism already
+  exists and is proven (`TestHelloRebindsTheAuthorID`): `hello` carries
+  `Identity`, and `Participants.Join` maps it to the same author id on every
+  reconnect. What is missing is that the client must invent and remember the
+  string, and `raj ctl hello` is not a command (notes section, item 3), so
+  almost nothing binds first. Fix: on first anonymous TCP connect the server
+  mints an identity token and returns it in the `hello` response; the client
+  persists it in `RAJ_IDENTITY` (like `RAJ_CONTROL_TOKEN`) and presents it on
+  every later connect, rebinding to the same author. Server-minted, not
+  client-chosen: no collisions, no two agents picking `claude-1`. `raj ctl`
+  reads `RAJ_IDENTITY` and says `hello` with it automatically before any other
+  verb — bind-first as the default; when unset, it adopts the server's token
+  and prints it once ("set RAJ_IDENTITY=tok_…"). `raj box` injects
+  `RAJ_IDENTITY` alongside `RAJ_CONTROL_ADDR`/`RAJ_CONTROL_TOKEN`. Resolves
+  notes items 3 and 8 and the proposals-on-dead-ids review problem. Open: with
+  identities durable, does the 256 cap still bind, or are `gone` ids recycled?
+- [ ] **`who` lists every participant the process has ever seen.** After one
+  TCP session the listing held 255 entries, all but three dead anons, which
+  makes it noise exactly when several drivers need reading apart. A `-live`
+  flag, or dropping gone-anons from the listing entirely.
+- [ ] **Dump snapshots are keyed by author id, not by identity.** A rebound
+  identity keeps its text but not its snapshots, so `dump`→`patch` across two
+  CLI invocations fails until the driver re-dumps. Keying snapshots by the
+  bound identity string keeps them across reconnects.
 - [ ] **`exec` over TCP is refused, not sandboxed.** The refusal is correct —
   the command would run on the editor's machine, outside the container the
   driver was put in — and it costs the staleness check, which is the one thing
   `exec` was for. A driver running tests in its own sandbox has no way to be
   told it is testing files that do not match the buffers. `buffers` answers it
   with a second round trip and nothing prompts the driver to make one.
-~~A stale socket from a killed process is only probed, not reaped~~ — discovery
-  now removes what it finds dead. A unix socket with no listener refuses
-  immediately, so a live but busy editor is never reaped.
 - [ ] **Region leases.** `apply` rejects a stale hunk after the fact; a lease
   would stop the user and a driver being told they both own a span in the first
   place. The conflict report carries the version that invalidated the range, so
@@ -484,6 +535,45 @@ missing is addressing and state.
   Unnamed buffers stay unaddressable: there is no name to ask for.
 - [ ] **SQLite session store** — the op log as the shareable, forkable artifact.
   Unchanged by the socket, and the socket makes it more useful rather than less.
+
+## `raj box` — the container build/run, folded into the CLI
+
+The two shell functions (`bldraj`, `oc`) that build the opencode image and run
+the agent container move into the binary as `raj box build` / `raj box run`,
+added at the `raj ctl` seam in `cmd/raj/main.go` — a different program sharing
+a binary, dispatched before `flag.Parse`. Goals: the agent always runs against
+an up-to-date binary, and the address/token/port wiring stops being manual.
+The image (`Dockerfile.opencode`) is `node:22-slim` + opencode + an `oc` user
+(UID 501/GID 20), and COPYs four files out of this repo: `bin/raj-linux`,
+`skills/raj-editor/SKILL.md`, `plugins/raj-gate.ts` and
+`opencode/{opencode.json,agents/raj.md}`.
+
+- [ ] **`raj box build`** — cross-compile (`GOOS=linux GOARCH=amd64
+  CGO_ENABLED=0 go build -o bin/raj-linux ./cmd/raj`), then `docker build`
+  with the build context at the repo root rather than `~/Desktop/projects`,
+  so the COPY paths are repo-relative and always current (today the Dockerfile
+  lives one directory up and only sees a committed binary). Stamp the image
+  with `--label raj.src=$(git rev-parse HEAD)` — a diagnostic only, not the
+  freshness guard (see the resolution below).
+- [ ] **`raj box run`** — `--agent raj --rm -it`, the data volume and the
+  API-key passthrough. Generates the control token itself (crypto/rand,
+  replacing the manual `openssl rand -hex 32` export) and injects it into both
+  the container env and the control address, and picks a free loopback port
+  instead of hardcoding 7391, so two instances no longer collide.
+
+The stale-binary fork is resolved. The Dockerfile puts raj the binary in the
+box, but in the current arrangement the agent is a pure `raj ctl` client of
+raj the editor on the host over TCP: rebuilding the image refreshes only the
+binary baked in at `docker build` time, a `-v` mount never touches
+`/usr/local/bin/raj`, and neither reaches the long-running host process that
+actually holds the buffers. So the immediate fix is model (b): mount the repo
+(`-v "$PWD:/work"`) and run raj's own editor in the box, so a rebuild
+genuinely delivers a fresh binary — and with the source mounted, a Go
+toolchain in the image becomes worth adding. The durable fix for two binaries
+that can drift is the version handshake on the control connection (spec above,
+with the TCP items); the originally proposed `-ldflags -X main.version` stamp
+is unnecessary because `vcs.revision` is already embedded (confirmed in both
+`bin/raj` and `bin/raj-linux`).
 
 ## Known rough edges
 
@@ -552,29 +642,14 @@ Each item is cheap relative to what it cost to work around.
   refused rather than served degraded. Decode-silently-ignores is the right
   default for forward compatibility; an opt-in refusal is the mode an agent
   wants, because its workaround for a missing feature is always worse than
-  the error.
-- **No way to read a line range.** `read -start/-end` covers bytes, but an
-  agent holding a line number from a compiler or a search hit still pipes the
-  full text through host shell tools. A `read -lines A,B` flag removes the
-  last reason to reach past the buffer.
-- ~~**No way to learn a document's length without reading it.**~~ `version -json`
-  now returns bytes and lines alongside the version, so sizing an apply span or
-  finding the end of a file is one cheap call on the buffer you already have.
-  The `stats [path]` alternative is unnecessary. Host-side verification
-  pending: `go test ./internal/control/`.
+  the error. The build-version half of this now has a concrete design: the
+  version handshake on the control connection, spec among the TCP items
+  above.
 - **`edit`'s refusal does not quote what it saw.** "does not appear in the
   buffer" against a 40-line `-old` leaves the driver diffing blind.
   Reporting the longest common prefix of the miss (or the offset of the
   nearest match) would turn the retry into a targeted fix instead of a
   re-read of the whole file.
-- **A streamed search cannot be consumed incrementally as JSON.** Batches
-  are suppressed until the end so the document stays parseable — right for
-  correctness, but a driver wanting early hits gets nothing for the whole
-  walk. An NDJSON mode (`-jsonl`, one object per line) keeps both halves.
-- **A driver cannot ask for its own outstanding proposals.** `groups` lists
-  every change set in the buffer; filtering by author is client-side and the
-  client has to already know its id. `groups -mine`, matched against the
-  connection's own author id, is the common case.
 - **Container ergonomics: no shared filesystem means stale-file checks are
   manual.** `exec` is correctly refused over TCP, but then nothing warns the
   driver that the bytes it is about to compile in its own sandbox do not
@@ -599,6 +674,40 @@ Each item is cheap relative to what it cost to work around.
   (a generation counter on `whoami`, bumped per listen) would let a driver
   bin its cached versions instead of discovering staleness one refused
   apply at a time.
+- **No Go toolchain in the container, so the host verifies.** No shared
+  filesystem and `exec` refused over TCP: agent work lands as proposals in
+  buffers, and the contract is that the user accepts and saves, then
+  `gofmt -w && go test ./... && make check` runs on the host. State it every
+  session.
+- **Bind an identity first over TCP, or every invocation is a new author.**
+  Each `raj ctl` call reconnects, and an anonymous reconnect mints a fresh
+  author id — per-author state (dump snapshots) does not survive between
+  invocations and proposals scatter across dead ids. `hello` is not a
+  `raj ctl` command: identity binding goes through `who` — `who -as X -name Y`
+  binds a name, and later `-as X` connections keep its id. Bind first, then
+  work. Open: add `raj ctl hello -as X -name Y` as the identity verb, or
+  document `who` as that verb.
+- **The Stream A/B/C/D labels are used but never defined.** The globs fix is
+  Stream B, scroll-ratio restore is Stream C, the driver-round additions ride
+  Stream D, and no file says what the streams are. Needs definitions from the
+  user to write.
+
+- **The rebuild boundary is not written down as a workflow.** New verbs are
+  compiled into the binary; buffer edits cannot make them live. Both
+  subagents in the 2026-09-09 session handled it correctly — verify semantics
+  against the running editor, state the host-side test contract — and each
+  had to discover the boundary for itself. The skill should state the loop
+  explicitly: propose in buffers, user accepts and saves, host rebuilds,
+  verify over the socket.
+- **The tooling prohibition needs to name the temptation.** "Use only raj
+  ctl verbs" invites the reading "for file access", and JSON post-processing
+  slips in under "just parsing tool output" — the orchestrator itself did it
+  once that session (python3 on `read -json` output; it failed on the spot,
+  no source edits went through it). Briefs should say: no interpreters
+  (python/node/jq) anywhere in the pipeline, including on `raj ctl` output;
+  if the output is hard to consume, that is a verb-surface gap to report. A
+  query flag on the verb (`read -json -field text`, in the spirit of the
+  flat-record item) is the sanctioned shape, not a pipe to an interpreter.
 
 ## Deliberately not doing
 

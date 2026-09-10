@@ -35,6 +35,14 @@ type Theme struct {
 	FindMatch  ui.Style
 	FindActive ui.Style
 
+	// ProposedAdd and ProposedDel are the review colours: a pending change
+	// set is green where it added text and red where it removed text, as in
+	// a git diff. Colour carries the STATE of a change, not its author —
+	// identity is the gutter mark. Accepted text keeps AgentTint, which is
+	// attribution rather than review.
+	ProposedAdd ui.Color
+	ProposedDel ui.Color
+
 	// Caret is the block a secondary cursor draws, CaretText the character
 	// left sitting in it.
 	Caret     ui.Color
@@ -46,15 +54,17 @@ type Theme struct {
 // tint are given explicit colours.
 func DefaultTheme() Theme {
 	return Theme{
-		Text:       ui.DefaultStyle,
-		Gutter:     ui.DefaultStyle.With(ui.Ansi(8)),
-		GutterCur:  ui.DefaultStyle.With(ui.Ansi(7)),
-		Selection:  ui.DefaultStyle.On(ui.Ansi(238)),
-		AgentTint:  ui.Ansi(22),
-		FindMatch:  ui.DefaultStyle.On(ui.Ansi(58)),
-		FindActive: ui.DefaultStyle.On(ui.Ansi(136)),
-		Caret:      ui.Ansi(12),
-		CaretText:  ui.Ansi(0),
+		Text:        ui.DefaultStyle,
+		Gutter:      ui.DefaultStyle.With(ui.Ansi(8)),
+		GutterCur:   ui.DefaultStyle.With(ui.Ansi(7)),
+		Selection:   ui.DefaultStyle.On(ui.Ansi(238)),
+		AgentTint:   ui.Ansi(22),
+		ProposedAdd: ui.Ansi(28),
+		ProposedDel: ui.Ansi(88),
+		FindMatch:   ui.DefaultStyle.On(ui.Ansi(58)),
+		FindActive:  ui.DefaultStyle.On(ui.Ansi(136)),
+		Caret:       ui.Ansi(12),
+		CaretText:   ui.Ansi(0),
 	}
 }
 
@@ -98,6 +108,9 @@ func (p *Pane) RenderFocused(s *ui.Screen, x, y, w, h int, th Theme, focused boo
 	// running it inside drawLine would repeat it for every visible row of a
 	// wrapped screen.
 	brackets := p.bracketMarks()
+	// Same shape for the pending change sets: the journal walk DiffPending
+	// runs once per frame, and the rows below tint from the result.
+	p.pending = p.PendingMarks()
 
 	// Rows, not lines. When wrapping is off every line is one row and this
 	// degenerates to the old loop; when it is on, the first line starts above
@@ -252,9 +265,14 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 	}
 }
 
-// authorTints maps byte offsets within a line to a background colour, for text
-// written by an agent. Original and user text is left untinted so the terminal
-// background shows through.
+// authorTints maps byte offsets within a line to a background colour, for
+// text written by an agent. Original and user text is left untinted so the
+// terminal background shows through.
+//
+// Two layers, one mechanism: attribution is AgentTint, review is ProposedAdd.
+// A pending hunk's inserted text is green while it awaits a decision, exactly
+// the added half of a diff; accepting it drops it back to the plain author
+// tint, because it is no longer under review.
 func (p *Pane) authorTints(start, length int, th Theme) map[int]ui.Color {
 	out := map[int]ui.Color{}
 	if length == 0 {
@@ -266,6 +284,23 @@ func (p *Pane) authorTints(start, length int, th Theme) map[int]ui.Color {
 		}
 		for i := 0; i < sp.Len; i++ {
 			out[sp.Off-start+i] = th.AgentTint
+		}
+	}
+	end := start + length
+	for _, m := range p.pending {
+		if m.Removed || m.End <= start || m.Start >= end {
+			continue // a deletion leaves nothing to colour
+		}
+		lo := m.Start
+		if lo < start {
+			lo = start
+		}
+		hi := m.End
+		if hi > end {
+			hi = end
+		}
+		for i := lo; i < hi; i++ {
+			out[i-start] = th.ProposedAdd
 		}
 	}
 	return out

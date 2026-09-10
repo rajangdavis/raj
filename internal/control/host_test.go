@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ type memHost struct {
 	opens  []string
 	dirty  []DirtyBuffer
 	groups []Group
+	diffs  []DiffGroup
 	snaps  map[uint64]snapEntry
 	seq    uint64
 }
@@ -491,6 +493,16 @@ func (h *memHost) Dirty() []DirtyBuffer { return h.dirty }
 
 func (h *memHost) Groups(path string) ([]Group, error) { return h.groups, nil }
 
+// Diff mirrors Groups: a memory host has no journal to rebase, so the pending
+// diffs are fixture data rather than a walk. The real host's walk is
+// exercised in internal/piecetable and internal/app instead.
+func (h *memHost) Diff(path string) ([]DiffGroup, error) {
+	if _, ok := h.docs[path]; !ok {
+		return nil, ErrNoBuffer
+	}
+	return h.diffs, nil
+}
+
 func (h *memHost) Decide(path string, group uint64, accept bool) error {
 	for i := range h.groups {
 		if h.groups[i].ID != group {
@@ -690,6 +702,45 @@ func TestDispatchGroups(t *testing.T) {
 		t.Error("reject with no group id was accepted")
 	}
 	if res := Dispatch(g, Request{Op: "reject", Path: "/etc/passwd", Group: 7}); res.OK {
+		t.Error("a path outside the workspace was accepted")
+	}
+}
+
+// diff is the review surface for what groups only lists: each pending change
+// set comes back as old→new hunks in current coordinates, and an empty
+// pending set is a clean answer rather than an error.
+func TestDispatchDiff(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.diffs = []DiffGroup{{
+		Group: Group{ID: 7, Path: path, Author: FirstAgent, State: "proposed", Ops: 1, Bytes: 1},
+		Hunks: []DiffHunk{{Start: 6, End: 11, Old: "world", New: "earth"}},
+	}}
+
+	res := Dispatch(g, Request{Op: "diff", Path: path})
+	if !res.OK {
+		t.Fatalf("diff = %+v", res)
+	}
+	var diffs []DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatalf("the diff payload is not JSON: %v", err)
+	}
+	if len(diffs) != 1 || diffs[0].ID != 7 || len(diffs[0].Hunks) != 1 {
+		t.Fatalf("decoded diffs = %+v, want the one seeded group and hunk", diffs)
+	}
+	if diffs[0].Hunks[0].Old != "world" || diffs[0].Hunks[0].New != "earth" {
+		t.Errorf("hunk = %+v", diffs[0].Hunks[0])
+	}
+
+	// Nothing pending is a clean buffer: OK with an empty list, not an error.
+	h.diffs = nil
+	res = Dispatch(g, Request{Op: "diff", Path: path})
+	if !res.OK || res.DiffJSON != "[]" {
+		t.Errorf("empty diff = %+v, want OK with an empty list", res)
+	}
+
+	// A path outside the workspace is refused, as for every other verb.
+	if res := Dispatch(g, Request{Op: "diff", Path: "/etc/passwd"}); res.OK {
 		t.Error("a path outside the workspace was accepted")
 	}
 }

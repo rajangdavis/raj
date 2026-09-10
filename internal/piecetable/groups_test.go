@@ -259,3 +259,83 @@ func TestUndoInASharedGroupTouchesOnlyYourOwnOps(t *testing.T) {
 		t.Errorf("undo = %q, want only the user's insertion removed", got)
 	}
 }
+
+// DiffPending renders a proposed change set as old→new text: the span each
+// member occupies now, the bytes it removed, and the bytes it wrote.
+func TestDiffPendingRendersOldAndNew(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.End()
+	s.MarkGroup(s.LastGroup(), Proposed)
+
+	diffs := s.DiffPending()
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want the one proposed group", diffs)
+	}
+	d := diffs[0]
+	if d.Moved != 0 || len(d.Hunks) != 1 {
+		t.Fatalf("diff = %+v, want one placed hunk", d)
+	}
+	hk := d.Hunks[0]
+	if hk.Old != "world" || hk.New != "socket" {
+		t.Errorf("hunk old/new = %q/%q, want world/socket", hk.Old, hk.New)
+	}
+	if hk.Start != 6 || hk.End != 6+len("socket") {
+		t.Errorf("hunk span = %d..%d, want 6..12", hk.Start, hk.End)
+	}
+
+	// Accepted, the set is no longer pending and the diff is clean.
+	s.AcceptGroup(d.Group.ID)
+	if got := s.DiffPending(); len(got) != 0 {
+		t.Errorf("diffs after accepting = %+v, want none", got)
+	}
+}
+
+// A pure deletion reports its removed text as old with an empty new, and its
+// span collapses to the point where the text was.
+func TestDiffPendingRendersADeletion(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 5, End: 11, Text: ""}})
+	s.End()
+	s.MarkGroup(s.LastGroup(), Proposed)
+
+	diffs := s.DiffPending()
+	if len(diffs) != 1 || len(diffs[0].Hunks) != 1 {
+		t.Fatalf("diffs = %+v, want one group with one hunk", diffs)
+	}
+	hk := diffs[0].Hunks[0]
+	if hk.Old != " world" || hk.New != "" {
+		t.Errorf("hunk old/new = %q/%q, want %q/empty", hk.Old, hk.New, " world")
+	}
+	if hk.Start != 5 || hk.End != 5 {
+		t.Errorf("deletion span = %d..%d, want the point 5..5", hk.Start, hk.End)
+	}
+}
+
+// A member whose text a later edit reached into can no longer be placed
+// honestly; it is counted as moved rather than shown as if the buffer still
+// held what was written.
+func TestDiffPendingCountsMembersMovedPast(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.End()
+	s.MarkGroup(s.LastGroup(), Proposed)
+
+	// The user types inside the proposed text, so the hunk's span no longer
+	// holds what the agent wrote.
+	s.Insert(User, 8, "XYZ")
+
+	diffs := s.DiffPending()
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want the one group", diffs)
+	}
+	if diffs[0].Moved != 1 || len(diffs[0].Hunks) != 0 {
+		t.Errorf("diff = %+v, want the overwritten member counted as moved", diffs[0])
+	}
+}

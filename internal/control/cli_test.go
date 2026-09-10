@@ -30,7 +30,9 @@ type fakeEditor struct {
 	// bump is called before each apply, to simulate the user typing between a
 	// read and the write that follows it.
 	bump func()
-	stop chan struct{}
+	// diffJSON is the canned diff answer; empty means no pending changes.
+	diffJSON string
+	stop     chan struct{}
 }
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
@@ -172,6 +174,11 @@ func (f *fakeEditor) run(req Request) Response {
 		return Response{OK: true, Version: f.vers[path]}
 	case "save":
 		return Response{OK: true, Version: f.vers[path]}
+	case "diff":
+		if f.diffJSON == "" {
+			return Response{OK: true, DiffJSON: "[]"}
+		}
+		return Response{OK: true, DiffJSON: f.diffJSON}
 	}
 	return Response{Err: "unknown op " + req.Op}
 }
@@ -319,6 +326,36 @@ func TestCLIJSON(t *testing.T) {
 	out, _, code = run(t, "read", "-json", "/w/a.go")
 	if code != 0 || !strings.Contains(out, `"version"`) {
 		t.Errorf("json read = %q", out)
+	}
+}
+
+// diff is the review surface: each pending group renders as old→new lines
+// under its id, author and span; -json returns the structured form.
+func TestCLIDiffRendersPendingChanges(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.diffJSON = `[{"id":7,"path":"/w/a.go","author":2,"state":"proposed","ops":1,` +
+		`"bytes":1,"first":1,"last":1,"hunks":[{"start":6,"end":11,"old":"world","new":"earth"}],"moved":0}]`
+
+	out, errs, code := run(t, "diff", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	for _, want := range []string{"group 7", "author 2", "@@ 6..11 @@", "-world", "+earth"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff output %q missing %q", out, want)
+		}
+	}
+
+	out, _, code = run(t, "diff", "-json", "/w/a.go")
+	if code != 0 || !strings.Contains(out, `"old": "world"`) || !strings.Contains(out, `"new": "earth"`) {
+		t.Errorf("json diff = %q, code %d", out, code)
+	}
+
+	// No pending change sets is a clean, explicit answer on exit 0.
+	ed.diffJSON = ""
+	out, _, code = run(t, "diff", "/w/a.go")
+	if code != 0 || !strings.Contains(out, "no pending changes") {
+		t.Errorf("clean diff = %q, code %d", out, code)
 	}
 }
 

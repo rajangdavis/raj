@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -470,6 +471,68 @@ func TestAgentEditsArriveAsProposals(t *testing.T) {
 	}
 	if got := h.text(); got != "hello world\n" {
 		t.Errorf("after rejecting = %q, want the original back", got)
+	}
+}
+
+// The diff verb is the review surface: the proposal that `groups` only lists
+// comes back as old→new text with the span it covers now, and a clean buffer
+// answers with an empty list rather than an error.
+func TestControlDiffRendersPendingChanges(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	// Nothing proposed yet: a clean, explicit empty answer.
+	res := c.do(h, control.Request{Op: "diff", Path: path})
+	if !res.OK {
+		t.Fatalf("diff = %+v", res)
+	}
+	var diffs []control.DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatalf("diff payload is not JSON: %v", err)
+	}
+	if len(diffs) != 0 {
+		t.Fatalf("diffs = %+v, want none before any proposal", diffs)
+	}
+
+	read := c.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}); !r.OK {
+		t.Fatal("apply failed")
+	}
+
+	res = c.do(h, control.Request{Op: "diff", Path: path})
+	if !res.OK {
+		t.Fatalf("diff = %+v", res)
+	}
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatalf("diff payload is not JSON: %v", err)
+	}
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want the one proposal", diffs)
+	}
+	d := diffs[0]
+	if d.State != "proposed" || len(d.Hunks) != 1 {
+		t.Fatalf("diff group = %+v, want the proposed set with one hunk", d)
+	}
+	if d.Hunks[0].Old != "world" || d.Hunks[0].New != "socket" {
+		t.Errorf("hunk old/new = %q/%q, want world/socket", d.Hunks[0].Old, d.Hunks[0].New)
+	}
+	if d.Hunks[0].Start != 6 || d.Hunks[0].End != 12 {
+		t.Errorf("hunk span = %d..%d, want 6..12", d.Hunks[0].Start, d.Hunks[0].End)
+	}
+
+	// Rejected, the set is no longer pending and the diff is clean again.
+	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: d.ID}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
+	res = c.do(h, control.Request{Op: "diff", Path: path})
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatalf("diff payload is not JSON: %v", err)
+	}
+	if len(diffs) != 0 {
+		t.Errorf("diffs after reject = %+v, want none", diffs)
 	}
 }
 

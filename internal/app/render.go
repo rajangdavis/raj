@@ -34,6 +34,7 @@ func (a *App) Draw() {
 	if l.ShowEditor {
 		a.drawEditor(l)
 		a.drawDiagnosticMarks(l)
+		a.drawProposalMarks(l)
 	}
 	a.drawStatus(cols, rows-1)
 
@@ -141,6 +142,52 @@ func (a *App) drawDiagnosticMarks(l Layout) {
 			st = st.With(ui.Ansi(3)) // yellow
 		}
 		a.screen.SetString(l.EditorX, row, severityMark(sev), st, 1)
+	}
+}
+
+// drawProposalMarks writes the pending-review mark into the gutter: one cell
+// on each line a proposed change touches — the writer initial in green where
+// text was added, red where text was removed. Colour carries the state of the
+// change; the letter carries who, from the participant table. It shares the
+// diagnostics marks trade: the number under a mark is recoverable from the
+// status line, and a mark drawn over its first digit is still readable.
+func (a *App) drawProposalMarks(l Layout) {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	marks := p.PendingMarks()
+	if len(marks) == 0 {
+		return
+	}
+	top, rows := l.TopY, l.Rows
+	if p.Find.Open {
+		top, rows = top+1, rows-1
+	}
+	first := p.Viewport.Top
+	// Two passes so a removal wins a shared line: red is the mark that cannot
+	// be seen anywhere else, since a deletion leaves no text to tint.
+	for _, removed := range []bool{false, true} {
+		for _, m := range marks {
+			if m.Removed != removed {
+				continue
+			}
+			last := m.Line
+			if m.End > m.Start {
+				last = p.File.LineOf(m.End - 1)
+			}
+			for line := m.Line; line <= last; line++ {
+				if line < first || line >= first+rows {
+					continue
+				}
+				color := a.theme.ProposedAdd
+				if removed {
+					color = a.theme.ProposedDel
+				}
+				a.screen.SetString(l.EditorX, top+(line-first),
+					a.participantInitial(m.Author), a.theme.Gutter.With(color), 1)
+			}
+		}
 	}
 }
 

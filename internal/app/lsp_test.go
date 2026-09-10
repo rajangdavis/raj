@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"raj/internal/lsp"
+	"raj/internal/piecetable"
 )
 
 // The rule the whole integration follows: no language feature may make the
@@ -347,5 +348,72 @@ func TestCompletionDoesNotReopenAClosedPopup(t *testing.T) {
 	h.applyAnswer()
 	if h.Complete.Open {
 		t.Error("a late answer reopened the popup")
+	}
+}
+
+// The journal window becomes the batch a sync sends: one edit per op, in
+// application order, with the inserted text read back out of the stores.
+// Offsets here come from the document, never a hand count — the UTF-16
+// conversion downstream stands on them being right.
+func TestEditsSince(t *testing.T) {
+	sess := piecetable.NewSession(piecetable.NewDoc("one\ntwo\n", 8))
+	v0 := sess.Version()
+
+	two := strings.Index("one\ntwo\n", "two")
+	sess.ApplyDiff(piecetable.User, sess.Version(), []piecetable.Hunk{
+		{Start: two, End: two + len("two"), Text: "TWO"},
+	})
+	v1 := sess.Version()
+
+	edits := editsSince(sess, v0)
+	if len(edits) != 1 {
+		t.Fatalf("edits = %v, want the one op", edits)
+	}
+	want := lsp.Edit{Start: two, End: two + len("two"), Text: "TWO"}
+	if edits[0] != want {
+		t.Errorf("edit = %+v, want %+v", edits[0], want)
+	}
+
+	// The window pins to the version: asking from the present yields nothing.
+	if got := editsSince(sess, v1); got != nil {
+		t.Errorf("editsSince(present) = %v, want nil — nothing since", got)
+	}
+
+	// Undo is an op too, and it restores what the edit removed: the reversal
+	// deletes "TWO" and re-inserts the "two" still held in the store.
+	if !sess.Undo(piecetable.User) {
+		t.Fatal("undo refused its only op")
+	}
+	edits = editsSince(sess, v1)
+	if len(edits) != 1 {
+		t.Fatalf("edits after undo = %v, want the reversal", edits)
+	}
+	want = lsp.Edit{Start: two, End: two + len("TWO"), Text: "two"}
+	if edits[0] != want {
+		t.Errorf("undo edit = %+v, want %+v", edits[0], want)
+	}
+}
+
+// A window of several ops stays in order, and an insertion's text reads back
+// byte for byte — the multibyte case, since the ranges convert to UTF-16
+// against these exact offsets.
+func TestEditsSincePreservesOrderAndText(t *testing.T) {
+	const doc = "a λ日 😀\n"
+	sess := piecetable.NewSession(piecetable.NewDoc(doc, 8))
+	v0 := sess.Version()
+
+	at := strings.Index(doc, "λ")
+	sess.Insert(piecetable.User, at, "→")
+	sess.Delete(piecetable.User, 0, 1)
+
+	edits := editsSince(sess, v0)
+	if len(edits) != 2 {
+		t.Fatalf("edits = %v, want insert then delete", edits)
+	}
+	if want := (lsp.Edit{Start: at, End: at, Text: "→"}); edits[0] != want {
+		t.Errorf("insert = %+v, want %+v", edits[0], want)
+	}
+	if want := (lsp.Edit{Start: 0, End: 1, Text: ""}); edits[1] != want {
+		t.Errorf("delete = %+v, want %+v", edits[1], want)
 	}
 }

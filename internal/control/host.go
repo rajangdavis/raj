@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -95,6 +96,11 @@ type BufferHost interface {
 	// group: the members are rebased through everything that landed after them
 	// and rolled back together if any cannot be placed.
 	Decide(path string, group uint64, accept bool) error
+
+	// Diff renders the buffer's pending change sets as old→new hunks in
+	// current coordinates: the review surface for what Groups only lists.
+	// An empty result means no changes await a decision.
+	Diff(path string) ([]DiffGroup, error)
 
 	// Dump captures a snapshot of [start,end) at the buffer's current version,
 	// returning its id, the version it was taken at, and the text. The id is
@@ -277,6 +283,22 @@ func (g *Guard) Dump(path string, start, end int, author uint8) (uint64, uint64,
 		g.mu.Unlock()
 	}
 	return id, v, text, hash, err
+}
+
+// Diff is a read in the read-before-write sense, like Dump: it hands back
+// chunks of the buffer's text and records that the caller has seen them.
+func (g *Guard) Diff(path string) ([]DiffGroup, error) {
+	name, err := g.canonical(path)
+	if err != nil {
+		return nil, err
+	}
+	diffs, err := g.Host.Diff(name)
+	if err == nil {
+		g.mu.Lock()
+		g.read[name] = true
+		g.mu.Unlock()
+	}
+	return diffs, err
 }
 
 // Patch writes, so it runs the same author check as Apply: a socket may not
@@ -530,6 +552,19 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true, Groups: groups}
+	case "diff":
+		diffs, err := g.Diff(req.Path)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		if diffs == nil {
+			diffs = []DiffGroup{}
+		}
+		data, err := json.Marshal(diffs)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true, DiffJSON: string(data)}
 	case "accept", "reject":
 		name, err := g.canonical(req.Path)
 		if err != nil {

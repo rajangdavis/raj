@@ -29,6 +29,7 @@ func fullHeader() Header {
 		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, ByteStart: 10, ByteEnd: 14}},
 		Conflicts:    []Conflict{{Index: 1, At: 8, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
+		DiffJSON:     `[{"id":4,"hunks":[{"start":1,"end":2,"old":"a","new":"b"}],"moved":0}]`,
 	}
 }
 
@@ -77,6 +78,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"bytes", got.Bytes, want.Bytes}, {"lines", got.Lines, want.Lines},
 		{"files", got.Files, want.Files},
 		{"capped", got.Capped, want.Capped}, {"stats", got.Stats, want.Stats},
+		{"diffjson", got.DiffJSON, want.DiffJSON},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
@@ -247,7 +249,7 @@ func TestEveryVerbHasACode(t *testing.T) {
 	for _, op := range []string{
 		"ping", "buffers", "text", "open", "apply", "save", "version", "search",
 		"groups", "accept", "reject", "exec", "execcheck", "stats", "hello",
-		"cancel", "recv", "snapshot", "prog",
+		"cancel", "recv", "snapshot", "prog", "diff",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)

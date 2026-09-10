@@ -56,6 +56,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   groups [path]              change sets in a buffer, and their state
   accept [path] -group N     agree to a change set
   reject [path] -group N     back one out
+  diff [path]                pending change sets as old→new text, for review
   search -q PATTERN          search the workspace, unsaved edits included
   version [path]             the version a later apply bases on
   dump [path]                snapshot a span (or the whole file) for later patch
@@ -240,6 +241,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "accept", "reject":
 		return simple(c, Request{Op: cmd, Path: path, Group: *group}, cmd+"ed",
 			stdout, stderr, *asJSON)
+	case "diff":
+		return diffCmd(c, path, stdout, stderr, *asJSON)
 	case "who":
 		res, err := c.Do(Request{Op: "hello", Identity: identityOf(*identity), Name: *name})
 		if code := fail(stderr, res, err); code != 0 {
@@ -706,6 +709,55 @@ func patchCmd(c *Client, path string, dumpID uint64, textArg, textFile string, s
 	}
 	fmt.Fprintf(stdout, "patched snapshot %d at version %d; the buffer has unsaved changes\n", dumpID, res.Version)
 	return 0
+}
+
+// diffCmd prints the pending change sets as old→new text: the review surface
+// for the proposals `groups` only lists. An empty pending set is a clean
+// buffer, reported on stdout with a zero exit — review found nothing to do,
+// which is an answer, not a failure.
+func diffCmd(c *Client, path string, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "diff", Path: path})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	var diffs []DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		fmt.Fprintln(stderr, "raj ctl diff:", err)
+		return 1
+	}
+	if asJSON {
+		return emit(stdout, diffs)
+	}
+	if len(diffs) == 0 {
+		fmt.Fprintf(stdout, "%s: no pending changes\n", firstOf(path, "active buffer"))
+		return 0
+	}
+	for _, g := range diffs {
+		fmt.Fprintf(stdout, "group %d\tauthor %d\t%s\t%d ops\t%+d bytes\n",
+			g.ID, g.Author, g.State, g.Ops, g.Bytes)
+		for _, h := range g.Hunks {
+			fmt.Fprintf(stdout, "@@ %d..%d @@\n", h.Start, h.End)
+			writeDiffLines(stdout, "-", h.Old)
+			writeDiffLines(stdout, "+", h.New)
+		}
+		if g.Moved > 0 {
+			fmt.Fprintf(stdout, "  note: %d op(s) moved past what a rebase can carry; "+
+				"review the buffer directly\n", g.Moved)
+		}
+	}
+	return 0
+}
+
+// writeDiffLines prints one diff line per line of text. An empty side prints
+// nothing at all: a pure insertion has no - lines and a pure deletion no +
+// lines, so neither gets a bare marker.
+func writeDiffLines(w io.Writer, prefix, text string) {
+	if text == "" {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		fmt.Fprintf(w, "%s%s\n", prefix, line)
+	}
 }
 
 // doLSP asks the language server for hover text, a definition, completions, or

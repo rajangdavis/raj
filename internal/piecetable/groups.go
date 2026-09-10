@@ -1,6 +1,9 @@
 package piecetable
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Change sets, and whether they are in.
 //
@@ -194,4 +197,65 @@ func (s *Session) AcceptGroup(id uint64) {
 		return // reversed already; accepting would claim text that is not there
 	}
 	s.MarkGroup(id, Accepted)
+}
+
+// DiffHunk is one member op of a change set as old→new text, in the
+// coordinates of the present: Start and End locate the op's inserted text
+// now, Old is the text it removed and New the text it added. A pure insertion
+// has Old empty; a pure deletion has New empty and Start == End.
+type DiffHunk struct {
+	Start, End int
+	Old, New   string
+}
+
+// GroupDiff is a change set rendered for review: the group as Groups lists
+// it, one hunk per member op, and a count of members the buffer has moved
+// past.
+type GroupDiff struct {
+	Group Group
+	Hunks []DiffHunk
+	Moved int
+}
+
+// DiffPending renders the pending change sets — proposed, with live members —
+// as old→new text, oldest first. It is the review surface Groups cannot be: a
+// listing says a change set exists, this says what it says.
+//
+// Each member's span is carried from the version it was recorded at to the
+// present by the same rebase walk that applies and reverses edits, so the
+// span is where the hunk sits now. A member whose inserted text no longer
+// survives intact — a later edit reached inside it — cannot be placed
+// honestly, and showing what was written as though it were what is there is
+// how a hunk lands unverified; it is counted in Moved instead.
+func (s *Session) DiffPending() []GroupDiff {
+	var out []GroupDiff
+	for _, g := range s.Pending() {
+		d := GroupDiff{Group: g}
+		for _, o := range s.journal {
+			if o.Group != g.ID || o.Kind != KindEdit || !s.live(o.Seq) {
+				continue
+			}
+			start, end, _, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
+			if !ok || end-start != o.InsLen() {
+				d.Moved++
+				continue
+			}
+			d.Hunks = append(d.Hunks, DiffHunk{
+				Start: start, End: end,
+				Old: s.recsText(o.Del), New: s.recsText(o.Ins),
+			})
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// recsText reads the bytes a piece list spans out of the stores. Nothing is
+// ever erased, so the pieces an op deleted still read back exactly.
+func (s *Session) recsText(recs []PieceRec) string {
+	var b strings.Builder
+	for _, r := range recs {
+		b.Write(s.buf.Store().Slice(Author(r.Buf), r.Start, r.Length))
+	}
+	return b.String()
 }

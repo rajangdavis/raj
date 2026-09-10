@@ -10,6 +10,7 @@ import (
 
 	"raj/internal/editor"
 	"raj/internal/lsp"
+	"raj/internal/piecetable"
 	"raj/internal/ui"
 
 	"raj/internal/safe"
@@ -233,13 +234,51 @@ func (a *App) syncDoc(ls *langServer, p *editor.Pane) bool {
 	if id == "" {
 		return false
 	}
-	version := int(p.File.Session().Version())
+	sess := p.File.Session()
+	version := int(sess.Version())
 	text := p.File.Text()
 	if !ls.sync.IsOpen(path) {
 		return ls.sync.Open(path, id, text, version) == nil
 	}
-	ls.sync.Change(path, text, version)
+	// The journal window since the version the server last saw is the edit
+	// history, already in application order. A window that cannot be read —
+	// none, or a version the journal no longer reaches — is nil edits, which
+	// the sync layer reads as "history unavailable" and pays the whole
+	// document for.
+	last, _ := ls.sync.Version(path)
+	ls.sync.Change(path, text, version, editsSince(sess, piecetable.Version(last)))
 	return true
+}
+
+// editsSince renders the journal window (since, present] as LSP edits, in
+// application order. Undo and redo ops convert the same way as edits: each
+// carries the range it replaces and the pieces it inserts in the frame its
+// predecessors produced, which is the frame the server applies the change to.
+func editsSince(sess *piecetable.Session, since piecetable.Version) []lsp.Edit {
+	ops := sess.OpsSince(since)
+	if len(ops) == 0 {
+		return nil
+	}
+	store := sess.Store()
+	edits := make([]lsp.Edit, 0, len(ops))
+	for _, o := range ops {
+		edits = append(edits, lsp.Edit{
+			Start: o.Pos,
+			End:   o.Pos + o.DelLen(),
+			Text:  recsText(store, o.Ins),
+		})
+	}
+	return edits
+}
+
+// recsText reads the bytes a piece list spans out of the stores. Nothing is
+// ever erased, so the pieces an op inserted still read back exactly.
+func recsText(store *piecetable.Store, recs []piecetable.PieceRec) string {
+	var b strings.Builder
+	for _, r := range recs {
+		b.Write(store.Slice(piecetable.Author(r.Buf), r.Start, r.Length))
+	}
+	return b.String()
 }
 
 // docPath is a pane's path made absolute.

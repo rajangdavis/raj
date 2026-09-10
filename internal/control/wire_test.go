@@ -113,6 +113,7 @@ func TestFrameRoundTrip(t *testing.T) {
 			{Start: 9, End: 9, Text: ""},
 			{Start: 12, End: 14, Text: "\x00\xff multi\nline"},
 		}},
+		{ID: 4, Op: "patch", Path: "/w/a.go", Author: 5, DumpID: 9, PatchText: "whole\nfile\ntext"},
 	}
 	var buf bytes.Buffer
 	for _, r := range reqs {
@@ -134,6 +135,9 @@ func TestFrameRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got.ID != want.ID || got.Op != want.Op || got.Path != want.Path || got.Author != want.Author {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+		if got.DumpID != want.DumpID || got.PatchText != want.PatchText {
 			t.Errorf("got %+v, want %+v", got, want)
 		}
 		if len(got.Hunks) != len(want.Hunks) {

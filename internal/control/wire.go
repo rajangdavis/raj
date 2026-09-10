@@ -139,6 +139,13 @@ type Header struct {
 	LSPMode string
 	LSPJSON string
 
+	// DiffJSON carries a diff's answer as one JSON string, the same escape
+	// hatch LSPJSON uses: the nested group-and-hunk structure has no
+	// flat-record shape, and the spans it reports are computed from the
+	// journal before encoding, so no caller re-derives offsets from the
+	// text inside it.
+	DiffJSON string
+
 	// Exit, Dirty and Stats are exec's answers. Stream marks an output frame:
 	// 1 stdout, 2 stderr, with the bytes in the body.
 	Exit         int
@@ -325,7 +332,11 @@ func EncodeRequest(req Request) (Header, []byte) {
 	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
-		DumpID: req.DumpID, LSPMode: req.LSPMode}
+		DumpID: req.DumpID, LSPMode: req.LSPMode,
+		// Path belongs in the literal, not below: the patch and prog early
+		// returns run before anything set afterwards, and a patch that
+		// arrives pathless lands on the active tab instead of its file.
+		Path: req.Path}
 	if req.Start != nil {
 		h.Start = req.Start
 	}
@@ -348,7 +359,6 @@ func EncodeRequest(req Request) (Header, []byte) {
 		// The whole edited text is the body, unclaimed: see DecodeRequest.
 		return h, []byte(req.PatchText)
 	}
-	h.Path = req.Path
 	for _, x := range req.Hunks {
 		h.Hunks = append(h.Hunks, HunkMeta{Start: x.Start, End: x.End, Len: len(x.Text)})
 		body = append(body, x.Text...)
@@ -404,7 +414,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Files: res.Files, Capped: res.Capped, Final: res.Final, Author: res.Author,
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
 		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
-		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON}
+		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON}
 	var body []byte
 	if res.Stream != 0 {
 		// Command output is bytes off a pipe: whatever the process wrote, not
@@ -436,7 +446,7 @@ func DecodeResponse(f Frame) (Response, error) {
 		Stats: f.Header.Stats, Stream: f.Header.Stream,
 		Participants: f.Header.Participants, Groups: f.Header.Groups,
 		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
-		LSPJSON: f.Header.LSPJSON}
+		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

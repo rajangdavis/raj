@@ -33,7 +33,17 @@ const (
 	Files Mode = iota
 	// Symbols lists the declarations in one file, and choosing one jumps.
 	Symbols
+	// Proposals lists the pending change sets in one file, and choosing one
+	// jumps to where it sits.
+	Proposals
 )
+
+// Proposal is one row in Proposals mode: a pending change set, labelled for a
+// review pass, and the 1-based line choosing it jumps to.
+type Proposal struct {
+	Label string
+	Line  int
+}
 
 // Picker is the floating quick-open overlay.
 type Picker struct {
@@ -108,6 +118,20 @@ func (p *Picker) ShowSymbols(path string, syms []symbols.Symbol) {
 			label += "  " + string(s.Kind)
 		}
 		p.items = append(p.items, entry{label: label, line: s.Line})
+	}
+	p.filter()
+}
+
+// ShowProposals opens the same overlay over the pending change sets of one
+// file, for the review pass: the rows are already labelled by the caller,
+// choosing one jumps to the line the change sits on, and accept and reject
+// are the chords that decide it there.
+func (p *Picker) ShowProposals(path string, rows []Proposal) {
+	p.reset(Proposals, "Review change")
+	p.file = path
+	p.items = p.items[:0]
+	for _, r := range rows {
+		p.items = append(p.items, entry{label: r.Label, line: r.Line})
 	}
 	p.filter()
 }
@@ -336,7 +360,7 @@ func allDigits(s string) bool {
 // in it" and the caller needs one path rather than two.
 func (p *Picker) choose(s scored) string {
 	p.Hide()
-	if p.mode == Symbols {
+	if p.mode == Symbols || p.mode == Proposals {
 		if p.file == "" {
 			return ""
 		}
@@ -432,6 +456,16 @@ func (p *Picker) score(query string) {
 	for _, it := range p.items {
 		if q == "" {
 			p.shown = append(p.shown, scored{entry: it})
+			continue
+		}
+		if p.mode == Proposals {
+			// Proposal labels are prose ("group 4 · AgentD · -7 bytes · 1 op(s)"),
+			// not paths: a subsequence match lets a group number collide with the
+			// digits in the byte delta, which is every label in production. Tokens
+			// are what a reviewer types — a group number, an author name.
+			if s, hits, ok := tokenMatch(it.label, q); ok {
+				p.shown = append(p.shown, scored{it, s, hits})
+			}
 			continue
 		}
 		if s, hits, ok := fuzzy(it.label, q); ok {
@@ -541,6 +575,47 @@ func subsequence(s, query string) bool {
 	return false
 }
 
+// tokenMatch scores a query against a proposals label: the query must equal a
+// whole token, or prefix one. Tokens are the words between spaces and middle
+// dots, so "4" matches "group 4 · AgentD · -7 bytes" and matches nothing in
+// "group 3 · AgentD · +40 bytes" — the byte-delta digits stay inert, which is
+// the entire point: a reviewer types a group number or an author name, never
+// a scattered subsequence.
+//
+// Exact tokens outrank prefixes, and earlier tokens outrank later ones, so
+// the group id — the first word — wins any tie.
+func tokenMatch(label, query string) (score int, hits []int, ok bool) {
+	lower := strings.ToLower(label)
+	best := -1
+	at := 0
+	for _, tok := range strings.FieldsFunc(lower, func(r rune) bool {
+		return r == ' ' || r == '·'
+	}) {
+		i := strings.Index(lower[at:], tok)
+		start := at + i
+		at = start + len(tok)
+		s := -1
+		switch {
+		case tok == query:
+			s = 1000
+		case strings.HasPrefix(tok, query):
+			s = 400
+		}
+		if s < 0 {
+			continue
+		}
+		s -= start // earlier tokens win ties
+		if s > best {
+			best, hits = s, nil
+			for j := 0; j < len(query); j++ {
+				hits = append(hits, start+j)
+			}
+			ok = true
+		}
+	}
+	return best, hits, ok
+}
+
 // Render draws the overlay centred horizontally in the upper third, where
 // VSCode puts it — close to the top so results have room, but not so high it
 // looks like part of the tab bar.
@@ -628,6 +703,9 @@ func (p *Picker) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 	noun := " files "
 	if p.mode == Symbols {
 		noun = " symbols "
+	}
+	if p.mode == Proposals {
+		noun = " changes "
 	}
 	s.SetString(x+2, y+h-1, " "+itoa(len(p.shown))+noun, th.Dim, w-4)
 }

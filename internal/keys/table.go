@@ -162,6 +162,12 @@ var Natives = []Native{
 	{"pgdown", PageDown, ""},
 	{"backspace", Backspace, ""},
 	{"delete", Delete, ""},
+	// Reviewing proposals. No terminal claims a ctrl+alt+letter — ctrl
+	// suppresses macOS option-composition the same way it does for the wrap
+	// toggle — so report_all delivers them with no config line at all.
+	{"ctrl+alt+a", AcceptProposed, "accept the proposed change set at the caret"},
+	{"ctrl+alt+x", RejectProposed, "back out the proposed change set at the caret"},
+	{"ctrl+alt+v", ReviewProposed, "list the pending change sets and jump to one; not g: that is find-all on Linux"},
 }
 
 // Emitted is every chord that needs a line in a terminal config: the ones the

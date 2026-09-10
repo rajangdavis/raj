@@ -41,6 +41,11 @@ type Pane struct {
 	// cmd+u can put them back. A snapshot of a place rather than of an action:
 	// cursor undo returns to a position, which is what undo means for a cursor.
 	cursorHistory []cursorSnapshot
+
+	// pending is the proposed change sets in current coordinates, filled once
+	// per frame by RenderFocused so every drawn row tints from one journal
+	// walk rather than walking it per line.
+	pending []PendingMark
 }
 
 // cursorSnapshot is one recorded cursor position: the whole set and which of

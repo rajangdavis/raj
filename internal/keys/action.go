@@ -113,4 +113,11 @@ const (
 	// only ever appears on its own after MinPrefix characters, so there is no
 	// way to ask for it after a cursor move or with a one-character prefix.
 	Complete Action = "complete"
+
+	// proposals — an agent change set lands as a proposal: in the document,
+	// tinted, save-blocked, and decided one gesture at a time. Accept marks it
+	// agreed; reject backs it out; review lists what is still pending.
+	AcceptProposed Action = "accept_proposed"
+	RejectProposed Action = "reject_proposed"
+	ReviewProposed Action = "review_proposed"
 )

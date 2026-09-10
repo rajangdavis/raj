@@ -662,6 +662,12 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.saveActive(nil)
 	case keys.Reload:
 		a.reloadActive()
+	case keys.AcceptProposed:
+		a.reviewProposed(true)
+	case keys.RejectProposed:
+		a.reviewProposed(false)
+	case keys.ReviewProposed:
+		a.reviewPicker()
 	case keys.Cut:
 		a.clip(true)
 	case keys.Copy:
