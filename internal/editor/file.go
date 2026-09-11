@@ -27,6 +27,19 @@ type File struct {
 	Path string
 	Cols view.Columns
 
+	// Hints are the inline hints the language server returned for the text
+	// this file had when they were installed, trimmed to the lines whose whole
+	// line, hints included, fits the pane text width the set was built for.
+	// They are installed and cleared on the event thread, so there is no lock;
+	// nil means no hints, which draws nothing rather than an empty overlay.
+	Hints *HintSet
+
+	// hintWidth is the text width the installed Hints were filtered for.
+	// LineCol and OffsetAt read Hints without knowing the pane, so the
+	// application refilters from the full answer when the pane width changes;
+	// this is how it tells that the installed set is stale.
+	hintWidth int
+
 	// Indent is what one press of Tab inserts, resolved at open from the
 	// format, the content and the language in that order. indentFrom records
 	// which of them answered, so a weaker default cannot contradict it.
@@ -261,7 +274,8 @@ func (f *File) LineOf(off int) int { return f.idx.LineOf(off) }
 // LineCol converts a byte offset to a line and display column.
 func (f *File) LineCol(off int) (line, col int) {
 	line = f.idx.LineOf(off)
-	return line, f.Cols.ColOf(f.Line(line), off-f.idx.LineStart(line))
+	text := f.Line(line)
+	return line, f.Cols.ColOfHints(text, off-f.idx.LineStart(line), f.HintCols(line))
 }
 
 // OffsetAt converts a line and display column back to a byte offset, clamping
@@ -273,7 +287,47 @@ func (f *File) OffsetAt(line, col int) int {
 	if line >= f.idx.Lines() {
 		return f.Len()
 	}
-	return f.idx.LineStart(line) + f.Cols.OffsetOf(f.Line(line), col)
+	text := f.Line(line)
+	return f.idx.LineStart(line) + f.Cols.OffsetOfHints(text, col, f.HintCols(line))
+}
+
+// HintsAt is the hints anchored on a line, nil when the file has none. This is
+// the renderer read path and the nil check is the fast one: most files, and
+// most lines, have no hints.
+func (f *File) HintsAt(line int) []Hint {
+	if f.Hints == nil {
+		return nil
+	}
+	return f.Hints.At(line)
+}
+
+// SetHints installs a hint set for the file, replacing whatever was there.
+func (f *File) SetHints(h *HintSet) { f.Hints = h }
+
+// HintWidth is the text width the installed Hints were filtered for, or zero
+// when nothing has been filtered yet. The application compares it against the
+// pane width to decide whether the installed set is still current.
+func (f *File) HintWidth() int { return f.hintWidth }
+
+// SetHintsFiltered installs the hints from an answer that fit width, dropping
+// every hint on a line whose whole line, hints included, is wider than the
+// pane. It records width as the width the installed set describes, which is
+// what lets a later width change refilter from the full answer rather than
+// trusting stale hints.
+func (f *File) SetHintsFiltered(lineHints []LineHint, width int) {
+	f.Hints = HintsThatFit(f, lineHints, width)
+	f.hintWidth = width
+}
+
+// ClearHints drops every hint for the file, for an edit that has moved the
+// offsets they were anchored to. The next answer reinstalls them.
+func (f *File) ClearHints() { f.Hints = nil }
+
+// HintCols is the line's hints in the view-only column form the layout code
+// reads. A file with no hints answers nil, so the hint-aware conversions fall
+// back to the un-hinted ones exactly.
+func (f *File) HintCols(line int) []view.HintCol {
+	return HintCols(f.HintsAt(line))
 }
 
 // Insert adds text attributed to author.

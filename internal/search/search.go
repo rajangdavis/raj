@@ -100,6 +100,39 @@ func (r Result) Total() int {
 	return n
 }
 
+// FileCount is one file and its true match total, beside the rows the search
+// reported for it. The two differ once a file passes MaxPerFile.
+type FileCount struct {
+	Path  string
+	Shown int
+	Total int
+}
+
+// Truncated returns the files the per-file cap cut down, in path order: each
+// holds more than MaxPerFile matches, of which only MaxPerFile rows were
+// reported. Without it a capped file is indistinguishable from one that holds
+// exactly MaxPerFile, since both report MaxPerFile rows and Result.Capped
+// stays false because the global cap never tripped. A walk stopped by the
+// global cap sets Capped, which is the flag for that and covers the file it
+// stopped inside, whose total is then a lower bound.
+func (r Result) Truncated() []FileCount {
+	if len(r.Counts) == 0 {
+		return nil
+	}
+	shown := make(map[string]int, len(r.Counts))
+	for _, m := range r.Matches {
+		shown[m.Path]++
+	}
+	out := make([]FileCount, 0, len(r.Counts))
+	for path, total := range r.Counts {
+		if total > MaxPerFile {
+			out = append(out, FileCount{Path: path, Shown: shown[path], Total: total})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
 // Docs is the contents of documents that are open and may differ from what is
 // on disk, keyed by absolute path.
 //
@@ -337,6 +370,14 @@ func compile(q Query) (*regexp.Regexp, error) {
 	if q.Word {
 		pattern = `\b` + pattern + `\b`
 	}
+	// (?m) makes ^ and $ anchor to a line, which is what a grep user means by
+	// them. The sweep in scanData runs the pattern over the whole file at once,
+	// so without it ^ matched only the first byte of the file and $ only its
+	// last, while a quoted literal for the same bytes matched on every line. It
+	// is harmless on a quoted literal — QuoteMeta leaves no anchor behind — and
+	// it does not change what . matches: in Go a dot never crosses a newline,
+	// with or without (?m).
+	pattern = "(?m)" + pattern
 	if !q.Case {
 		pattern = "(?i)" + pattern
 	}
@@ -509,6 +550,14 @@ func globs(spec string) []string {
 // matches tests a path against a glob list. An empty list means "no
 // constraint", which is why the caller passes what an empty list should mean.
 //
+// A pattern with no separator is a filename glob, the way grep --include means
+// it: it is tried against both the relative path and the basename, so
+// *_test.go reaches a test file in any directory. filepath.Match's * does not
+// cross a separator — that is why the basename test is needed; without it a
+// bare filename glob could only select files at the search root. A pattern
+// that contains a separator is path-scoped and keeps matching the relative
+// path alone.
+//
 // Patterns of the form *.ext — which is almost all of them in practice — are
 // answered by comparing the extension rather than by running the glob matcher.
 // filepath.Match costs more than the read it is meant to avoid: on ghostty,
@@ -517,12 +566,21 @@ func matches(path string, patterns []string, emptyResult bool) bool {
 	if len(patterns) == 0 {
 		return emptyResult
 	}
+	base := filepath.Base(path)
 	for _, p := range patterns {
 		if ext, ok := plainExt(p); ok {
 			if strings.EqualFold(filepath.Ext(path), ext) {
 				return true
 			}
 			continue
+		}
+		// A pattern with no separator is a filename glob, so the basename
+		// counts as well as the relative path; a path-scoped pattern (one
+		// containing "/") is tested against the relative path alone.
+		if !strings.Contains(p, "/") {
+			if ok, _ := filepath.Match(p, base); ok {
+				return true
+			}
 		}
 		if ok, _ := filepath.Match(p, path); ok {
 			return true

@@ -38,6 +38,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -91,7 +92,7 @@ type Request struct {
 	LineEnd   *int
 
 	// LSPMode is the sub-operation of an lsp request: hover, definition,
-	// completion or diagnostics. Line and Col name the position to ask about
+	// references, completion or diagnostics. Line and Col name the position to ask about
 	// (1-based), which the host maps to the server's UTF-16 coordinates.
 	LSPMode string
 
@@ -198,6 +199,15 @@ type SearchMatch struct {
 	Text      string
 }
 
+// TruncatedFile is one file the per-file cap cut down: Shown is how many rows
+// the search reported, Total how many matches the file holds. It is what makes
+// a capped file distinguishable from one that holds exactly the cap.
+type TruncatedFile struct {
+	Path  string
+	Shown int
+	Total int
+}
+
 // Span is one authored run of the document. Reads come back as spans rather
 // than as one string because that is how the document is stored: pieces carry
 // an author, so a caller learns who wrote each byte without a second call.
@@ -233,6 +243,31 @@ type Buffer struct {
 	Bytes   int    `json:"bytes"`
 	Lines   int    `json:"lines"`
 	Active  bool   `json:"active"`
+	// Pending is how many change sets in this buffer are still proposed, and
+	// Moved how many of their members a later edit has moved past so no honest
+	// span can be projected. They let one `buffers` call answer "which open
+	// files hold decisions" instead of 1 + N `groups` calls. Both travel in
+	// their own sparse header field rather than as two more hBuffers fields:
+	// records are positional, so appending would make an older reader read a
+	// pending count as the next buffer's path.
+	Pending int `json:"pending"`
+	Moved   int `json:"moved"`
+	// Tally is the buffer's brace balance, string- and comment-aware, or nil
+	// when the buffer is unnamed or unreadable. It is computed CLI-side from
+	// the live text (unsaved edits included), not carried on the wire header:
+	// moving it host-side wants the hBuffers encoding, which is frozen pending
+	// the flat-record conversion.
+	Tally *BraceTally `json:"tally,omitempty"`
+}
+
+// BraceTally is the net balance of one buffer's brackets: openers minus
+// closers, per kind. A missing closer reads positive, a stray one negative, so
+// a balanced file is all zero and a broken one points at the kind that broke.
+// Brackets inside strings and comments do not count.
+type BraceTally struct {
+	Braces   int `json:"braces"`
+	Parens   int `json:"parens"`
+	Brackets int `json:"brackets"`
 }
 
 // Conflict is a hunk that could not be rebased onto the current version. At is
@@ -250,10 +285,33 @@ type Conflict struct {
 // names are the protocol a script reads.
 type LSPResult struct {
 	Text      string        `json:"text,omitempty"`      // hover
-	Locations []LSPLocation `json:"locations,omitempty"` // definition
+	Locations []LSPLocation `json:"locations,omitempty"` // definition/references
 	Items     []LSPItem     `json:"items,omitempty"`     // completion
 	Diags     []LSPDiag     `json:"diagnostics,omitempty"`
+	// Status says whether a diagnostics answer is a real reading of the
+	// server's state. It is set only for diagnostics, and never left empty
+	// there: "ok" means the list is current, so an empty list means no
+	// problems, while anything else means there is no published state to read
+	// — no server, or a ready one that has not published about this file yet —
+	// and the absent list is not a clean bill of health.
+	Status string `json:"status,omitempty"`
+	// Detail is the reason for a non-ok status, already worded for a person.
+	Detail string `json:"detail,omitempty"`
 }
+
+// LSPStatus values for a diagnostics answer, so a caller can tell "no
+// problems" from "not a reading of the current text". ok is the only one that
+// licenses reading an empty list as clean.
+const (
+	LSPStatusOK          = "ok"
+	LSPStatusUnpublished = "unpublished"
+	LSPStatusStale       = "stale"
+	LSPStatusStarting    = "starting"
+	LSPStatusNotStarted  = "not-started"
+	LSPStatusMissing     = "missing"
+	LSPStatusNoServer    = "no-server"
+	LSPStatusGaveUp      = "gave-up"
+)
 
 // LSPLocation is a file and a 1-based line and column — the editor's own
 // coordinates rather than the server's UTF-16 ones.
@@ -300,9 +358,19 @@ type Response struct {
 	Buffers []Buffer
 	Matches []SearchMatch
 	Files   int
-	Capped  bool
-	Spans   []Span
-	Version uint64
+	// Considered is how many files the walk opened and scanned, as distinct
+	// from Files, which held a match: a search under an -include glob that
+	// matched no file leaves it zero, and the CLI warns on exactly that.
+	Considered int
+	Capped     bool
+	// Truncated names the files whose rows are fewer than the matches found,
+	// each with both numbers. It is independent of Capped, which is the global
+	// MaxMatches flag: a per-file cap trips without it. Sent only when
+	// nonempty, so a server that does not know the field omits it and a client
+	// must read absence as unknown rather than as "nothing was truncated".
+	Truncated []TruncatedFile
+	Spans     []Span
+	Version   uint64
 	// Bytes and Lines describe the buffer a version answers for, so a driver
 	// can size an apply span or find the end of a file without a read.
 	Bytes     int
@@ -330,6 +398,12 @@ type Response struct {
 	Stats        ExecStats
 	Participants []Participant
 	Groups       []Group
+	// SrcVersion is the revision the server was built from. connection.send
+	// stamps it on every response, so a client learns it on any frame, not
+	// just the handshake. Identity is on the hello reply only: the token the
+	// server minted for an anonymous client, for the client to adopt.
+	SrcVersion string
+	Identity   string
 	// Messages is what recv returns: everything the user has said to this
 	// participant since it last asked.
 	Messages []Message
@@ -639,9 +713,30 @@ func (s *Server) serve(conn net.Conn) {
 			continue
 		}
 		if req.Op == "hello" {
-			// Answered on the reading goroutine: it rebinds this connection's
-			// author id and touches no document state.
-			id, err := s.Participants.Join(req.Identity, req.Name, KindAgent)
+			// Answered on the reading goroutine: it rebinds the author id this
+			// connection writes as, and touches no document state.
+			identity := req.Identity
+			var minted string
+			if identity == "" && s.Remote() {
+				// An anonymous TCP client gets a server-minted token: durable,
+				// so a reconnect can own the text it already wrote, and
+				// server-chosen, so no two agents collide on a name. The
+				// reply carries it for the client to adopt.
+				var err error
+				if minted, err = mintIdentity(); err != nil {
+					c.send(Response{ID: req.ID, Err: err.Error(), Final: true})
+					continue
+				}
+				identity = minted
+			}
+			if identity == "" {
+				// Anonymous on a local socket keeps its provisional id: the
+				// filesystem permissions already decided who may connect.
+				c.send(Response{ID: req.ID, OK: true, Final: true,
+					Participants: s.Participants.List()})
+				continue
+			}
+			id, err := s.Participants.Join(identity, req.Name, KindAgent)
 			if err != nil {
 				c.send(Response{ID: req.ID, Err: err.Error(), Final: true})
 				continue
@@ -651,7 +746,7 @@ func (s *Server) serve(conn net.Conn) {
 			c.mu.Lock()
 			c.author = id
 			c.mu.Unlock()
-			c.send(Response{ID: req.ID, OK: true, Final: true,
+			c.send(Response{ID: req.ID, OK: true, Final: true, Identity: minted,
 				Participants: s.Participants.List()})
 			continue
 		}
@@ -694,10 +789,13 @@ type connection struct {
 
 func (c *connection) send(res Response) {
 	// Stamped here rather than by each handler, so no verb can forget it and
-	// none can claim a different one.
+	// none can claim a different one. SrcVersion rides every frame for the
+	// same reason: a client that missed the handshake still learns what it is
+	// talking to.
 	c.mu.Lock()
 	res.Author = c.author
 	c.mu.Unlock()
+	res.SrcVersion = srcVersion
 	h, body := EncodeResponse(res)
 	c.mu.Lock()
 	closed := c.closed
@@ -942,10 +1040,11 @@ func (c *connection) search(req Request, emit func(Response)) {
 		c.mu.Unlock()
 	}()
 
-	files, capped, err := snap.Searcher.Search(ctx, *req.Query, func(batch []SearchMatch) {
+	files, considered, capped, truncated, err := snap.Searcher.Search(ctx, *req.Query, func(batch []SearchMatch) {
 		emit(Response{ID: req.ID, OK: true, Matches: batch})
 	})
-	final := Response{ID: req.ID, OK: err == nil, Files: files, Capped: capped, Final: true}
+	final := Response{ID: req.ID, OK: err == nil, Files: files, Considered: considered,
+		Capped: capped, Truncated: truncated, Final: true}
 	if err != nil {
 		final.Err = err.Error()
 	}
@@ -990,6 +1089,35 @@ func (s *Server) anonSeq() int {
 	defer s.mu.Unlock()
 	s.anon++
 	return s.anon
+}
+
+// srcVersion is the VCS revision this binary was built from, read from the
+// build info the go tool embeds when it builds inside a checkout — confirmed
+// present in the shipped binaries, so no -ldflags stamp is needed. Empty
+// means unknown, and an unknown on either side keeps the handshake check
+// silent.
+var srcVersion = func() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			return s.Value
+		}
+	}
+	return ""
+}()
+
+// mintIdentity returns a fresh identity token for an anonymous TCP client.
+// Server-minted rather than client-chosen: no collisions, and no two agents
+// both arriving as claude-1.
+func mintIdentity() (string, error) {
+	tok, err := NewToken()
+	if err != nil {
+		return "", err
+	}
+	return "tok_" + tok, nil
 }
 
 // submit parks a request and waits for the event thread to answer it.

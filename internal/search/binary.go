@@ -57,7 +57,7 @@ var binaryExts = map[string]bool{
 //
 // A map lookup on a lowered extension, which is why this is worth doing at all:
 // the check has to be cheaper than the open and read it avoids by a wide enough
-// margin that it is free on the files it does not skip. See BENCHMARKS.md — a
+// margin that it is free on the files it does not skip. See docs/BENCHMARKS.md — a
 // filter costing more than the read it saves is not a hypothetical here, it is
 // what the glob measurement found.
 func skipBinary(name string) bool {

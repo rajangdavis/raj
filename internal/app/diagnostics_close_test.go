@@ -29,6 +29,9 @@ func TestClosingATabClearsItsDiagnostics(t *testing.T) {
 	if len(h.diags.forPath(path)) != 1 {
 		t.Fatal("setup: the diagnostic was not stored")
 	}
+	if !h.diags.published(path) {
+		t.Fatal("setup: the publish was not recorded")
+	}
 
 	h.press("super+w")
 	if h.Tabs.Count() != 0 {
@@ -36,6 +39,11 @@ func TestClosingATabClearsItsDiagnostics(t *testing.T) {
 	}
 	if got := h.diags.forPath(path); len(got) != 0 {
 		t.Errorf("%d diagnostics survived the close", len(got))
+	}
+	// The published flag goes with the list: a reopened file has been heard
+	// from by nothing, and must report unpublished rather than clean.
+	if h.diags.published(path) {
+		t.Error("the closed file still reads as published")
 	}
 }
 

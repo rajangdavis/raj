@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"raj/internal/control"
 	"raj/internal/lsp"
 	"raj/internal/piecetable"
 )
@@ -38,6 +41,47 @@ func TestDefinitionWithoutAServerIsHarmless(t *testing.T) {
 	}
 	if len(h.Tabs.All()) != 1 {
 		t.Error("a tab was opened with no definition to open")
+	}
+}
+
+// An empty diagnostics list must not read as a clean file when there is no
+// server to have said so. A fresh harness has no live server, so the answer
+// carries a non-ok status whatever gopls is installed.
+func TestLSPDiagnosticsReportsNoServer(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	hs := host{a: h.App}
+	caller, err := hs.LSP(h.Pane().File.Path, 0, 0, "diagnostics")
+	if err != nil {
+		t.Fatalf("LSP diagnostics: %v", err)
+	}
+	data, err := caller.Run(context.Background())
+	if err != nil {
+		t.Fatalf("diagnostics run: %v", err)
+	}
+	var out control.LSPResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("diagnostics JSON %q: %v", data, err)
+	}
+	if out.Status == "" || out.Status == control.LSPStatusOK {
+		t.Errorf("status = %q; an empty list with no live server must not read as ok", out.Status)
+	}
+}
+
+// Every reason there is no server maps to a status the CLI can refuse on, and
+// only a live one is "ok".
+func TestLSPStatusNamesTheState(t *testing.T) {
+	cases := map[serverState]string{
+		serverReady:      control.LSPStatusOK,
+		serverStarting:   control.LSPStatusStarting,
+		serverNotStarted: control.LSPStatusNotStarted,
+		serverMissing:    control.LSPStatusMissing,
+		serverNone:       control.LSPStatusNoServer,
+		serverGaveUp:     control.LSPStatusGaveUp,
+	}
+	for st, want := range cases {
+		if got := lspStatus(st); got != want {
+			t.Errorf("lspStatus(%v) = %q, want %q", st, got, want)
+		}
 	}
 }
 
@@ -148,6 +192,24 @@ func TestServerSelection(t *testing.T) {
 	}
 	if _, st := s.for_("/w/a.md", nil); st != serverNone {
 		t.Error("markdown has a language id but no configured server")
+	}
+}
+
+// The inlayHint capability is presence-only: a server sends hints only when
+// the client advertised it, and it must not advertise resolveSupport, which
+// would defer a hint's text edits to a second request raj does not make.
+func TestClientCapabilitiesAdvertiseInlayHints(t *testing.T) {
+	caps := clientCapabilities()
+	td, _ := caps["textDocument"].(map[string]any)
+	if td == nil {
+		t.Fatal("no textDocument capabilities")
+	}
+	inlay, ok := td["inlayHint"].(map[string]any)
+	if !ok {
+		t.Fatalf("inlayHint = %T, want an options object", td["inlayHint"])
+	}
+	if len(inlay) != 0 {
+		t.Errorf("inlayHint = %v, want an empty object — presence is the advertisement", inlay)
 	}
 }
 
@@ -415,5 +477,186 @@ func TestEditsSincePreservesOrderAndText(t *testing.T) {
 	}
 	if want := (lsp.Edit{Start: 0, End: 1, Text: ""}); edits[1] != want {
 		t.Errorf("delete = %+v, want %+v", edits[1], want)
+	}
+}
+
+// A multi-hunk agent diff is the batch incremental sync was built for. Each
+// hunk lands as one op, and every hunk after the first was rebased through the
+// hunks before it, so its offsets mean something only in the frame those hunks
+// produced — which is also the frame the server applies a ranged change to.
+// The proof is a replay: applying the batch in order to the pre-diff text must
+// reproduce the buffer byte for byte.
+func TestEditsSinceMultiHunkDiff(t *testing.T) {
+	const doc = "one two λ😀\nthree\nfour\n"
+	sess := piecetable.NewSession(piecetable.NewDoc(doc, 8))
+	v0 := sess.Version()
+
+	at := func(text, sub string) int {
+		i := strings.Index(text, sub)
+		if i < 0 {
+			t.Fatalf("%q not in %q — the test's own fixture is wrong", sub, text)
+		}
+		return i
+	}
+	_, conflicts := sess.ApplyDiff(piecetable.User, v0, []piecetable.Hunk{
+		// Disjoint hunks, each written against v0: a shrink, a replacement
+		// past it that the shrink moves, and a deletion past both.
+		{Start: at(doc, "two"), End: at(doc, "two") + len("two"), Text: "2"},
+		{Start: at(doc, "λ😀"), End: at(doc, "λ😀") + len("λ😀"), Text: "X"},
+		{Start: at(doc, "four"), End: at(doc, "four") + len("four")},
+	})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %v, want none — the hunks are disjoint", conflicts)
+	}
+
+	edits := editsSince(sess, v0)
+	if len(edits) != 3 {
+		t.Fatalf("edits = %v, want one per hunk", edits)
+	}
+
+	// The wants are derived by replaying the hunks on the test's own copy, so
+	// a wrongly rebased offset shows as a wrong value, not a restatement of
+	// the code under test.
+	mid1 := doc[:at(doc, "two")] + "2" + doc[at(doc, "two")+len("two"):]
+	mid2 := mid1[:at(mid1, "λ😀")] + "X" + mid1[at(mid1, "λ😀")+len("λ😀"):]
+	wants := []lsp.Edit{
+		{Start: at(doc, "two"), End: at(doc, "two") + len("two"), Text: "2"},
+		{Start: at(mid1, "λ😀"), End: at(mid1, "λ😀") + len("λ😀"), Text: "X"},
+		{Start: at(mid2, "four"), End: at(mid2, "four") + len("four")},
+	}
+	for i, want := range wants {
+		if edits[i] != want {
+			t.Errorf("edit %d = %+v, want %+v", i, edits[i], want)
+		}
+	}
+
+	// The property the UTF-16 conversion downstairs stands on: replayed in
+	// order, each edit against the frame its predecessors produced, the batch
+	// arrives at the buffer exactly.
+	replay := doc
+	for _, e := range edits {
+		if e.Start < 0 || e.End < e.Start || e.End > len(replay) {
+			t.Fatalf("edit %+v does not fit the %d-byte frame it claims", e, len(replay))
+		}
+		replay = replay[:e.Start] + e.Text + replay[e.End:]
+	}
+	if got := sess.Buffer().Slice(0, sess.Buffer().Len()); replay != got {
+		t.Errorf("replayed batch %q, buffer %q", replay, got)
+	}
+}
+
+// acceptServerEdit drives the same path a keystroke takes: open a blank line, type
+// a prefix that opens the popup, park a server answer carrying the item, and
+// return the harness with the popup showing it. "handleRequest" is already in the
+// buffer, so a buffer word opens the popup and the server answer replaces it.
+func acceptServerEdit(t *testing.T, prefix string, item lsp.CompletionItem) *harness {
+	t.Helper()
+	h := newHarness(t, "handleRequest()\n\n")
+	h.press("ctrl+g")
+	h.typeText("2")
+	h.press("enter")
+	h.typeText(prefix)
+	if !h.Complete.Open {
+		t.Fatal("setup: no popup")
+	}
+	parkAnswer(h, prefix, []lsp.CompletionItem{item})
+	return h
+}
+
+// A textEdit names the span to overwrite, so accepting replaces it rather than
+// typing the word. The suffix past the range is left alone, which is the
+// difference from the plain path that appends the remainder.
+func TestAcceptServerTextEditReplacesRange(t *testing.T) {
+	h := acceptServerEdit(t, "hand", lsp.CompletionItem{
+		Label:  "handleRequest",
+		Insert: "handleRequest",
+		Edit: &lsp.TextEdit{
+			Range:   lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 1, Character: 4}},
+			NewText: "handleEdit",
+		},
+	})
+	h.press("tab")
+	if got := cursorLineText(h); got != "handleEdit" {
+		t.Errorf("line = %q, want handleEdit — the server range was not replaced", got)
+	}
+}
+
+// The import line travels as an additionalTextEdit. Without it the completion
+// leaves the file uncompilable, which is the whole reason to honour the field.
+func TestAcceptServerAdditionalTextEditsLand(t *testing.T) {
+	h := acceptServerEdit(t, "hand", lsp.CompletionItem{
+		Label: "handleRequest",
+		Edit: &lsp.TextEdit{
+			Range:   lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 1, Character: 4}},
+			NewText: "handleRequest",
+		},
+		Additional: []lsp.TextEdit{{
+			Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 0}, End: lsp.Position{Line: 0, Character: 0}},
+			NewText: "import \"fmt\"\n",
+		}},
+	})
+	h.press("tab")
+	if got := h.text(); !strings.HasPrefix(got, "import \"fmt\"\n") {
+		t.Errorf("text = %q, want the import line at the top", got)
+	}
+	if got := cursorLineText(h); got != "handleRequest" {
+		t.Errorf("line = %q, want the completed word under the cursor", got)
+	}
+}
+
+// The word and its import are one user action, so one undo reverses both.
+func TestAcceptServerEditsAreOneUndo(t *testing.T) {
+	h := acceptServerEdit(t, "hand", lsp.CompletionItem{
+		Label: "handleRequest",
+		Edit: &lsp.TextEdit{
+			Range:   lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 1, Character: 4}},
+			NewText: "handleRequest",
+		},
+		Additional: []lsp.TextEdit{{
+			Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 0}, End: lsp.Position{Line: 0, Character: 0}},
+			NewText: "import \"fmt\"\n",
+		}},
+	})
+	before := h.text()
+	h.press("tab")
+	if h.text() == before {
+		t.Fatal("accepting changed nothing")
+	}
+	h.press("super+z")
+	if got := h.text(); got != before {
+		t.Errorf("one undo left %q, want %q", got, before)
+	}
+}
+
+// A candidate with no textEdit keeps the old path exactly: the remainder of the
+// word is typed after the prefix.
+func TestAcceptWithoutTextEditTypesTheRemainder(t *testing.T) {
+	h := acceptServerEdit(t, "hand", lsp.CompletionItem{
+		Label: "handleRequest", Insert: "handleRequest",
+	})
+	h.press("tab")
+	if got := cursorLineText(h); got != "handleRequest" {
+		t.Errorf("line = %q, want handleRequest", got)
+	}
+}
+
+// The server answered when the prefix was shorter, so its range ends before the
+// cursor. The characters typed since must be overwritten, not left dangling
+// after the insertion.
+func TestAcceptServerEditCoversTypedExtension(t *testing.T) {
+	h := acceptServerEdit(t, "han", lsp.CompletionItem{
+		Label: "handleRequest",
+		Edit: &lsp.TextEdit{
+			Range:   lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 1, Character: 3}},
+			NewText: "handleEdit",
+		},
+	})
+	h.typeText("d")
+	if got := cursorLineText(h); got != "hand" {
+		t.Fatalf("setup: line = %q, want hand", got)
+	}
+	h.press("tab")
+	if got := cursorLineText(h); got != "handleEdit" {
+		t.Errorf("line = %q, want handleEdit — the typed extension should be replaced", got)
 	}
 }

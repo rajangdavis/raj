@@ -133,6 +133,32 @@ func TestVarintRoundTrip(t *testing.T) {
 	}
 }
 
+// A varint must carry a signed int, because the one signed field on the wire —
+// a change set's net byte delta — is negative whenever the edit removes text.
+// The old encoding wrote a zero byte for -1 and a ten-byte form the reader
+// refused, so a negative delta truncated the list it appeared in.
+func TestVarintRoundTripsSignedValues(t *testing.T) {
+	for _, v := range []int{
+		0, 1, 127, 128, 16383, 1 << 31,
+		-1, -2, -42, -127, -128, -16384, -1 << 31,
+	} {
+		b := PutVarint(nil, v)
+		if bytes.IndexByte(b, 0) >= 0 {
+			t.Errorf("%d encoded with a zero byte: %x", v, b)
+		}
+		got, n, err := Varint(b)
+		if err != nil {
+			t.Fatalf("%d: %v", v, err)
+		}
+		if got != v || n != len(b) {
+			t.Errorf("%d round-tripped as %d in %d/%d bytes", v, got, n, len(b))
+		}
+		if want := len(b); VarintLen(v) != want {
+			t.Errorf("%d: VarintLen said %d, encoding took %d", v, VarintLen(v), want)
+		}
+	}
+}
+
 // The property the encoding is shaped around: nothing in the framing is ever
 // zero, so a program travels through anything that stops at NUL — argv being
 // the one that matters.

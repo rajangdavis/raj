@@ -156,3 +156,55 @@ func TestSaveCreatesNewFile(t *testing.T) {
 		t.Fatal("buffer still dirty after a successful save")
 	}
 }
+
+// A filesystem can accept every call and still drop the bytes; the read-back
+// is the only thing that catches it. The stub stands in for that filesystem:
+// the write itself goes through the real one, so the file lands correctly and
+// only the verification can fail.
+func TestWriteAtomicDetectsReadBackMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+
+	orig := readFile
+	readFile = func(string) ([]byte, error) {
+		return []byte("corrupted"), nil
+	}
+	defer func() { readFile = orig }()
+
+	err := writeAtomic(path, []byte("real content"))
+	if err == nil {
+		t.Fatal("a read-back mismatch must fail the save, not report success")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("error = %v, want it to say the read-back did not match", err)
+	}
+	// The write itself landed; only the verification lied about it.
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "real content" {
+		t.Fatalf("content = %q, want %q", got, "real content")
+	}
+}
+
+// The read-back failing outright — rather than returning wrong bytes — is the
+// same verdict: the save cannot be called saved.
+func TestWriteAtomicReadBackErrorFailsSave(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+
+	orig := readFile
+	readFile = func(string) ([]byte, error) {
+		return nil, os.ErrPermission
+	}
+	defer func() { readFile = orig }()
+
+	err := writeAtomic(path, []byte("content"))
+	if err == nil {
+		t.Fatal("a read-back failure must fail the save, not report success")
+	}
+	if !strings.Contains(err.Error(), "verified") {
+		t.Fatalf("error = %v, want it to say the save could not be verified", err)
+	}
+}

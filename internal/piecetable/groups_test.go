@@ -316,10 +316,121 @@ func TestDiffPendingRendersADeletion(t *testing.T) {
 	}
 }
 
-// A member whose text a later edit reached into can no longer be placed
-// honestly; it is counted as moved rather than shown as if the buffer still
-// held what was written.
-func TestDiffPendingCountsMembersMovedPast(t *testing.T) {
+// An additive edit inside a proposed span does not erase the member: the runs
+// the agent wrote on either side of the user's text survive, in the present,
+// and the set stays reachable.
+func TestDiffPendingProjectsSurvivingRuns(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	// The user types inside the proposed text. The bytes on either side are
+	// still the agent's; the typed bytes are the user's.
+	s.Insert(User, 8, "XYZ")
+
+	diffs := s.DiffPending()
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want the one proposed group", diffs)
+	}
+	d := diffs[0]
+	if d.Moved != 0 {
+		t.Errorf("moved = %d, want 0: the surrounding runs survive", d.Moved)
+	}
+	if len(d.Hunks) != 2 {
+		t.Fatalf("hunks = %+v, want the two surviving runs", d.Hunks)
+	}
+	if got := d.Hunks[0]; got.Start != 6 || got.End != 8 || got.New != "so" || got.Old != "world" {
+		t.Errorf("first run = %+v, want 6..8 %q with old %q", got, "so", "world")
+	}
+	if got := d.Hunks[1]; got.Start != 11 || got.End != 15 || got.New != "cket" || got.Old != "" {
+		t.Errorf("second run = %+v, want 11..15 %q with no old side", got, "cket")
+	}
+	if pending := s.Pending(); len(pending) != 1 || pending[0].ID != id {
+		t.Errorf("pending = %+v, want the set still reachable", pending)
+	}
+}
+
+// A proposal a later edit has entirely overwritten is auto-rejected: every
+// agent piece is gone, so Pending drops it and it cannot block a save. Its
+// moved member is still reported by the projection, and the state stays
+// Proposed as a record.
+func TestDiffPendingAutoRejectsOverwrittenSet(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	// Replace every byte of the inserted text with the user's own.
+	s.Delete(User, 6, len("socket"))
+	s.Insert(User, 6, "port")
+
+	if got := s.Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v, want the overwritten set auto-rejected", got)
+	}
+	// The projection still reports it as moved, so a reviewer can see what the
+	// buffer moved past even though it no longer blocks a save.
+	diffs := s.DiffPending()
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want the moved set still reported", diffs)
+	}
+	if diffs[0].Moved != 1 || len(diffs[0].Hunks) != 0 {
+		t.Errorf("diff = %+v, want the overwritten member counted as moved", diffs[0])
+	}
+	if s.GroupState(id) != Proposed {
+		t.Errorf("state = %v, want the record to stay proposed", s.GroupState(id))
+	}
+	if got := text(s); got != "hello port\n" {
+		t.Errorf("text = %q, want the user's replacement", got)
+	}
+}
+
+// A member whose inserted text is entirely gone is counted as moved, and a set
+// with another surviving member keeps that count rather than hiding it.
+func TestDiffPendingCountsAMovedMemberAmongSurvivors(t *testing.T) {
+	s := groupSession(t, "aaa bbb ccc\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{
+		{Start: 0, End: 3, Text: "AAA"},
+		{Start: 8, End: 11, Text: "CCC"},
+	})
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	// Overwrite the second member's text; the first survives untouched.
+	s.Delete(User, 8, 3)
+	s.Insert(User, 8, "zzz")
+
+	diffs := s.DiffPending()
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want the set kept by its surviving member", diffs)
+	}
+	d := diffs[0]
+	if d.Moved != 1 {
+		t.Errorf("moved = %d, want the overwritten member counted", d.Moved)
+	}
+	if len(d.Hunks) != 1 {
+		t.Fatalf("hunks = %+v, want the one surviving member", d.Hunks)
+	}
+	if got := d.Hunks[0]; got.Start != 0 || got.End != 3 || got.New != "AAA" {
+		t.Errorf("surviving hunk = %+v, want 0..3 %q", got, "AAA")
+	}
+	if pending := s.Pending(); len(pending) != 1 || pending[0].ID != id {
+		t.Errorf("pending = %+v, want the set still pending for its survivor", pending)
+	}
+}
+
+// A partial deletion trims the member instead of dropping it: what is left of
+// the inserted text is still the agent's, contiguous and unbroken.
+func TestDiffPendingProjectsATrimmedRun(t *testing.T) {
 	s := groupSession(t, "hello world\n")
 	base := s.Version()
 	s.Begin()
@@ -327,15 +438,18 @@ func TestDiffPendingCountsMembersMovedPast(t *testing.T) {
 	s.End()
 	s.MarkGroup(s.LastGroup(), Proposed)
 
-	// The user types inside the proposed text, so the hunk's span no longer
-	// holds what the agent wrote.
-	s.Insert(User, 8, "XYZ")
+	// Remove the middle of the inserted text: "so|cke|t" loses "cke".
+	s.Delete(User, 8, 3)
 
 	diffs := s.DiffPending()
 	if len(diffs) != 1 {
 		t.Fatalf("diffs = %+v, want the one group", diffs)
 	}
-	if diffs[0].Moved != 1 || len(diffs[0].Hunks) != 0 {
-		t.Errorf("diff = %+v, want the overwritten member counted as moved", diffs[0])
+	d := diffs[0]
+	if d.Moved != 0 || len(d.Hunks) != 1 {
+		t.Fatalf("diff = %+v, want one surviving run", d)
+	}
+	if got := d.Hunks[0]; got.Start != 6 || got.End != 9 || got.New != "sot" || got.Old != "world" {
+		t.Errorf("trimmed run = %+v, want 6..9 %q", got, "sot")
 	}
 }

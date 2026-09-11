@@ -233,7 +233,6 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		filepath.Join(string(filepath.Separator), "etc", "passwd"),
 		filepath.Join(h.root, "..", "etc", "passwd"),
 		filepath.Join(h.root, "sub", "..", "..", "escape"),
-		"relative/path.go",
 	}
 	for _, p := range outside {
 		if _, err := g.Open(p); err == nil {
@@ -248,6 +247,27 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 	}
 	if len(h.opens) != 0 {
 		t.Errorf("a rejected path still reached the host: %v", h.opens)
+	}
+}
+
+// A relative path is inside the workspace by construction: it resolves against
+// the root, the same step every host verb takes, so open accepts the spelling a
+// caller would type. An escaping one is still refused, because the check runs
+// on the joined path.
+func TestGuardAcceptsRelativePathInsideTheRoot(t *testing.T) {
+	g, h := guarded(t)
+	want := filepath.Join(h.root, "a.go")
+	if _, err := g.Open("a.go"); err != nil {
+		t.Fatalf("Open(%q) was refused: %v", "a.go", err)
+	}
+	if len(h.opens) != 1 || h.opens[0] != want {
+		t.Errorf("the host was asked to open %v, want %q", h.opens, want)
+	}
+	if _, err := g.Open(filepath.Join("..", "etc", "passwd")); err == nil {
+		t.Error("a relative path that escapes the root was accepted")
+	}
+	if len(h.opens) != 1 {
+		t.Errorf("the escaping path reached the host: %v", h.opens)
 	}
 }
 
@@ -518,7 +538,7 @@ func (h *memHost) Decide(path string, group uint64, accept bool) error {
 	return ErrNoBuffer
 }
 
-func (h *memHost) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, bool, error) {
+func (h *memHost) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, int, bool, []TruncatedFile, error) {
 	var out []SearchMatch
 	for p, t := range h.docs {
 		for i, line := range strings.Split(t, "\n") {
@@ -531,7 +551,7 @@ func (h *memHost) Search(ctx context.Context, q SearchQuery, emit func([]SearchM
 	if emit != nil && len(out) > 0 {
 		emit(out)
 	}
-	return len(h.docs), false, nil
+	return len(h.docs), len(h.docs), false, nil, nil
 }
 
 // The document names glob escape separately from path escape because it is a
@@ -570,11 +590,11 @@ func TestSearchNeedsAPattern(t *testing.T) {
 func TestSnapshotSearcherValidates(t *testing.T) {
 	g, _ := guarded(t)
 	s := g.Snapshot()
-	if _, _, err := s.Search(context.Background(), SearchQuery{Text: "x", Include: "../*"}, nil); err == nil {
+	if _, _, _, _, err := s.Search(context.Background(), SearchQuery{Text: "x", Include: "../*"}, nil); err == nil {
 		t.Error("an escaping glob was allowed through the snapshot")
 	}
 	var got []SearchMatch
-	if _, _, err := s.Search(context.Background(), SearchQuery{Text: "world"},
+	if _, _, _, _, err := s.Search(context.Background(), SearchQuery{Text: "world"},
 		func(b []SearchMatch) { got = append(got, b...) }); err != nil {
 		t.Fatal(err)
 	}
@@ -822,5 +842,48 @@ func TestDiffLines(t *testing.T) {
 		if got != tc.b {
 			t.Errorf("DiffLines(%q, %q): applied to %q, want %q (hunks %+v)", tc.a, tc.b, got, tc.b, hunks)
 		}
+	}
+}
+
+// The tally is the buffer checking itself: a balanced file is all zero, a
+// missing closer reads positive, a stray one negative.
+func TestBraceTallyBalance(t *testing.T) {
+	if got := braceTally("ok.go", "package p\n\nfunc f() {\n\tg([]int{1})\n}\n"); got != (BraceTally{}) {
+		t.Errorf("balanced = %+v, want zero", got)
+	}
+	missing := braceTally("bad.go", "package p\n\nfunc f() {\n")
+	if missing.Braces != 1 {
+		t.Errorf("a missing } = %+v, want braces +1", missing)
+	}
+	stray := braceTally("stray.go", "package p\n}\n")
+	if stray.Braces != -1 {
+		t.Errorf("a stray } = %+v, want braces -1", stray)
+	}
+}
+
+// A bracket inside a string or a comment is not structural and does not count,
+// through the same ClassAt seam bracket matching uses.
+func TestBraceTallyIgnoresStringsAndComments(t *testing.T) {
+	src := "package p\n" +
+		"var s = \"{([\"\n" + // one double-quoted string, whole line ignored
+		"var t = \"}\"\n" + // a closer inside a string, ignore
+		"// a comment with { ( [\n" + // line comment, ignore
+		"/* a block with } ) ] */\n" + // block comment, ignore
+		"func f() {}\n" // the only structural pair
+	if got := braceTally("src.go", src); got != (BraceTally{}) {
+		t.Errorf("strings and comments counted: %+v, want zero", got)
+	}
+}
+
+// When the lexer has nothing to say — here an unknown language — every bracket
+// counts: plain depth counting, the same degrade as the matcher.
+func TestBraceTallyWithoutALexer(t *testing.T) {
+	got := braceTally("data.zzz", "{ [] }\n") // no lexer for .zzz
+	if got.Braces != 0 || got.Parens != 0 || got.Brackets != 0 {
+		t.Errorf("plain counting got %+v, want all balanced", got)
+	}
+	unbalanced := braceTally("data.zzz", "{\n")
+	if unbalanced.Braces != 1 {
+		t.Errorf("plain counting of a lone { = %+v, want braces +1", unbalanced)
 	}
 }

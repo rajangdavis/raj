@@ -12,12 +12,26 @@ import (
 // differ from the label, tsserver returns items whose insert text is a snippet
 // template, and both mark the list incomplete when they have more.
 
+// TextEdit is a range replacement as a server reports it. Positions are LSP
+// coordinates, converted to buffer offsets at the point the candidate is built
+// for acceptance.
+type TextEdit struct {
+	Range   Range
+	NewText string
+}
+
 // CompletionItem is one suggestion.
 type CompletionItem struct {
 	Label  string
 	Insert string // what to type; the label when the server gives nothing else
 	Detail string // a type or a signature, shown beside the label
 	Kind   int
+	// Edit, when the server sent a textEdit, is its own replacement for this
+	// candidate; Additional are the further edits — an import line, usually —
+	// that must land with it. Both are in server coordinates and are converted
+	// to buffer offsets where the candidate is built for acceptance.
+	Edit       *TextEdit
+	Additional []TextEdit
 	// sortText and filterText are the server's own ordering and matching keys.
 	// They exist because a server ranks by things the client cannot see —
 	// scope, type compatibility, usage — and encodes the result in a string
@@ -45,14 +59,15 @@ type completionResponse struct {
 }
 
 type completionItem struct {
-	Label            string          `json:"label"`
-	Kind             int             `json:"kind"`
-	Detail           string          `json:"detail"`
-	SortText         string          `json:"sortText"`
-	FilterText       string          `json:"filterText"`
-	InsertText       string          `json:"insertText"`
-	InsertTextFormat int             `json:"insertTextFormat"`
-	TextEdit         json.RawMessage `json:"textEdit"`
+	Label               string          `json:"label"`
+	Kind                int             `json:"kind"`
+	Detail              string          `json:"detail"`
+	SortText            string          `json:"sortText"`
+	FilterText          string          `json:"filterText"`
+	InsertText          string          `json:"insertText"`
+	InsertTextFormat    int             `json:"insertTextFormat"`
+	TextEdit            json.RawMessage `json:"textEdit"`
+	AdditionalTextEdits []TextEdit      `json:"additionalTextEdits"`
 }
 
 // Completions asks what could go at a position.
@@ -92,6 +107,8 @@ func Completions(ctx context.Context, c *Conn, path string, p Position) (items [
 			Insert:     insertTextOf(it),
 			Detail:     strings.TrimSpace(it.Detail),
 			Kind:       it.Kind,
+			Edit:       decodeTextEdit(it.TextEdit),
+			Additional: it.AdditionalTextEdits,
 			sortText:   it.SortText,
 			filterText: it.FilterText,
 		})
@@ -108,10 +125,11 @@ func Completions(ctx context.Context, c *Conn, path string, p Position) (items [
 // advertises snippetSupport: false, so a server sending one anyway is not
 // being obliged.
 //
-// A textEdit is likewise ignored. It carries its own range, which may extend
-// beyond the prefix being completed, and honouring it correctly means applying
-// a server-computed edit rather than typing a word. That is the right thing
-// eventually and is a different operation from the one the popup performs.
+// A textEdit is not read here. It is parsed separately into Edit, and honouring
+// it means applying a server-computed range replacement rather than typing a
+// word, which is a different operation from the one the popup performs. This
+// function still decides the plain word used for display and filtering, and for
+// the accept path when no textEdit was sent.
 func insertTextOf(it completionItem) string {
 	if it.InsertTextFormat == 2 { // snippet
 		return it.Label
@@ -120,6 +138,39 @@ func insertTextOf(it completionItem) string {
 		return it.InsertText
 	}
 	return it.Label
+}
+
+// decodeTextEdit parses a completion item textEdit, which comes in two shapes.
+// The plain TextEdit names one range; InsertReplaceEdit names both the span an
+// insertion would extend and the span the completed word replaces. The replace
+// span covers the whole word, which is what accepting should overwrite, so it
+// is preferred. raj does not advertise insertReplaceSupport, but a server is
+// free to send the richer shape anyway.
+//
+// A textEdit with no range at all, or nonsense, becomes nil: the candidate
+// still works as a plain word.
+func decodeTextEdit(raw json.RawMessage) *TextEdit {
+	if len(raw) == 0 || isNull(raw) {
+		return nil
+	}
+	var shape struct {
+		Range   *Range `json:"range"`
+		Insert  *Range `json:"insert"`
+		Replace *Range `json:"replace"`
+		NewText string `json:"newText"`
+	}
+	if json.Unmarshal(raw, &shape) != nil {
+		return nil
+	}
+	switch {
+	case shape.Replace != nil:
+		return &TextEdit{Range: *shape.Replace, NewText: shape.NewText}
+	case shape.Range != nil:
+		return &TextEdit{Range: *shape.Range, NewText: shape.NewText}
+	case shape.Insert != nil:
+		return &TextEdit{Range: *shape.Insert, NewText: shape.NewText}
+	}
+	return nil
 }
 
 // FilterKey is what a candidate should be matched against: the server's own

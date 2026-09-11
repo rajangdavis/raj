@@ -89,7 +89,7 @@ than the session. `--no-restore` turns both saving and restoring off.
 Buffer *contents* are not saved. A dirty buffer comes back as the file on disk,
 because restoring stale text over something edited elsewhere destroys work where
 a stale cursor position does not; persisting the journal is a separate problem
-kept in TODO.md. For the same reason a scratch buffer from cmd+n is the one tab
+kept in docs/TODO.md. For the same reason a scratch buffer from cmd+n is the one tab
 that cannot return: it is keyed on a path and has none.
 
 A session is a hint, never an instruction. Every field is re-checked against the
@@ -245,15 +245,15 @@ open-and-save byte round trip.
 
 ## Documents
 
-- `TODO.md` — open work
-- `COMPLETED.md` — what works, and what has been fixed
-- `BENCHMARKS.md` — measured numbers
-- `INVESTIGATIONS.md` — terminal findings, root causes, decisions
-- `HARNESS-BROKER-AGENT.md` — how an agent should author changes against the
+- `docs/TODO.md` — open work
+- `docs/COMPLETED.md` — what works, and what has been fixed
+- `docs/BENCHMARKS.md` — measured numbers
+- `docs/INVESTIGATIONS.md` — terminal findings, root causes, decisions
+- `docs/HARNESS-BROKER-AGENT.md` — how an agent should author changes against the
   live buffer. Design record; the control socket is a partial step toward it.
-- `CURSOR-VIEWPORT-SPEC.md` — the position invariants, and the properties that assert them
-- `KEYBINDINGS.md` — every chord, generated from `keys.Bindings` so it cannot
-  drift. Regenerate with `raj --keys > KEYBINDINGS.md`; a test fails if the
+- `docs/CURSOR-VIEWPORT-SPEC.md` — the position invariants, and the properties that assert them
+- `docs/KEYBINDINGS.md` — every chord, generated from `keys.Bindings` so it cannot
+  drift. Regenerate with `raj --keys > docs/KEYBINDINGS.md`; a test fails if the
   checked-in copy is stale.
 
 ## Configuration

@@ -12,7 +12,7 @@ import (
 
 // BufferHost is the vocabulary, with no transport in it.
 //
-// HARNESS-BROKER-AGENT.md puts the transport last and the interface second, for
+// docs/HARNESS-BROKER-AGENT.md puts the transport last and the interface second, for
 // a reason worth restating: a socket is one adapter over this, an in-process
 // call is another, and adding either must change nothing above this line. The
 // tests use the in-process path, so what they exercise is the same code the
@@ -145,7 +145,13 @@ type BufferHost interface {
 // second regex dialect answering the same query differently, and against model
 // latency the speed is free while coherence is not.
 type Searcher interface {
-	Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (files int, capped bool, err error)
+	// files is how many files held a match; considered is how many were
+	// opened and scanned at all — the number a too-narrow -include glob
+	// leaves at zero, which is how the CLI can say the glob matched nothing
+	// rather than implying the pattern did. truncated names the files the
+	// per-file cap cut down, which is independent of capped: the global
+	// MaxMatches flag.
+	Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (files, considered int, capped bool, truncated []TruncatedFile, err error)
 }
 
 var (
@@ -211,6 +217,14 @@ func (g *Guard) canonical(path string) (string, error) {
 }
 
 func (g *Guard) Open(path string) (uint64, error) {
+	// Open names a file that may not be a buffer yet, so unlike every other
+	// verb there is no Resolve to canonicalise it. A relative path is made
+	// absolute against the root here, the rule the host applies to every other
+	// verb, so open accepts the same spelling as read; the root check below
+	// then runs on the path it names rather than on how it was spelled.
+	if path != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(g.Host.Root(), path)
+	}
 	if err := g.inRoot(path); err != nil {
 		return 0, err
 	}
@@ -409,9 +423,9 @@ type guardedSearcher struct {
 	inner Searcher
 }
 
-func (s guardedSearcher) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, bool, error) {
+func (s guardedSearcher) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, int, bool, []TruncatedFile, error) {
 	if err := s.g.CheckQuery(q); err != nil {
-		return 0, false, err
+		return 0, 0, false, nil, err
 	}
 	return s.inner.Search(ctx, q, emit)
 }

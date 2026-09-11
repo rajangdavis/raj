@@ -391,6 +391,57 @@ func TestDiagnosticsDeliverNewestUnderPressure(t *testing.T) {
 	}
 }
 
+// A publish may carry the document version it applies to. The dispatcher must
+// keep it: the freshness rule compares it against the buffer, so dropping it
+// here would report every publish as versionless and therefore fresh.
+func TestPublishDiagnosticsCarriesVersion(t *testing.T) {
+	f := newFake(t)
+	v := 3
+	params, _ := json.Marshal(Diagnostics{
+		URI:     "file:///w/a.go",
+		Version: &v,
+		Items:   []Diagnostic{{Message: "problem"}},
+	})
+	f.push(&Message{
+		JSONRPC: "2.0",
+		Method:  "textDocument/publishDiagnostics",
+		Params:  params,
+	})
+
+	select {
+	case d := <-f.conn.Diagnostics:
+		if d.Version == nil || *d.Version != 3 {
+			t.Errorf("version = %v, want 3", d.Version)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no diagnostics arrived")
+	}
+}
+
+// The version is optional in the protocol, so a publish without one must still
+// decode, with the version left absent rather than invented as zero.
+func TestPublishDiagnosticsWithoutVersion(t *testing.T) {
+	f := newFake(t)
+	params, _ := json.Marshal(Diagnostics{
+		URI:   "file:///w/a.go",
+		Items: []Diagnostic{{Message: "problem"}},
+	})
+	f.push(&Message{
+		JSONRPC: "2.0",
+		Method:  "textDocument/publishDiagnostics",
+		Params:  params,
+	})
+
+	select {
+	case d := <-f.conn.Diagnostics:
+		if d.Version != nil {
+			t.Errorf("version = %v, want absent", d.Version)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no diagnostics arrived")
+	}
+}
+
 // Close stops the process even when the server ignores the polite shutdown. An
 // editor that leaves language servers running after it quits is a bug people
 // find in their process list.

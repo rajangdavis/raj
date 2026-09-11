@@ -177,6 +177,7 @@ func (a *App) settle(p *editor.Pane) {
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
+	p.Hints = a.InlayHints
 }
 
 // Focus is stored by name rather than by number so that reordering the enum

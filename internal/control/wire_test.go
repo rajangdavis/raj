@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"testing"
+
+	"raj/internal/prog"
 )
 
 // The header is JSON on purpose: the action and its arguments should be
@@ -176,6 +178,34 @@ func TestBaseZeroSurvives(t *testing.T) {
 	}
 }
 
+// A stated -start 0 asks for the head of the file; an absent one asks for the
+// whole of it. The encoder must not drop the zero, or the two collapse into
+// one request and the head-read comes back as the whole buffer.
+func TestStartZeroSurvives(t *testing.T) {
+	zero, fourHundred := 0, 400
+	h, body := EncodeRequest(Request{Op: "text", Start: &zero, End: &fourHundred})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, _ := ReadFrame(&buf)
+	got, err := DecodeRequest(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Start == nil || *got.Start != 0 {
+		t.Errorf("start = %v, want a present zero", got.Start)
+	}
+	if got.End == nil || *got.End != 400 {
+		t.Errorf("end = %v, want 400", got.End)
+	}
+	h, body = EncodeRequest(Request{Op: "text"})
+	buf.Reset()
+	WriteFrame(&buf, h, body)
+	f, _ = ReadFrame(&buf)
+	if got, _ = DecodeRequest(f); got.Start != nil || got.End != nil {
+		t.Errorf("start/end = %v/%v, want both absent", got.Start, got.End)
+	}
+}
+
 // A body that does not match the lengths its header names is a disagreement
 // about the format. Truncating to fit would turn a protocol bug into a
 // corrupted buffer.
@@ -285,6 +315,24 @@ func TestResponseCarriesMessages(t *testing.T) {
 	}
 }
 
+// Truncated rides in the header like buffers and messages; the failure mode is
+// EncodeResponse or DecodeResponse dropping it, which compiles and silently
+// loses the only sign that a per-file cap cut a file down.
+func TestResponseCarriesTruncatedFiles(t *testing.T) {
+	want := []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Truncated: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Truncated) != len(want) {
+		t.Fatalf("truncated = %+v, want %+v", got.Truncated, want)
+	}
+	if got.Truncated[0] != want[0] {
+		t.Errorf("truncated[0] = %+v, want %+v", got.Truncated[0], want[0])
+	}
+}
+
 // A frame carries a checksum, and a frame that fails it is refused rather than
 // parsed. The point is not bit rot on a Unix socket — there is none — it is
 // that an encoder bug becomes a named error here instead of a wrong offset
@@ -335,6 +383,68 @@ func TestShortFrameIsRefused(t *testing.T) {
 	for cut := 1; cut < len(good); cut++ {
 		if _, err := ReadFrame(bytes.NewReader(good[:cut])); err == nil {
 			t.Errorf("a frame cut to %d bytes was accepted", cut)
+		}
+	}
+}
+
+// The build revision rides every response, so a client that missed the
+// handshake still learns what it is talking to; empty means unknown, and
+// unknown is absence — no field is emitted, so a peer that predates the
+// field decodes the frame unchanged.
+func TestSrcVersionCrossesTheWire(t *testing.T) {
+	var buf bytes.Buffer
+	h, body := EncodeResponse(Response{ID: 4, OK: true, Final: true, SrcVersion: "abc123"})
+	if err := WriteFrame(&buf, h, body); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SrcVersion != "abc123" {
+		t.Errorf("SrcVersion = %q, want abc123", got.SrcVersion)
+	}
+
+	// Empty is not sent: the header program carries no hSrcVersion op at
+	// all, which is what "an old peer ignores it" and "an old server omits
+	// it" both reduce to.
+	h, _ = EncodeResponse(Response{ID: 4, OK: true, Final: true})
+	ops, err := prog.Decode(encodeHeader(h), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range ops {
+		if op.Code == hSrcVersion {
+			t.Error("an empty SrcVersion still emitted a header field")
+		}
+	}
+}
+
+// The stamp is in connection.send, not in the handlers, so it cannot be
+// forgotten by a verb: whatever the client asks first — handshake or not —
+// the answer names the build it came from.
+func TestServerStampsItsBuildRevision(t *testing.T) {
+	old := srcVersion
+	defer func() { srcVersion = old }()
+	srcVersion = "srv-abc"
+
+	ed := newFakeEditor(t, nil)
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for _, op := range []string{"ping", "buffers"} {
+		res, err := c.Do(Request{Op: op})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.SrcVersion != "srv-abc" {
+			t.Errorf("%s: SrcVersion = %q, want the stamped build revision", op, res.SrcVersion)
 		}
 	}
 }

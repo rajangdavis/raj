@@ -25,7 +25,7 @@ func TestUnimplementedActionsReallyAreUnimplemented(t *testing.T) {
 		h.handleKeyAction(action)
 		if !strings.HasPrefix(h.Status(), "unhandled:") {
 			t.Errorf("%s is listed as unimplemented (%q) but something handled it; "+
-				"drop it from keys.Unimplemented and regenerate KEYBINDINGS.md",
+				"drop it from keys.Unimplemented and regenerate docs/KEYBINDINGS.md",
 				action, why)
 		}
 	}
@@ -50,7 +50,7 @@ func TestEveryBoundActionIsHandled(t *testing.T) {
 		h.handleKeyAction(action)
 		if strings.HasPrefix(h.Status(), "unhandled:") {
 			t.Errorf("%s is bound but nothing handles it; either implement it or "+
-				"add it to keys.Unimplemented and regenerate KEYBINDINGS.md", action)
+				"add it to keys.Unimplemented and regenerate docs/KEYBINDINGS.md", action)
 		}
 	}
 }

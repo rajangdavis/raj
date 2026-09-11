@@ -8,7 +8,7 @@ import (
 )
 
 // docPath is the checked-in reference, relative to this package.
-const docPath = "../../KEYBINDINGS.md"
+const docPath = "../../docs/KEYBINDINGS.md"
 
 // The reference is generated, so the only thing that can go wrong is the
 // checked-in copy falling behind the table. This is the test that makes the
@@ -18,10 +18,10 @@ func TestCheckedInDocMatchesTheTable(t *testing.T) {
 	want := Doc()
 	got, err := os.ReadFile(docPath)
 	if err != nil {
-		t.Fatalf("%s is missing: %v\nrun: go run ./cmd/raj --keys > KEYBINDINGS.md", docPath, err)
+		t.Fatalf("%s is missing: %v\nrun: go run ./cmd/raj --keys > docs/KEYBINDINGS.md", docPath, err)
 	}
 	if string(got) != want {
-		t.Errorf("%s is stale.\nrun: go run ./cmd/raj --keys > KEYBINDINGS.md",
+		t.Errorf("%s is stale.\nrun: go run ./cmd/raj --keys > docs/KEYBINDINGS.md",
 			filepath.Base(docPath))
 	}
 }

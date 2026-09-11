@@ -179,6 +179,18 @@ type Header struct {
 	Buffers []Buffer
 	Files   int
 	Capped  bool
+	// Considered is how many files a search walk opened and scanned; a
+	// search under an -include glob that matched no file reports zero,
+	// which is how the CLI tells "no matches" from "nothing was searched".
+	Considered int
+	// Truncated names the files the per-file cap cut down, with both numbers.
+	// The path travels in the header like a buffer path does, since the header
+	// carries byte strings. Sent only when nonempty, so a server that does not
+	// know the field omits it and a client reads absence as unknown.
+	Truncated []TruncatedFile
+	// SrcVersion is the build revision of the server, stamped on every
+	// response; a client compares it with its own and warns on a mismatch.
+	SrcVersion string
 	// Matches carry their position in the header and their path and line text
 	// in the body, for the same reason document bytes are not in the JSON: a
 	// path is arbitrary bytes and a matched line is document content.
@@ -411,10 +423,12 @@ func EncodeResponse(res Response) (Header, []byte) {
 	h := Header{ID: res.ID, OK: res.OK, Err: res.Err, Root: res.Root, PID: res.PID,
 		Version: res.Version, Bytes: res.Bytes, Lines: res.Lines,
 		Buffers: res.Buffers, Conflicts: res.Conflicts,
-		Files: res.Files, Capped: res.Capped, Final: res.Final, Author: res.Author,
+		Files: res.Files, Considered: res.Considered, Capped: res.Capped,
+		Truncated: res.Truncated, Final: res.Final, Author: res.Author,
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
 		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
-		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON}
+		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON,
+		SrcVersion: res.SrcVersion, Identity: res.Identity}
 	var body []byte
 	if res.Stream != 0 {
 		// Command output is bytes off a pipe: whatever the process wrote, not
@@ -441,12 +455,14 @@ func DecodeResponse(f Frame) (Response, error) {
 		PID: f.Header.PID, Version: f.Header.Version,
 		Bytes: f.Header.Bytes, Lines: f.Header.Lines,
 		Buffers: f.Header.Buffers, Conflicts: f.Header.Conflicts,
-		Files: f.Header.Files, Capped: f.Header.Capped, Final: f.Header.Final,
+		Files: f.Header.Files, Considered: f.Header.Considered, Capped: f.Header.Capped,
+		Truncated: f.Header.Truncated, Final: f.Header.Final,
 		Author: f.Header.Author, Exit: f.Header.Exit, Dirty: f.Header.Dirty,
 		Stats: f.Header.Stats, Stream: f.Header.Stream,
 		Participants: f.Header.Participants, Groups: f.Header.Groups,
 		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
-		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON}
+		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON,
+		SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

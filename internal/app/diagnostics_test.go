@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"raj/internal/control"
 	"raj/internal/lsp"
 )
 
@@ -40,6 +41,49 @@ func TestEmptyPublishClears(t *testing.T) {
 	}
 	if got := d.summary("/w/a.go"); got != "" {
 		t.Errorf("summary = %q, want nothing", got)
+	}
+}
+
+// A publish is the server speaking about a path, so an empty publish marks it
+// published all the same. forPath cannot tell an empty publish from a path no
+// server has answered about: both return nothing, and the two must not read
+// the same to a caller checking for a clean file.
+func TestPublishMarksPathPublished(t *testing.T) {
+	d := newDiagnostics()
+	if d.published("/w/never.go") {
+		t.Error("an untouched path reported as published")
+	}
+
+	d.set("/w/a.go", nil) // an empty publish is still a publish
+	if !d.published("/w/a.go") {
+		t.Error("an empty publish did not mark the path published")
+	}
+
+	d.set("/w/b.go", []lsp.Diagnostic{diag(1, sevError, "broken")})
+	if !d.published("/w/b.go") {
+		t.Error("a publish with problems did not mark the path published")
+	}
+
+	d.clear("/w/a.go")
+	if d.published("/w/a.go") {
+		t.Error("clear left the path marked published")
+	}
+	if !d.published("/w/b.go") {
+		t.Error("clearing one path unpublished another")
+	}
+}
+
+// A store built by hand with only byPath set — the shape newDiagnostics is the
+// only real constructor for — must still answer published without panicking,
+// and must record a publish into a set that was never initialised.
+func TestPublishedOnHandBuiltStore(t *testing.T) {
+	d := &diagnostics{byPath: map[string][]lsp.Diagnostic{}}
+	if d.published("/w/a.go") {
+		t.Error("a hand-built store claimed a publish it never saw")
+	}
+	d.set("/w/a.go", nil)
+	if !d.published("/w/a.go") {
+		t.Error("a hand-built store did not record the publish")
 	}
 }
 
@@ -177,4 +221,88 @@ func TestDrainWithNoServers(t *testing.T) {
 	h := newHarness(t, "text\n")
 	h.drainDiagnostics()
 	h.drainDiagnostics()
+}
+
+// The version a publish applied to travels with the set, so the diagnostics
+// read can tell one that describes the current text from one that stopped
+// describing it the moment the buffer changed. A publish with no version
+// replaces the remembered one rather than leaving the older version to look
+// current, and clear drops both together.
+func TestPublishVersionRoundTrips(t *testing.T) {
+	d := newDiagnostics()
+	v := 7
+	d.setVersion("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "broken")}, &v)
+
+	if got, ok := d.publishedVersion("/w/a.go"); !ok || got != 7 {
+		t.Errorf("publishedVersion = (%d, %v), want (7, true)", got, ok)
+	}
+
+	d.set("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "broken")})
+	if got, ok := d.publishedVersion("/w/a.go"); ok {
+		t.Errorf("publishedVersion = (%d, true), want no version", got)
+	}
+
+	d.setVersion("/w/a.go", nil, &v)
+	if got, ok := d.publishedVersion("/w/a.go"); !ok || got != 7 {
+		t.Errorf("publishedVersion after a clean publish = (%d, %v), want (7, true)", got, ok)
+	}
+	d.clear("/w/a.go")
+	if got, ok := d.publishedVersion("/w/a.go"); ok {
+		t.Errorf("clear left version %d behind", got)
+	}
+}
+
+// An empty publish is still a publish, and it still applies to a version. A
+// clean file whose version was dropped would compare as fresh forever, which is
+// the one reading a per-hunk compile gate must never accept by accident.
+func TestEmptyPublishRecordsItsVersion(t *testing.T) {
+	d := newDiagnostics()
+	v := 3
+	d.setVersion("/w/a.go", nil, &v)
+
+	if !d.published("/w/a.go") {
+		t.Fatal("an empty publish did not mark the path published")
+	}
+	if got, ok := d.publishedVersion("/w/a.go"); !ok || got != 3 {
+		t.Errorf("publishedVersion = (%d, %v), want (3, true)", got, ok)
+	}
+}
+
+// The freshness rule is the fix, so every branch is pinned without a server:
+// an unpublished path, a server that has not been told about the current text,
+// a publish that predates it, a fresh one, and a fresh one whose server sent no
+// version at all.
+func TestDiagnosticsStatus(t *testing.T) {
+	version := func(v int) *int { return &v }
+	cases := []struct {
+		name       string
+		published  bool
+		pubVersion *int
+		synced     int
+		buf        int
+		want       string
+	}{
+		{"unpublished", false, nil, 5, 5, control.LSPStatusUnpublished},
+		{"unsynced", true, version(5), 3, 5, control.LSPStatusStale},
+		{"version mismatch", true, version(4), 5, 5, control.LSPStatusStale},
+		{"fresh", true, version(5), 5, 5, control.LSPStatusOK},
+		{"no version fresh", true, nil, 5, 5, control.LSPStatusOK},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, detail := diagnosticsStatus(c.published, c.pubVersion, c.synced, c.buf)
+			if got != c.want {
+				t.Errorf("status = %q, want %q", got, c.want)
+			}
+			if got == control.LSPStatusOK {
+				if detail != "" {
+					t.Errorf("an ok status carried detail %q", detail)
+				}
+				return
+			}
+			if detail == "" {
+				t.Errorf("status %q carried no detail", got)
+			}
+		})
+	}
 }

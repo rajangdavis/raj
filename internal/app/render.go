@@ -9,6 +9,11 @@ import (
 
 // Draw renders a frame and hands it to the host.
 func (a *App) Draw() {
+	// Hints are dropped here rather than at each mutation site: a keystroke
+	// reaches Draw after the edit, so comparing the document version against
+	// the installed answer catches typed keys, paste, undo, redo and a control
+	// write in one place, before a stale overlay can be painted.
+	a.invalidateHints()
 	cols, rows := a.syncSize()
 	a.screen.Clear()
 	if rows < 2 || cols < 4 {
@@ -224,6 +229,11 @@ func (a *App) drawEditor(l Layout) {
 		a.drawEmpty(l)
 		return
 	}
+	// The pane hints were filtered for the width they had when they were
+	// installed. A resize, a sidebar or a split changes that width, and this is
+	// the first point in the frame where the new width is known, so the set is
+	// refreshed here — before RenderFocused resizes the pane itself.
+	a.fitHints(p, l.EditorW-p.GutterWidth())
 	restore := a.screen.Clip(l.EditorX, l.TopY, l.EditorW, l.Rows)
 	defer restore()
 	a.screen.Fill(l.EditorX, l.TopY, l.EditorW, l.Rows, ui.DefaultStyle)
@@ -261,26 +271,37 @@ func (a *App) drawStatus(cols, y int) {
 	style := ui.DefaultStyle.Plus(ui.Reverse)
 	a.screen.Fill(0, y, cols, 1, style)
 
+	review := a.mode == ModeReview
 	left, right := " "+a.focusName(), ""
-	if p := a.Tabs.Active(); p != nil {
+	if review {
+		// The badge and keybar are the status line in Review mode: the mode is
+		// modal, and the shortcuts and progress are what matter while it is on.
+		left = " " + a.reviewBar()
+	} else if p := a.Tabs.Active(); p != nil {
 		f := p.File
 		dirty := ""
 		if f.Dirty() {
 			dirty = " •"
 		}
 		left = fmt.Sprintf(" %s%s", f.Name(), dirty)
+	}
+	if p := a.Tabs.Active(); p != nil {
+		f := p.File
 		line, col := f.LineCol(p.Cursors.Primary().Head)
 		right = fmt.Sprintf("%d:%d  %d pieces ", line+1, col+1, f.Pieces())
 		if n := p.Cursors.Count(); n > 1 {
 			right = fmt.Sprintf("%d cursors  ", n) + right
 		}
 	}
-	// Always name the focused pane: on a narrow window only one pane is drawn,
-	// so the status line is the only thing that says where keys are going.
-	left += "  [" + a.focusName() + "]"
-	if p := a.Tabs.Active(); p != nil {
-		if sum := a.diags.summary(a.docPath(p)); sum != "" {
-			left += "  " + sum
+	if !review {
+		// Always name the focused pane: on a narrow window only one pane is
+		// drawn, so the status line is the only thing that says where keys are
+		// going.
+		left += "  [" + a.focusName() + "]"
+		if p := a.Tabs.Active(); p != nil {
+			if sum := a.diags.summary(a.docPath(p)); sum != "" {
+				left += "  " + sum
+			}
 		}
 	}
 	// A transient message outranks the diagnostic on the cursor's line: the
@@ -290,8 +311,10 @@ func (a *App) drawStatus(cols, y int) {
 	case a.status != "":
 		left += "  " + a.status
 	default:
-		if d := a.diagnosticAtCursor(); d != "" {
-			left += "  " + d
+		if !review {
+			if d := a.diagnosticAtCursor(); d != "" {
+				left += "  " + d
+			}
 		}
 	}
 

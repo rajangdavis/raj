@@ -515,3 +515,378 @@ what makes the tool intuitive and where it fights back.
   repeatedly piped `raj ctl read` through `sed -n`. A locked-down container
   will not have `sed`; `raj ctl read -line N` or `-lines START,END` would remove
   the dependency entirely and is a better fit for an agent than byte offsets.
+
+## Review and edit modes (Wave D, 2026-09-10)
+
+The review surface is chord-level today: accept, reject and review on chords,
+plus the next/prev cycle over pending change sets. There is no mode, so the
+document stays editable while you review it, and a stray keystroke inside a
+proposed span is what produces the moved-hunk case below.
+
+### Two app-level modes, toggled by `cmd+r`
+
+Edit is today's editor. Review makes the document read-only: movement, scroll,
+search, hover and goto all work; every text mutation (insert, delete,
+backspace, enter, paste, cut, undo/redo, indent, move-line) is refused with a
+status note. The review decisions stay live in review mode — accept, reject,
+next/prev, skip — because they are decisions, not edits. Reject removes text,
+and that is the point of it. Reload moves off `cmd+r` to `cmd+shift+r`.
+
+Review mode enters at chunk 1 when there are pending sets; entering with none
+is allowed (read-only browse) and says "no proposed changes". A one-line keybar
+plus a mode badge in the status line carries progress and the shortcuts:
+`Review · 3/12 · n/p move · a accept · x reject · A all · s skip · cmd+r edit`.
+The socket verb `raj ctl review [path]` enters review mode and returns the
+chunk list; `-json` is the read-only list without entering. This is a new verb
+(eight layers, wire) on top of a new mode, so it needs a rebuild.
+
+### The moved-hunk case
+
+`DiffPending` (internal/piecetable/groups.go) projects each proposed member op
+by rebasing its inserted span forward and requiring it to keep its original
+length. A later edit that reaches inside the span fails that test, the member
+is counted in `Moved`, and `PendingMarks` drops it. The group is still
+`Proposed` with live ops, so `Pending()` still returns it: the gutter letter
+and the review tint vanish, accept/reject at the caret does nothing, next/prev
+skips it, and the save-review row has no line to jump to — yet cmd+s is still
+blocked by it. Invisible-but-blocking. `raj ctl groups` and `raj ctl diff`
+report `Moved`; no editor surface consumes it.
+
+Review mode read-only kills the accidental case. For a deliberate edit in edit
+mode the options are:
+
+- **A. Adjust (recommended).** Re-project the surviving piece runs of the
+  proposal; the region the user typed into becomes theirs; the set auto-rejects
+  only when no agent pieces remain. Needs `DiffPending` to project piece runs
+  rather than check one length.
+- **B. Auto-reject the set.** Simple, but destructive on an additive edit: it
+  removes the agent's surrounding text, which is what the user was editing.
+- **C. Prompt on first overlap.** Honest, but modal on the typing path.
+
+Open: pick A, B or C.
+
+## LSP inlay hints (option A — inline overlay)
+
+TODO.md calls inlay hints "a renderer project, not an LSP one", and that is
+right: the request is trivial and the drawing is everything. The chosen shape is
+**option A**, a true inline overlay — hint text occupies cells in the document
+flow, and every column map knows it: the caret, selection and highlights agree
+for a line that fits one visual row (see "Decision: the wrap fallback"); a
+multi-row line draws no hints. End-of-line-only and detached-overlay hints are
+rejected: both
+draw text the column map does not know about, which is exactly the class of bug
+`internal/view/wrap.go` already warns about (a caret on a row the renderer never
+drew). One invariant makes it safe to land in stages: **an empty hint set is
+byte-identical to today**, so every existing test stays green and the feature can
+be built one seam at a time behind a toggle.
+
+### Protocol
+
+`textDocument/inlayHint` takes `{textDocument:{uri}, range:{start,end}}`; the
+range is mandatory and is how a client asks only about the viewport. The result is
+`InlayHint[] | null`, a hint being:
+
+    position    Position
+    label       string | InlayHintLabelPart[]   // {value, tooltip?, location?, command?}
+    kind?       1 Type | 2 Parameter
+    textEdits?  TextEdit[]
+    tooltip?    string | MarkupContent
+    paddingLeft?, paddingRight?   bool
+
+Add `inlayHint` to `clientCapabilities()` in `internal/app/lsp.go` under
+`textDocument`, as an empty object. Presence is the advertisement; a server sends
+hints only when it is there. Do **not** advertise `resolveSupport` (so we never
+need `textDocument/inlayHint/resolve`) and do not advertise
+`dynamicRegistration`. `labelFormatSupport` does not exist for this request. The
+terminal has no rich text, so `label` parts are flattened to a plain string by
+joining `value` in order (ignoring `location` and `command`); `tooltip`, a
+`string | MarkupContent`, is flattened the same way — markup reduced to its plain
+text, exactly as the caret-driven hover panel reduces it today — and kept for the
+mouse-hover tooltip. Both `kind` 1 (type) and `kind` 2 (parameter) hints are
+shown; a kind filter is one setting or one constant, not a protocol decision.
+`textEdits` are decoded inline — with `resolveSupport` unadvertised a server sends
+them with the hint or not at all — and kept for the `cmd+.` apply path below
+rather than discarded.
+
+### Data model
+
+`internal/lsp/inlay.go` (new): `InlayHint{Pos Position; Text string; Kind int;
+PaddingLeft, PaddingRight bool; Tooltip string; Edits []TextEdit}`, the
+`inlayHint` wire struct, `labelText`, a `tooltipText` that flattens `string |
+MarkupContent` the way hover does, and `RequestInlayHints(ctx, c, path, r)
+([]InlayHint, error)` beside `RequestHover` in `requests.go`. The `textEdits`
+are decoded inline; `resolveSupport` is not advertised, so a server either sends
+them with the hint or omits them. `internal/editor/hints.go` (new): the
+renderer-facing model, deliberately in `editor` so the editor never imports
+`lsp`:
+
+    type Hint struct{ Off int; Text string; Left, Right bool; Kind int;
+                       Tooltip string; Edits []HintEdit }
+    type HintEdit struct{ Start, End int; Text string }   // byte offsets
+    type HintSet struct{ byLine map[int][]Hint }   // sorted by Off
+
+`At(line)` returns the slice for a line (nil fast path); the app converts each
+`lsp.InlayHint` to a line-relative `editor.Hint` when it installs, turning each
+LSP `TextEdit` into byte offsets with `lsp.Document.Span` exactly as completion
+`textEdits` are converted, so `editor` stays free of `lsp` imports. The layout
+engine only needs widths, so `view` gets a minimal `view.HintCol{Off, Width int}`
+and the column/wrap functions take `[]view.HintCol`, avoiding a `view -> editor`
+dependency.
+
+### App lifecycle and cache
+
+Mirror the diagnostics store, not the single-answer slot. New
+`internal/app/inlay.go`: `inlayStore{byPath map[string]entry}` with
+`entry{version int; hints []editor.LineHint}` and `set`/`forPath`/`clear`,
+guarded by a mutex. A stored hint is a `LineHint` — a `Hint` beside the line it
+anchors on, since its `Off` is line-relative. The cache
+is keyed by path **and document version**, because a hint from a version
+the buffer has left must never reach the renderer — a stale hint does not merely
+look wrong, it moves every column after it.
+
+Hints live on `File` (`File.Hints *HintSet`), installed and cleared on the event
+thread. `maybeRequestHints()` runs only from the idle `ui.Tick` case in
+`App.Handle` (the existing debounce), and only when the app is in edit mode, the
+pane has hints enabled, the path is non-empty, and the requested range or the
+document version changed since the last request. The editor's default range is
+the visible line range plus a half-screen margin; an agent may override it over
+the socket (see "Agent access" below), and the pane then requests what the agent
+asked for. Either way it converts both ends with
+`lsp.NewDocument(p.File.Text()).Position(...)`, gets the server with
+`servers.for_(path, notify)` (which also starts it lazily), calls `syncDoc`, bumps
+`a.inlayGen`, and calls `lsp.RequestInlayHints` inside `safe.Go` with a 2 s
+context, parking the result and posting `ui.Wake` exactly as `hover()` does. On
+the Wake, `applyAnswer` routes an `answerInlay` against `a.inlayGen`; the parked
+answer carries path and version, and `applyInlay` installs only if the path is
+active and the version still matches. Invalidation is the important half: any
+edit (typed key, paste, undo/redo, accept/reject) clears `File.Hints` and bumps
+`a.inlayGen` before the next draw, so stale columns cannot survive even one
+frame; `closeDoc` calls `inlays.clear(path)`. Files: `internal/app/inlay.go`
+(new), `internal/app/lsp.go` (capability, `closeDoc`, answer kind),
+`internal/app/app.go` (fields, Tick hook, edit hook), `internal/editor/file.go`
+(`Hints`).
+
+### Agent access: `lsp inlay-hints`
+
+`raj ctl lsp` gains an `inlay-hints` mode: `raj ctl lsp inlay-hints <path>`
+returns hints for the whole file, and `-lines A,B` (mirroring `read -lines`,
+1-based inclusive) restricts it. The result JSON mirrors the other `lsp` modes —
+1-based `line`/`col` positions in the editor's own coordinates, plus `text`,
+`kind`, `paddingLeft`/`paddingRight`, `tooltip` and `textEdits` — so a driver
+never parses a server payload directly. This is a range parameter on the LSP
+request and the control host threaded down to `lsp.RequestInlayHints`: the
+request already takes a `range`, but the control host, the `BufferHost` interface
+and the CLI have no way to pass one for this verb yet, which is why it is its own
+implementation step (step 8) rather than part of the editor-side fetch. The
+editor's own `maybeRequestHints` keeps the viewport default; the verb exists for
+whole-file audits and for verifying hint and column behaviour from a test.
+
+### Renderer integration (the crux)
+
+The column model becomes: `col(off) = baseCol(off) + sum(width(hint))` for hints
+anchored strictly before `off` (a hint at the boundary is drawn starting there,
+with the caret before it); the inverse subtracts the same sum, and a column
+landing inside a hint resolves to that hint’s anchor offset, never a byte inside
+it. LSP positions are untouched: they stay UTF-16 over bytes
+(`internal/lsp/position.go`), and only display columns change.
+
+This is the SHIPPED scope: hints are placed through the hint-aware column map
+for lines that fit a single visual row (see "Decision: the wrap fallback"
+below). There is no hint-aware wrap; a line that wraps to more than one visual
+row contributes no hints and its layout is byte-identical to today. The
+functions that consult the hint model:
+
+- `internal/view/columns.go` `HintCol` and the hint-aware `ColOfHints`,
+  `OffsetOfHints` and `WidthHints` -- the pure conversions. The boundary
+  convention is that a hint at `Off` draws starting there, so the caret sits
+  before it.
+- `internal/editor/file.go` `File.LineCol` and `File.OffsetAt` -- the chokepoints
+  the caret, motion, mouse and hover anchor already go through, hint-aware for
+  the single-row case.
+- `internal/editor/wrap.go` `cursorRowCol`, `moveVerticalWrapped` and
+  `offsetInRow` -- the row/caret helpers, hint-aware only for a fitting
+  single-row line.
+- `internal/editor/render.go` `drawLine`/`drawHint` -- `Hint.Width` advances
+  `col` by the hint width and the hint is painted with `Theme.InlayHint`; the EOL
+  secondary-cursor cell uses the hint-aware width.
+- `internal/editor/mouse.go` `OffsetAt` -- the inverse; a click inside a hint
+  clamps to its anchor, so the caret cannot land inside one.
+
+`internal/view/wrap.go` is deliberately untouched: it has no hint-aware
+functions. A hint occupies columns without a byte, so a hint-only row cannot be
+represented in a byte-offset row model (see "Decision: the wrap fallback").
+
+Hint text and padding order at the anchor: `[space if paddingLeft][text][space
+if paddingRight]`, one atomic cell run whose width is the display width of the
+text (`ui.RuneWidth`, not `len`) plus the padding. A line whose hints push it
+past one visual row is dropped as a whole, hint run included; the wrapper never
+sees a hint.
+
+Selection and find are tested per byte (`inAny(sel, off)`,
+`Find.Highlight(off)`), so a hint cell, which has no byte, is never painted with
+a selection, find or author tint. Requirement (b) falls out of the model rather
+than needing new checks.
+
+### Decision: the wrap fallback
+
+Full wrap integration was attempted and ABANDONED. The root cause is structural,
+not a matter of effort: the wrap/row model in `internal/view/wrap.go` is a list
+of BYTE offsets, and a hint occupies columns with no bytes. A row holding only a
+hint therefore has no byte to anchor it: the layout emits a duplicate break at
+the same byte (an empty row), and `RowOfBreaks` maps that byte to the text row,
+leaving the hint-only row unreachable by the renderer. Every one of
+`AppendWrap`, `WrapRows`, `RowOfBreaks` and `OffsetAtRow` would have to agree on
+a row no byte identifies, which is exactly the caret-on-an-undrawn-row failure
+the wrap code already warns about.
+
+The shipped design is the per-line fit fallback. The hints on a line are kept
+only when the whole line, hints included, fits one visual row:
+
+    WidthHints(line, hintCols) <= p.TextWidth()
+
+otherwise that line contributes no hints. `editor.HintsThatFit` decides,
+`File.SetHintsFiltered` and `File.HintWidth` hold the filtered set on the file,
+and `App.fitHints` re-filters from the store when the pane width changes, called
+from `drawEditor`. The hint-aware `internal/view/wrap.go` additions were
+reverted; `view` has NO hint-aware wrap functions, and that is deliberate. The
+single-row hint-aware column mapping (step 4a) is all the wrap path needs, and
+the row/caret helpers that do touch hints (`cursorRowCol`, `moveVerticalWrapped`,
+`offsetInRow`) handle only the fitting single-row case. The old `!p.Wrap` gate
+is gone, so hints show with wrapping ON for every line that fits; a multi-row
+line simply shows none. That is a real limitation of the shipped design, stated
+here rather than left to be discovered.
+
+### Interaction with the rest
+
+Diagnostics are gutter marks (`app.drawDiagnosticMarks`) keyed by line plus a
+status-line summary (`diagnostics.atLine`); neither touches columns, so a hint on
+a diagnosed line is indifferent to the mark. There are no diagnostic underlines
+today; if one is added it is a byte span and must skip hint cells for the same
+reason selection does. Search highlights move with the hint because `drawLine`
+advances `col` by the hint width, and find's jump uses the hint-aware
+`File.LineCol`. The hover panel is anchored with `p.File.LineCol(head)` in
+`applyHover`, so it keeps tracking the text and `Panel.Render` needs no change;
+the mouse-hover hint tooltip shares the same `hover.Panel` (see below), so any
+action that hides the caret panel hides the tooltip too, and the two must not
+both claim the panel in one frame.
+Copy and selection read byte ranges from the buffer, so hint text can never be
+selected or copied. Performance is preserved because hints are per-line and
+range-scoped: `RenderFocused` asks `HintSet.At(line)` for the same visible lines
+it already draws, the fetch covers only the viewport (or the agent's requested
+range), and no frame ever walks the file.
+
+### Tooltips (mouse-hover)
+
+The one thing the caret cannot reach is the thing a tooltip hangs off: a hint
+occupies cells no caret may enter, so the existing caret-driven hover path can
+never anchor one. The mouse can. `internal/keys/mouse.go` already decodes a bare
+move as `Mouse{Motion: true, Button: MouseNone}` and `internal/ui/host.go`
+delivers it as `ui.Mouse`; `internal/app/app.go`'s mouse handling and
+`internal/app/pointer.go` act only on wheel and clicks today, so the motion event
+is received and ignored. No terminal or protocol change is needed — only an
+app-side motion path.
+
+On a motion event, map the pointer's `(Col, Row)` to a visible hint cell: row to
+line through the wrap map (`Layout{EditorX, EditorW, TabY, TopY, Rows}` plus the
+editor's row/line functions), the hint's display span from the hint-aware column
+map including its padding. After a short dwell on the same cell, show the hint's
+`Tooltip` in `hover.Panel` via `Show(text, line, col)` anchored at the hint.
+Hide it on movement off the cell, on scroll, on typing, and on any action —
+`Panel.Handle` already hides on any action, and motion needs its own hide-on-leave
+because the caret never moved. Because the whole path reads the hint-aware
+column map, it is a late step: it lands after the column map (step 4). There
+is no hint-aware wrap to wait on (see "Decision: the wrap fallback").
+
+Hint tooltips are mouse-only. A hint cell is not a caret position, so there is no
+keyboard anchor to hang a tooltip on; the caret hover path keeps serving symbols
+and is deliberately not repurposed, because showing a hint's tooltip from a caret
+that cannot rest on the hint would make one panel answer two different questions.
+A frame with no mouse simply gets no hint tooltips, and that is the documented
+fallback.
+
+### Applying a hint's `textEdits` (`cmd+.`)
+
+A hint's `textEdits` are applied, VS Code quick-fix style. The chord `super+.`
+(native, CSI-u `46;9u`; mac `cmd+period`, Linux `ctrl+period`) bound to an action
+named `ApplyInlayEdit` finds the hint nearest the caret on the current line, takes
+its `Edits`, and applies them through the same range-replacement machinery
+completion edits use, as one undo step. The edits are already byte-offset
+`editor.HintEdit`s, converted when the hint was installed, so no LSP coordinate
+conversion happens here. When there is no hint on the line, or the nearest hint
+carries no edits, the action is a no-op that reports through the status line
+rather than silently doing nothing. In review mode, where mutations are refused,
+it is likewise refused. The accounting tests
+(`TestEveryKeymapChordIsAccountedFor`, `TestBindingsRoundTrip`) and the
+`KEYBINDINGS.md` row apply to this chord exactly as to the toggle.
+
+### Toggle and UX
+
+`App.InlayHints` is default on, inherited by panes like
+`WrapDefault`/`AutoPairs` and persisted as `session.Pane.Hints`; on matches the
+existing hover and diagnostics defaults and makes the feature discoverable. Both
+kind 1 (type) and kind 2 (parameter) hints are shown, with a kind filter
+available as one setting or one constant. The toggle chord is `shift+super+i`
+(native, CSI-u `105;10u`; mac `cmd+shift+i`, Linux `ctrl+shift+i`), following the
+table's existing `shift+super+<letter>` / `ctrl+shift+<letter>` pattern. Add
+`keys.ToggleInlayHints` to `keys/action.go` and a `Natives` row in
+`keys/table.go`; `TestEveryKeymapChordIsAccountedFor` and
+`TestBindingsRoundTrip` enforce the accounting, and `KEYBINDINGS.md` gets the
+row. Hint cells use a dedicated `Theme.InlayHint` style (dim/italic) so they read
+as annotations and not as document text; nothing else advertises that they are
+non-editable, because nothing can — the caret cannot enter them, selection and
+find never cover them, and a marker glyph would itself have to be
+width-accounted.
+
+### Step plan
+
+Steps 1-5 have shipped; the remaining five are listed after them.
+
+Shipped:
+
+1. Protocol and capability. `internal/lsp/inlay.go` (`InlayHint`,
+   `RequestInlayHints(ctx,c,path,r)`, `labelText`, `tooltipText`);
+   `textDocument.inlayHint` advertised as an empty object in
+   `clientCapabilities()` (no `resolveSupport`).
+2. Hint model and store. `internal/editor/hints.go` (`Hint`, `HintEdit`,
+   `HintSet`, `LineHint`; `File.Hints`, `HintsAt`/`SetHints`/`ClearHints`);
+   `internal/app/inlay.go` (`inlayStore` keyed by path+version).
+3. Fetch lifecycle. `maybeRequestHints` on the idle tick (visible range plus a
+   half-screen margin), `answerInlay`, `applyInlay`, `invalidateHints`;
+   generation and version drops.
+4. Column map. `internal/view/columns.go` `HintCol` and the hint-aware
+   `ColOfHints`/`OffsetOfHints`/`WidthHints` (boundary convention: a hint at
+   `Off` draws starting there, caret before it); `Hint.Width`/`HintCols`;
+   `File.LineCol`/`OffsetAt` hint-aware; `drawLine`/`drawHint` paint with
+   `Theme.InlayHint`; `mouse.OffsetAt` clamps inside a hint to its anchor.
+5. Wrap integration - ATTEMPTED AND ABANDONED in favour of the per-line fit
+   fallback (see "Decision: the wrap fallback"). `editor.HintsThatFit`,
+   `File.SetHintsFiltered`/`HintWidth`, `App.fitHints`; the hint-aware
+   `view/wrap.go` additions were reverted. Hints show with `Wrap` on for every
+   line whose hints fit one row; multi-row lines show none.
+
+Remaining:
+
+6. Toggle chord, persistence and docs. `keys.ToggleInlayHints` plus a
+   `keys/table.go` row: native `shift+super+i`, CSI-u `105;10u`, mac
+   `cmd+shift+i`, linux `ctrl+shift+i`; persisted as `session.Pane.Hints`; a
+   `KEYBINDINGS.md` row; the accounting tests. (`App.InlayHints` defaults true
+   and `p.Hints` already exists.)
+7. Cross-cutting tests. Hover anchor, find-after-hint, selection-over-hint.
+8. Agent `lsp inlay-hints` verb and range. Whole file, `-lines A,B`; the eight
+   control layers plus the range plumbing.
+9. Mouse-hover tooltips. `internal/app/pointer.go` motion path, dwell and
+   motion dispatch, the row-to-line and hint-cell lookup, and `internal/hover`
+   `Panel` reuse; depends on the column map, not on wrap integration.
+10. `cmd+.` apply-hint-edit. `keys/action.go`, `keys/table.go`, `app.go`
+    `handleGlobal`, the completion-edit machinery, and the status note; the
+    chord accounting and the `KEYBINDINGS.md` row.
+
+### Decisions
+
+- Dwell before a tooltip appears is 300 ms (two idle ticks), long enough not to
+  flash on a pass and short enough not to feel broken. A named constant.
+- A hint with an empty `Tooltip` shows no panel, matching VS Code: the label is
+  already visible inline, and only a server-supplied tooltip adds anything.
+- `cmd+.` is caret-adjacent only, matching VS Code's quick-fix action: it applies
+  the nearest hint's edits on the current line. A whole-line or whole-file apply
+  is not offered.

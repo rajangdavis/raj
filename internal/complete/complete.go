@@ -23,11 +23,25 @@ type Source interface {
 	Candidates(prefix string) []Candidate
 }
 
+// Edit is a replacement of a byte range in the buffer the candidate was
+// computed against. It is the language-server shape of a suggestion: a server
+// names the bytes to overwrite rather than merely the word to type. It carries
+// no LSP type, so buffer words and server words share one candidate.
+type Edit struct {
+	Start, End int
+	Text       string
+}
+
 // Candidate is one suggestion. Detail is shown beside the word — the file it
 // came from, or a kind — and is never matched against.
 type Candidate struct {
 	Word   string
 	Detail string
+	// Edit, when set, is a server replacement for this candidate; Additional
+	// are further edits, such as an import line, that must land with it. The
+	// buffer-word source leaves both nil.
+	Edit       *Edit
+	Additional []Edit
 	// score is how strongly this candidate is preferred. Higher is better.
 	score int
 }

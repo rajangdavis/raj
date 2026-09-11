@@ -10,7 +10,7 @@ import (
 	"raj/internal/keys"
 )
 
-// The invariants in CURSOR-VIEWPORT-SPEC.md, asserted as properties rather than
+// The invariants in docs/CURSOR-VIEWPORT-SPEC.md, asserted as properties rather than
 // as examples. Every cursor bug so far has been a disagreement between two
 // representations of the same position — byte offset, line/column, display
 // column, visual row — and an example test only catches the disagreement it
@@ -53,7 +53,7 @@ func specDoc(rng *rand.Rand) string {
 
 // specSeeds is how many random documents the driver walks. 40 runs in a
 // fraction of a second and is the gate; raising it to 400 currently reproduces
-// the redo/UTF-8 bug filed in TODO.md at wrap=false seed=245 step=51, which is
+// the redo/UTF-8 bug filed in docs/TODO.md at wrap=false seed=245 step=51, which is
 // how that bug was found in the first place.
 const specSeeds = 40
 

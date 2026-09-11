@@ -180,6 +180,27 @@ func RequestDefinition(ctx context.Context, c *Conn, path string, p Position) ([
 	return decodeLocations(raw), nil
 }
 
+// RequestReferences asks for every place the symbol at a position is used.
+//
+// The result is a location array or null, decoded the same way a definition is:
+// an empty list means "no references", which is normal rather than an error.
+//
+// includeDeclaration includes the declaration itself. The editor passes true:
+// "who calls this" is most useful when the list also names the definition the
+// callers converge on.
+func RequestReferences(ctx context.Context, c *Conn, path string, p Position, includeDeclaration bool) ([]Location, error) {
+	if c == nil {
+		return nil, ErrClosed
+	}
+	params := positionParams(path, p)
+	params["context"] = map[string]any{"includeDeclaration": includeDeclaration}
+	var raw json.RawMessage
+	if err := c.Call(ctx, "textDocument/references", params, &raw); err != nil {
+		return nil, err
+	}
+	return decodeLocations(raw), nil
+}
+
 func decodeLocations(raw json.RawMessage) []Location {
 	if isNull(raw) {
 		return nil

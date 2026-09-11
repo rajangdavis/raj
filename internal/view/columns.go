@@ -17,6 +17,15 @@ type Columns struct {
 	Tab int // columns a tab advances to the next multiple of
 }
 
+// HintCol is a view-only inlay hint: display columns that are not part of the
+// line text. Off is the line-relative byte offset the hint is anchored at, and
+// Width is the display width it occupies, already including any padding. Hints
+// in a slice arrive sorted by Off ascending.
+type HintCol struct {
+	Off   int
+	Width int
+}
+
 // NewColumns returns a mapper; tab <= 0 uses TabWidth.
 func NewColumns(tab int) Columns {
 	if tab <= 0 {
@@ -25,13 +34,85 @@ func NewColumns(tab int) Columns {
 	return Columns{Tab: tab}
 }
 
-// Width is the display width of a line.
+// Width is the display width of a line. With no hints it is the plain width;
+// WidthHints is the same conversion with hint cells counted.
 func (c Columns) Width(line string) int {
-	return c.ColOf(line, len(line))
+	return c.WidthHints(line, nil)
 }
 
-// ColOf converts a byte offset within a line to a display column.
+// WidthHints is the display width of a line once every hint in hints is drawn:
+// the base width plus the widths of all hints. Unlike ColOfHints, a hint
+// anchored at end of line is included, because there is no later offset it
+// could be strictly before.
+func (c Columns) WidthHints(line string, hints []HintCol) int {
+	w := c.colOf(line, len(line))
+	for _, h := range hints {
+		w += h.Width
+	}
+	return w
+}
+
+// ColOf converts a byte offset within a line to a display column. With no hints
+// it is the un-hinted conversion; ColOfHints carries the hint arithmetic.
 func (c Columns) ColOf(line string, off int) int {
+	return c.ColOfHints(line, off, nil)
+}
+
+// ColOfHints converts a byte offset within a line to the display column at
+// which that boundary is drawn once hints are interleaved.
+//
+// A hint anchored at offset Off is drawn starting at the boundary Off, and the
+// caret for that boundary sits BEFORE the hint. So the result is the base
+// column of off plus the widths of hints anchored STRICTLY BEFORE off: a hint
+// at exactly off starts at this column and is not counted; a hint before it
+// pushes the column right.
+func (c Columns) ColOfHints(line string, off int, hints []HintCol) int {
+	col := c.colOf(line, off)
+	for _, h := range hints {
+		if h.Off >= off {
+			break
+		}
+		col += h.Width
+	}
+	return col
+}
+
+// OffsetOf converts a display column back to a byte offset within a line,
+// clamping to the line's end. A column landing inside a tab or a wide rune
+// resolves to that character's start, so the cursor never sits mid-glyph. With
+// no hints it is the un-hinted conversion; OffsetOfHints carries the hint
+// arithmetic.
+func (c Columns) OffsetOf(line string, col int) int {
+	return c.OffsetOfHints(line, col, nil)
+}
+
+// OffsetOfHints converts a display column back to a byte offset within a line
+// once hints are interleaved.
+//
+// Hints are walked in order accumulating their widths. A column inside a hint's
+// span [start, start+Width) resolves to that hint's anchor Off, never to a
+// byte, because a hint has none. A column at or before a hint's start stops the
+// walk, and the widths accumulated so far are subtracted before the remainder
+// is resolved against the line with offsetOf. A zero-width hint has an empty
+// span, so it adds nothing and a column at its anchor still resolves to its Off.
+func (c Columns) OffsetOfHints(line string, col int, hints []HintCol) int {
+	shift := 0
+	for _, h := range hints {
+		start := c.colOf(line, h.Off) + shift
+		if col < start {
+			break
+		}
+		if col < start+h.Width {
+			return h.Off
+		}
+		shift += h.Width
+	}
+	return c.offsetOf(line, col-shift)
+}
+
+// colOf is the un-hinted offset-to-column conversion; ColOf and ColOfHints
+// both build on it so there is one loop.
+func (c Columns) colOf(line string, off int) int {
 	col := 0
 	for i, r := range line {
 		if i >= off {
@@ -42,10 +123,9 @@ func (c Columns) ColOf(line string, off int) int {
 	return col
 }
 
-// OffsetOf converts a display column back to a byte offset within a line,
-// clamping to the line's end. A column landing inside a tab or a wide rune
-// resolves to that character's start, so the cursor never sits mid-glyph.
-func (c Columns) OffsetOf(line string, col int) int {
+// offsetOf is the un-hinted column-to-offset conversion; OffsetOf and
+// OffsetOfHints both build on it.
+func (c Columns) offsetOf(line string, col int) int {
 	cur := 0
 	for i, r := range line {
 		if cur >= col {

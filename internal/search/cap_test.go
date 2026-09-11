@@ -120,3 +120,33 @@ func TestHeaderReportsTheTrueTotal(t *testing.T) {
 		t.Errorf("file header missing %q:\n%s", want, screen)
 	}
 }
+
+// The per-file cap is now visible to a caller, not just to the pane: the files
+// it cut down are named with both numbers, so a file holding more than the cap
+// is distinguishable from one holding exactly the cap.
+func TestTruncatedNamesFilesCutByThePerFileCap(t *testing.T) {
+	const hits = MaxPerFile * 4
+	root := capFixture(t, hits)
+	res := Run(root, Query{Text: "needle"})
+
+	tr := res.Truncated()
+	if len(tr) != 1 {
+		t.Fatalf("Truncated() = %+v, want just the big file", tr)
+	}
+	hog := filepath.Join(root, "AAAA_hog.txt")
+	if tr[0].Path != hog || tr[0].Shown != MaxPerFile || tr[0].Total != hits {
+		t.Errorf("Truncated()[0] = %+v, want {%s %d %d}", tr[0], hog, MaxPerFile, hits)
+	}
+}
+
+// A file that holds exactly the cap was not cut down, so it must not appear:
+// the difference between at the limit and past the limit is the whole point of
+// the field.
+func TestTruncatedEmptyAtOrUnderTheCap(t *testing.T) {
+	if tr := Run(capFixture(t, MaxPerFile), Query{Text: "needle"}).Truncated(); len(tr) != 0 {
+		t.Errorf("Truncated() = %+v, want none at exactly the cap", tr)
+	}
+	if tr := Run(capFixture(t, 3), Query{Text: "needle"}).Truncated(); len(tr) != 0 {
+		t.Errorf("Truncated() = %+v, want none under the cap", tr)
+	}
+}

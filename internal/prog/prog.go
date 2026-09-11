@@ -29,8 +29,10 @@
 // It also borrows the property that makes SysEx passable anywhere — no byte of
 // the framing is ever zero. SysEx buys that with 7-bit data, because MIDI
 // reserves the high bit for status. Here it is bought with a bias instead:
-// every length and every number is a LEB128 varint of the value plus one, so
-// the encoded form is always at least 1 and no varint byte is ever 0x00. Full
+// every length, and every non-negative number, is a LEB128 varint of the value
+// plus one — and a negative number, which only a change set's byte delta is,
+// takes a two's-complement form instead (see PutVarint). Either way the encoded
+// form is always at least 1 and no varint byte is ever 0x00. Full
 // eight-bit payloads are kept, and a program costs nothing per byte for the
 // property.
 //
@@ -180,20 +182,39 @@ var (
 	ErrUnknownVerb = errors.New("prog: unknown verb")
 )
 
-// PutVarint appends v as a LEB128 varint of v+1.
+// PutVarint appends v as a LEB128 varint. Every non-negative value keeps the
+// original bias — v is stored as v+1 — so lengths, offsets, versions and counts
+// encode byte-for-byte as they always did, and the framing still never contains
+// a zero byte: LEB128 of a value of at least 1 emits continuation bytes with
+// the high bit set and a final byte holding the highest non-zero group, so
+// moving zero out of range costs nothing under 127 and one byte at each
+// power-of-128 boundary.
 //
-// The bias is the whole trick. LEB128 of a value of at least 1 never emits a
-// zero byte: continuation bytes have the high bit set, so they exceed 0x7f, and
-// the final byte holds the highest non-zero group. Encoding v+1 moves zero —
-// the one value that would produce 0x00 — out of range, at a cost of nothing
-// for values under 127 and one byte at each power-of-128 boundary.
+// A negative value cannot use that bias: v+1 for -1 wraps to zero, and every
+// other negative needs the ten-byte form the reader used to reject. So a
+// negative v is stored as its two's-complement bit pattern instead. The top bit
+// of the decoded unsigned value is the sign: if bit 63 is set the reader
+// returns that value as a signed int, and otherwise it subtracts the bias.
+// Callers that only pass non-negative numbers — every length and every offset
+// in the protocol — are unaffected; the distinction exists for the one signed
+// number on the wire, a change set's net byte delta.
 func PutVarint(dst []byte, v int) []byte {
-	u := uint64(v) + 1
+	u := varintBits(v)
 	for u >= 0x80 {
 		dst = append(dst, byte(u)|0x80)
 		u >>= 7
 	}
 	return append(dst, byte(u))
+}
+
+// varintBits is the unsigned form PutVarint writes: v+1 for a non-negative v
+// (the bias that keeps zero out of the framing), or the two's-complement
+// pattern for a negative one, whose top bit marks the sign on the way back.
+func varintBits(v int) uint64 {
+	if v < 0 {
+		return uint64(v)
+	}
+	return uint64(v) + 1
 }
 
 // Varint reads what PutVarint wrote, returning the value and the bytes
@@ -206,13 +227,16 @@ func Varint(b []byte) (v int, n int, err error) {
 		if i == 0 && b[i] == 0 {
 			return 0, 0, ErrNulByte
 		}
-		if i >= 9 {
+		if i > 9 {
 			return 0, 0, ErrBadVarint
 		}
 		u |= uint64(b[i]&0x7f) << (7 * i)
 		if b[i]&0x80 == 0 {
 			if u == 0 {
 				return 0, 0, ErrBadVarint // the bias makes zero unrepresentable
+			}
+			if u >= 1<<63 {
+				return int(u), i + 1, nil // a negative v, stored two's-complement
 			}
 			return int(u - 1), i + 1, nil
 		}
@@ -222,7 +246,7 @@ func Varint(b []byte) (v int, n int, err error) {
 
 // VarintLen is what PutVarint would append, without appending it.
 func VarintLen(v int) int {
-	n, u := 1, uint64(v)+1
+	n, u := 1, varintBits(v)
 	for u >= 0x80 {
 		n++
 		u >>= 7

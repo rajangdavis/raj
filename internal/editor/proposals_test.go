@@ -136,3 +136,46 @@ func TestAcceptedTextFallsBackToAuthorTint(t *testing.T) {
 		t.Errorf("marks after accept = %+v, want none", p.PendingMarks())
 	}
 }
+
+// An additive user edit inside a proposed span leaves the agent's runs around
+// it: the mark follows the surviving bytes, so the gutter, the caret and the
+// jump still find the set instead of it going invisible but save-blocking.
+func TestPendingMarksFollowSurvivingRuns(t *testing.T) {
+	p := newTestPane("hello world\n")
+	id := propose(t, p, piecetable.Hunk{Start: 6, End: 11, Text: "socket"})
+
+	// The user types inside the proposed text, at offset 8.
+	p.File.ApplyDiff(piecetable.User, p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 8, End: 8, Text: "XYZ"}})
+
+	marks := p.PendingMarks()
+	if len(marks) != 2 {
+		t.Fatalf("marks = %+v, want the two surviving runs", marks)
+	}
+	if m := marks[0]; m.Group != id || m.Start != 6 || m.End != 8 {
+		t.Errorf("first mark = %+v, want group %d at 6..8", m, id)
+	}
+	if m := marks[1]; m.Group != id || m.Start != 11 || m.End != 15 {
+		t.Errorf("second mark = %+v, want group %d at 11..15", m, id)
+	}
+	if !marks[0].CoversLine(p.File, 0) {
+		t.Error("the surviving run must still cover its line for accept-at-caret")
+	}
+}
+
+// A set whose inserted text the user replaced entirely has no marks at all and
+// is no longer pending, so it neither tints nor blocks a save.
+func TestPendingMarksDropAnOverwrittenSet(t *testing.T) {
+	p := newTestPane("hello world\n")
+	propose(t, p, piecetable.Hunk{Start: 6, End: 11, Text: "socket"})
+
+	p.File.ApplyDiff(piecetable.User, p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 6, End: 12, Text: "port"}})
+
+	if marks := p.PendingMarks(); len(marks) != 0 {
+		t.Errorf("marks = %+v, want none for an overwritten set", marks)
+	}
+	if got := p.File.Session().Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v, want the set auto-rejected", got)
+	}
+}

@@ -168,3 +168,75 @@ func TestMalformedCompletionsAreSurvived(t *testing.T) {
 		t.Errorf("err = %v, want ErrClosed", err)
 	}
 }
+
+// A textEdit carries its own range, which is what lets a server overwrite the
+// word rather than only extend it. Both fields are decoded so acceptance can
+// apply the server edit instead of typing a word.
+func TestTextEditDecodes(t *testing.T) {
+	raw := `{"items":[{"label":"rand","textEdit":{"range":{"start":{"line":3,"character":8},"end":{"line":3,"character":12}},"newText":"rand.Intn"}}]}`
+	items, _ := complete(t, raw)
+	if len(items) != 1 {
+		t.Fatalf("got %d items", len(items))
+	}
+	got := items[0].Edit
+	if got == nil {
+		t.Fatal("textEdit was not decoded")
+	}
+	want := TextEdit{
+		Range:   Range{Start: Position{Line: 3, Character: 8}, End: Position{Line: 3, Character: 12}},
+		NewText: "rand.Intn",
+	}
+	if *got != want {
+		t.Errorf("edit = %+v, want %+v", *got, want)
+	}
+}
+
+// additionalTextEdits are the other half of an import completion: the import
+// line has to land in the same action as the word.
+func TestAdditionalTextEditsDecode(t *testing.T) {
+	raw := `{"items":[{"label":"rand","additionalTextEdits":[
+		{"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":0}},"newText":"\t\"math/rand\"\n"}]}]}`
+	items, _ := complete(t, raw)
+	add := items[0].Additional
+	if len(add) != 1 {
+		t.Fatalf("additional edits = %v, want one", add)
+	}
+	if add[0].NewText != "\t\"math/rand\"\n" {
+		t.Errorf("newText = %q", add[0].NewText)
+	}
+	if add[0].Range.Start.Line != 2 || add[0].Range.Start.Character != 0 ||
+		add[0].Range.End.Line != 2 || add[0].Range.End.Character != 0 {
+		t.Errorf("range = %+v, want an insertion at 2:0", add[0].Range)
+	}
+}
+
+// The richer InsertReplaceEdit shape names both the span an insertion would
+// extend and the span the whole word occupies. raj does not advertise
+// insertReplaceSupport, but a server may send it anyway, and replace is the
+// span acceptance has to overwrite.
+func TestInsertReplaceEditPrefersReplace(t *testing.T) {
+	raw := `{"items":[{"label":"Foo","textEdit":{"newText":"Foo","insert":{"start":{"line":1,"character":2},"end":{"line":1,"character":4}},"replace":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}}}}]}`
+	items, _ := complete(t, raw)
+	got := items[0].Edit
+	if got == nil {
+		t.Fatal("insertReplace textEdit was not decoded")
+	}
+	if got.Range.Start.Character != 0 || got.Range.End.Character != 9 {
+		t.Errorf("range = %+v, want the replace span", got.Range)
+	}
+	if got.NewText != "Foo" {
+		t.Errorf("newText = %q, want Foo", got.NewText)
+	}
+}
+
+// An item with no textEdit leaves Edit nil, so the accept path still types the
+// word exactly as before.
+func TestNoTextEditLeavesEditNil(t *testing.T) {
+	items, _ := complete(t, `{"items":[{"label":"Foo","insertText":"Foo"}]}`)
+	if items[0].Edit != nil {
+		t.Errorf("edit = %+v, want nil", items[0].Edit)
+	}
+	if items[0].Additional != nil {
+		t.Errorf("additional = %+v, want nil", items[0].Additional)
+	}
+}

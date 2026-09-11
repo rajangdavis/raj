@@ -36,6 +36,10 @@ type PendingMark struct {
 // hunk spans rebased onto the current document. It is a projection of
 // Session.DiffPending, nothing more — the walk stays in the piece table, this
 // stays a mapping.
+//
+// A member a later edit fragmented comes back as one mark per surviving run,
+// and the runs share the group id, so the gutter, the caret and next/prev
+// still read them as the one change set they are.
 func (p *Pane) PendingMarks() []PendingMark {
 	var out []PendingMark
 	for _, g := range p.File.Session().DiffPending() {

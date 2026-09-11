@@ -47,6 +47,11 @@ type Theme struct {
 	// left sitting in it.
 	Caret     ui.Color
 	CaretText ui.Color
+
+	// InlayHint styles the inline text a language server asks to show between
+	// characters. Dim italic marks it as an annotation rather than document
+	// text, so it does not read as something that can be typed or selected.
+	InlayHint ui.Style
 }
 
 // DefaultTheme names as little as possible: the terminal's foreground and
@@ -65,6 +70,7 @@ func DefaultTheme() Theme {
 		FindActive:  ui.DefaultStyle.On(ui.Ansi(136)),
 		Caret:       ui.Ansi(12),
 		CaretText:   ui.Ansi(0),
+		InlayHint:   ui.DefaultStyle.Plus(ui.Dim).Plus(ui.Italic),
 	}
 }
 
@@ -194,7 +200,7 @@ func (p *Pane) drawGutter(s *ui.Screen, x, y, w, line, curLine int, th Theme, nu
 func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, heads, brackets map[int]bool, th Theme) {
 	// lo..hi is the byte range of this visual row within the line; without
 	// wrapping it is the whole line. Columns are measured from the row's own
-	// start, which is also how the wrap engine measures them — the two have to
+	// start, which is also how the wrap engine measures them - the two have to
 	// agree or the caret lands a column off after every break.
 	start := p.File.LineStart(line) + lo
 	full := p.File.Line(line)
@@ -208,8 +214,27 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 	// where it starts or the colours slide left by the preceding rows' bytes.
 	shift := lo
 
+	// Hints are installed only for lines that fit one visual row, so the row
+	// that is the whole line is the hinted row, wrapped or not. A continuation
+	// row of a line the app did not hint draws none.
+	hintable := lo == 0 && hi == len(full)
+	var hints []Hint
+	if hintable {
+		hints = p.File.HintsAt(line)
+	}
+
 	col := 0
+	hint := 0
 	for i, r := range runes {
+		// A hint anchored at this byte is drawn starting here, before the
+		// character at it, advancing the column count by its own width. Hint
+		// cells have no byte of their own, so they are painted with the hint
+		// style alone: syntax, author tint, find, selection and brackets,
+		// which all key on a byte, never touch them.
+		for hint < len(hints) && hints[hint].Off <= offs[i] {
+			col = p.drawHint(s, x, y, w, col, hints[hint], th)
+			hint++
+		}
 		if col < p.Viewport.Left {
 			col++
 			continue
@@ -256,13 +281,55 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 	}
 
 	// A secondary cursor at end of line has no character to sit on, so the
-	// caret is the blank cell past the text.
-	endCol := p.File.Cols.Width(text)
+	// caret is the blank cell past the text. It sits at the hint-aware end
+	// boundary, before any end-of-line hint anchored there.
+	endCol := p.File.Cols.ColOfHints(text, len(text), HintCols(hints))
+	caret := false
 	if hi == len(full) && heads[start+len(text)] && endCol >= p.Viewport.Left {
 		if sx := x + endCol - p.Viewport.Left; sx < x+w {
 			s.Set(sx, y, ' ', th.Text.On(th.Caret).With(th.CaretText))
+			caret = true
 		}
 	}
+	// End-of-line hints draw after the last character and after that caret
+	// cell; a hint anchored at the line's end has no later offset it could be
+	// strictly before, so ColOfHints left the caret in front of it.
+	ecol := endCol
+	if caret {
+		ecol++
+	}
+	for ; hint < len(hints) && hints[hint].Off >= len(text); hint++ {
+		ecol = p.drawHint(s, x, y, w, ecol, hints[hint], th)
+	}
+}
+
+// drawHint paints one inlay hint at display column col, padding and text, and
+// returns the column after it. A hint whose run does not fit wholly inside the
+// row is suppressed rather than clipped, but its columns are still counted:
+// the column map counts them whether or not the viewport has room, so skipping
+// the advance would shift every character after it.
+func (p *Pane) drawHint(s *ui.Screen, x, y, w, col int, h Hint, th Theme) int {
+	width := h.Width()
+	screenX := x + col - p.Viewport.Left
+	if screenX >= x && screenX+width <= x+w {
+		textW := width
+		if h.Left {
+			textW--
+		}
+		if h.Right {
+			textW--
+		}
+		cx := screenX
+		if h.Left {
+			s.Set(cx, y, ' ', th.InlayHint)
+			cx++
+		}
+		cx += s.SetString(cx, y, h.Text, th.InlayHint, textW)
+		if h.Right {
+			s.Set(cx, y, ' ', th.InlayHint)
+		}
+	}
+	return col + width
 }
 
 // authorTints maps byte offsets within a line to a background colour, for

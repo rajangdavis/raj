@@ -2,8 +2,11 @@
 // question and hands the answer back so the caller can resume what it was
 // doing.
 //
-// Two shapes, one type. Ask takes a line of text (where should this file go?);
-// Confirm picks between labelled buttons (this has unsaved changes — now what?).
+// Three shapes, one type. Ask takes a line of text (where should this file go?);
+// Confirm picks between labelled buttons (this has unsaved changes — now what?);
+// Review is a Confirm with a listing attached: the rows name what the answer
+// would be about, and stepping through them comes first (accept the pending
+// change sets — now?).
 // They share the type because they share every hard part: they take all keys
 // while open, they can be dismissed, and their answer arrives later than the
 // keystroke that opened them.
@@ -16,6 +19,7 @@
 package prompt
 
 import (
+	"fmt"
 	"strings"
 
 	"raj/internal/keys"
@@ -56,6 +60,7 @@ type kind int
 const (
 	ask kind = iota
 	confirm
+	review
 )
 
 // Prompt is a modal question. Only one is open at a time: a dialog that can be
@@ -74,6 +79,12 @@ type Prompt struct {
 	options []string
 	sel     int
 	done    func(answer string, ok bool)
+
+	// A Review kind also lists rows to step through before answering. moved is
+	// the follow-up to a row becoming current — the app jumps the caret.
+	rows  []string
+	row   int
+	moved func(row int)
 }
 
 // New returns a closed prompt.
@@ -119,6 +130,16 @@ func (p *Prompt) Confirm(title, message string, options []string, done func(answ
 		options: options, done: done}
 }
 
+// Review opens a Confirm with a listing attached: rows name what the answer
+// would be about, and up and down step the current row through them while the
+// buttons stay the answer. moved is a follow-up hook, cheap enough that a row
+// becoming current can, say, move the caret.
+func (p *Prompt) Review(title, message string, rows []string, options []string,
+	moved func(row int), done func(answer string, ok bool)) {
+	*p = Prompt{Open: true, kind: review, title: title, message: message,
+		rows: rows, options: options, moved: moved, done: done}
+}
+
 // ActiveInput is the field of an open text question, and nil for a button
 // choice — there is nothing to select in a row of buttons.
 func (p *Prompt) ActiveInput() *widget.Input {
@@ -142,9 +163,13 @@ func (p *Prompt) Title() string { return p.title }
 // Text is the current contents of an Ask field, for tests.
 func (p *Prompt) Text() string { return p.input.Text }
 
-// Selected is the highlighted option of a Confirm, for tests.
+// Selected is the highlighted option of a button-choice question — Confirm
+// or Review — for tests.
 func (p *Prompt) Selected() string {
-	if p.kind != confirm || p.sel >= len(p.options) {
+	if p.kind != confirm && p.kind != review {
+		return ""
+	}
+	if p.sel >= len(p.options) {
 		return ""
 	}
 	return p.options[p.sel]
@@ -176,6 +201,21 @@ func (p *Prompt) Handle(a keys.Action, text string) {
 		}
 		return
 	}
+	if p.kind == review {
+		// Two axes on purpose: left and right pick the answer, up and down
+		// step through the listing.
+		switch a {
+		case keys.CharLeft:
+			p.move(-1)
+		case keys.CharRight:
+			p.move(+1)
+		case keys.LineUp:
+			p.moveRow(-1)
+		case keys.LineDown:
+			p.moveRow(+1)
+		}
+		return
+	}
 	if p.kind == confirm {
 		// Arrows only. Buttons are a row, but a vertical arrow meaning the
 		// same thing costs nothing and saves guessing which axis this dialog
@@ -198,8 +238,51 @@ func (p *Prompt) move(d int) {
 	p.sel = (p.sel + d + len(p.options)) % len(p.options)
 }
 
+// moveRow steps the review listing, wrapping, and runs the follow-up hook so
+// whatever the current row names can follow too.
+func (p *Prompt) moveRow(d int) {
+	if len(p.rows) == 0 {
+		return
+	}
+	p.row = (p.row + d + len(p.rows)) % len(p.rows)
+	if p.moved != nil {
+		p.moved(p.row)
+	}
+}
+
+// reviewMaxRows is the most of a review listing the dialog will draw before it
+// scrolls. A save can carry more pending sets than a dialog can show, and
+// burying the buttons is how they stop being reachable.
+const reviewMaxRows = 8
+
+// reviewWindow is the slice of rows the dialog draws, with the current one
+// always inside it.
+func (p *Prompt) reviewWindow() (first, shown int) {
+	shown = len(p.rows)
+	if shown > reviewMaxRows {
+		shown = reviewMaxRows
+	}
+	if p.row >= shown {
+		first = p.row - shown + 1
+	}
+	if first > len(p.rows)-shown {
+		first = len(p.rows) - shown
+	}
+	return first, shown
+}
+
+// buttonsAt is where the options sit, counted in dialog rows: after the
+// listing when there is one, where they have always sat otherwise.
+func (p *Prompt) buttonsAt() int {
+	if p.kind == review {
+		_, shown := p.reviewWindow()
+		return 2 + shown
+	}
+	return buttonRow
+}
+
 func (p *Prompt) answer() string {
-	if p.kind == confirm {
+	if p.kind == confirm || p.kind == review {
 		return p.Selected()
 	}
 	return strings.TrimSpace(p.input.Text)
@@ -234,6 +317,11 @@ func (p *Prompt) box(cols, rows int) (x, y, w, h int, ok bool) {
 	if p.kind == ask {
 		h = 1 + widget.Height + 2 // the field draws its own three-row border
 	}
+	if p.kind == review {
+		// The listing sits between the question and the buttons.
+		_, shown := p.reviewWindow()
+		h = 4 + shown
+	}
 	if w < 24 || h > rows-2 {
 		return 0, 0, 0, 0, false
 	}
@@ -263,7 +351,19 @@ func (p *Prompt) ClickAt(cols, rows, col, row int) bool {
 		p.input.ClickAt(dx-2, dy-1, w-4)
 		return true
 	}
-	if dy == buttonRow {
+	if p.kind == review && dy >= 2 && dy < p.buttonsAt() {
+		// A press on a row selects it, and the follow-up hook fires the same as
+		// an arrow would — the pointer is not a shortcut past the listing.
+		first, _ := p.reviewWindow()
+		if idx := first + dy - 2; idx < len(p.rows) {
+			p.row = idx
+			if p.moved != nil {
+				p.moved(p.row)
+			}
+		}
+		return true
+	}
+	if dy == p.buttonsAt() {
 		for i, sp := range p.buttons(w) {
 			if dx >= sp.Start && dx < sp.End {
 				p.sel = i
@@ -310,7 +410,12 @@ func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 
 	s.Fill(x, y, w, h, ui.DefaultStyle)
 	widget.Box(s, x, y, w, h, th.BorderFocus)
-	s.SetString(x+2, y, " "+p.title+" ", th.BorderFocus, w-4)
+	title := p.title
+	if p.kind == review && len(p.rows) > 0 {
+		// The current row's index is part of the question being asked.
+		title = fmt.Sprintf("%s %d/%d", p.title, p.row+1, len(p.rows))
+	}
+	s.SetString(x+2, y, " "+title+" ", th.BorderFocus, w-4)
 
 	if p.kind == ask {
 		// Inset by one so the field's border sits inside the dialog's rather
@@ -320,7 +425,20 @@ func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 		return
 	}
 	s.SetString(x+2, y+1, widget.Truncate(p.message, w-4), th.Text, w-4)
-	p.renderButtons(s, x, y+buttonRow, w, th)
+	if p.kind == review {
+		// The listing between the question and the buttons; the current row is
+		// highlighted and its index named in the title below.
+		first, shown := p.reviewWindow()
+		for i := 0; i < shown; i++ {
+			idx := first + i
+			style := th.Text
+			if idx == p.row {
+				style = th.Selected
+			}
+			s.SetString(x+2, y+2+i, widget.Truncate(p.rows[idx], w-4), style, w-4)
+		}
+	}
+	p.renderButtons(s, x, y+p.buttonsAt(), w, th)
 }
 
 func (p *Prompt) renderButtons(s *ui.Screen, x, y, w int, th widget.Theme) {

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -109,12 +110,16 @@ func (f *FakeHost) Type(text string) {
 }
 
 // Press queues a chord by its canonical name, e.g. "super+s" or "shift+tab".
-// It fails silently on an unknown chord name; tests should assert on the
-// resulting frames, which will make a typo obvious.
+// An unknown chord name panics: a typo means the test is lying about the
+// keystrokes it sent, and the failure belongs at the line that made the
+// mistake, not three assertions later. The canonical names are the binding
+// table's chords and the ones eventForChord parses — "esc", not "escape".
 func (f *FakeHost) Press(chord string) {
-	if e, ok := eventForChord(chord); ok {
-		f.Send(Key{e})
+	e, ok := eventForChord(chord)
+	if !ok {
+		panic(fmt.Sprintf("FakeHost.Press: unknown chord %q — check the canonical chord names in eventForChord", chord))
 	}
+	f.Send(Key{e})
 }
 
 // SetTheme overrides the reported theme, for testing light-background handling.

@@ -42,7 +42,8 @@ func (p *Pane) OffsetAt(x, y int) int {
 		col = 0
 	}
 	text := p.File.Line(line)
-	return p.File.LineStart(line) + p.File.Cols.OffsetOf(text, col)
+	return p.File.LineStart(line) + p.File.Cols.OffsetOfHints(text, col, p.File.HintCols(line))
+
 }
 
 // offsetAtWrapped walks visual rows the way placeCaretWrapped does, counting
@@ -90,6 +91,12 @@ func (p *Pane) offsetInRow(line, within, x int) int {
 		end = len(text)
 	}
 	segment := text[start:end]
+	// A hinted line fits one visual row, so start is zero and its hints apply
+	// to the whole segment; resolving the column through them clamps a click
+	// inside a hint to the hint anchor instead of a byte that is not there.
+	if hs := p.File.HintCols(line); len(hs) > 0 && start == 0 {
+		return p.File.LineStart(line) + p.File.Cols.OffsetOfHints(segment, x, hs)
+	}
 	// The column is measured from the start of the row, but tab stops are
 	// measured from the start of the line — so the segment is expanded in its
 	// own right only when it begins at a tab stop. Rows begin at a break

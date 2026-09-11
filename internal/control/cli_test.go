@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -32,7 +33,19 @@ type fakeEditor struct {
 	bump func()
 	// diffJSON is the canned diff answer; empty means no pending changes.
 	diffJSON string
-	stop     chan struct{}
+	// lspJSON is the canned answer an lsp request returns, verbatim, so a test
+	// can drive the CLI's diagnostics handling without a language server.
+	lspJSON string
+	// truncated is the per-file truncation the fake search reports, so the CLI
+	// can be tested on a walk that cut a file down without a real one.
+	truncated []TruncatedFile
+	// groups is the canned change-set list `groups` returns; decided records
+	// every id accept/reject was called with, in order; decideErr makes a named
+	// group fail, standing in for a reject a later edit wedged.
+	groups    []Group
+	decided   []uint64
+	decideErr map[uint64]string
+	stop      chan struct{}
 }
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
@@ -152,6 +165,8 @@ func (f *fakeEditor) run(req Request) Response {
 			f.docs[path], f.vers[path] = "", 1
 		}
 		return Response{OK: true, Version: f.vers[path]}
+	case "goto":
+		return Response{OK: true}
 	case "apply":
 		if f.bump != nil {
 			f.bump()
@@ -174,14 +189,30 @@ func (f *fakeEditor) run(req Request) Response {
 		return Response{OK: true, Version: f.vers[path]}
 	case "save":
 		return Response{OK: true, Version: f.vers[path]}
+	case "groups":
+		return Response{OK: true, Groups: append([]Group(nil), f.groups...)}
+	case "accept", "reject":
+		if msg, ok := f.decideErr[req.Group]; ok {
+			return Response{Err: msg}
+		}
+		f.decided = append(f.decided, req.Group)
+		return Response{OK: true}
 	case "diff":
 		if f.diffJSON == "" {
 			return Response{OK: true, DiffJSON: "[]"}
 		}
 		return Response{OK: true, DiffJSON: f.diffJSON}
+	case "lspprep":
+		return Response{OK: true, LSP: fakeLSP{json: f.lspJSON}}
 	}
 	return Response{Err: "unknown op " + req.Op}
 }
+
+// fakeLSP is a language-server answer the CLI can be handed without a server:
+// the JSON is exactly what a real lspCaller would have produced.
+type fakeLSP struct{ json string }
+
+func (f fakeLSP) Run(context.Context) ([]byte, error) { return []byte(f.json), nil }
 
 func run(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
@@ -209,6 +240,35 @@ func TestCLIReadSpan(t *testing.T) {
 	out, _, code := run(t, "read", "-start", "11", "-end", "17", "/w/a.go")
 	if code != 0 || out != "func f" {
 		t.Errorf("read span = %q, code %d", out, code)
+	}
+}
+
+// A span written as positional operands used to read the whole file and look
+// like it worked, with two numbers that look like offsets read does take. The
+// refusal names the flags that carry them.
+func TestCLIRefusesPositionalSpan(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
+
+	out, errs, code := run(t, "read", "/w/a.go", "940", "1000")
+	if code != 2 {
+		t.Errorf("read with positional offsets: code = %d, want 2 (usage); stdout %q", code, out)
+	}
+	if out != "" {
+		t.Errorf("a refused read still wrote to stdout: %q", out)
+	}
+	if !strings.Contains(errs, `unexpected argument "940"`) || !strings.Contains(errs, "-start/-end") {
+		t.Errorf("stderr = %q, want the stray operand and the flags that take it", errs)
+	}
+
+	out, errs, code = run(t, "dump", "/w/a.go", "0", "10")
+	if code != 2 || out != "" || !strings.Contains(errs, "-start/-end") {
+		t.Errorf("dump with a positional span: code = %d, stdout %q, stderr %q", code, out, errs)
+	}
+
+	// goto legitimately takes LINE[:COL] as a second operand, so the same
+	// shape has to keep working there.
+	if _, errs, code = run(t, "goto", "/w/a.go", "2:1"); code != 0 {
+		t.Errorf("goto with a position: code = %d, stderr %q", code, errs)
 	}
 }
 
@@ -258,6 +318,101 @@ func TestCLIRefusalsExitNonZero(t *testing.T) {
 				t.Errorf("buffer changed anyway: %q", ed.docs["/w/a.go"])
 			}
 		})
+	}
+}
+
+// An empty diagnostics list only means "no problems" when a server produced
+// it. A missing or not-yet-running server also has no diagnostics, and the old
+// output — `{}` — was indistinguishable from a clean file.
+func TestCLILSPDiagnosticsRefusesWhenThereIsNoServer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"status":"no-server","detail":"no language server for this file type"}`
+	out, errs, code := run(t, "lsp", "diagnostics", "/w/a.go")
+	if code != 1 {
+		t.Errorf("code = %d, want 1 when there is no server; stderr %q", code, errs)
+	}
+	if out != "" {
+		t.Errorf("a refused diagnostics wrote %q to stdout", out)
+	}
+	if !strings.Contains(errs, "no language server for this file type") {
+		t.Errorf("stderr = %q, want the reason", errs)
+	}
+}
+
+// A clean file still exits 0, but says a server said so rather than printing an
+// empty object that could mean anything.
+func TestCLILSPDiagnosticsCleanCarriesAStatus(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"status":"ok"}`
+	out, _, code := run(t, "lsp", "diagnostics", "/w/a.go")
+	if code != 0 {
+		t.Errorf("code = %d, want 0 for a clean file", code)
+	}
+	if strings.TrimSpace(out) == "{}" || !strings.Contains(out, `"status": "ok"`) {
+		t.Errorf("clean diagnostics = %q, want a status and not an empty object", out)
+	}
+}
+
+// An editor from before the status field answers `{}`; that is exactly the
+// ambiguity this call cannot bless, so it is refused with a version-skew hint.
+func TestCLILSPDiagnosticsOldServerIsRefused(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{}`
+	_, errs, code := run(t, "lsp", "diagnostics", "/w/a.go")
+	if code != 1 {
+		t.Errorf("code = %d, want 1 for an ambiguous empty answer", code)
+	}
+	if !strings.Contains(errs, "did not report a diagnostics status") {
+		t.Errorf("stderr = %q, want the version-skew explanation", errs)
+	}
+}
+
+// A bare positional is the pattern typed in the wrong place: search takes
+// no path, so accepting it silently would run a different search than was
+// meant — the refusal names both flags the caller might have wanted.
+func TestSearchRefusesBareArgument(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+	out, errs, code := run(t, "search", "needle")
+	if code != 2 {
+		t.Errorf("code = %d, want 2 (usage); stdout %q", code, out)
+	}
+	want := `search: unexpected argument "needle" — the pattern goes to -q; to limit paths use -include`
+	if !strings.Contains(errs, want) {
+		t.Errorf("stderr = %q, want %q", errs, want)
+	}
+}
+
+// An -include glob that matches nothing looks exactly like "no matches"
+// without a warning, and the two call for opposite fixes.
+func TestSearchWarnsWhenIncludeMatchesNoFiles(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+	_, errs, code := run(t, "search", "-q", "needle", "-include", "*.zzz")
+	if code != 1 {
+		t.Errorf("code = %d, want 1 (no hits)", code)
+	}
+	if !strings.Contains(errs, "search: warning: -include pattern(s) matched no files") {
+		t.Errorf("stderr = %q, want the include warning", errs)
+	}
+}
+
+// The control cases: a glob that does match files stays quiet, and a no-hit
+// search without -include stays quiet too.
+func TestSearchIncludeWarningStaysQuietWhenFilesWereSearched(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+	_, errs, code := run(t, "search", "-q", "needle", "-include", "*.go")
+	if code != 0 {
+		t.Errorf("code = %d, want 0; stderr %q", code, errs)
+	}
+	if strings.Contains(errs, "-include") {
+		t.Errorf("stderr = %q, want no include warning", errs)
+	}
+
+	_, errs, code = run(t, "search", "-q", "absent")
+	if code != 1 {
+		t.Errorf("code = %d, want 1 (no hits)", code)
+	}
+	if strings.Contains(errs, "-include") {
+		t.Errorf("stderr = %q, want no include warning", errs)
 	}
 }
 
@@ -404,17 +559,44 @@ func TestLocatePrecedence(t *testing.T) {
 func (f *fakeEditor) Snapshot() Searcher { return f }
 
 // Search blocks until released, so a test can cancel one in flight.
-func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, bool, error) {
+// Include globs are honoured against the full path and the base name —
+// enough for the CLI's no-file-matched warning to be exercised without
+// re-implementing the real walker's relative-path matching.
+func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, int, bool, []TruncatedFile, error) {
 	f.mu.Lock()
 	docs := make(map[string]string, len(f.docs))
 	for k, v := range f.docs {
 		docs[k] = v
 	}
 	gate := f.gate
+	truncated := append([]TruncatedFile(nil), f.truncated...)
 	f.mu.Unlock()
 
-	files := 0
+	var inc []string
+	if q.Include != "" {
+		inc = strings.Split(q.Include, ",")
+	}
+	included := func(p string) bool {
+		if inc == nil {
+			return true
+		}
+		for _, g := range inc {
+			if ok, _ := path.Match(g, p); ok {
+				return true
+			}
+			if ok, _ := path.Match(g, filepath.Base(p)); ok {
+				return true
+			}
+		}
+		return false
+	}
+
+	files, considered := 0, 0
 	for p, t := range docs {
+		if !included(p) {
+			continue
+		}
+		considered++
 		if gate != nil {
 			// Emit one batch, then wait: the caller gets a partial result and
 			// can cancel while the rest is outstanding.
@@ -424,7 +606,7 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 				f.mu.Lock()
 				f.cancelled = true
 				f.mu.Unlock()
-				return files, false, ctx.Err()
+				return files, considered, false, nil, ctx.Err()
 			case <-gate:
 			}
 		}
@@ -435,7 +617,7 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 		}
 		files++
 	}
-	return files, false, nil
+	return files, considered, false, truncated, nil
 }
 
 // Streaming: batches arrive as the walk finds them, not all at the end.
@@ -461,6 +643,41 @@ func TestSearchStreams(t *testing.T) {
 	}
 	if !res.Final {
 		t.Error("the last frame was not marked final")
+	}
+}
+
+// A per-file cap is invisible in capped, so the CLI must name the files it cut
+// down and by how much, rather than let a capped file read as an exact one.
+func TestSearchReportsTruncatedFiles(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/COMPLETED.md": "## one\n## two\n"})
+	ed.mu.Lock()
+	ed.truncated = []TruncatedFile{{Path: "/w/COMPLETED.md", Shown: 2, Total: 1434}}
+	ed.mu.Unlock()
+
+	out, errs, code := run(t, "search", "-q", "##")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(errs, "/w/COMPLETED.md") || !strings.Contains(errs, "2 of 1434") {
+		t.Errorf("stderr = %q, want the truncated file and its counts", errs)
+	}
+	if !strings.Contains(errs, "1 file(s)") {
+		t.Errorf("stderr = %q, want the count of truncated files", errs)
+	}
+	if strings.Contains(out, `"truncated"`) {
+		t.Error("plain output should be hits only")
+	}
+
+	// The JSON form carries the same fact as data, so a driver does not parse
+	// the warning to find it.
+	out, errs, code = run(t, "search", "-q", "##", "-json")
+	if code != 0 {
+		t.Fatalf("json code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"truncated": [`) ||
+		!strings.Contains(out, `"Total": 1434`) ||
+		!strings.Contains(out, `"Shown": 2`) {
+		t.Errorf("json = %q, want the truncated list", out)
 	}
 }
 
@@ -854,6 +1071,96 @@ func TestHelloRebindsTheAuthorID(t *testing.T) {
 	}
 }
 
+// An anonymous TCP client is handed a server-minted identity token, and
+// presenting it on the next connection rebinds to the same author id.
+func TestHelloMintsAnIdentityToken(t *testing.T) {
+	t.Setenv(TokenEnv, "test-token")
+	srv, err := listenTCP("127.0.0.1:0", func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	first, err := Dial(srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := first.Do(Request{Op: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("hello = %+v", res)
+	}
+	if !strings.HasPrefix(res.Identity, "tok_") {
+		t.Fatalf("hello identity = %q, want a server-minted token", res.Identity)
+	}
+	id := first.Author()
+	first.Close()
+
+	// A different connection presenting the token is the same writer, and is
+	// not minted another one.
+	second, err := Dial(srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	res2, err := second.Do(Request{Op: "hello", Identity: res.Identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Author() != id {
+		t.Errorf("reconnected as %d, was %d", second.Author(), id)
+	}
+	if res2.Identity != "" {
+		t.Errorf("second hello minted %q, want none", res2.Identity)
+	}
+}
+
+// SrcVersion and the minted identity cross the wire only when set, so a peer
+// built before either field still decodes what a new one sends.
+func TestSrcVersionAndIdentityRoundTrip(t *testing.T) {
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true,
+		SrcVersion: "abc123", Identity: "tok_xyz"})
+	res, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SrcVersion != "abc123" || res.Identity != "tok_xyz" {
+		t.Errorf("decoded %+v, want both fields", res)
+	}
+
+	h, body = EncodeResponse(Response{ID: 9, OK: true, Final: true})
+	res, err = DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SrcVersion != "" || res.Identity != "" {
+		t.Errorf("decoded %+v, want both empty", res)
+	}
+}
+
+// The version check is a warning, not a refusal, and stays silent when either
+// side cannot name its build.
+func TestWarnVersionSkew(t *testing.T) {
+	old := srcVersion
+	defer func() { srcVersion = old }()
+	srcVersion = "ctl-abc"
+
+	var b strings.Builder
+	warnVersionSkew(&b, "editor-def")
+	if !strings.Contains(b.String(), "ctl-abc") || !strings.Contains(b.String(), "editor-def") {
+		t.Errorf("warning = %q, want both revisions named", b.String())
+	}
+
+	b.Reset()
+	warnVersionSkew(&b, "ctl-abc")
+	warnVersionSkew(&b, "")
+	if b.String() != "" {
+		t.Errorf("warning = %q, want silence on match or unknown", b.String())
+	}
+}
+
 // A connection that never identifies itself still works; it just does not
 // survive a reconnect as the same writer.
 func TestAnonymousConnectionsStillGetAnID(t *testing.T) {
@@ -919,5 +1226,146 @@ func TestDiscoverReapsDeadSockets(t *testing.T) {
 	}
 	if !sawLive {
 		t.Errorf("discovery lost the live editor: %+v", found)
+	}
+}
+
+// apply -hunks sends a whole change set read from a JSON Lines file: one
+// {start,end,text} object per line, all rebased together against one base. A
+// k-site edit is one invocation and one re-read instead of k of each.
+func TestCLIApplyHunks(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	hunks := filepath.Join(t.TempDir(), "hunks.jsonl")
+	err := os.WriteFile(hunks, []byte(
+		`{"start":0,"end":5,"text":"goodbye"}`+"\n"+
+			`{"start":6,"end":11,"text":"earth"}`+"\n"), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-hunks", hunks)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "goodbye earth\n" {
+		t.Errorf("buffer = %q, want both hunks applied", got)
+	}
+	if !strings.Contains(out, "applied 2 hunk(s)") {
+		t.Errorf("output = %q, want the hunk count", out)
+	}
+}
+
+// parseHunks is the -hunks reader on its own: blank lines are skipped, a
+// backwards span and a malformed line are refused, and an empty file is not a
+// silent no-op.
+func TestParseHunks(t *testing.T) {
+	var errs bytes.Buffer
+	hunks, echo, code := parseHunks(
+		`{"start":6,"end":11,"text":"earth"}`+"\n"+
+			"\n"+
+			`{"start":0,"end":5,"text":""}`+"\n", &errs)
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs.String())
+	}
+	if len(hunks) != 2 || hunks[0].Start != 6 || hunks[1].Text != "" {
+		t.Errorf("hunks = %+v", hunks)
+	}
+	if len(echo) != 2 || echo[0].End != 11 {
+		t.Errorf("echo = %+v", echo)
+	}
+	if _, _, code := parseHunks(`{"start":5,"end":1}`, &errs); code != 1 {
+		t.Errorf("a backwards span was accepted: %d", code)
+	}
+	if _, _, code := parseHunks("not json\n", &errs); code != 1 {
+		t.Errorf("a malformed line was accepted: %d", code)
+	}
+	if _, _, code := parseHunks("\n\n", &errs); code != 1 {
+		t.Errorf("an empty hunks file was accepted: %d", code)
+	}
+}
+
+// -hunks is a whole change set; mixing it with the single-hunk flags is a
+// usage error rather than a silent preference for one of them.
+func TestCLIApplyHunksRefusesMixedFlags(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	hunks := filepath.Join(t.TempDir(), "hunks.jsonl")
+	err := os.WriteFile(hunks, []byte(`{"start":0,"end":0,"text":"y"}`+"\n"), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-hunks", hunks, "-start", "0")
+	if code != 2 {
+		t.Fatalf("code = %d, want 2 (usage); stdout %q, stderr %q", code, out, errs)
+	}
+	if !strings.Contains(errs, "-hunks") || !strings.Contains(errs, "-start") {
+		t.Errorf("stderr = %q, want both flags named", errs)
+	}
+	if ed.docs["/w/a.go"] != "x\n" {
+		t.Errorf("buffer changed anyway: %q", ed.docs["/w/a.go"])
+	}
+}
+
+// accept -all decides every group the path reports in one command. Each
+// decision is its own frame, but the caller makes one invocation and sees
+// every outcome.
+func TestCLIAcceptAllDecidesEveryGroup(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.groups = []Group{{ID: 3}, {ID: 7}, {ID: 9}}
+	out, errs, code := run(t, "accept", "/w/a.go", "-all")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	for _, want := range []string{"accepted change set 3", "accepted change set 7", "accepted change set 9"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output %q missing %q", out, want)
+		}
+	}
+	if len(ed.decided) != 3 || ed.decided[0] != 3 || ed.decided[1] != 7 || ed.decided[2] != 9 {
+		t.Errorf("decided %v, want 3, 7, 9", ed.decided)
+	}
+}
+
+// A reject that a later edit wedged is named with its reason, not dropped from
+// a count. The groups after it are still decided, because one refusal is not
+// the whole batch's failure.
+func TestCLIRejectAllNamesTheWedgedGroup(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.groups = []Group{{ID: 3}, {ID: 7}, {ID: 9}}
+	ed.decideErr = map[uint64]string{7: "a later edit overlaps this change set"}
+	out, errs, code := run(t, "reject", "/w/a.go", "-all")
+	if code == 0 {
+		t.Fatalf("a wedged reject reported success; stdout %q", out)
+	}
+	if !strings.Contains(errs, "change set 7") || !strings.Contains(errs, "overlaps") {
+		t.Errorf("stderr = %q, want the wedged group named with its reason", errs)
+	}
+	if !strings.Contains(errs, "1 of 3") {
+		t.Errorf("stderr = %q, want the summary to say one of three failed", errs)
+	}
+	if len(ed.decided) != 2 || ed.decided[0] != 3 || ed.decided[1] != 9 {
+		t.Errorf("decided %v, want 3 and 9 (7 refused, the rest still decided)", ed.decided)
+	}
+	if !strings.Contains(out, "rejected change set 3") || !strings.Contains(out, "rejected change set 9") {
+		t.Errorf("stdout = %q, want the two outcomes that landed", out)
+	}
+}
+
+// -all is bulk and -group is one; passing both is a usage error, because
+// guessing which one wins would decide a change set the caller did not name.
+func TestCLIAllAndGroupAreAlternatives(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "accept", "/w/a.go", "-all", "-group", "3")
+	if code != 2 || !strings.Contains(errs, "-all and -group are alternatives") {
+		t.Errorf("code %d, stderr %q", code, errs)
+	}
+}
+
+// mineOnly is the view `groups -mine` and `accept/reject -all -mine` share.
+func TestMineOnlyKeepsTheCallersGroups(t *testing.T) {
+	groups := []Group{{ID: 1, Author: 4}, {ID: 2, Author: 5}, {ID: 3, Author: 4}}
+	got := mineOnly(groups, 4)
+	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 3 {
+		t.Errorf("mineOnly = %+v, want groups 1 and 3", got)
+	}
+	if mineOnly(groups, 9) != nil {
+		t.Errorf("mineOnly with no match = %+v, want nil", mineOnly(groups, 9))
 	}
 }

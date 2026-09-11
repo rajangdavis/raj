@@ -292,22 +292,50 @@ func TestReclaimRoundTrip(t *testing.T) {
 	}
 }
 
-// The proposal review chords are commands, not typed text. They live in
-// Natives — no terminal claims a ctrl+alt+letter — so the only thing to pin is
-// that the keymap resolves them in the editor scope.
+// The proposal review chords are commands, not typed text. Accept, reject and
+// the next/prev cycle are ctrl+super chords in Bindings — no terminal claims
+// them, but the encoding is pinned there for both platforms — while review
+// stays a Native ctrl+alt chord. This pins that each resolves in the editor
+// scope under its canonical chord name.
 func TestProposalReviewChordsResolve(t *testing.T) {
 	k := NewKeymap()
 	cases := []struct {
 		chord string
 		want  Action
 	}{
-		{"ctrl+alt+a", AcceptProposed},
-		{"ctrl+alt+x", RejectProposed},
+		{"ctrl+super+m", AcceptProposed},
+		{"ctrl+super+/", RejectProposed},
+		{"ctrl+super+,", PrevProposed},
+		{"ctrl+super+.", NextProposed},
 		{"ctrl+alt+v", ReviewProposed},
 	}
 	for _, c := range cases {
 		if got := k.Lookup(Editor, c.chord); got != c.want {
 			t.Errorf("%s = %q, want %q", c.chord, got, c.want)
+		}
+	}
+}
+
+// The CSI-u payloads Ghostty emits for the ctrl+super proposal chords must
+// decode to the same actions the keymap resolves: the chord and the wire format
+// are one decision, and a typo in the Seq column of the table would only show
+// up as a dead key on a real terminal.
+func TestProposalChordsResolveFromCSIu(t *testing.T) {
+	k := NewKeymap()
+	cases := []struct {
+		name string
+		seq  string
+		want Action
+	}{
+		{"accept", "\x1b[109;13u", AcceptProposed},
+		{"reject", "\x1b[47;13u", RejectProposed},
+		{"prev", "\x1b[44;13u", PrevProposed},
+		{"next", "\x1b[46;13u", NextProposed},
+		{"review", "\x1b[118;7u", ReviewProposed},
+	}
+	for _, c := range cases {
+		if a, _, ok := k.Resolve(Editor, mustParse(t, c.seq)); !ok || a != c.want {
+			t.Errorf("%s: %s resolved to (%q, %v), want %q", c.name, c.seq, a, ok, c.want)
 		}
 	}
 }

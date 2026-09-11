@@ -1,6 +1,8 @@
 package editor
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -8,6 +10,11 @@ import (
 // defaultMode is what a file raj creates gets. Only used when there is nothing
 // on disk to copy the mode from.
 const defaultMode os.FileMode = 0o644
+
+// readFile is os.ReadFile under a name so a test can stub the read-back: a
+// filesystem that accepts a write and drops the bytes cannot be conjured up on
+// demand, so the test stands in for it.
+var readFile = os.ReadFile
 
 // writeAtomic replaces path's contents with data, or leaves the file exactly as
 // it was.
@@ -34,6 +41,13 @@ const defaultMode os.FileMode = 0o644
 // The fsync is what makes the guarantee hold across a power loss rather than
 // only across a process death: without it the rename can reach the disk before
 // the data it points at.
+//
+// The read-back at the end is the one guarantee the dance above cannot make on
+// its own: a filesystem can report success for every call and still drop the
+// bytes. Comparing what landed against what was sent is what makes a nil
+// return mean the file is saved, rather than merely that nothing complained.
+// The comparison is a full byte compare, not a hash: the files raj opens are
+// small enough that hashing would add a step without saving one.
 func writeAtomic(path string, data []byte) error {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
@@ -73,6 +87,18 @@ func writeAtomic(path string, data []byte) error {
 		return err
 	}
 	syncDir(dir)
+
+	// Everything above reporting success is the filesystem's word. Read the
+	// file back and compare before returning nil: a mismatch means the write
+	// was accepted and the bytes dropped anyway, and the save must fail
+	// loudly here rather than mark the buffer clean over a lie.
+	got, err := readFile(path)
+	if err != nil {
+		return fmt.Errorf("save written but could not be verified: reading back %s: %w", path, err)
+	}
+	if !bytes.Equal(got, data) {
+		return fmt.Errorf("save verification failed: %s on disk does not match what was written (%d bytes read back, %d written)", path, len(got), len(data))
+	}
 	return nil
 }
 

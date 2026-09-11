@@ -187,6 +187,67 @@ func TestDefinitionDecodesEscapedURIs(t *testing.T) {
 	}
 }
 
+// References is the inverse of a definition: every place a symbol is used
+// rather than the one place it is declared. The result is a location array or
+// null, and an empty list is "no references" rather than an error.
+func TestReferencesShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"array", `[{"uri":"file:///w/b.go","range":{"start":{"line":3,"character":5},"end":{"line":3,"character":9}}},{"uri":"file:///w/c.go","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":4}}}]`, 2},
+		{"empty array", `[]`, 0},
+		{"null", `null`, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t)
+			f.on("textDocument/references", func(*Message) (any, *ResponseError) {
+				return json.RawMessage(c.raw), nil
+			})
+			ctx, cancel := ctx1s(t)
+			defer cancel()
+			locs, err := RequestReferences(ctx, f.conn, "/w/a.go", Position{}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(locs) != c.want {
+				t.Errorf("got %d locations, want %d: %+v", len(locs), c.want, locs)
+			}
+		})
+	}
+}
+
+// The request names the position it was asked about and asks the server to
+// include the declaration. A list of callers without the definition it belongs
+// to, or one answered for the wrong position, is confidently wrong.
+func TestReferencesSendsContext(t *testing.T) {
+	f := newFake(t)
+	var got map[string]any
+	f.on("textDocument/references", func(m *Message) (any, *ResponseError) {
+		json.Unmarshal(m.Params, &got)
+		return json.RawMessage(`[]`), nil
+	})
+	ctx, cancel := ctx1s(t)
+	defer cancel()
+	if _, err := RequestReferences(ctx, f.conn, "/w/a.go", Position{Line: 12, Character: 34}, true); err != nil {
+		t.Fatal(err)
+	}
+	pos, _ := got["position"].(map[string]any)
+	if pos == nil || pos["line"] != float64(12) || pos["character"] != float64(34) {
+		t.Errorf("position sent as %v, want 12:34", pos)
+	}
+	doc, _ := got["textDocument"].(map[string]any)
+	if doc == nil || doc["uri"] != "file:///w/a.go" {
+		t.Errorf("uri sent as %v", doc)
+	}
+	refctx, _ := got["context"].(map[string]any)
+	if refctx == nil || refctx["includeDeclaration"] != true {
+		t.Errorf("context sent as %v, want includeDeclaration=true", got["context"])
+	}
+}
+
 // Nonsense from a server produces nothing rather than a panic. Servers send
 // shapes no version of the specification describes.
 func TestMalformedResponsesAreSurvived(t *testing.T) {
@@ -217,6 +278,9 @@ func TestRequestsOnADeadConnection(t *testing.T) {
 	}
 	if _, err := RequestDefinition(context.Background(), nil, "/w/a.go", Position{}); err != ErrClosed {
 		t.Errorf("definition err = %v, want ErrClosed", err)
+	}
+	if _, err := RequestReferences(context.Background(), nil, "/w/a.go", Position{}, true); err != ErrClosed {
+		t.Errorf("references err = %v, want ErrClosed", err)
 	}
 
 	f := newFake(t)

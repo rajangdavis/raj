@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -20,12 +21,14 @@ func fullHeader() Header {
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
 		Root: "/w", PID: 4242, Version: 70000, Bytes: 12345, Lines: 678, Files: 12, Capped: true,
+		Considered:   34,
 		Dirty:        []DirtyBuffer{{Path: "/w/a.go", AgentOnly: true}, {Path: "/w/b.go"}},
 		Stats:        ExecStats{Runs: 5, Stale: 1, AgentOnly: 2},
 		Participants: []Participant{{ID: 1, Identity: "i", Name: "n", Kind: KindAgent, Connected: true}},
 		Groups:       []Group{{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 3, Bytes: 40, First: 1, Last: 9}},
 		Messages:     []Message{{From: 1, Text: "hello"}},
-		Buffers:      []Buffer{{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Lines: 5}},
+		Buffers:      []Buffer{{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Pending: 2, Moved: 1, Lines: 5}},
+		Truncated:    []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}},
 		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, ByteStart: 10, ByteEnd: 14}},
 		Conflicts:    []Conflict{{Index: 1, At: 8, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
@@ -76,7 +79,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"root", got.Root, want.Root}, {"pid", got.PID, want.PID},
 		{"version", got.Version, want.Version},
 		{"bytes", got.Bytes, want.Bytes}, {"lines", got.Lines, want.Lines},
-		{"files", got.Files, want.Files},
+		{"files", got.Files, want.Files}, {"considered", got.Considered, want.Considered},
 		{"capped", got.Capped, want.Capped}, {"stats", got.Stats, want.Stats},
 		{"diffjson", got.DiffJSON, want.DiffJSON},
 	} {
@@ -89,6 +92,29 @@ func TestHeaderRoundTrip(t *testing.T) {
 	}
 	if len(got.Spans) != 2 || got.Spans[1] != want.Spans[1] {
 		t.Errorf("spans = %+v", got.Spans)
+	}
+}
+
+// A group's Bytes is the net change in document length, negative for any edit
+// that removes text. It is the one signed number on the wire, and a negative
+// one used to corrupt the groups record and drop every group after it — which
+// is how `groups` listed one set while `diff` rendered three.
+func TestHeaderKeepsNegativeGroupBytes(t *testing.T) {
+	want := []Group{
+		{ID: 1, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 3, Bytes: -42, First: 1, Last: 3},
+		{ID: 2, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, Bytes: -4, First: 4, Last: 4},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Groups: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Groups) != len(want) {
+		t.Fatalf("decoded %d groups, want %d — a negative byte count truncated the list", len(got.Groups), len(want))
+	}
+	for i := range want {
+		if got.Groups[i] != want[i] {
+			t.Errorf("group %d = %+v, want %+v", i, got.Groups[i], want[i])
+		}
 	}
 }
 
@@ -307,5 +333,73 @@ func TestEnumsTravelAsCodes(t *testing.T) {
 	}
 	if back.Groups[0].State != "half-accepted" {
 		t.Errorf("state = %q", back.Groups[0].State)
+	}
+}
+
+// Pending and Moved are per-buffer counts that must survive the wire: they are
+// what lets one `buffers` call say which open files hold proposed changes.
+func TestBufferPendingAndMovedRoundTrip(t *testing.T) {
+	want := []Buffer{
+		{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Lines: 5, Pending: 2, Moved: 1},
+		{Path: "/w/b.go", Version: 9, Bytes: 4, Lines: 1},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Buffers: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Buffers) != len(want) {
+		t.Fatalf("buffers = %+v, want %d", got.Buffers, len(want))
+	}
+	for i := range want {
+		if got.Buffers[i] != want[i] {
+			t.Errorf("buffer %d = %+v, want %+v", i, got.Buffers[i], want[i])
+		}
+	}
+}
+
+// A frame from before pending and moved existed carries only the six original
+// hBuffers fields. It must decode to zero counts rather than fail or invent a
+// seventh buffer: the counts ride in their own field, so their absence is
+// ordinary.
+func TestOldShapedBufferRecordStillDecodes(t *testing.T) {
+	var w prog.Writer
+	w.Str("/w/a.go").Num(3).Bool(true).Num(90).Num(5).Bool(false)
+	w.Str("/w/b.go").Num(1).Bool(false).Num(0).Num(1).Bool(false)
+	old := prog.Encode([]prog.Op{{Code: hBuffers, Payload: w.Done()}})
+
+	got, err := decodeHeader(old)
+	if err != nil {
+		t.Fatalf("an old-shaped buffers field was refused: %v", err)
+	}
+	if len(got.Buffers) != 2 {
+		t.Fatalf("buffers = %+v, want two", got.Buffers)
+	}
+	for i, b := range got.Buffers {
+		if b.Pending != 0 || b.Moved != 0 {
+			t.Errorf("buffer %d carries counts %d/%d; neither was on the wire", i, b.Pending, b.Moved)
+		}
+	}
+	if b := got.Buffers[0]; b.Path != "/w/a.go" || !b.Dirty || b.Bytes != 90 || b.Lines != 5 {
+		t.Errorf("buffer 0 = %+v, want the six original fields intact", b)
+	}
+}
+
+// A record list cut off mid-record sets Reader.Bad, which used to make More
+// report false and end the list one element early. It must be a named frame
+// error instead: that is how a malformed groups reply once listed one change
+// set while three existed.
+func TestTruncatedRecordListIsRefused(t *testing.T) {
+	var w prog.Writer
+	w.Str("/w/a.go").Num(3).Bool(true).Num(90).Num(5).Bool(false)
+	payload := w.Done()
+	payload = payload[:len(payload)-1] // drop the final Active flag
+	b := prog.Encode([]prog.Op{{Code: hBuffers, Payload: payload}})
+
+	_, err := decodeHeader(b)
+	if err == nil {
+		t.Fatal("a truncated record list decoded as a short list")
+	}
+	if !errors.Is(err, errBadFrame) {
+		t.Errorf("err = %v, want it to wrap errBadFrame", err)
 	}
 }

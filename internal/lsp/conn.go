@@ -61,9 +61,14 @@ type Conn struct {
 }
 
 // Diagnostics is a published diagnostic set for one document.
+//
+// Version is the document version this set applies to. The protocol makes it
+// optional, so a nil means the server published without one rather than a
+// version of zero — a distinction the freshness check depends on.
 type Diagnostics struct {
-	URI   string       `json:"uri"`
-	Items []Diagnostic `json:"diagnostics"`
+	URI     string       `json:"uri"`
+	Version *int         `json:"version,omitempty"`
+	Items   []Diagnostic `json:"diagnostics"`
 }
 
 // Diagnostic is one problem in a document.

@@ -52,7 +52,7 @@ var Bindings = []Binding{
 
 	{"file", NewFile, "super+n", "110;9u", "cmd+n", "ctrl+n", "ghostty default: new window"},
 	{"file", Save, "super+s", "115;9u", "cmd+s", "ctrl+s", ""},
-	{"file", Reload, "super+r", "114;9u", "cmd+r", "ctrl+r", "free in both terminals: iTerm2 clears the buffer on cmd+k, not cmd+r"},
+	{"file", Reload, "shift+super+r", "114;10u", "cmd+shift+r", "ctrl+shift+r", "reload moved off cmd+r, which now toggles review mode"},
 
 	{"edit", Undo, "super+z", "122;9u", "cmd+z", "ctrl+z", ""},
 	{"edit", Redo, "shift+super+z", "122;10u", "cmd+shift+z", "ctrl+shift+z", ""},
@@ -115,6 +115,16 @@ var Bindings = []Binding{
 	// their terminal is a worse trade than picking a duller letter.
 	{"nav", Hover, "super+i", "105;9u", "cmd+i", "ctrl+i", ""},
 	{"nav", GotoDef, "super+j", "106;9u", "cmd+j", "ctrl+alt+j", ""},
+
+	// Reviewing proposals from the keyboard. These are ctrl+super chords the
+	// way all_occurrences is: no terminal claims them, but they live in
+	// Bindings rather than Natives so the CSI-u encoding is pinned for both
+	// platforms instead of inferred from report_all.
+	{"proposals", ToggleReview, "super+r", "114;9u", "cmd+r", "ctrl+r", "toggle review mode: the document is read-only while on; reload moved to cmd+shift+r"},
+	{"proposals", AcceptProposed, "ctrl+super+m", "109;13u", "cmd+ctrl+m", "ctrl+alt+m", "accept the proposed change set at the caret"},
+	{"proposals", RejectProposed, "ctrl+super+/", "47;13u", "cmd+ctrl+slash", "ctrl+alt+slash", "back out the proposed change set at the caret"},
+	{"proposals", PrevProposed, "ctrl+super+,", "44;13u", "cmd+ctrl+comma", "ctrl+alt+comma", "previous pending change set"},
+	{"proposals", NextProposed, "ctrl+super+.", "46;13u", "cmd+ctrl+period", "ctrl+alt+period", "next pending change set"},
 }
 
 // Reclaim holds chords a terminal keeps for itself, which raj therefore has to
@@ -162,11 +172,11 @@ var Natives = []Native{
 	{"pgdown", PageDown, ""},
 	{"backspace", Backspace, ""},
 	{"delete", Delete, ""},
-	// Reviewing proposals. No terminal claims a ctrl+alt+letter — ctrl
-	// suppresses macOS option-composition the same way it does for the wrap
-	// toggle — so report_all delivers them with no config line at all.
-	{"ctrl+alt+a", AcceptProposed, "accept the proposed change set at the caret"},
-	{"ctrl+alt+x", RejectProposed, "back out the proposed change set at the caret"},
+	// Reviewing proposals. ctrl+alt+v needs no config line — no terminal claims
+	// it, and ctrl suppresses macOS option-composition the same way it does for
+	// the wrap toggle — so report_all delivers it untouched. Accept, reject and
+	// next/prev are ctrl+super chords and live in Bindings, where the encoding
+	// is pinned for both platforms.
 	{"ctrl+alt+v", ReviewProposed, "list the pending change sets and jump to one; not g: that is find-all on Linux"},
 }
 
@@ -185,7 +195,7 @@ func GhosttyConfig(platform string) string {
 	b.WriteString("# " + HashMarker + Hash() + "\n")
 	b.WriteString("# Applies only while the focused app has KKP report_all set;\n")
 	b.WriteString("# otherwise Ghostty's own bindings are untouched.\n")
-	for _, g := range []string{"panes", "tabs", "file", "edit", "cursor", "nav"} {
+	for _, g := range []string{"panes", "tabs", "file", "edit", "cursor", "nav", "proposals"} {
 		b.WriteString("\n# ===== " + g + " =====\n")
 		for _, bd := range Emitted() {
 			if bd.Group != g {

@@ -170,6 +170,35 @@ func TestControlAppliesAnEdit(t *testing.T) {
 	}
 }
 
+// A span past the end of the buffer is refused, not clamped to an empty read:
+// for one driver that is a typo, for several writing concurrently it is silent
+// corruption. The read verbs and the write surface share the one check.
+func TestSpanBoundsAreChecked(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+
+	const want = "offset out of range"
+	read := c.do(h, control.Request{Op: "text", Start: intPtr(9999), End: intPtr(9999)})
+	if read.OK || !strings.Contains(read.Err, want) {
+		t.Errorf("text past the end = OK %v err %q, want %q", read.OK, read.Err, want)
+	}
+	dump := c.do(h, control.Request{Op: "dump", Start: intPtr(9999), End: intPtr(9999)})
+	if dump.OK || !strings.Contains(dump.Err, want) {
+		t.Errorf("dump past the end = OK %v err %q, want %q", dump.OK, dump.Err, want)
+	}
+	base := c.do(h, control.Request{Op: "text"}).Version
+	ap := c.do(h, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 9999, End: 9999, Text: "x"}}})
+	if ap.OK || !strings.Contains(ap.Err, want) {
+		t.Errorf("apply past the end = OK %v err %q, want %q", ap.OK, ap.Err, want)
+	}
+	if got := h.text(); got != "hello\n" {
+		t.Errorf("buffer = %q, want the refused writes to have changed nothing", got)
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
 // The user's own save is the approval gesture: it writes the file and clears
 // every pending mark, so a later agent save is not refused for work that is
 // already committed.
@@ -193,6 +222,15 @@ func TestUserSaveAcceptsPendingChanges(t *testing.T) {
 	}
 
 	h.press("super+s")
+	// The save reviews the pending set rather than accepting it blind, so the
+	// gesture now lands in the review dialog; enter answers Save.
+	if !h.Prompt.Open {
+		t.Fatal("super+s with a pending set did not open the save review")
+	}
+	if got := p.File.Session().Pending(); len(got) != 1 {
+		t.Fatalf("pending = %+v while the review is open, want the set still there", got)
+	}
+	h.press("enter")
 
 	if got := p.File.Session().Pending(); len(got) != 0 {
 		t.Errorf("pending = %+v after the user saved, want none", got)
@@ -578,5 +616,86 @@ func TestAcceptClearsTheMarkWithoutChangingText(t *testing.T) {
 		if g.ID == id && g.State != "accepted" {
 			t.Errorf("state = %q after accepting", g.State)
 		}
+	}
+}
+
+// A relative path resolves against the workspace root for every read verb, the
+// same way open does, instead of against the process working directory. The
+// harness root is a temp directory, so a bare file name can only mean the open
+// buffer if the host joins it to the root.
+func TestControlRelativePathsResolveAgainstTheRoot(t *testing.T) {
+	h := controlHarness(t, "hello\nworld\n")
+	c := h.dial(t)
+
+	abs := h.Tabs.Active().File.Path
+	rel := filepath.Base(abs)
+
+	want := c.do(h, control.Request{Op: "text", Path: abs})
+	got := c.do(h, control.Request{Op: "text", Path: rel})
+	if !got.OK || got.Text() != "hello\nworld\n" {
+		t.Fatalf("read %q = %+v", rel, got)
+	}
+	if got.Version != want.Version {
+		t.Errorf("relative read is version %d, absolute is %d", got.Version, want.Version)
+	}
+	if v := c.do(h, control.Request{Op: "version", Path: rel}); !v.OK || v.Version != want.Version {
+		t.Errorf("version %q = %+v", rel, v)
+	}
+	if g := c.do(h, control.Request{Op: "groups", Path: rel}); !g.OK {
+		t.Errorf("groups %q = %+v", rel, g)
+	}
+	if g := c.do(h, control.Request{Op: "goto", Path: rel, Line: 1, Col: 1}); !g.OK {
+		t.Errorf("goto %q = %+v", rel, g)
+	}
+}
+
+// A relative path that names no open buffer is refused with the same answer an
+// unopened absolute path gets: the seam resolves the spelling, it does not
+// invent a buffer.
+func TestControlRelativePathWithNoBufferRefuses(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	r := c.do(h, control.Request{Op: "text", Path: "not-open.go"})
+	if r.OK || !strings.Contains(r.Err, "no open buffer") {
+		t.Errorf("read of an unopened relative path = OK %v err %q", r.OK, r.Err)
+	}
+}
+
+// The absolute spelling is unchanged by the seam.
+func TestControlAbsolutePathStillNamesTheBuffer(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	abs := h.Tabs.Active().File.Path
+	if r := c.do(h, control.Request{Op: "text", Path: abs}); !r.OK || r.Text() != "hello\n" {
+		t.Fatalf("read %q = %+v", abs, r)
+	}
+}
+
+// open accepts the relative spelling too, so a driver never joins the path
+// itself; reopening by the relative name focuses the tab the harness already
+// opened rather than stacking a duplicate.
+func TestControlOpenAcceptsARelativePath(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	before := h.Tabs.Count()
+	rel := filepath.Base(h.Tabs.Active().File.Path)
+	if r := c.do(h, control.Request{Op: "open", Path: rel}); !r.OK {
+		t.Fatalf("open %q = %+v", rel, r)
+	}
+	if got := h.Tabs.Count(); got != before {
+		t.Errorf("tab count = %d, want %d — the relative path opened a duplicate", got, before)
+	}
+}
+
+// A path spelled through ".." names the same file: the seam cleans it before
+// it compares, so climbing out of a directory and back in is not a different
+// buffer.
+func TestControlPathThroughDotDotNamesTheSameBuffer(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	abs := h.Tabs.Active().File.Path
+	climb := filepath.Join("..", filepath.Base(filepath.Dir(abs)), filepath.Base(abs))
+	if r := c.do(h, control.Request{Op: "text", Path: climb}); !r.OK || r.Text() != "hello\n" {
+		t.Fatalf("read %q = %+v", climb, r)
 	}
 }

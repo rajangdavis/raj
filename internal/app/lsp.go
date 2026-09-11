@@ -73,11 +73,12 @@ func newServers(root string) *servers {
 type serverState int
 
 const (
-	serverReady    serverState = iota // usable now
-	serverStarting                    // handshaking; ask again shortly
-	serverMissing                     // the binary is not on PATH
-	serverNone                        // no server is configured for this language
-	serverGaveUp                      // it kept failing and will not be retried
+	serverReady      serverState = iota // usable now
+	serverStarting                      // handshaking; ask again shortly
+	serverNotStarted                    // available, but nothing has asked for it yet
+	serverMissing                       // the binary is not on PATH
+	serverNone                          // no server is configured for this language
+	serverGaveUp                        // it kept failing and will not be retried
 )
 
 // running returns the server already handling a path's language, without
@@ -150,11 +151,45 @@ func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 	}
 }
 
+// state reports the server already handling a path's language without starting
+// one, so a caller that must not spawn a process can still say why there is no
+// answer. Diagnostics use it: the published cache is meaningful only for a
+// server already running, and a read that started one would report "starting"
+// on a first call while looking like it had answered.
+func (s *servers) state(path string) (*langServer, serverState) {
+	id := lsp.LanguageID(path)
+	if id == "" {
+		return nil, serverNone
+	}
+	argv, ok := command[id]
+	if !ok {
+		return nil, serverNone
+	}
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		return nil, serverMissing
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls := s.byID[id]
+	if ls == nil {
+		return nil, serverNotStarted
+	}
+	if ls.srv.Conn() != nil && ls.sync != nil {
+		return ls, serverReady
+	}
+	if ls.srv.GaveUp() {
+		return nil, serverGaveUp
+	}
+	return nil, serverStarting
+}
+
 // message is what to show for a state, or "" when there is nothing to say.
 func (st serverState) message(path string) string {
 	switch st {
 	case serverStarting:
 		return "starting language server\u2026"
+	case serverNotStarted:
+		return "language server not running; a hover or completion starts it"
 	case serverMissing:
 		if argv, ok := command[lsp.LanguageID(path)]; ok {
 			return argv[0] + " not found on PATH"
@@ -204,6 +239,11 @@ func (s *servers) stopAll() {
 // servers send richer responses that are then discarded — snippet completions
 // arrive as templates raj would insert literally, and markdown hovers arrive
 // with formatting a cell grid cannot show.
+//
+// inlayHint is advertised as an empty object: its presence is the whole
+// advertisement. resolveSupport is deliberately not sent, so a server includes
+// a hint's text edits with the hint rather than deferring them to a resolve
+// request raj would have to implement.
 func clientCapabilities() map[string]any {
 	return map[string]any{
 		"textDocument": map[string]any{
@@ -217,6 +257,7 @@ func clientCapabilities() map[string]any {
 					"snippetSupport": false,
 				},
 			},
+			"inlayHint": map[string]any{},
 		},
 	}
 }
@@ -316,12 +357,19 @@ type lspAnswer struct {
 	// line and col anchor the word the answer describes, so a cached list can
 	// be matched against a later keystroke's word rather than only its text.
 	line, col int
+	// path and inlayVersion describe an inlay answer: which document asked and
+	// which text version the server answered for, so install can drop one the
+	// buffer has already left.
+	path         string
+	inlayVersion int
+	hints        []lsp.InlayHint
 }
 
 const (
 	answerHover = iota
 	answerDefinition
 	answerCompletion
+	answerInlay
 )
 
 // park stores an answer and wakes the event loop.
@@ -348,6 +396,16 @@ func (a *App) applyAnswer() {
 	if ans == nil {
 		return
 	}
+	// Inlay answers have their own generation and their own install path: an
+	// edit supersedes them rather than a cursor move, and the install has a
+	// document version to check as well.
+	if ans.kind == answerInlay {
+		if ans.gen != a.inlayGen {
+			return
+		}
+		a.applyInlay(*ans)
+		return
+	}
 	// Two generations, because the two kinds are superseded by different
 	// things: a hover is stale once the cursor moves, a completion once the
 	// typing moves on. Checking one counter for both made every completion
@@ -372,11 +430,12 @@ func (a *App) applyAnswer() {
 
 // closeDoc forgets everything that was keyed on a pane's path.
 //
-// Two things outlive a closed tab if nothing does this. The server keeps the
-// document open and keeps publishing about it, and the diagnostics store keeps
-// the last set it published — counted in nothing visible, since the status line
-// only reports the active file, but held for as long as the session runs and
-// resurrected the moment the file is reopened, stale.
+// Three things outlive a closed tab if nothing does this. The server keeps the
+// document open and keeps publishing about it, the diagnostics store keeps the
+// last set it published, and the hint store keeps the last answer. None is
+// counted in anything visible for a closed tab — the status line reports only
+// the active file — but all are held for as long as the session runs and
+// resurrected, stale, the moment the file is reopened.
 //
 // It runs before the tab is removed rather than after, because the path is read
 // off the pane and a removed pane is one nobody can be asked about.
@@ -391,6 +450,14 @@ func (a *App) closeDoc(p *editor.Pane) {
 		_ = ls.sync.Close(path)
 	}
 	a.diags.clear(path)
+	a.inlays.clear(path)
+	// The guard is keyed on a path, so a reopen of the same file at the same
+	// version would otherwise be treated as a request already answered. An
+	// answer still in flight is dropped by the generation bump.
+	if a.inlayReq.path == path {
+		a.inlayReq = inlayRequest{}
+		a.inlayGen++
+	}
 	a.refreshProblems()
 }
 
@@ -573,5 +640,5 @@ func (a *App) applyCompletion(ans lspAnswer) {
 	}
 	// Nothing left after filtering: the buffer words already on screen are
 	// better than an empty popup.
-	a.showItems(prefix, ans.items, line, col)
+	a.showItems(p, prefix, ans.items, line, col)
 }

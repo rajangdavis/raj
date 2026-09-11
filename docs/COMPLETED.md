@@ -156,6 +156,13 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 - [x] Syntax retokenises after every key, not only on the tick; tab labels
   disambiguate shared base names; workspace root walks up to the nearest .git;
   syntax uses the bright half of the palette.
+- [x] **Position fuzzing extended from points to ranges.**
+  `FuzzRangeRebaseAgainstOracle` (piecetable) carries byte ranges through a
+  random op soup of insert/delete/undo/redo/reject asserting doc-oracle
+  agreement; `FuzzRangeRoundTrip` (lsp) fuzzes `Document.Span`. Unblocks
+  incremental document sync and any future textEdit honouring. Host-side
+  verification pending: `go test ./internal/piecetable/ ./internal/lsp/`
+  plus short `-fuzz` runs.
 
 
 ## Mouse
@@ -1356,6 +1363,11 @@ harness. Both now wait on the thing they are actually about.
   clamping plain `Top` for legacy JSON. Tests: same size, resized larger,
   empty file (ratio 0), legacy JSON without `ratio`. Host-side verification
   pending: `go test ./internal/session/ ./internal/app/`.
+- [x] **The session is written from the idle tick, not only on a clean
+  exit.** Debounced to three seconds and touched whenever a tab opens or
+  closes, so a crash loses seconds of session state rather than the whole
+  session. Host-side verification pending: `go test ./internal/session/
+  ./internal/app/`.
 - [x] **Notice the change before the save.** Done and verified (go test green):
   `Pane.diskStale` with `MarkDiskStale`/`ClearDiskStale`/`DiskStale`,
   `App.diskCheck()` on the idle tick — one stat per open tab, skipping
@@ -1407,12 +1419,19 @@ harness. Both now wait on the thing they are actually about.
   over the socket: pending change sets as old→new text, pure editor state —
   group spans plus the rebase walk — the review surface the hunk-echo and
   group-ranges bullets ask for. Host-side test verification pending.
-- [x] **`raj ctl search` include/exclude globs match the basename, not the
-  path.** Done and verified: `matches()` now receives the relative path from
-  `filepath.Rel(root, path)` at both sites — the walk filter and the open-doc
-  eligibility check; `filepath.Match`'s `*` crosses separators, so `*.go`
-  keeps matching, and the `plainExt` fast path is unchanged.
-  `TestRunGlobsMatchPath` covers it. (Stream B)
+- [x] **`raj ctl search` include/exclude globs match the basename when the
+  pattern has no separator, and the relative path when it has one.** Done:
+  `matches()` receives the relative path from `filepath.Rel(root, path)` at
+  both sites — the walk filter and the open-doc eligibility check. A pattern
+  with no `/` is a filename glob as with `grep --include`, tested against
+  `filepath.Base(path)` as well as the relative path, so `*_test.go` reaches a
+  test file in any directory, `search.go` means any file so named, and `*.go`
+  keeps matching tree-wide through the unchanged `plainExt` fast path. A
+  pattern that contains `/` is path-scoped and still matches the relative path
+  alone. The earlier comment here was wrong: `filepath.Match`'s `*` does not
+  cross a separator, which is exactly why the basename test is needed.
+  `TestRunGlobsMatchPath` and the basename/path tests in
+  `internal/search/search_test.go` cover it.
 - [x] **A stale socket from a killed process is only probed, not reaped** —
   discovery now removes what it finds dead. A unix socket with no listener
   refuses immediately, so a live but busy editor is never reaped.
@@ -1437,3 +1456,41 @@ harness. Both now wait on the thing they are actually about.
   -mine` is implemented: the flag filters the listing to the connection's
   own author id, before both the JSON and text paths. Implemented by a raj
   subagent; host-side verification pending.
+- [x] **Version handshake and server-minted identity.** `SrcVersion` read
+  from `vcs.revision` via `debug.ReadBuildInfo()` (no `-ldflags` stamp
+  needed), sent in the `hello` reply and stamped on every response in
+  `connection.send`; anonymous TCP hello mints a `tok_…` identity via the
+  existing TCP-token entropy path and Joins with it, so a reconnecting
+  client rebinds to the same author id; `raj ctl` says hello with
+  `RAJ_IDENTITY` before any verb, adopts a server-minted token and prints
+  `set RAJ_IDENTITY=tok_…` once; version mismatch warns on stderr naming
+  both commits (silent when either side is empty). Unix-socket hello
+  unchanged. Three tests; `make check` passed on the host.
+  (kimi-handshake, 2026-09-10.)
+- [x] **Sidebar search on the streaming path.** internal/search/pane.go
+  moved from `RunDocs` to `RunStream`: incremental batches park under the
+  worker mutex and Notify, drain in walk order on the event thread (first
+  batch of a generation replaces the list, later batches append at the
+  tail so selection survives), and the finished result installs wholesale,
+  so collapse-threshold timing is unchanged. The `p.search` test seam kept
+  its shape; no test file touched. (kimi-stream, 2026-09-10.)
+- [x] **Skill fixes from live driving.** skills/raj-editor/SKILL.md:
+  identity binding rewritten around `who -as X -name Y` with `-as`
+  first-after-the-verb (the old text led with the nonexistent `raj ctl
+  hello`); the tooling prohibition now names the interpreter temptation;
+  the rebuild-boundary loop stated as an explicit workflow. (kimi-docs,
+  orchestrator direct, 2026-09-10.)
+- [x] **In-editor accept and reject for proposals.** `AcceptProposed` /
+  `RejectProposed` / `ReviewProposed` actions with ctrl+alt+a /
+  ctrl+alt+x / ctrl+alt+v in the Natives table — no terminal config
+  needed; ctrl+alt+letter is unclaimed terminal space. Caret-on-hunk
+  decides that hunk by line proximity (deletions reachable); caret-off
+  decides all proposed changes on screen and reports the count.
+  internal/app/review.go. Found pre-existing on 2026-09-10.
+- [x] **Phase 0 — recursive-raj prompt autoloads.** RECURSIVE_RAJ.md gained skill frontmatter and a §0 standing-workflow section, and opencode/agents/raj.md a bootstrap paragraph gated to primary sessions, so a fresh session lists the raj-recursive skill and opens with the standing workflow. Verified live 2026-09-10.
+- [x] **Phase 1 — control-surface correctness.** `resolveSpan` bounds-checks `apply`/`read`/`dump`; the `Start`/`End`/`LineStart`/`LineEnd` presence fix makes `read`/`dump -start 0` return the head; `who -live` filters to connected participants; `buffers -json` carries a brace `tally`. Host-verified 2026-09-10.
+- [x] **Phase 2 — handshake batch.** `SrcVersion` stamped on every response with a CLI skew warning on mismatch; server-minted identity adopted into `RAJ_IDENTITY`; gone ids recycled at the 255 cap, skipping id 1 so an agent never recycles onto the local human. Host-verified 2026-09-10.
+- [x] **Phase 3(b) — save read-back-and-compare.** `writeAtomic` reads the file back after rename+fsync and fails the save on a mismatch or an unreadable file ("save verification failed"), behind an injectable `readFile` seam for tests. Host-verified.
+- [x] **Phase 3(c) — save-time review popup.** `Prompt.Review` opens from saveActive when pending > 0 — rows name the pending sets and jump the caret, enter accepts-all+saves, esc cancels. Host-verified.
+- [x] **Review mode, moved-hunk option A, and control-surface honesty (2026-09-11).** D1/D2: cmd+r toggles an app-level Review mode; the document is read-only in it (mutations refused with a status note) while decisions, movement, scroll and search stay live; a status-line badge and keybar carry the real chords and `n`/`N`; Reload moved to cmd+shift+r. D4: `DiffPending` projects the surviving runs of a proposed member instead of dropping it, `Pending()` auto-rejects a set with no surviving run, and `PendingMarks` follows the fragments. CLI: `apply -hunks FILE` (JSON Lines), `accept -all` / `reject -all`, positional-argument refusal for path verbs, the signed-varint fix that stopped negative `Group.Bytes` truncating the `groups` list, and an honest `lsp diagnostics` `status`/`detail`. Wire: `buffers -json` gains `pending`/`moved` through a sparse `hBufferState` (0x44), and `decodeHeader` checks `Reader.Bad` after each list. Search: `-include`/`-exclude` with no `/` now match the basename as well as the relative path, so `*_test.go` works tree-wide. The raj-editor skill documents `-hunks`, `-all`, `buffers` pending/moved, the diagnostics status, and the no-slash glob rule. `make check` green on the host (`go vet`, `go build`, `go test ./...`); live behaviour awaits a rebuild + editor restart + container-image rebuild.
+- [x] **Inlay hints steps 1-5, plus `lsp references`, diagnostics freshness, completion auto-import and multi-cursor paste (2026-09-11).** Inlay hints (option A inline overlay): `internal/lsp/inlay.go` (`InlayHint`, `RequestInlayHints`, `labelText`, `tooltipText`) and a `textDocument.inlayHint` capability (empty object, no `resolveSupport`); the editor-side model `internal/editor/hints.go` (`Hint`, `HintEdit`, `HintSet`, `LineHint`; `File.Hints`, `HintsAt`/`SetHints`/`ClearHints`) with `internal/app/inlay.go` (`inlayStore` keyed by path+version); the fetch lifecycle (`maybeRequestHints` on the idle tick over the visible range plus a half-screen margin, `answerInlay`, `applyInlay`, `invalidateHints`, generation and version drops); the hint-aware column map `internal/view/columns.go` (`HintCol`, `ColOfHints`, `OffsetOfHints`, `WidthHints`) and the single-row caret/render/mouse path (`File.LineCol`/`OffsetAt`, `drawLine`/`drawHint` with `Theme.InlayHint`, `mouse.OffsetAt` clamping inside a hint); and the shipped wrap answer, the per-line fit fallback (`editor.HintsThatFit`, `File.SetHintsFiltered`/`HintWidth`, `App.fitHints`, re-filtered from `drawEditor`), after full wrap integration was attempted and abandoned because the byte-offset row model cannot represent a hint-only row. `view` deliberately has no hint-aware wrap functions: multi-row lines draw no hints. Also shipped: `lsp references`; diagnostics freshness (`unpublished`/`stale`, the pure `diagnosticsStatus`, publish `version` decode); completion `textEdit` plus `additionalTextEdits` (auto-import); and multi-cursor paste-at-each-cursor. Inlay hints steps 1-5, `lsp references`, diagnostics freshness and completion are in tree and `make check` is green on the host; multi-cursor paste and the live inlay behaviour await a rebuild, editor restart and container-image rebuild.

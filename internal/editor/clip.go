@@ -125,6 +125,10 @@ func (p *Pane) PasteClip(c Clip) {
 		p.PasteDistributed(lines)
 		return
 	}
+	if len(cursors) > 1 {
+		p.PasteAtEachCursor(c.Text)
+		return
+	}
 	p.Paste(c.Text)
 }
 

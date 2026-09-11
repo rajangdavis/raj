@@ -67,19 +67,8 @@ func (c Columns) wrap(s string, w int, opp BreakPolicy, out *[]int) int {
 		return 1
 	}
 	rows, col := 1, 0
-	// oppAt is the byte offset just past the last break opportunity still
-	// available on the current row; -1 once the row has none left to use.
 	oppAt, oppCol := -1, 0
-
 	for i, r := range s {
-		// A loop, not a branch. Retreating to a break opportunity does not
-		// guarantee the rune now fits: a tab's width is elastic, so moving it
-		// to a new column can make it WIDER. " 0\t" at width 2 with tab 4
-		// retreats to after the space, recomputes the tab as three columns and
-		// produces a row four columns wide. Found by fuzzing, not by reading.
-		//
-		// col == 0 terminates it: a rune too wide for the pane gets a row of
-		// its own rather than looping forever.
 		rw := c.runeCols(r, col)
 		for col+rw > w && col > 0 {
 			var at int
@@ -87,9 +76,6 @@ func (c Columns) wrap(s string, w int, opp BreakPolicy, out *[]int) int {
 				at = oppAt
 				col = c.colOfFrom(s[oppAt:i], oppCol)
 			} else {
-				// No usable opportunity on this row: break where we stand, or
-				// an overlong token never advances. Minified output, base64
-				// and deep paths all reach this.
 				at, col = i, 0
 			}
 			if out != nil {

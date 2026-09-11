@@ -14,8 +14,8 @@ import (
 // if the table changes and the sequence does not, the smoke test should notice
 // before a user does.
 const (
-	cmdS  = "115;9u" // save
-	cmdR  = "114;9u" // reload
+	cmdS  = "115;9u"  // save
+	cmdR  = "114;10u" // reload (cmd+shift+r; cmd+r toggles review)
 	enter = "13u"
 	esc   = "27u"
 	right = "1;9C" // in a dialog, moves to the next answer

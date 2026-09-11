@@ -12,7 +12,7 @@ import (
 // remembers to update. Generating it means the only way to change what is
 // documented is to change what is bound.
 //
-// Written to KEYBINDINGS.md and checked in, because a reference you have to
+// Written to docs/KEYBINDINGS.md and checked in, because a reference you have to
 // build the program to read is not a reference. A test asserts the file matches
 // what Doc() produces, so the checked-in copy cannot fall behind either.
 
@@ -36,7 +36,7 @@ func Doc() string {
 	var b strings.Builder
 	b.WriteString("# raj keybindings\n\n")
 	b.WriteString("Generated from `internal/keys/table.go`. Do not edit by hand:\n")
-	b.WriteString("run `raj --keys > KEYBINDINGS.md`, or just change the table and\n")
+	b.WriteString("run `raj --keys > docs/KEYBINDINGS.md`, or just change the table and\n")
 	b.WriteString("let the test tell you.\n\n")
 	b.WriteString("Chords are written as raj resolves them. The macOS and Linux columns\n")
 	b.WriteString("are what the terminal has to be configured to send — see\n")

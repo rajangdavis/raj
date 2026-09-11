@@ -23,10 +23,25 @@ type diagnostics struct {
 	mu sync.Mutex
 	// byPath is the whole set for a file, replaced wholesale on each publish.
 	byPath map[string][]lsp.Diagnostic
+	// publishedPaths is every path a server has published about, including an
+	// empty publish. byPath alone cannot tell "the server says this file is
+	// clean" from "no server has answered about this file yet": both read as
+	// no items, and only the first may be read as no problems.
+	publishedPaths map[string]bool
+	// versions is the document version each path's last publish applied to,
+	// where the server sent one. A missing entry means the publish carried no
+	// version, which is not the same as version zero: the freshness check
+	// treats an absent version as unknown rather than as describing the first
+	// revision of the document.
+	versions map[string]*int
 }
 
 func newDiagnostics() *diagnostics {
-	return &diagnostics{byPath: map[string][]lsp.Diagnostic{}}
+	return &diagnostics{
+		byPath:         map[string][]lsp.Diagnostic{},
+		publishedPaths: map[string]bool{},
+		versions:       map[string]*int{},
+	}
 }
 
 // Severity values, as the protocol numbers them.
@@ -37,14 +52,37 @@ const (
 	sevHint    = 4
 )
 
-// set replaces the diagnostics for a document.
+// set replaces the diagnostics for a document with a publish that carried no
+// version.
+func (d *diagnostics) set(path string, items []lsp.Diagnostic) {
+	d.setVersion(path, items, nil)
+}
+
+// setVersion replaces the diagnostics for a document, recording the document
+// version the publish applied to alongside them. A nil version means the
+// server sent none, and is stored as absent rather than as zero.
 //
 // An empty list is meaningful and must be stored as a clearing rather than
 // ignored: that is how a server says the problems it reported are fixed, and
-// dropping it would leave them on screen forever.
-func (d *diagnostics) set(path string, items []lsp.Diagnostic) {
+// dropping it would leave them on screen forever. It still records its
+// version, because a clean publish is exactly the reading the freshness check
+// has to date.
+func (d *diagnostics) setVersion(path string, items []lsp.Diagnostic, version *int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.publishedPaths == nil {
+		d.publishedPaths = map[string]bool{}
+	}
+	d.publishedPaths[path] = true
+	if version == nil {
+		delete(d.versions, path)
+	} else {
+		if d.versions == nil {
+			d.versions = map[string]*int{}
+		}
+		v := *version
+		d.versions[path] = &v
+	}
 	if len(items) == 0 {
 		delete(d.byPath, path)
 		return
@@ -68,6 +106,29 @@ func (d *diagnostics) forPath(path string) []lsp.Diagnostic {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.byPath[path]
+}
+
+// published reports whether a server has published diagnostics for a path,
+// empty or not. A file never heard from and a file the server called clean
+// both have no items; only the latter may be read as no problems.
+func (d *diagnostics) published(path string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.publishedPaths[path]
+}
+
+// publishedVersion is the document version the last publish for a path applied
+// to, and whether the server sent one. An absent version is not version zero:
+// the caller uses the bool to tell "the server dated this publish" from "the
+// server did not", which the freshness check decides differently.
+func (d *diagnostics) publishedVersion(path string) (int, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v, ok := d.versions[path]
+	if !ok || v == nil {
+		return 0, false
+	}
+	return *v, true
 }
 
 // atLine is the most severe diagnostic on a line, and whether there is one.
@@ -115,6 +176,8 @@ func (d *diagnostics) clear(path string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.byPath, path)
+	delete(d.publishedPaths, path)
+	delete(d.versions, path)
 }
 
 // severityRank orders severities by how much they matter, lowest first.
@@ -190,7 +253,7 @@ func (a *App) drainDiagnostics() {
 		for {
 			select {
 			case d := <-c.Diagnostics:
-				a.diags.set(lsp.Path(d.URI), d.Items)
+				a.diags.setVersion(lsp.Path(d.URI), d.Items, d.Version)
 				changed = true
 			default:
 				goto next

@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"raj/internal/syntax"
 )
 
 // `raj ctl` — the command-line face of the control socket.
@@ -51,19 +53,22 @@ const ctlUsage = `usage: raj ctl <command> [options]
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
   close [path]                close a buffer; refused while it has unsaved work
   whoami                     the author id this connection writes as
-  who                        everyone writing in this workspace
+  who [-live]                everyone writing in this workspace; -live filters to connected
   recv                       wait for the user to say something, then print it
   groups [path]              change sets in a buffer, and their state
-  accept [path] -group N     agree to a change set
-  reject [path] -group N     back one out
+  accept [path] -group N     agree to a change set; -all for every pending one
+  reject [path] -group N     back one out; -all for every pending one
   diff [path]                pending change sets as old→new text, for review
   search -q PATTERN          search the workspace, unsaved edits included
   version [path]             the version a later apply bases on
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] -dump N       replace a snapshot's text; the editor diffs and applies
-  lsp MODE [path] LINE:COL   hover, definition, completion, or diagnostics [path]
-  apply [path] -base N -start N -end N [-text S | -text-file F]
+  lsp MODE [path] LINE:COL   hover, definition, references, completion, or diagnostics [path]
+  apply [path] -base N [-start N -end N [-text S | -text-file F]]
                              replace bytes [start,end) with text
+  apply [path] -base N -hunks F
+                             replace each span in a JSON Lines file: one
+                             {"start":S,"end":E,"text":"..."} per line, - for stdin
   edit [path] -old S -new S  replace an exact string (convenience over apply)
   save [path]                write a buffer to disk
   exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
@@ -110,12 +115,14 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
 	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
 	textFile := fs.String("text-file", "", "apply: read -text from a file, or - for stdin")
+	hunksFile := fs.String("hunks", "", "apply: read hunks from a file of JSON Lines, one {start,end,text} per line, or - for stdin")
 	old := fs.String("old", "", "edit: the exact existing text to replace")
 	newText := fs.String("new", "", "edit: the replacement text")
 	oldFile := fs.String("old-file", "", "edit: read -old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read -new from a file, or - for stdin")
-	all := fs.Bool("all", false, "edit: replace every occurrence instead of requiring exactly one")
+	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject: every pending change set")
 	mine := fs.Bool("mine", false, "groups: only the connection's own change sets")
+	live := fs.Bool("live", false, "who: only participants connected right now, not every id the process has minted")
 	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
 	// Everything after "--" is another program's argv and must reach it intact:
 	// `raj ctl exec -- go test -run X` has to give go its own -run, not have it
@@ -128,6 +135,9 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	path := fs.Arg(0)
+	if code := refuseExtraArgs(cmd, fs, stderr); code != 0 {
+		return code
+	}
 
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, ctlUsage)
@@ -155,6 +165,22 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	if _, err := c.ResolveRoots(cwd); err != nil {
 		fmt.Fprintln(stderr, "raj ctl:", err)
 		return 1
+	}
+
+	// Bind-first: hello before any other verb, so the connection writes as
+	// the durable identity the harness pinned with RAJ_IDENTITY (or -as)
+	// rather than as a fresh anonymous id every invocation. Nothing pinned
+	// goes out empty, and a TCP server mints a token and hands it back; adopt
+	// it for the rest of the process and say so once, so the harness can pin
+	// it next run. A failed hello changes nothing: the connection works on
+	// anonymously, exactly as it did before this handshake.
+	bind := firstOf(*identity, os.Getenv("RAJ_IDENTITY"))
+	if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: *name}); err == nil && hi.Err == "" {
+		if bind == "" && hi.Identity != "" {
+			adoptedIdentity = hi.Identity
+			fmt.Fprintf(stderr, "set RAJ_IDENTITY=%s\n", hi.Identity)
+		}
+		warnVersionSkew(stderr, hi.SrcVersion)
 	}
 
 	switch cmd {
@@ -222,13 +248,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return code
 		}
 		if *mine {
-			var mineOnly []Group
-			for _, g := range res.Groups {
-				if g.Author == c.Author() {
-					mineOnly = append(mineOnly, g)
-				}
-			}
-			res.Groups = mineOnly
+			res.Groups = mineOnly(res.Groups, c.Author())
 		}
 		if *asJSON {
 			return emit(stdout, res.Groups)
@@ -239,6 +259,9 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	case "accept", "reject":
+		if *all {
+			return decideAll(c, cmd, path, *mine, *group, stdout, stderr, *asJSON)
+		}
 		return simple(c, Request{Op: cmd, Path: path, Group: *group}, cmd+"ed",
 			stdout, stderr, *asJSON)
 	case "diff":
@@ -247,6 +270,19 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		res, err := c.Do(Request{Op: "hello", Identity: identityOf(*identity), Name: *name})
 		if code := fail(stderr, res, err); code != 0 {
 			return code
+		}
+		if *live {
+			// Client-side on purpose: the registry's full listing is the
+			// attribution record — a gone participant's text is still in the
+			// document — so the wire answer keeps every row and the flag is a
+			// view, not a change to what the server reports.
+			here := make([]Participant, 0, len(res.Participants))
+			for _, p := range res.Participants {
+				if p.Connected {
+					here = append(here, p)
+				}
+			}
+			res.Participants = here
 		}
 		if *asJSON {
 			return emit(stdout, res.Participants)
@@ -278,6 +314,13 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%d\n", res.Author)
 		return 0
 	case "search":
+		// A bare positional is never a path here — search takes none — so it
+		// is the pattern typed in the wrong place, and accepting it silently
+		// would run a different search than the one that was meant.
+		if arg := fs.Arg(0); arg != "" {
+			fmt.Fprintf(stderr, "search: unexpected argument %q — the pattern goes to -q; to limit paths use -include\n", arg)
+			return 2
+		}
 		return doSearch(c, SearchQuery{Text: *query, Include: *include, Exclude: *exclude,
 			Regex: *regex, Case: *matchCase, Word: *word}, *jsonl, *asJSON, stdout, stderr)
 	case "version":
@@ -300,7 +343,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "lsp":
 		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), stdout, stderr, *asJSON)
 	case "apply":
-		return apply(c, path, *base, *start, *end, *textArg, *textFile, fs, stdout, stderr, *asJSON)
+		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile, fs, stdout, stderr, *asJSON)
 	case "edit":
 		o, n, code := editText(*old, *newText, *oldFile, *newFile, stderr)
 		if code != 0 {
@@ -309,6 +352,45 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return edit(c, path, o, n, *all, stdout, stderr, *asJSON)
 	}
 	fmt.Fprintf(stderr, "raj ctl: unknown command %q\n\n%s", cmd, ctlUsage)
+	return 2
+}
+
+// argLimit is how many positional operands a verb takes, and what to say about
+// one it does not. A verb absent from the map takes none; goto and lsp are
+// absent too, because their extra operands are positions rather than a stray
+// span.
+//
+// The case that matters is a byte span written as operands. `raj ctl read path
+// 940 1000` used to read the whole file and look like it worked, with two
+// numbers that look like offsets read accepts; refusing the second operand and
+// naming the flags turns a silently wrong read into a usage error.
+var argLimit = map[string]struct {
+	n    int
+	hint string
+}{
+	"read":    {1, "read takes a path; a byte span goes to -start/-end, a line range to -lines"},
+	"dump":    {1, "dump takes a path; the span goes to -start/-end"},
+	"version": {1, "version takes a path and nothing else"},
+	"open":    {1, "open takes a path and nothing else"},
+	"close":   {1, "close takes a path and nothing else"},
+	"save":    {1, "save takes a path and nothing else"},
+	"groups":  {1, "groups takes a path and nothing else"},
+	"accept":  {1, "accept takes a path; the change set id goes to -group"},
+	"reject":  {1, "reject takes a path; the change set id goes to -group"},
+	"diff":    {1, "diff takes a path and nothing else"},
+	"patch":   {1, "patch takes a path; the snapshot id goes to -dump"},
+	"apply":   {1, "apply takes a path; offsets go to -base/-start/-end"},
+	"edit":    {1, "edit takes a path; the strings go to -old/-new"},
+}
+
+// refuseExtraArgs rejects a positional operand the verb does not take, so a
+// stray one cannot be ignored while the command appears to succeed.
+func refuseExtraArgs(cmd string, fs *flag.FlagSet, stderr io.Writer) int {
+	lim, ok := argLimit[cmd]
+	if !ok || fs.NArg() <= lim.n {
+		return 0
+	}
+	fmt.Fprintf(stderr, "%s: unexpected argument %q — %s\n", cmd, fs.Arg(lim.n), lim.hint)
 	return 2
 }
 
@@ -322,9 +404,15 @@ func firstOf(vals ...string) string {
 	return ""
 }
 
+// adoptedIdentity is the token the server minted for this process when
+// nothing was pinned, kept so a later hello on another connection — recv,
+// say — rebinds to the same participant instead of minting again.
+var adoptedIdentity string
+
 // identityOf falls back to the environment, so a harness sets RAJ_IDENTITY once
-// rather than passing -as on every call — and a harness that forgets both is
-// anonymous rather than broken.
+// rather than passing -as on every call, then to the token the server minted
+// this run; a harness that forgets all three stays anonymous rather than
+// broken.
 func identityOf(flagVal string) string {
 	if flagVal != "" {
 		return flagVal
@@ -332,7 +420,22 @@ func identityOf(flagVal string) string {
 	if env := os.Getenv("RAJ_IDENTITY"); env != "" {
 		return env
 	}
+	if adoptedIdentity != "" {
+		return adoptedIdentity
+	}
 	return "anon-cli"
+}
+
+// warnVersionSkew notes a ctl/editor build mismatch. A warning, not a refusal:
+// a stale pair still works for the verbs that did not change, and which those
+// are is for the user to decide. Empty on either side means unknown, and the
+// check stays silent.
+func warnVersionSkew(stderr io.Writer, server string) {
+	if srcVersion == "" || server == "" || srcVersion == server {
+		return
+	}
+	fmt.Fprintf(stderr, "raj ctl: warning — ctl is built from %s, the editor from %s; "+
+		"verbs that changed between the two may misbehave\n", srcVersion, server)
 }
 
 // indexOf finds a literal argument.
@@ -543,6 +646,99 @@ func doExec(c *Client, argv []string, dir string, stdout, stderr io.Writer, asJS
 	return res.Exit
 }
 
+// decideAll accepts or rejects every change set the path reports in one
+// command. It is the client-side bulk form: `groups` once, then one frame per
+// group, so reviewing k change sets is one invocation rather than 1+k. The
+// server still decides each group on its own terms — which is what keeps a
+// wedged reject from taking the rest with it, and why one that fails is named
+// rather than only counted.
+func decideAll(c *Client, op, path string, mine bool, group uint64,
+	stdout, stderr io.Writer, asJSON bool) int {
+	if group != 0 {
+		fmt.Fprintf(stderr, "raj ctl %s: -all and -group are alternatives\n", op)
+		return 2
+	}
+	res, err := c.Do(Request{Op: "groups", Path: path})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	groups := res.Groups
+	if mine {
+		groups = mineOnly(groups, c.Author())
+	}
+	if len(groups) == 0 {
+		// Nothing to decide is an answer, not a failure, exactly as an empty
+		// `groups` listing is.
+		if asJSON {
+			return emit(stdout, map[string]any{"ok": true, "decided": []uint64{}})
+		}
+		fmt.Fprintf(stdout, "%s: no pending change sets\n", firstOf(path, "active buffer"))
+		return 0
+	}
+	type outcome struct {
+		ID    uint64 `json:"id"`
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	out := make([]outcome, 0, len(groups))
+	verb := op + "ed"
+	var failed []uint64
+	for _, g := range groups {
+		dres, derr := c.Do(Request{Op: op, Path: path, Group: g.ID})
+		switch {
+		case derr != nil:
+			out = append(out, outcome{ID: g.ID, Error: derr.Error()})
+			failed = append(failed, g.ID)
+			if !asJSON {
+				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %v\n", op, g.ID, derr)
+			}
+		case dres.Err != "":
+			out = append(out, outcome{ID: g.ID, Error: dres.Err})
+			failed = append(failed, g.ID)
+			if !asJSON {
+				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %s\n", op, g.ID, dres.Err)
+			}
+		default:
+			out = append(out, outcome{ID: g.ID, OK: true})
+			if !asJSON {
+				fmt.Fprintf(stdout, "%s change set %d\n", verb, g.ID)
+			}
+		}
+	}
+	if asJSON {
+		if code := emit(stdout, out); code != 0 {
+			return code
+		}
+		if len(failed) > 0 {
+			return 1
+		}
+		return 0
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(stderr, "raj ctl %s: %d of %d change set(s) could not be %s:",
+			op, len(failed), len(groups), verb)
+		for _, id := range failed {
+			fmt.Fprintf(stderr, " %d", id)
+		}
+		fmt.Fprintln(stderr)
+		return 1
+	}
+	return 0
+}
+
+// mineOnly keeps the change sets this connection wrote. `groups` is the
+// attribution record — a gone participant's record is not discarded — so the
+// filter is a view applied here, not a change to what the server reports.
+func mineOnly(groups []Group, author uint8) []Group {
+	var kept []Group
+	for _, g := range groups {
+		if g.Author == author {
+			kept = append(kept, g)
+		}
+	}
+	return kept
+}
+
 // doSearch prints hits in the grep format every tool already parses:
 // path:line:col:text. The overlay means a hit can be in a buffer the user has
 // not saved, which is the point — an agent that grepped the filesystem would
@@ -578,12 +774,29 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
+	// An -include that admits no file is almost always a mistyped glob, and
+	// its output is indistinguishable from "no matches" without this — but
+	// the two call for opposite fixes, so say which one happened.
+	if q.Include != "" && res.Considered == 0 {
+		fmt.Fprintln(stderr, "search: warning: -include pattern(s) matched no files")
+	}
 	if !jsonl && asJSON {
 		return emit(stdout, map[string]any{
-			"matches": res.Matches, "files": res.Files, "capped": res.Capped})
+			"matches": res.Matches, "files": res.Files, "capped": res.Capped,
+			"truncated": res.Truncated})
 	}
 	if res.Capped {
 		fmt.Fprintln(stderr, "note: results were capped; narrow the query with -include")
+	}
+	// A per-file cap is not the global one: a file with more matches than the
+	// limit reports the limit and leaves capped false, so without this it is
+	// indistinguishable from a file holding exactly the limit. Name the files,
+	// rather than a count the caller has to go and resolve.
+	if n := len(res.Truncated); n > 0 {
+		fmt.Fprintf(stderr, "note: %d file(s) hold more matches than the per-file limit shows:\n", n)
+		for _, f := range res.Truncated {
+			fmt.Fprintf(stderr, "  %s (%d of %d)\n", f.Path, f.Shown, f.Total)
+		}
 	}
 	if len(res.Matches) == 0 {
 		return 1 // no hits is a non-zero exit, as grep has always had it
@@ -592,13 +805,16 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 }
 
 // apply is the direct write: offsets, and the version they were measured in.
-func apply(c *Client, path string, base uint64, start, end int, textArg, textFile string,
+func apply(c *Client, path string, base uint64, start, end int, textArg, textFile, hunksFile string,
 	fs *flag.FlagSet, stdout, stderr io.Writer, asJSON bool) int {
 	if !flagSet(fs, "base") {
 		fmt.Fprintln(stderr, "raj ctl apply: -base is required.\n"+
 			"Offsets only mean something in the coordinates of a version you have read;\n"+
 			"get one with `raj ctl read -json` or `raj ctl version`.")
 		return 2
+	}
+	if hunksFile != "" {
+		return applyHunks(c, path, base, hunksFile, fs, stdout, stderr, asJSON)
 	}
 	if start < 0 || end < start {
 		fmt.Fprintf(stderr, "raj ctl apply: -start %d -end %d is not a span\n", start, end)
@@ -627,6 +843,82 @@ func apply(c *Client, path string, base uint64, start, end int, textArg, textFil
 		Hunks: []Hunk{{Start: start, End: end, Text: text}}})
 	return reportApply(res, err, 1, []hunkEcho{{Start: start, End: end, Text: text}},
 		stdout, stderr, asJSON)
+}
+
+// applyHunks sends every hunk in a JSON Lines file as one change set at one
+// base. This is the k-site edit as a single call: the caller reads the buffer
+// and the version once, hands over k hunks, and the editor rebases them
+// together. The file's shape is the program's opcodes without the framing —
+// {"start":S,"end":E,"text":"..."}, one object per line — so a caller
+// producing it from a diff never assembles offsets into a program by hand.
+func applyHunks(c *Client, path string, base uint64, file string, fs *flag.FlagSet,
+	stdout, stderr io.Writer, asJSON bool) int {
+	for _, other := range []string{"start", "end", "text", "text-file"} {
+		if flagSet(fs, other) {
+			fmt.Fprintf(stderr, "raj ctl apply: -hunks carries its own spans and text; "+
+				"it cannot be mixed with -%s\n", other)
+			return 2
+		}
+	}
+	var data []byte
+	var err error
+	if file == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		data, err = os.ReadFile(file)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl apply:", err)
+		return 1
+	}
+	hunks, echo, code := parseHunks(string(data), stderr)
+	if code != 0 {
+		return code
+	}
+	res, derr := c.Do(Request{Op: "apply", Path: path, Base: &base, Hunks: hunks})
+	return reportApply(res, derr, len(hunks), echo, stdout, stderr, asJSON)
+}
+
+// parseHunks decodes JSON Lines: one {start,end,text} object per line. A blank
+// line is skipped, so the trailing newline every text file ends with is not an
+// error; anything else is refused with its line number, because a hunk that
+// cannot be placed is worse than a hunk never sent.
+func parseHunks(text string, stderr io.Writer) ([]Hunk, []hunkEcho, int) {
+	var hunks []Hunk
+	var echo []hunkEcho
+	for line := 1; len(text) > 0; line++ {
+		raw := text
+		if nl := strings.IndexByte(text, '\n'); nl >= 0 {
+			raw, text = text[:nl], text[nl+1:]
+		} else {
+			text = ""
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		var h struct {
+			Start int    `json:"start"`
+			End   int    `json:"end"`
+			Text  string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(raw), &h); err != nil {
+			fmt.Fprintf(stderr, "raj ctl apply: -hunks line %d: %v\n", line, err)
+			return nil, nil, 1
+		}
+		if h.Start < 0 || h.End < h.Start {
+			fmt.Fprintf(stderr, "raj ctl apply: -hunks line %d: -start %d -end %d is not a span\n",
+				line, h.Start, h.End)
+			return nil, nil, 1
+		}
+		hunks = append(hunks, Hunk{Start: h.Start, End: h.End, Text: h.Text})
+		echo = append(echo, hunkEcho{Start: h.Start, End: h.End, Text: h.Text})
+	}
+	if len(hunks) == 0 {
+		fmt.Fprintln(stderr, "raj ctl apply: -hunks file holds no hunks")
+		return nil, nil, 1
+	}
+	return hunks, echo, 0
 }
 
 // dumpCmd captures a span (or the whole file) as an editable snapshot. The text
@@ -760,15 +1052,15 @@ func writeDiffLines(w io.Writer, prefix, text string) {
 	}
 }
 
-// doLSP asks the language server for hover text, a definition, completions, or
+// doLSP asks the language server for hover text, a definition, references, completions, or
 // the cached diagnostics for a path. The answer is JSON already; -json prints
 // it whole and the plain path pretty-prints it, so a script and a person read
 // the same result.
 func doLSP(c *Client, mode, path, pos string, stdout, stderr io.Writer, asJSON bool) int {
 	switch mode {
-	case "hover", "definition", "completion", "diagnostics":
+	case "hover", "definition", "references", "completion", "diagnostics":
 	default:
-		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, completion or diagnostics")
+		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, references, completion or diagnostics")
 		return 2
 	}
 	line, col := 0, 0
@@ -788,16 +1080,32 @@ func doLSP(c *Client, mode, path, pos string, stdout, stderr io.Writer, asJSON b
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
+	// The answer is structured even though it crosses the wire as one JSON
+	// string, so a diagnostics status can be read rather than guessed at. An
+	// empty list is only an answer when the status says a server produced it:
+	// otherwise the call is refused, because a per-hunk check that reads
+	// "server missing" as "no problems" is worse than no check at all.
+	var out LSPResult
+	if uerr := json.Unmarshal([]byte(res.LSPJSON), &out); uerr != nil {
+		// An answer this build cannot parse is still the server's answer.
+		fmt.Fprintln(stdout, res.LSPJSON)
+		return 0
+	}
+	if mode == "diagnostics" && out.Status != LSPStatusOK {
+		if asJSON {
+			fmt.Fprintln(stdout, res.LSPJSON)
+		} else {
+			fmt.Fprintln(stderr, "raj ctl lsp diagnostics: "+
+				firstOf(out.Detail, out.Status,
+					"the editor did not report a diagnostics status; rebuild it to match this ctl"))
+		}
+		return 1
+	}
 	if asJSON {
 		fmt.Fprintln(stdout, res.LSPJSON)
 		return 0
 	}
-	var v any
-	if err := json.Unmarshal([]byte(res.LSPJSON), &v); err != nil {
-		fmt.Fprintln(stdout, res.LSPJSON)
-		return 0
-	}
-	return emit(stdout, v)
+	return emit(stdout, out)
 }
 
 // reportApply is shared by apply and edit so the two cannot describe the same
@@ -883,6 +1191,23 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 		return code
 	}
 	if asJSON {
+		// Health, not just size: a per-buffer brace balance, computed from the
+		// live text (unsaved edits included). One text read per named buffer —
+		// a diagnostic cost the plain listing does not pay, and the reason this
+		// stays -json only. A buffer that will not read keeps a nil tally
+		// rather than a false zero.
+		for i := range res.Buffers {
+			b := &res.Buffers[i]
+			if b.Path == "" {
+				continue
+			}
+			txt, terr := c.Do(Request{Op: "text", Path: b.Path})
+			if terr != nil || !txt.OK {
+				continue
+			}
+			tally := braceTally(b.Path, txt.Text())
+			b.Tally = &tally
+		}
 		return emit(stdout, res.Buffers)
 	}
 	if len(res.Buffers) == 0 {
@@ -906,6 +1231,72 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 
 	}
 	return 0
+}
+
+// braceTally is the buffer checking itself, no toolchain needed: a missing }
+// and a stray } both survive a text-level read, and gofmt masks the real break
+// behind cascading "expected declaration" echoes at later clean lines. A net
+// balance per bracket kind flags them immediately. It is string- and
+// comment-aware through the same ClassAt seam bracket matching uses: a brace
+// inside a string or comment is not structural and does not count.
+//
+// The lexer is asynchronous and version-keyed, so a one-shot tally Ensures and
+// waits, bounded. When it has nothing to say — a language it does not know, a
+// file over MaxSize, or the wait running out — every bracket counts, degrading
+// to plain depth counting the way the matcher does rather than to no answer.
+func braceTally(path, text string) BraceTally {
+	var t BraceTally
+	var hl *syntax.Highlighter
+	if len(text) <= syntax.MaxSize {
+		hl = syntax.New(path, true)
+		if hl.Enabled() {
+			hl.Ensure(text, 0)
+			for i := 0; i < 500 && !hl.Ready(); i++ {
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}
+	// Walk line by line so the spans, which are line-relative, line up with the
+	// byte offset. A nil line of spans makes ClassAt answer ClassCode, which is
+	// the plain-counting degrade rather than a special case here.
+	lineNo := 0
+	for start := 0; start <= len(text); lineNo++ {
+		eol := strings.IndexByte(text[start:], '\n')
+		var line string
+		if eol < 0 {
+			line = text[start:]
+		} else {
+			line = text[start : start+eol]
+		}
+		var spans []syntax.Span
+		if hl != nil && hl.Ready() {
+			spans = hl.Line(lineNo)
+		}
+		for col := 0; col < len(line); col++ {
+			if syntax.ClassAt(spans, col) != syntax.ClassCode {
+				continue
+			}
+			switch line[col] {
+			case '{':
+				t.Braces++
+			case '}':
+				t.Braces--
+			case '(':
+				t.Parens++
+			case ')':
+				t.Parens--
+			case '[':
+				t.Brackets++
+			case ']':
+				t.Brackets--
+			}
+		}
+		if eol < 0 {
+			break
+		}
+		start += eol + 1
+	}
+	return t
 }
 
 func read(c *Client, path string, start, end int, lines string, stdout, stderr io.Writer, asJSON bool) int {

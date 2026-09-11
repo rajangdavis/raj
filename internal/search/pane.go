@@ -22,6 +22,11 @@ type Pane struct {
 	Root   string
 	Result Result
 
+	// resultGen is the generation Result is showing, so apply can tell an
+	// append to the search in flight from a new search's first batch, which
+	// starts the list over. Event thread only.
+	resultGen int
+
 	// Hidden is the visibility policy, loaded once from the workspace and
 	// attached to every query the pane runs, so the search and the sidebar
 	// disagree about no file.
@@ -42,11 +47,12 @@ type Pane struct {
 	list    widget.List
 	spot    int
 
-	// Searching happens off the event thread: Run walks the whole tree, and a
-	// keystroke must never wait for it. The worker touches nothing the rest of
-	// this file touches — it parks its result in pending, and apply installs it
-	// on the event thread — so every field above stays single-threaded and only
-	// the four below need the lock.
+	// Searching happens off the event thread: RunStream walks the whole tree,
+	// and a keystroke must never wait for it. The worker touches nothing the
+	// rest of this file touches — it parks what the walk finds in partial and
+	// its result in pending, and apply installs both on the event thread — so
+	// every field above stays single-threaded and only the fields below need
+	// the lock.
 	//
 	// gen keeps results ORDERED: each search carries the generation it was
 	// started for, and a result whose generation has moved on is dropped.
@@ -61,6 +67,13 @@ type Pane struct {
 	timer       *time.Timer
 	pending     Result
 	havePending bool
+	// partial is what the current search has emitted and apply has not yet
+	// installed; partialFiles counts the file batches in it. RunStream emits
+	// one file's matches per call in walk order, so appending here keeps the
+	// adjacency group relies on. run clears both the moment gen moves, so
+	// partial only ever holds one search's findings.
+	partial      []Match
+	partialFiles int
 
 	// cancel stops the walk that is currently running. Dropping a stale result
 	// is not the same as not computing it: on a large repository a search
@@ -87,7 +100,7 @@ type Pane struct {
 	lastDur   time.Duration
 	abandoned int
 
-	// search is RunContext unless a test substitutes something slower or
+	// search is RunStream unless a test substitutes something slower or
 	// ordered. Debounce pins the pause after the last keystroke; zero lets the
 	// pane choose one from how long searches here actually take.
 	search   func(ctx context.Context, root string, q Query) Result
@@ -405,6 +418,10 @@ func (p *Pane) run() {
 		p.cancel()
 		p.cancel = nil
 	}
+	// Whatever the superseded search parked is stale now: painting it would
+	// show the previous query's answer over this one's first findings.
+	p.pending, p.havePending = Result{}, false
+	p.partial, p.partialFiles = nil, 0
 	// Stop reports whether it beat the timer. When it did, that search never
 	// started and must not be counted as in flight.
 	if p.timer != nil && p.timer.Stop() {
@@ -419,7 +436,7 @@ func (p *Pane) run() {
 	// The snapshot is taken here, on the event thread, and handed to the
 	// worker by value. Taking it inside the worker would read a piece table
 	// concurrently with the keystrokes that are still editing it.
-	q, root, fn := p.q, p.Root, p.searcher(p.snapshot())
+	q, root, fn := p.q, p.Root, p.searcher(p.snapshot(), gen)
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.inflight++
@@ -459,17 +476,57 @@ func (p *Pane) work(ctx context.Context, gen int, root string, q Query, fn func(
 	}
 }
 
-// apply installs a finished search. Event thread only — Handle and Render both
+// deliver parks one file's matches mid-walk, so a search that takes seconds
+// paints as it goes rather than all at once at the end. RunStream calls it on
+// the walking goroutine, which is the pane's worker: the same rule as work
+// applies — park under mu, Notify outside it. append copies: the slice
+// RunStream hands over aliases its growing result.
+func (p *Pane) deliver(gen int, batch []Match) {
+	p.mu.Lock()
+	ok := gen == p.gen
+	if ok {
+		p.partial = append(p.partial, batch...)
+		p.partialFiles++
+	}
+	notify := p.Notify
+	p.mu.Unlock()
+	if ok && notify != nil {
+		notify()
+	}
+}
+
+// apply installs what a search has parked: the matches its walk has found so
+// far, then the finished result if it landed — the finish replaces them, being
+// the same walk's matches and more. Event thread only — Handle and Render both
 // call it, so a result is picked up on the next keystroke or the next tick.
 func (p *Pane) apply() {
 	p.mu.Lock()
 	res, ok := p.pending, p.havePending
 	p.pending, p.havePending = Result{}, false
+	batch, files := p.partial, p.partialFiles
+	p.partial, p.partialFiles = nil, 0
+	gen := p.gen
 	p.mu.Unlock()
+
+	if len(batch) > 0 {
+		if gen != p.resultGen {
+			// A new search's first findings replace the previous query's
+			// list; after that batches append, and since one file's matches
+			// arrive together in walk order the existing rows do not move,
+			// so the selection survives them.
+			p.Result = Result{}
+			p.resultGen = gen
+			p.list.Reset()
+		}
+		p.Result.Matches = append(p.Result.Matches, batch...)
+		p.Result.Files += files
+		p.group()
+	}
 	if !ok {
 		return
 	}
 	p.Result = res
+	p.resultGen = gen
 	p.group()
 	if p.Result.Files > CollapseThreshold {
 		p.CollapseAll()
@@ -505,10 +562,11 @@ func (p *Pane) snapshot() Docs {
 	return p.Buffers()
 }
 
-// searcher binds the snapshot to the search function, which keeps the
-// substitution seam a test uses at three arguments rather than four: a test
-// that replaces the search entirely has no disk to disagree with.
-func (p *Pane) searcher(open Docs) func(context.Context, string, Query) Result {
+// searcher binds the snapshot and the generation to the search function, which
+// keeps the substitution seam a test uses at three arguments rather than five:
+// a test that replaces the search entirely has no disk to disagree with, and
+// no walk to report from.
+func (p *Pane) searcher(open Docs, gen int) func(context.Context, string, Query) Result {
 	if p.search != nil {
 		return p.search
 	}
@@ -516,7 +574,9 @@ func (p *Pane) searcher(open Docs) func(context.Context, string, Query) Result {
 		if q.Hidden == nil {
 			q.Hidden = p.Hidden
 		}
-		return RunDocs(ctx, root, q, open)
+		return RunStream(ctx, root, q, open, func(batch []Match) {
+			p.deliver(gen, batch)
+		})
 	}
 }
 

@@ -37,6 +37,10 @@ when you mean to, not to paper over a wrong path.
 Every command takes an optional path; omit it for the buffer the user is
 currently looking at. Add `-json` to any command for machine-readable output.
 
+`buffers -json` adds `pending` (change sets still awaiting a decision) and
+`moved` (their members a later edit has moved past) per buffer, so one call
+tells you which open files hold review work.
+
 ## If you are in a container and the editor is not
 
 This is the normal arrangement, not an exotic one. raj runs in the terminal on
@@ -127,6 +131,13 @@ take comma-separated globs and must stay inside the workspace.
 
 Exit is non-zero when there are no matches, as with grep.
 
+A pattern with no `/` matches the basename as well as the relative path, like
+`grep --include`: `-include '*_test.go'` finds test files at any depth and
+`-include 'search.go'` finds that file wherever it sits, while a pattern
+containing `/` stays path-scoped. A bare positional argument is refused — the
+pattern goes to `-q` — and a search whose `-include` matched no files says so
+rather than returning an authoritative empty result.
+
 ## Read before you edit, every time
 
 ```
@@ -167,6 +178,18 @@ so indentation and whitespace cannot make an edit fail.
 
 For replacement text containing newlines, write it to a file and use
 `-text-file /tmp/new.txt`, or `-text-file -` for stdin.
+
+### Apply several hunks at once
+
+```
+raj ctl apply /abs/path/to/file.go -base 41 -hunks /tmp/hunks.jsonl
+```
+
+`-hunks` reads JSON Lines — one `{"start":S,"end":E,"text":"..."}` per line,
+`-` for stdin — and applies every hunk as one change set at one `-base`. A
+k-site edit is then one call instead of k reads and k applies. Each hunk is
+rebased against `-base`, so order does not matter; the flag is exclusive with
+`-start`/`-end`/`-text`/`-text-file`. Blank lines are skipped.
 
 ## Or edit by quoting text
 
@@ -332,14 +355,21 @@ when you have a batch, or when you are replaying one you recorded.
 
 ## Say who you are
 
-```
-raj ctl hello -as "$RAJ_IDENTITY" -name claude-1
-```
+You do not have to — identity is automatic. The host plugin
+(plugins/raj-gate.ts) injects, captures and scrubs `RAJ_IDENTITY` per session:
+the first `raj ctl` runs unpinned, the server mints a durable `tok_...`, and
+the plugin captures the adopt line before it reaches the model, reinjecting
+the token on later shells. Do NOT pass `-as`, export `RAJ_IDENTITY`, or run
+`who -as X -name Y`: each session and subagent already gets a distinct author
+id and its own tint.
 
-Do this once when you start. It binds your connection to a durable identity, so
-if you reconnect you keep the same author id and the text you already wrote
-stays yours. Without it you are anonymous — everything still works, but a
-restart makes you a different writer and orphans your earlier edits.
+Why it still works: **every `raj ctl` invocation is a fresh connection**, and
+an anonymous connection mints a fresh author id from a `uint8` space capped at
+256 — per-author state (dump snapshots) does not survive between invocations,
+proposals scatter across dead ids, and the space itself drains (one delegated
+session burned ~130). The durable token the plugin manages is what keeps your
+author id stable across those connections, so per-author state like dump
+snapshots and your attribution stick. The plugin handles this; you just work.
 
 `raj ctl who` lists everyone writing in this workspace. When more than one agent
 is connected, that is how you tell whose text is whose.
@@ -365,10 +395,11 @@ read it before committing to the next thing rather than after.
 
 Two things to get right:
 
-- **Say `hello` with the same identity everywhere.** The mailbox belongs to your
-  participant, not to a connection. `raj ctl recv` does this for you from
-  `-as` or `RAJ_IDENTITY`; if those differ between calls you are a different
-  participant each time and will wait on an empty mailbox forever.
+- **Keep one identity across calls.** The mailbox belongs to your
+  participant, not to a connection — `recv` only finds your messages if every
+  call carries the same stable author id. The plugin now provides that
+  automatically (see "Say who you are"), so this takes no action on your part;
+  it is why you must not override it with `-as`.
 - **Messages keep while you are gone.** Anything said while you were restarting
   is delivered when you come back, so a `recv` after a reconnect may return
   several at once, oldest first.
@@ -435,6 +466,11 @@ already jumped you to the first change and closed the files that have none.
   proposal from the record; editing over it leaves both your fix and the
   original diff in the history.
 
+- **Decide a whole file at once.** `accept` and `reject` take `-all`: every
+  pending set for the path is decided in one command (honor `-mine` to keep to
+  your own). A set wedged behind a later edit is named and skipped rather than
+  silently counted, and the rest still proceed.
+
 ## Saving
 
 **You cannot save your own unapproved work, and should not try.** While your
@@ -477,8 +513,10 @@ raj ctl lsp diagnostics /abs/path/to/file.go
 
 Positions are 1-based `line:col` in the editor's own coordinates; the host maps
 them to the server's UTF-16 grid for you. Hover, definition and completion
-block for the server's answer; `diagnostics` returns the last-known cached
-state and never blocks. A file type with no server is a clean error, not a
+block for the server's answer; `diagnostics` returns the last-known cached state and never blocks, and its
+answer carries a `status`: only `ok` is a real reading, so an empty list is
+"no problems" only when the status says so — `starting`/`missing`/`no-server`
+is refused rather than read as clean. A file type with no server is a clean error, not a
 hang. Results come back as JSON — add `-json` to read the structured form.
 
 Use this rather than parsing compiler output or grepping for a definition: the
@@ -632,15 +670,17 @@ every hunk, read the file and print the lines AROUND the edit — one function
 before through one after — and study the seams, not the center. Splitting the
 read on "\n" is encoding-safe even when byte offsets are not.
 
-### include/exclude globs match the relative path, not the basename
+### include/exclude globs: no-slash matches the basename too
 
-Globs are matched against each file's path relative to the search root, so a
-path-scoped glob works: `-include 'internal/control/*.go'` matches only files
-under `internal/control/`. The flip side: a bare filename is no longer a valid
-scope — `-include 'search.go'` matches nothing, because no relative path is
-exactly `search.go`. The extension fast path and `filepath.Match`'s `*`
-crossing separators keep `-include '*.go'` matching a whole-repo Go search.
-(Stream B, done; `TestRunGlobsMatchPath` in internal/search covers it.)
+A pattern containing `/` is matched against each file's path relative to the
+search root, so a path-scoped glob works: `-include 'internal/control/*.go'`
+matches only files under `internal/control/`. A pattern with NO `/` is matched
+against the basename as well, like `grep --include`: `-include '*_test.go'`
+matches every test file in the tree and `-include 'search.go'` matches that file
+wherever it sits. `filepath.Match`'s `*` does NOT cross `/`, so `*.go` matches
+tree-wide only through the extension fast path; rely on the no-slash basename
+rule rather than assuming a bare `*` crosses directories.
+(Updated 2026-09-11; the basename rule was previously absent.)
 
 ### -q is the pattern; -regex is a flag
 
@@ -676,6 +716,16 @@ When the repo lives only on the editor's machine, nothing in the container can
 compile. The contract is: proposals in the buffers, the user accepts and saves,
 and `gofmt -w && go test ./... && make check` run on the host is the
 verification step. State that contract out loud every session that hits it.
+
+The rebuild boundary is part of that contract. New verbs and wire changes are
+compiled into the binary: buffer edits cannot make them live, and the running
+editor keeps serving the old surface until the user rebuilds and restarts it
+— the container image, which bakes in a `raj` binary, needs the same rebuild
+or the skill and the CLI drift from the server again. The loop is: propose in
+buffers → user accepts and saves → host rebuilds (`make`, and the container
+image if the CLI changed) → verify over the socket against the NEW process.
+Verify semantics against the running editor and state the host-side test
+contract, rather than assuming a proposal took effect because it landed.
 
 ### Revealing the agent's edits to the user
 
@@ -722,6 +772,14 @@ drift: parsing `read -json` with node re-implements the editor's JSON by hand,
 and grepping a `/tmp` dump reads text that is already stale. If a verb is
 genuinely missing, the subagent should stop and report the gap — that is how
 this list grows — rather than reach for a host tool.
+
+The prohibition has to name the temptation, not just the file access: "use only
+raj ctl verbs" invites the reading "for file access", and JSON post-processing
+slips in under "just parsing tool output". Briefs should say: no interpreters
+(python/node/jq) anywhere in the pipeline, including on `raj ctl` output; if
+the output is hard to consume, that is a verb-surface gap to report. A query
+flag on the verb (`read -json -field text`, in the spirit of the flat-record
+item) is the sanctioned shape, not a pipe to an interpreter.
 
 Concrete gaps, current as of the live server (commit `42f9c653`; verify with
 `raj ctl version` rather than trusting this list's age):

@@ -88,9 +88,13 @@ const (
 	hLineEnd      = 0x3b // read: 1-based last line of the range
 	hDump         = 0x3c // patch: snapshot id to replace; dump: the id it returns
 	hHash         = 0x3d // dump: hash of the snapshot text
-	hLSPMode      = 0x3e // lsp: hover, definition, completion or diagnostics
+	hLSPMode      = 0x3e // lsp: hover, definition, references, completion or diagnostics
 	hLSPJSON      = 0x3f // lsp: the JSON-encoded answer
 	hDiffJSON     = 0x40 // diff: the JSON-encoded pending change sets
+	hSrcVersion   = 0x41 // the build revision of the server, stamped on every response
+	hConsidered   = 0x42 // search: files opened and scanned; zero under an -include that matched nothing
+	hTruncated    = 0x43 // search: files the per-file cap cut down, with shown and total
+	hBufferState  = 0x44 // buffers: sparse pending and moved counts, one record per buffer that has either
 
 )
 
@@ -197,17 +201,21 @@ func encodeHeader(h Header) []byte {
 	num(hCancel, h.Cancel)
 	num(hLine, h.Line)
 	num(hCol, h.Col)
+	// The four span fields are pointers for the same reason as Base: zero is a
+	// real offset and "not stated" is not the same as offset zero — a read or
+	// dump with -start 0 asks for the head of the file, an absent one asks for
+	// the whole of it. Emit directly so a stated zero survives the trip.
 	if h.Start != nil {
-		num(hStart, *h.Start)
+		ops = append(ops, Op8{hStart, prog.Number(*h.Start)})
 	}
 	if h.End != nil {
-		num(hEnd, *h.End)
+		ops = append(ops, Op8{hEnd, prog.Number(*h.End)})
 	}
 	if h.LineStart != nil {
-		num(hLineStart, *h.LineStart)
+		ops = append(ops, Op8{hLineStart, prog.Number(*h.LineStart)})
 	}
 	if h.LineEnd != nil {
-		num(hLineEnd, *h.LineEnd)
+		ops = append(ops, Op8{hLineEnd, prog.Number(*h.LineEnd)})
 	}
 
 	num(hGroup, int(h.Group))
@@ -226,12 +234,14 @@ func encodeHeader(h Header) []byte {
 	num(hBytes, h.Bytes)
 	num(hLines, h.Lines)
 	num(hFiles, h.Files)
+	num(hConsidered, h.Considered)
 	flag(hCapped, h.Capped)
 	num(hDump, int(h.DumpID))
 	str(hHash, h.Hash)
 	str(hLSPMode, h.LSPMode)
 	str(hLSPJSON, h.LSPJSON)
 	str(hDiffJSON, h.DiffJSON)
+	str(hSrcVersion, h.SrcVersion)
 
 	if len(h.Argv) > 0 {
 		var w prog.Writer
@@ -300,9 +310,36 @@ func encodeHeader(h Header) []byte {
 		var w prog.Writer
 		for _, b := range h.Buffers {
 			w.Str(b.Path).Num(int(b.Version)).Bool(b.Dirty).Num(b.Bytes).Num(b.Lines).Bool(b.Active)
-
 		}
 		ops = append(ops, Op8{hBuffers, w.Done()})
+
+		// Pending and Moved ride in their own sparse field, one record per
+		// buffer that has either, rather than as two more fields on each
+		// hBuffers record. Records are positional — no element count and no
+		// per-field opcode — so an older reader would read a nonzero pending
+		// count as the next record's path. An unknown argument field, by
+		// contrast, is skipped: an old reader loses the counts and keeps the
+		// buffers, and an old server omits the field so the counts read zero.
+		var counts prog.Writer
+		var any bool
+		for _, b := range h.Buffers {
+			if b.Pending == 0 && b.Moved == 0 {
+				continue
+			}
+			any = true
+			counts.Str(b.Path).Num(b.Pending).Num(b.Moved)
+		}
+		if any {
+			ops = append(ops, Op8{hBufferState, counts.Done()})
+		}
+	}
+
+	if len(h.Truncated) > 0 {
+		var w prog.Writer
+		for _, t := range h.Truncated {
+			w.Str(t.Path).Num(t.Shown).Num(t.Total)
+		}
+		ops = append(ops, Op8{hTruncated, w.Done()})
 	}
 	if len(h.Matches) > 0 {
 		var w prog.Writer
@@ -352,6 +389,10 @@ func decodeHeader(b []byte) (Header, error) {
 		return Header{}, fmt.Errorf("%w: %v", errBadFrame, err)
 	}
 	var h Header
+	// Buffer pending/moved counts arrive in a field of their own. Collect them
+	// and merge once every op has been read, so their position relative to
+	// hBuffers does not matter.
+	var states []bufferState
 	for _, op := range ops {
 		switch op.Code {
 		case hID:
@@ -420,6 +461,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Lines = prog.ReadNumber(op.Payload)
 		case hFiles:
 			h.Files = prog.ReadNumber(op.Payload)
+		case hConsidered:
+			h.Considered = prog.ReadNumber(op.Payload)
 		case hCapped:
 			h.Capped = true
 		case hDump:
@@ -432,11 +475,16 @@ func decodeHeader(b []byte) (Header, error) {
 			h.LSPJSON = string(op.Payload)
 		case hDiffJSON:
 			h.DiffJSON = string(op.Payload)
+		case hSrcVersion:
+			h.SrcVersion = string(op.Payload)
 
 		case hArgv:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
 				h.Argv = append(h.Argv, r.Str())
+			}
+			if err := recordsOK(r, "argv"); err != nil {
+				return Header{}, err
 			}
 		case hQuery:
 			r := prog.NewReader(op.Payload)
@@ -448,10 +496,16 @@ func decodeHeader(b []byte) (Header, error) {
 			for r.More() {
 				h.Hunks = append(h.Hunks, HunkMeta{Start: r.Num(), End: r.Num(), Len: r.Num()})
 			}
+			if err := recordsOK(r, "hunks"); err != nil {
+				return Header{}, err
+			}
 		case hDirty:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
 				h.Dirty = append(h.Dirty, DirtyBuffer{Path: r.Str(), AgentOnly: r.Bool()})
+			}
+			if err := recordsOK(r, "dirty"); err != nil {
+				return Header{}, err
 			}
 		case hStats:
 			r := prog.NewReader(op.Payload)
@@ -469,6 +523,9 @@ func decodeHeader(b []byte) (Header, error) {
 				}
 				h.Participants = append(h.Participants, p)
 			}
+			if err := recordsOK(r, "participants"); err != nil {
+				return Header{}, err
+			}
 		case hGroups:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -483,10 +540,16 @@ func decodeHeader(b []byte) (Header, error) {
 				}
 				h.Groups = append(h.Groups, g)
 			}
+			if err := recordsOK(r, "groups"); err != nil {
+				return Header{}, err
+			}
 		case hMessages:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
 				h.Messages = append(h.Messages, Message{From: uint8(r.Num()), Text: r.Str()})
+			}
+			if err := recordsOK(r, "messages"); err != nil {
+				return Header{}, err
 			}
 		case hBuffers:
 			r := prog.NewReader(op.Payload)
@@ -494,7 +557,26 @@ func decodeHeader(b []byte) (Header, error) {
 				h.Buffers = append(h.Buffers, Buffer{
 					Path: r.Str(), Version: uint64(r.Num()), Dirty: r.Bool(),
 					Bytes: r.Num(), Lines: r.Num(), Active: r.Bool()})
-
+			}
+			if err := recordsOK(r, "buffers"); err != nil {
+				return Header{}, err
+			}
+		case hBufferState:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				states = append(states, bufferState{path: r.Str(), pending: r.Num(), moved: r.Num()})
+			}
+			if err := recordsOK(r, "buffer state"); err != nil {
+				return Header{}, err
+			}
+		case hTruncated:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Truncated = append(h.Truncated, TruncatedFile{
+					Path: r.Str(), Shown: r.Num(), Total: r.Num()})
+			}
+			if err := recordsOK(r, "truncated"); err != nil {
+				return Header{}, err
 			}
 		case hMatches:
 			r := prog.NewReader(op.Payload)
@@ -504,6 +586,9 @@ func decodeHeader(b []byte) (Header, error) {
 					PathLen: r.Num(), TextLen: r.Num(),
 					ByteStart: r.Num(), ByteEnd: r.Num()})
 			}
+			if err := recordsOK(r, "matches"); err != nil {
+				return Header{}, err
+			}
 		case hConflicts:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -511,12 +596,52 @@ func decodeHeader(b []byte) (Header, error) {
 					Index: r.Num(), At: uint64(r.Num()),
 					Hunk: Hunk{Start: r.Num(), End: r.Num(), Text: r.Str()}})
 			}
+			if err := recordsOK(r, "conflicts"); err != nil {
+				return Header{}, err
+			}
 		case hSpans:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
 				h.Spans = append(h.Spans, SpanMeta{Len: r.Num(), Author: uint8(r.Num())})
 			}
+			if err := recordsOK(r, "spans"); err != nil {
+				return Header{}, err
+			}
+		}
+	}
+	for _, st := range states {
+		for i := range h.Buffers {
+			if h.Buffers[i].Path == st.path {
+				h.Buffers[i].Pending, h.Buffers[i].Moved = st.pending, st.moved
+				break
+			}
 		}
 	}
 	return h, nil
+}
+
+// bufferState is one buffer's pending and moved counts as they cross the wire,
+// carried in the sparse hBufferState field rather than inside its hBuffers
+// record.
+type bufferState struct {
+	path    string
+	pending int
+	moved   int
+}
+
+// recordsOK turns a Reader that ran off the end of a record list into a named
+// frame error.
+//
+// A record list has no element count — the payload is the list — and a Reader
+// reports failure through Bad rather than an error return, so the caller can
+// check once. That check is the whole point: without it a payload cut
+// mid-record sets Bad, More reports false, and the list silently ends one
+// element early. That is how a malformed groups reply listed one change set
+// while three existed; this makes it a named frame error instead of a short
+// list.
+func recordsOK(r *prog.Reader, field string) error {
+	if r.Bad {
+		return fmt.Errorf("%w: truncated %s record", errBadFrame, field)
+	}
+	return nil
 }

@@ -131,17 +131,22 @@ func (s *Session) Groups() []Group {
 	return out
 }
 
-// Pending lists the change sets still awaiting a decision, oldest first.
+// Pending lists the change sets that still need a decision: proposed, with a
+// surviving projection in the document, oldest first.
 //
-// A proposed group whose members have all been reversed is not pending: there
-// is nothing left in the text to agree to, and reporting it would block a save
-// on a change that is not there.
+// Auto-rejection lives here. A proposed group whose members have all been
+// reversed is not pending, and neither is one a later edit has entirely
+// overwritten — every agent piece gone. There is nothing left in the text to
+// agree to in either case, and reporting it would block a save on a change
+// that is not there. The state stays Proposed as a record; only the claim on
+// the user's decision is dropped, and it comes back if that edit is undone.
 func (s *Session) Pending() []Group {
 	var out []Group
-	for _, g := range s.Groups() {
-		if g.State == Proposed && g.Ops > 0 {
-			out = append(out, g)
+	for _, d := range s.DiffPending() {
+		if len(d.Hunks) == 0 {
+			continue // no agent piece survives: nothing left to decide
 		}
+		out = append(out, d.Group)
 	}
 	return out
 }
@@ -199,53 +204,132 @@ func (s *Session) AcceptGroup(id uint64) {
 	s.MarkGroup(id, Accepted)
 }
 
-// DiffHunk is one member op of a change set as old→new text, in the
-// coordinates of the present: Start and End locate the op's inserted text
-// now, Old is the text it removed and New the text it added. A pure insertion
-// has Old empty; a pure deletion has New empty and Start == End.
+// DiffHunk is one surviving run of a change set as old→new text, in the
+// coordinates of the present: Start and End locate that run of inserted text
+// now, Old is the text the member removed and New the text it added. A pure
+// insertion has Old empty; a pure deletion has New empty and Start == End.
 type DiffHunk struct {
 	Start, End int
 	Old, New   string
 }
 
 // GroupDiff is a change set rendered for review: the group as Groups lists
-// it, one hunk per member op, and a count of members the buffer has moved
-// past.
+// it, one hunk per surviving run of its member ops, and a count of members the
+// buffer has moved past entirely.
 type GroupDiff struct {
 	Group Group
 	Hunks []DiffHunk
 	Moved int
 }
 
-// DiffPending renders the pending change sets — proposed, with live members —
-// as old→new text, oldest first. It is the review surface Groups cannot be: a
-// listing says a change set exists, this says what it says.
+// projectGroup renders one proposed group: each live member's surviving runs
+// as hunks, and a count of members whose inserted text a later edit has
+// completely overwritten.
+func (s *Session) projectGroup(g Group) GroupDiff {
+	d := GroupDiff{Group: g}
+	for _, o := range s.journal {
+		if o.Group != g.ID || o.Kind != KindEdit || !s.live(o.Seq) {
+			continue
+		}
+		hunks := s.projectMember(o)
+		if len(hunks) == 0 {
+			d.Moved++
+			continue
+		}
+		d.Hunks = append(d.Hunks, hunks...)
+	}
+	return d
+}
+
+// projectMember carries one live member op into the present. A pure deletion
+// projects to a single zero-width hunk at its rebased point. An insertion
+// projects to one hunk per run of its text that survives, so a later edit
+// inside the span fragments the member rather than erasing it: the runs the
+// agent wrote stay theirs, and the bytes the user typed between them are
+// theirs. It returns nil when a member's inserted text is entirely gone, which
+// is the one honest reason to count the member in Moved.
+func (s *Session) projectMember(o Op) []DiffHunk {
+	if o.InsLen() == 0 {
+		at, _, _, ok := s.rebase(o.Pos, o.Pos, o.Seq+1)
+		if !ok {
+			return nil
+		}
+		return []DiffHunk{{Start: at, End: at, Old: s.recsText(o.Del)}}
+	}
+	// Empty probes give a bounding span even when a later edit deleted part
+	// of it: a probe is never damaged, it clamps to the deletion, so the two
+	// ends still bracket every surviving byte. rebase cannot do this for the
+	// whole span, because one deletion inside it is a conflict by its rules.
+	lo, _, _, okLo := s.rebase(o.Pos, o.Pos, o.Seq+1)
+	_, hi, _, okHi := s.rebase(o.Pos+o.InsLen(), o.Pos+o.InsLen(), o.Seq+1)
+	if !okLo || !okHi || hi <= lo {
+		return nil
+	}
+	var hunks []DiffHunk
+	var run []PieceRec
+	pos := lo
+	runStart := lo
+	flush := func() {
+		if len(run) == 0 {
+			return
+		}
+		hunks = append(hunks, DiffHunk{Start: runStart, End: pos, New: s.recsText(run)})
+		run = nil
+	}
+	for _, p := range s.buf.pieceRange(lo, hi-lo) {
+		if insOwns(o.Ins, p) {
+			if len(run) == 0 {
+				runStart = pos
+			}
+			run = append(run, p)
+		} else {
+			flush()
+		}
+		pos += p.Length
+	}
+	flush()
+	if len(hunks) > 0 && o.DelLen() > 0 {
+		// The removed bytes have no surviving position of their own, so the
+		// old side rides on the member's first surviving run.
+		hunks[0].Old = s.recsText(o.Del)
+	}
+	return hunks
+}
+
+// insOwns reports whether a current piece is part of what a member inserted.
+// Stores are append-only, so (Buf, Start) names the exact bytes written; a
+// later edit that split or trimmed the piece leaves a sub-range of the same
+// record, while another author's text points into a different store range.
+func insOwns(ins []PieceRec, p PieceRec) bool {
+	for _, r := range ins {
+		if r.Buf == p.Buf && p.Start >= r.Start && p.Start+p.Length <= r.Start+r.Length {
+			return true
+		}
+	}
+	return false
+}
+
+// DiffPending renders the proposed change sets as old→new text, oldest first,
+// including any the buffer has moved entirely past. It is the review surface
+// Groups cannot be: a listing says a change set exists, this says what it says.
 //
 // Each member's span is carried from the version it was recorded at to the
-// present by the same rebase walk that applies and reverses edits, so the
-// span is where the hunk sits now. A member whose inserted text no longer
-// survives intact — a later edit reached inside it — cannot be placed
-// honestly, and showing what was written as though it were what is there is
-// how a hunk lands unverified; it is counted in Moved instead.
+// present by the same rebase walk that applies and reverses edits, then
+// projected onto the pieces that survive now. A later edit inside a member
+// leaves the runs on either side of it; they come back as separate hunks so
+// the tint, the caret and the jump all stop at the bytes the agent still owns.
+// A member whose inserted text is entirely gone is counted in Moved rather
+// than dropped; the group is still rendered so a reviewer can see what the
+// buffer moved past. Pending is the stricter list — it leaves out a set with
+// no surviving member, because a later edit has overwritten it and there is
+// nothing left to decide or to block a save on.
 func (s *Session) DiffPending() []GroupDiff {
 	var out []GroupDiff
-	for _, g := range s.Pending() {
-		d := GroupDiff{Group: g}
-		for _, o := range s.journal {
-			if o.Group != g.ID || o.Kind != KindEdit || !s.live(o.Seq) {
-				continue
-			}
-			start, end, _, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
-			if !ok || end-start != o.InsLen() {
-				d.Moved++
-				continue
-			}
-			d.Hunks = append(d.Hunks, DiffHunk{
-				Start: start, End: end,
-				Old: s.recsText(o.Del), New: s.recsText(o.Ins),
-			})
+	for _, g := range s.Groups() {
+		if g.State != Proposed || g.Ops == 0 {
+			continue
 		}
-		out = append(out, d)
+		out = append(out, s.projectGroup(g))
 	}
 	return out
 }

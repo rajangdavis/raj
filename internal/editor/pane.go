@@ -31,6 +31,11 @@ type Pane struct {
 	// preference people genuinely differ on.
 	AutoPairs bool
 
+	// Hints shows language-server inlay hints inline. It inherits the
+	// application default as a pane opens, like Wrap and AutoPairs, so the
+	// setting and the toggle cannot disagree about a newly opened file.
+	Hints bool
+
 	wrapBuf []int // reused across lines and frames by the renderer
 	focused bool
 	// diskStale records the file changed on disk since raj read or wrote it,
@@ -151,6 +156,33 @@ func (p *Pane) InsertText(text string) {
 	})
 }
 
+// ReplaceRange replaces the buffer range [start,end) with text, leaving the
+// cursor at the end of the inserted text.
+//
+// This is the single-range form of an accept: a language server names a span to
+// overwrite rather than a prefix to extend, so its edit cannot go through
+// InsertText. The range is clamped to the buffer, because it was computed
+// against a version the server saw and the user may have edited since.
+func (p *Pane) ReplaceRange(start, end int, text string) {
+	n := p.File.Len()
+	if start < 0 {
+		start = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end < start {
+		end = start
+	}
+	if end > n {
+		end = n
+	}
+	p.Cursors.Set(start, start)
+	p.editEachCursor(func(Cursor) (pos, remove int, insert string) {
+		return start, end - start, text
+	})
+}
+
 // Paste inserts a block of text as a single edit.
 //
 // A paste has no per-cursor semantics: it is one chunk of text arriving at one
@@ -204,6 +236,51 @@ func (p *Pane) PasteDistributed(lines []string) {
 		p.File.Insert(p.Author, lo, lines[i])
 		p.Cursors.Shift(lo, 0, len(lines[i]))
 		p.bumpCursorsAt(lo, len(lines[i]))
+	}
+	p.Cursors.CollapseSelections()
+	p.Cursors.Normalize()
+	p.FollowCursor()
+}
+
+// PasteAtEachCursor inserts the whole clipboard at every cursor, replacing each
+// selection. It is the fallback for a multi-cursor paste whose text is not one
+// line per cursor, where distributing would keep only the first line.
+//
+// The text is stored once: the highest cursor performs the real insert and the
+// pieces it produced are then spliced at every cursor below it, appending
+// nothing. Cursors are edited highest-offset-first so earlier ones stay valid,
+// and the whole thing is one undo step.
+func (p *Pane) PasteAtEachCursor(text string) {
+	if text == "" {
+		return
+	}
+	p.File.Begin()
+	defer p.File.End()
+
+	cursors := p.Cursors.All()
+	if len(cursors) == 0 {
+		return
+	}
+	last := len(cursors) - 1
+	lo, hi := cursors[last].Range()
+	if hi > lo {
+		p.File.Delete(p.Author, lo, hi-lo)
+		p.Cursors.Shift(lo, hi-lo, 0)
+	}
+	p.File.Insert(p.Author, lo, text)
+	recs := p.File.Snapshot(lo, len(text))
+	p.Cursors.Shift(lo, 0, len(text))
+	p.bumpCursorsAt(lo, len(text))
+
+	for i := last - 1; i >= 0; i-- {
+		lo, hi := cursors[i].Range()
+		if hi > lo {
+			p.File.Delete(p.Author, lo, hi-lo)
+			p.Cursors.Shift(lo, hi-lo, 0)
+		}
+		p.File.InsertPieces(p.Author, lo, recs)
+		p.Cursors.Shift(lo, 0, len(text))
+		p.bumpCursorsAt(lo, len(text))
 	}
 	p.Cursors.CollapseSelections()
 	p.Cursors.Normalize()

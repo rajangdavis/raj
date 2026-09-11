@@ -174,7 +174,7 @@ func isASCII(b []byte) bool {
 //
 // Go's compiler does not auto-vectorize, so this SWAR form is the portable
 // stand-in: it is ~3x the naive byte loop and ~12x strings.ToLower. See
-// BENCHMARKS.md.
+// docs/BENCHMARKS.md.
 func foldLower(b []byte) (sawHigh bool) {
 	var hi uint64
 	i := 0

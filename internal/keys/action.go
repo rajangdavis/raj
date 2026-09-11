@@ -117,7 +117,13 @@ const (
 	// proposals — an agent change set lands as a proposal: in the document,
 	// tinted, save-blocked, and decided one gesture at a time. Accept marks it
 	// agreed; reject backs it out; review lists what is still pending.
+	// ToggleReview switches the whole application between Edit and Review
+	// mode. Review makes the document read-only so a review pass cannot edit
+	// the text it is reviewing; the review decisions stay live in both modes.
+	ToggleReview   Action = "toggle_review"
 	AcceptProposed Action = "accept_proposed"
 	RejectProposed Action = "reject_proposed"
 	ReviewProposed Action = "review_proposed"
+	NextProposed   Action = "next_proposed"
+	PrevProposed   Action = "prev_proposed"
 )

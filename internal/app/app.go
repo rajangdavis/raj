@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,12 @@ type App struct {
 	// sharing one counter would make each cancel the other.
 	completeGen int
 
+	// inlayGen is the cancellation generation for hint requests, separate for
+	// the same reason completeGen is separate from lspGen: cursor moves and
+	// typing each cancel their own kind of answer, and sharing one counter
+	// would make them cancel each other.
+	inlayGen int
+
 	// cached is the last completion list a server returned, kept only when the
 	// server said the list was complete. A complete list is everything that
 	// could go at that point, so a longer prefix can only be a subset of it and
@@ -81,6 +88,15 @@ type App struct {
 	// diags is the current problems per file, published by servers rather than
 	// requested.
 	diags *diagnostics
+
+	// inlays is the last hint answer per file, keyed by path and carrying the
+	// document version it describes. A hint from a version the buffer has left
+	// must never reach the renderer: it would move every column after it
+	// rather than merely look wrong.
+	inlays *inlayStore
+	// inlayReq records the last hint request — path, document version and
+	// range — so the idle tick asks again only when one of those has moved.
+	inlayReq inlayRequest
 
 	// drag tracks a press-and-hold in the editor, and click counts a rapid
 	// sequence in one place so double and triple clicks can mean something.
@@ -115,13 +131,17 @@ type App struct {
 	// AutoPairs is applied to every pane as it opens, for the same reason as
 	// WrapDefault: the setting lives on the application and panes inherit it,
 	// rather than each pane deciding for itself and drifting.
-	AutoPairs  bool
+	AutoPairs bool
+	// InlayHints is the application default for language-server hints, applied
+	// to panes as they open the way WrapDefault and AutoPairs are.
+	InlayHints bool
 	dark       bool
 	lastLayout Layout
 	// promptReturn is where focus goes when a dialog closes. Captured when the
 	// first prompt in a chain opens, so an overwrite check answered three
 	// dialogs deep still lands back where the user was.
 	promptReturn Focus
+	mode         Mode
 	status       string
 	focused      bool
 	quit         bool
@@ -167,6 +187,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		completeCache: complete.NewCache(),
 		servers:       newServers(root),
 		diags:         newDiagnostics(),
+		inlays:        newInlayStore(),
 		Picker:        picker.New(root),
 		Prompt:        prompt.New(),
 		root:          root,
@@ -178,6 +199,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		// to set the field.
 		WrapDefault: true,
 		AutoPairs:   true,
+		InlayHints:  true,
 		dark:        host.Theme().Dark(),
 		wth:         widget.DefaultTheme(),
 		focused:     true,
@@ -257,6 +279,7 @@ func (a *App) OpenFile(path string) {
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
+	p.Hints = a.InlayHints
 	// A Makefile whose recipe lines are indented with spaces is already broken,
 	// and make's own message names a line rather than the cause. Raj indents the
 	// next line correctly and leaves the rest alone, so without this the file
@@ -427,7 +450,7 @@ func (a *App) showCompletion(p *editor.Pane, minPrefix int) bool {
 	// filtered rather than re-fetched. This is the difference the isIncomplete
 	// flag buys: one request per word instead of one per keystroke.
 	if a.cached.covers(prefix, line, anchor) {
-		return a.showItems(prefix, a.cached.items, line, anchor)
+		return a.showItems(p, prefix, a.cached.items, line, anchor)
 	}
 
 	cands := a.completeCache.Rank(a.completionSnapshots(p), prefix)
@@ -444,20 +467,41 @@ func (a *App) showCompletion(p *editor.Pane, minPrefix int) bool {
 // showItems renders a server list, filtered to a prefix. Shared by the fresh
 // answer and the cached one so the two cannot present the same items
 // differently.
-func (a *App) showItems(prefix string, items []lsp.CompletionItem, line, col int) bool {
+//
+// The pane is needed because a candidate can carry a server textEdit, whose
+// ranges are LSP coordinates. They are converted to byte offsets against the
+// current pane text here, once, so acceptance is a plain range replacement.
+func (a *App) showItems(p *editor.Pane, prefix string, items []lsp.CompletionItem, line, col int) bool {
 	items = lsp.FilterItems(items, prefix)
 	if len(items) == 0 {
 		return false
 	}
 	lsp.SortItems(items)
+
+	var doc *lsp.Document
+	if p != nil {
+		doc = lsp.NewDocument(p.File.Text())
+	}
 	cands := make([]complete.Candidate, 0, len(items))
 	for i, it := range items {
 		if i >= complete.MaxResults {
 			break
 		}
-		cands = append(cands, complete.Candidate{
-			Word: it.Insert, Detail: it.Detail,
-		})
+		c := complete.Candidate{Word: it.Insert, Detail: it.Detail}
+		if doc != nil {
+			if it.Edit != nil {
+				start, end := doc.Span(it.Edit.Range)
+				c.Edit = &complete.Edit{Start: start, End: end, Text: it.Edit.NewText}
+			}
+			if len(it.Additional) > 0 {
+				c.Additional = make([]complete.Edit, 0, len(it.Additional))
+				for _, te := range it.Additional {
+					start, end := doc.Span(te.Range)
+					c.Additional = append(c.Additional, complete.Edit{Start: start, End: end, Text: te.NewText})
+				}
+			}
+		}
+		cands = append(cands, c)
 	}
 	a.Complete.Show(prefix, cands, line, col)
 	return a.Complete.Open
@@ -506,16 +550,73 @@ func (a *App) completionSymbols(p *editor.Pane, path string) []string {
 	return names
 }
 
-// acceptCompletion replaces the typed prefix with the chosen word.
+// acceptCompletion applies the chosen candidate.
 //
-// Replacing rather than appending the remainder, because the two differ when
-// the candidate and the prefix disagree in a way a prefix match still allows —
-// and one edit is one undo step, which appending plus fixing up would not be.
+// A candidate with no server edit replaces the typed prefix with the word, as
+// it always has: replacing rather than appending the remainder, because the two
+// differ when the candidate and the prefix disagree in a way a prefix match
+// still allows, and one edit is one undo step.
+//
+// A candidate from a language server can instead carry a textEdit — a range to
+// overwrite — and additional edits such as an import line that must land with
+// it. Those are applied highest offset first so earlier ranges stay valid, as
+// one undo step.
 func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candidate) {
-	if c.Word == "" || !strings.HasPrefix(c.Word, prefix) {
+	if c.Edit == nil {
+		if c.Word == "" || !strings.HasPrefix(c.Word, prefix) {
+			return
+		}
+		p.InsertText(c.Word[len(prefix):])
+		a.Explorer.Tree.MarkChanged(p.File.Path)
 		return
 	}
-	p.InsertText(c.Word[len(prefix):])
+
+	primary := *c.Edit
+	// The server range end is where the cursor was when it answered, but more
+	// may have been typed since. When the cursor is still on that line at or
+	// after the end, extend the replaced span to it, so the extra characters
+	// are overwritten rather than left dangling after the insertion. A cursor
+	// that moved to another line is left alone: extending there would delete
+	// text the user did not type as part of the word.
+	if head := p.Cursors.Primary().Head; head >= primary.End &&
+		p.File.LineOf(head) == p.File.LineOf(primary.End) {
+		primary.End = head
+	}
+
+	edits := make([]complete.Edit, 0, len(c.Additional)+1)
+	edits = append(edits, primary)
+	edits = append(edits, c.Additional...)
+	// Highest offset first so earlier spans stay valid, and for equal starts
+	// the wider span first so an insertion at the same point lands before the
+	// word rather than inside it.
+	sort.SliceStable(edits, func(i, j int) bool {
+		if edits[i].Start != edits[j].Start {
+			return edits[i].Start > edits[j].Start
+		}
+		return edits[i].End > edits[j].End
+	})
+
+	p.File.Begin()
+	for _, e := range edits {
+		p.ReplaceRange(e.Start, e.End, e.Text)
+	}
+	// The cursor belongs after the word the user chose, not in an import line
+	// the server added at the top of the file.
+	at := primary.Start + len(primary.Text)
+	for _, e := range c.Additional {
+		if e.Start <= primary.Start {
+			at += len(e.Text) - (e.End - e.Start)
+		}
+	}
+	if at < 0 {
+		at = 0
+	}
+	if n := p.File.Len(); at > n {
+		at = n
+	}
+	p.Cursors.Set(at, at)
+	p.File.End()
+	p.FollowCursor()
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 }
 
@@ -578,6 +679,10 @@ func (a *App) Handle(e ui.Event) {
 		// never sit on the keystroke path.
 		a.refreshSyntax()
 		a.diskCheck()
+		// Inlay hints are asked for here and only here, and only when the
+		// visible range or the document version has moved, so this is a
+		// debounce rather than a request per keystroke.
+		a.maybeRequestHints(a.Tabs.Active())
 		a.sessionTick(time.Now())
 		a.Debug.sample()
 	case ui.Quit:
@@ -660,7 +765,15 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.host.Suspend()
 	case keys.Save:
 		a.saveActive(nil)
+	case keys.ToggleReview:
+		a.toggleReview()
 	case keys.Reload:
+		// Reload replaces the buffer from disk. Refused in Review: it is not an
+		// edit, but it would discard the proposals being reviewed.
+		if a.mode == ModeReview {
+			a.status = reviewReadOnlyNote()
+			return true
+		}
 		a.reloadActive()
 	case keys.AcceptProposed:
 		a.reviewProposed(true)
@@ -668,7 +781,17 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.reviewProposed(false)
 	case keys.ReviewProposed:
 		a.reviewPicker()
+	case keys.NextProposed:
+		a.cycleProposed(true)
+	case keys.PrevProposed:
+		a.cycleProposed(false)
 	case keys.Cut:
+		// Cut is an edit. Copy stays live; and cut in a dialog's own field is
+		// not the document, so only the editor is refused.
+		if a.mode == ModeReview && a.focus == FocusEditor {
+			a.status = reviewReadOnlyNote()
+			return true
+		}
 		a.clip(true)
 	case keys.Copy:
 		a.clip(false)
@@ -823,6 +946,12 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		}
 		return
 	}
+	// Review mode is read-only for the document. Movement, selection, search,
+	// hover and goto fall through; any keystroke that would change the text is
+	// refused with a note rather than silently dropped.
+	if a.mode == ModeReview && a.reviewRefuses(action, text) {
+		return
+	}
 	// Summoning the popup is claimed before the popup itself sees keys, so
 	// pressing the chord while it is already open re-asks rather than being
 	// swallowed as a navigation key it does not use.
@@ -877,6 +1006,12 @@ func (a *App) paste(text string) {
 		return
 	}
 	if a.focus == FocusEditor {
+		// Paste is an edit, refused in Review mode with the same note a typed
+		// character gets. Fields and dialogs are not the document.
+		if a.mode == ModeReview {
+			a.status = reviewReadOnlyNote()
+			return
+		}
 		a.pasteIntoBuffer(text)
 		return
 	}
@@ -1066,6 +1201,7 @@ func (a *App) newFile() {
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
+	p.Hints = a.InlayHints
 	// A Makefile whose recipe lines are indented with spaces is already broken,
 	// and make's own message names a line rather than the cause. Raj indents the
 	// next line correctly and leaves the rest alone, so without this the file
@@ -1143,6 +1279,14 @@ func (a *App) saveActive(then func(saved bool)) {
 	p := a.Tabs.Active()
 	if p == nil {
 		report(then, false)
+		return
+	}
+	// Proposed change sets get reviewed before they get saved: the gesture
+	// opens a listing to step through rather than accepting sight-unseen.
+	// Accept-all-and-save stays one chord, so the review is a glance, not a
+	// gate.
+	if pending := p.File.Session().Pending(); len(pending) > 0 {
+		a.reviewSave(p, pending, then)
 		return
 	}
 	if p.File.Path == "" {

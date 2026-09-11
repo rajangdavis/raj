@@ -12,7 +12,7 @@
 // journal, and persisting that is a different problem with a different failure
 // mode — restoring stale text over a file someone edited elsewhere destroys
 // work, where restoring a stale cursor position does not. So a dirty buffer is
-// restored as its file on disk, and TODO.md keeps the journal as its own item.
+// restored as its file on disk, and docs/TODO.md keeps the journal as its own item.
 //
 // For the same reason an unnamed buffer is not restored at all: it is keyed on
 // a path and has none.

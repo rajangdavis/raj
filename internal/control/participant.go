@@ -85,6 +85,12 @@ func NewRegistry() *Registry {
 // The same identity always gets the same id back, which is the whole point: a
 // harness that restarts mid-session continues to own the text it already wrote,
 // instead of orphaning it under an id nothing will ever claim again.
+//
+// A new identity arriving when the one-byte space is full reuses the lowest
+// row a disconnected participant left behind, rather than failing: full of
+// rows is not full of writers. Recycling forgets the evicted identity — its
+// text now reads as the new writer — so it stays the pressure valve, not the
+// first choice: fresh ids go out in order for as long as there are any.
 func (r *Registry) Join(identity, name string, kind Kind) (uint8, error) {
 	if identity == "" {
 		return 0, fmt.Errorf("participant: an identity is required")
@@ -99,17 +105,44 @@ func (r *Registry) Join(identity, name string, kind Kind) (uint8, error) {
 		}
 		return id, nil
 	}
-	if int(r.next) > MaxParticipants || r.next == 0 {
-		return 0, fmt.Errorf("participant: no author ids left (%d used)", len(r.byID))
-	}
-	id := r.next
-	r.next++
 	if name == "" {
 		name = identity
+	}
+	id := r.next
+	if int(r.next) > MaxParticipants || r.next == 0 {
+		// The one-byte space is full — of rows, not of writers. A participant
+		// that disconnected left its row behind so its text still has an owner
+		// to name, and that row is the one id that can be handed out again:
+		// the lowest gone id, so two joins racing the cap pick the same one.
+		// The old identity is forgotten and its text now reads as the new
+		// writer. Refuse only when nobody is gone.
+		gone, ok := lowestGone(r.byID)
+		if !ok {
+			return 0, fmt.Errorf("participant: no author ids left (%d used)", len(r.byID))
+		}
+		delete(r.byIdentity, r.byID[gone].Identity)
+		id = gone
+	} else {
+		r.next++
 	}
 	r.byID[id] = &Participant{ID: id, Identity: identity, Name: name, Kind: kind, Connected: true}
 	r.byIdentity[identity] = id
 	return id, nil
+}
+
+// lowestGone finds the lowest recyclable author id: one whose participant has
+// disconnected. The scan starts past the local human — an agent handed id 1
+// would write text indistinguishable from typed — and a connected row is
+// never taken, because that id is somebody writing right now.
+func lowestGone(byID map[uint8]*Participant) (uint8, bool) {
+	for id := uint8(LocalHuman + 1); ; id++ {
+		if p, ok := byID[id]; ok && !p.Connected {
+			return id, true
+		}
+		if id == MaxParticipants {
+			return 0, false
+		}
+	}
 }
 
 // Leave marks a participant disconnected. The row stays: its text is still in

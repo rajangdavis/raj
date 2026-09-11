@@ -34,6 +34,12 @@ func (p *Pane) textWidth() int {
 	return w
 }
 
+// TextWidth is the pane text width as the renderer knows it. It is exported
+// for the application, which trims inlay hints to the lines that fit one row
+// at exactly the width RenderFocused will use. Zero means the pane has not
+// been laid out yet, and the caller keeps every hint until it has.
+func (p *Pane) TextWidth() int { return p.Viewport.Cols }
+
 // lineBreaks lays out one line into the pane width, returning nil when wrapping
 // is off so callers take the unwrapped path without a branch at each use.
 //
@@ -67,6 +73,12 @@ func (p *Pane) cursorRowCol(off int) (line, row, col int) {
 	var buf [64]int
 	breaks := p.File.Cols.AppendWrap(buf[:0], text, p.textWidth(), WrapPolicy)
 	row, col = p.File.Cols.RowOfBreaks(breaks, text, within)
+	// A hinted line fits one row by construction, so its hints all sit on row
+	// zero and ColOfHints is the column the renderer draws. A hinted line that
+	// somehow wrapped keeps the plain row mapping.
+	if hs := p.File.HintCols(line); len(hs) > 0 && row == 0 {
+		col = p.File.Cols.ColOfHints(text, within, hs)
+	}
 	return line, row, col
 }
 
@@ -220,6 +232,12 @@ func (p *Pane) moveVerticalWrapped(delta int, extend bool) {
 		var buf [64]int
 		breaks := p.File.Cols.AppendWrap(buf[:0], text, p.textWidth(), WrapPolicy)
 		within := p.File.Cols.OffsetAtRow(breaks, text, row, col)
+		// A hinted line fits one row, so its hints apply to the column being
+		// resolved and OffsetOfHints is the inverse of the caret column; an
+		// un-hinted wrapped line keeps the plain conversion.
+		if hs := p.File.HintCols(line); len(hs) > 0 && row == 0 {
+			within = p.File.Cols.OffsetOfHints(text, col, hs)
+		}
 		c.Head = p.File.LineStart(line) + within
 		if !extend {
 			c.Anchor = c.Head

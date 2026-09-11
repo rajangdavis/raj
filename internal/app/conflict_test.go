@@ -138,12 +138,12 @@ func TestConflictCancelWritesNothing(t *testing.T) {
 	}
 }
 
-// cmd+r takes the disk version deliberately, instead of the only route being to
+// cmd+shift+r takes the disk version deliberately, instead of the only route being to
 // attempt a save you did not want.
 func TestReloadBindingOnACleanBuffer(t *testing.T) {
 	h := newHarness(t, "original\n")
 	rewriteOnDisk(t, h, "theirs\n")
-	h.press("super+r")
+	h.press("shift+super+r")
 
 	if h.Prompt.Open {
 		t.Fatal("reloading a clean buffer asked a question")
@@ -167,7 +167,7 @@ func TestReloadBindingOnADirtyBufferAsks(t *testing.T) {
 			h := newHarness(t, "original\n")
 			h.typeText("mine ")
 			rewriteOnDisk(t, h, "theirs\n")
-			h.press("super+r")
+			h.press("shift+super+r")
 
 			if !h.Prompt.Open {
 				t.Fatal("reloading over unsaved changes did not ask")
@@ -186,7 +186,7 @@ func TestReloadBindingOnAnUnnamedBuffer(t *testing.T) {
 	h := newHarness(t, "original\n")
 	h.press("super+n")
 	h.typeText("scratch")
-	h.press("super+r")
+	h.press("shift+super+r")
 
 	if h.Prompt.Open {
 		t.Fatal("reloading a scratch buffer opened a dialog")
@@ -215,7 +215,7 @@ func TestIdleTickMarksDiskChangedTab(t *testing.T) {
 		t.Errorf("changed-on-disk mark missing from the tab bar:\n%s", h.host.Text())
 	}
 
-	h.press("super+r")
+	h.press("shift+super+r")
 	if h.Pane().DiskStale() {
 		t.Error("mark still set after reload")
 	}

@@ -73,7 +73,7 @@ func (a *App) ControlPath() string {
 // woken on its own goroutine. Nothing here waits for the driver to read it.
 //
 // This is the whole editor-side surface, deliberately small. What is missing
-// above it is a chord and a prompt — see TODO.md — and leaving that out is not
+// above it is a chord and a prompt — see docs/TODO.md — and leaving that out is not
 // an oversight: a binding is a claim on a chord the terminal then stops
 // delivering to anything else, and that is a decision about the keymap rather
 // than about messaging.
@@ -138,16 +138,50 @@ func (h host) isAgent(id uint8) bool {
 func (h host) Buffers() []control.Buffer {
 	out := make([]control.Buffer, 0, h.a.Tabs.Count())
 	for _, p := range h.a.Tabs.All() {
-		out = append(out, control.Buffer{
+		sess := p.File.Session()
+		b := control.Buffer{
 			Path:    p.File.Path,
-			Version: uint64(p.File.Session().Version()),
+			Version: uint64(sess.Version()),
 			Dirty:   p.File.Dirty(),
 			Bytes:   p.File.Len(),
 			Lines:   p.File.Lines(),
 			Active:  p == h.a.Tabs.Active(),
-		})
+		}
+		// The pending count is what turns "which open files hold decisions"
+		// from 1 + N `groups` calls into the one `buffers` call. Moved reuses
+		// the DiffPending accounting — members a later edit has moved past so
+		// no honest span can be projected — and is only computed when there is
+		// a pending change set to account for.
+		if pending := sess.Pending(); len(pending) > 0 {
+			b.Pending = len(pending)
+			for _, d := range sess.DiffPending() {
+				b.Moved += d.Moved
+			}
+		}
+		out = append(out, b)
 	}
 	return out
+}
+
+// canonicalPath maps a request's path to the name a tab is keyed on: a
+// relative path resolves against the workspace root, and .. and symlink
+// spellings collapse to the one file they name. It is the single seam every
+// path-taking verb goes through before comparing, so a relative path means the
+// same buffer for read as it does for open instead of resolving against the
+// process's working directory.
+//
+// It does not resolve symlinks in the returned path: the name a new buffer is
+// stored under stays the spelling the caller used, and it is sameFile that
+// makes two spellings of one file compare equal. An empty path is returned
+// unchanged because it means the buffer the user is looking at.
+func (h host) canonicalPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(h.a.root, path)
+	}
+	return filepath.Clean(path)
 }
 
 // find locates an open buffer. Unnamed buffers are unaddressable, for the same
@@ -160,8 +194,9 @@ func (h host) find(path string) (*editor.Pane, error) {
 		}
 		return nil, control.ErrNoBuffer
 	}
+	want := h.canonicalPath(path)
 	for _, p := range h.a.Tabs.All() {
-		if p.File.Path == path {
+		if sameFile(want, p.File.Path) {
 			return p, nil
 		}
 	}
@@ -181,7 +216,11 @@ func (h host) Open(path string) (uint64, error) {
 	// A path names a file on disk, and a file can be spelled several ways —
 	// through a symlink, through .., through the tab's own form. Reopening one
 	// that is already open should focus its tab rather than stack a duplicate:
-	// the identity comparison is by file, not by string.
+	// the identity comparison is by file, not by string. Canonicalising first
+	// is the step every other verb takes, so a relative path opens the buffer
+	// its absolute spelling names rather than one keyed on the process's
+	// working directory.
+	path = h.canonicalPath(path)
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		for _, p := range h.a.Tabs.All() {
 			if sameFile(resolved, p.File.Path) && h.a.Tabs.Focus(p) {
@@ -262,6 +301,23 @@ func (h host) Close(path string) error {
 	return fmt.Errorf("%w: %s", control.ErrNoBuffer, path)
 }
 
+// resolveSpan clamps a byte span to [0, size], refusing the ones no clamp can
+// save. A negative start means the whole buffer; a negative end means to the
+// end. Anything past size is an error, not a silent empty read: for one agent
+// that is a typo, for several writing concurrently it is silent corruption.
+func resolveSpan(start, end, size int) (int, int, error) {
+	if start < 0 {
+		return 0, size, nil
+	}
+	if start > size || (end >= 0 && (end > size || end < start)) {
+		return 0, 0, fmt.Errorf("offset out of range: [%d, %d) is not within [0, %d)", start, end, size)
+	}
+	if end < 0 {
+		end = size
+	}
+	return start, end, nil
+}
+
 // Read hands back the document as authored runs, straight off the piece table:
 // Spans already reports an author per run, so this is a projection rather than
 // an analysis.
@@ -291,18 +347,10 @@ func (h host) Read(path string, start, end, lineStart, lineEnd int) ([]control.S
 			end = len(text)
 		}
 	}
-	if start < 0 {
-		start, end = 0, len(text)
-	} else {
-		if end < 0 || end > len(text) {
-			end = len(text)
-		}
-		if start > len(text) {
-			start = len(text)
-		}
-		if start > end {
-			start = end
-		}
+	var serr error
+	start, end, serr = resolveSpan(start, end, len(text))
+	if serr != nil {
+		return nil, 0, serr
 	}
 	var out []control.Span
 	for _, s := range p.File.Spans(start, end-start) {
@@ -334,8 +382,12 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	if err != nil {
 		return 0, nil, err
 	}
+	size := len(p.File.Text())
 	pt := make([]piecetable.Hunk, 0, len(hunks))
-	for _, x := range hunks {
+	for i, x := range hunks {
+		if _, _, serr := resolveSpan(x.Start, x.End, size); serr != nil {
+			return 0, nil, fmt.Errorf("hunk %d: %w", i, serr)
+		}
 		pt = append(pt, piecetable.Hunk{Start: x.Start, End: x.End, Text: x.Text})
 	}
 	// The connection's own author id, not a blanket Agent: the tint and the
@@ -387,26 +439,18 @@ func snapshotHash(text string) string {
 }
 
 // Dump captures [start,end) as a snapshot the same writer can patch back. The
-// span is clamped the way read's is: a missing start means the whole file, a
-// missing end reads to the end.
+// span resolves the way read's does: a missing start means the whole file, a
+// missing end reads to the end, and a span past the buffer is an error.
 func (h host) Dump(path string, start, end int, author uint8) (uint64, uint64, string, string, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return 0, 0, "", "", err
 	}
 	text := p.File.Text()
-	if start < 0 {
-		start, end = 0, len(text)
-	} else {
-		if end < 0 || end > len(text) {
-			end = len(text)
-		}
-		if start > len(text) {
-			start = len(text)
-		}
-		if start > end {
-			start = end
-		}
+	var serr error
+	start, end, serr = resolveSpan(start, end, len(text))
+	if serr != nil {
+		return 0, 0, "", "", serr
 	}
 	chunk := text[start:end]
 	h.a.snapSeq++
@@ -518,7 +562,7 @@ type snapshotSearcher struct {
 }
 
 func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
-	emit func([]control.SearchMatch)) (int, bool, error) {
+	emit func([]control.SearchMatch)) (int, int, bool, []control.TruncatedFile, error) {
 	res := search.RunStream(ctx, s.root, search.Query{
 		Text: q.Text, Include: q.Include, Exclude: q.Exclude,
 		Regex: q.Regex, Case: q.Case, Word: q.Word,
@@ -531,7 +575,11 @@ func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 		}
 		emit(out)
 	})
-	return res.Files, res.Capped, res.Err
+	var truncated []control.TruncatedFile
+	for _, f := range res.Truncated() {
+		truncated = append(truncated, control.TruncatedFile{Path: f.Path, Shown: f.Shown, Total: f.Total})
+	}
+	return res.Files, res.Considered, res.Capped, truncated, res.Err
 }
 
 // Groups lists a buffer's change sets.
@@ -647,9 +695,9 @@ func (h host) Save(path string) (uint64, error) {
 // a clean "no server" or "not ready" answer the driver can retry.
 func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, error) {
 	switch mode {
-	case "hover", "definition", "completion", "diagnostics":
+	case "hover", "definition", "references", "completion", "diagnostics":
 	default:
-		return nil, fmt.Errorf("unknown lsp mode %q (want hover, definition, completion or diagnostics)", mode)
+		return nil, fmt.Errorf("unknown lsp mode %q (want hover, definition, references, completion or diagnostics)", mode)
 	}
 	p, err := h.find(path)
 	if err != nil {
@@ -661,8 +709,45 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 	}
 	if mode == "diagnostics" {
 		// The cached state, never a request: a diagnostic set is what the server
-		// last published, and the plan's rule is that this mode never blocks.
-		return lspCaller{mode: "diagnostics", diags: h.a.diags.forPath(lpath)}, nil
+		// last published, and the plan's rule is that this mode never blocks. No
+		// server is started here either, so the answer must say which state it
+		// is: a missing or not-yet-running server also has no diagnostics, and
+		// reporting an empty list would read as a clean file.
+		ls, st := h.a.servers.state(lpath)
+		if ls == nil {
+			return lspCaller{mode: "diagnostics", status: lspStatus(st), detail: st.message(lpath)}, nil
+		}
+		// The published latch is not a freshness proof. An edit after the
+		// publish leaves the previous set in place until the server speaks
+		// again, so compare the version the publish applied to, and the version
+		// the server was last told about, against the buffer's own. A mismatch
+		// reports stale rather than a clean file: a per-hunk compile gate that
+		// read "not yet republished" as "no problems" would pass broken code.
+		var pubVersion *int
+		if v, ok := h.a.diags.publishedVersion(lpath); ok {
+			pubVersion = &v
+		}
+		// state returns a server only alongside a live sync, so this branch is
+		// unreachable today; guarding it keeps a nil dereference off the event
+		// thread if that invariant ever changes.
+		if ls.sync == nil {
+			return lspCaller{
+				mode:   "diagnostics",
+				status: control.LSPStatusStarting,
+				detail: "the language server is not ready",
+			}, nil
+		}
+		synced, _ := ls.sync.Version(lpath)
+		status, detail := diagnosticsStatus(
+			h.a.diags.published(lpath), pubVersion,
+			synced, int(p.File.Session().Version()),
+		)
+		return lspCaller{
+			mode:   "diagnostics",
+			status: status,
+			detail: detail,
+			diags:  h.a.diags.forPath(lpath),
+		}, nil
 	}
 	if line < 1 || col < 1 {
 		return nil, fmt.Errorf("lsp %s needs a 1-based line and column", mode)
@@ -691,17 +776,21 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 // is what host.LSP hands the connection, so a slow server blocks the driver's
 // request, not the editor.
 type lspCaller struct {
-	mode  string
-	conn  *lsp.Conn
-	path  string
-	pos   lsp.Position
-	diags []lsp.Diagnostic
+	mode   string
+	conn   *lsp.Conn
+	path   string
+	pos    lsp.Position
+	diags  []lsp.Diagnostic
+	status string
+	detail string
 }
 
 func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 	var out control.LSPResult
 	switch c.mode {
 	case "diagnostics":
+		out.Status = c.status
+		out.Detail = c.detail
 		out.Diags = make([]control.LSPDiag, 0, len(c.diags))
 		for _, d := range c.diags {
 			out.Diags = append(out.Diags, control.LSPDiag{
@@ -735,6 +824,20 @@ func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 			})
 		}
 		return json.Marshal(out)
+	case "references":
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		locs, err := lsp.RequestReferences(ctx, c.conn, c.path, c.pos, true)
+		if err != nil {
+			return nil, err
+		}
+		out.Locations = make([]control.LSPLocation, 0, len(locs))
+		for _, l := range locs {
+			out.Locations = append(out.Locations, control.LSPLocation{
+				Path: l.Path, Line: l.Range.Start.Line + 1, Col: l.Range.Start.Character + 1,
+			})
+		}
+		return json.Marshal(out)
 	case "completion":
 		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
@@ -751,6 +854,50 @@ func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 		return json.Marshal(out)
 	}
 	return nil, fmt.Errorf("unknown lsp mode %q", c.mode)
+}
+
+// lspStatus names the state a diagnostics answer reports, so a caller never has
+// to read an empty list as "no problems" when the real reason is "no server".
+func lspStatus(st serverState) string {
+	switch st {
+	case serverReady:
+		return control.LSPStatusOK
+	case serverStarting:
+		return control.LSPStatusStarting
+	case serverNotStarted:
+		return control.LSPStatusNotStarted
+	case serverMissing:
+		return control.LSPStatusMissing
+	case serverGaveUp:
+		return control.LSPStatusGaveUp
+	default:
+		return control.LSPStatusNoServer
+	}
+}
+
+// diagnosticsStatus decides whether a cached publish is a reading of the
+// buffer in front of the caller, and words the reason when it is not.
+//
+// It is pure so the rule can be tested without a live server. published is the
+// store's latch, pubVersion the document version that publish applied to (nil
+// when the server sent none), syncedVersion the version the server was last
+// told about, and bufVersion the buffer's current version. A set is a real
+// reading only when it was published for the text the buffer holds now: a
+// publish that predates it, or a server that has not even been told about it,
+// is stale rather than clean.
+func diagnosticsStatus(published bool, pubVersion *int, syncedVersion, bufVersion int) (status, detail string) {
+	switch {
+	case !published:
+		return control.LSPStatusUnpublished,
+			"the language server has not published diagnostics for this file yet"
+	case syncedVersion != bufVersion:
+		return control.LSPStatusStale,
+			"the language server has not been told about the current text yet"
+	case pubVersion != nil && *pubVersion != bufVersion:
+		return control.LSPStatusStale,
+			"the language server's diagnostics are for an earlier version of the file"
+	}
+	return control.LSPStatusOK, ""
 }
 
 // completionKindName folds the protocol's kind number down to the handful a
