@@ -114,15 +114,24 @@ const (
 	// way to ask for it after a cursor move or with a one-character prefix.
 	Complete Action = "complete"
 
+	// ToggleInlayHints flips language-server inlay hints for the active pane.
+	// Per-pane rather than app-wide: the application default still applies to
+	// files opened later, so silencing hints on one file does not have to
+	// silence every file opened next.
+	ToggleInlayHints Action = "toggle_inlay_hints"
+
 	// proposals — an agent change set lands as a proposal: in the document,
 	// tinted, save-blocked, and decided one gesture at a time. Accept marks it
-	// agreed; reject backs it out; review lists what is still pending.
+	// agreed, reject marks it out of the agreed composition without touching
+	// the text, and clear hard-purges a rejected set; review lists what is
+	// still pending.
 	// ToggleReview switches the whole application between Edit and Review
 	// mode. Review makes the document read-only so a review pass cannot edit
 	// the text it is reviewing; the review decisions stay live in both modes.
 	ToggleReview   Action = "toggle_review"
 	AcceptProposed Action = "accept_proposed"
 	RejectProposed Action = "reject_proposed"
+	ClearRejected  Action = "clear_rejected"
 	ReviewProposed Action = "review_proposed"
 	NextProposed   Action = "next_proposed"
 	PrevProposed   Action = "prev_proposed"

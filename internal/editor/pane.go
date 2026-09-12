@@ -20,6 +20,13 @@ type Pane struct {
 	Author   piecetable.Author
 	Find     Find
 
+	// leaseHit is the change set that refused the most recent edit attempt and
+	// leaseBlocked records that a refusal happened, so the application can turn
+	// it into a status note. The key path returns only "consumed", so the pane
+	// carries the refusal itself and TakeLeaseRefusal drains it.
+	leaseHit     uint64
+	leaseBlocked bool
+
 	// Wrap makes long lines occupy several visual rows instead of scrolling
 	// horizontally. Off by default: turning it on changes what a "row" means
 	// for every viewport calculation, so it is opt-in per pane.
@@ -195,11 +202,15 @@ func (p *Pane) Paste(text string) {
 	if text == "" {
 		return
 	}
+	c := p.Cursors.Primary()
+	lo, hi := c.Range()
+	if g, ok := p.File.EditLeased(lo, hi-lo); ok {
+		p.noteLease(g)
+		return
+	}
 	p.File.Begin()
 	defer p.File.End()
 
-	c := p.Cursors.Primary()
-	lo, hi := c.Range()
 	p.Cursors.Set(lo, lo)
 	if hi > lo {
 		p.File.Delete(p.Author, lo, hi-lo)
@@ -222,6 +233,14 @@ func (p *Pane) PasteDistributed(lines []string) {
 	cursors := p.Cursors.All()
 	if len(lines) != len(cursors) {
 		p.Paste(strings.Join(lines, "\n"))
+		return
+	}
+	edits := make([]cursorEdit, 0, len(cursors))
+	for i, c := range cursors {
+		lo, hi := c.Range()
+		edits = append(edits, cursorEdit{pos: lo, remove: hi - lo, insert: lines[i]})
+	}
+	if p.leaseBlocks(edits) {
 		return
 	}
 	p.File.Begin()
@@ -254,13 +273,21 @@ func (p *Pane) PasteAtEachCursor(text string) {
 	if text == "" {
 		return
 	}
-	p.File.Begin()
-	defer p.File.End()
-
 	cursors := p.Cursors.All()
 	if len(cursors) == 0 {
 		return
 	}
+	edits := make([]cursorEdit, 0, len(cursors))
+	for _, c := range cursors {
+		lo, hi := c.Range()
+		edits = append(edits, cursorEdit{pos: lo, remove: hi - lo, insert: text})
+	}
+	if p.leaseBlocks(edits) {
+		return
+	}
+	p.File.Begin()
+	defer p.File.End()
+
 	last := len(cursors) - 1
 	lo, hi := cursors[last].Range()
 	if hi > lo {
@@ -384,16 +411,23 @@ func (p *Pane) reindent(add bool) {
 	unit := p.File.Indent.Unit()
 	lines := p.touchedLines()
 	// Bottom-up: editing a later line cannot invalidate an earlier line's start.
+	edits := make([]cursorEdit, 0, len(lines))
 	for i := len(lines) - 1; i >= 0; i-- {
 		start := p.File.LineStart(lines[i])
 		text := p.File.Line(lines[i])
 		if add {
-			p.applyEdit(start, 0, unit)
+			edits = append(edits, cursorEdit{pos: start, insert: unit})
 			continue
 		}
 		if n := leadingSpaces(text, p.File.Cols.Tab); n > 0 {
-			p.applyEdit(start, n, "")
+			edits = append(edits, cursorEdit{pos: start, remove: n})
 		}
+	}
+	if p.leaseBlocks(edits) {
+		return
+	}
+	for _, e := range edits {
+		p.applyEdit(e.pos, e.remove, e.insert)
 	}
 	p.Cursors.Normalize()
 }
@@ -432,23 +466,76 @@ func leadingSpaces(line string, tab int) int {
 	return n
 }
 
+// noteLease records that change set group owns text an edit just tried to
+// touch. The application drains it with TakeLeaseRefusal.
+func (p *Pane) noteLease(group uint64) {
+	p.leaseHit, p.leaseBlocked = group, true
+}
+
+// TakeLeaseRefusal returns the change set that refused the most recent edit
+// and clears the mark, so the application surfaces each refusal once. The
+// second result is false when nothing was refused.
+func (p *Pane) TakeLeaseRefusal() (uint64, bool) {
+	if !p.leaseBlocked {
+		return 0, false
+	}
+	g := p.leaseHit
+	p.leaseHit, p.leaseBlocked = 0, false
+	return g, true
+}
+
+// cursorEdit is one replacement a multi-cursor action will make.
+type cursorEdit struct {
+	pos, remove int
+	insert      string
+}
+
+// leaseBlocks reports whether any of edits would intersect a lease, recording
+// the refusing set. Every site is checked before any is applied, so a
+// multi-cursor action is refused whole rather than mutating some cursors and
+// not others.
+func (p *Pane) leaseBlocks(edits []cursorEdit) bool {
+	for _, e := range edits {
+		if g, ok := p.File.EditLeased(e.pos, e.remove); ok {
+			p.noteLease(g)
+			return true
+		}
+	}
+	return false
+}
+
 // editEachCursor applies one edit per cursor, highest offset first so that
-// earlier cursors' positions remain valid throughout.
+// earlier cursors' positions remain valid throughout. The edits are computed
+// first and checked together against the leases, so an action whose range
+// touches a read-only run changes nothing at all.
 func (p *Pane) editEachCursor(fn func(Cursor) (pos, remove int, insert string)) {
 	cursors := p.Cursors.All()
+	edits := make([]cursorEdit, 0, len(cursors))
 	for i := len(cursors) - 1; i >= 0; i-- {
 		pos, remove, insert := fn(cursors[i])
 		if remove == 0 && insert == "" {
 			continue
 		}
-		p.applyEdit(pos, remove, insert)
+		edits = append(edits, cursorEdit{pos: pos, remove: remove, insert: insert})
+	}
+	if p.leaseBlocks(edits) {
+		return
+	}
+	for _, e := range edits {
+		p.applyEdit(e.pos, e.remove, e.insert)
 	}
 	p.Cursors.CollapseSelections()
 	p.Cursors.Normalize()
 }
 
-// applyEdit performs one replacement and shifts every cursor to match.
+// applyEdit performs one replacement and shifts every cursor to match. It
+// refuses and records the lease when the range touches a read-only run, so no
+// text moves and no cursor shifts onto a position the edit did not create.
 func (p *Pane) applyEdit(pos, remove int, insert string) {
+	if g, ok := p.File.EditLeased(pos, remove); ok {
+		p.noteLease(g)
+		return
+	}
 	if remove > 0 {
 		p.File.Delete(p.Author, pos, remove)
 		p.Cursors.Shift(pos, remove, 0)

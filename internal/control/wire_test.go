@@ -58,6 +58,60 @@ func TestReadSpanRoundTripsThroughHeader(t *testing.T) {
 	}
 }
 
+// The review verb's list-only flag must survive the header, or `raj ctl
+// review -json` would enter the mode it promised to leave alone.
+func TestReviewListSurvives(t *testing.T) {
+	h, body := EncodeRequest(Request{Op: "review", Path: "/w/a.go", ReviewList: true})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeRequest(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Op != "review" || !got.ReviewList {
+		t.Errorf("got op %q list %v, want review true", got.Op, got.ReviewList)
+	}
+	// Absence must read as "enter the mode", not as list-only.
+	h, body = EncodeRequest(Request{Op: "review", Path: "/w/a.go"})
+	buf.Reset()
+	WriteFrame(&buf, h, body)
+	f, _ = ReadFrame(&buf)
+	if got, _ = DecodeRequest(f); got.ReviewList {
+		t.Error("absent flag read as list-only")
+	}
+}
+
+// An annotated read asks for the view plus its state runs; the flag must
+// survive or the state runs go missing.
+func TestAnnotatedReadFlagSurvives(t *testing.T) {
+	h, body := EncodeRequest(Request{Op: "text", Path: "/w/a.go", Annotated: true})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeRequest(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Op != "text" || !got.Annotated {
+		t.Errorf("got op %q annotated %v, want text true", got.Op, got.Annotated)
+	}
+	// Absence is the default view with no state runs, not the annotation.
+	h, body = EncodeRequest(Request{Op: "text", Path: "/w/a.go"})
+	buf.Reset()
+	WriteFrame(&buf, h, body)
+	f, _ = ReadFrame(&buf)
+	if got, _ = DecodeRequest(f); got.Annotated {
+		t.Error("absent flag read as annotated")
+	}
+}
+
 // The reason document bytes are not in the JSON.
 //
 // A buffer is a byte string. Go's encoder replaces anything that is not valid
@@ -330,6 +384,42 @@ func TestResponseCarriesTruncatedFiles(t *testing.T) {
 	}
 	if got.Truncated[0] != want[0] {
 		t.Errorf("truncated[0] = %+v, want %+v", got.Truncated[0], want[0])
+	}
+}
+
+// StatesJSON is the annotated read's per-run owner and state. It rides as one
+// header string; forgetting it in EncodeResponse or DecodeResponse compiles
+// and silently strips the states from `read -annotated`.
+func TestResponseCarriesStatesJSON(t *testing.T) {
+	want := `[{"off":0,"len":5,"group":0,"state":"accepted"}]`
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, StatesJSON: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StatesJSON != want {
+		t.Errorf("states = %q, want %q", got.StatesJSON, want)
+	}
+}
+
+// A search hit's line start crosses the response boundary like its other
+// offsets. EncodeResponse or DecodeResponse dropping it compiles and leaves
+// every hit at zero, which is the wrong anchor an agent would build on.
+func TestResponseCarriesMatchLineStart(t *testing.T) {
+	want := []SearchMatch{{
+		Path: "/w/a.go", Line: 2, Col: 1, Len: 6, LineStart: 9,
+		ByteStart: 10, ByteEnd: 16, Text: "\tneedle here",
+	}}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Matches: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != 1 {
+		t.Fatalf("matches = %+v, want %+v", got.Matches, want)
+	}
+	if got.Matches[0] != want[0] {
+		t.Errorf("match = %+v, want %+v", got.Matches[0], want[0])
 	}
 }
 

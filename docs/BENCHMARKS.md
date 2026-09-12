@@ -419,3 +419,43 @@ keystrokes that do not cross a word boundary.
 The remaining 0.93 µs is ranking the cached words, which is bounded by the
 number of candidates rather than by file size. That is now well clear of the
 frame budget the rest of the keystroke path is held to.
+
+## Layered proposals: projection
+
+The `Session.Project(policy)` primitive derives a composition of the session
+journal. Measured 2026-09-12 on the host with `BenchmarkProjection` (one
+four-byte append per change set; the swarm shape marks every set Proposed and
+every third Rejected), before the in-place and no-decisions work:
+
+| ops | Project/Annotated | swarm Leased | allocated |
+|---|---:|---:|---:|
+| 1k | 3.9 ms | 4.5 ms | ~17 MB |
+| 10k | 356 ms | 370 ms | ~1.6 GB |
+| 100k | 53 s | 50 s | ~160 GB |
+
+The allocation column is what made this quadratic: the forward pass allocates a
+fresh `mu []int` of the whole view length on every op, so an n-op journal
+allocates O(n^2) ints over an O(n)-byte document. At 100k ops that is 160 GB of
+garbage and tens of seconds per projection.
+
+`BenchmarkProjectionAlt` times two redesigns against the shipped pass, gated by
+`TestProjectionAltMatchesProject` on byte-for-byte and state-for-state equality
+over 1..200 ops:
+
+- **forward-in-place** reuses one `mu` and splices it in place (append to grow,
+  `copy` to move the tail), so allocation is O(document) and the tail move on
+  these append-only journals is one element.
+- **unapply** starts from the session view and removes the excluded edits
+  newest-first, O(excluded x view): cheap when few decisions exist, degrading as
+  undecided proposals accumulate.
+
+| ops | Project/Annotated/forward-in-place | Project/Annotated/unapply |
+|---|---:|---:|
+| 1k | pending host run | pending host run |
+| 10k | pending host run | pending host run |
+| 100k | pending host run | pending host run |
+
+The prototype columns and the after numbers for the shipped `Project` (the
+no-decisions short-circuit, the newest-first unapply pass and the indexed
+`stateRuns`) are pending the host run; the equality gate is what makes the
+alt-run timings trustworthy.

@@ -339,3 +339,23 @@ func TestProposalChordsResolveFromCSIu(t *testing.T) {
 		}
 	}
 }
+
+// The inlay-hints toggle is a bound, implemented chord: the canonical name
+// resolves, the CSI-u payload the table pins decodes to it, the reference names
+// it, and it is deliberately absent from Unimplemented.
+func TestInlayHintsToggleChordResolves(t *testing.T) {
+	k := NewKeymap()
+	if got := k.Lookup(Editor, "shift+super+i"); got != ToggleInlayHints {
+		t.Errorf("shift+super+i = %q, want %q", got, ToggleInlayHints)
+	}
+	if a, _, ok := k.Resolve(Editor, mustParse(t, "\x1b[105;10u")); !ok || a != ToggleInlayHints {
+		t.Errorf("105;10u resolved to (%q, %v), want %q", a, ok, ToggleInlayHints)
+	}
+	doc := Doc()
+	if !strings.Contains(doc, "`shift+super+i`") || !strings.Contains(doc, "toggle_inlay_hints") {
+		t.Error("the reference does not name the inlay-hints toggle")
+	}
+	if why := Unimplemented[ToggleInlayHints]; why != "" {
+		t.Errorf("the inlay-hints toggle is listed as unimplemented: %s", why)
+	}
+}

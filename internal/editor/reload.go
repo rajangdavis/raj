@@ -65,7 +65,7 @@ func (f *File) Reload() error {
 	f.applied = f.sess.Version()
 	f.newline = piecetable.PieceRec{} // pointed into the store that just went away
 	f.nlBuf = f.nlBuf[:0]
-	f.markSaved(text)
+	f.markSavedBytes(text, data)
 	f.stampDisk()
 	return nil
 }

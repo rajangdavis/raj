@@ -22,6 +22,7 @@ type Match struct {
 	Text      string // the whole line, trimmed of trailing space
 	Col       int    // byte offset of the match within Text
 	Len       int
+	LineStart int // byte offset of the start of the hit line within the file
 	ByteStart int // byte offset of the match within the file
 	ByteEnd   int // one past the last byte of the match within the file
 }
@@ -460,6 +461,7 @@ func scanData(path string, data []byte, m matcher, res *Result) (found, total in
 				Path: path, Line: line,
 				Text: strings.TrimRight(string(text), " \t"),
 				Col:  start - lineStart, Len: end - start,
+				LineStart: lineStart,
 				ByteStart: start, ByteEnd: end,
 			})
 			found++
@@ -522,6 +524,7 @@ func scanLines(path string, m matcher, data []byte, res *Result) (found, total i
 					Path: path, Line: line,
 					Text: strings.TrimRight(string(raw), " \t"),
 					Col:  start, Len: stop - start,
+					LineStart: off,
 					ByteStart: off + start, ByteEnd: off + stop,
 				})
 				found++

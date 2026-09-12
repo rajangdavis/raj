@@ -133,6 +133,15 @@ type Header struct {
 	DumpID uint64
 	Hash   string
 
+	// ReviewList is the review request's list-only switch: it returns the
+	// pending change sets without entering Review mode. Absent means false,
+	// which enters the mode; `-json` sets it.
+	ReviewList bool
+	// Annotated is a read's switch for the review view's per-run change set
+	// and state. Absent means no state runs; the text is the buffer's view
+	// either way.
+	Annotated bool
+
 	// LSPMode names the lsp sub-operation on a request; LSPJSON carries the
 	// JSON-encoded answer back on a response. Neither needs the body: they are
 	// text by construction, valid UTF-8, not document bytes.
@@ -145,6 +154,10 @@ type Header struct {
 	// journal before encoding, so no caller re-derives offsets from the
 	// text inside it.
 	DiffJSON string
+	// StatesJSON carries an annotated read's []StateRun as one JSON string,
+	// the same escape hatch DiffJSON uses: the run list has no flat-record
+	// shape and its offsets are a projection of the journal.
+	StatesJSON string
 
 	// Exit, Dirty and Stats are exec's answers. Stream marks an output frame:
 	// 1 stdout, 2 stderr, with the bytes in the body.
@@ -216,6 +229,7 @@ type MatchMeta struct {
 	Len       int `json:"len"`
 	PathLen   int `json:"path_len"`
 	TextLen   int `json:"text_len"`
+	LineStart int `json:"line_start"`
 	ByteStart int `json:"byte_start"`
 	ByteEnd   int `json:"byte_end"`
 }
@@ -344,7 +358,8 @@ func EncodeRequest(req Request) (Header, []byte) {
 	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
-		DumpID: req.DumpID, LSPMode: req.LSPMode,
+		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
+		Annotated: req.Annotated,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
@@ -385,7 +400,8 @@ func DecodeRequest(f Frame) (Request, error) {
 		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
 		Start: f.Header.Start, End: f.Header.End,
 		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
-		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode}
+		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
+		Annotated: f.Header.Annotated}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -428,6 +444,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
 		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
 		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON,
+		StatesJSON: res.StatesJSON,
 		SrcVersion: res.SrcVersion, Identity: res.Identity}
 	var body []byte
 	if res.Stream != 0 {
@@ -439,7 +456,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 	for _, m := range res.Matches {
 		h.Matches = append(h.Matches, MatchMeta{Line: m.Line, Col: m.Col, Len: m.Len,
 			PathLen: len(m.Path), TextLen: len(m.Text),
-			ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
+			LineStart: m.LineStart, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
 		body = append(body, m.Path...)
 		body = append(body, m.Text...)
 	}
@@ -462,6 +479,7 @@ func DecodeResponse(f Frame) (Response, error) {
 		Participants: f.Header.Participants, Groups: f.Header.Groups,
 		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
 		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON,
+		StatesJSON: f.Header.StatesJSON,
 		SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
@@ -486,7 +504,7 @@ func DecodeResponse(f Frame) (Response, error) {
 		res.Matches = append(res.Matches, SearchMatch{
 			Path: string(runs[outRuns+2*i]), Text: string(runs[outRuns+2*i+1]),
 			Line: m.Line, Col: m.Col, Len: m.Len,
-			ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
+			LineStart: m.LineStart, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
 	}
 	for i, m := range f.Header.Spans {
 		res.Spans = append(res.Spans, Span{Text: string(runs[matchRuns+i]), Author: m.Author})

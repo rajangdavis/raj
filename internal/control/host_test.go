@@ -17,6 +17,7 @@ type memHost struct {
 	docs   map[string]string
 	vers   map[string]uint64
 	opens  []string
+	reads  []bool
 	dirty  []DirtyBuffer
 	groups []Group
 	diffs  []DiffGroup
@@ -75,11 +76,12 @@ func (h *memHost) Open(path string) (uint64, error) {
 	return h.vers[path], nil
 }
 
-func (h *memHost) Read(path string, start, end, lineStart, lineEnd int) ([]Span, uint64, error) {
+func (h *memHost) Read(path string, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
 	t, ok := h.docs[path]
 	if !ok {
-		return nil, 0, ErrNoBuffer
+		return nil, nil, 0, ErrNoBuffer
 	}
+	h.reads = append(h.reads, annotated)
 	if lineStart > 0 {
 		starts := []int{0}
 		for i := 0; i < len(t); i++ {
@@ -112,7 +114,14 @@ func (h *memHost) Read(path string, start, end, lineStart, lineEnd int) ([]Span,
 			start = len(t)
 		}
 	}
-	return []Span{{Text: t[start:end], Author: FirstAgent}}, h.vers[path], nil
+	spans := []Span{{Text: t[start:end], Author: FirstAgent}}
+	if annotated {
+		// The control tests do not model decisions; a run covering the read
+		// text is enough to prove the flag reached the host and the states
+		// came back on the response.
+		return spans, []StateRun{{Off: 0, Len: end - start, Group: 7, State: "proposed"}}, h.vers[path], nil
+	}
+	return spans, nil, h.vers[path], nil
 }
 
 func (h *memHost) Version(path string) (uint64, error) {
@@ -238,7 +247,7 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		if _, err := g.Open(p); err == nil {
 			t.Errorf("Open(%q) was allowed", p)
 		}
-		if _, _, err := g.Read(p, -1, -1, 0, 0); err == nil {
+		if _, _, _, err := g.Read(p, -1, -1, 0, 0, false); err == nil {
 			t.Errorf("Read(%q) was allowed", p)
 		}
 		if _, _, err := g.Apply(p, FirstAgent, 1, []Hunk{{}}); err == nil {
@@ -285,7 +294,7 @@ func TestGuardRequiresAReadBeforeAWrite(t *testing.T) {
 		t.Fatalf("buffer changed anyway: %q", h.docs[path])
 	}
 
-	if _, _, err := g.Read(path, -1, -1, 0, 0); err != nil {
+	if _, _, _, err := g.Read(path, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
@@ -313,7 +322,7 @@ func TestVersionCountsAsARead(t *testing.T) {
 func TestGuardRejectsMalformedSpans(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	g.Read(path, -1, -1, 0, 0)
+	g.Read(path, -1, -1, 0, 0, false)
 	for _, hk := range []Hunk{{Start: -1, End: 0}, {Start: 5, End: 2}} {
 		if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{hk}); err == nil {
 			t.Errorf("%+v was allowed", hk)
@@ -466,7 +475,7 @@ func TestDispatchEmptyApplyIsAVersionQuery(t *testing.T) {
 func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	g.Read(path, -1, -1, 0, 0)
+	g.Read(path, -1, -1, 0, 0, false)
 	for _, a := range []uint8{0, 1} {
 		if _, _, err := g.Apply(path, a, 1, []Hunk{{Start: 0, End: 1, Text: "x"}}); err == nil {
 			t.Errorf("author %d was accepted", a)
@@ -484,7 +493,7 @@ func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 // text from the user's without a second call.
 func TestReadCarriesAuthorship(t *testing.T) {
 	g, h := guarded(t)
-	spans, _, err := g.Read(filepath.Join(h.root, "a.go"), -1, -1, 0, 0)
+	spans, _, _, err := g.Read(filepath.Join(h.root, "a.go"), -1, -1, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,6 +506,31 @@ func TestReadCarriesAuthorship(t *testing.T) {
 	}
 	if total != len("hello world\n") {
 		t.Errorf("spans total %d bytes, want %d", total, len("hello world\n"))
+	}
+}
+
+// An annotated read must reach the host with the flag set and carry its state
+// runs back on the response, or the read verb silently returns the view with
+// no state runs attached.
+func TestAnnotatedReadCarriesStates(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	res := Dispatch(g, Request{Op: "text", Path: path, Annotated: true})
+	if !res.OK {
+		t.Fatalf("text = %+v", res)
+	}
+	if len(h.reads) == 0 || !h.reads[len(h.reads)-1] {
+		t.Errorf("host saw annotated reads %v, want the last one true", h.reads)
+	}
+	if res.StatesJSON == "" {
+		t.Fatal("annotated read returned no states")
+	}
+	var runs []StateRun
+	if err := json.Unmarshal([]byte(res.StatesJSON), &runs); err != nil {
+		t.Fatalf("states are not JSON: %v", err)
+	}
+	if len(runs) != 1 || runs[0].State != "proposed" || runs[0].Len != len("hello world\n") {
+		t.Errorf("states = %+v", runs)
 	}
 }
 
@@ -521,6 +555,22 @@ func (h *memHost) Diff(path string) ([]DiffGroup, error) {
 		return nil, ErrNoBuffer
 	}
 	return h.diffs, nil
+}
+
+// Review mirrors Groups over a memory host: the pending sets are fixture data
+// and there is no app mode to switch, so listOnly is ignored. The real host's
+// EnterReview is exercised in internal/app.
+func (h *memHost) Review(path string, listOnly bool) ([]Group, error) {
+	if _, ok := h.docs[path]; !ok {
+		return nil, ErrNoBuffer
+	}
+	var out []Group
+	for _, g := range h.groups {
+		if g.State == "proposed" {
+			out = append(out, g)
+		}
+	}
+	return out, nil
 }
 
 func (h *memHost) Decide(path string, group uint64, accept bool) error {
@@ -609,7 +659,7 @@ func TestSnapshotSearcherValidates(t *testing.T) {
 func TestReadOfActiveBufferAuthorisesWriteByName(t *testing.T) {
 	g, h := guarded(t)
 	path := filepath.Join(h.root, "a.go")
-	if _, _, err := g.Read("", -1, -1, 0, 0); err != nil {
+	if _, _, _, err := g.Read("", -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {

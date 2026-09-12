@@ -50,6 +50,11 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 - [x] **Text input** — KKP flag 16 confirmed; shift+a types `A`, dead keys and
   non-Latin layouts covered.
 
+- [x] **Wave 2 — review-flow chords and cycling.** Accept/reject replaced
+  ctrl+alt+a/x with ctrl+super+m and ctrl+super+/; next/prev cycle on
+  ctrl+super+, and ctrl+super+. walks distinct sets in document order, wraps,
+  and reports "proposal N of M".
+
 ## Editor and buffer
 
 - [x] **Undo no longer deletes the wrong bytes** when a later insertion landed
@@ -225,6 +230,22 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   reopening, and the server kept publishing about a file nothing was showing.
   Closing never starts a server to say so.
 
+- [x] **Wave 1 — incremental LSP sync.** `App.syncDoc` pulls `OpsSince` and
+  renders the window through `editsSince`; a live gopls hover check rides the
+  rebuild.
+- [x] **Document sync is incremental now.** `App.syncDoc` pulls the window
+  `Session.OpsSince(since)` — keystrokes, ApplyDiff hunks, undo and reject
+  reversals all land in the one journal — converts each span to a UTF-16 Range
+  against the frame its predecessors produced, and replays the batch through a
+  pinned copy of the server's last-known text: ranges go out only when the
+  replay reproduces the buffer byte-for-byte. On any doubt it sends the whole
+  document instead (kind not Incremental, version reset, batch over 64 edits,
+  frame mismatch, mid-rune edge, replay disagreement); the capability is parsed
+  number-or-options-object, unknown means Full. Found already in tree this
+  session — the "unblocked" bullet above was stale; TestEditsSinceMultiHunkDiff
+  added 2026-09-10. Host verification of the fuzz gates and a live gopls hover
+  check ride the next rebuild+restart.
+
 ## Brackets
 
 - [x] **The matching bracket under the cursor is underlined.** Underline rather
@@ -318,6 +339,10 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 - [x] **Open documents are exempt.** An unsaved buffer is searched from memory
   and never opened, so whatever the tab is called, its contents are text and
   are on screen.
+
+- [x] **Wave C — search honesty follow-ons.** Per-file truncation is surfaced
+  (response opcode 0x43 plus a CLI "truncated" report) and -regex anchors
+  match per line. The CLI half needs the container image rebuilt.
 
 ## Hover
 
@@ -1494,3 +1519,17 @@ harness. Both now wait on the thing they are actually about.
 - [x] **Phase 3(c) — save-time review popup.** `Prompt.Review` opens from saveActive when pending > 0 — rows name the pending sets and jump the caret, enter accepts-all+saves, esc cancels. Host-verified.
 - [x] **Review mode, moved-hunk option A, and control-surface honesty (2026-09-11).** D1/D2: cmd+r toggles an app-level Review mode; the document is read-only in it (mutations refused with a status note) while decisions, movement, scroll and search stay live; a status-line badge and keybar carry the real chords and `n`/`N`; Reload moved to cmd+shift+r. D4: `DiffPending` projects the surviving runs of a proposed member instead of dropping it, `Pending()` auto-rejects a set with no surviving run, and `PendingMarks` follows the fragments. CLI: `apply -hunks FILE` (JSON Lines), `accept -all` / `reject -all`, positional-argument refusal for path verbs, the signed-varint fix that stopped negative `Group.Bytes` truncating the `groups` list, and an honest `lsp diagnostics` `status`/`detail`. Wire: `buffers -json` gains `pending`/`moved` through a sparse `hBufferState` (0x44), and `decodeHeader` checks `Reader.Bad` after each list. Search: `-include`/`-exclude` with no `/` now match the basename as well as the relative path, so `*_test.go` works tree-wide. The raj-editor skill documents `-hunks`, `-all`, `buffers` pending/moved, the diagnostics status, and the no-slash glob rule. `make check` green on the host (`go vet`, `go build`, `go test ./...`); live behaviour awaits a rebuild + editor restart + container-image rebuild.
 - [x] **Inlay hints steps 1-5, plus `lsp references`, diagnostics freshness, completion auto-import and multi-cursor paste (2026-09-11).** Inlay hints (option A inline overlay): `internal/lsp/inlay.go` (`InlayHint`, `RequestInlayHints`, `labelText`, `tooltipText`) and a `textDocument.inlayHint` capability (empty object, no `resolveSupport`); the editor-side model `internal/editor/hints.go` (`Hint`, `HintEdit`, `HintSet`, `LineHint`; `File.Hints`, `HintsAt`/`SetHints`/`ClearHints`) with `internal/app/inlay.go` (`inlayStore` keyed by path+version); the fetch lifecycle (`maybeRequestHints` on the idle tick over the visible range plus a half-screen margin, `answerInlay`, `applyInlay`, `invalidateHints`, generation and version drops); the hint-aware column map `internal/view/columns.go` (`HintCol`, `ColOfHints`, `OffsetOfHints`, `WidthHints`) and the single-row caret/render/mouse path (`File.LineCol`/`OffsetAt`, `drawLine`/`drawHint` with `Theme.InlayHint`, `mouse.OffsetAt` clamping inside a hint); and the shipped wrap answer, the per-line fit fallback (`editor.HintsThatFit`, `File.SetHintsFiltered`/`HintWidth`, `App.fitHints`, re-filtered from `drawEditor`), after full wrap integration was attempted and abandoned because the byte-offset row model cannot represent a hint-only row. `view` deliberately has no hint-aware wrap functions: multi-row lines draw no hints. Also shipped: `lsp references`; diagnostics freshness (`unpublished`/`stale`, the pure `diagnosticsStatus`, publish `version` decode); completion `textEdit` plus `additionalTextEdits` (auto-import); and multi-cursor paste-at-each-cursor. Inlay hints steps 1-5, `lsp references`, diagnostics freshness and completion are in tree and `make check` is green on the host; multi-cursor paste and the live inlay behaviour await a rebuild, editor restart and container-image rebuild.
+- [x] **Layered proposals phase 0 — durable op log (2026-09-11).** `internal/journal` is a new dependency-free, append-only format: header plus base / store-append / op / decision / author / session / written records, fixed-width little-endian, each record length-prefixed and CRC32'd, with torn-tail detection and `Truncate`. The editor captures the journal behind `RAJ_JOURNAL`: one log per buffer under `session.Dir(root)/logs/`, an app-level pull on the idle-tick debounce (no keystroke-path I/O) with fsync flush on save/close/quit/decision; `piecetable.NewRestoredSession` and `editor.NewRestoredFile` rebuild a buffer from base + store blobs + replayed ops + decisions; `session.Dir` is now the one state-dir convention. The `Written` record carries the digest and session version of the last save, so save-then-restore comes back clean (not dirty at the origin); `Registry.Seed` restores the authored id→identity/name/kind table so attribution survives a restart; and a log that no longer matches the disk (neither the origin base nor the last write) is archived under `logs/archive/` and a fresh base started rather than replayed ambiguously. Verified live 2026-09-11: crash-restore (dirty buffer + pending change set + version), save-then-restore, and external-change skip all behaved; `make check` green on the host. Design and decisions in `docs/LAYERED-PROPOSALS-SPEC.md`; phases 1a–1c open in `docs/TODO.md`.
+- [x] **Layered proposals phase 1a — the projection primitive (2026-09-12).** `internal/piecetable/project.go` adds `Policy` (`AcceptedOnly` / `AcceptedAndProposed` / `Annotated`), `StateRun` and `DerivedProject`; `Session.Project(p)` derives a composition in one forward pass with a view→composition drift map, so an excluded edit drops its bytes but still shifts later coordinates, and a live excluded deletion is restored by never being applied. The composition is a `Naive` over the shared append-only stores (zero copy), and `Annotated` labels each run with the change set that put it there and the state it is in. Reversal ops contribute no content — `live` decides whether a reversed edit is present. Pure addition, no consumer changes; spec §5. `internal/piecetable/project_test.go` adds nine unit tests and `FuzzProjectAgainstOracle`, which folds the journal independently over `[]byte`, re-derives liveness from the journal alone, and cross-checks its own replay against the buffer before comparing. Host-verified 2026-09-12: `go test ./...` and `make check` green. Phases 1b/1c open in `docs/TODO.md`.
+
+- [x] **Wave 3 — honesty fixes.** FakeHost.Press panics on an unknown chord;
+  search refuses a bare positional path and warns when -include matches
+  nothing.
+- [x] **`patch` (and `prog`) dropped their path on the wire.** `EncodeRequest`
+  returned early for `patch` and `prog` before setting `h.Path`, so a patch
+  request arrived pathless and the host resolved it against the active tab —
+  refused when the snapshot named another file, silently misapplied if it
+  happened to match. Found while driving dump/patch over TCP. Fixed in tree:
+  `Path` is set in the `EncodeRequest` header literal, with a comment
+  explaining why, and the regression case rides `TestFrameRoundTrip`; host
+  verification rides the next `make check`.

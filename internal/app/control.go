@@ -16,6 +16,7 @@ import (
 	"raj/internal/piecetable"
 	"raj/internal/search"
 	"raj/internal/ui"
+	"raj/internal/view"
 )
 
 func wakeEvent() ui.Event { return ui.Wake{} }
@@ -45,6 +46,7 @@ func (a *App) StartControl(addr string, remoteExec bool) error {
 	}
 	srv.AllowRemoteExec = remoteExec
 	a.control = srv
+	a.seedParticipants()
 	return nil
 }
 
@@ -142,7 +144,7 @@ func (h host) Buffers() []control.Buffer {
 		b := control.Buffer{
 			Path:    p.File.Path,
 			Version: uint64(sess.Version()),
-			Dirty:   p.File.Dirty(),
+			Dirty:   p.File.ViewDirty(),
 			Bytes:   p.File.Len(),
 			Lines:   p.File.Lines(),
 			Active:  p == h.a.Tabs.Active(),
@@ -289,7 +291,7 @@ func (h host) Close(path string) error {
 	if err != nil {
 		return err
 	}
-	if p.File.Dirty() {
+	if p.File.ViewDirty() {
 		return fmt.Errorf("%s has unsaved changes; save or reject them first", p.File.Path)
 	}
 	for i, q := range h.a.Tabs.All() {
@@ -318,21 +320,38 @@ func resolveSpan(start, end, size int) (int, int, error) {
 	return start, end, nil
 }
 
-// Read hands back the document as authored runs, straight off the piece table:
-// Spans already reports an author per run, so this is a projection rather than
-// an analysis.
-func (h host) Read(path string, start, end, lineStart, lineEnd int) ([]control.Span, uint64, error) {
+// Read hands back the document as authored runs, straight off a projection of
+// the session: Spans already reports an author per run, so this is a mapping
+// rather than an analysis.
+//
+// It returns the buffer's own view by default — Project(Annotated), whose text
+// is exactly what is on screen, proposed and rejected sets included — because
+// apply interprets hunk offsets in the view frame. Returning the agreed
+// composition here would make an agent's read and apply disagree whenever a
+// decision existed, so read stays on the view until a proper accepted-to-view
+// translation exists; the default becoming the agreed composition is a future
+// change.
+//
+// annotated additionally returns the per-run change set and state, so a caller
+// can tell accepted from proposed from rejected; the text is the view either
+// way.
+//
+// Byte offsets and -lines are in the returned text's own coordinates, which is
+// why the line translation builds an index over the projection it hands back.
+func (h host) Read(path string, start, end, lineStart, lineEnd int, annotated bool) ([]control.Span, []control.StateRun, uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	text := p.File.Text()
+	comp := p.File.Session().Project(piecetable.Annotated)
+	text := comp.Text()
 	if lineStart > 0 {
-		// A 1-based inclusive line range, translated by the editor's own index
-		// so a driver reads the line a compiler or a search reports without
-		// re-implementing the byte model. A missing lineEnd reads to the end;
-		// a line past the document clamps to the last one.
-		lines := p.File.Lines()
+		// A 1-based inclusive line range, translated by an index over the
+		// composition so a driver reads the line a compiler or a search
+		// reports without re-implementing the byte model. A missing lineEnd
+		// reads to the end; a line past the document clamps to the last one.
+		idx := view.NewIndex(text)
+		lines := idx.Lines()
 		first := lineStart - 1
 		if first < 0 {
 			first = 0
@@ -340,9 +359,9 @@ func (h host) Read(path string, start, end, lineStart, lineEnd int) ([]control.S
 		if first >= lines {
 			first = lines - 1
 		}
-		start = p.File.LineStart(first)
+		start = idx.LineStart(first)
 		if lineEnd > 0 && lineEnd < lines {
-			end = p.File.LineStart(lineEnd) // exclusive: the start of the next line
+			end = idx.LineStart(lineEnd) // exclusive: the start of the next line
 		} else {
 			end = len(text)
 		}
@@ -350,10 +369,10 @@ func (h host) Read(path string, start, end, lineStart, lineEnd int) ([]control.S
 	var serr error
 	start, end, serr = resolveSpan(start, end, len(text))
 	if serr != nil {
-		return nil, 0, serr
+		return nil, nil, 0, serr
 	}
 	var out []control.Span
-	for _, s := range p.File.Spans(start, end-start) {
+	for _, s := range comp.Buffer().Spans(start, end-start) {
 		if s.Len <= 0 || s.Off < 0 || s.Off+s.Len > len(text) {
 			continue
 		}
@@ -362,7 +381,35 @@ func (h host) Read(path string, start, end, lineStart, lineEnd int) ([]control.S
 	if len(out) == 0 && start < end {
 		out = []control.Span{{Text: text[start:end], Author: uint8(piecetable.Original)}}
 	}
-	return out, uint64(p.File.Session().Version()), nil
+	var states []control.StateRun
+	if annotated {
+		states = clipStates(comp.States(), start, end)
+	}
+	return out, states, uint64(p.File.Session().Version()), nil
+}
+
+// clipStates trims the Annotated projection's runs to [start, end) and makes
+// their offsets relative to the text a read returns, so a caller can align them
+// with the spans it was handed. A run that straddles a boundary is cut, never
+// dropped: every returned byte still has exactly one owning state.
+func clipStates(runs []piecetable.StateRun, start, end int) []control.StateRun {
+	var out []control.StateRun
+	for _, r := range runs {
+		lo, hi := r.Off, r.Off+r.Len
+		if r.Len <= 0 || hi <= start || lo >= end {
+			continue
+		}
+		if lo < start {
+			lo = start
+		}
+		if hi > end {
+			hi = end
+		}
+		out = append(out, control.StateRun{
+			Off: lo - start, Len: hi - lo, Group: r.Group, State: r.State.String(),
+		})
+	}
+	return out
 }
 
 func (h host) Version(path string) (uint64, error) {
@@ -402,7 +449,7 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	// in the piece table because only this layer knows which authors are
 	// agents — and a second human's edits must not be marked.
 	if h.isAgent(author) {
-		p.File.Session().MarkGroup(p.File.Session().LastGroup(), piecetable.Proposed)
+		p.File.ProposeGroup(p.File.Session().LastGroup())
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
@@ -496,7 +543,7 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 	conflicts := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(snap.version), pt)
 	p.File.End()
 	if h.isAgent(author) {
-		p.File.Session().MarkGroup(p.File.Session().LastGroup(), piecetable.Proposed)
+		p.File.ProposeGroup(p.File.Session().LastGroup())
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
@@ -522,7 +569,7 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 func (h host) Dirty() []control.DirtyBuffer {
 	var out []control.DirtyBuffer
 	for _, p := range h.a.Tabs.All() {
-		if !p.File.Dirty() {
+		if !p.File.ViewDirty() {
 			continue
 		}
 		agentOnly := true
@@ -546,7 +593,7 @@ func (h host) Dirty() []control.DirtyBuffer {
 func (h host) Snapshot() control.Searcher {
 	docs := search.Docs{}
 	for _, p := range h.a.Tabs.All() {
-		if p.File.Path != "" && p.File.Dirty() {
+		if p.File.Path != "" && p.File.ViewDirty() {
 			docs[p.File.Path] = p.File.Text()
 		}
 	}
@@ -571,7 +618,7 @@ func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 		for _, m := range batch {
 			out = append(out, control.SearchMatch{
 				Path: m.Path, Line: m.Line, Col: m.Col, Len: m.Len,
-				ByteStart: m.ByteStart, ByteEnd: m.ByteEnd, Text: m.Text})
+				LineStart: m.LineStart, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd, Text: m.Text})
 		}
 		emit(out)
 	})
@@ -627,19 +674,44 @@ func (h host) Diff(path string) ([]control.DiffGroup, error) {
 	return out, nil
 }
 
+// Review returns a buffer's pending change sets and, unless listOnly, enters
+// Review mode at the first one. It is the socket form of the cmd+r toggle and
+// the proposals picker: the list is what `groups` shows filtered to the sets
+// still awaiting a decision, and EnterReview is the same enter path the chord
+// takes, so the two surfaces cannot drift.
+func (h host) Review(path string, listOnly bool) ([]control.Group, error) {
+	p, err := h.find(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []control.Group
+	for _, g := range p.File.Session().Pending() {
+		out = append(out, control.Group{
+			ID: g.ID, Path: p.File.Path, Author: uint8(g.Author),
+			State: g.State.String(), Ops: g.Ops, Bytes: g.Bytes,
+			First: uint64(g.First), Last: uint64(g.Last),
+		})
+	}
+	if !listOnly {
+		h.a.EnterReview()
+	}
+	return out, nil
+}
+
 // Decide accepts or rejects a change set.
 //
-// Rejection can fail without being an error to retry: a group wedged behind a
-// later change that overlaps it cannot be rebased out, and the caller has to
-// look at what happened since rather than trying again.
+// Rejecting is a state flip, so its only failure is about the address: an id
+// the buffer does not hold, or a set that is already Rejected. False no longer
+// means a later edit wedged the reversal — rejecting never removes text.
 func (h host) Decide(path string, group uint64, accept bool) error {
 	p, err := h.find(path)
+	defer h.a.flushJournal(p)
 	if err != nil {
 		return err
 	}
 	sess := p.File.Session()
 	if accept {
-		sess.AcceptGroup(group)
+		p.File.AcceptGroup(group)
 		return nil
 	}
 	var found bool
@@ -651,9 +723,8 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 	if !found {
 		return fmt.Errorf("no change set %d in %s", group, path)
 	}
-	if !sess.RejectGroup(group) {
-		return fmt.Errorf("change set %d could not be backed out: later edits "+
-			"overlap it, so removing it would leave text nobody wrote", group)
+	if !p.File.RejectGroup(group) {
+		return fmt.Errorf("change set %d is already rejected", group)
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)

@@ -136,6 +136,13 @@ func (p *Pane) PasteClip(c Clip) {
 // earlier cursors stay valid.
 func (p *Pane) distribute(spans [][]piecetable.PieceRec) {
 	cursors := p.Cursors.All()
+	for _, c := range cursors {
+		lo, hi := c.Range()
+		if g, ok := p.File.EditLeased(lo, hi-lo); ok {
+			p.noteLease(g)
+			return
+		}
+	}
 	for i := len(cursors) - 1; i >= 0; i-- {
 		lo, hi := cursors[i].Range()
 		if hi > lo {
@@ -155,6 +162,10 @@ func (p *Pane) distribute(spans [][]piecetable.PieceRec) {
 // spliceAtPrimary replaces the primary selection with captured pieces.
 func (p *Pane) spliceAtPrimary(recs []piecetable.PieceRec) {
 	lo, hi := p.Cursors.Primary().Range()
+	if g, ok := p.File.EditLeased(lo, hi-lo); ok {
+		p.noteLease(g)
+		return
+	}
 	if hi > lo {
 		p.File.Delete(p.Author, lo, hi-lo)
 	}

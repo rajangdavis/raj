@@ -29,10 +29,13 @@ func fullHeader() Header {
 		Messages:     []Message{{From: 1, Text: "hello"}},
 		Buffers:      []Buffer{{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Pending: 2, Moved: 1, Lines: 5}},
 		Truncated:    []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}},
-		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, ByteStart: 10, ByteEnd: 14}},
+		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, ByteStart: 10, ByteEnd: 14}},
 		Conflicts:    []Conflict{{Index: 1, At: 8, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
 		DiffJSON:     `[{"id":4,"hunks":[{"start":1,"end":2,"old":"a","new":"b"}],"moved":0}]`,
+		StatesJSON:   `[{"off":0,"len":5,"group":0,"state":"accepted"}]`,
+		ReviewList:   true,
+		Annotated:    true,
 	}
 }
 
@@ -65,6 +68,9 @@ func TestHeaderRoundTrip(t *testing.T) {
 	if len(got.Conflicts) != 1 || got.Conflicts[0] != want.Conflicts[0] {
 		t.Errorf("conflicts = %+v", got.Conflicts)
 	}
+	if len(got.Matches) != 1 || got.Matches[0] != want.Matches[0] {
+		t.Errorf("matches = %+v, want %+v", got.Matches, want.Matches)
+	}
 	for _, c := range []struct {
 		name      string
 		got, want any
@@ -82,6 +88,9 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"files", got.Files, want.Files}, {"considered", got.Considered, want.Considered},
 		{"capped", got.Capped, want.Capped}, {"stats", got.Stats, want.Stats},
 		{"diffjson", got.DiffJSON, want.DiffJSON},
+		{"statesjson", got.StatesJSON, want.StatesJSON},
+		{"reviewlist", got.ReviewList, want.ReviewList},
+		{"annotated", got.Annotated, want.Annotated},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
@@ -275,7 +284,7 @@ func TestEveryVerbHasACode(t *testing.T) {
 	for _, op := range []string{
 		"ping", "buffers", "text", "open", "apply", "save", "version", "search",
 		"groups", "accept", "reject", "exec", "execcheck", "stats", "hello",
-		"cancel", "recv", "snapshot", "prog", "diff",
+		"cancel", "recv", "snapshot", "prog", "diff", "review",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)
@@ -333,6 +342,28 @@ func TestEnumsTravelAsCodes(t *testing.T) {
 	}
 	if back.Groups[0].State != "half-accepted" {
 		t.Errorf("state = %q", back.Groups[0].State)
+	}
+}
+
+// A match's LineStart rides in a sparse field of its own, so a zero line start
+// must survive next to a nonzero one, and each start must stay with its own
+// hit rather than shift onto the next.
+func TestHeaderKeepsMatchLineStart(t *testing.T) {
+	want := []MatchMeta{
+		{Line: 1, Col: 0, Len: 6, PathLen: 4, LineStart: 0, ByteStart: 0, ByteEnd: 6},
+		{Line: 2, Col: 1, Len: 6, PathLen: 4, LineStart: 9, ByteStart: 10, ByteEnd: 16},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Matches: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != len(want) {
+		t.Fatalf("decoded %d matches, want %d", len(got.Matches), len(want))
+	}
+	for i := range want {
+		if got.Matches[i] != want[i] {
+			t.Errorf("match %d = %+v, want %+v", i, got.Matches[i], want[i])
+		}
 	}
 }
 

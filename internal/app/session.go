@@ -54,12 +54,14 @@ func (a *App) SessionState() session.State {
 		if p.File.Path == "" {
 			continue
 		}
+		hints := p.Hints
 		st.Tabs = append(st.Tabs, session.Tab{
 			Path:   p.File.Path,
 			Cursor: p.Cursors.Primary().Head,
 			Top:    p.Viewport.Top,
 			Ratio:  scrollRatio(p),
 			Wrap:   p.Wrap,
+			Hints:  &hints,
 		})
 	}
 	// Active is an index into the tabs that were kept, so skipping unnamed ones
@@ -114,6 +116,7 @@ func (a *App) RestoreSession() {
 	if a.root == "" || a.NoRestore {
 		return
 	}
+	defer a.restoreJournals()
 	st := session.Load(a.root)
 	if len(st.Tabs) == 0 && len(st.Expanded) == 0 {
 		return
@@ -133,6 +136,12 @@ func (a *App) RestoreSession() {
 		}
 		a.settle(p)
 		p.Wrap = t.Wrap
+		// Hints is tri-state: absent (nil) means the session predates the
+		// field, and settle leaves the app default in place. An explicit value
+		// is what the pane saved and overrides it.
+		if t.Hints != nil {
+			p.Hints = *t.Hints
+		}
 		// Clamped against the file as it is now, not as it was: Load validated
 		// against its size, but the authority is the buffer that just opened.
 		at := t.Cursor

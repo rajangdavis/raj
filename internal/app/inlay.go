@@ -299,3 +299,29 @@ func (a *App) fitHints(p *editor.Pane, width int) {
 	}
 	p.File.SetHintsFiltered(hints, width)
 }
+
+// toggleInlayHints flips language-server hints for the active pane.
+//
+// It is per-pane (p.Hints) rather than app-wide (a.InlayHints): the app
+// default is what a file opened later inherits, and a file whose generated
+// code makes hints noise should not have to silence every other file to get
+// quiet. The app default is left untouched, so the choice stays local to this
+// pane and is what the session writes back for the tab.
+//
+// Turning hints off clears what is on screen immediately, through the same
+// clear-and-invalidate path an edit uses: ClearHints plus a generation bump,
+// so an answer still in flight is discarded rather than installed. It also
+// forgets the request guard, which is what lets turning them back on ask again
+// even though the text has not moved.
+func (a *App) toggleInlayHints() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	p.Hints = !p.Hints
+	if !p.Hints {
+		p.File.ClearHints()
+		a.inlayGen++
+	}
+	a.inlayReq = inlayRequest{}
+}

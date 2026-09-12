@@ -397,3 +397,108 @@ func TestHintsClearAtTheNextDrawAfterAnyEdit(t *testing.T) {
 		t.Error("a mutation outside the key path left stale hints")
 	}
 }
+
+// The per-pane toggle is authoritative: turning hints off clears what is on
+// screen immediately, forgets the request guard and stops further requests;
+// turning them back on leaves the guard clear so the next idle tick asks
+// again. The application default is untouched.
+func TestToggleInlayHintsClearsAndReRequests(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	// A file type with no configured server: the request path is exercised
+	// without spawning a real gopls, and the pane guard stays observable.
+	h.Pane().File.Path = "/w/notes.txt"
+	h.Draw()
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "x"})
+	if h.Pane().File.Hints == nil {
+		t.Fatal("setup: hints were not installed")
+	}
+	if !h.Pane().Hints || !h.InlayHints {
+		t.Fatal("setup: hints should start on, on the pane and on the app")
+	}
+
+	// Off: the overlay goes, the in-flight answer is invalidated, and the
+	// request guard is forgotten.
+	gen := h.inlayGen
+	h.press("shift+super+i")
+	if h.Pane().Hints {
+		t.Error("the toggle did not turn the pane hints off")
+	}
+	if h.Pane().File.Hints != nil {
+		t.Error("toggling off left the installed hints on screen")
+	}
+	if h.inlayGen <= gen {
+		t.Error("toggling off did not invalidate the installed answer")
+	}
+	if !h.InlayHints {
+		t.Error("the pane toggle changed the application default")
+	}
+
+	// A disabled pane makes no request: a guard it was given is dropped.
+	h.inlayReq = inlayRequest{path: h.docPath(h.Pane()), version: h.inlayVersion()}
+	before := h.inlayGen
+	h.maybeRequestHints(h.Pane())
+	if h.inlayReq != (inlayRequest{}) {
+		t.Errorf("a disabled pane kept a request guard: %+v", h.inlayReq)
+	}
+	if h.inlayGen != before {
+		t.Errorf("a disabled pane bumped the generation from %d to %d", before, h.inlayGen)
+	}
+
+	// On: the guard is clear, so the next idle tick wants this document again
+	// even though its text has not moved.
+	h.press("shift+super+i")
+	if !h.Pane().Hints {
+		t.Error("the toggle did not turn the pane hints back on")
+	}
+	if !h.hintsWanted(h.docPath(h.Pane()), h.inlayVersion(), 0, 0) {
+		t.Error("turning hints back on left the request guard in place")
+	}
+}
+
+// Selection over a hint works in document bytes, and vertical movement's goal
+// column is display-aware: the hint pushes the byte after it to a later column,
+// and moving down onto an un-hinted line lands on the byte that column names.
+func TestSelectionDownOntoAHintUsesDisplayColumns(t *testing.T) {
+	h := newHarness(t, "abcdef\nabcdef\n")
+	h.Draw()
+	// The plain vertical move is the one under test; the wrap fallback has its
+	// own tests in inlay_wrap_test.go.
+	h.Pane().Wrap = false
+	// Width 4 at byte 1 on line 0: byte 2 sits at display column 6 (the anchor
+	// byte 1, then the hint's four cells).
+	h.installInlay(lsp.InlayHint{
+		Pos:          lsp.Position{Line: 0, Character: 1},
+		Text:         "XY",
+		PaddingLeft:  true,
+		PaddingRight: true,
+	})
+	h.Pane().Cursors.Set(2, 2)
+	h.press("shift+down")
+	c := h.Pane().Cursors.Primary()
+	// Line 1 has no hint, so display column 6 is byte 6 of the line: 7 + 6.
+	if c.Head != 13 {
+		t.Errorf("head = %d, want 13 (line 1 display column 6)", c.Head)
+	}
+	if c.Anchor != 2 {
+		t.Errorf("anchor = %d, want 2 (the selection kept its anchor)", c.Anchor)
+	}
+}
+
+// Find works in document bytes, so a match after a hint lands on the byte it
+// names rather than one shifted by the hint's display columns.
+func TestFindAfterAHintLandsOnTheByte(t *testing.T) {
+	h := newHarness(t, "abcdef\n")
+	h.Draw()
+	h.installInlay(lsp.InlayHint{
+		Pos:          lsp.Position{Line: 0, Character: 1},
+		Text:         "XY",
+		PaddingLeft:  true,
+		PaddingRight: true,
+	})
+	h.press("super+f")
+	h.typeText("e")
+	c := h.Pane().Cursors.Primary()
+	if c.Anchor != 4 || c.Head != 5 {
+		t.Errorf("find selection = %d..%d, want match bytes 4..5 after the hint", c.Anchor, c.Head)
+	}
+}

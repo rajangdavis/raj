@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"raj/internal/control"
+	"raj/internal/piecetable"
 )
 
 // A client speaking the real protocol over a real socket, using the same
@@ -247,6 +248,50 @@ func TestUserSaveAcceptsPendingChanges(t *testing.T) {
 	}
 }
 
+// A save writes the agreed composition, never text a reviewer rejected: the
+// buffer keeps the rejected bytes, read returns them by default as the view,
+// and the file on disk holds only the agreed bytes.
+func TestControlSaveWritesTheAgreedComposition(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	base := c.do(h, control.Request{Op: "text"}).Version
+	if r := c.do(h, control.Request{
+		Op:    "apply",
+		Base:  &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}},
+	}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	var id uint64
+	for _, g := range c.do(h, control.Request{Op: "groups", Path: path}).Groups {
+		if g.State == "proposed" {
+			id = g.ID
+		}
+	}
+	if id == 0 {
+		t.Fatal("no proposal to reject")
+	}
+	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: id}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
+	// The rejected set no longer blocks a save, and it is not written.
+	if s := c.do(h, control.Request{Op: "save", Path: path}); !s.OK {
+		t.Fatalf("save = %+v", s)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello world\n" {
+		t.Errorf("on disk = %q, want the agreed composition", string(data))
+	}
+	if got := h.text(); got != "hello socket\n" {
+		t.Errorf("buffer = %q, want the rejected text still in the buffer", got)
+	}
+}
+
 // An apply with no base is refused. It is the one request that can silently
 // corrupt a file: the offsets were computed against some version, and applying
 // them to whatever the buffer is now looks like success.
@@ -474,7 +519,8 @@ func TestControlSearchSeesUnsavedEdits(t *testing.T) {
 }
 
 // End to end: an agent's edit arrives as a proposal, is listed as one, and can
-// be backed out — leaving the document as if it had never been written.
+// be rejected — a decision that keeps the text in the document and drops the
+// set from the agreed composition, unlike the clear gesture that purges it.
 func TestAgentEditsArriveAsProposals(t *testing.T) {
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
@@ -507,8 +553,32 @@ func TestAgentEditsArriveAsProposals(t *testing.T) {
 	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: proposal.ID}); !r.OK {
 		t.Fatalf("reject = %+v", r)
 	}
-	if got := h.text(); got != "hello world\n" {
-		t.Errorf("after rejecting = %q, want the original back", got)
+	// A reject is a decision, not an edit: the text stays in the buffer and
+	// only its standing changes. read returns the view — the buffer's own
+	// text — by default, so the rejected bytes are present either way; only
+	// -annotated adds the per-run state.
+	if got := h.text(); got != "hello socket\n" {
+		t.Errorf("buffer after rejecting = %q, want the text to stay", got)
+	}
+	if got := c.do(h, control.Request{Op: "text"}).Text(); got != "hello socket\n" {
+		t.Errorf("default read after rejecting = %q, want the buffer view", got)
+	}
+	ann := c.do(h, control.Request{Op: "text", Annotated: true})
+	if got := ann.Text(); got != "hello socket\n" {
+		t.Errorf("annotated read after rejecting = %q, want the buffer", got)
+	}
+	var runs []control.StateRun
+	if err := json.Unmarshal([]byte(ann.StatesJSON), &runs); err != nil {
+		t.Fatalf("annotated states are not JSON: %v", err)
+	}
+	var rejected bool
+	for _, r := range runs {
+		if r.State == "rejected" {
+			rejected = true
+		}
+	}
+	if !rejected {
+		t.Errorf("annotated states = %+v, want a rejected run", runs)
 	}
 }
 
@@ -697,5 +767,115 @@ func TestControlPathThroughDotDotNamesTheSameBuffer(t *testing.T) {
 	climb := filepath.Join("..", filepath.Base(filepath.Dir(abs)), filepath.Base(abs))
 	if r := c.do(h, control.Request{Op: "text", Path: climb}); !r.OK || r.Text() != "hello\n" {
 		t.Fatalf("read %q = %+v", climb, r)
+	}
+}
+
+// A rejected change set has to leave the line index where the text is. Reject
+// used to reach the session directly, so the reversal never reached the index;
+// the next apply anchored its catch-up at the current version and advanced
+// `applied` past the unmirrored reversal, and the lines from every rejected
+// insertion stayed indexed for good. The count then ran away from the text and
+// read -lines near EOF walked past the buffer.
+func TestControlLineIndexSurvivesApplyRejectCycles(t *testing.T) {
+	h := controlHarness(t, "one\ntwo\nthree\nfour\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	f := h.Tabs.Active().File
+
+	// check asserts the index agrees with a rescan of the text, on the version
+	// answer a driver reads and on the editor's own count, and that the end of
+	// the index still addresses the end of the document.
+	check := func(step string) {
+		t.Helper()
+		text := f.Text()
+		want := strings.Count(text, "\n") + 1
+		v := c.do(h, control.Request{Op: "version", Path: path})
+		if !v.OK {
+			t.Fatalf("%s: version = %+v", step, v)
+		}
+		if v.Lines != want || f.Lines() != want {
+			t.Fatalf("%s: index has %d lines (version says %d), text has %d",
+				step, f.Lines(), v.Lines, want)
+		}
+		last := f.Lines() - 1
+		if start := f.LineStart(last); start > len(text) {
+			t.Fatalf("%s: last line starts at %d, past %d bytes", step, start, len(text))
+		}
+		if r := c.do(h, control.Request{Op: "text", Path: path, LineStart: intPtr(last + 1)}); !r.OK {
+			t.Fatalf("%s: read of the last line = %+v", step, r)
+		}
+	}
+
+	// reject backs out the one proposed set the buffer is holding.
+	reject := func() {
+		t.Helper()
+		res := c.do(h, control.Request{Op: "groups", Path: path})
+		var id uint64
+		for _, g := range res.Groups {
+			if g.State == "proposed" {
+				id = g.ID
+			}
+		}
+		if id == 0 {
+			t.Fatal("no proposed change set to reject")
+		}
+		if r := c.do(h, control.Request{Op: "reject", Path: path, Group: id}); !r.OK {
+			t.Fatalf("reject = %+v", r)
+		}
+	}
+
+	for i := 0; i < 25; i++ {
+		base := c.do(h, control.Request{Op: "text"}).Version
+		if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+			Hunks: []control.Hunk{{Start: 0, End: 0, Text: "a\nb\nc\nd\ne\n"}}}); !r.OK {
+			t.Fatalf("apply %d = %+v", i, r)
+		}
+		check("after apply")
+		reject()
+		check("after reject")
+
+		// patch is the other writer's path into the same catch-up: dump the
+		// whole file, hand back edited text, then reject the set it proposes.
+		d := c.do(h, control.Request{Op: "dump", Path: path})
+		if !d.OK {
+			t.Fatalf("dump %d = %+v", i, d)
+		}
+		if r := c.do(h, control.Request{Op: "patch", Path: path, DumpID: d.DumpID,
+			PatchText: d.Text() + "extra\n"}); !r.OK {
+			t.Fatalf("patch %d = %+v", i, r)
+		}
+		check("after patch")
+		reject()
+		check("after reject patch")
+	}
+}
+
+// The review verb is the socket form of the cmd+r toggle: it returns the
+// pending change sets and, unless the caller asked for the list only, enters
+// Review mode so the document is read-only while the sets are decided.
+func TestControlReviewEntersTheMode(t *testing.T) {
+	h := controlHarness(t, reviewFixture)
+	c := h.dial(t)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	r := c.do(h, control.Request{Op: "review"})
+	if !r.OK {
+		t.Fatalf("review = %+v", r)
+	}
+	if len(r.Groups) != 1 || r.Groups[0].State != "proposed" {
+		t.Errorf("groups = %+v, want the one proposed set", r.Groups)
+	}
+	if h.mode != ModeReview {
+		t.Errorf("mode = %v after review, want Review", h.mode)
+	}
+
+	// The list-only form leaves the mode alone.
+	h.mode = ModeEdit
+	l := c.do(h, control.Request{Op: "review", ReviewList: true})
+	if !l.OK || len(l.Groups) != 1 {
+		t.Fatalf("review -json = %+v", l)
+	}
+	if h.mode != ModeEdit {
+		t.Errorf("mode = %v after review -json, want it left in Edit", h.mode)
 	}
 }

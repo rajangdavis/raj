@@ -97,6 +97,7 @@ rather than hidden.
 | goto_symbol | `shift+super+o` | cmd+shift+o | ctrl+shift+o | — |
 | hover | `super+i` | cmd+i | ctrl+i | — |
 | goto_definition | `super+j` | cmd+j | ctrl+alt+j | — |
+| toggle_inlay_hints | `shift+super+i` | cmd+shift+i | ctrl+shift+i | toggle inline hints for the active pane |
 
 ## proposals
 
@@ -104,7 +105,8 @@ rather than hidden.
 | --- | --- | --- | --- | --- |
 | toggle_review | `super+r` | cmd+r | ctrl+r | toggle review mode: the document is read-only while on; reload moved to cmd+shift+r |
 | accept_proposed | `ctrl+super+m` | cmd+ctrl+m | ctrl+alt+m | accept the proposed change set at the caret |
-| reject_proposed | `ctrl+super+/` | cmd+ctrl+slash | ctrl+alt+slash | back out the proposed change set at the caret |
+| reject_proposed | `ctrl+super+/` | cmd+ctrl+slash | ctrl+alt+slash | reject the proposed change set at the caret |
+| clear_rejected | `ctrl+super+k` | cmd+ctrl+k | ctrl+alt+k | hard-purge the rejected change set at the caret |
 | prev_proposed | `ctrl+super+,` | cmd+ctrl+comma | ctrl+alt+comma | previous pending change set |
 | next_proposed | `ctrl+super+.` | cmd+ctrl+period | ctrl+alt+period | next pending change set |
 

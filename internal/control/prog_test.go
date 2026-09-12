@@ -291,11 +291,29 @@ func TestSearchArgumentsCompileInAnyOrder(t *testing.T) {
 // The four verbs that stay out, and the compiler refuses them by the ordinary
 // unknown-verb rule rather than by a special case.
 func TestVerbsThatStayOutOfPrograms(t *testing.T) {
-	for _, code := range []byte{0x93, 0x94, 0xff} { // unallocated verb range; the table ends at OpDiff
+	for _, code := range []byte{0x94, 0x95, 0xff} { // unallocated verb range; the table ends at OpReview
 		p := prog.Encode([]prog.Op{{Code: code}})
 		if _, err := Requests(p, 1); !errors.Is(err, prog.ErrUnknownVerb) {
 			t.Errorf("verb %#x = %v, want ErrUnknownVerb", code, err)
 		}
+	}
+}
+
+// review is a program verb, and its list-only argument rides the request flag
+// rather than the op string: a batch can list the pending sets without the
+// editor switching modes.
+func TestReviewCompilesAsAProgramVerb(t *testing.T) {
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpReviewList},
+		{Code: prog.OpReview},
+	})
+	reqs, err := Requests(p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0].Op != "review" || !reqs[0].ReviewList {
+		t.Errorf("review program = %+v, want one review with the list flag", reqs)
 	}
 }
 

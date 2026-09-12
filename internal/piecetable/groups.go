@@ -7,10 +7,12 @@ import (
 
 // Change sets, and whether they are in.
 //
-// Begin/End already ties ops into a group so that one action is one undo step,
-// and reverseGroup already backs a whole group out all-or-nothing, rebasing each
-// member and rolling back if any cannot be placed. So "reject this change" is
-// not a new mechanism — it is undo, addressed by group instead of by recency.
+// Begin/End ties ops into a group so that one action is one undo step, and
+// reverseGroup backs a whole group out all-or-nothing, rebasing each member and
+// rolling back if any cannot be placed. That mechanism still backs undo, redo
+// and the clear gesture. A rejection is not that: a decision about a change set
+// is state, not an edit. Rejecting marks the set without touching the text, and
+// only the clear gesture reverses it.
 //
 // What was missing is the two things that make a group reviewable: a way to
 // enumerate groups, and somewhere to record whether one has been agreed to.
@@ -30,9 +32,11 @@ const (
 	// Proposed is in the document and visible, but not yet agreed. Marked by
 	// whoever knows the writer is proposing rather than editing.
 	Proposed
-	// Rejected has been reversed. The ops stay in the journal — it is
-	// append-only, and offsets recorded against past versions have to remain
-	// rebaseable through them — so this records the decision, not a deletion.
+	// Rejected is in the document but excluded from the agreed composition.
+	// The text stays live — rejecting is a decision, not an edit — and only
+	// the clear gesture reverses it. The ops stay in the journal, which is
+	// append-only, so offsets recorded against past versions remain
+	// rebaseable through them.
 	Rejected
 )
 
@@ -81,6 +85,18 @@ func (s *Session) MarkGroup(id uint64, st GroupState) {
 	s.groupState[id] = st
 }
 
+// hasGroup reports whether any op in the journal belongs to id. RejectGroup
+// addresses a real change set: marking an id nothing wrote would record a
+// decision about nothing and report a state flip that never happened.
+func (s *Session) hasGroup(id uint64) bool {
+	for _, o := range s.journal {
+		if o.Group == id {
+			return true
+		}
+	}
+	return false
+}
+
 // GroupState returns a group's state, Accepted if nothing said otherwise.
 func (s *Session) GroupState(id uint64) GroupState {
 	if s.groupState == nil {
@@ -88,6 +104,11 @@ func (s *Session) GroupState(id uint64) GroupState {
 	}
 	return s.groupState[id]
 }
+
+// HasDecisions reports whether any change set carries a decision other than
+// the default Accepted. groupState holds only the exceptions, so this is a
+// length check rather than a scan.
+func (s *Session) HasDecisions() bool { return len(s.groupState) > 0 }
 
 // Groups lists every change set in the journal, oldest first.
 //
@@ -165,43 +186,59 @@ func (s *Session) AcceptPending() int {
 	return len(pending)
 }
 
-// RejectGroup backs a change set out and records the decision.
+// RejectGroup records that a change set is not agreed.
 //
-// This is undo addressed by group rather than by recency, which is what lets a
-// caller reject an older change while newer ones stay: each member is rebased
-// through everything that landed after it, and if any cannot be placed the
-// whole group rolls back rather than leaving the document in a state nobody
-// created.
+// A reject is a pure state flip: the text stays in the document and only the
+// decision changes, so it cannot fail and can never be wedged by a later edit.
+// The set drops out of the agreed composition and takes on the rejected tint;
+// AcceptGroup un-rejects it. The only operation that removes rejected text is
+// ClearRejected, the clear gesture.
 //
-// It returns false when the group is not reversible — already rejected, or
-// wedged behind a later change it overlaps. False is not an error to retry: the
-// caller has to look at what happened since.
-//
-// It takes no author. It used to, and the parameter selected which members to
-// back out, which meant a caller had to already know who wrote the group and a
-// caller that passed the deciding author instead — the natural reading of
-// "reject" — silently selected nothing and got a bare false. Rejecting a change
-// set means the whole change set; who decided that is a fact about the
-// conversation, not about which ops come out of the document.
+// It returns whether the state actually changed: false if id names no change
+// set the journal holds or the set was already Rejected, true otherwise.
 func (s *Session) RejectGroup(id uint64) bool {
-	if s.GroupState(id) == Rejected {
+	if !s.hasGroup(id) {
 		return false
 	}
-	if !s.reverseGroup(id, KindUndo, nil) {
+	if s.GroupState(id) == Rejected {
 		return false
 	}
 	s.MarkGroup(id, Rejected)
 	return true
 }
 
-// AcceptGroup agrees to a proposed change set. The text is already in the
-// document — accepting is a decision, not an edit — so this only clears the
-// pending mark.
+// AcceptGroup agrees to a change set. The text is already in the document —
+// accepting is a decision, not an edit — so this only clears the mark: it
+// un-rejects a set RejectGroup marked, and clears a Proposed mark. Both are
+// the same forgetting, because Accepted is the default.
 func (s *Session) AcceptGroup(id uint64) {
-	if s.GroupState(id) == Rejected {
-		return // reversed already; accepting would claim text that is not there
+	s.MarkGroup(id, Accepted)
+}
+
+// ClearRejected is the hard purge behind the clear gesture: it reverses a
+// rejected change set out of the document and drops the decision, so the text
+// and the set both leave the view.
+//
+// Unlike RejectGroup this really edits, because removing the bytes is the
+// point: the reversal can wedge behind a later change and return false. It
+// acts only on a set currently Rejected, so a false means either that the set
+// was not rejected to begin with or that a reversal genuinely wedged. A set
+// with no live members left to reverse — its edits were undone — has nothing
+// to wedge, so clearing it drops the decision and succeeds. False is not
+// retryable: the caller has to look at what happened since.
+func (s *Session) ClearRejected(id uint64) bool {
+	if s.GroupState(id) != Rejected {
+		return false
+	}
+	if len(s.reverseMembers(id, KindUndo, nil)) == 0 {
+		s.MarkGroup(id, Accepted)
+		return true
+	}
+	if !s.reverseGroup(id, KindUndo, nil) {
+		return false
 	}
 	s.MarkGroup(id, Accepted)
+	return true
 }
 
 // DiffHunk is one surviving run of a change set as old→new text, in the
@@ -300,6 +337,10 @@ func (s *Session) projectMember(o Op) []DiffHunk {
 // Stores are append-only, so (Buf, Start) names the exact bytes written; a
 // later edit that split or trimmed the piece leaves a sub-range of the same
 // record, while another author's text points into a different store range.
+//
+// The scan is over one member's inserted pieces, not the whole journal: this
+// runs on the DiffPending review path, not inside Project's per-piece origin
+// lookup, so stateRuns' originIndex does not apply here.
 func insOwns(ins []PieceRec, p PieceRec) bool {
 	for _, r := range ins {
 		if r.Buf == p.Buf && p.Start >= r.Start && p.Start+p.Length <= r.Start+r.Length {

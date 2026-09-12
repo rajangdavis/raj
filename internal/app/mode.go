@@ -24,15 +24,23 @@ const (
 	ModeReview
 )
 
-// toggleReview switches modes. Entering Review with pending change sets jumps
-// to the first one, so a review pass starts at chunk 1; entering with none is
-// allowed — a read-only browse — and says so.
+// toggleReview switches modes. Leaving is a plain mode flip; entering goes
+// through EnterReview so the chord and the socket verb share one path.
 func (a *App) toggleReview() {
 	if a.mode == ModeReview {
 		a.mode = ModeEdit
 		a.status = "edit mode"
 		return
 	}
+	a.EnterReview()
+}
+
+// EnterReview puts the app in Review mode. Entering with pending change sets
+// jumps to the first one, so a review pass starts at chunk 1; entering with
+// none is allowed — a read-only browse — and says so. It is the one enter
+// path: the cmd+r chord and `raj ctl review` both call it, so the two cannot
+// drift.
+func (a *App) EnterReview() {
 	a.mode = ModeReview
 	// A completion popup would accept into the document on the next tab, so it
 	// is closed on the way in.
@@ -92,6 +100,16 @@ func (a *App) reviewRefuses(action keys.Action, text string) bool {
 // leaves Review mode, read from the binding table rather than assuming cmd+r.
 func reviewReadOnlyNote() string {
 	return "read-only in review mode: " + chordFor(keys.ToggleReview) + " to edit"
+}
+
+// leaseNote is the status line refusal for an edit that would touch a leased
+// span. A pending or rejected change set owns its text until it is decided, so
+// the note names the set and points at the decision rather than at a chord.
+func leaseNote(group uint64) string {
+	if group == 0 {
+		return "read-only: a change set owns this text; accept or reject it first"
+	}
+	return fmt.Sprintf("read-only: change set %d owns this text; accept or reject it first", group)
 }
 
 // chordFor is the canonical chord an action is bound to, read from the key

@@ -126,7 +126,7 @@ func (t *Tabs) Goto(n int) {
 // DirtyCount is how many open files have unsaved changes.
 func (t *Tabs) DirtyCount() (n int) {
 	for _, p := range t.panes {
-		if p.File.Dirty() {
+		if p.File.ViewDirty() {
 			n++
 		}
 	}
@@ -138,7 +138,7 @@ func (t *Tabs) DirtyCount() (n int) {
 func (t *Tabs) Dirty() []*editor.Pane {
 	var out []*editor.Pane
 	for _, p := range t.panes {
-		if p.File.Dirty() {
+		if p.File.ViewDirty() {
 			out = append(out, p)
 		}
 	}
@@ -292,7 +292,7 @@ func (t *Tabs) labels() []string {
 				name = dir + "/" + name
 			}
 		}
-		if p.File.Dirty() {
+		if p.File.ViewDirty() {
 			name += " •"
 		}
 		if p.DiskStale() {

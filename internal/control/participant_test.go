@@ -221,3 +221,43 @@ func TestRecycledIDForgetsItsOldIdentity(t *testing.T) {
 		t.Errorf("name = %q, want the identity as the default name", p.Name)
 	}
 }
+
+// A registry rebuilt from a persisted author table seeds explicit ids, so a
+// restored op's author resolves to the identity it was written under rather
+// than whatever a fresh join order would hand out, and a later join for a new
+// identity does not collide with a seeded one.
+func TestSeedRestoresExplicitAuthors(t *testing.T) {
+	r := NewRegistry()
+	if !r.Seed(Participant{ID: 5, Identity: "tok_a", Name: "claude-a", Kind: KindAgent}) {
+		t.Fatal("Seed refused a fresh explicit row")
+	}
+	if !r.Seed(Participant{ID: 7, Identity: "tok_b", Name: "claude-b", Kind: KindAgent}) {
+		t.Fatal("Seed refused a second explicit row")
+	}
+	// Idempotent and first-wins, and impossible rows are refused.
+	if r.Seed(Participant{ID: 5, Identity: "other", Name: "x", Kind: KindAgent}) {
+		t.Error("Seed overwrote an existing id")
+	}
+	if r.Seed(Participant{ID: 0, Identity: "zero", Name: "x", Kind: KindAgent}) {
+		t.Error("Seed installed author 0")
+	}
+	if r.Seed(Participant{ID: 9, Identity: "", Name: "x", Kind: KindAgent}) {
+		t.Error("Seed installed an empty identity")
+	}
+
+	got, ok := r.Get(5)
+	if !ok || got.Identity != "tok_a" || got.Name != "claude-a" || got.Kind != KindAgent {
+		t.Errorf("id 5 = %+v, want the seeded row", got)
+	}
+	if got.Connected {
+		t.Error("a seeded row reads as live; nothing is attached across a restart")
+	}
+	// The same identity reconnecting resolves to the seeded id, and a new
+	// identity lands past both seeded ids rather than on one of them.
+	if again, err := r.Join("tok_a", "", KindAgent); err != nil || again != 5 {
+		t.Errorf("Join(tok_a) = %d, %v, want the seeded id 5", again, err)
+	}
+	if fresh, err := r.Join("fresh", "", KindAgent); err != nil || fresh <= 7 {
+		t.Errorf("Join(fresh) = %d, %v, want an id past the seeded 7", fresh, err)
+	}
+}

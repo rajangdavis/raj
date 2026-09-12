@@ -76,8 +76,11 @@ type BufferHost interface {
 	// to bytes — so a driver can read the line a compiler or a search reports
 	// without re-implementing the editor's byte model. Both nil means read the
 	// whole file. The returned spans are still in document order and may be
-	// clipped at the boundaries.
-	Read(path string, start, end, lineStart, lineEnd int) (spans []Span, version uint64, err error)
+	// clipped at the boundaries. The text is the buffer's view,
+	// Project(Annotated), because apply's hunks are in the view frame;
+	// Annotated additionally returns the per-run owner and state alongside the
+	// spans. The agreed composition as the default is a future change.
+	Read(path string, start, end, lineStart, lineEnd int, annotated bool) (spans []Span, states []StateRun, version uint64, err error)
 
 	// Version is what a later Apply bases on, without moving the bytes.
 	Version(path string) (uint64, error)
@@ -101,6 +104,11 @@ type BufferHost interface {
 	// current coordinates: the review surface for what Groups only lists.
 	// An empty result means no changes await a decision.
 	Diff(path string) ([]DiffGroup, error)
+
+	// Review returns the buffer's pending change sets and, unless listOnly,
+	// enters Review mode at the first one. The list is what `groups` shows
+	// filtered to the sets still awaiting a decision.
+	Review(path string, listOnly bool) ([]Group, error)
 
 	// Dump captures a snapshot of [start,end) at the buffer's current version,
 	// returning its id, the version it was taken at, and the text. The id is
@@ -251,18 +259,18 @@ func (g *Guard) Close(path string) error {
 	return g.Host.Close(name)
 }
 
-func (g *Guard) Read(path string, start, end, lineStart, lineEnd int) ([]Span, uint64, error) {
+func (g *Guard) Read(path string, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
 	name, err := g.canonical(path)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	spans, v, err := g.Host.Read(name, start, end, lineStart, lineEnd)
+	spans, states, v, err := g.Host.Read(name, start, end, lineStart, lineEnd, annotated)
 	if err == nil {
 		g.mu.Lock()
 		g.read[name] = true
 		g.mu.Unlock()
 	}
-	return spans, v, err
+	return spans, states, v, err
 }
 
 func (g *Guard) Version(path string) (uint64, error) {
@@ -313,6 +321,18 @@ func (g *Guard) Diff(path string) ([]DiffGroup, error) {
 		g.mu.Unlock()
 	}
 	return diffs, err
+}
+
+// Review canonicalises the path and passes through, entering the mode unless
+// listOnly. It deliberately does not satisfy read-before-write: the pending
+// sets carry no text or offsets, so a caller that has only reviewed has not
+// seen the coordinates an edit would need.
+func (g *Guard) Review(path string, listOnly bool) ([]Group, error) {
+	name, err := g.canonical(path)
+	if err != nil {
+		return nil, err
+	}
+	return g.Host.Review(name, listOnly)
 }
 
 // Patch writes, so it runs the same author check as Apply: a socket may not
@@ -551,11 +571,19 @@ func Dispatch(g *Guard, req Request) Response {
 		if req.LineEnd != nil {
 			lineEnd = *req.LineEnd
 		}
-		spans, v, err := g.Read(req.Path, start, end, lineStart, lineEnd)
+		spans, states, v, err := g.Read(req.Path, start, end, lineStart, lineEnd, req.Annotated)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
-		return Response{OK: true, Spans: spans, Version: v}
+		res := Response{OK: true, Spans: spans, Version: v}
+		if len(states) > 0 {
+			data, err := json.Marshal(states)
+			if err != nil {
+				return Response{Err: err.Error()}
+			}
+			res.StatesJSON = string(data)
+		}
+		return res
 	case "groups":
 		name, err := g.canonical(req.Path)
 		if err != nil {
@@ -579,6 +607,15 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true, DiffJSON: string(data)}
+	case "review":
+		groups, err := g.Review(req.Path, req.ReviewList)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		if groups == nil {
+			groups = []Group{}
+		}
+		return Response{OK: true, Groups: groups}
 	case "accept", "reject":
 		name, err := g.canonical(req.Path)
 		if err != nil {

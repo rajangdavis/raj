@@ -399,3 +399,30 @@ func TestScrollRestoresLegacyJSONByTop(t *testing.T) {
 		t.Errorf("legacy restore top = %d, want 40", got)
 	}
 }
+
+// A per-pane hints choice survives a save and restore: the session carries the
+// pane flag, not the app default, so a tab left with hints off comes back off
+// while the default still governs tabs with no saved choice.
+func TestSessionPersistsPaneHints(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	os.WriteFile(f, []byte("x\n"), 0o644)
+
+	first := newHarnessAt(t, root)
+	first.OpenFile(f)
+	first.Tabs.Active().Hints = false
+	if err := first.SaveSession(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := newHarnessAt(t, root)
+	second.InlayHints = true
+	second.RestoreSession()
+	p := second.Tabs.Active()
+	if p == nil {
+		t.Fatal("nothing restored")
+	}
+	if p.Hints {
+		t.Error("the saved per-pane hints-off did not survive the restore")
+	}
+}

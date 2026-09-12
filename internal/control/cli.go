@@ -48,7 +48,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
 
   list                       running editors and their workspaces
   buffers                    files open in the editor
-  read [path]                full text of a buffer, unsaved changes included; use -start/-end for a span
+  read [path]                the buffer view; -annotated adds per-run states, -start/-end/-lines for a span
   open <path>                open a file in the editor
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
   close [path]                close a buffer; refused while it has unsaved work
@@ -59,6 +59,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   accept [path] -group N     agree to a change set; -all for every pending one
   reject [path] -group N     back one out; -all for every pending one
   diff [path]                pending change sets as old→new text, for review
+  review [path]              enter review mode and list pending change sets; -json lists without entering
   search -q PATTERN          search the workspace, unsaved edits included
   version [path]             the version a later apply bases on
   dump [path]                snapshot a span (or the whole file) for later patch
@@ -111,6 +112,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	start := fs.Int("start", -1, "apply/read: first byte of the span")
 	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
+	annotated := fs.Bool("annotated", false, "read: add the per-run change set and state of the view")
 	textArg := fs.String("text", "", "apply: replacement text")
 	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
 	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
@@ -187,7 +189,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "buffers":
 		return buffers(c, stdout, stderr, *asJSON)
 	case "read":
-		return read(c, path, *start, *end, *lines, stdout, stderr, *asJSON)
+		return read(c, path, *start, *end, *lines, *annotated, stdout, stderr, *asJSON)
 	case "open":
 		if path == "" {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
@@ -266,6 +268,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			stdout, stderr, *asJSON)
 	case "diff":
 		return diffCmd(c, path, stdout, stderr, *asJSON)
+	case "review":
+		return reviewCmd(c, path, *asJSON, stdout, stderr)
 	case "who":
 		res, err := c.Do(Request{Op: "hello", Identity: identityOf(*identity), Name: *name})
 		if code := fail(stderr, res, err); code != 0 {
@@ -378,6 +382,7 @@ var argLimit = map[string]struct {
 	"accept":  {1, "accept takes a path; the change set id goes to -group"},
 	"reject":  {1, "reject takes a path; the change set id goes to -group"},
 	"diff":    {1, "diff takes a path and nothing else"},
+	"review":  {1, "review takes a path and nothing else"},
 	"patch":   {1, "patch takes a path; the snapshot id goes to -dump"},
 	"apply":   {1, "apply takes a path; offsets go to -base/-start/-end"},
 	"edit":    {1, "edit takes a path; the strings go to -old/-new"},
@@ -646,27 +651,93 @@ func doExec(c *Client, argv []string, dir string, stdout, stderr io.Writer, asJS
 	return res.Exit
 }
 
-// decideAll accepts or rejects every change set the path reports in one
-// command. It is the client-side bulk form: `groups` once, then one frame per
-// group, so reviewing k change sets is one invocation rather than 1+k. The
-// server still decides each group on its own terms — which is what keeps a
-// wedged reject from taking the rest with it, and why one that fails is named
-// rather than only counted.
+// bulkOutcome is one change set's decision in a bulk accept or reject, in the
+// order it was attempted. Error is empty for a decision that landed.
+type bulkOutcome struct {
+	ID    uint64 `json:"id"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// decideAll accepts or rejects the path's change sets in one command. It is
+// the client-side bulk form: one listing, then one frame per set, so deciding
+// k sets is one invocation rather than 1+k. The server still decides each set
+// on its own terms — one refusal does not take the rest with it, and a set that
+// fails is named rather than only counted.
+//
+// Accepting is order-independent: the text is already in the document, so the
+// one listing `groups` gives is decided as it comes. Rejecting is not.
+// Reversing a set rebases its inverse through everything that landed after it,
+// so a set can only come out once every later edit that overlaps it is already
+// gone. The pending projection (`diff`) is walked newest-first and re-read
+// after each reversal, so the next attempt sees the document as it now is. It
+// is `diff`, not `groups`, because `groups` also lists accepted sets and sets a
+// later edit has fully overwritten; attempting either is the refusal that made
+// a bulk reject look wedged when its work was already done.
 func decideAll(c *Client, op, path string, mine bool, group uint64,
 	stdout, stderr io.Writer, asJSON bool) int {
 	if group != 0 {
 		fmt.Fprintf(stderr, "raj ctl %s: -all and -group are alternatives\n", op)
 		return 2
 	}
-	res, err := c.Do(Request{Op: "groups", Path: path})
-	if code := fail(stderr, res, err); code != 0 {
-		return code
+	verb := op + "ed"
+	var out []bulkOutcome
+	var failed []uint64
+	// decide performs one decision and records it, printing each as it lands so
+	// a person watching sees the outcomes rather than one batch at the end.
+	decide := func(id uint64) {
+		dres, derr := c.Do(Request{Op: op, Path: path, Group: id})
+		switch {
+		case derr != nil:
+			out = append(out, bulkOutcome{ID: id, Error: derr.Error()})
+			failed = append(failed, id)
+			if !asJSON {
+				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %v\n", op, id, derr)
+			}
+		case dres.Err != "":
+			out = append(out, bulkOutcome{ID: id, Error: dres.Err})
+			failed = append(failed, id)
+			if !asJSON {
+				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %s\n", op, id, dres.Err)
+			}
+		default:
+			out = append(out, bulkOutcome{ID: id, OK: true})
+			if !asJSON {
+				fmt.Fprintf(stdout, "%s change set %d\n", verb, id)
+			}
+		}
 	}
-	groups := res.Groups
-	if mine {
-		groups = mineOnly(groups, c.Author())
+	if op == "reject" {
+		// Newest-first, re-reading the pending list after each reversal. A set
+		// already attempted is not retried in this invocation: if it could not
+		// come out when it was newest, nothing older can free it.
+		attempted := map[uint64]bool{}
+		for {
+			pending, code := pendingRejections(c, path, mine, stderr)
+			if code != 0 {
+				return code
+			}
+			id, ok := newestRejection(pending, attempted)
+			if !ok {
+				break
+			}
+			attempted[id] = true
+			decide(id)
+		}
+	} else {
+		res, err := c.Do(Request{Op: "groups", Path: path})
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		groups := res.Groups
+		if mine {
+			groups = mineOnly(groups, c.Author())
+		}
+		for _, g := range groups {
+			decide(g.ID)
+		}
 	}
-	if len(groups) == 0 {
+	if len(out) == 0 {
 		// Nothing to decide is an answer, not a failure, exactly as an empty
 		// `groups` listing is.
 		if asJSON {
@@ -674,36 +745,6 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 		}
 		fmt.Fprintf(stdout, "%s: no pending change sets\n", firstOf(path, "active buffer"))
 		return 0
-	}
-	type outcome struct {
-		ID    uint64 `json:"id"`
-		OK    bool   `json:"ok"`
-		Error string `json:"error,omitempty"`
-	}
-	out := make([]outcome, 0, len(groups))
-	verb := op + "ed"
-	var failed []uint64
-	for _, g := range groups {
-		dres, derr := c.Do(Request{Op: op, Path: path, Group: g.ID})
-		switch {
-		case derr != nil:
-			out = append(out, outcome{ID: g.ID, Error: derr.Error()})
-			failed = append(failed, g.ID)
-			if !asJSON {
-				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %v\n", op, g.ID, derr)
-			}
-		case dres.Err != "":
-			out = append(out, outcome{ID: g.ID, Error: dres.Err})
-			failed = append(failed, g.ID)
-			if !asJSON {
-				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %s\n", op, g.ID, dres.Err)
-			}
-		default:
-			out = append(out, outcome{ID: g.ID, OK: true})
-			if !asJSON {
-				fmt.Fprintf(stdout, "%s change set %d\n", verb, g.ID)
-			}
-		}
 	}
 	if asJSON {
 		if code := emit(stdout, out); code != 0 {
@@ -716,7 +757,7 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 	}
 	if len(failed) > 0 {
 		fmt.Fprintf(stderr, "raj ctl %s: %d of %d change set(s) could not be %s:",
-			op, len(failed), len(groups), verb)
+			op, len(failed), len(out), verb)
 		for _, id := range failed {
 			fmt.Fprintf(stderr, " %d", id)
 		}
@@ -724,6 +765,54 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 		return 1
 	}
 	return 0
+}
+
+// pendingRejections is the pending projection a bulk reject works from: the
+// change sets with surviving text, which are the only ones a reversal can act
+// on. `groups` also lists accepted sets and sets a later edit has fully
+// overwritten, so attempting either reports a refusal for work already done —
+// the state that looked like a wedge.
+func pendingRejections(c *Client, path string, mine bool, stderr io.Writer) ([]DiffGroup, int) {
+	res, err := c.Do(Request{Op: "diff", Path: path})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	var diffs []DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		fmt.Fprintln(stderr, "raj ctl reject:", err)
+		return nil, 1
+	}
+	kept := diffs[:0]
+	for _, d := range diffs {
+		if len(d.Hunks) == 0 {
+			continue // no surviving text: auto-rejected, nothing to back out
+		}
+		if mine && d.Author != c.Author() {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	return kept, 0
+}
+
+// newestRejection picks the latest change set not yet attempted, by journal
+// position. A later edit can overlap an earlier set and block its inverse, so
+// the newest has to come out first; the ID tie-break keeps the choice total so
+// the loop cannot stall.
+func newestRejection(pending []DiffGroup, attempted map[uint64]bool) (uint64, bool) {
+	var best DiffGroup
+	found := false
+	for _, d := range pending {
+		if attempted[d.ID] {
+			continue
+		}
+		if !found || d.First > best.First ||
+			(d.First == best.First && (d.Last > best.Last ||
+				(d.Last == best.Last && d.ID > best.ID))) {
+			best, found = d, true
+		}
+	}
+	return best.ID, found
 }
 
 // mineOnly keeps the change sets this connection wrote. `groups` is the
@@ -756,7 +845,7 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 			for _, m := range batch {
 				enc.Encode(map[string]any{
 					"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
-					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "text": m.Text,
+					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "line_start": m.LineStart, "text": m.Text,
 				})
 				n++
 			}
@@ -1000,6 +1089,31 @@ func patchCmd(c *Client, path string, dumpID uint64, textArg, textFile string, s
 		return emit(stdout, map[string]any{"ok": true, "version": res.Version})
 	}
 	fmt.Fprintf(stdout, "patched snapshot %d at version %d; the buffer has unsaved changes\n", dumpID, res.Version)
+	return 0
+}
+
+// reviewCmd enters Review mode and lists the pending change sets, or with
+// -json returns the list without touching the mode. The list is the change
+// sets `groups` lists filtered to those still awaiting a decision; entering
+// the mode is the same enter path the cmd+r chord takes.
+func reviewCmd(c *Client, path string, listOnly bool, stdout, stderr io.Writer) int {
+	res, err := c.Do(Request{Op: "review", Path: path, ReviewList: listOnly})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if listOnly {
+		return emit(stdout, res.Groups)
+	}
+	if len(res.Groups) == 0 {
+		fmt.Fprintf(stdout, "%s: no proposed changes\n", firstOf(path, "active buffer"))
+		return 0
+	}
+	fmt.Fprintf(stdout, "%s: review mode, %d proposed change set(s)\n",
+		firstOf(path, "active buffer"), len(res.Groups))
+	for _, g := range res.Groups {
+		fmt.Fprintf(stdout, "%d\tauthor %d\t%s\t%d ops\t%+d bytes\n",
+			g.ID, g.Author, g.State, g.Ops, g.Bytes)
+	}
 	return 0
 }
 
@@ -1299,7 +1413,7 @@ func braceTally(path, text string) BraceTally {
 	return t
 }
 
-func read(c *Client, path string, start, end int, lines string, stdout, stderr io.Writer, asJSON bool) int {
+func read(c *Client, path string, start, end int, lines string, annotated bool, stdout, stderr io.Writer, asJSON bool) int {
 	var sp, ep *int
 	if start >= 0 {
 		sp = &start
@@ -1315,7 +1429,7 @@ func read(c *Client, path string, start, end int, lines string, stdout, stderr i
 		}
 	}
 	res, err := c.Do(Request{Op: "text", Path: path, Start: sp, End: ep,
-		LineStart: lsp, LineEnd: lep})
+		LineStart: lsp, LineEnd: lep, Annotated: annotated})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -1330,10 +1444,17 @@ func read(c *Client, path string, start, end int, lines string, stdout, stderr i
 				"mine": sp.Mine(c.Author()), "by_user": sp.ByUser(),
 			})
 		}
-		return emit(stdout, map[string]any{
+		out := map[string]any{
 			"text": res.Text(), "version": res.Version,
 			"author": c.Author(), "spans": spans,
-		})
+		}
+		// An annotated read carries the state of every run in the returned
+		// text, relative to that text. It rides as raw JSON so the run list
+		// stays exactly what the editor computed.
+		if res.StatesJSON != "" {
+			out["states"] = json.RawMessage(res.StatesJSON)
+		}
+		return emit(stdout, out)
 	}
 	io.WriteString(stdout, res.Text())
 	return 0

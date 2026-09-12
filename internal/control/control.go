@@ -95,6 +95,15 @@ type Request struct {
 	// references, completion or diagnostics. Line and Col name the position to ask about
 	// (1-based), which the host maps to the server's UTF-16 coordinates.
 	LSPMode string
+	// ReviewList is set on a review request to return the pending change sets
+	// without entering Review mode. Its absence enters the mode, which is what
+	// a plain `raj ctl review` asks for; `-json` sets it.
+	ReviewList bool
+	// Annotated is set on a read to return the per-run change set and state of
+	// the review view — every live edit with its owner and its state. The text
+	// is the buffer's view either way; the agreed composition as the default is
+	// a future change.
+	Annotated bool
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
@@ -194,6 +203,7 @@ type SearchMatch struct {
 	Line      int // 1-based
 	Col       int // byte offset of the match within Text
 	Len       int
+	LineStart int // byte offset of the start of the hit line within the file
 	ByteStart int // byte offset of the match within the file
 	ByteEnd   int // one past the last byte of the match within the file
 	Text      string
@@ -226,6 +236,17 @@ func (s Span) Mine(author uint8) bool { return s.Author == author }
 // ByUser reports text the human typed, which is the span kind an agent must
 // never quietly discard.
 func (s Span) ByUser() bool { return s.Author == AuthorUser }
+
+// StateRun is one run of an annotated read: the bytes [Off, Off+Len) of the
+// returned text, the change set that put them there (0 is the file as loaded),
+// and what was decided about it. Offsets are relative to the text the read
+// returned, so they line up with the spans a caller was handed.
+type StateRun struct {
+	Off   int    `json:"off"`
+	Len   int    `json:"len"`
+	Group uint64 `json:"group"`
+	State string `json:"state"`
+}
 
 // AuthorOriginal is the file as loaded and AuthorUser is the human. Agents
 // start at FirstAgent. These are the piece table's own numbers, deliberately:
@@ -424,6 +445,10 @@ type Response struct {
 	// pending change sets as old→new text. Nested like LSPJSON, so it
 	// crosses the wire as one header string rather than as flat records.
 	DiffJSON string
+	// StatesJSON is the JSON-encoded []StateRun an annotated read returns: the
+	// per-run owner and state of the returned text. Nested like DiffJSON, so
+	// the run list crosses as one header string.
+	StatesJSON string
 }
 
 // Text flattens the spans, for callers that do not care who wrote what.

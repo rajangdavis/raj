@@ -27,6 +27,7 @@ import (
 	"raj/internal/search"
 	"raj/internal/symbols"
 	"raj/internal/tabs"
+	"raj/internal/timing"
 	"raj/internal/ui"
 	"raj/internal/widget"
 )
@@ -149,6 +150,11 @@ type App struct {
 	// Quit forces the exit instead of reopening the same question.
 	quitAsked bool
 
+	// saveDoneAt is when the last successful save finished, for the timing
+	// instrument: the next frame reports the distance from it to the first
+	// frame that paints the buffer clean. Zero whenever timing is off.
+	saveDoneAt time.Time
+
 	// NoRestore disables reading and writing the session file, for --no-restore
 	// and for tests that must not touch a workspace they did not create.
 	NoRestore bool
@@ -157,6 +163,22 @@ type App struct {
 	// crash loses seconds rather than the whole session.
 	sessionDirty bool
 	sessionSaved time.Time
+
+	// journals is the op-log tap per buffer path, nil until the first dirty
+	// tick opens one. journalSaved debounces the append the same way
+	// sessionSaved debounces the session file, but the tick does not fsync:
+	// durability is the save, close and quit flush.
+	journals     map[string]*logTap
+	journalSaved time.Time
+	// restoredAuthors is the author table read from the op logs at startup,
+	// waiting for the control registry StartControl builds later in startup.
+	// Ids are explicit, so a restored op's author resolves to the identity,
+	// name and kind it was written under rather than a fresh join order.
+	restoredAuthors []control.Participant
+
+	// tabWidth is the indent width the tab set was built with, kept so a log
+	// restore can build a File with the same geometry as one read from disk.
+	tabWidth int
 
 	// control is the Unix-socket server, nil unless --control was given. Its
 	// requests are executed in drainControl, on this thread.
@@ -181,6 +203,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		keymap:        keys.NewKeymap(),
 		screen:        ui.NewScreen(cols, rows),
 		Tabs:          tabs.New(tabWidth),
+		tabWidth:      tabWidth,
 		Explorer:      explorer.NewPane(root),
 		Search:        search.NewPane(root),
 		Problems:      problems.New(),
@@ -224,7 +247,7 @@ func New(host ui.Host, root string, tabWidth int) *App {
 	a.Search.Buffers = func() search.Docs {
 		var open search.Docs
 		for _, p := range a.Tabs.All() {
-			if p.File.Path == "" || !p.File.Dirty() {
+			if p.File.Path == "" || !p.File.ViewDirty() {
 				continue
 			}
 			if open == nil {
@@ -629,6 +652,7 @@ func (a *App) Run() error {
 	// The socket is a file in the filesystem; leaving it behind means the next
 	// process finds a path that answers nothing.
 	defer a.StopControl()
+	defer a.closeJournals()
 
 	a.Draw()
 	for e := range a.host.Events() {
@@ -684,6 +708,7 @@ func (a *App) Handle(e ui.Event) {
 		// debounce rather than a request per keystroke.
 		a.maybeRequestHints(a.Tabs.Active())
 		a.sessionTick(time.Now())
+		a.journalTick(time.Now())
 		a.Debug.sample()
 	case ui.Quit:
 		a.quit = true
@@ -759,6 +784,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 	case keys.ToggleDebug:
 		a.Debug.Open = !a.Debug.Open
 		a.Debug.sample()
+	case keys.ToggleInlayHints:
+		a.toggleInlayHints()
 	case keys.Quit:
 		a.tryQuit()
 	case keys.Suspend:
@@ -779,6 +806,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.reviewProposed(true)
 	case keys.RejectProposed:
 		a.reviewProposed(false)
+	case keys.ClearRejected:
+		a.clearRejected()
 	case keys.ReviewProposed:
 		a.reviewPicker()
 	case keys.NextProposed:
@@ -980,6 +1009,7 @@ func (a *App) handleEditor(action keys.Action, text string) {
 	if c, accepted, consumed := a.Complete.Handle(action); consumed {
 		if accepted {
 			a.acceptCompletion(p, prefix, c)
+			a.noteLeaseRefusal(p)
 		}
 		return
 	}
@@ -987,12 +1017,24 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		if !p.Handle(action) {
 			a.status = "unhandled: " + string(action)
 		}
+		a.noteLeaseRefusal(p)
 		a.offerCompletion(p, action == keys.Backspace)
 		return
 	}
 	p.HandleText(text)
+	a.noteLeaseRefusal(p)
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 	a.offerCompletion(p, true)
+}
+
+// noteLeaseRefusal drains a lease refusal the pane recorded during the last
+// edit attempt and turns it into the status note. A keystroke that touches a
+// pending or rejected run changes nothing, so the note is the only feedback;
+// draining it here keeps the mark from outliving the attempt.
+func (a *App) noteLeaseRefusal(p *editor.Pane) {
+	if g, ok := p.TakeLeaseRefusal(); ok {
+		a.status = leaseNote(g)
+	}
 }
 
 // paste routes a bracketed-paste payload to whatever has focus.
@@ -1051,6 +1093,7 @@ func (a *App) pasteIntoBuffer(text string) {
 		clip = editor.Clip{Text: text}
 	}
 	p.PasteClip(clip)
+	a.noteLeaseRefusal(p)
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 }
 
@@ -1233,7 +1276,7 @@ func (a *App) closeTabAt(i int) {
 		return
 	}
 	p := panes[i]
-	if !p.File.Dirty() {
+	if !p.File.ViewDirty() {
 		a.closeDoc(p)
 		a.Tabs.CloseIndex(i)
 		a.refreshProblems() // the open-files filter just lost a file
@@ -1354,7 +1397,7 @@ func (a *App) reloadActive() {
 		a.status = "nothing to reload: this buffer has never been saved"
 		return
 	}
-	if !p.File.Dirty() {
+	if !p.File.ViewDirty() {
 		a.reload(p, nil)
 		return
 	}
@@ -1381,7 +1424,7 @@ func (a *App) reloadActive() {
 // touched it. On a dirty buffer it is destructive in the same way Overwrite is,
 // just pointed the other way, so it sits in the middle and asks again.
 func (a *App) conflict(p *editor.Pane, path string, then func(saved bool)) {
-	dirty := p.File.Dirty()
+	dirty := p.File.ViewDirty()
 	options := []string{prompt.Overwrite, prompt.Reload, prompt.Cancel}
 	question := filepath.Base(path) + " was modified by another program. " +
 		"Overwrite it with this buffer, or reload and lose your changes?"
@@ -1481,9 +1524,15 @@ func (a *App) writeTo(p *editor.Pane, path string, then func(saved bool)) {
 // write is writeTo with the answer to the conflict question already given.
 // force is what an "Overwrite" answer turns into.
 func (a *App) write(p *editor.Pane, path string, force bool, then func(saved bool)) {
+	var saveStart time.Time
+	var tSaved time.Time
+	if timing.On {
+		saveStart = time.Now()
+	}
 	was := p.File.Path
 	renamed := was != path
 	p.File.SetPath(path)
+	a.appendJournal(p)
 	save := p.File.Save
 	if force {
 		save = p.File.SaveOver
@@ -1508,6 +1557,9 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 		report(then, false)
 		return
 	}
+	if timing.On {
+		tSaved = time.Now()
+	}
 	a.status = "saved " + p.File.Name()
 	p.ClearDiskStale()
 	// The user pressing save is the approval. Nothing else in the editor can
@@ -1519,8 +1571,21 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 	// All-or-nothing, and the status line says how much, because that is the
 	// only thing this gesture can honestly mean. Per-hunk review is a different
 	// gesture and wants its own binding.
-	if n := p.File.Session().AcceptPending(); n > 0 {
+	if n := p.File.AcceptPending(); n > 0 {
 		a.status += fmt.Sprintf(" (accepted %d proposed change set(s))", n)
+	}
+	a.recordWritten(p)
+	a.flushJournal(p)
+
+	if timing.On {
+		// The save proper is tSaved-saveStart: text materialise, writeAtomic
+		// and the saved-content digest. accept is the second Pending walk,
+		// AcceptPending over the same journal. saveDoneAt starts the clock the
+		// next frame reads to report save-to-clean.
+		a.saveDoneAt = time.Now()
+		timing.Log("save", a.saveDoneAt.Sub(saveStart),
+			"write", tSaved.Sub(saveStart),
+			"accept", a.saveDoneAt.Sub(tSaved))
 	}
 	if renamed {
 		// A rename is the only save that puts a file in the tree that was not

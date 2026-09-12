@@ -1,7 +1,10 @@
 package editor
 
 import (
+	"time"
+
 	"raj/internal/piecetable"
+	"raj/internal/timing"
 )
 
 // Reviewing what an agent proposed.
@@ -41,6 +44,10 @@ type PendingMark struct {
 // and the runs share the group id, so the gutter, the caret and next/prev
 // still read them as the one change set they are.
 func (p *Pane) PendingMarks() []PendingMark {
+	var start time.Time
+	if timing.On {
+		start = time.Now()
+	}
 	var out []PendingMark
 	for _, g := range p.File.Session().DiffPending() {
 		for _, h := range g.Hunks {
@@ -55,6 +62,12 @@ func (p *Pane) PendingMarks() []PendingMark {
 				Bytes:   g.Group.Bytes,
 			})
 		}
+	}
+	if timing.On {
+		// DiffPending walks the journal once per group, so the frame log can
+		// say whether that walk is the beat. Draw resets the accumulator
+		// before it paints.
+		timing.AddPending(time.Since(start))
 	}
 	return out
 }

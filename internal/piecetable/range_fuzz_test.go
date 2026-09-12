@@ -27,13 +27,13 @@ func FuzzRangeRebaseAgainstOracle(f *testing.F) {
 	//   - three adjacent ranges; the middle one's whole span deleted, which
 	//     must break that range and carry the other two flush against each
 	//     other
-	//   - a tracked range deleted, then the delete rejected: the range is
-	//     parked and restored through the anchor records
+	//   - a tracked range deleted, then the delete rejected and cleared: the
+	//     range is parked and restored through the anchor records
 	//   - inserts by two authors around a range, undone and redone
 	f.Add([]byte{0x05, 0x11, 0x00, 0x00, 0x01, 0x00})
 	f.Add([]byte{0x05, 0x2f, 0x00, 0x0e, 0x02, 0x00})
 	f.Add([]byte{0x05, 0x20, 0x05, 0x52, 0x05, 0x75, 0x01, 0x02})
-	f.Add([]byte{0x05, 0x52, 0x01, 0x02, 0x04, 0x00})
+	f.Add([]byte{0x05, 0x52, 0x01, 0x02, 0x04, 0x00, 0x06, 0x00})
 	f.Add([]byte{0x05, 0x52, 0x00, 0x03, 0x00, 0x06, 0x02, 0x00, 0x02, 0x01, 0x03, 0x00})
 
 	f.Fuzz(func(t *testing.T, program []byte) {
@@ -60,7 +60,7 @@ func FuzzRangeRebaseAgainstOracle(f *testing.F) {
 			text := doc.Buffer().Slice(0, doc.Buffer().Len())
 			author := authors[int(arg)%len(authors)]
 
-			switch op % 6 {
+			switch op % 7 {
 			case 0: // insert a whole rune at a rune boundary
 				pos := runeStart(text, int(arg)%(len(text)+1))
 				r := runes[int(arg)%len(runes)]
@@ -82,7 +82,7 @@ func FuzzRangeRebaseAgainstOracle(f *testing.F) {
 				doc.Redo(author)
 				oracle.Redo(author)
 				log = append(log, "redo")
-			case 4: // reject a change set, which is undo addressed by group
+			case 4: // reject a change set: a state flip, no text change
 				groups := doc.Groups()
 				if len(groups) == 0 {
 					continue
@@ -107,6 +107,22 @@ func FuzzRangeRebaseAgainstOracle(f *testing.F) {
 				}
 				filled++
 				log = append(log, "track")
+			case 6: // clear a rejected set: the reversal path, so anchors stay covered
+				var id uint64
+				found := false
+				for _, g := range doc.Groups() {
+					if g.State == Rejected {
+						id, found = g.ID, true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+				if doc.ClearRejected(id) != oracle.ClearRejected(id) {
+					t.Fatalf("engines disagreed about clearing group %d\nlog=%v", id, log)
+				}
+				log = append(log, "clear")
 			}
 
 			// The engines must agree on the text before a range comparison

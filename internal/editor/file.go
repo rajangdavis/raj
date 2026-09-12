@@ -60,9 +60,27 @@ type File struct {
 	savedLen int
 	savedSum [sha256.Size]byte
 
+	// savedDisk is the digest of the exact bytes the last write put on disk,
+	// encoding included, so the op log can record what a save wrote and a
+	// restart can tell a disk that matches it from one that has moved.
+	savedDisk [sha256.Size]byte
+
+	// savedGen is decisionGen at the last write, so a save can be trusted
+	// clean across frames while a decision that follows it cannot be: a
+	// decision moves the agreed composition without moving the version.
+	savedGen uint64
+	// decisionGen advances on every decision made through this File.
+	decisionGen uint64
+	// layered records that a change set has been proposed or rejected here,
+	// which is the only case where the view and the agreed composition differ.
+	layered bool
+
 	// cleanVer memoises the last content comparison, because Dirty is asked
 	// once per tab per frame and the comparison reads the whole document.
+	// cleanGen is decisionGen at that comparison, so a decision forces a fresh
+	// one even though the version did not move.
 	cleanVer  piecetable.Version
+	cleanGen  uint64
 	cleanKnow bool
 	cleanDirt bool
 
@@ -116,7 +134,8 @@ func Open(path string, tab int) (*File, error) {
 	text, enc := decode(string(data))
 	f := NewFile(path, text, tab)
 	f.Enc = enc
-	f.stampDisk() // what was just read is what raj knows about
+	f.savedDisk = sha256.Sum256(data) // the bytes actually on disk, encoding included
+	f.stampDisk()                     // what was just read is what raj knows about
 	return f, nil
 }
 
@@ -136,6 +155,66 @@ func NewFile(path, content string, tab int) *File {
 		idx:        view.NewIndex(content),
 	}
 	f.markSaved(content) // what was opened is what is on disk
+	return f
+}
+
+// RestoredWrite is the last write a restored buffer's log recorded: Content is
+// the exact text that was written, Version the session version it was written
+// at, and Disk the digest of the encoded bytes. A zero value — OK false — means
+// the log has no usable marker, and the buffer baselines on its origin instead.
+type RestoredWrite struct {
+	Content string
+	Version piecetable.Version
+	Disk    [sha256.Size]byte
+	OK      bool
+}
+
+// NewRestoredFile wraps a session rebuilt from a persisted journal. The session
+// already holds the document — base plus replayed ops — so the line index and
+// the highlighter are built from it and applied starts at its version, which is
+// what makes a restored dirty buffer render correctly on the first frame.
+//
+// The clean baseline is the last write the log recorded when wrote.OK is set —
+// the session version the bytes were written at, so a buffer restored from a log
+// whose disk matches that write reads clean rather than dirty. Otherwise the
+// baseline is the log's base, not what the session currently holds: the origin
+// store is the file as it was when logging began, so a buffer whose log contains
+// no ops reads as clean and one whose ops changed the text reads as dirty. A
+// restored buffer has never been saved by this process, so its encoding is the
+// default until a save writes one.
+func NewRestoredFile(path string, sess *piecetable.Session, tab int, wrote RestoredWrite) *File {
+	content := sess.Buffer().Slice(0, sess.Buffer().Len())
+	style, from := IndentFor(path, content, Indent{Width: tab})
+	f := &File{
+		Path:       path,
+		Indent:     style,
+		indentFrom: from,
+		Cols:       view.NewColumns(tab),
+		Syntax:     syntax.New(path, true),
+		dark:       true,
+		sess:       sess,
+		idx:        view.NewIndex(content),
+	}
+	f.applied = sess.Version()
+	if wrote.OK {
+		f.saved = wrote.Version
+		f.savedLen = len(wrote.Content)
+		f.savedSum = sha256.Sum256([]byte(wrote.Content))
+		f.savedDisk = wrote.Disk
+	} else {
+		store := sess.Store()
+		base := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
+		f.saved = 0
+		f.savedLen = len(base)
+		f.savedSum = sha256.Sum256(base)
+	}
+	// A restored log can hold decisions made after the write it records, so
+	// the version shortcut is not trustworthy until Dirty has compared the
+	// agreed composition once.
+	f.noteDecisions()
+	if f.layered {
+		f.decisionGen = 1 // savedGen stays zero, forcing that comparison
+	}
 	return f
 }
 
@@ -205,18 +284,67 @@ const MaxCleanCheck = 8 << 20
 // looks like — is worth digesting.
 func (f *File) Dirty() bool {
 	v := f.sess.Version()
-	if v == f.saved {
+	if !f.layered {
+		if v == f.saved {
+			return false
+		}
+		if f.cleanKnow && f.cleanVer == v {
+			return f.cleanDirt
+		}
+		dirty := true
+		if n := f.Len(); n == f.savedLen && n <= MaxCleanCheck {
+			dirty = f.checksum() != f.savedSum
+		}
+		f.cleanVer, f.cleanKnow, f.cleanDirt = v, true, dirty
+		return dirty
+	}
+	// A change set is proposed or rejected here, so the buffer can hold text
+	// that is not part of the agreed composition. Clean means the agreed
+	// composition matches what the last write saved, not that the screen does.
+	// A decision moves it without moving the version, which is what
+	// decisionGen is for.
+	if v == f.saved && f.decisionGen == f.savedGen {
 		return false
 	}
-	if f.cleanKnow && f.cleanVer == v {
+	if f.cleanKnow && f.cleanVer == v && f.cleanGen == f.decisionGen {
 		return f.cleanDirt
 	}
-	dirty := true
-	if n := f.Len(); n == f.savedLen && n <= MaxCleanCheck {
-		dirty = f.checksum() != f.savedSum
-	}
-	f.cleanVer, f.cleanKnow, f.cleanDirt = v, true, dirty
+	dirty := f.acceptedDirty()
+	f.cleanVer, f.cleanGen, f.cleanKnow, f.cleanDirt = v, f.decisionGen, true, dirty
 	return dirty
+}
+
+// ViewDirty reports whether the buffer on screen differs from the last save.
+//
+// It is not Dirty. Dirty asks whether the agreed composition — what a save
+// would write — matches disk, which is the save-path question. A buffer
+// holding only a proposed or rejected set has an agreed composition equal to
+// disk, so Dirty is false and a save would be a no-op, while the view still
+// shows bytes that are not on disk. Search, the tab marker and the
+// unsaved-work prompts need the view question, and answering it with the
+// agreed composition is what let search fall back to the stale file.
+//
+// The version check catches any edit, decisionGen a decision made through this
+// File (which moves the view without moving the version), and HasDecisions one
+// made straight on the session. Any of them can trip while the bytes still
+// match disk — an undone edit is the common one — so a tripped probe falls
+// through to a content comparison rather than answering dirty.
+func (f *File) ViewDirty() bool {
+	// The version and the decision generation are cheap "has anything
+	// happened" probes, not the answer. An edit that is undone returns the text
+	// to what is on disk without returning the version, and a save writes the
+	// agreed composition even while a rejected set still sits in the view, so
+	// either probe can be true while the bytes match disk. When one trips,
+	// compare the view to the bytes the last write put there, the same content
+	// check the old view Dirty used.
+	if f.sess.Version() == f.saved && f.decisionGen == f.savedGen && !f.sess.HasDecisions() {
+		return false
+	}
+	n := f.Len()
+	if n != f.savedLen || n > MaxCleanCheck {
+		return true
+	}
+	return f.checksum() != f.savedSum
 }
 
 // checksum digests the document without materialising it. Reading it as one
@@ -236,14 +364,59 @@ func (f *File) checksum() [sha256.Size]byte {
 	return sum
 }
 
+// acceptedDirty reports whether the agreed composition differs from the bytes
+// the last write put on disk. It is the layered form of checksum: the same
+// size guard, because past MaxCleanCheck the digest would cost a frame and a
+// buffer that cannot be verified cheaply is reported dirty.
+func (f *File) acceptedDirty() bool {
+	acc := f.sess.Project(piecetable.AcceptedOnly)
+	n := acc.Len()
+	if n != f.savedLen || n > MaxCleanCheck {
+		return true
+	}
+	h := sha256.New()
+	buf := acc.Buffer()
+	for pos := 0; pos < n; {
+		size := 64 << 10
+		if n-pos < size {
+			size = n - pos
+		}
+		io.WriteString(h, buf.Slice(pos, size))
+		pos += size
+	}
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return sum != f.savedSum
+}
+
 // markSaved records what is now on disk, so a later edit that puts the buffer
-// back to it reads as clean.
+// back to it reads as clean. The encoding is applied so the digest names the
+// bytes a save would write.
 func (f *File) markSaved(content string) {
+	f.markSavedBytes(content, encode(content, f.Enc))
+}
+
+// markSavedBytes is markSaved with the encoded bytes already in hand, for a
+// save that just wrote them. content is the decoded text and data the exact
+// bytes on disk.
+func (f *File) markSavedBytes(content string, data []byte) {
 	f.saved = f.sess.Version()
 	f.savedLen = len(content)
 	f.savedSum = sha256.Sum256([]byte(content))
+	f.savedDisk = sha256.Sum256(data)
+	f.savedGen = f.decisionGen
 	f.cleanKnow = false
 }
+
+// SavedDigest is the SHA-256 of the exact bytes the last save wrote. It is the
+// zero digest before the first save. The op log records it so a restart can
+// tell a save's own write from a later external edit.
+func (f *File) SavedDigest() [sha256.Size]byte { return f.savedDisk }
+
+// SavedVersion is the session version the last save wrote, paired with
+// SavedDigest. A restored buffer sets it from the log's Written marker, so
+// the next write records the same version the bytes carry.
+func (f *File) SavedVersion() piecetable.Version { return f.saved }
 
 // Name is the file's base name, or a placeholder for an unnamed buffer.
 func (f *File) Name() string {
@@ -330,30 +503,64 @@ func (f *File) HintCols(line int) []view.HintCol {
 	return HintCols(f.HintsAt(line))
 }
 
-// Insert adds text attributed to author.
-func (f *File) Insert(author piecetable.Author, pos int, text string) {
+// Leased names the change set that owns the text at [pos,pos+length), if any.
+// A pending, rejected or invalidated run is read-only until it is decided, so
+// an edit that would touch it is refused; the set is named so the caller can
+// point at the decision. It reports false when nothing is leased, which is the
+// common case.
+func (f *File) Leased(pos, length int) (group uint64, ok bool) {
+	return f.sess.Leased(pos, length)
+}
+
+// EditLeased reports whether replacing [pos,pos+remove) would intersect a
+// lease, naming the set that owns it. A pure insertion has remove == 0, which
+// probes the insertion point itself; a replacement is caught by the bytes it
+// takes away, since an insertion point strictly inside a lease would put the
+// start of the removed span inside it too. The bytes put down need no check of
+// their own: an insert flush with a run edge sits beside the run, not in it.
+func (f *File) EditLeased(pos, remove int) (group uint64, ok bool) {
+	return f.Leased(pos, remove)
+}
+
+// Insert adds text attributed to author. It refuses, changing nothing, when
+// the insertion would land inside a leased run, and reports whether it landed.
+// Returning the outcome rather than panicking is what lets a caller skip the
+// cursor shifts an insertion would have caused.
+func (f *File) Insert(author piecetable.Author, pos int, text string) bool {
 	if text == "" {
-		return
+		return false
+	}
+	if _, ok := f.Leased(pos, 0); ok {
+		return false
 	}
 	f.sess.Insert(author, pos, text)
 	f.sync()
+	return true
 }
 
-// Delete removes length bytes.
-func (f *File) Delete(author piecetable.Author, pos, length int) {
+// Delete removes length bytes. It refuses, changing nothing, when the range
+// would touch a leased run, and reports whether it landed.
+func (f *File) Delete(author piecetable.Author, pos, length int) bool {
 	if length <= 0 {
-		return
+		return false
+	}
+	if _, ok := f.Leased(pos, length); ok {
+		return false
 	}
 	f.sess.Delete(author, pos, length)
 	f.sync()
+	return true
 }
 
 // ApplyDiff routes an agent's diff through the session and catches the index
 // up on every hunk that landed.
 func (f *File) ApplyDiff(author piecetable.Author, base piecetable.Version, hunks []piecetable.Hunk) []piecetable.Conflict {
-	before := f.sess.Version()
 	_, conflicts := f.sess.ApplyDiff(author, base, hunks)
-	for _, op := range f.sess.OpsSince(before) {
+	// Anchor the catch-up at `applied`, not at the version on entry. An op that
+	// reached the journal without going through File — a reject made straight on
+	// the session — is otherwise left unmirrored while `applied` jumps past it,
+	// and its line starts stay in the index for good.
+	for _, op := range f.sess.OpsSince(f.applied) {
 		f.applyToIndex(op)
 	}
 	f.applied = f.sess.Version()
@@ -384,6 +591,81 @@ func (f *File) reverse(ok bool) ([]piecetable.Op, bool) {
 	}
 	f.applied = f.sess.Version()
 	return ops, true
+}
+
+// RejectGroup marks a change set rejected. Rejecting is a decision, not an
+// edit, so the text and the line index do not move; the sync is a no-op for it
+// and stays only as a guard for an op that reached the session outside File,
+// so a later ApplyDiff does not jump `applied` past unmirrored line starts.
+func (f *File) RejectGroup(group uint64) bool {
+	ok := f.sess.RejectGroup(group)
+	if ok {
+		f.noteDecision()
+	}
+	f.sync()
+	return ok
+}
+
+// ClearRejected hard-purges a rejected change set: it reverses the set out of
+// the document and drops the decision. Unlike RejectGroup this really edits,
+// so the line index has to mirror the reversal; noteDecision moves the
+// decision generation so Dirty and ViewDirty stop trusting the pre-clear
+// composition. It reports false when the set was not rejected or a reversal
+// genuinely wedged, exactly as the session does.
+func (f *File) ClearRejected(group uint64) bool {
+	if !f.sess.ClearRejected(group) {
+		return false
+	}
+	f.noteDecision()
+	f.sync()
+	return true
+}
+
+// ProposeGroup marks a change set as awaiting a decision. A proposal is not in
+// the agreed composition — it is neither saved nor read back by a driver — and
+// routing the mark through here is what lets Dirty know the composition moved.
+func (f *File) ProposeGroup(group uint64) {
+	f.sess.MarkGroup(group, piecetable.Proposed)
+	f.noteDecision()
+}
+
+// AcceptGroup agrees to a change set. Accepting is a decision, not an edit: the
+// text stays where it is, so no op reaches the index; only the agreed
+// composition moves, which is what the clean baseline tracks.
+func (f *File) AcceptGroup(group uint64) {
+	f.sess.AcceptGroup(group)
+	f.noteDecision()
+}
+
+// AcceptPending is the bulk accept the save gesture uses. It reports how many
+// sets it agreed to, matching Session.AcceptPending.
+func (f *File) AcceptPending() int {
+	n := f.sess.AcceptPending()
+	if n > 0 {
+		f.noteDecision()
+	}
+	return n
+}
+
+// noteDecision records that the agreed composition may have changed without the
+// session version moving, so Dirty's memo has to be dropped and the buffer has
+// to stop taking the view-only cheap path.
+func (f *File) noteDecision() {
+	f.layered = true
+	f.decisionGen++
+	f.cleanKnow = false
+}
+
+// noteDecisions marks a session that already carries decisions — one restored
+// from its journal — as layered, so Dirty compares the agreed composition
+// rather than the view.
+func (f *File) noteDecisions() {
+	for _, g := range f.sess.Groups() {
+		if g.State != piecetable.Accepted {
+			f.layered = true
+			return
+		}
+	}
 }
 
 // sync catches the index up on every op applied since it was last current.
@@ -444,7 +726,15 @@ func (f *File) applyToIndex(op piecetable.Op) {
 	f.Syntax.Edit(op.Pos, op.DelLen(), n, f.nlBuf, uint64(op.Seq)+1)
 }
 
-// Save writes the document to disk and marks the current version clean.
+// Save writes the agreed composition to disk and marks the current version
+// clean.
+//
+// It writes Project(AcceptedOnly), never the raw view: proposed and rejected
+// sets are in the buffer but not on disk, which is what makes deciding a
+// proposal a separate gesture from saving one. The save gesture is itself the
+// approval, so every pending set is accepted first — the review popup a human
+// answers is that gesture, and the control verb refuses while anything is
+// proposed before it reaches here.
 //
 // The write is atomic — see writeAtomic — so an interrupted save leaves the
 // previous file rather than a truncated one.
@@ -459,17 +749,19 @@ func (f *File) Save() error {
 	return f.SaveOver()
 }
 
-// SaveOver writes unconditionally, discarding whatever else was written to the
-// file. Only for a caller that has asked and been told to go ahead.
+// SaveOver is Save without the disk-changed check. Only for a caller that has
+// asked and been told to go ahead.
 func (f *File) SaveOver() error {
 	if f.Path == "" {
 		return os.ErrInvalid
 	}
-	content := f.Text()
-	if err := writeAtomic(f.Path, encode(content, f.Enc)); err != nil {
+	f.AcceptPending()
+	content := f.sess.Project(piecetable.AcceptedOnly).Text()
+	data := encode(content, f.Enc)
+	if err := writeAtomic(f.Path, data); err != nil {
 		return err
 	}
-	f.markSaved(content)
+	f.markSavedBytes(content, data)
 	f.stampDisk() // raj is now the last writer
 	return nil
 }
@@ -515,13 +807,19 @@ func (f *File) Snapshot(pos, length int) []piecetable.PieceRec {
 	return f.sess.Snapshot(pos, length)
 }
 
-// InsertPieces splices captured pieces at pos, appending no text.
-func (f *File) InsertPieces(author piecetable.Author, pos int, recs []piecetable.PieceRec) {
+// InsertPieces splices captured pieces at pos, appending no text. It refuses,
+// changing nothing, when the insertion point lands inside a leased run, and
+// reports whether it landed.
+func (f *File) InsertPieces(author piecetable.Author, pos int, recs []piecetable.PieceRec) bool {
 	if len(recs) == 0 {
-		return
+		return false
+	}
+	if _, ok := f.Leased(pos, 0); ok {
+		return false
 	}
 	f.sess.InsertPieces(author, pos, recs)
 	f.sync()
+	return true
 }
 
 // NewlinePiece returns a piece pointing at a single newline, appending one to

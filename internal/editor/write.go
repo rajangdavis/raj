@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+
+	"raj/internal/timing"
 )
 
 // defaultMode is what a file raj creates gets. Only used when there is nothing
@@ -49,6 +52,10 @@ var readFile = os.ReadFile
 // The comparison is a full byte compare, not a hash: the files raj opens are
 // small enough that hashing would add a step without saving one.
 func writeAtomic(path string, data []byte) error {
+	var tStart, tOpen, tWrite, tSync, tClose, tRename, tDir time.Time
+	if timing.On {
+		tStart = time.Now()
+	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
 	}
@@ -63,6 +70,9 @@ func writeAtomic(path string, data []byte) error {
 		return err
 	}
 	name := tmp.Name()
+	if timing.On {
+		tOpen = time.Now()
+	}
 	// Every failure past this point removes the temp file. A save that fails
 	// should not litter the directory it failed in — and the user is about to
 	// try again.
@@ -72,9 +82,15 @@ func writeAtomic(path string, data []byte) error {
 		tmp.Close()
 		return err
 	}
+	if timing.On {
+		tWrite = time.Now()
+	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
+	}
+	if timing.On {
+		tSync = time.Now()
 	}
 	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
@@ -83,10 +99,19 @@ func writeAtomic(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	if timing.On {
+		tClose = time.Now()
+	}
 	if err := os.Rename(name, path); err != nil {
 		return err
 	}
+	if timing.On {
+		tRename = time.Now()
+	}
 	syncDir(dir)
+	if timing.On {
+		tDir = time.Now()
+	}
 
 	// Everything above reporting success is the filesystem's word. Read the
 	// file back and compare before returning nil: a mismatch means the write
@@ -98,6 +123,20 @@ func writeAtomic(path string, data []byte) error {
 	}
 	if !bytes.Equal(got, data) {
 		return fmt.Errorf("save verification failed: %s on disk does not match what was written (%d bytes read back, %d written)", path, len(got), len(data))
+	}
+	if timing.On {
+		// Which of the filesystem's steps the beat went into: the temp file
+		// open and write, the file fsync that makes the bytes durable, the
+		// chmod and close, the atomic rename, the directory fsync that makes
+		// the rename durable, and the read-back that verifies what landed.
+		timing.Log("write-atomic", time.Since(tStart),
+			"open", tOpen.Sub(tStart),
+			"write", tWrite.Sub(tOpen),
+			"fsync", tSync.Sub(tWrite),
+			"close", tClose.Sub(tSync),
+			"rename", tRename.Sub(tClose),
+			"dirsync", tDir.Sub(tRename),
+			"readback", time.Since(tDir))
 	}
 	return nil
 }

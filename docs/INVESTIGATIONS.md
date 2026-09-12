@@ -325,6 +325,18 @@ than trusted because it looks right.
   found by the properties in CURSOR-VIEWPORT-SPEC.md within seconds of writing
   them, having survived every example test in the repository.
 
+- [~] **Reject bypassed `File`, and `ApplyDiff` anchored its catch-up at the
+  version on entry.** `host.Decide` and `App.decideProposed` called
+  `Session.RejectGroup` directly, so the reversal's ops never reached `f.idx`
+  and `f.applied` stayed put; the next `ApplyDiff` then mirrored only its own
+  diff while `applied` jumped to the new version, and the unmirrored reversal
+  was gone for good. Every rejected insertion's line starts stayed in the index,
+  so the count ran away from the text (approaching 2× under apply/reject
+  cycles) and line starts near EOF addressed past the buffer. Fixed in buffer
+  2026-09-11: `File.RejectGroup` delegates then `sync`s (even when a reverse
+  rolls back), both callers route through it, and `ApplyDiff` catches up from
+  `f.applied` rather than a local `before`. Host verification pending.
+
 ### Escape never arrived without KKP
 
 - [x] **A lone ESC was held forever, so escape did nothing.** `Parse` returns
@@ -890,3 +902,36 @@ Remaining:
 - `cmd+.` is caret-adjacent only, matching VS Code's quick-fix action: it applies
   the nearest hint's edits on the current line. A whole-line or whole-file apply
   is not offered.
+
+## The timing instrument wrote to the terminal (2026-09-11)
+
+Wave B's save-review lag instrument (`internal/timing`) defaulted its output to
+`os.Stderr` and, with `RAJ_TIMING` set, logged a `draw` line on every frame.
+raj owns the terminal — it runs in the alternate screen and emits its own
+escape stream — so the two writers shared one file descriptor. The timing
+lines interleaved with the frame output and painted over the screen until the
+editor was unusable: the document text was never touched, but the user could
+not see or review anything and had to fall back to `git diff` to inspect the
+changes. Recovery took killing the process and relaunching with the variable
+unset (`env -u RAJ_TIMING raj .`), not any editor action.
+
+### What the design got wrong
+
+- **stderr is not a neutral sink in a full-screen program.** For a CLI it is
+  the diagnostics stream; here it is the same terminal the TUI is drawing to,
+  so anything written to it lands in the middle of a frame. A terminal-ui
+  process has no safe diagnostic stream of its own.
+- **The mitigation was the user's job.** The instrument documented "redirect
+  stderr to a file", which turns a design flaw into an instruction and failed
+  the first time it mattered. A gate that is safe only when the operator
+  remembers a shell redirect is not safe.
+- **A single startup read made it unrecoverable in-process.** `On` is computed
+  once, so once the broken gate was on only a restart could clear it — and the
+  restart inherited the same environment.
+
+### The rule
+
+Environment-gated diagnostics in the full-screen editor go to a **file**, never
+to stdout or stderr. `RAJ_TIMING` names a path; `1` means a documented default
+path under the user state directory; unset or empty means off, and an
+unopenable path means off as well — never a fallback to a terminal stream.

@@ -167,6 +167,52 @@ func TestRunReportsMatchByteOffsets(t *testing.T) {
 	if m.ByteStart != 9 || m.ByteEnd != 15 {
 		t.Errorf("byte_start=%d byte_end=%d, want 9 and 15", m.ByteStart, m.ByteEnd)
 	}
+	// The same hit's line starts at the first byte of the file here; the
+	// distinction only shows on an indented line, tested below.
+	if m.LineStart != 9 {
+		t.Errorf("line_start=%d, want 9", m.LineStart)
+	}
+}
+
+// LineStart is the first byte of the hit's line, so it parts from ByteStart
+// whenever the match is not at the line's first byte — the anchor an apply
+// wants when it means the whole line, leading indentation included.
+func TestRunReportsLineStart(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "x.txt"), []byte("line one\n\tneedle here\nline three\n"), 0o644)
+	res := Run(dir, Query{Text: "needle"})
+	if len(res.Matches) != 1 {
+		t.Fatalf("got %d matches", len(res.Matches))
+	}
+	m := res.Matches[0]
+	if m.Col != 1 || m.ByteStart != 10 || m.ByteEnd != 16 {
+		t.Errorf("col=%d byte_start=%d byte_end=%d, want 1, 10 and 16", m.Col, m.ByteStart, m.ByteEnd)
+	}
+	// "line one\n" is 9 bytes; line 2 starts at 9, one byte before the tab.
+	if m.LineStart != 9 {
+		t.Errorf("line_start=%d, want 9", m.LineStart)
+	}
+}
+
+// The per-line fallback, taken for a non-ASCII file under a case-insensitive
+// query, computes each line start positionally and must set it too.
+func TestRunFallbackReportsLineStart(t *testing.T) {
+	dir := t.TempDir()
+	// The Kelvin sign on line one forces the fallback for a query containing
+	// "s"; the match on line two sits one tab in.
+	os.WriteFile(filepath.Join(dir, "x.txt"), []byte("\u212A\n\task here\n"), 0o644)
+	res := Run(dir, Query{Text: "ask"})
+	if len(res.Matches) != 1 {
+		t.Fatalf("got %d matches", len(res.Matches))
+	}
+	m := res.Matches[0]
+	if m.ByteStart != 5 || m.ByteEnd != 8 {
+		t.Errorf("byte_start=%d byte_end=%d, want 5 and 8", m.ByteStart, m.ByteEnd)
+	}
+	// The Kelvin sign is three bytes; with its newline, line 2 starts at 4.
+	if m.LineStart != 4 {
+		t.Errorf("line_start=%d, want 4", m.LineStart)
+	}
 }
 
 func TestRunEmptyQuery(t *testing.T) {

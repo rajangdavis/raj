@@ -84,22 +84,23 @@ const (
 // from the byte alone whether to skip it or refuse the program.
 const (
 	// arguments (0x00–0x7f): skipped when unknown
-	OpPath    = 0x01 // the file a verb acts on, as raw bytes
-	OpBase    = 0x02 // uW: the version an APPLY's offsets were measured in
-	OpSpan    = 0x03 // uW uW: start and end of the span to replace
-	OpText    = 0x04 // replacement bytes
-	OpAuthor  = 0x05 // u8: the writer
-	OpToken   = 0x06 // shared secret, for a TCP listener
-	OpGroup   = 0x07 // uW: a change set id
-	OpQuery   = 0x08 // search pattern
-	OpFlags   = 0x09 // u8 bitfield: see FlagRegex, FlagCase, FlagWord
-	OpID      = 0x0a // varint: request id, echoed in the response
-	OpInclude = 0x0b // comma-separated globs a search is limited to
-	OpExclude = 0x0c // comma-separated globs a search skips
-	OpLine    = 0x0d // varint: 1-based line for goto
-	OpCol     = 0x0e // varint: 1-based column for goto
-	OpDumpID  = 0x0f // varint: a snapshot id from a prior dump, for patch
-	OpLSPMode = 0x10 // string: hover, definition, completion or diagnostics
+	OpPath       = 0x01 // the file a verb acts on, as raw bytes
+	OpBase       = 0x02 // uW: the version an APPLY's offsets were measured in
+	OpSpan       = 0x03 // uW uW: start and end of the span to replace
+	OpText       = 0x04 // replacement bytes
+	OpAuthor     = 0x05 // u8: the writer
+	OpToken      = 0x06 // shared secret, for a TCP listener
+	OpGroup      = 0x07 // uW: a change set id
+	OpQuery      = 0x08 // search pattern
+	OpFlags      = 0x09 // u8 bitfield: see FlagRegex, FlagCase, FlagWord
+	OpID         = 0x0a // varint: request id, echoed in the response
+	OpInclude    = 0x0b // comma-separated globs a search is limited to
+	OpExclude    = 0x0c // comma-separated globs a search skips
+	OpLine       = 0x0d // varint: 1-based line for goto
+	OpCol        = 0x0e // varint: 1-based column for goto
+	OpDumpID     = 0x0f // varint: a snapshot id from a prior dump, for patch
+	OpLSPMode    = 0x10 // string: hover, definition, completion or diagnostics
+	OpReviewList = 0x11 // flag: review returns the list only, entering no mode
 
 	// verbs (0x80–0xff) are the driver verbs, refused when unknown
 	OpPing    = 0x80
@@ -121,6 +122,7 @@ const (
 	OpPatch   = 0x90 // replace a snapshot's text; the editor diffs and rebases
 	OpLSP     = 0x91 // ask the language server: hover, definition, completion, diagnostics
 	OpDiff    = 0x92 // pending change sets as old→new text, for review
+	OpReview  = 0x93 // pending change sets and, unless list-only, review mode
 
 )
 
@@ -149,6 +151,7 @@ var names = map[byte]string{
 	OpGoto:  "goto", OpClose: "close", OpLine: "line", OpCol: "col",
 	OpDumpID: "dump-id", OpDump: "dump", OpPatch: "patch",
 	OpLSPMode: "lsp-mode", OpLSP: "lsp", OpDiff: "diff",
+	OpReviewList: "review-list", OpReview: "review",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

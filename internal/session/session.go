@@ -4,7 +4,8 @@
 // # What is saved, and what deliberately is not
 //
 // Open tabs and which one was active, the primary cursor and scroll position in
-// each, wrap, the expanded directories in the sidebar, and which pane had focus.
+// each, wrap, whether inlay hints are on, the expanded directories in the
+// sidebar, and which pane had focus.
 // All of it is view state: recreating it wrong costs a scroll, and recreating it
 // not at all costs the same as today.
 //
@@ -47,6 +48,11 @@ type Tab struct {
 	// JSON so a session written by an older build still reads as Ratio 0.
 	Ratio float64 `json:"ratio,omitempty"`
 	Wrap  bool    `json:"wrap"`
+
+	// Hints is the pane inlay-hints flag. It is a pointer so absence is a
+	// distinct state: an old session with no hints field loads nil and the app
+	// default applies, while an explicit false is a choice that is kept.
+	Hints *bool `json:"hints,omitempty"`
 }
 
 // State is a whole workspace's remembered position.
@@ -64,6 +70,20 @@ type State struct {
 // Version is the current format.
 const Version = 1
 
+// Dir is the workspace's scratch-state directory: .git/raj when the workspace
+// is a git checkout, and .raj otherwise. The session file and the op log both
+// live under it, so the two do not invent separate conventions for the same
+// question.
+func Dir(root string) string {
+	if root == "" {
+		return ""
+	}
+	if info, err := os.Stat(filepath.Join(root, ".git")); err == nil && info.IsDir() {
+		return filepath.Join(root, ".git", "raj")
+	}
+	return filepath.Join(root, ".raj")
+}
+
 // File is where a workspace's state lives, relative to its root.
 //
 // Under .git rather than beside it: this is per-checkout scratch state, not
@@ -72,13 +92,11 @@ const Version = 1
 // with no .git falls back to .raj, which is where the hidden-files config
 // already lives.
 func File(root string) string {
-	if root == "" {
+	dir := Dir(root)
+	if dir == "" {
 		return ""
 	}
-	if info, err := os.Stat(filepath.Join(root, ".git")); err == nil && info.IsDir() {
-		return filepath.Join(root, ".git", "raj", "session.json")
-	}
-	return filepath.Join(root, ".raj", "session.json")
+	return filepath.Join(dir, "session.json")
 }
 
 // Save writes the state. Temp file plus rename, so an interrupted write leaves

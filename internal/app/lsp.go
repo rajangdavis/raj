@@ -440,6 +440,7 @@ func (a *App) applyAnswer() {
 // It runs before the tab is removed rather than after, because the path is read
 // off the pane and a removed pane is one nobody can be asked about.
 func (a *App) closeDoc(p *editor.Pane) {
+	a.closeJournal(p)
 	path := a.docPath(p)
 	if path == "" {
 		return // an unnamed buffer was never opened with a server

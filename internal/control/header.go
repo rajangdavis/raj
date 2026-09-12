@@ -41,60 +41,64 @@ import (
 // latent.
 const (
 	// request fields
-	hID       = 0x01
-	hOp       = 0x02
-	hPath     = 0x03
-	hAuthor   = 0x04
-	hToken    = 0x05
-	hBase     = 0x06
-	hHunks    = 0x07
-	hQuery    = 0x08
-	hCancel   = 0x09
-	hGroup    = 0x0a
-	hIdentity = 0x0b
-	hName     = 0x0c
-	hArgv     = 0x0d
-	hDir      = 0x0e
-	hOpName   = 0x0f
+	hID         = 0x01
+	hOp         = 0x02
+	hPath       = 0x03
+	hAuthor     = 0x04
+	hToken      = 0x05
+	hBase       = 0x06
+	hHunks      = 0x07
+	hQuery      = 0x08
+	hCancel     = 0x09
+	hGroup      = 0x0a
+	hIdentity   = 0x0b
+	hName       = 0x0c
+	hArgv       = 0x0d
+	hDir        = 0x0e
+	hOpName     = 0x0f
+	hReviewList = 0x10 // review: list the pending sets without entering the mode
+	hAnnotated  = 0x11 // read: return the annotated composition and its state runs
 
 	// response fields
-	hExit         = 0x20
-	hDirty        = 0x21
-	hStats        = 0x22
-	hParticipants = 0x23
-	hGroups       = 0x24
-	hMessages     = 0x25
-	hStream       = 0x26
-	hOutLen       = 0x27
-	hFinal        = 0x28
-	hOK           = 0x29
-	hErr          = 0x2a
-	hRoot         = 0x2b
-	hPID          = 0x2c
-	hVersion      = 0x2d
-	hBuffers      = 0x2e
-	hFiles        = 0x2f
-	hCapped       = 0x30
-	hMatches      = 0x31
-	hConflicts    = 0x32
-	hSpans        = 0x33
-	hLine         = 0x34 // 1-based line for goto
-	hCol          = 0x35 // 1-based column for goto
-	hStart        = 0x36 // byte offset for read span; absent means read whole file
-	hEnd          = 0x37 // byte offset for read span; absent means read whole file
-	hBytes        = 0x38 // buffer size in bytes, on a version response
-	hLines        = 0x39 // buffer size in lines, on a version response
-	hLineStart    = 0x3a // read: 1-based first line of the range
-	hLineEnd      = 0x3b // read: 1-based last line of the range
-	hDump         = 0x3c // patch: snapshot id to replace; dump: the id it returns
-	hHash         = 0x3d // dump: hash of the snapshot text
-	hLSPMode      = 0x3e // lsp: hover, definition, references, completion or diagnostics
-	hLSPJSON      = 0x3f // lsp: the JSON-encoded answer
-	hDiffJSON     = 0x40 // diff: the JSON-encoded pending change sets
-	hSrcVersion   = 0x41 // the build revision of the server, stamped on every response
-	hConsidered   = 0x42 // search: files opened and scanned; zero under an -include that matched nothing
-	hTruncated    = 0x43 // search: files the per-file cap cut down, with shown and total
-	hBufferState  = 0x44 // buffers: sparse pending and moved counts, one record per buffer that has either
+	hExit           = 0x20
+	hDirty          = 0x21
+	hStats          = 0x22
+	hParticipants   = 0x23
+	hGroups         = 0x24
+	hMessages       = 0x25
+	hStream         = 0x26
+	hOutLen         = 0x27
+	hFinal          = 0x28
+	hOK             = 0x29
+	hErr            = 0x2a
+	hRoot           = 0x2b
+	hPID            = 0x2c
+	hVersion        = 0x2d
+	hBuffers        = 0x2e
+	hFiles          = 0x2f
+	hCapped         = 0x30
+	hMatches        = 0x31
+	hConflicts      = 0x32
+	hSpans          = 0x33
+	hLine           = 0x34 // 1-based line for goto
+	hCol            = 0x35 // 1-based column for goto
+	hStart          = 0x36 // byte offset for read span; absent means read whole file
+	hEnd            = 0x37 // byte offset for read span; absent means read whole file
+	hBytes          = 0x38 // buffer size in bytes, on a version response
+	hLines          = 0x39 // buffer size in lines, on a version response
+	hLineStart      = 0x3a // read: 1-based first line of the range
+	hLineEnd        = 0x3b // read: 1-based last line of the range
+	hDump           = 0x3c // patch: snapshot id to replace; dump: the id it returns
+	hHash           = 0x3d // dump: hash of the snapshot text
+	hLSPMode        = 0x3e // lsp: hover, definition, references, completion or diagnostics
+	hLSPJSON        = 0x3f // lsp: the JSON-encoded answer
+	hDiffJSON       = 0x40 // diff: the JSON-encoded pending change sets
+	hSrcVersion     = 0x41 // the build revision of the server, stamped on every response
+	hConsidered     = 0x42 // search: files opened and scanned; zero under an -include that matched nothing
+	hTruncated      = 0x43 // search: files the per-file cap cut down, with shown and total
+	hBufferState    = 0x44 // buffers: sparse pending and moved counts, one record per buffer that has either
+	hMatchLineStart = 0x45 // search: byte offset of each hit line start within the file
+	hStatesJSON     = 0x46 // read -annotated: the JSON-encoded []StateRun
 
 )
 
@@ -123,7 +127,7 @@ var verbCodes = map[string]byte{
 	"goto": 24, "close": 25,
 	"dump": 26, "patch": 27,
 	"lsp": 28, "lspprep": 29,
-	"diff": 30,
+	"diff": 30, "review": 31,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -201,6 +205,8 @@ func encodeHeader(h Header) []byte {
 	num(hCancel, h.Cancel)
 	num(hLine, h.Line)
 	num(hCol, h.Col)
+	flag(hReviewList, h.ReviewList)
+	flag(hAnnotated, h.Annotated)
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
 	// dump with -start 0 asks for the head of the file, an absent one asks for
@@ -241,6 +247,7 @@ func encodeHeader(h Header) []byte {
 	str(hLSPMode, h.LSPMode)
 	str(hLSPJSON, h.LSPJSON)
 	str(hDiffJSON, h.DiffJSON)
+	str(hStatesJSON, h.StatesJSON)
 	str(hSrcVersion, h.SrcVersion)
 
 	if len(h.Argv) > 0 {
@@ -348,6 +355,23 @@ func encodeHeader(h Header) []byte {
 				Num(m.ByteStart).Num(m.ByteEnd)
 		}
 		ops = append(ops, Op8{hMatches, w.Done()})
+
+		// LineStart rides in its own sparse field rather than as another Num in
+		// the positional hMatches record: appending to a record-shaped field
+		// would misalign an older reader, as it would for hBuffers. It is sent
+		// only when some hit is not at offset zero, the field default, so an
+		// omitted field means every line start was zero.
+		var starts prog.Writer
+		anyStart := false
+		for _, m := range h.Matches {
+			if m.LineStart != 0 {
+				anyStart = true
+			}
+			starts.Num(m.LineStart)
+		}
+		if anyStart {
+			ops = append(ops, Op8{hMatchLineStart, starts.Done()})
+		}
 	}
 	if len(h.Conflicts) > 0 {
 		var w prog.Writer
@@ -393,6 +417,10 @@ func decodeHeader(b []byte) (Header, error) {
 	// and merge once every op has been read, so their position relative to
 	// hBuffers does not matter.
 	var states []bufferState
+	// Match line starts arrive in their own sparse field; collect them and
+	// merge after every op, so their position relative to hMatches does not
+	// matter.
+	var lineStarts []int
 	for _, op := range ops {
 		switch op.Code {
 		case hID:
@@ -428,6 +456,10 @@ func decodeHeader(b []byte) (Header, error) {
 		case hLineEnd:
 			v := prog.ReadNumber(op.Payload)
 			h.LineEnd = &v
+		case hReviewList:
+			h.ReviewList = true
+		case hAnnotated:
+			h.Annotated = true
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
@@ -475,6 +507,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.LSPJSON = string(op.Payload)
 		case hDiffJSON:
 			h.DiffJSON = string(op.Payload)
+		case hStatesJSON:
+			h.StatesJSON = string(op.Payload)
 		case hSrcVersion:
 			h.SrcVersion = string(op.Payload)
 
@@ -589,6 +623,14 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "matches"); err != nil {
 				return Header{}, err
 			}
+		case hMatchLineStart:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				lineStarts = append(lineStarts, r.Num())
+			}
+			if err := recordsOK(r, "match line starts"); err != nil {
+				return Header{}, err
+			}
 		case hConflicts:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -615,6 +657,11 @@ func decodeHeader(b []byte) (Header, error) {
 				h.Buffers[i].Pending, h.Buffers[i].Moved = st.pending, st.moved
 				break
 			}
+		}
+	}
+	for i, ls := range lineStarts {
+		if i < len(h.Matches) {
+			h.Matches[i].LineStart = ls
 		}
 	}
 	return h, nil

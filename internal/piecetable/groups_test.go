@@ -55,31 +55,39 @@ func TestGroupStateDefaultsToAccepted(t *testing.T) {
 	}
 }
 
-// Rejection is undo addressed by group rather than by recency: an older change
-// can be backed out while newer ones stay.
-func TestRejectAnOlderGroup(t *testing.T) {
+// A reject is a pure state flip: the text stays in the document and only the
+// decision changes. It can address an older change without depending on
+// anything landing after it, and it cannot fail.
+func TestRejectMarksWithoutTouchingText(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "AAA")
-	first := s.LastGroup()
-	s.Insert(User, 8, "BBB") // after the agent's text, untouched by removing it
+	id := s.LastGroup()
+	s.Insert(User, 8, "BBB") // after the agent's text, untouched by the decision
 	before := text(s)
 	if before != "AAAhelloBBB\n" {
 		t.Fatalf("setup produced %q", before)
 	}
 
-	if !s.RejectGroup(first) {
+	if !s.RejectGroup(id) {
 		t.Fatal("rejecting the older group failed")
 	}
-	if got := text(s); got != "helloBBB\n" {
-		t.Errorf("after rejecting = %q, want the later change kept", got)
+	if got := text(s); got != before {
+		t.Errorf("after rejecting = %q, want the text unchanged", got)
 	}
-	if s.GroupState(first) != Rejected {
-		t.Errorf("state = %v", s.GroupState(first))
+	if s.GroupState(id) != Rejected {
+		t.Errorf("state = %v, want rejected", s.GroupState(id))
+	}
+	// The agreed composition drops the rejected set; the review view keeps it.
+	if got := s.Project(AcceptedOnly).Text(); got != "helloBBB\n" {
+		t.Errorf("agreed composition = %q, want the rejected text absent", got)
+	}
+	if got := s.Project(Annotated).Text(); got != before {
+		t.Errorf("review composition = %q, want the rejected text present", got)
 	}
 }
 
-// A rejected group is not rejected twice. The journal is append-only, so a
-// second reversal would re-apply the text rather than removing it again.
+// A rejected group is not rejected twice: the second call has no state change
+// to report and leaves the text alone.
 func TestRejectIsNotRepeatable(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "X")
@@ -96,23 +104,45 @@ func TestRejectIsNotRepeatable(t *testing.T) {
 	}
 }
 
-// Accepting something already reversed would claim text that is not there.
-func TestAcceptDoesNotResurrectARejectedGroup(t *testing.T) {
+// A reject addresses a change set the journal actually holds. An id nothing
+// wrote must not be marked rejected, and the call reports that no state
+// changed.
+func TestRejectUnknownGroupIsRefused(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "X")
 	id := s.LastGroup()
-	s.RejectGroup(id)
-	s.AcceptGroup(id)
-	if s.GroupState(id) != Rejected {
-		t.Errorf("state = %v, want it to stay rejected", s.GroupState(id))
+	before := text(s)
+
+	if s.RejectGroup(id + 100) {
+		t.Error("rejecting an id nothing wrote reported a state change")
 	}
-	if got := text(s); got != "hello\n" {
-		t.Errorf("text = %q", got)
+	if got := s.GroupState(id + 100); got != Accepted {
+		t.Errorf("unknown group state = %v, want accepted (nothing marked)", got)
+	}
+	if got := text(s); got != before {
+		t.Errorf("text = %q, want it untouched", got)
 	}
 }
 
-// A reversed group still appears — the journal is append-only and the decision
-// is part of the record — but contributes no live ops.
+// Accepting a rejected set un-rejects it: decisions are a toggle, and the text
+// was in the document the whole time.
+func TestAcceptUnrejectsARejectedGroup(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Insert(Agent, 0, "X")
+	id := s.LastGroup()
+	before := text(s)
+	s.RejectGroup(id)
+	s.AcceptGroup(id)
+	if s.GroupState(id) != Accepted {
+		t.Errorf("state = %v, want accepted", s.GroupState(id))
+	}
+	if got := text(s); got != before {
+		t.Errorf("text = %q, want %q", got, before)
+	}
+}
+
+// A rejected group appears, keeps its decision and keeps its live ops: the
+// text is still in the document, so the listing must show it.
 func TestRejectedGroupsStayListed(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "X")
@@ -128,12 +158,15 @@ func TestRejectedGroupsStayListed(t *testing.T) {
 		if g.State != Rejected {
 			t.Errorf("state = %v", g.State)
 		}
-		if g.Ops != 0 {
-			t.Errorf("ops = %d, want none live", g.Ops)
+		if g.Ops != 1 {
+			t.Errorf("ops = %d, want the still-live member", g.Ops)
 		}
 	}
 	if !found {
 		t.Error("a rejected group vanished from the listing")
+	}
+	if got := text(s); got != "Xhello\n" {
+		t.Errorf("text = %q, want the rejected text present", got)
 	}
 }
 
@@ -173,9 +206,8 @@ func TestPendingListsOnlyUndecidedGroups(t *testing.T) {
 	}
 }
 
-// A proposed group that has been rejected is no longer pending. Its ops are in
-// the journal — that is append-only — but they are not in the text, so blocking
-// a save on it would block on a change nobody can see.
+// A rejected group is not pending: it is a decision already made, even though
+// its text is still in the document.
 func TestPendingIgnoresRejectedGroups(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Insert(Agent, 0, "B")
@@ -214,13 +246,13 @@ func TestAcceptPendingClearsEverything(t *testing.T) {
 	}
 }
 
-// Rejecting is a decision about a proposal, not about a person, so it backs out
-// the whole change set — including the parts a second author contributed to it.
+// Clearing is the operation that removes rejected text, and it backs out the
+// whole change set — including the parts a second author contributed to it.
 //
-// This is the case the old author-selected form could not express: it took the
-// group's author and reversed only that author's members, so a group written by
-// two hands came half out.
-func TestRejectBacksOutTheWholeGroup(t *testing.T) {
+// This is the case the old author-selected rejection could not express: it took
+// the group's author and reversed only that author's members, so a group
+// written by two hands came half out.
+func TestClearRejectedBacksOutTheWholeGroup(t *testing.T) {
 	s := groupSession(t, "hello\n")
 	s.Begin()
 	s.Insert(Agent, 0, "A")
@@ -232,14 +264,70 @@ func TestRejectBacksOutTheWholeGroup(t *testing.T) {
 	if got := text(s); got != "ABhello\n" {
 		t.Fatalf("setup produced %q", got)
 	}
+	// A reject only marks; the text waits for the clear gesture.
 	if !s.RejectGroup(id) {
 		t.Fatal("reject failed")
 	}
+	if got := text(s); got != "ABhello\n" {
+		t.Errorf("after rejecting = %q, want the text still present", got)
+	}
+	if !s.ClearRejected(id) {
+		t.Fatal("clear failed")
+	}
 	if got := text(s); got != "hello\n" {
-		t.Errorf("after rejecting = %q, want the whole change set gone", got)
+		t.Errorf("after clearing = %q, want the whole change set gone", got)
+	}
+	if got := s.GroupState(id); got != Accepted {
+		t.Errorf("state = %v after clearing, want the decision dropped", got)
 	}
 	if got := s.Pending(); len(got) != 0 {
-		t.Errorf("pending = %+v after rejecting, want none", got)
+		t.Errorf("pending = %+v after clearing, want none", got)
+	}
+}
+
+// ClearRejected acts only on a set currently rejected: on anything else it
+// reports false and touches no text.
+func TestClearRejectedOnlyActsOnRejected(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Insert(Agent, 0, "X")
+	id := s.LastGroup()
+	before := text(s)
+
+	if s.ClearRejected(id) {
+		t.Error("clearing an accepted set reported success")
+	}
+	if got := text(s); got != before {
+		t.Errorf("text = %q, want it unchanged", got)
+	}
+	s.MarkGroup(id, Proposed)
+	if s.ClearRejected(id) {
+		t.Error("clearing a proposed set reported success")
+	}
+	if got := text(s); got != before {
+		t.Errorf("text = %q, want it unchanged", got)
+	}
+}
+
+// A rejected set with nothing live left to reverse — its edits were undone —
+// has no reversal to wedge, so the clear gesture succeeds by dropping the
+// decision rather than leaving it stuck.
+func TestClearRejectedWithNoLiveMembersSucceeds(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Insert(Agent, 0, "X")
+	id := s.LastGroup()
+	if !s.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	s.Undo(Agent) // the edit is gone; only the decision remains
+
+	if got := text(s); got != "hello\n" {
+		t.Fatalf("setup produced %q", got)
+	}
+	if !s.ClearRejected(id) {
+		t.Fatal("clearing a rejected set with nothing left to reverse failed")
+	}
+	if got := s.GroupState(id); got != Accepted {
+		t.Errorf("state = %v after clearing, want the decision dropped", got)
 	}
 }
 
@@ -451,5 +539,40 @@ func TestDiffPendingProjectsATrimmedRun(t *testing.T) {
 	}
 	if got := d.Hunks[0]; got.Start != 6 || got.End != 9 || got.New != "sot" || got.Old != "world" {
 		t.Errorf("trimmed run = %+v, want 6..9 %q", got, "sot")
+	}
+}
+
+// An apply whose hunk lands inside a leased run conflicts, names the set, and
+// leaves the document and the version alone. An insertion flush with the run's
+// first byte is outside the lease and still lands.
+func TestApplyDiffRefusesALease(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	v0 := s.Version()
+
+	_, conflicts := s.ApplyDiff(User, v0, []Hunk{{Start: 8, End: 10, Text: "XX"}})
+	if len(conflicts) != 1 {
+		t.Fatalf("conflicts = %+v, want one lease refusal", conflicts)
+	}
+	if conflicts[0].Group != id {
+		t.Errorf("conflict group = %d, want %d", conflicts[0].Group, id)
+	}
+	if s.Version() != v0 {
+		t.Errorf("version moved on a refused hunk: %d -> %d", v0, s.Version())
+	}
+	if got := text(s); got != "hello socket\n" {
+		t.Fatalf("text = %q, want the leased text unchanged", got)
+	}
+
+	// The run starts at 6; an insertion there sits before it, not in it.
+	_, conflicts = s.ApplyDiff(User, s.Version(), []Hunk{{Start: 6, End: 6, Text: ">"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("boundary insert conflicted: %+v", conflicts)
+	}
+	if got := text(s); got != "hello >socket\n" {
+		t.Errorf("text = %q, want the boundary insert to land", got)
 	}
 }

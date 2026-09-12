@@ -17,8 +17,9 @@ import (
 //     which is the difference between "seed 578 step 12" and a five-op
 //     reproduction you can read.
 //   - It covers ops the seeded walk does not: two authors interleaved, and
-//     rejection, which is undo addressed by group and therefore the operation
-//     most likely to reverse something a later op depends on.
+//     clearing a rejected set, which is the operation most likely to reverse
+//     something a later op depends on. A reject is now only a state flip, so
+//     the clear gesture is what keeps the reversal machinery covered.
 //
 // The oracle is the same one the rest of the package uses: Naive applies the
 // identical journal to a flat string, so a disagreement is a bug in the tree or
@@ -47,7 +48,7 @@ func FuzzSessionAgainstOracle(f *testing.F) {
 			text := doc.Buffer().Slice(0, doc.Buffer().Len())
 			author := authors[int(arg)%len(authors)]
 
-			switch op % 5 {
+			switch op % 6 {
 			case 0: // insert a whole rune at a rune boundary
 				pos := runeStart(text, int(arg)%(len(text)+1))
 				r := runes[int(arg)%len(runes)]
@@ -69,7 +70,7 @@ func FuzzSessionAgainstOracle(f *testing.F) {
 				doc.Redo(author)
 				oracle.Redo(author)
 				log = append(log, "redo")
-			case 4: // reject a change set, which is undo addressed by group
+			case 4: // reject a change set: a pure state flip, no text change
 				groups := doc.Groups()
 				if len(groups) == 0 {
 					continue
@@ -77,14 +78,31 @@ func FuzzSessionAgainstOracle(f *testing.F) {
 				id := groups[int(arg)%len(groups)].ID
 				// Both sessions have applied the same journal in the same
 				// order, so the group counter agrees and the same id addresses
-				// the same change set in each. They must also agree about
-				// whether it could be backed out: a reversal that succeeds on
-				// one engine and fails on the other is a divergence even when
-				// the text still matches afterwards.
+				// the same change set in each. A reject cannot fail, but the
+				// engines must still agree about whether the state changed.
 				if doc.RejectGroup(id) != oracle.RejectGroup(id) {
 					t.Fatalf("engines disagreed about rejecting group %d\nlog=%v", id, log)
 				}
 				log = append(log, "reject")
+			case 5: // clear a rejected set: the reversal path, so undo stays covered
+				var id uint64
+				found := false
+				for _, g := range doc.Groups() {
+					if g.State == Rejected {
+						id, found = g.ID, true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+				// Clearing really edits, so the two engines must agree that it
+				// landed as well as on the text afterwards. That disagreement
+				// check is what rejecting used to provide.
+				if doc.ClearRejected(id) != oracle.ClearRejected(id) {
+					t.Fatalf("engines disagreed about clearing group %d\nlog=%v", id, log)
+				}
+				log = append(log, "clear")
 			}
 
 			got := doc.Buffer().Slice(0, doc.Buffer().Len())

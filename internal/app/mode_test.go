@@ -105,11 +105,20 @@ func TestReviewModeKeepsAccept(t *testing.T) {
 
 func TestReviewModeKeepsReject(t *testing.T) {
 	h := newHarness(t, reviewFixture)
-	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r")
 	h.press("ctrl+super+/")
-	if got := h.text(); got != reviewFixture {
-		t.Fatalf("text = %q, want the proposal backed out", got)
+	if got := h.text(); got != "hello socket\n" {
+		t.Fatalf("text = %q, rejecting must keep the text", got)
+	}
+	if st := h.Pane().File.Session().GroupState(id); st != piecetable.Rejected {
+		t.Fatalf("state = %v, want rejected in Review mode", st)
+	}
+	if h.mode != ModeReview {
+		t.Fatalf("mode = %v, want Review to stay on after a decision", h.mode)
+	}
+	if !strings.Contains(h.host.Text(), "socket") {
+		t.Errorf("the rejected text is no longer shown in Review:\n%s", h.host.Text())
 	}
 }
 
@@ -158,17 +167,19 @@ func TestReviewBarNamesTheRealChords(t *testing.T) {
 	}
 }
 
-// An additive edit inside a proposed span fragments the member into surviving
-// runs, so the set stays pending and reachable rather than becoming a moved
-// whole; the bar progress total and next/prev own count still agree.
+// A lease keeps each set whole, so the bar progress total and the next/prev
+// own count still agree.
 func TestReviewBarProgressMatchesTheCycle(t *testing.T) {
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
-	// Type inside the second set: the runs on either side survive, so it is
-	// fragmented, not moved, and both sets remain reachable.
+	// Typing inside the second set is refused by its lease, so neither set is
+	// fragmented and both remain reachable.
 	h.Pane().Cursors.Set(9, 9)
 	h.typeText("X")
+	if !strings.Contains(h.Status(), "read-only") {
+		t.Errorf("status = %q, want the lease refusal", h.Status())
+	}
 	if got := len(h.Pane().File.Session().Pending()); got != 2 {
 		t.Fatalf("pending = %d, want both sets still pending", got)
 	}
@@ -191,52 +202,60 @@ func TestReviewBarProgressMatchesTheCycle(t *testing.T) {
 	}
 }
 
-// A proposed set the buffer has entirely overwritten is auto-rejected under
-// option A: it is not pending, does not block a save, and the bar does not
-// claim to have moved past it.
-func TestReviewBarAutoRejectedSetDropsOut(t *testing.T) {
+// The lease stops a set being overwritten, so it stays pending and the bar
+// keeps counting it instead of quietly dropping it.
+func TestReviewBarKeepsALeasedSet(t *testing.T) {
 	h := newHarness(t, reviewFixture)
-	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
-	// Replace every byte of the inserted text with the user's own.
+	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	// Try to replace every byte of the inserted text with the user's own.
 	h.Pane().Cursors.Set(reviewAt, reviewAt+len(reviewNew))
 	h.typeText("port")
-	if marks := h.Pane().PendingMarks(); len(marks) != 0 {
-		t.Fatalf("marks = %d, want the overwritten set to have no projection", len(marks))
+
+	if got := h.text(); got != "hello socket\n" {
+		t.Fatalf("text = %q, want the leased set unchanged", got)
 	}
-	if got := len(h.Pane().File.Session().Pending()); got != 0 {
-		t.Fatalf("pending = %d, want the overwritten set auto-rejected", got)
+	if !strings.Contains(h.Status(), "read-only") {
+		t.Errorf("status = %q, want the lease refusal", h.Status())
+	}
+	if marks := h.Pane().PendingMarks(); len(marks) != 1 {
+		t.Fatalf("marks = %d, want the set still pending", len(marks))
+	}
+	if got := len(h.Pane().File.Session().Pending()); got != 1 {
+		t.Fatalf("pending = %d, want the set still awaiting a decision", got)
+	}
+	if st := h.Pane().File.Session().GroupState(id); st != piecetable.Proposed {
+		t.Errorf("state = %v, want proposed", st)
 	}
 
 	h.press("super+r")
-	if !strings.Contains(h.Status(), "no proposed changes") {
-		t.Errorf("status = %q, want no-proposals once the set is auto-rejected", h.Status())
+	if !strings.Contains(h.reviewBar(), "1/1") {
+		t.Errorf("bar = %q, want the set counted", h.reviewBar())
 	}
-	bar := h.reviewBar()
-	if !strings.Contains(bar, "no proposed changes") {
-		t.Errorf("bar = %q, want no-proposals once the set is auto-rejected", bar)
-	}
-	if strings.Contains(bar, "moved past") || strings.Contains(bar, "not shown") {
-		t.Errorf("bar = %q, want no moved wording for an auto-rejected set", bar)
+	if strings.Contains(h.reviewBar(), "not shown") {
+		t.Errorf("bar = %q, want no unplaced-member wording for a whole set", h.reviewBar())
 	}
 }
 
-// A set with one member overwritten and one surviving stays pending, and the
-// bar names the unplaced member rather than dropping the set or calling the
-// whole set moved.
-func TestReviewBarNamesUnplacedMembers(t *testing.T) {
+// A lease protects every member of a set, so an edit over the second member is
+// refused and the set keeps both of them: the bar counts it whole and names no
+// unplaced member.
+func TestReviewBarKeepsBothMembersOfALeasedSet(t *testing.T) {
 	h := newHarness(t, "aaa bbb ccc\n")
 	propose(t, h,
 		piecetable.Hunk{Start: 0, End: 3, Text: "AAA"},
 		piecetable.Hunk{Start: 8, End: 11, Text: "CCC"},
 	)
-	// Overwrite the second member whole; the first survives untouched.
+	// Try to overwrite the second member whole; both stay the agent's.
 	h.Pane().Cursors.Set(8, 11)
 	h.typeText("zzz")
+	if got := h.text(); got != "AAA bbb CCC\n" {
+		t.Fatalf("text = %q, want the leased set unchanged", got)
+	}
 	if got := len(h.Pane().File.Session().Pending()); got != 1 {
-		t.Fatalf("pending = %d, want the set kept by its surviving member", got)
+		t.Fatalf("pending = %d, want the set still pending", got)
 	}
 	if reachable := len(proposalGroups(h.Pane())); reachable != 1 {
-		t.Fatalf("reachable = %d, want the one surviving set", reachable)
+		t.Fatalf("reachable = %d, want the one set", reachable)
 	}
 
 	h.press("super+r")
@@ -244,11 +263,8 @@ func TestReviewBarNamesUnplacedMembers(t *testing.T) {
 	if !strings.Contains(bar, "1/1") {
 		t.Errorf("bar = %q, want progress 1/1", bar)
 	}
-	if !strings.Contains(bar, "1 member(s) not shown") {
-		t.Errorf("bar = %q, want the unplaced member named", bar)
-	}
-	if strings.Contains(bar, "set(s) moved past") {
-		t.Errorf("bar = %q, want per-member wording, not a whole-set moved count", bar)
+	if strings.Contains(bar, "not shown") {
+		t.Errorf("bar = %q, want no unplaced member for a whole set", bar)
 	}
 }
 

@@ -51,22 +51,36 @@ func TestAcceptProposedAtCaret(t *testing.T) {
 	}
 }
 
-// ctrl+super+/ backs the change out: the document reads as though it was never
-// written, and the pending list is empty.
+// ctrl+super+/ rejects the change at the caret: the text stays exactly as the
+// agent wrote it, the set is marked Rejected, and the status says what was
+// decided. Rejecting is a decision, not an edit.
 func TestRejectProposedAtCaret(t *testing.T) {
 	h := newHarness(t, reviewFixture)
-	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(reviewAt+1, reviewAt+1)
 
 	h.press("ctrl+super+/")
-	if got := h.text(); got != reviewFixture {
-		t.Errorf("after reject = %q, want the original back", got)
+	if got := h.text(); got != "hello socket\n" {
+		t.Errorf("after reject = %q, rejecting must not change the text", got)
+	}
+	if st := h.Pane().File.Session().GroupState(id); st != piecetable.Rejected {
+		t.Errorf("state after reject = %v, want rejected", st)
 	}
 	if marks := h.Pane().PendingMarks(); len(marks) != 0 {
-		t.Errorf("marks after reject = %+v, want none", marks)
+		t.Errorf("marks after reject = %+v, want none: a rejected set is not pending", marks)
 	}
 	if !strings.Contains(h.Status(), "rejected") {
 		t.Errorf("status = %q, want the decision reported", h.Status())
+	}
+
+	// A second reject has nothing left to flip: the set is already Rejected,
+	// so it is a no-op and the text is still untouched.
+	h.press("ctrl+super+/")
+	if got := h.text(); got != "hello socket\n" {
+		t.Errorf("after a second reject = %q, want the text still untouched", got)
+	}
+	if st := h.Pane().File.Session().GroupState(id); st != piecetable.Rejected {
+		t.Errorf("state after a second reject = %v, want still rejected", st)
 	}
 }
 
@@ -91,12 +105,39 @@ func TestReviewFallsBackToAllVisible(t *testing.T) {
 // inside the span: line covering, not byte covering.
 func TestCaretOnTheLineIsEnough(t *testing.T) {
 	h := newHarness(t, reviewFixture)
-	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(0, 0) // start of the same line, outside the span
 
 	h.press("ctrl+super+/")
+	if got := h.text(); got != "hello socket\n" {
+		t.Errorf("after reject = %q, rejecting must not change the text", got)
+	}
+	if st := h.Pane().File.Session().GroupState(id); st != piecetable.Rejected {
+		t.Errorf("state = %v, want rejected for a caret anywhere on the line", st)
+	}
+}
+
+// ctrl+super+k hard-purges the rejected set at the caret: the agent text
+// leaves the document and the decision goes with it. Clearing is the one
+// gesture that really edits, which is why it routes through File.
+func TestClearRejectedAtCaret(t *testing.T) {
+	h := newHarness(t, reviewFixture)
+	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	h.Pane().Cursors.Set(reviewAt+1, reviewAt+1)
+
+	h.press("ctrl+super+/") // reject first: the text stays
+	if got := h.text(); got != "hello socket\n" {
+		t.Fatalf("after reject = %q, rejecting must not change the text", got)
+	}
+	h.press("ctrl+super+k")
 	if got := h.text(); got != reviewFixture {
-		t.Errorf("after reject = %q, want the original back", got)
+		t.Errorf("after clear = %q, want the rejected text purged", got)
+	}
+	if st := h.Pane().File.Session().GroupState(id); st != piecetable.Accepted {
+		t.Errorf("state after clear = %v, want the decision dropped", st)
+	}
+	if !strings.Contains(h.Status(), "cleared") {
+		t.Errorf("status = %q, want the clear reported", h.Status())
 	}
 }
 

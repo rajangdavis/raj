@@ -3,6 +3,8 @@ package control
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,6 +35,10 @@ type fakeEditor struct {
 	bump func()
 	// diffJSON is the canned diff answer; empty means no pending changes.
 	diffJSON string
+	// mode records the app mode a request switched to, so a test can assert
+	// that `review -json` did not enter review while a plain `review` did.
+	// Empty means still editing.
+	mode string
 	// lspJSON is the canned answer an lsp request returns, verbatim, so a test
 	// can drive the CLI's diagnostics handling without a language server.
 	lspJSON string
@@ -45,7 +51,16 @@ type fakeEditor struct {
 	groups    []Group
 	decided   []uint64
 	decideErr map[uint64]string
-	stop      chan struct{}
+	// pending, when set, is the projection `diff` reports: the change sets with
+	// surviving text. A successful reject removes its entry and an entry named
+	// in wedge fails while its blocker is still pending, the two behaviours a
+	// bulk reject has to drive. A nil pending falls back to the canned diffJSON
+	// the fixed diff tests use.
+	pending []Group
+	// wedge names a group that cannot be reversed while another is still
+	// pending; 0 means wedged outright.
+	wedge map[uint64]uint64
+	stop  chan struct{}
 }
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
@@ -159,7 +174,11 @@ func (f *fakeEditor) run(req Request) Response {
 				start = len(text)
 			}
 		}
-		return Response{OK: true, Spans: []Span{{Text: text[start:end], Author: FirstAgent}}, Version: f.vers[path]}
+		res := Response{OK: true, Spans: []Span{{Text: text[start:end], Author: FirstAgent}}, Version: f.vers[path]}
+		if req.Annotated {
+			res.StatesJSON = fmt.Sprintf(`[{"off":0,"len":%d,"group":0,"state":"accepted"}]`, end-start)
+		}
+		return res
 	case "open":
 		if _, ok := f.docs[path]; !ok {
 			f.docs[path], f.vers[path] = "", 1
@@ -192,16 +211,58 @@ func (f *fakeEditor) run(req Request) Response {
 	case "groups":
 		return Response{OK: true, Groups: append([]Group(nil), f.groups...)}
 	case "accept", "reject":
+		if req.Op == "reject" && f.pending != nil {
+			// A set a newer overlapping set still blocks cannot come out — the
+			// same refusal the real Session gives.
+			if blocker, ok := f.wedge[req.Group]; ok {
+				blocked := blocker == 0
+				for _, g := range f.pending {
+					if g.ID == blocker {
+						blocked = true
+					}
+				}
+				if blocked {
+					return Response{Err: fmt.Sprintf("change set %d could not be backed out: "+
+						"later edits overlap it", req.Group)}
+				}
+			}
+			for i := range f.pending {
+				if f.pending[i].ID == req.Group {
+					f.pending = append(f.pending[:i], f.pending[i+1:]...)
+					f.decided = append(f.decided, req.Group)
+					return Response{OK: true}
+				}
+			}
+			return Response{Err: fmt.Sprintf("no change set %d", req.Group)}
+		}
 		if msg, ok := f.decideErr[req.Group]; ok {
 			return Response{Err: msg}
 		}
 		f.decided = append(f.decided, req.Group)
 		return Response{OK: true}
 	case "diff":
+		if f.pending != nil {
+			diffs := make([]DiffGroup, 0, len(f.pending))
+			for _, g := range f.pending {
+				// One surviving hunk marks the set pending, which is all the
+				// CLI reads the projection for.
+				diffs = append(diffs, DiffGroup{Group: g, Hunks: []DiffHunk{{Start: 0, End: 0}}})
+			}
+			data, err := json.Marshal(diffs)
+			if err != nil {
+				return Response{Err: err.Error()}
+			}
+			return Response{OK: true, DiffJSON: string(data)}
+		}
 		if f.diffJSON == "" {
 			return Response{OK: true, DiffJSON: "[]"}
 		}
 		return Response{OK: true, DiffJSON: f.diffJSON}
+	case "review":
+		if !req.ReviewList {
+			f.mode = "review"
+		}
+		return Response{OK: true, Groups: append([]Group(nil), f.groups...)}
 	case "lspprep":
 		return Response{OK: true, LSP: fakeLSP{json: f.lspJSON}}
 	}
@@ -240,6 +301,25 @@ func TestCLIReadSpan(t *testing.T) {
 	out, _, code := run(t, "read", "-start", "11", "-end", "17", "/w/a.go")
 	if code != 0 || out != "func f" {
 		t.Errorf("read span = %q, code %d", out, code)
+	}
+}
+
+// -annotated reaches the server and its state runs reach the JSON output; the
+// plain form still prints just the text.
+func TestCLIReadAnnotated(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
+
+	out, _, code := run(t, "read", "-annotated", "/w/a.go")
+	if code != 0 || out != "package a\n\nfunc f() {}\n" {
+		t.Errorf("annotated read = %q, code %d", out, code)
+	}
+
+	out, _, code = run(t, "read", "-annotated", "-json", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("annotated json read: code %d", code)
+	}
+	if !strings.Contains(out, `"states"`) || !strings.Contains(out, `"accepted"`) {
+		t.Errorf("annotated json = %q, want states", out)
 	}
 }
 
@@ -1323,28 +1403,85 @@ func TestCLIAcceptAllDecidesEveryGroup(t *testing.T) {
 	}
 }
 
-// A reject that a later edit wedged is named with its reason, not dropped from
-// a count. The groups after it are still decided, because one refusal is not
-// the whole batch's failure.
-func TestCLIRejectAllNamesTheWedgedGroup(t *testing.T) {
+// reject -all unwinds newest-first: an earlier set a later overlapping one
+// wedges can only come out once the later set is gone. Reversing in document
+// order would hit the earlier one first, refuse it, and leave it applied.
+func TestCLIRejectAllUnwindsAnOverlappingPair(t *testing.T) {
 	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
-	ed.groups = []Group{{ID: 3}, {ID: 7}, {ID: 9}}
-	ed.decideErr = map[uint64]string{7: "a later edit overlaps this change set"}
+	ed.pending = []Group{
+		{ID: 3, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, First: 1, Last: 1},
+		{ID: 9, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, First: 8, Last: 8},
+	}
+	ed.wedge = map[uint64]uint64{3: 9} // 3 cannot come out while 9 is still in
+	out, errs, code := run(t, "reject", "/w/a.go", "-all")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if len(ed.decided) != 2 || ed.decided[0] != 9 || ed.decided[1] != 3 {
+		t.Fatalf("decided %v, want 9 then 3, so 9 frees 3", ed.decided)
+	}
+	if len(ed.pending) != 0 {
+		t.Errorf("pending = %+v, want the stack fully unwound", ed.pending)
+	}
+	if !strings.Contains(out, "rejected change set 9") || !strings.Contains(out, "rejected change set 3") {
+		t.Errorf("stdout = %q, want both outcomes", out)
+	}
+}
+
+// A set that cannot be reversed even as the newest one is named and skipped,
+// and the sets already out are not re-attempted: the bulk form reports the one
+// failure and leaves the rest of the stack unwound rather than tripping over a
+// set that is already gone — the wedge the old single-listing loop produced.
+func TestCLIRejectAllReportsAnUnplaceableSet(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.pending = []Group{
+		{ID: 3, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, First: 1, Last: 1},
+		{ID: 9, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, First: 8, Last: 8},
+	}
+	ed.wedge = map[uint64]uint64{3: 0} // 3 is wedged outright
 	out, errs, code := run(t, "reject", "/w/a.go", "-all")
 	if code == 0 {
-		t.Fatalf("a wedged reject reported success; stdout %q", out)
+		t.Fatalf("an unplaceable reject reported success: %q", out)
 	}
-	if !strings.Contains(errs, "change set 7") || !strings.Contains(errs, "overlaps") {
-		t.Errorf("stderr = %q, want the wedged group named with its reason", errs)
+	if !strings.Contains(errs, "change set 3") || !strings.Contains(errs, "overlap") {
+		t.Errorf("stderr = %q, want the unplaceable set named", errs)
 	}
-	if !strings.Contains(errs, "1 of 3") {
-		t.Errorf("stderr = %q, want the summary to say one of three failed", errs)
+	if !strings.Contains(errs, "1 of 2") {
+		t.Errorf("stderr = %q, want one of two failed", errs)
 	}
-	if len(ed.decided) != 2 || ed.decided[0] != 3 || ed.decided[1] != 9 {
-		t.Errorf("decided %v, want 3 and 9 (7 refused, the rest still decided)", ed.decided)
+	if len(ed.decided) != 1 || ed.decided[0] != 9 {
+		t.Errorf("decided %v, want only 9 (3 refused)", ed.decided)
 	}
-	if !strings.Contains(out, "rejected change set 3") || !strings.Contains(out, "rejected change set 9") {
-		t.Errorf("stdout = %q, want the two outcomes that landed", out)
+	if len(ed.pending) != 1 || ed.pending[0].ID != 3 {
+		t.Errorf("pending = %+v, want only the unplaceable 3", ed.pending)
+	}
+	if !strings.Contains(out, "rejected change set 9") {
+		t.Errorf("stdout = %q, want the outcome that landed", out)
+	}
+}
+
+// A proposed set a later edit has fully overwritten is not pending — there is
+// nothing left to back out — so a bulk reject never attempts it and never
+// reports the wedge that attempting it would produce. This is the second live
+// run: both sets at 0 ops, and a reject that reported an overlap anyway.
+func TestCLIRejectAllSkipsSetsWithNothingLeft(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.diffJSON = `[{"id":3,"path":"/w/a.go","author":2,"state":"proposed","ops":1,` +
+		`"bytes":0,"first":1,"last":1,"hunks":[],"moved":1},` +
+		`{"id":9,"path":"/w/a.go","author":2,"state":"proposed","ops":1,` +
+		`"bytes":1,"first":8,"last":8,"hunks":[{"start":0,"end":1,"old":"","new":"x"}],"moved":0}]`
+	out, errs, code := run(t, "reject", "/w/a.go", "-all")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if len(ed.decided) != 1 || ed.decided[0] != 9 {
+		t.Errorf("decided %v, want only the pending 9", ed.decided)
+	}
+	if strings.Contains(errs, "change set 3") {
+		t.Errorf("stderr = %q, want no failure for the already-settled 3", errs)
+	}
+	if !strings.Contains(out, "rejected change set 9") {
+		t.Errorf("stdout = %q", out)
 	}
 }
 
@@ -1367,5 +1504,35 @@ func TestMineOnlyKeepsTheCallersGroups(t *testing.T) {
 	}
 	if mineOnly(groups, 9) != nil {
 		t.Errorf("mineOnly with no match = %+v, want nil", mineOnly(groups, 9))
+	}
+}
+
+// review -json is the read-only listing: it returns the pending change sets
+// without entering Review mode. The plain form enters the mode and lists them
+// too, so the two surfaces cannot disagree about what is pending.
+func TestCLIReviewListsWithoutEnteringMode(t *testing.T) {
+	f := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	f.groups = []Group{{ID: 7, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, Bytes: 4}}
+
+	out, _, code := run(t, "review", "/w/a.go", "-json")
+	if code != 0 {
+		t.Fatalf("review -json exit = %d\n%s", code, out)
+	}
+	if f.mode != "" {
+		t.Errorf("review -json entered mode %q", f.mode)
+	}
+	if !strings.Contains(out, `"id": 7`) {
+		t.Errorf("review -json output = %q, want the pending set", out)
+	}
+
+	out, _, code = run(t, "review", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("review exit = %d\n%s", code, out)
+	}
+	if f.mode != "review" {
+		t.Errorf("mode = %q after review, want review", f.mode)
+	}
+	if !strings.Contains(out, "review mode, 1 proposed") {
+		t.Errorf("review output = %q, want the mode and count", out)
 	}
 }

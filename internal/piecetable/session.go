@@ -13,7 +13,13 @@ package piecetable
 // whose range someone else edited in the meantime is rejected on its own; the
 // rest of the diff still lands.
 type Session struct {
-	buf     pieceEditor
+	buf pieceEditor
+	// origLen is the base document length at construction: the bytes the
+	// Original store held before any edit. Project measures the base from
+	// this rather than the store's current length, because an Original-authored
+	// insert appends to the same store and would otherwise land twice -- once
+	// as base bytes and again as the op that inserted them.
+	origLen int
 	journal []Op
 	// groupState records decisions about change sets. Sparse: only groups that
 	// are not simply Accepted have an entry, so ordinary typing costs nothing.
@@ -34,7 +40,47 @@ type Session struct {
 // NewSession takes ownership of buf. Edits must go through the session from
 // this point, or the journal and the document diverge.
 func NewSession(buf pieceEditor) *Session {
-	return &Session{buf: buf, reversers: map[Version][]Version{}}
+	return &Session{buf: buf, reversers: map[Version][]Version{}, origLen: buf.Store().Len(Original)}
+}
+
+// NewRestoredSession rebuilds a session from a persisted journal. buf must
+// already be a document over the log's base with every store blob the ops
+// reference appended in order, because replaying an op reads its deleted bytes
+// back out of the document and points its inserted bytes at the store; the
+// caller reconstructs the store, and this is the seam that makes it live.
+//
+// baseLen is the length of the base document inside the Original store: the
+// log's Base bytes, not the store's current length, because Original-authored
+// appends sit after the base and replaying their ops must not count them a
+// second time.
+//
+// ops must be in Seq order with Seq == index, so OpsSince keeps meaning
+// "everything after this version". New commits continue numbering after the
+// highest group in ops, so a restored group is never reused, and reversers is
+// rebuilt from the undo and redo ops so live() answers the same before and
+// after a restart. groupState seeds review decisions; nil, or an Accepted
+// entry, means the group is accepted, which is the default.
+func NewRestoredSession(buf pieceEditor, ops []Op, groupState map[uint64]GroupState, baseLen int) *Session {
+	s := &Session{buf: buf, reversers: map[Version][]Version{}, origLen: baseLen}
+	for _, o := range ops {
+		apply(s.buf, o)
+		if o.Kind != KindEdit {
+			s.reversers[o.Undoes] = append(s.reversers[o.Undoes], o.Seq)
+		}
+		if o.Group > s.group {
+			s.group = o.Group
+		}
+	}
+	s.journal = append([]Op(nil), ops...)
+	if len(groupState) > 0 {
+		s.groupState = map[uint64]GroupState{}
+		for id, st := range groupState {
+			if st != Accepted {
+				s.groupState[id] = st
+			}
+		}
+	}
+	return s
 }
 
 func (s *Session) Buffer() Buffer { return s.buf }
@@ -142,6 +188,10 @@ type Conflict struct {
 	Index int
 	Hunk  Hunk
 	At    Version // the op that invalidated the range
+	// Group names the change set that owns the range as a read-only lease when
+	// the conflict is a lease refusal; zero otherwise. It tells a caller which
+	// decision has to be made before the hunk can land.
+	Group uint64
 }
 
 // ApplyDiff applies hunks written against version base.
@@ -157,6 +207,13 @@ func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version,
 		start, end, at, ok := s.rebase(h.Start, h.End, base)
 		if !ok {
 			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, At: at})
+			continue
+		}
+		// A pending or rejected span is a read-only lease: a hunk that would
+		// land in one is refused, so the composition stays overlap-free, and
+		// the conflict names the set whose decision has to come first.
+		if g, leased := s.Leased(start, end-start); leased {
+			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, Group: g})
 			continue
 		}
 		op := Op{Author: author, Pos: start}
@@ -386,16 +443,9 @@ func byAuthor(a Author) func(Author) bool {
 	return func(got Author) bool { return got == a }
 }
 
-// reverseGroup reverses every live member of a group, latest first so each
-// inverse lands on the document the next one expects. The inverses share one
-// group of their own, which is what lets redo reverse them as a unit.
-//
-// keep selects which members to reverse; nil means all of them. The two callers
-// want different things and the difference is not cosmetic. Undo is personal —
-// it must not back out an op that merely shares a group with yours — while
-// rejecting a change set means the whole set, which is the only reading under
-// which "reject" is a decision about a proposal rather than about a person.
-func (s *Session) reverseGroup(group uint64, want OpKind, keep func(Author) bool) bool {
+// reverseMembers collects the live ops reverseGroup would reverse: the group's
+// members of the kind want reverses, narrowed by keep when it is not nil.
+func (s *Session) reverseMembers(group uint64, want OpKind, keep func(Author) bool) []Op {
 	var members []Op
 	for _, o := range s.journal {
 		if o.Group != group || !s.live(o.Seq) {
@@ -409,6 +459,20 @@ func (s *Session) reverseGroup(group uint64, want OpKind, keep func(Author) bool
 		}
 		members = append(members, o)
 	}
+	return members
+}
+
+// reverseGroup reverses every live member of a group, latest first so each
+// inverse lands on the document the next one expects. The inverses share one
+// group of their own, which is what lets redo reverse them as a unit.
+//
+// keep selects which members to reverse; nil means all of them. The two callers
+// want different things and the difference is not cosmetic. Undo is personal —
+// it must not back out an op that merely shares a group with yours — while
+// rejecting a change set means the whole set, which is the only reading under
+// which "reject" is a decision about a proposal rather than about a person.
+func (s *Session) reverseGroup(group uint64, want OpKind, keep func(Author) bool) bool {
+	members := s.reverseMembers(group, want, keep)
 	s.Begin()
 	defer s.End()
 

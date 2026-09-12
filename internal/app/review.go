@@ -31,8 +31,7 @@ func (a *App) reviewProposed(accept bool) {
 		if a.decideProposed(p, m.Group, accept) {
 			a.status = decidedStatus(accept, m.Group)
 		} else {
-			a.status = fmt.Sprintf("change set %d is wedged behind later edits; "+
-				"it cannot be backed out", m.Group)
+			a.status = fmt.Sprintf("change set %d is no longer awaiting a decision", m.Group)
 		}
 		return
 	}
@@ -64,21 +63,83 @@ func decidedStatus(accept bool, group uint64) string {
 	return fmt.Sprintf("rejected change set %d", group)
 }
 
-// decideProposed applies one decision. Accepting cannot fail — the text is
-// already in the document — while rejecting can: a group wedged behind a
-// later overlapping edit cannot be rebased out, and false says so.
+// decideProposed applies one decision through the File, so its decision
+// generation moves with it and Dirty/ViewDirty see the change. Accepting
+// cannot fail — the text is already in the document and the mark clears.
+// Rejecting returns false only when the set names nothing the journal holds or
+// is already Rejected; it never removes text, so a later edit can no longer
+// wedge it.
 func (a *App) decideProposed(p *editor.Pane, group uint64, accept bool) bool {
-	sess := p.File.Session()
+	defer a.flushJournal(p)
 	if accept {
-		sess.AcceptGroup(group)
+		p.File.AcceptGroup(group)
 		return true
 	}
-	if !sess.RejectGroup(group) {
+	if !p.File.RejectGroup(group) {
 		return false
 	}
 	p.Cursors.Normalize()
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 	return true
+}
+
+// clearRejected hard-purges the rejected change set at the caret. Clearing is
+// an edit — ClearRejected reverses the set's ops out of the document — so it
+// goes through File, which mirrors the reversal into the line index and moves
+// the decision generation with it. A line carrying more than one rejected set
+// cannot name one, and says so rather than purging the wrong text; a
+// rejected-set picker would be the surface for that case.
+func (a *App) clearRejected() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	groups := rejectedAtCaret(p.File, p.Cursors.Primary().Head)
+	if len(groups) == 0 {
+		a.status = "no rejected changes here"
+		return
+	}
+	if len(groups) > 1 {
+		a.status = fmt.Sprintf("%d rejected change sets here; the caret cannot pick one", len(groups))
+		return
+	}
+	id := groups[0]
+	defer a.flushJournal(p)
+	if !p.File.ClearRejected(id) {
+		a.status = fmt.Sprintf("could not clear rejected change set %d: later edits overlap it", id)
+		return
+	}
+	p.Cursors.Normalize()
+	a.Explorer.Tree.MarkChanged(p.File.Path)
+	a.status = fmt.Sprintf("cleared rejected change set %d", id)
+}
+
+// rejectedAtCaret names the rejected change sets whose live runs touch the
+// caret's line, in document order. Rejected sets carry no PendingMarks — those
+// are proposed only — so the lookup reads the Annotated projection, whose
+// state runs cover every live edit in the same coordinates as the buffer the
+// caret indexes. Line covering matches proposalAtCaret: a caret anywhere on a
+// line a set owns reaches it. More than one set on the line comes back whole
+// rather than guessed between.
+func rejectedAtCaret(f *editor.File, off int) []uint64 {
+	line := f.LineOf(off)
+	var out []uint64
+	seen := map[uint64]bool{}
+	for _, r := range f.Session().Project(piecetable.Annotated).States() {
+		if r.State != piecetable.Rejected || seen[r.Group] {
+			continue
+		}
+		first, last := f.LineOf(r.Off), f.LineOf(r.Off)
+		if r.Len > 0 {
+			last = f.LineOf(r.Off + r.Len - 1)
+		}
+		if line < first || line > last {
+			continue
+		}
+		seen[r.Group] = true
+		out = append(out, r.Group)
+	}
+	return out
 }
 
 // proposalAtCaret is the proposed change the caret is on. Line covering

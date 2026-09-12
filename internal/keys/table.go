@@ -116,13 +116,20 @@ var Bindings = []Binding{
 	{"nav", Hover, "super+i", "105;9u", "cmd+i", "ctrl+i", ""},
 	{"nav", GotoDef, "super+j", "106;9u", "cmd+j", "ctrl+alt+j", ""},
 
+	// ToggleInlayHints turns the inline language-server annotations on and off
+	// for the active pane. shift+super+i is the shifted sibling of Hover's
+	// super+i and no terminal claims it; the choice is per-pane and the app
+	// default is untouched.
+	{"nav", ToggleInlayHints, "shift+super+i", "105;10u", "cmd+shift+i", "ctrl+shift+i", "toggle inline hints for the active pane"},
+
 	// Reviewing proposals from the keyboard. These are ctrl+super chords the
 	// way all_occurrences is: no terminal claims them, but they live in
 	// Bindings rather than Natives so the CSI-u encoding is pinned for both
 	// platforms instead of inferred from report_all.
 	{"proposals", ToggleReview, "super+r", "114;9u", "cmd+r", "ctrl+r", "toggle review mode: the document is read-only while on; reload moved to cmd+shift+r"},
 	{"proposals", AcceptProposed, "ctrl+super+m", "109;13u", "cmd+ctrl+m", "ctrl+alt+m", "accept the proposed change set at the caret"},
-	{"proposals", RejectProposed, "ctrl+super+/", "47;13u", "cmd+ctrl+slash", "ctrl+alt+slash", "back out the proposed change set at the caret"},
+	{"proposals", RejectProposed, "ctrl+super+/", "47;13u", "cmd+ctrl+slash", "ctrl+alt+slash", "reject the proposed change set at the caret"},
+	{"proposals", ClearRejected, "ctrl+super+k", "107;13u", "cmd+ctrl+k", "ctrl+alt+k", "hard-purge the rejected change set at the caret"},
 	{"proposals", PrevProposed, "ctrl+super+,", "44;13u", "cmd+ctrl+comma", "ctrl+alt+comma", "previous pending change set"},
 	{"proposals", NextProposed, "ctrl+super+.", "46;13u", "cmd+ctrl+period", "ctrl+alt+period", "next pending change set"},
 }

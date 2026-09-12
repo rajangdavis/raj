@@ -1,7 +1,8 @@
 # TODO
 
 Open work only. Measured numbers live in BENCHMARKS.md; root causes, terminal
-findings and decisions live in INVESTIGATIONS.md.
+findings and decisions live in INVESTIGATIONS.md. Raw, dated agent feedback
+lives in RAJ_FEEDBACK.md; its actionable items are in the section below.
 
 **RECURSIVE_RAJ: start here.** A Raj agent improving raj reads
 RECURSIVE_RAJ.md first (identity, rebuild boundary, editing discipline, swarm
@@ -9,41 +10,15 @@ workflow), then works the active plan in the next section.
 
 ## Active plan — recursive raj (2026-09-10, second instance)
 
-Landed and host-verified (`make check` green):
+Open work:
 
-- [x] **Wave 1 — incremental LSP sync.** `App.syncDoc` pulls `OpsSince` and
-  renders the window through `editsSince`; a live gopls hover check rides the
-  rebuild.
-- [x] **Wave 2 — review-flow chords and cycling.** Accept/reject replaced
-  ctrl+alt+a/x with ctrl+super+m and ctrl+super+/; next/prev cycle on
-  ctrl+super+, and ctrl+super+. walks distinct sets in document order, wraps,
-  and reports "proposal N of M".
-- [x] **Wave 3 — honesty fixes.** FakeHost.Press panics on an unknown chord;
-  search refuses a bare positional path and warns when -include matches
-  nothing.
-- [x] **Wave C — search honesty follow-ons.** Per-file truncation is surfaced
-  (response opcode 0x43 plus a CLI "truncated" report) and -regex anchors
-  match per line. The CLI half needs the container image rebuilt.
-
-- [x] **D1/D2 — review mode (2026-09-11).** cmd+r toggles an app-level Review
-  mode; the document is read-only in it (mutations refused with a status note),
-  while decisions, movement, scroll and search stay live; a status-line badge
-  plus a keybar show the real chords and `n`/`N`; Reload moves to cmd+shift+r.
-  Files: internal/app/{mode,render,app}.go, internal/keys/{action,table}.go,
-  docs/KEYBINDINGS.md, tests.
-- [x] **D4 — moved-hunk option A (2026-09-11).** `DiffPending`
-  (internal/piecetable/groups.go) projects the surviving runs of a proposed
-  member instead of dropping it; `Pending()` auto-rejects a set with no
-  surviving run; `PendingMarks` follows the fragments. The review bar is
-  reconciled to per-member "not shown" wording.
-
-Still open:
-
-- [ ] **Wave 2 remainder — save-review lag.** Diagnosed: the dirty bit and
-  the proposal tint clear inside one synchronous `Handle`, so the beat is
-  wall-clock — the fsync/rename/read-back write path, the
+- [~] **Wave 2 remainder — save-review lag.** Instrumented: `internal/timing`
+  behind `RAJ_TIMING` logs the write path, the per-frame draw and pending walk,
+  and save-to-clean. The first cut wrote to `os.Stderr`, which a full-screen
+  editor cannot use as a log sink (it painted over the TUI; see
+  INVESTIGATIONS.md) — the gate is being moved to a file before any numbers are
+  taken. The diagnosis stands: the beat is wall-clock in the write path, the
   `PendingMarks`/`Groups` journal walk during `Draw`, or one frame's paint.
-  Measure with an env-gated log in the `Run` loop before any fix.
 - [ ] **D3 — `raj ctl review [path]` socket verb.** Enter Review mode and list
   pending sets over the control channel; a new verb (wire, eight layers), so it
   rides a rebuild. The mode itself (D1/D2) landed; the pending-span edit
@@ -59,6 +34,33 @@ the target); owner/group preservation (needs a root-capable machine); parallel
 walk (blocked on streaming results); terminal, tmux, iTerm2 and chord items
 (need the user's terminal); tree-sitter (its own milestone); the /tmp/opencode
 image fix (rides the `raj box` work).
+
+## Layered proposals — phases (2026-09-11)
+
+Design and all decisions: `docs/LAYERED-PROPOSALS-SPEC.md`. Phase 0 (durable op log) is archived in COMPLETED.md; each remaining item is one
+focused task.
+
+~~Phase 1a — the projection primitive~~ is done and host-verified 2026-09-12
+  (`go test`, `make check` green); see COMPLETED.md. `piecetable.Project(policy)`
+  returns a `DerivedProject` built by a forward drift-map pass over the shared
+  stores, with an independent byte-level fuzz oracle in `project_test.go`.
+- [ ] **Phase 1b — decisions as state flips and leases.** `RejectGroup` marks
+  `Rejected` (no reversal, cannot fail); `AcceptGroup` can un-reject; a pending,
+  rejected or invalidated span is a read-only lease, so an edit or `apply` that
+  intersects one is refused. `save` writes `Project(AcceptedOnly)`; `read`
+  defaults to accepted with an annotated flag; the edit view is
+  `AcceptedAndProposed` with inert spans hidden as atomic folds, Review is
+  `Annotated`; `cmd+ctl+k` clears rejected, `cmd+ctl+l` clears invalidated.
+- [ ] **Phase 1c — invalidation and conflict reporting.** An orthogonal,
+  recomputed `Invalid` marks a still-`Proposed` set whose edit no longer fits
+  the current composition; it is excluded from edit/agreed and annotated in
+  Review, with the colliding span reported, never cascaded or clamped. The D4
+  promote rule is retired. Rendering and gutter polish for the new states.
+- [ ] **Then:** change gutter vs `HEAD`, annotated `read`/`exec`/LSP
+  composition, git verbs (read-only diff first).
+- [ ] **Also open (spec §7, §10):** `session.json` into the store; compaction /
+  checkpoints; the engine behind the record interface (SQLite later); the
+  attachment model (loaded vs announced, headless read).
 
 ## Panes and fields
 
@@ -168,18 +170,6 @@ image fix (rides the `raj box` work).
   server that needs a config file to start is a setup problem raj should not
   pretend to solve silently, but there is no way to point raj at one either.
   A per-workspace config file is the answer, and it does not exist yet.
-- [x] **Document sync is incremental now.** `App.syncDoc` pulls the window
-  `Session.OpsSince(since)` — keystrokes, ApplyDiff hunks, undo and reject
-  reversals all land in the one journal — converts each span to a UTF-16 Range
-  against the frame its predecessors produced, and replays the batch through a
-  pinned copy of the server's last-known text: ranges go out only when the
-  replay reproduces the buffer byte-for-byte. On any doubt it sends the whole
-  document instead (kind not Incremental, version reset, batch over 64 edits,
-  frame mismatch, mid-rune edge, replay disagreement); the capability is parsed
-  number-or-options-object, unknown means Full. Found already in tree this
-  session — the "unblocked" bullet above was stale; TestEditsSinceMultiHunkDiff
-  added 2026-09-10. Host verification of the fuzz gates and a live gopls hover
-  check ride the next rebuild+restart.
 - [ ] **Auto-indent knows brackets and nothing else.** Adding a level after an
   unclosed opener and lining up a closer covers C-family languages and leaves
   out everything indented another way: Python's colon, Ruby's `do`/`end`, YAML,
@@ -224,28 +214,6 @@ image fix (rides the `raj box` work).
 ~~The session is written only on a clean exit~~ — it is now also written from
   the idle tick, debounced to three seconds, and touched whenever a tab opens or
   closes. A crash loses seconds rather than the session.
-- [ ] **Dirty-buffer restore** — persist the journal and add-buffers, validated
-  by an orig-hash per buffer.
-- [ ] **Attribution across restarts** — tint is commit-scoped, so it must
-  outlive the process.
-- [ ] **Proposal-review state must outlive the process too.** Raised by the
-  user 2026-09-11, and the session made the case: a wave of subagent work
-  lands as proposed change sets, the review loop walks them one at a time,
-  and an accidental restart mid-review loses every pending decision (the
-  restart that orphaned twelve groups this session lost the *proposals*; had
-  any been accepted-but-unsaved, the acceptances would have gone too). Group
-  state — proposed/accepted/rejected, keyed by group id and author — is
-  small beside the journal, and it belongs with the two items above rather
-  than on its own: persist the journal (dirty-buffer restore), the author
-  table (attribution), and the group decisions (this) in one store, so a
-  restored session resumes a review where it stopped instead of pretending
-  nothing was pending. SQLite session store is the existing candidate for
-  the journal; group state rides the same artifact. Storage shape evaluated
-  against DuckDB (user asked 2026-09-11): columnar analytics over op-log
-  appends is wrong-weight for a per-editor embedded store; the fit for
-  heavy dependency is SQLite (modernc pure-Go, no cgo). If op-log analytics
-  ever lands as a separate tool, DuckDB reopens then, not for the session
-  store itself.
 - [ ] **Subagent transcripts feed the efficiency loop.** User asked 2026-09-11.
   The orchestrator's §8 loop reviews tool-usage reports by hand; the durable
   version mines captured subagent transcripts (the task tool's outputs in
@@ -352,31 +320,12 @@ is the transport and the rules around it.
   be collapsed because the transport package has no editor types to reach for,
   and the Stream D additions ride the same eight layers. What remains:
 
-- [x] **`patch` (and `prog`) dropped their path on the wire.** `EncodeRequest`
-  returned early for `patch` and `prog` before setting `h.Path`, so a patch
-  request arrived pathless and the host resolved it against the active tab —
-  refused when the snapshot named another file, silently misapplied if it
-  happened to match. Found while driving dump/patch over TCP. Fixed in tree:
-  `Path` is set in the `EncodeRequest` header literal, with a comment
-  explaining why, and the regression case rides `TestFrameRoundTrip`; host
-  verification rides the next `make check`.
 - [ ] **A `find` step in the opcode pipeline.** `run -prog` cannot ask "where
   is this text" and get an offset back in the same program, so a batched driver
   round (find → read → apply) is several round trips today. A `find` op
   answering with a byte span is the single-round-trip version of the
   `search` and `read` bullets above.
 
-- [x] **`apply` did not bounds-check its span.** Verified live: an apply with
-  `-start 99999 -end 99999` against a ~50 KB buffer was accepted silently
-  instead of refused, and the text landed in a near-empty document — the
-  clamp-or-refuse guard the skill's offset warnings assumed was not there. For
-  one agent that is a typo; for several writing concurrently it is silent
-  corruption. Fixed: a shared `resolveSpan(start, end, size)` in
-  internal/app/control.go refuses a span outside `[0, len]` with "offset out
-  of range: [s, e) is not within [0, size)", and `host.Read`, `host.Dump` and
-  `host.Apply` all resolve through it (apply wraps it as `hunk N: ...`).
-  Regression: `TestSpanBoundsAreChecked` (app/control_test.go). Host-verified
-  2026-09-10 (make check green); live after the next rebuild+restart.
 - [ ] **Attribution has no inverse.** An agent can see which spans are its own,
   but there is no verb to drop them. Reverting its own work means computing a
   reverse diff and applying it, which leaves both edits in the journal. A
@@ -394,37 +343,14 @@ hard way: each failure below had a cheap structural remedy on the `raj ctl`
 surface, and all three would have caught the byte-drift corruption before a
 compiler hand-off.
 
-- [x] **`buffers` reported size, not health.** A missing `}` and a stray ` }`
-  both survived text-level reads, and gofmt masked the real break behind
-  cascading "expected declaration" echoes. Now: `braceTally` (cli.go) computes
-  a per-buffer net balance per bracket kind, string- and comment-aware through
-  the same `syntax.ClassAt` seam bracket matching uses (nil spans degrade to
-  plain counting, mirroring the matcher). `buffers -json` attaches it as
-  `tally` per named buffer, computed CLI-side from live text, unsaved edits
-  included; unnamed/unreadable buffers carry nil (omitted, never a false
-  zero). Host-verified 2026-09-10 (`TestBraceTally{Balance,
-  IgnoresStringsAndComments,WithoutALexer}`). Follow-up, not done: move it
-  host-side into `host.Buffers()` + the `hBuffers` encoding once that wire is
-  unfrozen — the CLI-side shape was forced by the frozen header, not chosen.
-  Cheap enough to grow into the proposed `lint` verb.
 - [ ] **`exec` is refused over TCP.** The verify-after-save loop (`raj ctl
   exec -- make check` once buffers land) is blocked unless raj starts with
   `--control-exec`, so the user hand-off is the only gate today. If the refusal
-  is deliberate, the two bullets above are the driver-side substitute. If not,
+  is deliberate, the driver-side substitute is a `buffers`/`read` staleness
+  check in the client (both fixes landed; see COMPLETED.md). If not,
   `--control-exec` on the canonical start line turns the gate into a
   self-service loop and this bullet disappears.
 
-- [x] **`read`/`dump -start 0` returned the whole file.** Absent-means-zero on
-  the wire header: an explicit `-start 0` was indistinguishable from no flag,
-  so a span read or dump from byte zero came back as the whole buffer.
-  Verified live against `read` too, not just `dump`: `read -start 0 -end 400`
-  returned everything while `-start 100 -end 400` worked. Fixed with a
-  presence fix, not a bit: the four span fields (`Start`/`End`/`LineStart`/
-  `LineEnd`) are pointers, and `encodeHeader` now emits their op directly
-  under the nil check (mirroring `Base`) instead of routing through the
-  zero-skipping `num` helper. Regression: `TestStartZeroSurvives`
-  (wire_test.go). Host-verified 2026-09-10 (make check green); live after the
-  next rebuild+restart.
 - [ ] **`search` has no `-path`/root flag.** `-include` globs suffice; noted
   by a driver for completeness.
 
@@ -496,10 +422,10 @@ missing is addressing and state.
   refineable spans?), advisory versus enforced overlap, and claim lifetime
   (tie to connection liveness). Design doc and verb spec before
   implementation.
-- [ ] **Which composition does `read` return?** Accepted-only is the argument:
-  an agent should propose against the agreed base, not against another agent's
-  unaccepted guesses, or overlap detection compares offsets in different
-  frames. A flag would ask for the annotated view.
+- [~] **Which composition does `read` return?** Decided: `AcceptedOnly` by
+  default, with an explicit annotated flag (spec §6, §12). Implementation lands
+  with phase 1b; the argument stands — an agent proposes against the agreed
+  base, not another agent's unaccepted guesses.
 - [ ] **The sidebar does not use the streaming path yet.** `search.RunStream`
   and the snapshot split exist and the socket uses them, so a search over the
   socket runs off the event thread and reports as it goes. The pane still calls
@@ -600,15 +526,6 @@ missing is addressing and state.
   `RAJ_IDENTITY` alongside `RAJ_CONTROL_ADDR`/`RAJ_CONTROL_TOKEN`. Resolves
   notes items 3 and 8 and the proposals-on-dead-ids review problem. Open: with
   identities durable, does the 256 cap still bind, or are `gone` ids recycled?
-- [x] **`who` listed every participant the process had ever seen.** After one
-  TCP session the listing held 255 entries, all but three dead anons, which
-  made it noise exactly when several drivers need reading apart. Fixed as a
-  `-live` flag, client-side on purpose: the registry's full listing is the
-  attribution record (a gone participant's text is still in the document), so
-  the wire keeps every row and the flag is a view. `Registry.Join`/`Leave`
-  flip `Connected`; `-live` filters on it. Regression:
-  `TestLeaveMarksGoneNotLive` (participant_test.go). Host-verified 2026-09-10
-  (make check green); live after the next rebuild+restart.
 - [ ] **Dump snapshots are keyed by author id, not by identity.** A rebound
   identity keeps its text but not its snapshots, so `dump`→`patch` across two
   CLI invocations fails until the driver re-dumps. Keying snapshots by the
@@ -697,8 +614,10 @@ missing is addressing and state.
   hidden. `open` then means what it says: a request to show the user. The
   close-when-clean convention in the skill becomes automatic rather than
   agent-disciplined.
-- [ ] **SQLite session store** — the op log as the shareable, forkable artifact.
-  Unchanged by the socket, and the socket makes it more useful rather than less.
+- [~] **SQLite session store** — the op log is now persisted (`internal/journal`,
+  phase 0) as the shareable/forkable artifact; the engine is deferred (a plain
+  append-only log first, SQLite later behind the record interface), and folding
+  `session.json` into the same store is still open. See the spec §7.
 
 ## `raj box` — the container build/run, folded into the CLI
 
@@ -791,444 +710,174 @@ is unnecessary because `vcs.revision` is already embedded (confirmed in both
 - [ ] `cmd+shift+r` to reopen closed tabs, handing `cmd+shift+t` back — only
   worth doing if Ghostty actually binds it; check `+list-keybinds` first.
 
-## Notes from driving `raj ctl` as an agent
+## Agent feedback — actionable (context in RAJ_FEEDBACK.md)
 
-One session's worth of friction, recorded where the next driver will find it.
-Each item is cheap relative to what it cost to work around.
+Open items extracted from the agent feedback notes now kept in
+`docs/RAJ_FEEDBACK.md`; the raw notes, dates and explanations are there. Items
+already tracked elsewhere in this file are not repeated. `- [~]` marks work
+that is in tree but still needs host verification.
 
-- **Version skew between host binary and container CLI is invisible.** The
-  running editor predated `read -start/-end` in its own source: the request
-  fields were silently ignored and the whole buffer came back, with no hint
-  that anything had been dropped. Two things would have caught it in one
-  round trip: `whoami -json` (or an `about` verb) reporting a build version
-  or commit the driver can compare against the source tree it sees, and a
-  `-strict` mode where a request carrying fields the server does not know is
-  refused rather than served degraded. Decode-silently-ignores is the right
-  default for forward compatibility; an opt-in refusal is the mode an agent
-  wants, because its workaround for a missing feature is always worse than
-  the error. The build-version half of this now has a concrete design: the
-  version handshake on the control connection, spec among the TCP items
-  above.
-- **`edit`'s refusal does not quote what it saw.** "does not appear in the
-  buffer" against a 40-line `-old` leaves the driver diffing blind.
-  Reporting the longest common prefix of the miss (or the offset of the
-  nearest match) would turn the retry into a targeted fix instead of a
-  re-read of the whole file.
-- **Container ergonomics: no shared filesystem means stale-file checks are
-  manual.** `exec` is correctly refused over TCP, but then nothing warns the
-  driver that the bytes it is about to compile in its own sandbox do not
-  match the buffers. `buffers -json` answers it with a second round trip;
-  what is missing is the prompt to make one. A client-side flag (`exec
-  -warn-stale`, refusing locally if any buffer is dirty) would move the
-  check into the driver's own sandbox where it belongs.
-- **Path mapping is applied inconsistently across verbs.** After an editor
-  restart with `RAJ_ROOT_MAP=/work=/Users/.../raj` in force, `buffers`
-  reported `/work/TODO.md` and `open`/`version` accepted it, but `read
-  /work/TODO.md` answered "no open buffer for that path" while `read
-  /Users/.../raj/TODO.md` succeeded — the same string the editor itself had
-  just reported. The `text` op resolves the path without translating it,
-  where `open` translates first; a driver should never see the editor's
-  internal paths at all, and the ones it is handed should round-trip through
-  every verb.
-- **An editor restart orphans the driver's read-before-write state.** The
-  rebuilt editor kept the buffers open but reset every version to 0, so a
-  driver holding offsets from before the restart has coordinates against a
-  document that no longer exists. That is correct — anything else would be
-  worse — but nothing says so. A connection-scoped "editor restarted" marker
-  (a generation counter on `whoami`, bumped per listen) would let a driver
-  bin its cached versions instead of discovering staleness one refused
-  apply at a time.
-- **No Go toolchain in the container, so the host verifies.** No shared
-  filesystem and `exec` refused over TCP: agent work lands as proposals in
-  buffers, and the contract is that the user accepts and saves, then
-  `gofmt -w && go test ./... && make check` runs on the host. State it every
-  session.
-- **Bind an identity first over TCP, or every invocation is a new author.**
-  Each `raj ctl` call reconnects, and an anonymous reconnect mints a fresh
-  author id — per-author state (dump snapshots) does not survive between
-  invocations and proposals scatter across dead ids. `hello` is not a
-  `raj ctl` command: identity binding goes through `who` — `who -as X -name Y`
-  binds a name, and later `-as X` connections keep its id. Bind first, then
-  work. Open: add `raj ctl hello -as X -name Y` as the identity verb, or
-  document `who` as that verb.
-- **The Stream A/B/C/D labels are used but never defined.** The globs fix is
-  Stream B, scroll-ratio restore is Stream C, the driver-round additions ride
-  Stream D, and no file says what the streams are. Needs definitions from the
-  user to write.
+Path and identity:
 
-- **The rebuild boundary is not written down as a workflow.** New verbs are
-  compiled into the binary; buffer edits cannot make them live. Both
-  subagents in the 2026-09-09 session handled it correctly — verify semantics
-  against the running editor, state the host-side test contract — and each
-  had to discover the boundary for itself. The skill should state the loop
-  explicitly: propose in buffers, user accepts and saves, host rebuilds,
-  verify over the socket.
-- **The tooling prohibition needs to name the temptation.** "Use only raj
-  ctl verbs" invites the reading "for file access", and JSON post-processing
-  slips in under "just parsing tool output" — the orchestrator itself did it
-  once that session (python3 on `read -json` output; it failed on the spot,
-  no source edits went through it). Briefs should say: no interpreters
-  (python/node/jq) anywhere in the pipeline, including on `raj ctl` output;
-  if the output is hard to consume, that is a verb-surface gap to report. A
-  query flag on the verb (`read -json -field text`, in the spirit of the
-  flat-record item) is the sanctioned shape, not a pipe to an interpreter.
-- **The baked skill led with a verb the running build did not have.** The
-  image baked into the container instructed `raj ctl hello -as ... -name
-  ...`, which fails on contact against a pre-handshake build: there is no
-  `hello` command. The working pattern is `who -as X -name Y` once, then
-  `-as X` as the first flag after the verb on every call. This is the
-  version-skew class the handshake exists to kill, biting the skill itself.
-  The skill is fixed now; the note stays as the recorded failure mode,
-  because any image older than the editor will produce it again.
-- **`-as` is refused before the verb and accepted after it.** "unknown
-  command" in one position, silently fine in the other, and the usage text
-  shows neither — first flag after the verb is the only placement that
-  works. Also observed: `whoami -as X` printed a fresh anon id rather than
-  the bound one. Unreproduced since; treat it as a suspected bug and
-  confirm before trusting `whoami` as the bind check.
-- **`RAJ_IDENTITY` was not honoured by the pre-handshake build.** Set and
-  exported, a fresh anon was minted anyway. Now fixed — the handshake
-  session verified a server-minted token is adopted and rebinds — so this
-  stays only so a driver on an old build recognises the symptom instead of
-  debugging its own environment.
-- **Ten exploratory commands burned twelve author ids.** 26/256 used
-  mid-session, 55/256 by session end, almost all of them dead anons. That
-  is the live validation for server-minted identity, and the evidence for
-  recycling `gone` ids — the open decision on the server-minted-identity
-  item above.
-- **An empty `/work` in the container is expected, and `ls` is the trap.**
-  The mount point is empty inside the container while the editor's root
-  maps to the host repo, so the reflexive sanity check reads exactly like
-  "the files are gone". The check that works is `raj ctl buffers`; the
-  container filesystem was never the truth.
+- [ ] **Verbs resolve paths inconsistently.** `read path/to/file.go` refuses a
+  relative path where `open` accepts it, and `edit /work/...` can fail where
+  the host spelling works, while `read` on an unopened path answers with the
+  editor's `/Users/...` spelling. One resolution seam, used by every verb.
 
-Notes from the Wave 1 reconstruction session (2026-09-10), after the
-accidental restart wiped the unsaved proposals and they were re-applied
-piece by piece:
+Editing and applying:
 
-- **Two raj processes squatted one TCP port and the driver talked to the
-  other one.** An accidental editor restart left PID A bound to
-  `127.0.0.1:7391` and PID B to `*:7391`; the container reaches the host
-  via `host.docker.internal` (non-loopback), so only the wildcard bind was
-  reachable, and that process held the connection open while speaking
-  nothing. Every verb hung, with no refusal. The token was right all along
-  — the port was wrong. `lsof -iTCP:7391 -sTCP:LISTEN` on the host was the
-  only way to see it. Both failure modes want a real answer: the still-open
-  "one listener, not both" bullet above, and a client-side connect timeout
-  that names "the port answers but no control frame came back" as the
-  wrong-process case rather than hanging.
-- **A restarted editor orphans in-flight proposals, and the recovery is in
-  the driver, not the editor.** The orchestrator re-applied Wave 1 hunk by
-  hunk from its own task history after the restart. That worked because the
-  subagents had reported complete function-level designs. It is still the
-  user hand-off gap the dirty-buffer-journal item names; the session notes
-  here just add that a clean `raj ctl buffers` read (all `saved`) is what
-  confirmed the proposals were really gone rather than merely unaccepted.
-- **`lsp diagnostics` as a per-hunk smoke check worked.** The per-hunk loop
-  settled into: apply → `lsp diagnostics` → seam re-read → `goto` + focus
-  the tab → user review → cmd+s. The diagnostics call caught nothing this
-  session, but it occupied the slot where a malformed hunk would have shown
-  (the one bad hunk in Wave 1 was a bad test fixture, which diagnostics
-  cannot see). Cheap enough to keep in the skill's loop.
-- **The `braceTally` fixture failures were bad fixtures, two rounds.** A
-  raw-string case and an unbalanced `{ [(] }` both failed; ambiguity about
-  which constructs the Go lexer unambiguously classifies means the durable
-  fixture is double-quoted strings plus comments, nothing fancier. The
-  lesson to keep: when a tally is string/comment-aware, its tests will be
-  only as stable as the lexer's classification of the constructs chosen.
-- **`exec` refused over TCP still costs the verify loop.** Wave 1 needed
-  `go test ./internal/control -run TestBraceTally -v` on the host twice;
-  the agent could not run it, and each round was a user hand-off. That is
-  the intentionally-recorded trade (the refusal is correct), but the
-  per-hunk-loop above now has to lean on `lsp diagnostics` and claim that
-  semantic checks move to the user. Correction to an earlier draft of this
-  note: there is no `ping` verb (`raj ctl ping` is "unknown command") — ping
-  exists only as a protocol op the test harness sends. If a health-check
-  verb is wanted, that is a (cheap) gap, not an omission from usage.
-- **Color/readability on proposals is a user-reported niggle.** A
-  screenshot review of a proposal hunk prompted "the colors are a bit
-  difficult to read" — recorded here rather than guessed at, since the tint
-  palette is the user's terminal theme and any fix is a renderer design
-  question (which palette index proposals use, or a high-contrast mode),
-  not a Wave 1 item.
-- **`braceTally` counts markdown fences as code.** `buffers -json` on
-  TODO.md reports nonzero parens/brackets because unclosed `(`/`[` in prose
-  are counted — correct for a string/comment-aware tally that has no
-  markdown-fence class, but a false positive the reader has to dismiss. If
-  it ever becomes the `lint` verb, "is this file really source" is a
-  per-language question it currently cannot answer.
+- [ ] **`edit` usage does not show its positional `[path]`.** `-h` lists only
+  flags, so the natural call omits the path and edits the active buffer; when the
+  text is not there the error is `that text does not appear in the buffer`, which
+  reads as a bad quote rather than a wrong target. Show positional args in usage,
+  and name the buffer in the error.
 
-Agent tool-usage review, wave reports 2026-09-10/11 (filed per the new
-RECURSIVE_RAJ §8 step — deduped against the notes above; "none reported"
-waves were W2a and most of W2b, meaning the surface held):
+- [ ] **`edit` has no stdin form.** `-old-file -` / `-new-file -` do not
+  exist, so a multi-line inline `-new` breaks when an apostrophe closes the
+  shell's single-quoted string, leaving a broken intermediate group. A stdin
+  form would remove the trap.
+- [ ] **`-text-file -` heredocs always end in a newline** and split a one-line
+  literal mid-line when the payload was meant verbatim. A "no trailing
+  newline" note or a verbatim flag would remove the trap.
+- [ ] **A save can signal the driver (review-loop handoff).** In a per-file
+  review the user's cmd+s is the decision point, but the agent sits at a turn
+  boundary. A save hook posting `saved <path>` via `App.Tell`, plus a client
+  parked on `recv`, would let a save start the next review step.
 
-- [ ] **`edit` takes no `-base`, and a failed one does not report the miss
-  point.** Reported by the 3c subagent. `edit` is the convenience form of
-  `apply`, but it drops the version pin entirely: an edit against a stale
-  read replaces whatever text is CURRENTLY there. Two separable fixes: a
-  `-base` on edit (the old text must match as of that version), and the
-  refusal quoting the longest-common-prefix point, which the earlier note
-  already asks for. Also: that multiline `edit -old` works by exact match
-  is undocumented — one line in `--help` or the skill.
-- [ ] **`search` silently ignores a bare path argument and an unmatched
-  `-include`.** Reported by Wave 1 subagent A: a positional path is
-  accepted and ignored, and a `-include` glob that matches nothing returns
-  `(no output)` — indistinguishable from "no matches". Both want a refusal
-  or a warning; the current shape trains drivers to believe an empty
-  result is authoritative.
-- [ ] **`read` rejects relative paths while `open` accepts them.** Wave 1
-  subagent A: `read path/to/file.go` answered "no open buffer for that
-  path" where the absolute path worked. Same class as the path-mapping
-  note above (verbs resolve paths inconsistently) — one resolution seam,
-  used by every verb.
-- [ ] **`/tmp/opencode` is not writable in the opencode image.** Reported
-  independently by subagents B, 3b, and W2b: the directory is root-owned
-  0555 while the tooling docs call it pre-approved scratch space. Every
-  subagent routed to plain `/tmp`. Fix belongs in the image build
-  (Dockerfile.opencode: `mkdir -m 1777 /tmp/opencode` or chown to oc) and
-  rides the `raj box` work.
-- **Bash heredoc/`"` nesting in `edit -new` arguments is fragile.** 3c
-  reported a chained command that quoted poorly and had to be split into
-  separate guarded edits. Partially a discipline note (already in the
-  skill: single-quote args, use -old-file/-new-file for big blocks), but a
-  `-new-file` path is the documented escape and subagents reached for it
-  only after a failure — briefs should name it up front for multi-line
-  payloads.
-- [ ] **FakeHost.Press fails silently on an unknown chord name.** Cost a
-  make-check round 2026-09-11: a test pressed "escape" where the canonical
-  name is "esc", the host dropped it, and with a modal Prompt swallowing
-  every key the only signal was an assertion three steps later. The fix was
-  the test name, but Press should say so: panic or fail the test on an
-  unknown chord. One line in fake.go, and every future mistyped chord stops
-  being a debugging session.
+Search:
 
-Agent tool-usage review, wave reports 2026-09-10 (second plan instance, waves
-0/1/3 — the sync wave reported the surface held; new items below):
-
-- [x] **`search` truncates silently.** Fixed 2026-09-10: the per-file cap is
-  surfaced (response opcode 0x43 plus a CLI "truncated" report naming each cut
-  file as shown-of-total). Needs a rebuild, and the container image for the
-  CLI half.
-- [x] **`-regex` anchor semantics are undocumented.** Fixed 2026-09-10:
-  `compile` adds `(?m)`, so `^`/`$` match per line as a grep user expects;
-  literal quoting keeps a literal `^` literal.
-- [ ] **No file-listing verb.** Package discovery needs a
-  `search -q 'package x'` workaround; a glob/list verb would close it.
-- [ ] **`-include` glob semantics surprise.** `*COMPLETED*` matched nothing
-  against a file named COMPLETED.md — matching runs against walker-relative
-  paths in a way a driver cannot predict. The new matched-nothing warning says
-  THAT nothing matched, not why.
-- [ ] **New ctl against an old server warns falsely on -include.** `Considered`
-  rides a new header field (0x42); an old server never sets it, so every
-  -include search looks like zero files considered. warnVersionSkew prints on
-  the mismatch, which is the designed mitigation — recorded so a driver
-  recognises the pairing.
-- **Truncated tool output spills to a dead-end path** (harness-side, not raj):
-  the spill file under /home/oc/.local is outside raj's root and unreadable by
-  a subagent. Driver guidance: keep searches narrow.
-- **`open` on a nonexistent path creates the buffer** — relied on by a
-  subagent to create a test file; works, undocumented in the skill's refusal
-  table. One line to add (orchestrator direct).
-- **One garbled line on a long `read -lines 1,330`** — unreproduced on re-read
-  of the exact span; suspected display-side one-off, recorded in case it
-  repeats.
-
-Agent tool-usage review, wave reports 2026-09-10/11 (this session's swarm —
-review-flow chords, relative paths, search honesty, and a read-only save-lag
-diagnosis; deduped against the notes above):
-
-- [ ] **`raj ctl groups` under-reports a multi-hunk proposal.** On
-  `internal/keys/table.go` it listed one set (`1 ... +0 bytes`) while
-  `raj ctl diff` rendered three. The summary is actively misleading for
-  review; `diff` is the honest listing.
-- [ ] **`lsp diagnostics` returns `{}` for every file, including while gopls
-  is starting.** An empty object is indistinguishable from "no problems", so
-  it cannot serve as the per-hunk compile check the review loop leans on. A
-  "server starting" / "no server" status would be honest.
-- [ ] **`edit` has no stdin form.** `-old-file -`/`-new-file -` do not exist,
-  and a multi-line inline `-new` breaks on an apostrophe closing the shell's
-  single-quoted string, leaving a broken intermediate group. The file form
-  works but subagents reach for inline first; a stdin form would remove the
-  trap.
-- [ ] **A positional span argument is silently ignored.** `raj ctl read
-  <path> 940 1000` returns the whole file with no error; the numbers look like
-  offsets. Refuse, or say the extra argument was ignored.
 - [ ] **`search` gives no hint when a literal query has metacharacters.**
-  `-q 'func (a \*App)'` matched nothing while `-regex` would have; a note when
-  a pattern contains regex metacharacters but matches literally zero would
-  save a round trip.
-- [ ] **`read` on an unopened path reports the editor's host path.** It
-  answers with the `/Users/...` spelling rather than the translated `/work`
-  one the driver can see, which reads as a mismatch (same family as the path
-  mapping note above).
-- **Concurrent writers share the version stream, and rebasing handles it.**
-  Two subagents edited `control.go` concurrently; a hunk applied with a stale
-  `-base` rebased onto the other writer transparently. Worth knowing, not a
-  defect.
-- **A stale root `/work/KEYBINDINGS.md` duplicates the tested
-  `docs/KEYBINDINGS.md`.** No test reads it; delete it.
+  `-q 'func (a \*App)'` matches nothing while `-regex` would; a note when a
+  pattern contains regex metacharacters but matches literally zero saves a
+  round trip.
+- [ ] **`search` carries no buffer version.** A concurrent proposal shifted a
+  match between the `search` and the later `read`, and the caller could not
+  tell. A version per hit or per file would make the drift detectable.
+- [ ] **The whole-buffer search `-json` uses Go field names** (`Path`,
+  `ByteStart`, `LineStart`) while `-jsonl` uses snake_case. Unify them, or
+  state which is the contract.
+- [ ] **New `raj ctl` against an old server warns falsely on `-include`.**
+  `Considered` rides header field 0x42; an old server never sets it, so every
+  `-include` search looks like zero files considered. `warnVersionSkew` is the
+  designed mitigation — recorded so a driver recognises the pairing.
 
-## Agent-efficiency review — the walk and the ctl surface (2026-09-11)
+Diff and groups:
 
-Two reviewers read the D1/D2 and H1/H2/H3 subagent reports and the walks they
-implied; a follow-up swarm implemented the cheap half. "Walk discipline" now
-lives in RECURSIVE_RAJ §5 (anchor → locate → owning file → enclosing block →
-seam). Items below are deduped against the notes above. Items marked `[x]` are
-in tree and host-verified 2026-09-11; the rest still need the host rebuild, or
-remain open.
-
-Cheap, client-only or one-file:
-
-- [x] **`apply` cannot take more than one hunk.** `-start/-end/-text` build one
-  `Hunk`, though `Request.Hunks` and the encode loop already carry a list. A
-  `-hunks FILE` form (JSON Lines of `{start,end,text}`, `-` for stdin) landed.
-  In tree, host-verified 2026-09-11. Follow-on: nothing emits that format, so
-  an agent still computes offsets by hand — a `diff -hunks` or
-  `apply -from-diff` would close the loop.
-- [ ] **`lsp references`.** No way to ask "who calls this"; the modes are
-  hover/definition/completion/diagnostics. Reuses `LSPResult.Locations`; no
-  header change. Replaces `search -q name` plus a read per hit, and separates
-  same-named symbols.
 - [ ] **`diff` hunks have no line numbers.** Byte `start/end` only, so naming
-  or reading a hunk costs another call. Add line/end_line (nested DiffJSON) and
-  print `@@ L12..L18 (bytes 120..148) @@` (in the buffers).
+  or reading a hunk costs another call. Add `line`/`end_line` and print
+  `@@ L12..L18 (bytes 120..148) @@`.
 - [ ] **`diff` drops moved hunks to a bare count.** A brand-new file edited
   after insertion reports "moved … review the buffer directly" and shows
   nothing. Emit the recorded old/new marked as-written.
-- [x] **`-include`/`-exclude` match basenames for no-slash patterns.** Fixed in
-  `internal/search/search.go`; corrects a wrong comment there and a wrong
-  COMPLETED.md claim. In tree, host-verified 2026-09-11. Distinct from the
-  existing `search -path` item.
+- [ ] **`groups` hunks/moved, and no pending-only view.** `groups` cannot say a
+  set has N hunks or M moved members without `diff`, and it mixes proposed,
+  accepted and reversed sets. Add `Group.Hunks`/`.Moved` and a state filter.
+
+Diagnostics:
+
+- [ ] **`lsp diagnostics` is never `ok` for in-buffer text, and reads `ok`
+  when the server never published.** An empty object is indistinguishable from
+  "no problems", so it cannot serve as the per-hunk compile check. Push the
+  control-path text (or add a server-independent syntax check), and add a
+  `published` set with an `unpublished` status.
+- [ ] **Cross-buffer diagnostics staleness.** gopls reports `undefined`/stale
+  when a different unsaved buffer is unsynced; the freshness fix only covers a
+  same-file version mismatch.
+- [ ] **No raw-LSP verb.** No way to inspect inbound `publishDiagnostics`
+  frames or their `version` field, so the freshness assumption is
+  unverifiable from the socket. A debug verb or a trace would close it.
+
+Dated notes, 2026-09-12 (layered-proposals 1a wave):
+
+- [ ] **`lsp diagnostics` goes permanently stale after an apply.** Following an
+  agent `apply`, every later call answers `the language server has not been told
+  about the current text yet` (occasionally `status: stale`), so the per-hunk
+  syntax check silently stops running for the rest of the session. A blocking
+  `lsp hover` on the file does force the server to sync — that is the workaround
+  the 1b F1 subagent found — but it is undocumented and costs a round trip.
+  Riding the version bump, or a `diagnostics -sync` flag, would close it. Hit by
+  the 1a and 1b agents on every file.
+- [ ] **A saved buffer can still carry proposed sets.** After a rebuild and
+  restart, `buffers` reported `saved` for `internal/piecetable/project_test.go`
+  while `groups`/`diff` showed two `proposed` sets whose ops read `moved past
+  what a rebase can carry`; the sets then vanished without a visible accept.
+  Needs a reproduction before it is a fix — it may be the journal restore
+  seeding decisions, or `saved` meaning only that the text matches disk while
+  the decisions ride a separate axis. Relevant to 1b, which changes this exact
+  reject/decision path.
+
+Open and review:
+
 - [ ] **`open` creates a buffer for a typo'd path, silently.** Refuse a
   nonexistent path unless `-create`; say which happened. A swarm making this
   mistake creates phantom tabs.
-- [ ] **`lsp diagnostics` says ok+clean when the server never published.** The
-  Status/Detail work is in the buffers; this is its one hole — add a
-  `published` set and an `unpublished` status.
-- [x] **`decodeHeader` silently truncates a malformed list.** Fixed (checks
-  `Reader.Bad` after each list). In tree, host-verified 2026-09-11; records the
-  failure mode that outlived the signed-varint fix.
+- [ ] **The keyboard bulk review has the same oldest-first defect.**
+  `internal/app/review.go:reviewProposed` decides every visible set in list
+  order with no re-list; mirror the `reject -all` fix.
 
-Design first — wire (header + encode/decode + host + CLI) or a new op:
+Inlay hints, remaining:
 
-- [x] **`buffers -json` pending/moved per buffer.** Landed as a new sparse
-  `hBufferState` field (0x44): appending to the record-shaped `hBuffers` would
-  break old readers, so the counts ride a separate argument field. The swarm
-  read path: "which open files hold proposals" in one call. In tree,
-  host-verified 2026-09-11. Note it also makes `version` pay for the
-  `DiffPending` walk (host.Buffers is reused) — split a cheap path if that
-  latency matters.
-- [x] **`accept -all` / `reject -all`.** Client loop landed. In tree,
-  host-verified 2026-09-11; the one-frame form still wants an `All` argument op.
-- [ ] **`reject -all` should go newest-first.** Verified live 2026-09-11: with
-  an earlier set whose span a later set edited, the client loop rejects in
-  document order, so the earlier `reverseGroup` is blocked by the later
-  overlap, the loop reports "1 of 2 could not be rejected", and the older set
-  stays applied. Rejecting in reverse document order (and re-listing after)
-  would let a bulk reject unwind an overlapping stack; `accept -all` is
-  order-independent. A second live run showed it worse: after rejecting the
-  first set, the second reported "later edits overlap it" even though both
-  ended at 0 ops, leaving the buffer dirty-but-empty and unclosable without a
-  save — so the bulk form can wedge state, not just skip a set.
-- [ ] **`groups` hunks/moved.** `groups` still cannot say a set has N hunks or
-  M moved members without `diff`; `Group.Hunks`/`.Moved` keeps the listing from
-  drifting again.
-- [ ] **`open -create`.** Argument op + `host.Open` signature.
-
-New friction from the 2026-09-11 swarm wave (all subagents, deduped):
-
-- [ ] **`search -json` `ByteStart` is the matched substring, not the line
-  start.** An apply anchored on it began 25 bytes into a bullet and ate the
-  next line's prefix. Document that offsets are matched-text coordinates, or
-  add a line-start offset.
-- [ ] **`search` offsets and displayed `Text` disagree on leading
-  indentation.** A match at a line start shows a leading tab in `Text` but
-  `ByteEnd-ByteStart` excludes it, so an insert lands one tab late. Same family
-  as the item above.
-- [ ] **`groups` and `diff` list different pending sets.** Reported by three
-  agents this wave: `groups` returned 5 of 6 rows (one with `bytes 0`), and 2
-  where `diff` showed 3 hunks; ids do not line up between the views. The H2
-  varint fix is in tree (host-verified 2026-09-11); re-check on the rebuilt
-  binary before calling it fixed.
-- [ ] **`read -lines` disagrees with the reported line count at EOF.** After
-  edits, `read -lines N,N` on the last reported line fails "offset out of
-  range" (off-by-one/trailing newline). Byte edits are unaffected; the line
-  counts are not trustworthy.
-- [ ] **`-text-file -` heredocs always end in a newline** and split a one-line
-  literal mid-line when the payload was meant to replace it verbatim. A
-  "no trailing newline" note or a verbatim flag would remove the trap (the same
-  reason `printf` got reached for).
-- [x] **The `raj-editor` skill's glob field note is stale.** It said globs
-  match the relative path, not the basename; the no-slash change makes the
-  basename apply too. `skills/raj-editor/SKILL.md` now documents the rule. In
-  tree, host-verified 2026-09-11; the container copy still rides the image
-  rebuild.
-- [x] **Option A moved the moved-hunk goalposts for tests.** Under the
-  projected-run model an additive edit leaves surviving runs; the
-  `internal/app/mode_test.go` moved-past assertions were updated with D4. In
-  tree, host-verified 2026-09-11.
-- [ ] **`edit` (and possibly other write verbs) need the editor's own path
-  spelling.** `read`/`search`/`apply` accept the translated `/work/...` path;
-  `edit /work/...` can fail "no open buffer for that path" or "outside the
-  workspace", and the host spelling works. Same family as the path-mapping note
-  above; re-check which verbs translate on the rebuilt binary.
-
-- [ ] **A save can signal the driver (review-loop handoff).** Low priority, and
-  the same gap as "nothing calls `App.Tell`": in a per-file review the user's
-  cmd+s is the decision point, but the agent sits at a turn boundary rather
-  than parked on a socket read. A save hook that posts `saved <path>` via
-  `App.Tell`, plus a client parked on `recv`, would let a save start the next
-  review step without a typed "next". The opencode half — a plugin/skill that
-  turns a mailbox message into the next turn — is what makes it automatic.
-
-Duplicates, deliberately not re-filed: the `find` opcode, a file-listing verb,
-`read -json -field text`, flat-record responses, the version handshake,
-`edit -base` + miss-point reporting, `search -path`/`-dir`, inspection-without-
-a-tab, `read` on an unopened path reporting the host spelling, `exec
--warn-stale`.
-
-## Agent tool-usage review, 2026-09-11 (inlay hints, fallback)
-
-Deduped against the notes above. The inlay-hints rewrite is the substantive work
-of this session; the defects it surfaced are filed here, and the remaining
-inlay-hints steps follow.
-
-- [ ] **Line-index corruption (severe).** A buffer driven through many
-  `apply`/`reject`/`patch` cycles reported ~2x the true line count (`version
-  -json` said 1212 lines for a 21022-byte file) and `read -lines` near EOF
-  computed offsets past EOF, while the text stayed correct; it cleared after
-  save + close/reopen. The existing "The line index and the document disagreed
-  after a batch" note (INVESTIGATIONS.md) is the same class, and this is a hard
-  reproduction, so the two want investigating together.
-- [ ] **`search -json` `ByteStart` recurrence (dedup of the two items above).**
-  Still the matched-substring start, not the line start, and still excludes the
-  displayed `Text` leading tab; this session it cost a corrupted apply in the
-  mouse.go span. Third report; the existing items stand.
-- [ ] **Cross-buffer diagnostics staleness.** gopls reports `undefined`/stale
-  results when a different unsaved buffer is unsynced, and `lsp diagnostics` can
-  read `ok` for file A while file B is stale. The freshness fix only covers a
-  same-file version mismatch, so the cross-buffer case is still open.
-- [ ] **No raw-LSP verb.** There is no way to inspect inbound
-  `publishDiagnostics` frames or their `version` field, so the assumption in the
-  freshness fix that gopls sends `version` is unverifiable from the socket. A
-  debug verb or a trace would close it.
-- [ ] **`/tmp/opencode` is root-owned and not writable.** Still true (dedup of
-  the earlier note); rides the `raj box` work.
-
-Inlay hints - remaining:
-
-- [ ] **Toggle chord.** `keys.ToggleInlayHints` plus a `keys/table.go` row:
-  native `shift+super+i`, CSI-u `105;10u`, mac `cmd+shift+i`, linux
-  `ctrl+shift+i`; persisted as `session.Pane.Hints`; a `KEYBINDINGS.md` row; the
-  accounting tests. (`App.InlayHints` defaults true and `p.Hints` already
-  exists.)
-- [ ] **Cross-cutting tests.** Hover anchor, find-after-hint,
-  selection-over-hint.
 - [ ] **`raj ctl lsp inlay-hints` verb.** Whole file with `-lines A,B`; the
   eight control layers plus the range plumbing.
-- [ ] **Mouse-hover tooltips.** VS Code-style, using the hint `Tooltip`; depends
-  on the column map, not on wrap integration.
+- [ ] **Mouse-hover tooltips.** VS Code-style, using the hint `Tooltip`;
+  depends on the column map, not on wrap integration.
 - [ ] **`cmd+.` apply-hint-edit.** Applies a hint `textEdits`.
+
+In tree, host verification pending:
+
+- [~] **Line-index corruption after apply/reject/patch cycles** — fixed in
+  buffer: `host.Decide`/`App.decideProposed` called `Session.RejectGroup`
+  directly (bypassing `File`), and `ApplyDiff` anchored its catch-up at the
+  entry version.
+- [~] **`reject -all` newest-first** — fixed in buffer: the bulk reject drives
+  the pending `diff` projection newest-first and re-reads it after each
+  reversal.
+- [~] **`search` line-start offset** — fixed in buffer: hits carry a
+  source-computed `LineStart` (sparse wire field 0x45); `ByteStart`/`ByteEnd`
+  stay matched-substring coordinates.
+
+Superseded or already tracked, not re-filed here: the positional-span and
+path-verb refusals and `FakeHost.Press` panic (Wave 3); the `-include`/
+`-exclude` basename fix and the search `truncates`/`-regex` follow-ons (Wave
+C); `lsp references`; `edit -base` and miss-point reporting; `/tmp/opencode`;
+the `find`/file-listing verb; and the `search` `ByteStart`-vs-`LineStart`,
+`groups`-vs-`diff` and `read -lines` reports (fixed by the three `[~]` items
+above). The rest of the feedback is context in `docs/RAJ_FEEDBACK.md`.
+
+## Wave B proposals, 2026-09-11 (review verb, save-lag timing, inlay toggle)
+
+In tree as proposals; host verification pending.
+
+- [~] **D3 — `raj ctl review [path]`** — the verb is threaded through the eight
+  layers (`OpReview`/`OpReviewList`, request field `hReviewList`, `Host.Review`,
+  the `memHost` fake), and `App.EnterReview` is now the one enter path shared
+  by the cmd+r chord and the socket. `-json` lists without entering the mode.
+- [~] **Save-review lag** — `internal/timing` behind `RAJ_TIMING` logs the
+  write-path phases, the per-frame draw and pending walk, and save-to-clean.
+  Measurement, not a fix. **Regression:** the first cut defaulted to
+  `os.Stderr`, so with the gate on it painted over the TUI and made the editor
+  unusable; `RAJ_TIMING` is being changed to name a file (with `1` a default
+  path) and stderr barred. See INVESTIGATIONS.md.
+- [~] **Inlay-hints toggle** — `keys.ToggleInlayHints` (shift+super+i,
+  cmd+shift+i, ctrl+shift+i), per-pane `p.Hints`, persisted as
+  `session.Tab.Hints` (a pointer: absent = app default), a KEYBINDINGS row, and
+  toggle, session-round-trip and selection/find cross-cutting tests.
+- [ ] **`raj ctl review [path]` enters Review mode on the active tab.** A
+  non-active `[path]` lists that buffer's sets while the mode badge and the
+  jump belong to another tab. Focus the buffer before `EnterReview`, or
+  document that `[path]` only scopes the listing.
+- [ ] **The hover-anchor cross-cutting test is blocked on a server seam.**
+  `internal/app` has no fake LSP server and the hover path early-returns
+  without one; the column math is covered at the editor layer only.
+
+- [ ] **A normal save into a missing directory fails with a raw error.** Saving
+  a buffer whose parent directory does not exist — e.g. a new package created
+  through the control socket, like `internal/timing/` — fails inside
+  `writeAtomic`'s `os.CreateTemp(dir, ...)` with an `ENOENT`. The save-as path
+  already detects the missing directory and offers to create it
+  (`internal/app/app.go`, the `MkdirAll` branch); a save to an existing name
+  should give the same prompt, or create the directory, rather than surfacing
+  the temp-file error.
 
 ## Deliberately not doing
 

@@ -37,7 +37,8 @@ var knownOps = map[byte]bool{
 	prog.OpDump: true, prog.OpPatch: true,
 	prog.OpDumpID: true,
 	prog.OpLSP:    true, prog.OpLSPMode: true,
-	prog.OpDiff: true,
+	prog.OpReviewList: true,
+	prog.OpDiff:       true, prog.OpReview: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -52,7 +53,7 @@ var verbNames = map[byte]string{
 	prog.OpSearch: "search", prog.OpStats: "stats",
 	prog.OpGoto: "goto", prog.OpClose: "close",
 	prog.OpDump: "dump", prog.OpPatch: "patch",
-	prog.OpLSP: "lsp", prog.OpDiff: "diff",
+	prog.OpLSP: "lsp", prog.OpDiff: "diff", prog.OpReview: "review",
 }
 
 // Four verbs stay out of programs, and the reasons are different enough to be
@@ -157,6 +158,8 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			pending.Group = uint64(prog.ReadNumber(op.Payload))
 		case prog.OpDumpID:
 			pending.DumpID = uint64(prog.ReadNumber(op.Payload))
+		case prog.OpReviewList:
+			pending.ReviewList = true
 		case prog.OpLSPMode:
 			pending.LSPMode = string(op.Payload)
 		case prog.OpLine:

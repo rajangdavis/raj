@@ -206,3 +206,43 @@ func TestLegacyJSONWithoutRatio(t *testing.T) {
 		t.Errorf("legacy tab = %+v, want top 7, ratio 0", st.Tabs)
 	}
 }
+
+// Hints is a tri-state on a saved tab: absent means the app default governs,
+// so an old session file keeps loading, while an explicit false is written and
+// read back as a choice.
+func TestHintsRoundTripAndAbsence(t *testing.T) {
+	root := workspace(t, "a.go")
+	path := filepath.Join(root, "a.go")
+
+	off := false
+	if err := Save(root, State{Tabs: []Tab{{Path: path, Hints: &off}}}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(File(root))
+	if !strings.Contains(string(data), `"hints": false`) {
+		t.Errorf("an explicit false was omitted from the saved JSON: %s", data)
+	}
+	st := Load(root)
+	if len(st.Tabs) != 1 || st.Tabs[0].Hints == nil || *st.Tabs[0].Hints {
+		t.Fatalf("tabs = %+v, want an explicit false", st.Tabs)
+	}
+
+	on := true
+	Save(root, State{Tabs: []Tab{{Path: path, Hints: &on}}})
+	st = Load(root)
+	if len(st.Tabs) != 1 || st.Tabs[0].Hints == nil || !*st.Tabs[0].Hints {
+		t.Fatalf("tabs = %+v, want an explicit true", st.Tabs)
+	}
+
+	// Absence is the app default: a file written before the field existed
+	// loads with Hints nil.
+	p := File(root)
+	body := `{"version":1,"tabs":[{"path":"` + path + `","cursor":0,"top":0,"wrap":true}],"active":0}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st = Load(root)
+	if len(st.Tabs) != 1 || st.Tabs[0].Hints != nil {
+		t.Errorf("tabs = %+v, want Hints nil so the app default applies", st.Tabs)
+	}
+}

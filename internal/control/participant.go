@@ -130,6 +130,38 @@ func (r *Registry) Join(identity, name string, kind Kind) (uint8, error) {
 	return id, nil
 }
 
+// Seed installs a participant row under an explicit author id, for a registry
+// rebuilt from a persisted author table. It is not Join: the id is the one the
+// log already used, so restored text resolves to the identity and tint it was
+// written under instead of whatever join order a fresh registry would hand out.
+//
+// A row for the id or the identity already present is left as it is, a
+// restored row is never Connected, and next moves past the highest seeded id.
+// It returns whether the row was installed.
+func (r *Registry) Seed(p Participant) bool {
+	if p.ID == 0 || p.Identity == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.byID[p.ID]; exists {
+		return false
+	}
+	if _, exists := r.byIdentity[p.Identity]; exists {
+		return false
+	}
+	p.Connected = false
+	r.byID[p.ID] = &p
+	r.byIdentity[p.Identity] = p.ID
+	switch {
+	case p.ID == MaxParticipants:
+		r.next = 0 // the one-byte space is full after this id
+	case p.ID >= r.next:
+		r.next = p.ID + 1
+	}
+	return true
+}
+
 // lowestGone finds the lowest recyclable author id: one whose participant has
 // disconnected. The scan starts past the local human — an agent handed id 1
 // would write text indistinguishable from typed — and a connected row is

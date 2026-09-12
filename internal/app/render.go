@@ -2,13 +2,25 @@ package app
 
 import (
 	"fmt"
+	"time"
 
 	"raj/internal/editor"
+	"raj/internal/timing"
 	"raj/internal/ui"
 )
 
 // Draw renders a frame and hands it to the host.
 func (a *App) Draw() {
+	// The frame timer covers the whole paint, Present included: the beat the
+	// save-review question is about is wall-clock to the screen, not to the
+	// last Set. It also brackets the pending-marks accumulator, which the
+	// editor adds to as PendingMarks walks the journal.
+	var drawStart time.Time
+	if timing.On {
+		drawStart = time.Now()
+		timing.ResetPending()
+		defer a.traceDraw(drawStart)
+	}
 	// Hints are dropped here rather than at each mutation site: a keystroke
 	// reaches Draw after the edit, so comparing the document version against
 	// the installed answer catches typed keys, paste, undo, redo and a control
@@ -62,6 +74,27 @@ func (a *App) Draw() {
 		// visible instead of looking like random corruption.
 		a.status = "display write failed: " + err.Error()
 	}
+}
+
+// traceDraw is the frame timer's tail. It reports the frame and the pending
+// journal walk inside it, then, when a save finished since the last frame, the
+// distance from that save to the end of the first frame that paints the buffer
+// clean — the lag the save-review question is about. Installed only when the
+// timing gate is open; see package timing.
+func (a *App) traceDraw(start time.Time) {
+	pending, calls := timing.TakePending()
+	timing.Log("draw", time.Since(start), "pending", pending, "calls", calls)
+	if a.saveDoneAt.IsZero() {
+		return
+	}
+	dirty := true
+	if p := a.Tabs.Active(); p != nil {
+		dirty = p.File.Dirty()
+	}
+	if !dirty {
+		timing.Log("save-clean", time.Since(a.saveDoneAt))
+	}
+	a.saveDoneAt = time.Time{}
 }
 
 // syncSize adopts the host's size, since a resize can arrive between frames.
@@ -280,7 +313,7 @@ func (a *App) drawStatus(cols, y int) {
 	} else if p := a.Tabs.Active(); p != nil {
 		f := p.File
 		dirty := ""
-		if f.Dirty() {
+		if f.ViewDirty() {
 			dirty = " •"
 		}
 		left = fmt.Sprintf(" %s%s", f.Name(), dirty)
