@@ -1562,6 +1562,10 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 	}
 	a.status = "saved " + p.File.Name()
 	p.ClearDiskStale()
+	// Every connected driver hears that the file reached disk, so a harness can
+	// react without polling. Best-effort: a delivery failure is not a save
+	// failure, and with no control listener this is nothing.
+	a.notifySaved(p.File.Path)
 	// The user pressing save is the approval. Nothing else in the editor can
 	// write this file — an agent's own save is refused while its change sets
 	// are proposed — so reaching here means a human chose to put these bytes on

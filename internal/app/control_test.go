@@ -248,6 +248,52 @@ func TestUserSaveAcceptsPendingChanges(t *testing.T) {
 	}
 }
 
+// A UI save tells every connected driver, so a harness learns the file reached
+// disk without polling. The message rides the same mailbox `recv` parks on;
+// a driver that is gone or has no room must not fail the save.
+func TestUserSaveNotifiesConnectedDrivers(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+
+	// Two connections, one identity: the parked recv needs its own client
+	// because Client.Do holds a lock for the length of a call.
+	c := h.dial(t)
+	if hi := c.do(h, control.Request{Op: "hello", Identity: "driver-1", Name: "claude"}); !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	parked := h.dial(t)
+	parked.do(h, control.Request{Op: "hello", Identity: "driver-1"})
+
+	got := make(chan control.Response, 1)
+	go func() {
+		res, err := parked.c.Do(control.Request{Op: "recv"})
+		if err != nil {
+			got <- control.Response{Err: err.Error()}
+			return
+		}
+		got <- res
+	}()
+	select {
+	case res := <-got:
+		t.Fatalf("recv answered %+v before the save", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	path := h.Tabs.Active().File.Path
+	h.press("super+s")
+
+	select {
+	case res := <-got:
+		if !res.OK {
+			t.Fatalf("recv = %+v", res)
+		}
+		if len(res.Messages) != 1 || res.Messages[0].Text != "saved "+path {
+			t.Fatalf("messages = %+v, want a saved notice for %s", res.Messages, path)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a save did not reach the connected driver")
+	}
+}
+
 // A save writes the agreed composition, never text a reviewer rejected: the
 // buffer keeps the rejected bytes, read returns them by default as the view,
 // and the file on disk holds only the agreed bytes.
@@ -515,6 +561,50 @@ func TestControlSearchSeesUnsavedEdits(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("unsaved edit was not searchable: %+v", res.Matches)
+	}
+}
+
+// -path limits the walk to one subtree under the workspace root, and a path
+// that reaches outside it is refused rather than walked.
+func TestControlSearchPathScopesAndRefusesEscape(t *testing.T) {
+	h := controlHarness(t, "root needle\n")
+	c := h.dial(t)
+	root := filepath.Dir(h.Tabs.Active().File.Path)
+
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "inside.go"), []byte("inside needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "outside.go"), []byte("outside needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unscoped, every file that holds the term reports it.
+	all := c.do(h, control.Request{Op: "search", Query: &control.SearchQuery{Text: "needle"}})
+	if !all.OK || len(all.Matches) < 3 {
+		t.Fatalf("unscoped search = %+v, want the root file and the subtree", all)
+	}
+
+	// Scoped, only the subtree.
+	scoped := c.do(h, control.Request{Op: "search", Query: &control.SearchQuery{Text: "needle", Path: "sub"}})
+	if !scoped.OK || len(scoped.Matches) == 0 {
+		t.Fatalf("scoped search = %+v", scoped)
+	}
+	for _, m := range scoped.Matches {
+		if filepath.Dir(m.Path) != filepath.Join(root, "sub") {
+			t.Errorf("scoped search returned %s, outside sub/", m.Path)
+		}
+	}
+
+	// An escape is refused, not walked.
+	out := c.do(h, control.Request{Op: "search", Query: &control.SearchQuery{Text: "needle", Path: "../elsewhere"}})
+	if out.OK {
+		t.Fatalf("a path outside the root was searched: %+v", out)
+	}
+	if !strings.Contains(out.Err, "not under") {
+		t.Errorf("refusal = %q, want it to name the root boundary", out.Err)
 	}
 }
 
@@ -847,6 +937,45 @@ func TestControlLineIndexSurvivesApplyRejectCycles(t *testing.T) {
 		check("after patch")
 		reject()
 		check("after reject patch")
+	}
+}
+
+// A hunk that would land in a proposed change set is refused and carries the
+// group that owns the text, so the caller can tell a lease from a stale offset
+// and knows which decision has to come first.
+func TestControlLeaseRefusalCarriesTheGroup(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	// The first proposal replaces "world", which leases offsets 6..11.
+	read := c.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if !c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}).OK {
+		t.Fatal("the first apply failed")
+	}
+	gs := c.do(h, control.Request{Op: "groups", Path: path})
+	var owner uint64
+	for _, g := range gs.Groups {
+		if g.State == "proposed" {
+			owner = g.ID
+		}
+	}
+	if owner == 0 {
+		t.Fatalf("no proposal listed: %+v", gs.Groups)
+	}
+
+	// A second hunk overlapping that span is refused, not rebased through it.
+	read = c.do(h, control.Request{Op: "text"})
+	base = read.Version
+	res := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 11, Text: "goodbye"}}})
+	if res.OK || len(res.Conflicts) != 1 {
+		t.Fatalf("apply = %+v, want one lease refusal", res)
+	}
+	if got := res.Conflicts[0].Group; got != owner {
+		t.Errorf("conflict group = %d, want the leasing set %d", got, owner)
 	}
 }
 

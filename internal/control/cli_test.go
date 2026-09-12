@@ -33,6 +33,13 @@ type fakeEditor struct {
 	// bump is called before each apply, to simulate the user typing between a
 	// read and the write that follows it.
 	bump func()
+	// lease is the change set the fake apply names when it refuses a hunk, so
+	// the CLI lease-refusal path can be exercised without a real Session. Zero
+	// makes the refusal an ordinary stale offset.
+	lease uint64
+	// searchPath records the -path the last search carried, so a CLI test can
+	// assert the flag reaches the wire without a real walker.
+	searchPath string
 	// diffJSON is the canned diff answer; empty means no pending changes.
 	diffJSON string
 	// mode records the app mode a request switched to, so a test can assert
@@ -51,6 +58,9 @@ type fakeEditor struct {
 	groups    []Group
 	decided   []uint64
 	decideErr map[uint64]string
+	// clearErr makes a named clear fail, standing in for a rejected set the
+	// journal has wedged behind a later edit.
+	clearErr map[uint64]string
 	// pending, when set, is the projection `diff` reports: the change sets with
 	// surviving text. A successful reject removes its entry and an entry named
 	// in wedge fails while its blocker is still pending, the two behaviours a
@@ -181,6 +191,11 @@ func (f *fakeEditor) run(req Request) Response {
 		return res
 	case "open":
 		if _, ok := f.docs[path]; !ok {
+			if !req.Create {
+				// The fake has no disk, so not-in-docs is the missing file the
+				// real host would stat for.
+				return Response{Err: "no open buffer or file at " + path}
+			}
 			f.docs[path], f.vers[path] = "", 1
 		}
 		return Response{OK: true, Version: f.vers[path]}
@@ -198,7 +213,7 @@ func (f *fakeEditor) run(req Request) Response {
 			return Response{Err: "apply needs a base version"}
 		}
 		if *req.Base != f.vers[path] {
-			return Response{Err: "stale", Conflicts: []Conflict{{Index: 0, Hunk: req.Hunks[0]}}}
+			return Response{Err: "stale", Conflicts: []Conflict{{Index: 0, Group: f.lease, Hunk: req.Hunks[0]}}}
 		}
 		for i := len(req.Hunks) - 1; i >= 0; i-- { // back to front: offsets stay valid
 			h := req.Hunks[i]
@@ -240,6 +255,22 @@ func (f *fakeEditor) run(req Request) Response {
 		}
 		f.decided = append(f.decided, req.Group)
 		return Response{OK: true}
+	case "clear":
+		if msg, ok := f.clearErr[req.Group]; ok {
+			return Response{Err: msg}
+		}
+		for i := range f.groups {
+			if f.groups[i].ID != req.Group {
+				continue
+			}
+			if f.groups[i].State != "rejected" {
+				return Response{Err: fmt.Sprintf("change set %d is not rejected", req.Group)}
+			}
+			f.groups[i].State = "accepted"
+			f.decided = append(f.decided, req.Group)
+			return Response{OK: true}
+		}
+		return Response{Err: fmt.Sprintf("no change set %d", req.Group)}
 	case "diff":
 		if f.pending != nil {
 			diffs := make([]DiffGroup, 0, len(f.pending))
@@ -456,7 +487,7 @@ func TestSearchRefusesBareArgument(t *testing.T) {
 	if code != 2 {
 		t.Errorf("code = %d, want 2 (usage); stdout %q", code, out)
 	}
-	want := `search: unexpected argument "needle" — the pattern goes to -q; to limit paths use -include`
+	want := `search: unexpected argument "needle" — the pattern goes to -q; to limit paths use -include or -path`
 	if !strings.Contains(errs, want) {
 		t.Errorf("stderr = %q, want %q", errs, want)
 	}
@@ -522,6 +553,75 @@ func TestCLIEditRefusesWhenTheBufferMoved(t *testing.T) {
 	}
 	if ed.docs["/w/a.go"] != orig {
 		t.Errorf("refused but wrote anyway: %q", ed.docs["/w/a.go"])
+	}
+}
+
+// A hunk a lease refused names the change set that owns the text — a decision
+// for the user rather than a re-read for the driver — and the -json form
+// carries the same group and reason.
+func TestCLIRefusalNamesTheLeaseOwner(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.lease = 7
+	ed.bump = func() { ed.vers["/w/a.go"]++ } // force the apply path to conflict
+
+	_, errs, code := run(t, "edit", "-old", "world", "-new", "socket")
+	if code == 0 {
+		t.Fatalf("a leased edit reported success")
+	}
+	if !strings.Contains(errs, "change set 7 owns this text") {
+		t.Errorf("message %q does not name the lease owner", errs)
+	}
+	if !strings.Contains(errs, "accept or reject it first") {
+		t.Errorf("message %q does not point at the decision", errs)
+	}
+
+	out, _, code := run(t, "edit", "-old", "world", "-new", "socket", "-json")
+	if code == 0 {
+		t.Fatalf("a leased edit reported success in json")
+	}
+	if !strings.Contains(out, `"group": 7`) || !strings.Contains(out, "change set 7 owns this text") {
+		t.Errorf("json = %q, want the group and the lease message", out)
+	}
+}
+
+// A conflict with no lease owner keeps the resubmit wording, in the text and
+// in the JSON.
+func TestCLIRefusalWithoutALeaseKeepsTheStaleMessage(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.bump = func() { ed.vers["/w/a.go"]++ }
+
+	_, errs, code := run(t, "edit", "-old", "world", "-new", "socket")
+	if code == 0 {
+		t.Fatalf("a stale edit reported success")
+	}
+	if !strings.Contains(errs, "could not be placed") {
+		t.Errorf("message %q lost the stale-offset wording", errs)
+	}
+
+	out, _, code := run(t, "edit", "-old", "world", "-new", "socket", "-json")
+	if code == 0 {
+		t.Fatalf("a stale edit reported success in json")
+	}
+	if !strings.Contains(out, "could not be placed") {
+		t.Errorf("json = %q lost the stale-offset wording", out)
+	}
+	if strings.Contains(out, `"group"`) {
+		t.Errorf("json = %q invented a lease group", out)
+	}
+}
+
+// -path reaches the wire as a query field; the real walk's scoping and its
+// refusal of a path outside the root are exercised in the app tests.
+func TestCLISearchPathReachesTheQuery(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+	if _, errs, code := run(t, "search", "-q", "needle", "-path", "internal"); code != 0 {
+		t.Fatalf("search -path: code %d: %s", code, errs)
+	}
+	ed.mu.Lock()
+	got := ed.searchPath
+	ed.mu.Unlock()
+	if got != "internal" {
+		t.Errorf("search path = %q, want internal", got)
 	}
 }
 
@@ -650,6 +750,7 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 	}
 	gate := f.gate
 	truncated := append([]TruncatedFile(nil), f.truncated...)
+	f.searchPath = q.Path
 	f.mu.Unlock()
 
 	var inc []string
@@ -1492,6 +1593,102 @@ func TestCLIAllAndGroupAreAlternatives(t *testing.T) {
 	_, errs, code := run(t, "accept", "/w/a.go", "-all", "-group", "3")
 	if code != 2 || !strings.Contains(errs, "-all and -group are alternatives") {
 		t.Errorf("code %d, stderr %q", code, errs)
+	}
+}
+
+// clear by group removes one rejected set, and the outcome names it.
+func TestCLIClearByGroup(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.groups = []Group{{ID: 5, Path: "/w/a.go", Author: 2, State: "rejected", Ops: 1, Bytes: 1}}
+	out, errs, code := run(t, "clear", "/w/a.go", "-group", "5")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "cleared change set 5") {
+		t.Errorf("stdout = %q", out)
+	}
+	if len(ed.decided) != 1 || ed.decided[0] != 5 {
+		t.Errorf("cleared %v, want 5", ed.decided)
+	}
+}
+
+// A set that is not rejected cannot be cleared. The refusal names the group,
+// which is what distinguishes it from the usage error for a missing -group.
+func TestCLIClearRefusesNonRejectedSet(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.groups = []Group{{ID: 5, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1}}
+	out, errs, code := run(t, "clear", "/w/a.go", "-group", "5")
+	if code == 0 {
+		t.Fatalf("clearing a proposed set reported success: %q", out)
+	}
+	if !strings.Contains(errs, "change set 5") || !strings.Contains(errs, "not rejected") {
+		t.Errorf("stderr = %q, want the group named", errs)
+	}
+}
+
+// clear -all purges every rejected set and leaves accepted and proposed ones
+// alone. It unwinds newest-first, the order a reversal needs.
+func TestCLIClearAllPurgesRejectedSets(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.groups = []Group{
+		{ID: 3, Path: "/w/a.go", Author: 2, State: "rejected", Ops: 1, First: 1, Last: 1},
+		{ID: 5, Path: "/w/a.go", Author: 2, State: "accepted", Ops: 1, First: 4, Last: 4},
+		{ID: 9, Path: "/w/a.go", Author: 2, State: "rejected", Ops: 1, First: 8, Last: 8},
+	}
+	out, errs, code := run(t, "clear", "/w/a.go", "-all")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if len(ed.decided) != 2 || ed.decided[0] != 9 || ed.decided[1] != 3 {
+		t.Fatalf("cleared %v, want 9 then 3 (newest-first, accepted 5 skipped)", ed.decided)
+	}
+	if !strings.Contains(out, "cleared change set 9") || !strings.Contains(out, "cleared change set 3") {
+		t.Errorf("stdout = %q, want both outcomes", out)
+	}
+}
+
+// A rejected set a later edit has wedged is named and skipped; the rest of the
+// bulk clear still runs.
+func TestCLIClearAllReportsAWedge(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.groups = []Group{
+		{ID: 3, Path: "/w/a.go", Author: 2, State: "rejected", Ops: 1, First: 1, Last: 1},
+		{ID: 9, Path: "/w/a.go", Author: 2, State: "rejected", Ops: 1, First: 8, Last: 8},
+	}
+	ed.clearErr = map[uint64]string{3: "change set 3 could not be cleared: later edits overlap it"}
+	out, errs, code := run(t, "clear", "/w/a.go", "-all")
+	if code == 0 {
+		t.Fatalf("an unplaceable clear reported success: %q", out)
+	}
+	if !strings.Contains(errs, "change set 3") || !strings.Contains(errs, "overlap") {
+		t.Errorf("stderr = %q, want the wedged set named", errs)
+	}
+	if len(ed.decided) != 1 || ed.decided[0] != 9 {
+		t.Errorf("cleared %v, want only 9 (3 refused)", ed.decided)
+	}
+}
+
+// open without -create refuses a path that is neither a buffer nor a file,
+// naming it; -create is the caller saying it means to make a new buffer.
+func TestCLIOpenRefusesMissingPathWithoutCreate(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	out, errs, code := run(t, "open", "/w/new.go")
+	if code != 1 {
+		t.Fatalf("open of a missing path: code = %d, want 1; stdout %q stderr %q", code, out, errs)
+	}
+	if !strings.Contains(errs, "/w/new.go") {
+		t.Errorf("stderr = %q, want the path named", errs)
+	}
+	if _, ok := ed.docs["/w/new.go"]; ok {
+		t.Errorf("the refused open created a buffer")
+	}
+
+	out, errs, code = run(t, "open", "/w/new.go", "-create")
+	if code != 0 {
+		t.Fatalf("open -create: code = %d: %s", code, errs)
+	}
+	if _, ok := ed.docs["/w/new.go"]; !ok {
+		t.Errorf("open -create created no buffer")
 	}
 }
 

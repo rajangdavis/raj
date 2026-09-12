@@ -104,12 +104,16 @@ type Request struct {
 	// is the buffer's view either way; the agreed composition as the default is
 	// a future change.
 	Annotated bool
+	// Create, on an open, says a path that is not already a buffer and not on
+	// disk is a name to make a new empty buffer for rather than a typo to
+	// refuse. Absent means open reaches only something that already exists.
+	Create bool
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
 	Identity string
 	Name     string
-	// Group addresses a change set for accept and reject.
+	// Group addresses a change set for accept, reject and clear.
 	Group uint64
 	// DumpID addresses a snapshot for patch: the id a prior dump returned.
 	// PatchText is the whole edited text the caller hands back, which the
@@ -192,9 +196,13 @@ type SearchQuery struct {
 	Text    string
 	Include string // comma-separated globs
 	Exclude string
-	Regex   bool
-	Case    bool
-	Word    bool
+	// Path limits the walk to a directory, resolved against the workspace
+	// root. Empty means the whole workspace. Like exec -dir it is validated
+	// against the root before the walk starts, so ".." cannot escape it.
+	Path  string
+	Regex bool
+	Case  bool
+	Word  bool
 }
 
 // SearchMatch is one hit. Text is the whole line it was found on.
@@ -295,9 +303,15 @@ type BraceTally struct {
 // the version of the op that invalidated the range, not a byte offset — it tells
 // a driver what it missed, so it can re-read from there rather than resubmitting
 // the whole diff blind.
+//
+// Group names the change set whose read-only lease refused the hunk, when that
+// is why it could not land; zero means the ordinary stale-offset conflict. It is
+// the difference between "read again and resubmit" and "someone has to accept or
+// reject this text first", which are opposite instructions for a driver.
 type Conflict struct {
 	Index int    `json:"index"`
 	At    uint64 `json:"at"`
+	Group uint64 `json:"group,omitempty"`
 	Hunk  Hunk   `json:"hunk"`
 }
 

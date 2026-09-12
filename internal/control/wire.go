@@ -141,6 +141,11 @@ type Header struct {
 	// and state. Absent means no state runs; the text is the buffer's view
 	// either way.
 	Annotated bool
+	// Create is open's switch for a path that is neither a buffer nor a file:
+	// absent refuses it, present makes a new empty buffer. It crosses as a
+	// presence flag like ReviewList, so a peer that does not know it omits it
+	// and keeps the refusing default.
+	Create bool
 
 	// LSPMode names the lsp sub-operation on a request; LSPJSON carries the
 	// JSON-encoded answer back on a response. Neither needs the body: they are
@@ -359,7 +364,7 @@ func EncodeRequest(req Request) (Header, []byte) {
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
-		Annotated: req.Annotated,
+		Annotated: req.Annotated, Create: req.Create,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
@@ -401,7 +406,7 @@ func DecodeRequest(f Frame) (Request, error) {
 		Start: f.Header.Start, End: f.Header.End,
 		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
-		Annotated: f.Header.Annotated}
+		Annotated: f.Header.Annotated, Create: f.Header.Create}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than

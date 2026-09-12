@@ -44,8 +44,11 @@ type BufferHost interface {
 	// reading "" and writing "/w/a.go" look like two different buffers.
 	Resolve(path string) (string, error)
 
-	// Open puts a path in a tab and returns its version.
-	Open(path string) (uint64, error)
+	// Open puts a path in a tab and returns its version. create says a path
+	// that is neither a buffer nor a file on disk is a name to make a new
+	// empty buffer for; without it such a path is refused rather than
+	// silently becoming a buffer nothing can read.
+	Open(path string, create bool) (uint64, error)
 
 	// Goto moves the cursor in a buffer to a 1-based line and column. Zero
 	// means "the editor decides": a missing line keeps the cursor's own, a
@@ -99,6 +102,12 @@ type BufferHost interface {
 	// group: the members are rebased through everything that landed after them
 	// and rolled back together if any cannot be placed.
 	Decide(path string, group uint64, accept bool) error
+
+	// Clear hard-purges a rejected change set: the set's ops are reversed out
+	// of the document and the decision dropped, so the text and the mark both
+	// leave the view. Unlike Decide this really edits, so it can fail; the
+	// error names the group.
+	Clear(path string, group uint64) error
 
 	// Diff renders the buffer's pending change sets as old→new hunks in
 	// current coordinates: the review surface for what Groups only lists.
@@ -209,6 +218,20 @@ func (g *Guard) inRoot(path string) error {
 	return nil
 }
 
+// inRootDir is inRoot for a directory a caller names relative to the workspace
+// root, which is how search -path and exec -dir are spelled. A relative name
+// is resolved against the root first; the check that follows is the same one,
+// so a relative ".." cannot reach outside any more than an absolute one can.
+func (g *Guard) inRootDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(g.Host.Root(), dir)
+	}
+	return g.inRoot(dir)
+}
+
 // canonical resolves and validates in one step, so no method can accidentally
 // check one name and act on another.
 func (g *Guard) canonical(path string) (string, error) {
@@ -224,7 +247,7 @@ func (g *Guard) canonical(path string) (string, error) {
 	return resolved, nil
 }
 
-func (g *Guard) Open(path string) (uint64, error) {
+func (g *Guard) Open(path string, create bool) (uint64, error) {
 	// Open names a file that may not be a buffer yet, so unlike every other
 	// verb there is no Resolve to canonicalise it. A relative path is made
 	// absolute against the root here, the rule the host applies to every other
@@ -236,7 +259,7 @@ func (g *Guard) Open(path string) (uint64, error) {
 	if err := g.inRoot(path); err != nil {
 		return 0, err
 	}
-	return g.Host.Open(path)
+	return g.Host.Open(path, create)
 }
 
 // Goto routes a cursor move through the same resolution every other verb
@@ -431,7 +454,13 @@ func (g *Guard) CheckQuery(q SearchQuery) error {
 	if err := escapingGlob(q.Include); err != nil {
 		return err
 	}
-	return escapingGlob(q.Exclude)
+	if err := escapingGlob(q.Exclude); err != nil {
+		return err
+	}
+	// The scope is a path like any other: it must resolve inside the workspace
+	// before a walk starts from it, or a search becomes a way to read files the
+	// editor would refuse to open.
+	return g.inRootDir(q.Path)
 }
 
 // Snapshot hands out a searcher wrapped so that a query is validated at the
@@ -456,6 +485,18 @@ func (g *Guard) Save(path string) (uint64, error) {
 		return 0, err
 	}
 	return g.Host.Save(name)
+}
+
+// Clear hard-purges a rejected change set, addressed by group rather than by
+// the caret. Like Save it is a write, so the path is canonicalised the same
+// way; the host owns the rejection state and reports a set that is not
+// rejected or that a later edit has wedged.
+func (g *Guard) Clear(path string, group uint64) error {
+	name, err := g.canonical(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.Clear(name, group)
 }
 
 // Exec policy: run, and say what is stale.
@@ -535,7 +576,7 @@ func Dispatch(g *Guard, req Request) Response {
 		if req.Path == "" {
 			return Response{Err: "open needs a path"}
 		}
-		v, err := g.Open(req.Path)
+		v, err := g.Open(req.Path, req.Create)
 		return done(v, err)
 	case "goto":
 		name, err := g.canonical(req.Path)
@@ -625,6 +666,14 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: req.Op + " needs a group id; list them with `groups`"}
 		}
 		if err := g.Host.Decide(name, req.Group, req.Op == "accept"); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "clear":
+		if req.Group == 0 {
+			return Response{Err: "clear needs a group id; list them with `groups`"}
+		}
+		if err := g.Clear(req.Path, req.Group); err != nil {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}

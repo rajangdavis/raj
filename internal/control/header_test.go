@@ -17,7 +17,7 @@ func fullHeader() Header {
 		ID: 7, Op: "apply", Path: "/w/main.go", Author: 3, Token: "t0ken",
 		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent",
 		Argv: []string{"go", "test", "./..."}, Dir: "/w",
-		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Regex: true, Word: true},
+		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true},
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
 		Root: "/w", PID: 4242, Version: 70000, Bytes: 12345, Lines: 678, Files: 12, Capped: true,
@@ -30,7 +30,7 @@ func fullHeader() Header {
 		Buffers:      []Buffer{{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Pending: 2, Moved: 1, Lines: 5}},
 		Truncated:    []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}},
 		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, ByteStart: 10, ByteEnd: 14}},
-		Conflicts:    []Conflict{{Index: 1, At: 8, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
+		Conflicts:    []Conflict{{Index: 1, At: 8, Group: 7, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
 		DiffJSON:     `[{"id":4,"hunks":[{"start":1,"end":2,"old":"a","new":"b"}],"moved":0}]`,
 		StatesJSON:   `[{"off":0,"len":5,"group":0,"state":"accepted"}]`,
@@ -283,7 +283,7 @@ func TestVerbsTravelAsCodes(t *testing.T) {
 func TestEveryVerbHasACode(t *testing.T) {
 	for _, op := range []string{
 		"ping", "buffers", "text", "open", "apply", "save", "version", "search",
-		"groups", "accept", "reject", "exec", "execcheck", "stats", "hello",
+		"groups", "accept", "reject", "clear", "exec", "execcheck", "stats", "hello",
 		"cancel", "recv", "snapshot", "prog", "diff", "review",
 	} {
 		if _, ok := verbCodes[op]; !ok {
@@ -364,6 +364,69 @@ func TestHeaderKeepsMatchLineStart(t *testing.T) {
 		if got.Matches[i] != want[i] {
 			t.Errorf("match %d = %+v, want %+v", i, got.Matches[i], want[i])
 		}
+	}
+}
+
+// A conflict's lease owner rides in its own sparse field, so a zero owner must
+// survive next to a nonzero one and each owner must stay with its own conflict.
+func TestHeaderKeepsConflictGroup(t *testing.T) {
+	want := []Conflict{
+		{Index: 0, At: 3, Hunk: Hunk{Start: 0, End: 5, Text: "x"}},
+		{Index: 1, At: 4, Group: 12, Hunk: Hunk{Start: 8, End: 8, Text: "y"}},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Conflicts: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Conflicts) != len(want) {
+		t.Fatalf("decoded %d conflicts, want %d", len(got.Conflicts), len(want))
+	}
+	for i := range want {
+		if got.Conflicts[i] != want[i] {
+			t.Errorf("conflict %d = %+v, want %+v", i, got.Conflicts[i], want[i])
+		}
+	}
+}
+
+// A frame from before the lease owner existed carries only the five original
+// conflict fields. It must decode to a zero group rather than fail, which is
+// what keeps an old server talking to a new client.
+func TestOldShapedConflictRecordStillDecodes(t *testing.T) {
+	var w prog.Writer
+	w.Num(0).Num(3).Num(0).Num(5).Str("x")
+	w.Num(1).Num(4).Num(8).Num(8).Str("y")
+	old := prog.Encode([]prog.Op{{Code: hConflicts, Payload: w.Done()}})
+
+	got, err := decodeHeader(old)
+	if err != nil {
+		t.Fatalf("an old-shaped conflicts field was refused: %v", err)
+	}
+	if len(got.Conflicts) != 2 {
+		t.Fatalf("conflicts = %+v, want two", got.Conflicts)
+	}
+	for i, c := range got.Conflicts {
+		if c.Group != 0 {
+			t.Errorf("conflict %d carries group %d; none was on the wire", i, c.Group)
+		}
+	}
+	if c := got.Conflicts[1]; c.Index != 1 || c.At != 4 || c.Hunk.Text != "y" {
+		t.Errorf("conflict 1 = %+v, want the five original fields intact", c)
+	}
+}
+
+// -path is the newest field on the query record; a payload from before it
+// existed must decode with an empty path rather than a frame error.
+func TestOldShapedQueryStillDecodes(t *testing.T) {
+	var w prog.Writer
+	w.Str("needle").Str("*.go").Str("vendor").Bool(false).Bool(false).Bool(false)
+	old := prog.Encode([]prog.Op{{Code: hQuery, Payload: w.Done()}})
+
+	got, err := decodeHeader(old)
+	if err != nil {
+		t.Fatalf("an old-shaped query was refused: %v", err)
+	}
+	if got.Query == nil || got.Query.Text != "needle" || got.Query.Path != "" {
+		t.Errorf("query = %+v, want the six original fields and no path", got.Query)
 	}
 }
 

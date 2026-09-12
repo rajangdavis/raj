@@ -49,7 +49,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   list                       running editors and their workspaces
   buffers                    files open in the editor
   read [path]                the buffer view; -annotated adds per-run states, -start/-end/-lines for a span
-  open <path>                open a file in the editor
+  open <path>                open a file; -create makes a buffer for a path not on disk
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
   close [path]                close a buffer; refused while it has unsaved work
   whoami                     the author id this connection writes as
@@ -58,9 +58,12 @@ const ctlUsage = `usage: raj ctl <command> [options]
   groups [path]              change sets in a buffer, and their state
   accept [path] -group N     agree to a change set; -all for every pending one
   reject [path] -group N     back one out; -all for every pending one
+  clear [path] -group N      hard-purge a rejected change set; -all for every rejected one
   diff [path]                pending change sets as old→new text, for review
   review [path]              enter review mode and list pending change sets; -json lists without entering
   search -q PATTERN          search the workspace, unsaved edits included
+  search -q PATTERN -path DIR
+                             search only DIR, under the workspace root
   version [path]             the version a later apply bases on
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] -dump N       replace a snapshot's text; the editor diffs and applies
@@ -96,7 +99,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	socket := fs.String("socket", "", "path to the editor's control socket")
 	addr := fs.String("addr", "", "the editor's control address: a socket path, or tcp://host:port")
 	asJSON := fs.Bool("json", false, "machine-readable output")
-	group := fs.Uint64("group", 0, "accept/reject: the change set id, from `groups`")
+	group := fs.Uint64("group", 0, "accept/reject/clear: the change set id, from `groups`")
 	dumpID := fs.Uint64("dump", 0, "patch: the snapshot id, from `dump`")
 	identity := fs.String("as", "", "identity to write as; the same one reconnecting keeps its author id")
 	name := fs.String("name", "", "display name for this participant")
@@ -104,6 +107,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	query := fs.String("q", "", "search: the pattern")
 	include := fs.String("include", "", "search: comma-separated globs to search")
 	exclude := fs.String("exclude", "", "search: comma-separated globs to skip")
+	searchPath := fs.String("path", "", "search: limit the walk to a directory under the workspace root")
 	regex := fs.Bool("regex", false, "search: treat the pattern as a regular expression")
 	matchCase := fs.Bool("case", false, "search: match case")
 	word := fs.Bool("word", false, "search: whole words only")
@@ -113,6 +117,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
 	annotated := fs.Bool("annotated", false, "read: add the per-run change set and state of the view")
+	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
 	textArg := fs.String("text", "", "apply: replacement text")
 	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
 	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
@@ -122,7 +127,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	newText := fs.String("new", "", "edit: the replacement text")
 	oldFile := fs.String("old-file", "", "edit: read -old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read -new from a file, or - for stdin")
-	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject: every pending change set")
+	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject/clear: every change set")
 	mine := fs.Bool("mine", false, "groups: only the connection's own change sets")
 	live := fs.Bool("live", false, "who: only participants connected right now, not every id the process has minted")
 	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
@@ -195,7 +200,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
 			return 2
 		}
-		return simple(c, Request{Op: "open", Path: path}, "opened "+path, stdout, stderr, *asJSON)
+		return simple(c, Request{Op: "open", Path: path, Create: *create},
+			"opened "+path, stdout, stderr, *asJSON)
 	case "goto":
 		if pos := fs.Arg(1); pos != "" {
 			line, col, ok := ctlPosition(pos)
@@ -260,11 +266,15 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 				g.ID, g.Author, g.State, g.Ops, g.Bytes)
 		}
 		return 0
-	case "accept", "reject":
+	case "accept", "reject", "clear":
 		if *all {
 			return decideAll(c, cmd, path, *mine, *group, stdout, stderr, *asJSON)
 		}
-		return simple(c, Request{Op: cmd, Path: path, Group: *group}, cmd+"ed",
+		msg := cmd + "ed"
+		if cmd == "clear" {
+			msg = fmt.Sprintf("cleared change set %d", *group)
+		}
+		return simple(c, Request{Op: cmd, Path: path, Group: *group}, msg,
 			stdout, stderr, *asJSON)
 	case "diff":
 		return diffCmd(c, path, stdout, stderr, *asJSON)
@@ -322,10 +332,11 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		// is the pattern typed in the wrong place, and accepting it silently
 		// would run a different search than the one that was meant.
 		if arg := fs.Arg(0); arg != "" {
-			fmt.Fprintf(stderr, "search: unexpected argument %q — the pattern goes to -q; to limit paths use -include\n", arg)
+			fmt.Fprintf(stderr, "search: unexpected argument %q — the pattern goes to -q; to limit paths use -include or -path\n", arg)
 			return 2
 		}
 		return doSearch(c, SearchQuery{Text: *query, Include: *include, Exclude: *exclude,
+			Path:  *searchPath,
 			Regex: *regex, Case: *matchCase, Word: *word}, *jsonl, *asJSON, stdout, stderr)
 	case "version":
 		res, err := c.Do(Request{Op: "version", Path: path})
@@ -381,6 +392,7 @@ var argLimit = map[string]struct {
 	"groups":  {1, "groups takes a path and nothing else"},
 	"accept":  {1, "accept takes a path; the change set id goes to -group"},
 	"reject":  {1, "reject takes a path; the change set id goes to -group"},
+	"clear":   {1, "clear takes a path; the change set id goes to -group"},
 	"diff":    {1, "diff takes a path and nothing else"},
 	"review":  {1, "review takes a path and nothing else"},
 	"patch":   {1, "patch takes a path; the snapshot id goes to -dump"},
@@ -659,11 +671,11 @@ type bulkOutcome struct {
 	Error string `json:"error,omitempty"`
 }
 
-// decideAll accepts or rejects the path's change sets in one command. It is
-// the client-side bulk form: one listing, then one frame per set, so deciding
-// k sets is one invocation rather than 1+k. The server still decides each set
-// on its own terms — one refusal does not take the rest with it, and a set that
-// fails is named rather than only counted.
+// decideAll accepts, rejects or clears the path's change sets in one command.
+// It is the client-side bulk form: one listing, then one frame per set, so
+// deciding k sets is one invocation rather than 1+k. The server still decides
+// each set on its own terms — one refusal does not take the rest with it, and a
+// set that fails is named rather than only counted.
 //
 // Accepting is order-independent: the text is already in the document, so the
 // one listing `groups` gives is decided as it comes. Rejecting is not.
@@ -674,6 +686,11 @@ type bulkOutcome struct {
 // is `diff`, not `groups`, because `groups` also lists accepted sets and sets a
 // later edit has fully overwritten; attempting either is the refusal that made
 // a bulk reject look wedged when its work was already done.
+//
+// Clearing is a reversal too, so it also unwinds newest-first, but it works
+// from `groups` filtered to the rejected sets rather than from `diff`: a
+// rejected set is exactly what ClearRejected acts on, and `diff` reports only
+// what is still proposed.
 func decideAll(c *Client, op, path string, mine bool, group uint64,
 	stdout, stderr io.Writer, asJSON bool) int {
 	if group != 0 {
@@ -733,8 +750,22 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 		if mine {
 			groups = mineOnly(groups, c.Author())
 		}
-		for _, g := range groups {
-			decide(g.ID)
+		if op == "clear" {
+			// Clearing reverses text, so it unwinds newest-first like a bulk
+			// reject: a later rejected set that overlaps an earlier one has to
+			// come out before the earlier one can. Only rejected sets are
+			// attempted — clearing anything else is the refusal the single
+			// form reports, and the groups listing is where the state is read.
+			for i := len(groups) - 1; i >= 0; i-- {
+				if groups[i].State != "rejected" {
+					continue
+				}
+				decide(groups[i].ID)
+			}
+		} else {
+			for _, g := range groups {
+				decide(g.ID)
+			}
 		}
 	}
 	if len(out) == 0 {
@@ -743,7 +774,11 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 		if asJSON {
 			return emit(stdout, map[string]any{"ok": true, "decided": []uint64{}})
 		}
-		fmt.Fprintf(stdout, "%s: no pending change sets\n", firstOf(path, "active buffer"))
+		kind := "pending"
+		if op == "clear" {
+			kind = "rejected"
+		}
+		fmt.Fprintf(stdout, "%s: no %s change sets\n", firstOf(path, "active buffer"), kind)
 		return 0
 	}
 	if asJSON {
@@ -1239,11 +1274,7 @@ func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, st
 		return 1
 	}
 	if len(res.Conflicts) > 0 {
-		fmt.Fprintf(stderr, "raj ctl apply: %d of %d hunks could not be placed on the current\n"+
-			"version — the buffer moved further than a rebase could carry them. Read it\n"+
-			"again and redo those hunks against the version you get back.\n",
-			len(res.Conflicts), hunks)
-		return 1
+		return reportConflicts(res.Conflicts, hunks, stdout, stderr, asJSON)
 	}
 	if res.Err != "" {
 		fmt.Fprintln(stderr, "raj ctl apply:", res.Err)
@@ -1270,6 +1301,56 @@ func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, st
 	fmt.Fprintf(stdout, "applied %d hunk(s) at version %d; the buffer has unsaved changes\n",
 		hunks, res.Version)
 	return 0
+}
+
+// conflictView is one refused hunk in the -json reply: the wire Conflict plus
+// the reason worded for a driver, so a script and a person read the same thing.
+type conflictView struct {
+	Index   int    `json:"index"`
+	At      uint64 `json:"at"`
+	Group   uint64 `json:"group,omitempty"`
+	Message string `json:"message"`
+	Hunk    Hunk   `json:"hunk"`
+}
+
+// reportConflicts describes hunks that could not be placed. A conflict that
+// carries a group is a lease refusal — a pending or rejected change set owns
+// the text and has to be decided before the hunk can land — and names the set;
+// one with no group is the ordinary stale offset and keeps the message that
+// tells the caller to re-read and resubmit. The two call for opposite actions,
+// which is why they no longer share a sentence.
+func reportConflicts(conflicts []Conflict, hunks int, stdout, stderr io.Writer, asJSON bool) int {
+	const stale = "could not be placed on the current version — the buffer moved " +
+		"further than a rebase could carry them; read it again and redo the hunk " +
+		"against the version you get back"
+	views := make([]conflictView, 0, len(conflicts))
+	staleCount := 0
+	for _, c := range conflicts {
+		v := conflictView{Index: c.Index, At: c.At, Group: c.Group, Hunk: c.Hunk}
+		if c.Group != 0 {
+			v.Message = fmt.Sprintf("change set %d owns this text; accept or reject it first", c.Group)
+		} else {
+			v.Message = stale
+			staleCount++
+		}
+		views = append(views, v)
+	}
+	if asJSON {
+		emit(stdout, map[string]any{"ok": false, "conflicts": views})
+		return 1
+	}
+	for _, v := range views {
+		if v.Group != 0 {
+			fmt.Fprintf(stderr, "raj ctl apply: change set %d owns this text; accept or reject it first\n", v.Group)
+		}
+	}
+	if staleCount > 0 {
+		fmt.Fprintf(stderr, "raj ctl apply: %d of %d hunks could not be placed on the current\n"+
+			"version — the buffer moved further than a rebase could carry them. Read it\n"+
+			"again and redo those hunks against the version you get back.\n",
+			staleCount, hunks)
+	}
+	return 1
 }
 
 // flagSet reports whether a flag was given, so a required one with a valid zero

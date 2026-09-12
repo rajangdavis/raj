@@ -291,7 +291,7 @@ func TestSearchArgumentsCompileInAnyOrder(t *testing.T) {
 // The four verbs that stay out, and the compiler refuses them by the ordinary
 // unknown-verb rule rather than by a special case.
 func TestVerbsThatStayOutOfPrograms(t *testing.T) {
-	for _, code := range []byte{0x94, 0x95, 0xff} { // unallocated verb range; the table ends at OpReview
+	for _, code := range []byte{0x95, 0x96, 0xff} { // unallocated verb range; the table ends at OpClear
 		p := prog.Encode([]prog.Op{{Code: code}})
 		if _, err := Requests(p, 1); !errors.Is(err, prog.ErrUnknownVerb) {
 			t.Errorf("verb %#x = %v, want ErrUnknownVerb", code, err)

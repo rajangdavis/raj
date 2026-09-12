@@ -58,6 +58,7 @@ const (
 	hOpName     = 0x0f
 	hReviewList = 0x10 // review: list the pending sets without entering the mode
 	hAnnotated  = 0x11 // read: return the annotated composition and its state runs
+	hCreate     = 0x12 // open: make a buffer for a path that is not on disk yet
 
 	// response fields
 	hExit           = 0x20
@@ -99,6 +100,7 @@ const (
 	hBufferState    = 0x44 // buffers: sparse pending and moved counts, one record per buffer that has either
 	hMatchLineStart = 0x45 // search: byte offset of each hit line start within the file
 	hStatesJSON     = 0x46 // read -annotated: the JSON-encoded []StateRun
+	hConflictGroup  = 0x47 // apply: sparse lease owner per conflict, one number per conflict
 
 )
 
@@ -127,7 +129,7 @@ var verbCodes = map[string]byte{
 	"goto": 24, "close": 25,
 	"dump": 26, "patch": 27,
 	"lsp": 28, "lspprep": 29,
-	"diff": 30, "review": 31,
+	"diff": 30, "review": 31, "clear": 32,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -207,6 +209,7 @@ func encodeHeader(h Header) []byte {
 	num(hCol, h.Col)
 	flag(hReviewList, h.ReviewList)
 	flag(hAnnotated, h.Annotated)
+	flag(hCreate, h.Create)
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
 	// dump with -start 0 asks for the head of the file, an absent one asks for
@@ -260,6 +263,12 @@ func encodeHeader(h Header) []byte {
 	if q := h.Query; q != nil {
 		var w prog.Writer
 		w.Str(q.Text).Str(q.Include).Str(q.Exclude).Bool(q.Regex).Bool(q.Case).Bool(q.Word)
+		// Path is appended rather than carved into the middle of the record: a
+		// reader that predates it reads the six fields it knows and ignores the
+		// trailing bytes, and a reader that knows it reads the seventh. No
+		// element count to disagree about, so the addition is invisible to the
+		// old end.
+		w.Str(q.Path)
 		ops = append(ops, Op8{hQuery, w.Done()})
 	}
 	if len(h.Hunks) > 0 {
@@ -379,6 +388,25 @@ func encodeHeader(h Header) []byte {
 			w.Num(c.Index).Num(int(c.At)).Num(c.Hunk.Start).Num(c.Hunk.End).Str(c.Hunk.Text)
 		}
 		ops = append(ops, Op8{hConflicts, w.Done()})
+
+		// The lease owner rides in its own sparse field rather than as another
+		// field on the record. hConflicts records are positional, so an older
+		// reader would read a sixth field as the next record index and misalign
+		// every conflict after it; a separate argument field is skipped whole.
+		// One number per conflict, in order; the field is absent when every
+		// owner is zero, which is the common stale-offset case, so an old
+		// client loses nothing it would have had.
+		var groups prog.Writer
+		var any bool
+		for _, c := range h.Conflicts {
+			if c.Group != 0 {
+				any = true
+			}
+			groups.Num(int(c.Group))
+		}
+		if any {
+			ops = append(ops, Op8{hConflictGroup, groups.Done()})
+		}
 	}
 	if len(h.Spans) > 0 {
 		var w prog.Writer
@@ -421,6 +449,9 @@ func decodeHeader(b []byte) (Header, error) {
 	// merge after every op, so their position relative to hMatches does not
 	// matter.
 	var lineStarts []int
+	// Conflict lease owners arrive the same way, one number per conflict, so
+	// their position relative to hConflicts does not matter either.
+	var conflictGroups []int
 	for _, op := range ops {
 		switch op.Code {
 		case hID:
@@ -460,6 +491,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.ReviewList = true
 		case hAnnotated:
 			h.Annotated = true
+		case hCreate:
+			h.Create = true
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
@@ -524,6 +557,10 @@ func decodeHeader(b []byte) (Header, error) {
 			r := prog.NewReader(op.Payload)
 			q := SearchQuery{Text: r.Str(), Include: r.Str(), Exclude: r.Str()}
 			q.Regex, q.Case, q.Word = r.Bool(), r.Bool(), r.Bool()
+			// The path is the last field, so a payload from before it existed
+			// leaves q.Path empty rather than an error: the value is absent,
+			// which is the same thing as no scope.
+			q.Path = r.Str()
 			h.Query = &q
 		case hHunks:
 			r := prog.NewReader(op.Payload)
@@ -641,6 +678,14 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "conflicts"); err != nil {
 				return Header{}, err
 			}
+		case hConflictGroup:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				conflictGroups = append(conflictGroups, r.Num())
+			}
+			if err := recordsOK(r, "conflict groups"); err != nil {
+				return Header{}, err
+			}
 		case hSpans:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -662,6 +707,11 @@ func decodeHeader(b []byte) (Header, error) {
 	for i, ls := range lineStarts {
 		if i < len(h.Matches) {
 			h.Matches[i].LineStart = ls
+		}
+	}
+	for i, g := range conflictGroups {
+		if i < len(h.Conflicts) {
+			h.Conflicts[i].Group = uint64(g)
 		}
 	}
 	return h, nil

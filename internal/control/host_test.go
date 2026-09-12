@@ -68,9 +68,16 @@ func (h *memHost) Resolve(path string) (string, error) {
 	return path, nil
 }
 
-func (h *memHost) Open(path string) (uint64, error) {
+func (h *memHost) Open(path string, create bool) (uint64, error) {
 	h.opens = append(h.opens, path)
 	if _, ok := h.docs[path]; !ok {
+		// The memHost has no disk, so the set of docs stands in for what is
+		// reachable: a path that is not already a buffer and not present is
+		// the missing file the real host stats for. create is what tells the
+		// two apart.
+		if !create {
+			return 0, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
+		}
 		h.docs[path], h.vers[path] = "", 1
 	}
 	return h.vers[path], nil
@@ -244,7 +251,7 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		filepath.Join(h.root, "sub", "..", "..", "escape"),
 	}
 	for _, p := range outside {
-		if _, err := g.Open(p); err == nil {
+		if _, err := g.Open(p, false); err == nil {
 			t.Errorf("Open(%q) was allowed", p)
 		}
 		if _, _, _, err := g.Read(p, -1, -1, 0, 0, false); err == nil {
@@ -266,17 +273,63 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 func TestGuardAcceptsRelativePathInsideTheRoot(t *testing.T) {
 	g, h := guarded(t)
 	want := filepath.Join(h.root, "a.go")
-	if _, err := g.Open("a.go"); err != nil {
+	if _, err := g.Open("a.go", false); err != nil {
 		t.Fatalf("Open(%q) was refused: %v", "a.go", err)
 	}
 	if len(h.opens) != 1 || h.opens[0] != want {
 		t.Errorf("the host was asked to open %v, want %q", h.opens, want)
 	}
-	if _, err := g.Open(filepath.Join("..", "etc", "passwd")); err == nil {
+	if _, err := g.Open(filepath.Join("..", "etc", "passwd"), false); err == nil {
 		t.Error("a relative path that escapes the root was accepted")
 	}
 	if len(h.opens) != 1 {
 		t.Errorf("the escaping path reached the host: %v", h.opens)
+	}
+}
+
+// open reaches only something that already exists. A path that is neither a
+// buffer nor a file is a typo, and refusing it is what keeps a misspelled name
+// from silently becoming an empty buffer that is later created. -create is the
+// caller saying it means to make one.
+func TestOpenRefusesMissingPathWithoutCreate(t *testing.T) {
+	g, h := guarded(t)
+	missing := filepath.Join(h.root, "new.go")
+
+	if _, err := g.Open(missing, false); err == nil {
+		t.Errorf("Open(%q) was allowed without -create", missing)
+	}
+	if _, ok := h.docs[missing]; ok {
+		t.Errorf("a refused open still created a buffer for %q", missing)
+	}
+
+	if _, err := g.Open(missing, true); err != nil {
+		t.Fatalf("Open(%q, create) was refused: %v", missing, err)
+	}
+	if _, ok := h.docs[missing]; !ok {
+		t.Errorf("Open(%q, create) created no buffer", missing)
+	}
+}
+
+// clear purges a rejected set and refuses anything else. The refusal names the
+// group and is an editor refusal, not the usage error for a request that named
+// no group at all.
+func TestDispatchClearOnlyActsOnRejected(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.groups = []Group{{ID: 7, Path: path, State: "rejected"}, {ID: 9, Path: path, State: "proposed"}}
+
+	if res := Dispatch(g, Request{Op: "clear", Path: path, Group: 7}); !res.OK {
+		t.Fatalf("clear of a rejected set = %+v", res)
+	}
+	if h.groups[0].State != "accepted" {
+		t.Errorf("group 7 state = %q, want purged", h.groups[0].State)
+	}
+	res := Dispatch(g, Request{Op: "clear", Path: path, Group: 9})
+	if res.OK || !strings.Contains(res.Err, "change set 9") {
+		t.Errorf("clear of a proposed set = %+v, want a refusal naming it", res)
+	}
+	if res := Dispatch(g, Request{Op: "clear", Path: path}); res.OK || !strings.Contains(res.Err, "group id") {
+		t.Errorf("clear with no group = %+v, want a usage refusal", res)
 	}
 }
 
@@ -588,6 +641,23 @@ func (h *memHost) Decide(path string, group uint64, accept bool) error {
 	return ErrNoBuffer
 }
 
+// Clear models the real ClearRejected: only a currently rejected set can be
+// purged, and the refusal names the group. The memHost has no journal to
+// reverse, so flipping the state stands in for the edit that removes the text.
+func (h *memHost) Clear(path string, group uint64) error {
+	for i := range h.groups {
+		if h.groups[i].ID != group {
+			continue
+		}
+		if h.groups[i].State != "rejected" {
+			return fmt.Errorf("change set %d is not rejected", group)
+		}
+		h.groups[i].State = "accepted"
+		return nil
+	}
+	return fmt.Errorf("no change set %d", group)
+}
+
 func (h *memHost) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, int, bool, []TruncatedFile, error) {
 	var out []SearchMatch
 	for p, t := range h.docs {
@@ -620,6 +690,22 @@ func TestGuardRejectsEscapingGlobs(t *testing.T) {
 	for _, ok := range []string{"", "*.go", "*.go,*.md", "sub/*.go", "a/b/c.txt"} {
 		if err := g.CheckQuery(SearchQuery{Text: "hello", Include: ok}); err != nil {
 			t.Errorf("Include %q was refused: %v", ok, err)
+		}
+	}
+}
+
+// The search scope is a path, so it gets the path check: a relative name is
+// resolved against the root and an escape is refused before the walk starts.
+func TestGuardRejectsEscapingSearchPath(t *testing.T) {
+	g, _ := guarded(t)
+	for _, bad := range []string{"..", "../elsewhere", "sub/../../etc"} {
+		if err := g.CheckQuery(SearchQuery{Text: "x", Path: bad}); err == nil {
+			t.Errorf("Path %q was allowed", bad)
+		}
+	}
+	for _, ok := range []string{"", "sub", "a/b"} {
+		if err := g.CheckQuery(SearchQuery{Text: "hello", Path: ok}); err != nil {
+			t.Errorf("Path %q was refused: %v", ok, err)
 		}
 	}
 }

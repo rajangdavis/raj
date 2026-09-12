@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"raj/internal/control"
@@ -84,6 +85,30 @@ func (a *App) Tell(to uint8, text string) error {
 		return fmt.Errorf("no control listener; start raj with --control")
 	}
 	return a.control.Send(to, text)
+}
+
+// notifySaved tells every connected driver that a buffer reached disk.
+//
+// Best-effort by design: the user asked for the save, and a driver whose
+// mailbox is full or that went away between the listing and the send must not
+// turn that into a failed save. Errors are dropped for the same reason. With no
+// control listener there is nothing to tell, which is the ordinary case for a
+// session started without --control.
+//
+// The path is the whole message: a driver knows what it asked for and needs to
+// know which save landed. It is a helper rather than an inline loop so the
+// control save path can call it too once that path shares App.write's
+// bookkeeping — see host.Save.
+func (a *App) notifySaved(path string) {
+	if a.control == nil {
+		return
+	}
+	for _, d := range a.control.Drivers() {
+		if !d.Connected {
+			continue
+		}
+		_ = a.Tell(d.ID, "saved "+path)
+	}
 }
 
 // Drivers lists who can be told something. Empty when nothing has ever
@@ -214,7 +239,7 @@ func (h host) Resolve(path string) (string, error) {
 	return p.File.Path, nil
 }
 
-func (h host) Open(path string) (uint64, error) {
+func (h host) Open(path string, create bool) (uint64, error) {
 	// A path names a file on disk, and a file can be spelled several ways —
 	// through a symlink, through .., through the tab's own form. Reopening one
 	// that is already open should focus its tab rather than stack a duplicate:
@@ -228,6 +253,21 @@ func (h host) Open(path string) (uint64, error) {
 			if sameFile(resolved, p.File.Path) && h.a.Tabs.Focus(p) {
 				return uint64(p.File.Session().Version()), nil
 			}
+		}
+	}
+	// Without -create, open reaches only something that already exists: a
+	// buffer already open (which may have been created earlier and never
+	// written, so it is not on disk) or a file raj can read. A path that is
+	// neither is a typo, and making an empty buffer for it is how a misspelled
+	// name later becomes a file. -create is the caller saying it means to make
+	// one.
+	if !create {
+		if p, err := h.find(path); err == nil {
+			h.a.Tabs.Focus(p)
+			return uint64(p.File.Session().Version()), nil
+		}
+		if _, err := os.Stat(path); err != nil {
+			return 0, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
 		}
 	}
 	h.a.OpenFile(path)
@@ -459,6 +499,11 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 		out = append(out, control.Conflict{
 			Index: c.Index,
 			At:    uint64(c.At),
+			// Group is the lease owner: zero for a stale offset, nonzero when
+			// a pending or rejected change set refused the hunk. It is what
+			// lets the CLI tell "read again and resubmit" from "decide about
+			// this text first" instead of printing one message for both.
+			Group: c.Group,
 			Hunk:  control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
 		})
 	}
@@ -553,6 +598,11 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 		out = append(out, control.Conflict{
 			Index: c.Index,
 			At:    uint64(c.At),
+			// Group is the lease owner: zero for a stale offset, nonzero when
+			// a pending or rejected change set refused the hunk. It is what
+			// lets the CLI tell "read again and resubmit" from "decide about
+			// this text first" instead of printing one message for both.
+			Group: c.Group,
 			Hunk:  control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
 		})
 	}
@@ -610,7 +660,11 @@ type snapshotSearcher struct {
 
 func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 	emit func([]control.SearchMatch)) (int, int, bool, []control.TruncatedFile, error) {
-	res := search.RunStream(ctx, s.root, search.Query{
+	root, err := s.walkRoot(q.Path)
+	if err != nil {
+		return 0, 0, false, nil, err
+	}
+	res := search.RunStream(ctx, root, search.Query{
 		Text: q.Text, Include: q.Include, Exclude: q.Exclude,
 		Regex: q.Regex, Case: q.Case, Word: q.Word,
 	}, s.docs, func(batch []search.Match) {
@@ -627,6 +681,29 @@ func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 		truncated = append(truncated, control.TruncatedFile{Path: f.Path, Shown: f.Shown, Total: f.Total})
 	}
 	return res.Files, res.Considered, res.Capped, truncated, res.Err
+}
+
+// walkRoot resolves a query's -path against the workspace root. A relative
+// path is joined to the root; an absolute one is taken as given. Either way it
+// must stay inside the workspace, the same rule the Guard applies to exec's
+// -dir: the walk is refused rather than allowed to read outside the tree. The
+// Guard validates the query before it reaches here, so this check is the
+// backstop for a Searcher driven directly.
+func (s snapshotSearcher) walkRoot(path string) (string, error) {
+	root := filepath.Clean(s.root)
+	if path == "" {
+		return root, nil
+	}
+	dir := path
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, dir)
+	}
+	dir = filepath.Clean(dir)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("search path %q is outside the workspace %s", path, root)
+	}
+	return dir, nil
 }
 
 // Groups lists a buffer's change sets.
@@ -731,6 +808,26 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 	return nil
 }
 
+// Clear hard-purges a rejected change set. Unlike Decide this really edits:
+// ClearRejected reverses the set's ops out of the document and drops the
+// decision, so both the text and the mark leave the view. It returns false for
+// a set that is not currently rejected or one a later edit has wedged, and the
+// refusal names the group because that is how the caller addressed it.
+func (h host) Clear(path string, group uint64) error {
+	p, err := h.find(path)
+	if err != nil {
+		return err
+	}
+	defer h.a.flushJournal(p)
+	if !p.File.ClearRejected(group) {
+		return fmt.Errorf("change set %d is not a rejected set that can be cleared "+
+			"(it may be proposed, already gone, or wedged behind a later edit)", group)
+	}
+	p.Cursors.Normalize()
+	h.a.Explorer.Tree.MarkChanged(p.File.Path)
+	return nil
+}
+
 // Save is deliberately its own verb: a caller that edits and saves in one step
 // gives the user no moment to look at what arrived before it is on disk.
 //
@@ -744,6 +841,10 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 // second participant is subject to the same rule for the same reason. What
 // makes a save legitimate is that somebody agreed to the change, not which
 // table row the caller occupies.
+//
+// A UI save announces itself to connected drivers via App.notifySaved; this
+// path does not, because it does not share App.write's bookkeeping yet. When
+// it does, the same call belongs here.
 func (h host) Save(path string) (uint64, error) {
 	p, err := h.find(path)
 	if err != nil {

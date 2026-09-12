@@ -7,7 +7,7 @@ build:
 # before types, types before the suite, the suite before the race detector.
 # Keeping the commands here rather than in the workflow means the thing that
 # gates a merge is the same thing you can run before pushing.
-check: fmt-check vet build test race
+check: fmt fmt-check vet build test race
 
 fmt:
 	gofmt -w cmd internal

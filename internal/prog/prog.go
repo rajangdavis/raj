@@ -123,6 +123,7 @@ const (
 	OpLSP     = 0x91 // ask the language server: hover, definition, completion, diagnostics
 	OpDiff    = 0x92 // pending change sets as old→new text, for review
 	OpReview  = 0x93 // pending change sets and, unless list-only, review mode
+	OpClear   = 0x94 // hard-purge a rejected change set
 
 )
 
@@ -151,7 +152,7 @@ var names = map[byte]string{
 	OpGoto:  "goto", OpClose: "close", OpLine: "line", OpCol: "col",
 	OpDumpID: "dump-id", OpDump: "dump", OpPatch: "patch",
 	OpLSPMode: "lsp-mode", OpLSP: "lsp", OpDiff: "diff",
-	OpReviewList: "review-list", OpReview: "review",
+	OpReviewList: "review-list", OpReview: "review", OpClear: "clear",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An
