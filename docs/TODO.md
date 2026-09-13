@@ -51,6 +51,28 @@ focused task.
   defaults to accepted with an annotated flag; the edit view is
   `AcceptedAndProposed` with inert spans hidden as atomic folds, Review is
   `Annotated`; `cmd+ctl+k` clears rejected, `cmd+ctl+l` clears invalidated.
+  - **Done (F3b-i, 2026-09-12):** the state flips (`RejectGroup` marks
+    `Rejected`; `AcceptGroup` un-rejects; `ClearRejected` reverses + drops),
+    region leases (`Session.Leased`; an intersecting edit/`apply` is refused),
+    `save` = `Project(AcceptedOnly)`, `read` = the buffer view with `-annotated`
+    states, and `cmd+ctl+k`.
+  - [ ] **F3b-ii — the presentation half.** Edit mode renders
+    `Project(AcceptedAndProposed)` with inert (rejected) spans hidden as atomic
+    folds; Review renders `Project(Annotated)` with per-state tint/annotation;
+    lease checks move off the keystroke path to the edit/commit boundary.
+    `cmd+ctl+l` and the invalidated state belong to Phase 1c, not here.
+  - [ ] **F3b-ii recon (2026-09-13).** The pane renders the raw session view
+    (`p.File.Line(...)`, `internal/editor/pane.go`); `Project` is reached only by
+    control `read` and the review state listing, so no display composition
+    exists yet. Spec §13 rejected a second document, so there is one coordinate
+    system and folds are display-only: this needs a bidirectional
+    document↔display map (bytes↔rows/cells) covering the caret, scroll, mouse,
+    diagnostics gutter and completion. Sequential because D2 uses D1's API:
+    **D1** = `internal/view` + `internal/editor/pane.go` — the composition, fold
+    rows, and the round-trip map, with unit/fuzz tests; **D2** =
+    `internal/app` (`mode.go`, `render.go`, `review.go`, `keys`) — policy by
+    mode, tint, and lease enforcement at commit instead of per key. Write a
+    short design note fixing the fold representation and the map API first.
 - [ ] **Phase 1c — invalidation and conflict reporting.** An orthogonal,
   recomputed `Invalid` marks a still-`Proposed` set whose edit no longer fits
   the current composition; it is excluded from edit/agreed and annotated in
