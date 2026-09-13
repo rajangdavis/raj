@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"raj/internal/control"
 	"raj/internal/keys"
 	"raj/internal/ui"
 	"raj/internal/widget"
@@ -284,4 +285,109 @@ func (h *harness) handleKeyAction(a keys.Action) {
 		}
 	}
 	h.drain()
+}
+
+// A headless buffer is cached, so the next lookup has to notice when the file
+// moved on disk rather than serving the snapshot it was first loaded from.
+func TestHeadlessReloadsWhenDiskChanges(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "changing.go")
+	if err := os.WriteFile(path, []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	first := c.do(h, control.Request{Op: "text", Path: path})
+	if !first.OK || first.Text() != "first\n" {
+		t.Fatalf("first read = %+v", first)
+	}
+	p, ok := h.findHeadless(path)
+	if !ok {
+		t.Fatal("read did not load the path headlessly")
+	}
+	sess := p.File.Session()
+
+	// A longer rewrite changes the size, so the stamp catches it even where
+	// the filesystem's mtime resolution is coarse.
+	if err := os.WriteFile(path, []byte("second, longer\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again := c.do(h, control.Request{Op: "text", Path: path})
+	if !again.OK || again.Text() != "second, longer\n" {
+		t.Fatalf("second read = %+v, want the new text", again)
+	}
+	p2, ok := h.findHeadless(path)
+	if !ok {
+		t.Fatal("path left the headless registry")
+	}
+	if p2 != p {
+		t.Errorf("lookup returned a different pane")
+	}
+	if p2.File.Session() == sess {
+		t.Errorf("the document was not reloaded")
+	}
+}
+
+// An unchanged file is not reloaded: the lookup reuses the cached pane and
+// document after one stat.
+func TestHeadlessUnchangedFileIsReused(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "stable.go")
+	if err := os.WriteFile(path, []byte("stable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.do(h, control.Request{Op: "text", Path: path}); !r.OK {
+		t.Fatalf("read = %+v", r)
+	}
+	p, ok := h.findHeadless(path)
+	if !ok {
+		t.Fatal("read did not load the path headlessly")
+	}
+	sess := p.File.Session()
+
+	if r := c.do(h, control.Request{Op: "text", Path: path}); !r.OK || r.Text() != "stable\n" {
+		t.Fatalf("second read = %+v", r)
+	}
+	p2, ok := h.findHeadless(path)
+	if !ok || p2 != p {
+		t.Fatal("lookup did not reuse the cached pane")
+	}
+	if p2.File.Session() != sess {
+		t.Errorf("an unchanged file was reloaded")
+	}
+}
+
+// A failed stat or read keeps the cached copy rather than dropping the buffer.
+func TestHeadlessStatErrorKeepsCache(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "gone.go")
+	if err := os.WriteFile(path, []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.do(h, control.Request{Op: "text", Path: path}); !r.OK {
+		t.Fatalf("read = %+v", r)
+	}
+	p, ok := h.findHeadless(path)
+	if !ok {
+		t.Fatal("read did not load the path headlessly")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	// The failed read must not evict the buffer: the text already read is the
+	// only copy of a file that is now gone.
+	got := c.do(h, control.Request{Op: "text", Path: path})
+	if !got.OK || got.Text() != "keep me\n" {
+		t.Fatalf("read after removal = %+v, want the cached text", got)
+	}
+	p2, ok := h.findHeadless(path)
+	if !ok || p2 != p {
+		t.Fatal("the unreadable buffer was dropped from the registry")
+	}
 }

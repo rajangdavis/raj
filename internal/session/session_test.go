@@ -41,15 +41,16 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-// A workspace with a repository puts the file under .git, which is scratch
-// state nothing commits and the sidebar already hides.
+// The state dir is .raj even in a repository: whether the workspace is a
+// checkout does not change where the editor keeps its scratch state.
 func TestFileLocation(t *testing.T) {
 	root := t.TempDir()
 	if got := File(root); !strings.HasSuffix(got, filepath.Join(".raj", "session.json")) {
 		t.Errorf("without .git: %s", got)
 	}
 	os.MkdirAll(filepath.Join(root, ".git"), 0o755)
-	if got := File(root); !strings.Contains(got, filepath.Join(".git", "raj")) {
+	if got := File(root); !strings.HasSuffix(got, filepath.Join(".raj", "session.json")) ||
+		strings.Contains(got, filepath.Join(".git", "raj")) {
 		t.Errorf("with .git: %s", got)
 	}
 	if File("") != "" {

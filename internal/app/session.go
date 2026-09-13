@@ -2,6 +2,8 @@ package app
 
 import (
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"raj/internal/editor"
@@ -35,7 +37,12 @@ func (a *App) sessionTick(now time.Time) {
 	if !a.sessionDirty || a.root == "" || a.NoRestore {
 		return
 	}
-	if !a.sessionSaved.IsZero() && now.Sub(a.sessionSaved) < SessionSaveInterval {
+	// A change to the tab set is not view churn: quitting inside the window
+	// would reopen a tab the user just closed, so it is written on the next
+	// tick. The interval is left for cursor and scroll movement.
+	tabs := a.sessionFingerprint()
+	structural := tabs != a.sessionTabs
+	if !structural && !a.sessionSaved.IsZero() && now.Sub(a.sessionSaved) < SessionSaveInterval {
 		return
 	}
 	a.sessionDirty = false
@@ -43,6 +50,22 @@ func (a *App) sessionTick(now time.Time) {
 	// A failure here is not worth interrupting anyone for: the next tick tries
 	// again, and the worst case is the position it had before.
 	_ = a.SaveSession()
+	a.sessionTabs = tabs
+}
+
+// sessionFingerprint names the tab set a write would save: the ordered paths
+// and the active index. Cursor and scroll are deliberately left out, so moving
+// around is not mistaken for a structural change.
+func (a *App) sessionFingerprint() string {
+	st := a.SessionState()
+	parts := make([]string, 0, len(st.Tabs)+1)
+	for _, t := range st.Tabs {
+		parts = append(parts, t.Path)
+	}
+	// Paths never contain a NUL, so the join cannot make two different tab
+	// sets look the same.
+	parts = append(parts, strconv.Itoa(st.Active))
+	return strings.Join(parts, "\x00")
 }
 
 // SessionState captures where the workspace is now.

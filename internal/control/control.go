@@ -264,7 +264,8 @@ const (
 	AuthorUser     uint8 = 1
 )
 
-// Buffer describes one open tab.
+// Buffer describes one buffer the editor is tracking: a tab the user can see,
+// or a headless one loaded over the control socket for reading alone.
 type Buffer struct {
 	Path    string `json:"path"`
 	Version uint64 `json:"version"`
@@ -272,6 +273,12 @@ type Buffer struct {
 	Bytes   int    `json:"bytes"`
 	Lines   int    `json:"lines"`
 	Active  bool   `json:"active"`
+	// Headless is true when the buffer is loaded and addressable over the
+	// socket but has no tab: `read`, `version` and `lsp diagnostics` load on
+	// demand, so an inspection leaves nothing in front of the user. A
+	// headless buffer can never hold a pending proposal — a proposal
+	// announces it, which is what puts a tab on screen for review.
+	Headless bool `json:"headless"`
 	// Pending is how many change sets in this buffer are still proposed, and
 	// Moved how many of their members a later edit has moved past so no honest
 	// span can be projected. They let one `buffers` call answer "which open
@@ -704,7 +711,10 @@ func (s *Server) serve(conn net.Conn) {
 	// says who it is still gets an id, so an anonymous one-off client works —
 	// it just does not survive a reconnect as the same writer.
 	author := s.nextAuthor()
-	defer s.Participants.Leave(author)
+	// The defer reads author when it runs, not when it is set: the hello path
+	// below rebinds it to the durable identity, and the row to release when
+	// the connection ends is whichever one it is bound to then.
+	defer func() { s.Participants.Leave(author) }()
 
 	// Reading and writing are separated because a streamed search takes
 	// seconds and a cancel has to arrive during it. A loop that read a frame,
@@ -780,7 +790,12 @@ func (s *Server) serve(conn net.Conn) {
 				c.send(Response{ID: req.ID, Err: err.Error(), Final: true})
 				continue
 			}
-			s.Participants.Leave(author)
+			if id != author {
+				// The provisional id goes back now, not at disconnect: it is
+				// recyclable at once, and the durable row just joined is the
+				// one this connection is bound to from here.
+				s.Participants.Leave(author)
+			}
 			author = id
 			c.mu.Lock()
 			c.author = id

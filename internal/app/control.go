@@ -163,16 +163,20 @@ func (h host) isAgent(id uint8) bool {
 }
 
 func (h host) Buffers() []control.Buffer {
-	out := make([]control.Buffer, 0, h.a.Tabs.Count())
-	for _, p := range h.a.Tabs.All() {
+	// A headless buffer is listed too, marked so a caller can tell a tab from a
+	// buffer it can read but cannot see.
+	panes := append(append([]*editor.Pane{}, h.a.Tabs.All()...), h.a.headless...)
+	out := make([]control.Buffer, 0, len(panes))
+	for _, p := range panes {
 		sess := p.File.Session()
 		b := control.Buffer{
-			Path:    p.File.Path,
-			Version: uint64(sess.Version()),
-			Dirty:   p.File.ViewDirty(),
-			Bytes:   p.File.Len(),
-			Lines:   p.File.Lines(),
-			Active:  p == h.a.Tabs.Active(),
+			Path:     p.File.Path,
+			Version:  uint64(sess.Version()),
+			Dirty:    p.File.ViewDirty(),
+			Bytes:    p.File.Len(),
+			Lines:    p.File.Lines(),
+			Active:   p == h.a.Tabs.Active(),
+			Headless: h.a.isHeadless(p),
 		}
 		// The pending count is what turns "which open files hold decisions"
 		// from 1 + N `groups` calls into the one `buffers` call. Moved reuses
@@ -227,12 +231,41 @@ func (h host) find(path string) (*editor.Pane, error) {
 			return p, nil
 		}
 	}
+	// A headless buffer is found by the same comparison as a tab; the only
+	// difference between them is presentation.
+	if p, ok := h.a.findHeadless(want); ok {
+		return p, nil
+	}
 	return nil, fmt.Errorf("%w: %s", control.ErrNoBuffer, path)
 }
 
-// Resolve maps an empty path to the buffer the user is looking at.
+// findOrLoad is find for the inspection verbs: a path already loaded is found,
+// and one the workspace can read that is not is loaded headlessly and served,
+// with no tab. It is deliberately not find itself, so a write or a close does
+// not load a file the caller never asked to touch. A path that is missing,
+// outside the workspace, unreadable, binary or oversized stays the same "no
+// open buffer" error find gave, so a typo is still a typo.
+func (h host) findOrLoad(path string) (*editor.Pane, error) {
+	if p, err := h.find(path); err == nil {
+		return p, nil
+	}
+	if path == "" {
+		return nil, control.ErrNoBuffer
+	}
+	p, err := h.a.loadHeadless(h.canonicalPath(path))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", control.ErrNoBuffer, path)
+	}
+	return p, nil
+}
+
+// Resolve maps an empty path to the buffer the user is looking at, and loads a
+// path the workspace can read headlessly. It is the seam the Guard resolves
+// every verb through, so a request against a file nobody has opened reaches a
+// loaded buffer rather than an error; whether that buffer gets a tab is the
+// business of the verb, not of resolution.
 func (h host) Resolve(path string) (string, error) {
-	p, err := h.find(path)
+	p, err := h.findOrLoad(path)
 	if err != nil {
 		return "", err
 	}
@@ -255,6 +288,15 @@ func (h host) Open(path string, create bool) (uint64, error) {
 			}
 		}
 	}
+	// A headless buffer is already loaded, and open is the request to show it:
+	// announce rather than load a second copy under the same path. This also
+	// covers -create, which skips the stat below and would otherwise make a
+	// duplicate for a file an agent had only inspected.
+	if p, err := h.find(path); err == nil {
+		h.a.announceIfHeadless(p)
+		h.a.Tabs.Focus(p)
+		return uint64(p.File.Session().Version()), nil
+	}
 	// Without -create, open reaches only something that already exists: a
 	// buffer already open (which may have been created earlier and never
 	// written, so it is not on disk) or a file raj can read. A path that is
@@ -262,10 +304,6 @@ func (h host) Open(path string, create bool) (uint64, error) {
 	// name later becomes a file. -create is the caller saying it means to make
 	// one.
 	if !create {
-		if p, err := h.find(path); err == nil {
-			h.a.Tabs.Focus(p)
-			return uint64(p.File.Session().Version()), nil
-		}
 		if _, err := os.Stat(path); err != nil {
 			return 0, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
 		}
@@ -309,6 +347,9 @@ func (h host) Goto(path string, line, col int) error {
 	if err != nil {
 		return err
 	}
+	// A caret move is only meaningful on screen, so a headless buffer is
+	// announced first: goto is a request to look at a place in a file.
+	h.a.announceIfHeadless(p)
 	if line <= 0 {
 		line, _ = p.File.LineCol(p.Cursors.Primary().Head)
 		line++
@@ -319,6 +360,9 @@ func (h host) Goto(path string, line, col int) error {
 	off := p.File.OffsetAt(line-1, col-1)
 	p.Cursors.Set(off, off)
 	p.Viewport.Center(line-1, p.File.Lines())
+	// A cursor and viewport move is view state the session records, so persist
+	// it the same way the editor's own goto does.
+	h.a.TouchSession()
 	return nil
 }
 
@@ -334,9 +378,24 @@ func (h host) Close(path string) error {
 	if p.File.ViewDirty() {
 		return fmt.Errorf("%s has unsaved changes; save or reject them first", p.File.Path)
 	}
+	// A headless buffer has no tab to remove; dropping it from the registry is
+	// the whole close. The dirty guard above is what keeps it safe, and a
+	// headless buffer is always clean because a proposal announces first.
+	if h.a.dropHeadless(p) {
+		return nil
+	}
 	for i, q := range h.a.Tabs.All() {
 		if q == p {
+			// The UI close path (closeTabAt) runs closeDoc before removing a tab,
+			// forgetting the journal, the LSP document and the diagnostics. A
+			// socket close skipped that, leaving the journal behind to be
+			// reopened as a tab on the next start.
+			h.a.closeDoc(p)
 			h.a.Tabs.CloseIndex(i)
+			// The tab set is the session, so a socket close must persist the
+			// same way the UI closeTabAt does; without this the tab reappears
+			// on the next start.
+			h.a.TouchSession()
 			return nil
 		}
 	}
@@ -379,7 +438,7 @@ func resolveSpan(start, end, size int) (int, int, error) {
 // Byte offsets and -lines are in the returned text's own coordinates, which is
 // why the line translation builds an index over the projection it hands back.
 func (h host) Read(path string, start, end, lineStart, lineEnd int, annotated bool) ([]control.Span, []control.StateRun, uint64, error) {
-	p, err := h.find(path)
+	p, err := h.findOrLoad(path)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -453,7 +512,7 @@ func clipStates(runs []piecetable.StateRun, start, end int) []control.StateRun {
 }
 
 func (h host) Version(path string) (uint64, error) {
-	p, err := h.find(path)
+	p, err := h.findOrLoad(path)
 	if err != nil {
 		return 0, err
 	}
@@ -469,6 +528,9 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	if err != nil {
 		return 0, nil, err
 	}
+	// A proposal the user has to decide about must be visible: a headless
+	// buffer is announced before the change set lands, never left hidden.
+	h.a.announceIfHeadless(p)
 	size := len(p.File.Text())
 	pt := make([]piecetable.Hunk, 0, len(hunks))
 	for i, x := range hunks {
@@ -571,6 +633,9 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 	if err != nil {
 		return 0, nil, err
 	}
+	// A patch creates a proposal too, so it is announced by the same rule as
+	// apply: work the user has to decide about is never hidden.
+	h.a.announceIfHeadless(p)
 	if snap.path != p.File.Path {
 		return 0, nil, fmt.Errorf("snapshot %d is of %s, not %s", id, snap.path, p.File.Path)
 	}
@@ -871,7 +936,7 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 	default:
 		return nil, fmt.Errorf("unknown lsp mode %q (want hover, definition, references, completion or diagnostics)", mode)
 	}
-	p, err := h.find(path)
+	p, err := h.findOrLoad(path)
 	if err != nil {
 		return nil, err
 	}

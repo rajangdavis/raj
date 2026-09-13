@@ -451,6 +451,28 @@ func TestBufferPendingAndMovedRoundTrip(t *testing.T) {
 	}
 }
 
+// Headless is per-buffer state and must cross the wire: it is how buffers tells
+// a loaded buffer with no tab from one the user can see. It rides in a sparse
+// field of its own, so a buffer without it decodes as tabbed.
+func TestBufferHeadlessRoundTrip(t *testing.T) {
+	want := []Buffer{
+		{Path: "/w/a.go", Version: 3, Bytes: 90, Lines: 5, Headless: true},
+		{Path: "/w/b.go", Version: 9, Bytes: 4, Lines: 1},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Buffers: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Buffers) != len(want) {
+		t.Fatalf("buffers = %+v, want %d", got.Buffers, len(want))
+	}
+	for i := range want {
+		if got.Buffers[i] != want[i] {
+			t.Errorf("buffer %d = %+v, want %+v", i, got.Buffers[i], want[i])
+		}
+	}
+}
+
 // A frame from before pending and moved existed carries only the six original
 // hBuffers fields. It must decode to zero counts rather than fail or invent a
 // seventh buffer: the counts ride in their own field, so their absence is
@@ -471,6 +493,9 @@ func TestOldShapedBufferRecordStillDecodes(t *testing.T) {
 	for i, b := range got.Buffers {
 		if b.Pending != 0 || b.Moved != 0 {
 			t.Errorf("buffer %d carries counts %d/%d; neither was on the wire", i, b.Pending, b.Moved)
+		}
+		if b.Headless {
+			t.Errorf("buffer %d reads as headless; the field was not on the wire", i)
 		}
 	}
 	if b := got.Buffers[0]; b.Path != "/w/a.go" || !b.Dirty || b.Bytes != 90 || b.Lines != 5 {

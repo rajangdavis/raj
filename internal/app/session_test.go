@@ -207,6 +207,94 @@ func TestSessionSaveIsDebounced(t *testing.T) {
 	}
 }
 
+// A tab set change is not view churn: quitting inside the debounce window
+// would reopen a tab the user just closed, so the next tick writes it. Opening
+// and closing are both structural; a cursor move is not.
+func TestSessionTabChangeBypassesTheDebounce(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	g := filepath.Join(root, "b.go")
+	os.WriteFile(f, []byte("x\n"), 0o644)
+	os.WriteFile(g, []byte("y\n"), 0o644)
+
+	a := newHarnessAt(t, root)
+	now := time.Now()
+	a.OpenFile(f)
+	a.sessionTick(now) // the first write records one tab
+	if st := session.Load(root); len(st.Tabs) != 1 {
+		t.Fatalf("setup wrote %d tabs, want 1", len(st.Tabs))
+	}
+
+	// Opening a tab well inside the window must not wait it out.
+	a.OpenFile(g)
+	a.sessionTick(now.Add(SessionSaveInterval / 4))
+	if st := session.Load(root); len(st.Tabs) != 2 {
+		t.Fatalf("opening a tab was debounced: %d tabs on disk, want 2", len(st.Tabs))
+	}
+
+	// Closing one is the same: the next tick writes the smaller set.
+	a.closeTabAt(1)
+	a.sessionTick(now.Add(SessionSaveInterval / 2))
+	if st := session.Load(root); len(st.Tabs) != 1 || st.Tabs[0].Path != f {
+		t.Fatalf("closing a tab was debounced: %+v", st.Tabs)
+	}
+}
+
+// Cursor and scroll movement is the churn the interval exists to absorb; a tab
+// set that did not change still waits it out.
+func TestSessionCursorChangeWaitsOutTheInterval(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	os.WriteFile(f, []byte("abcdef\n"), 0o644)
+
+	a := newHarnessAt(t, root)
+	now := time.Now()
+	a.OpenFile(f)
+	a.sessionTick(now)
+
+	// Move the cursor: same tab set, so this is not a structural change.
+	if p := a.Tabs.Active(); p != nil {
+		p.Cursors.Set(3, 3)
+	}
+	a.TouchSession()
+	a.sessionTick(now.Add(SessionSaveInterval / 2))
+	if !a.sessionDirty {
+		t.Fatal("a cursor-only change did not wait out the interval")
+	}
+	a.sessionTick(now.Add(SessionSaveInterval * 2))
+	if st := session.Load(root); len(st.Tabs) != 1 || st.Tabs[0].Cursor != 3 {
+		t.Errorf("cursor change not written after the interval: %+v", st.Tabs)
+	}
+}
+
+// Run's exit path flushes the session, so the last change lands even when the
+// quit comes inside the debounce window.
+func TestRunSavesSessionOnExit(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	g := filepath.Join(root, "b.go")
+	os.WriteFile(f, []byte("x\n"), 0o644)
+	os.WriteFile(g, []byte("y\n"), 0o644)
+
+	h := newHarnessAt(t, root)
+	h.OpenFile(f)
+	h.sessionTick(time.Now()) // the first write records one tab on disk
+
+	// A second tab well inside the window: a tick would hold it back, so only
+	// the exit flush can put it on disk.
+	h.OpenFile(g)
+	h.sessionSaved = time.Now()
+	h.sessionDirty = true
+
+	h.host.Press("ctrl+c") // queued; Run consumes it and quits
+	if err := h.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if st := session.Load(root); len(st.Tabs) != 2 {
+		t.Errorf("Run did not flush the session on exit: %+v", st.Tabs)
+	}
+}
+
 // Nothing to save means no writes at all, so an idle editor does not rewrite a
 // file every few seconds forever.
 func TestSessionTickIsInertWhenNothingChanged(t *testing.T) {

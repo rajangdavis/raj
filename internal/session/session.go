@@ -70,27 +70,27 @@ type State struct {
 // Version is the current format.
 const Version = 1
 
-// Dir is the workspace's scratch-state directory: .git/raj when the workspace
-// is a git checkout, and .raj otherwise. The session file and the op log both
-// live under it, so the two do not invent separate conventions for the same
-// question.
+// Dir is the workspace's scratch-state directory: always .raj, whether or not
+// the workspace is a repository. This is per-workspace application scratch
+// state — the session, and the op log under logs/ — not version-control data.
+// Parking it inside .git assumed a checkout, looked like VCS state, and broke
+// for worktrees, bare or read-only checkouts, and non-repos. .raj is already
+// the convention here: the hidden-files config lives in it, so there is one
+// state dir, not two.
+//
+// There is no migration from the old .git/raj: a workspace that has one starts
+// fresh under .raj, and the old directory is left untouched.
 func Dir(root string) string {
 	if root == "" {
 		return ""
-	}
-	if info, err := os.Stat(filepath.Join(root, ".git")); err == nil && info.IsDir() {
-		return filepath.Join(root, ".git", "raj")
 	}
 	return filepath.Join(root, ".raj")
 }
 
 // File is where a workspace's state lives, relative to its root.
 //
-// Under .git rather than beside it: this is per-checkout scratch state, not
-// something to commit or to show in the sidebar, and .git is already the
-// directory tools put such things in and that everything ignores. A workspace
-// with no .git falls back to .raj, which is where the hidden-files config
-// already lives.
+// In .raj, which the sidebar hides and nothing commits: per-workspace scratch
+// state belongs with the hidden-files config already there, not inside .git.
 func File(root string) string {
 	dir := Dir(root)
 	if dir == "" {

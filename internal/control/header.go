@@ -101,6 +101,7 @@ const (
 	hMatchLineStart = 0x45 // search: byte offset of each hit line start within the file
 	hStatesJSON     = 0x46 // read -annotated: the JSON-encoded []StateRun
 	hConflictGroup  = 0x47 // apply: sparse lease owner per conflict, one number per conflict
+	hBufferHeadless = 0x48 // buffers: sparse paths of buffers with no tab
 
 )
 
@@ -348,6 +349,25 @@ func encodeHeader(h Header) []byte {
 		if any {
 			ops = append(ops, Op8{hBufferState, counts.Done()})
 		}
+
+		// The path of a headless buffer rides in a sparse field of its own
+		// too, one record per headless buffer. The reason matches the counts
+		// above: an hBuffers record is positional, so a field added inside
+		// one would be read as the next record path by an older reader. An
+		// absent field is skipped whole, so an old client reads every buffer
+		// as tabbed — the only state an old build could make.
+		var headless prog.Writer
+		var anyHeadless bool
+		for _, b := range h.Buffers {
+			if !b.Headless {
+				continue
+			}
+			anyHeadless = true
+			headless.Str(b.Path)
+		}
+		if anyHeadless {
+			ops = append(ops, Op8{hBufferHeadless, headless.Done()})
+		}
 	}
 
 	if len(h.Truncated) > 0 {
@@ -452,6 +472,9 @@ func decodeHeader(b []byte) (Header, error) {
 	// Conflict lease owners arrive the same way, one number per conflict, so
 	// their position relative to hConflicts does not matter either.
 	var conflictGroups []int
+	// Headless buffer paths arrive the same sparse way: one path per buffer
+	// with no tab, marked on the matching buffers after every op is read.
+	var headless []string
 	for _, op := range ops {
 		switch op.Code {
 		case hID:
@@ -640,6 +663,14 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "buffer state"); err != nil {
 				return Header{}, err
 			}
+		case hBufferHeadless:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				headless = append(headless, r.Str())
+			}
+			if err := recordsOK(r, "buffer headless"); err != nil {
+				return Header{}, err
+			}
 		case hTruncated:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -700,6 +731,14 @@ func decodeHeader(b []byte) (Header, error) {
 		for i := range h.Buffers {
 			if h.Buffers[i].Path == st.path {
 				h.Buffers[i].Pending, h.Buffers[i].Moved = st.pending, st.moved
+				break
+			}
+		}
+	}
+	for _, p := range headless {
+		for i := range h.Buffers {
+			if h.Buffers[i].Path == p {
+				h.Buffers[i].Headless = true
 				break
 			}
 		}

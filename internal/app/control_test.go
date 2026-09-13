@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1006,5 +1007,223 @@ func TestControlReviewEntersTheMode(t *testing.T) {
 	}
 	if h.mode != ModeEdit {
 		t.Errorf("mode = %v after review -json, want it left in Edit", h.mode)
+	}
+}
+
+// A read of a path nobody opened loads it headlessly: the buffer is tracked and
+// addressable, but no tab appears in front of the user. This is the spec's
+// loaded-versus-announced split at the socket.
+func TestHeadlessReadDoesNotAddATab(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "other.go")
+	if err := os.WriteFile(path, []byte("other file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	before := h.Tabs.Count()
+	r := c.do(h, control.Request{Op: "text", Path: path})
+	if !r.OK || r.Text() != "other file\n" {
+		t.Fatalf("read of a closed path = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != before {
+		t.Errorf("tab count = %d, want %d: a read announced a tab", got, before)
+	}
+	if _, ok := h.findHeadless(path); !ok {
+		t.Errorf("read path is not tracked headlessly")
+	}
+	for _, p := range h.Tabs.All() {
+		if sameFile(path, p.File.Path) {
+			t.Errorf("read path got a tab")
+		}
+	}
+}
+
+// version and lsp diagnostics reach a closed-but-readable path the same way:
+// loaded and served, no tab.
+func TestHeadlessVersionAndDiagnosticsDoNotAddTabs(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "other.go")
+	if err := os.WriteFile(path, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := h.Tabs.Count()
+
+	if r := c.do(h, control.Request{Op: "version", Path: path}); !r.OK {
+		t.Fatalf("version of a closed path = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != before {
+		t.Errorf("version tab count = %d, want %d", got, before)
+	}
+
+	call, err := hostOf(h.App).LSP(path, 0, 0, "diagnostics")
+	if err != nil {
+		t.Fatalf("diagnostics of a closed path = %v", err)
+	}
+	if call == nil {
+		t.Fatal("diagnostics answered with no caller")
+	}
+	if got := h.Tabs.Count(); got != before {
+		t.Errorf("diagnostics tab count = %d, want %d", got, before)
+	}
+}
+
+// A proposal must be visible: applying to a buffer that was only inspected
+// announces it as a tab before the change set lands.
+func TestHeadlessApplyAnnounces(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "other.go")
+	if err := os.WriteFile(path, []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read first so the buffer is loaded headlessly, then propose against it.
+	read := c.do(h, control.Request{Op: "text", Path: path})
+	base := read.Version
+	before := h.Tabs.Count()
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 5, Text: "howdy"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != before+1 {
+		t.Fatalf("tab count = %d, want %d: the proposal stayed hidden", got, before+1)
+	}
+	if _, ok := h.findHeadless(path); ok {
+		t.Errorf("the pane is still headless after a proposal")
+	}
+	var pending int
+	for _, p := range h.Tabs.All() {
+		if sameFile(path, p.File.Path) {
+			pending = len(p.File.Session().Pending())
+		}
+	}
+	if pending != 1 {
+		t.Errorf("pending = %d, want the one proposed set", pending)
+	}
+}
+
+// The buffers listing carries headless buffers, marked so a caller can tell
+// them from tabs.
+func TestBuffersReportsHeadless(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "other.go")
+	if err := os.WriteFile(path, []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.do(h, control.Request{Op: "text", Path: path}); !r.OK {
+		t.Fatalf("read = %+v", r)
+	}
+
+	r := c.do(h, control.Request{Op: "buffers"})
+	var sawHeadless, sawTab bool
+	for _, b := range r.Buffers {
+		switch {
+		case b.Path == path:
+			sawHeadless = true
+			if !b.Headless {
+				t.Errorf("headless buffer %s is not marked headless", b.Path)
+			}
+		case b.Headless:
+			t.Errorf("tab %s is marked headless", b.Path)
+		default:
+			sawTab = true
+		}
+	}
+	if !sawHeadless || !sawTab {
+		t.Errorf("buffers = %+v, want both a tab and a headless buffer", r.Buffers)
+	}
+}
+
+// The registry is bounded; a clean headless buffer is dropped and re-read on
+// demand rather than accumulating for a whole inspection sweep.
+func TestHeadlessEvictionReloads(t *testing.T) {
+	h := newHarness(t, "root\n")
+	hh := hostOf(h.App)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+
+	paths := make([]string, 0, headlessMax+1)
+	for i := 0; i < headlessMax+1; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("headless%d.go", i))
+		if err := os.WriteFile(path, []byte("package h\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
+	}
+	for _, path := range paths {
+		if _, _, _, err := hh.Read(path, -1, -1, 0, 0, false); err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+	}
+	if got := len(h.headless); got != headlessMax {
+		t.Fatalf("headless registry = %d, want the cap %d", got, headlessMax)
+	}
+	if _, ok := h.findHeadless(paths[0]); ok {
+		t.Errorf("the oldest headless buffer survived eviction")
+	}
+	if _, _, _, err := hh.Read(paths[0], -1, -1, 0, 0, false); err != nil {
+		t.Fatalf("reload %s: %v", paths[0], err)
+	}
+	if _, ok := h.findHeadless(paths[0]); !ok {
+		t.Errorf("a dropped buffer did not reload on demand")
+	}
+}
+
+// A close over the socket is a change to the session's tab set, so it must
+// mark the session for rewriting the way the UI closeTabAt does. Without this
+// a tab an agent closed over the socket reappears on the next editor start.
+func TestControlCloseTouchesTheSession(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	path := h.Tabs.Active().File.Path
+	h.sessionDirty = false
+
+	if err := hostOf(h.App).Close(path); err != nil {
+		t.Fatalf("close = %v", err)
+	}
+	if !h.sessionDirty {
+		t.Error("a socket close left the session untouched; the tab will reappear on restart")
+	}
+	for _, p := range h.Tabs.All() {
+		if sameFile(path, p.File.Path) {
+			t.Errorf("tab for %s is still open after close", path)
+		}
+	}
+}
+
+// A close refused because the buffer is dirty is not a change to the session:
+// nothing moved, so marking it dirty would write a session that never changed.
+func TestControlRefusedCloseLeavesSessionUntouched(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	path := h.Tabs.Active().File.Path
+	h.typeText("x") // unsaved, so the close is refused
+	h.sessionDirty = false
+
+	if err := hostOf(h.App).Close(path); err == nil {
+		t.Fatal("close accepted a buffer with unsaved changes")
+	}
+	if h.sessionDirty {
+		t.Error("a refused close marked the session dirty")
+	}
+}
+
+// Goto moves the cursor and scrolls the viewport — both view state the session
+// records — so it must mark the session for rewriting like the editor's own
+// goto.
+func TestControlGotoTouchesTheSession(t *testing.T) {
+	h := controlHarness(t, "one\ntwo\nthree\n")
+	path := h.Tabs.Active().File.Path
+	h.sessionDirty = false
+
+	if err := hostOf(h.App).Goto(path, 2, 1); err != nil {
+		t.Fatalf("goto = %v", err)
+	}
+	if !h.sessionDirty {
+		t.Error("a socket goto left the session untouched")
 	}
 }

@@ -208,9 +208,8 @@ focused task.
   cannot bring back. It needs the dirty-buffer journal below, not a path.
 
 ~~Session persistence~~ — tabs, cursors, scroll, expanded directories and the
-  focused pane are saved to `.git/raj/session.json` (or `.raj/` without a
-  repository) and restored on start; `--no-restore` disables both directions.
-  What is left of it:
+  focused pane are saved to `.raj/session.json` and restored on start;
+  `--no-restore` disables both directions. What is left of it:
 ~~The session is written only on a clean exit~~ — it is now also written from
   the idle tick, debounced to three seconds, and touched whenever a tab opens or
   closes. A crash loses seconds rather than the session.
@@ -604,7 +603,7 @@ missing is addressing and state.
   a tab first, which also puts it in front of the user — deliberately, since an
   editor silently editing files you cannot see is worse than one extra call.
   Unnamed buffers stay unaddressable: there is no name to ask for.
-- [ ] **Inspection should not force a tab; proposals should.** Today even a
+- [~] **Inspection should not force a tab; proposals should.** Today even a
   read-only look — `read`, `version`, `lsp diagnostics` — needs `open` first,
   so an agent surveying twenty files puts twenty tabs in front of the user and
   then closes the ones it did not touch. Flip the default: the read-before-write
@@ -614,10 +613,18 @@ missing is addressing and state.
   hidden. `open` then means what it says: a request to show the user. The
   close-when-clean convention in the skill becomes automatic rather than
   agent-disciplined.
+  **In progress 2026-09-12:** the control surface carries it. `control.Buffer`
+  gains `Headless` (wire field `hBufferHeadless`, 0x48) so `buffers`/`buffers
+  -json` report a loaded buffer with no tab, the CLI usage documents `open` as
+  show and the read verbs as loading on demand, and the app side announces a
+  buffer when a proposal lands. Follow-on (orchestrator owns skill files): the
+  `raj-editor` skill read-before-write wording should stop requiring `open`
+  first and stop treating close-when-clean as the agent job.
 - [~] **SQLite session store** — the op log is now persisted (`internal/journal`,
-  phase 0) as the shareable/forkable artifact; the engine is deferred (a plain
-  append-only log first, SQLite later behind the record interface), and folding
-  `session.json` into the same store is still open. See the spec §7.
+  phase 0) under `.raj/` (not `.git/raj/`); whether the store is forkable is
+  still open. The engine is deferred (a plain append-only log first, SQLite
+  later behind the record interface), as is folding `session.json` into the same
+  store. See the spec §7.
 
 ## `raj box` — the container build/run, folded into the CLI
 

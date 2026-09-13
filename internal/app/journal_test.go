@@ -218,6 +218,10 @@ func TestJournalRestoreAfterSaveUsesWrittenHash(t *testing.T) {
 		t.Fatal("no Written marker after a save")
 	}
 
+	// A real restart has the tab in the session, so record it: without that the
+	// log reads as a clean leftover and is dropped before it can attach.
+	h.sessionTick(time.Now())
+
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
 	a := New(host, h.root, 2)
@@ -415,6 +419,10 @@ func TestJournalSaveThenRestoreIsClean(t *testing.T) {
 		t.Fatal("the buffer is dirty immediately after a save")
 	}
 
+	// A real restart has the tab in the session, so record it: without that the
+	// log reads as a clean leftover and is dropped before it can attach.
+	h.sessionTick(time.Now())
+
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
 	a := New(host, h.root, 2)
@@ -460,5 +468,115 @@ func TestJournalGateOffLeavesLogsAlone(t *testing.T) {
 	}
 	if got := archivedLogs(t, a); len(got) != 0 {
 		t.Errorf("archived logs with the gate off = %d, want 0", len(got))
+	}
+}
+
+// An explicit close removes the buffer's log: the user decided not to keep the
+// buffer, so there is nothing left to recover and nothing to reopen later.
+func TestJournalCloseRemovesLog(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.press("super+s") // save first, so the close is not the unsaved prompt
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("no log before the close: %v", err)
+	}
+
+	h.closeTabAt(0)
+
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Errorf("the closed buffer's log is still on disk (err=%v)", err)
+	}
+}
+
+// A socket close runs the same bookkeeping as the UI close: closeDoc forgets
+// the journal (and the LSP document) before the tab is removed, so the tab does
+// not come back on the next start.
+func TestJournalSocketCloseRemovesLog(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := controlHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.press("super+s")
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+
+	c := h.dial(t)
+	r := c.do(h, control.Request{Op: "close", Path: p.File.Path})
+	if !r.OK {
+		t.Fatalf("close = %+v", r)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Errorf("a socket close left the journal behind (err=%v)", err)
+	}
+	if n := len(h.Tabs.All()); n != 0 {
+		t.Errorf("tabs after close = %d, want 0", n)
+	}
+}
+
+// A log whose replay is already on disk and holds nothing to decide is a
+// leftover from a close, not work to recover: restore removes it rather than
+// opening a tab for it, so a tab the user closed does not come back.
+func TestJournalRestoreDropsCleanLeftover(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.press("super+s")
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+
+	// No session save: the tab is not in the restored set, so paneFor finds
+	// nothing and the log stands on its own.
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	if a.Pane() != nil {
+		t.Errorf("a clean leftover log reopened a tab: %q", a.Pane().File.Path)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Errorf("the clean leftover log still sits in the restore path (err=%v)", err)
+	}
+}
+
+// A log with unsaved work is crash recovery, not a leftover: restore still
+// opens it as a dirty tab carrying the edits the log recorded.
+func TestJournalRestoreKeepsUnsavedLog(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.flushJournal(p)
+	want := p.File.Text()
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	if a.Pane() == nil {
+		t.Fatal("a log with unsaved work did not reopen")
+	}
+	if got := a.Pane().File.Text(); got != want {
+		t.Errorf("restored text = %q, want %q", got, want)
+	}
+	if !a.Pane().File.Dirty() {
+		t.Error("a restored unsaved buffer should read dirty")
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		t.Errorf("the log backing a restored tab went missing: %v", err)
 	}
 }

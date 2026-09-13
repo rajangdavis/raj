@@ -3,6 +3,7 @@ package control
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 // The bug this replaces: an id was minted per connection, so a harness that
@@ -259,5 +260,86 @@ func TestSeedRestoresExplicitAuthors(t *testing.T) {
 	}
 	if fresh, err := r.Join("fresh", "", KindAgent); err != nil || fresh <= 7 {
 		t.Errorf("Join(fresh) = %d, %v, want an id past the seeded 7", fresh, err)
+	}
+}
+
+// A registry restored with an id at the very top must not wedge the counter.
+// Seed used to pin next to 0, a second "full" sentinel, so a registry holding
+// one restored row behaved as though every id were taken.
+func TestSeedAtTheTopDoesNotWedge(t *testing.T) {
+	r := NewRegistry()
+	if !r.Seed(Participant{ID: MaxParticipants, Identity: "tok_top", Name: "claude-top", Kind: KindAgent}) {
+		t.Fatal("Seed refused id MaxParticipants")
+	}
+	if _, err := r.Join("fresh", "claude-new", KindAgent); err != nil {
+		t.Fatalf("Join after seeding id %d refused: %v", MaxParticipants, err)
+	}
+}
+
+// The top id is a valid author byte like any other. A gone row at 255 is the
+// lowest recyclable gap when it is the only one, so Join hands it back rather
+// than scanning past it and reporting the table full.
+func TestGoneTopIDIsRecycled(t *testing.T) {
+	r := NewRegistry()
+	if !r.Seed(Participant{ID: MaxParticipants, Identity: "tok_top", Name: "claude-top", Kind: KindAgent}) {
+		t.Fatal("Seed refused id MaxParticipants")
+	}
+	id, err := r.Join("newcomer", "claude-new", KindAgent)
+	if err != nil {
+		t.Fatalf("Join with id %d gone: %v", MaxParticipants, err)
+	}
+	if id != MaxParticipants {
+		t.Errorf("recycled id %d, want the gone top id %d", id, MaxParticipants)
+	}
+	p, ok := r.Get(id)
+	if !ok || !p.Connected || p.Identity != "newcomer" || p.Name != "claude-new" {
+		t.Errorf("row %d = %+v, want the newcomer live under it", id, p)
+	}
+}
+
+// A connection minted a provisional id rebinds to its durable identity on
+// hello. The provisional row must be released as it moves off it, not held
+// live until the connection ends, and the deferred release must name the row
+// the connection is bound to at the end rather than the one it was minted.
+func TestRebindReleasesTheProvisionalAndBoundAuthors(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	first, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Do(Request{Op: "ping"}); err != nil {
+		t.Fatal(err)
+	}
+	provisional := first.Author()
+
+	res, err := first.Do(Request{Op: "hello", Identity: "harness-abc", Name: "claude-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("hello = %+v", res)
+	}
+	bound := first.Author()
+	if bound == provisional {
+		t.Fatalf("hello kept the provisional id %d", provisional)
+	}
+	// The provisional row is released as the connection moves off it, so it
+	// is recyclable at once instead of leaking one id per reconnect.
+	if p, ok := ed.srv.Participants.Get(provisional); ok && p.Connected {
+		t.Errorf("provisional id %d stayed connected after the rebind", provisional)
+	}
+
+	first.Close()
+	// The row actually bound at the end is the one the defer releases.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p, ok := ed.srv.Participants.Get(bound)
+		if ok && !p.Connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bound id %d still connected after the connection closed: %+v", bound, p)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

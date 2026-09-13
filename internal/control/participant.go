@@ -67,12 +67,12 @@ type Registry struct {
 	mu         sync.Mutex
 	byID       map[uint8]*Participant
 	byIdentity map[string]uint8
-	next       uint8
+	next       uint16
 }
 
 // NewRegistry returns a registry holding only the local human.
 func NewRegistry() *Registry {
-	r := &Registry{byID: map[uint8]*Participant{}, byIdentity: map[string]uint8{}, next: LocalHuman + 1}
+	r := &Registry{byID: map[uint8]*Participant{}, byIdentity: map[string]uint8{}, next: uint16(LocalHuman) + 1}
 	local := &Participant{ID: LocalHuman, Identity: "local", Name: "you",
 		Kind: KindHuman, Connected: true}
 	r.byID[LocalHuman] = local
@@ -108,8 +108,8 @@ func (r *Registry) Join(identity, name string, kind Kind) (uint8, error) {
 	if name == "" {
 		name = identity
 	}
-	id := r.next
-	if int(r.next) > MaxParticipants || r.next == 0 {
+	id := uint8(r.next)
+	if r.next > MaxParticipants {
 		// The one-byte space is full — of rows, not of writers. A participant
 		// that disconnected left its row behind so its text still has an owner
 		// to name, and that row is the one id that can be handed out again:
@@ -153,11 +153,11 @@ func (r *Registry) Seed(p Participant) bool {
 	p.Connected = false
 	r.byID[p.ID] = &p
 	r.byIdentity[p.Identity] = p.ID
-	switch {
-	case p.ID == MaxParticipants:
-		r.next = 0 // the one-byte space is full after this id
-	case p.ID >= r.next:
-		r.next = p.ID + 1
+	// next is one past the highest seeded id. Seeding id MaxParticipants
+	// makes it MaxParticipants+1, which nextAuthor reads as full — the
+	// counter can hold that now, so fullness needs no second sentinel.
+	if uint16(p.ID) >= r.next {
+		r.next = uint16(p.ID) + 1
 	}
 	return true
 }
@@ -167,14 +167,12 @@ func (r *Registry) Seed(p Participant) bool {
 // would write text indistinguishable from typed — and a connected row is
 // never taken, because that id is somebody writing right now.
 func lowestGone(byID map[uint8]*Participant) (uint8, bool) {
-	for id := uint8(LocalHuman + 1); ; id++ {
-		if p, ok := byID[id]; ok && !p.Connected {
-			return id, true
-		}
-		if id == MaxParticipants {
-			return 0, false
+	for id := uint16(LocalHuman) + 1; id <= MaxParticipants; id++ {
+		if p, ok := byID[uint8(id)]; ok && !p.Connected {
+			return uint8(id), true
 		}
 	}
+	return 0, false
 }
 
 // Leave marks a participant disconnected. The row stays: its text is still in

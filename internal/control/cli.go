@@ -47,9 +47,9 @@ import (
 const ctlUsage = `usage: raj ctl <command> [options]
 
   list                       running editors and their workspaces
-  buffers                    files open in the editor
-  read [path]                the buffer view; -annotated adds per-run states, -start/-end/-lines for a span
-  open <path>                open a file; -create makes a buffer for a path not on disk
+  buffers                    files open in the editor; a headless buffer has no tab
+  read [path]                the buffer view, loaded on demand; -annotated adds per-run states, -start/-end/-lines for a span
+  open <path>                show a file: load it and focus a tab; -create makes a buffer for a path not on disk
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
   close [path]                close a buffer; refused while it has unsaved work
   whoami                     the author id this connection writes as
@@ -78,6 +78,10 @@ const ctlUsage = `usage: raj ctl <command> [options]
   exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
   stats                      what the exec policy has cost this session
   run -prog BYTES            run a program of opcodes; @FILE or - for stdin
+
+read, version and lsp diagnostics load a file on demand, so they need no open
+first and leave no tab; open is a request to show a file to the user, and a
+pending proposal is what puts a tab on a buffer nobody asked to see.
 
 Path may be omitted for the buffer the user is looking at.
 
@@ -1421,6 +1425,9 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 		mark := ""
 		if b.Active {
 			mark = "\tactive"
+		}
+		if b.Headless {
+			mark += "\theadless"
 		}
 		fmt.Fprintf(stdout, "%s\t%d bytes\t%d lines\t%s%s\n", name, b.Bytes, b.Lines, state, mark)
 

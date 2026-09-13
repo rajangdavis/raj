@@ -421,9 +421,12 @@ func (a *App) flushJournals() {
 	}
 }
 
-// closeJournal flushes and closes one buffer's log. The file is left on disk: a
-// closed dirty buffer's edits may still be worth restoring, and the log is what
-// carries them.
+// closeJournal flushes and closes one buffer's log, then removes it. An
+// explicit close -- or a discard -- is the user deciding not to keep the
+// buffer, so there is nothing left to recover; leaving the log made restore
+// reopen a tab the user had closed. Crash recovery is unaffected because a
+// crash never reaches closeJournal, and quit still uses closeJournals, which
+// keeps leaving the files for the next start.
 func (a *App) closeJournal(p *editor.Pane) {
 	if !journalEnabled() || p == nil || p.File.Path == "" {
 		return
@@ -434,6 +437,10 @@ func (a *App) closeJournal(p *editor.Pane) {
 		return
 	}
 	if err := t.w.Close(); err != nil {
+		a.status = "journal: " + err.Error()
+	}
+	logPath := filepath.Join(a.journalDir(), journalName(p.File.Path))
+	if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
 		a.status = "journal: " + err.Error()
 	}
 	delete(a.journals, p.File.Path)
@@ -493,7 +500,20 @@ func (a *App) restoreLog(logPath string) {
 	}
 	a.collectAuthors(l)
 	p := a.paneFor(base.Path)
+	mark, wrote := lastWritten(l)
 	if p == nil {
+		// The session did not open this path, so the log is either crash
+		// recovery for a tab that never reached the session, or what an
+		// explicit close (or a discard) left behind. The latter replays to
+		// the bytes already on disk and holds no decision, so there is
+		// nothing to restore: remove it and do not open a tab, or a tab the
+		// user closed comes back. A log with unsaved work -- ops past the
+		// written baseline, or a pending decision -- still reopens below.
+		sess := buildSession(l)
+		if sess != nil && a.logIsCleanOnDisk(base, sess, mark, wrote) {
+			_ = os.Remove(logPath)
+			return
+		}
 		opened, err := a.Tabs.Open(base.Path)
 		if err != nil {
 			return // deleted, binary or too large: nothing to attach the log to
@@ -504,7 +524,6 @@ func (a *App) restoreLog(logPath string) {
 	store := p.File.Session().Store()
 	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
 	disk := hashBytes(orig)
-	mark, wrote := lastWritten(l)
 	// The disk is ours if it matches the origin the log started from, or the
 	// bytes the last save wrote: history is kept, so a save does not truncate
 	// the log, and the disk after a save is a log to restore, not one to skip.
@@ -540,6 +559,31 @@ func (a *App) restoreLog(logPath string) {
 		p.Cursors.Set(p.File.Len(), p.File.Len())
 	}
 	a.TouchSession()
+}
+
+// logIsCleanOnDisk reports whether a log's replay is already the bytes on
+// disk and holds nothing to decide: the leftover an explicit close (or a
+// discard) leaves, not work to recover. sess is the replay; mark and wrote are
+// the last write it recorded. A pending decision, or an op past the written
+// baseline -- the origin when the log never saved -- is unsaved work and reads
+// dirty. The disk is read the way a tab would read it, so an external edit
+// still falls through to the mismatch handling rather than being mistaken for
+// clean.
+func (a *App) logIsCleanOnDisk(base journal.Base, sess *piecetable.Session, mark journal.Written, wrote bool) bool {
+	if len(sess.Pending()) > 0 {
+		return false
+	}
+	f, err := editor.Open(base.Path, a.tabWidth)
+	if err != nil {
+		return false
+	}
+	store := f.Session().Store()
+	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
+	disk := hashBytes(orig)
+	if wrote && disk == mark.Hash {
+		return sess.Version() <= piecetable.Version(mark.Version)
+	}
+	return disk == base.Hash && sess.Version() == 0
 }
 
 // paneFor returns the open tab for a path, if any.

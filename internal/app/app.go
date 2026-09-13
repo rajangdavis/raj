@@ -160,9 +160,12 @@ type App struct {
 	NoRestore bool
 
 	// sessionDirty and sessionSaved debounce writing the session file, so a
-	// crash loses seconds rather than the whole session.
+	// crash loses seconds rather than the whole session. sessionTabs is the
+	// last-written tab-set fingerprint, so opening or closing a tab is flushed
+	// on the next tick instead of waiting out the interval.
 	sessionDirty bool
 	sessionSaved time.Time
+	sessionTabs  string
 
 	// journals is the op-log tap per buffer path, nil until the first dirty
 	// tick opens one. journalSaved debounces the append the same way
@@ -179,6 +182,12 @@ type App struct {
 	// tabWidth is the indent width the tab set was built with, kept so a log
 	// restore can build a File with the same geometry as one read from disk.
 	tabWidth int
+
+	// headless holds buffers that are loaded and addressable over the socket
+	// but have no tab: document state without presentation state, so an agent
+	// inspecting twenty files does not put twenty tabs on screen. Most recently
+	// used first, bounded by headlessMax; see headless.go.
+	headless []*editor.Pane
 
 	// control is the Unix-socket server, nil unless --control was given. Its
 	// requests are executed in drainControl, on this thread.
@@ -285,6 +294,14 @@ func (a *App) syncTheme() {
 // statement about what the file is.
 func (a *App) OpenFile(path string) {
 	if path == "" {
+		return
+	}
+	// A headless buffer is already loaded. Showing it is announcing, not
+	// reading it a second time: without this, a file an agent inspected and the
+	// user then clicked would exist twice, the tab and the hidden pane free to
+	// drift.
+	if p, ok := a.findHeadless(path); ok {
+		a.announce(p)
 		return
 	}
 	p, err := a.Tabs.Open(path)
@@ -653,6 +670,10 @@ func (a *App) Run() error {
 	// process finds a path that answers nothing.
 	defer a.StopControl()
 	defer a.closeJournals()
+	// A quit inside the debounce window would leave the last tab set on disk.
+	// Flush once more while the model is whole, before the socket and the
+	// journals go away.
+	defer func() { _ = a.SaveSession() }()
 
 	a.Draw()
 	for e := range a.host.Events() {
@@ -699,6 +720,10 @@ func (a *App) Handle(e ui.Event) {
 		// A drag held outside the pane scrolls from here, because the pointer
 		// is not moving and so there is no event to hang it on.
 		a.autoScrollStep()
+		// A burst of inspection can leave the headless registry over its cap;
+		// dropping the clean ones here keeps the bound on the idle path as
+		// well as on load.
+		a.evictHeadless()
 		// Idle work only: retokenising costs tens of milliseconds and must
 		// never sit on the keystroke path.
 		a.refreshSyntax()

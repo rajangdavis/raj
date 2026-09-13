@@ -81,8 +81,8 @@ active, the cursor and scroll in each, wrap, the expanded directories in the
 sidebar, and which pane had focus. It lands you back there instead of in the
 explorer.
 
-State goes in `.git/raj/session.json`, or `.raj/session.json` without a
-repository — scratch state nothing commits. It is written while raj runs, from
+State goes in `.raj/session.json` — scratch state nothing commits, and no
+repository is required. It is written while raj runs, from
 the idle tick and debounced to a few seconds, so a crash costs seconds rather
 than the session. `--no-restore` turns both saving and restoring off.
 

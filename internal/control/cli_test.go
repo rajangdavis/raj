@@ -52,6 +52,9 @@ type fakeEditor struct {
 	// truncated is the per-file truncation the fake search reports, so the CLI
 	// can be tested on a walk that cut a file down without a real one.
 	truncated []TruncatedFile
+	// headless names docs the fake reports as loaded with no tab, so the CLI
+	// buffers output can be tested on the field that says so.
+	headless map[string]bool
 	// groups is the canned change-set list `groups` returns; decided records
 	// every id accept/reject was called with, in order; decideErr makes a named
 	// group fail, standing in for a reject a later edit wedged.
@@ -159,7 +162,7 @@ func (f *fakeEditor) run(req Request) Response {
 		var bufs []Buffer
 		for p, text := range f.docs {
 			bufs = append(bufs, Buffer{Path: p, Version: f.vers[p], Bytes: len(text),
-				Lines: strings.Count(text, "\n")})
+				Lines: strings.Count(text, "\n"), Headless: f.headless[p]})
 		}
 		return Response{OK: true, Root: "/w", Buffers: bufs}
 	case "text":
@@ -323,6 +326,27 @@ func TestCLIReads(t *testing.T) {
 	out, _, code = run(t, "read", "/w/a.go")
 	if code != 0 || out != "package a\n\nfunc f() {}\n" {
 		t.Errorf("read = %q, code %d", out, code)
+	}
+}
+
+// A headless buffer is loaded and addressable but has no tab. buffers marks it
+// in the plain listing and carries headless in the JSON, so a driver can tell
+// it from one the user can see.
+func TestCLIBuffersReportsHeadless(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	ed.headless = map[string]bool{"/w/a.go": true}
+
+	out, errs, code := run(t, "buffers")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "headless") {
+		t.Errorf("buffers output %q does not mark a headless buffer", out)
+	}
+
+	out, _, code = run(t, "buffers", "-json")
+	if code != 0 || !strings.Contains(out, "\"headless\": true") {
+		t.Errorf("json buffers = %q, code %d", out, code)
 	}
 }
 
