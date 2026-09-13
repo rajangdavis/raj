@@ -7,6 +7,36 @@ description: Standing workflow for a Raj agent improving the raj editor itself. 
 
 You are improving the editor you are driving. Read this first, every session.
 
+## Working agreement — stability first, then features
+
+Read this before the workflow below; it is the part that keeps the editor
+working while it changes. The rule: **do not break existing behaviour to
+satisfy a spec.** The spec and BENCHMARKS.md explain how the code is meant to
+behave; they are not the goal.
+
+1. **Capture behaviour before changing it.** Name what must not change, and
+   lean on an end-to-end behaviour set (open/edit/save, session restore,
+   accept/reject, the control verbs) staying green — not only unit tests. A
+   behaviour change with no way to see that it happened is not ready.
+2. **Land inert, then wire.** A refactor goes in default-off on the identity
+   path, verified behaviour-identical, before a small change turns it on. One
+   switch per feature.
+3. **One owner per seam; parallel only when the files are independent.** An
+   interface has a single owner for both sides. Hand-frozen APIs across
+   concurrent agents drift at the seam, and the drift shows up only after the
+   work is done.
+4. **Verify behaviour live.** For anything that changes behaviour: rebuild,
+   restart, exercise the golden path over the socket, and state the expected
+   behaviour *before* looking. Never trust a client that may be older than the
+   editor — the container image has to match the build.
+5. **One accepted wave, one commit.** Small commits make `git revert` the
+   rollback.
+6. **Say the blast radius in plain language.** Before the user accepts: what it
+   does, what it must not change, how we will know, what to watch.
+7. **Keep the docs a readable model of the code.** INVESTIGATIONS.md and
+   BENCHMARKS.md are how a person keeps up with AI-generated code; update them
+   when behaviour or structure changes.
+
 ## 0. Standing workflow: plan, review, then focused agents
 
 This section is the prompt the user autoloads; executing it is what
@@ -150,9 +180,11 @@ reach it. A cheap walk and a session spent re-reading are the difference.
    tree-wide, unsaved-inclusive index. Scope with `-include 'relative/path.go'`
    or an extension glob; `*` does not cross `/`, so `*_test.go` matches nothing
    nested — use `*.go` or a full relative path.
-3. **Open only a path search returned.** `read` refuses a closed file, so
-   opening is required — but a nonexistent path opens *empty and silently*.
-   Never `open` a path typed from memory.
+3. **Read by path; `open` only to show.** `read <path>` loads a closed file
+   headlessly — no tab — so opening first is not required and only litters the
+   tab bar. `open` is the verb that shows a file to the user; use it when you
+   mean to. A nonexistent path under `open` opens *empty and silently*, so never
+   `open` a path typed from memory; `read` of a missing path is an error.
 4. **Read ranges, not files.** `read <path> -lines A,B` around the hit; widen
    only to the enclosing function plus one either side (the seam).
 5. **Own the whole block before editing.** Find its first and last line and

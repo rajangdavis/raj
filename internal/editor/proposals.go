@@ -72,6 +72,12 @@ func (p *Pane) PendingMarks() []PendingMark {
 	return out
 }
 
+// DispLine projects the mark first line onto the display: the row the gutter
+// draws its mark at, or -1 when a fold hides the line. The mark itself stays
+// in session coordinates; this is the one conversion a display-line consumer
+// needs, so no two consumers re-derive it.
+func (m PendingMark) DispLine(p *Pane) int { return p.DispOfDocLine(m.Line) }
+
 // CoversLine reports whether the hunk touches the given line. A deletion's
 // zero-width gap counts as covering the line it sits on, so a change that
 // removes an entire line is still decided from the line that held it.

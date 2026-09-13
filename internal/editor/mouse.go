@@ -31,7 +31,7 @@ func (p *Pane) OffsetAt(x, y int) int {
 		y = 0
 	}
 	line := p.Viewport.Top + y
-	if last := p.File.Lines() - 1; line > last {
+	if last := p.displayLines() - 1; line > last {
 		line = last
 	}
 	if line < 0 {
@@ -41,9 +41,7 @@ func (p *Pane) OffsetAt(x, y int) int {
 	if col < 0 {
 		col = 0
 	}
-	text := p.File.Line(line)
-	return p.File.LineStart(line) + p.File.Cols.OffsetOfHints(text, col, p.File.HintCols(line))
-
+	return p.docAt(line, col)
 }
 
 // offsetAtWrapped walks visual rows the way placeCaretWrapped does, counting
@@ -58,7 +56,7 @@ func (p *Pane) offsetAtWrapped(x, y int) int {
 	// Start above the viewport's first line by however many of its rows are
 	// scrolled off, which is what TopRow records.
 	row := -p.Viewport.TopRow
-	lines := p.File.Lines()
+	lines := p.displayLines()
 	for line := p.Viewport.Top; line < lines; line++ {
 		n := p.RowsInLine(line)
 		if y < row+n {
@@ -73,8 +71,16 @@ func (p *Pane) offsetAtWrapped(x, y int) int {
 	return p.File.Len()
 }
 
-// offsetInRow resolves a column within one visual row of a wrapped line.
+// offsetInRow resolves a column within one visual row of a wrapped display
+// line, the inverse of placeCaretWrapped. A fold or composition-only row has
+// no session bytes to measure a column against, so it defers to docAt, which
+// yields the row session cursor rather than a byte inside text it does not
+// draw.
 func (p *Pane) offsetInRow(line, within, x int) int {
+	sl, dlo, _, _ := p.line(line)
+	if sl < 0 {
+		return p.docAt(line, x)
+	}
 	breaks, text := p.lineBreaks(nil, line)
 	start := 0
 	if within > 0 && within-1 < len(breaks) {
@@ -94,8 +100,8 @@ func (p *Pane) offsetInRow(line, within, x int) int {
 	// A hinted line fits one visual row, so start is zero and its hints apply
 	// to the whole segment; resolving the column through them clamps a click
 	// inside a hint to the hint anchor instead of a byte that is not there.
-	if hs := p.File.HintCols(line); len(hs) > 0 && start == 0 {
-		return p.File.LineStart(line) + p.File.Cols.OffsetOfHints(segment, x, hs)
+	if hs := p.File.HintCols(sl); len(hs) > 0 && start == 0 && dlo == 0 {
+		return p.File.LineStart(sl) + p.File.Cols.OffsetOfHints(segment, x, hs)
 	}
 	// The column is measured from the start of the row, but tab stops are
 	// measured from the start of the line — so the segment is expanded in its
@@ -104,7 +110,7 @@ func (p *Pane) offsetInRow(line, within, x int) int {
 	// is resolved within the segment and the residual accepted: a click inside
 	// a tab that straddles a wrap point resolves to that tab, which is the
 	// same answer the caret would give.
-	return p.File.LineStart(line) + start + p.File.Cols.OffsetOf(segment, x)
+	return p.File.LineStart(sl) + dlo + start + p.File.Cols.OffsetOf(segment, x)
 }
 
 // ClickAt places the cursor where the pointer is.

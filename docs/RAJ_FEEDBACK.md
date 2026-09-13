@@ -167,3 +167,41 @@ items and COMPLETED.md. One friction item is not tracked anywhere:
 - **`apply`/`edit` report a size, not the resulting line.** "goto each
   hunk" costs a second `search`; a line offset in the reply would make it
   mechanical.
+
+## File lifecycle verbs — create, delete, rename (agent feedback, 2026-09-13)
+
+An agent adding modules (`create-store.js`, `hex.js`, `register.js`) or removing
+dead files had to hand the work back to the host: `raj ctl` has no create,
+delete or rename verb. Creation is partly covered — `open <path> -create` makes
+a buffer for a path that is not on disk, and a save writes the file — but the
+verb is not discoverable as "create", the container client was built before the
+flag existed, and nothing creates a missing parent directory, so a module in a
+new directory still fails at save. Delete and rename do not exist at all.
+
+Desired verbs, with the open decisions:
+
+- **`create [path]`** (or keep `open -create` as the one spelling). Empty buffer
+  → apply → save writes the file. Decision: parent directories — `MkdirAll` on
+  save for an explicitly created buffer, or a separate `mkdir`?
+- **`delete [path]`.** Tear the buffer down (`closeDoc`, drop the tab/headless
+  entry, remove the journal log, `TouchSession`), then remove the file. Refuse a
+  dirty buffer or one holding proposals (decide the work first), a directory,
+  and anything outside the workspace. Decision: unlink outright, or move to
+  `.raj/trash/` so it is recoverable without a VCS?
+- **`rename [path] NEW`** (or `move`). Both paths in the workspace; refuse an
+  existing destination and a dirty buffer. Rename on disk, then update
+  `File.Path`, close the old journal log (the log name is a hash of the path)
+  and the old language-server doc, and update the session. Import edits are
+  separate text proposals, not part of the rename.
+
+One design question behind all three: are these immediate verbs like `open` and
+`close`, or should a file operation surface as a decision in the review flow the
+way text does? The dirty/proposal refusal keeps immediate verbs
+review-consistent, and a file operation is not a text span; but a deletion is
+irreversible in a way a rejected hunk is not.
+
+Context confirmed while investigating: `open <path> -create` is implemented
+server-side (`Request.Create`, `hCreate = 0x12`, `Guard.Open`,
+`host.Open(path, create)`); the agent that saw "no create verb" was driving a
+container client built before that flag, so rebuilding the container image is
+part of any fix.

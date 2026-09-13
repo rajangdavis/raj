@@ -45,6 +45,12 @@ type Pane struct {
 
 	wrapBuf []int // reused across lines and frames by the renderer
 	focused bool
+
+	// disp is the display projection: the edit composition with hidden runs
+	// collapsed to fold rows. It is derived, not a second document, and nil
+	// means identity — no decisions, so display coordinates are the raw
+	// session coordinates. SetDisplay rebuilds it; edits never touch it.
+	disp *view.Projection
 	// diskStale records the file changed on disk since raj read or wrote it,
 	// set by the app idle tick and cleared by save or reload.
 	diskStale bool
@@ -134,9 +140,204 @@ func NewPane(f *File) *Pane {
 	}
 }
 
+// SetDisplay derives the pane display projection from a composition policy.
+//
+// It is the one place the pane reaches for Session.Project: Segments describes
+// how the raw session view and the policy composition line up, including the
+// runs the composition hides and the runs it restores. view.Build turns that
+// into the display map the renderer and every coordinate conversion read. No
+// decisions yields no segments and Build returns nil, so the projection is the
+// identity of the session — disp is derived, never a second document. The
+// application calls this once per frame; tests call it directly.
+func (p *Pane) SetDisplay(policy piecetable.Policy) {
+	comp := p.File.Session().Project(policy)
+	segs := comp.Segments()
+	var out []view.Seg
+	if len(segs) > 0 {
+		out = make([]view.Seg, len(segs))
+		for i, s := range segs {
+			out[i] = view.Seg{
+				Doc:         s.Doc,
+				Disp:        s.Disp,
+				Len:         s.Len,
+				DLen:        s.DLen,
+				Fold:        s.Hide,
+				Group:       s.Group,
+				HiddenLines: s.HiddenLines,
+			}
+		}
+	}
+	p.disp = view.Build(comp.Text(), out)
+}
+
+// displayLines is the number of display rows the projection yields, or the
+// document line count when there is no projection.
+func (p *Pane) displayLines() int {
+	if p.disp != nil {
+		return p.disp.Lines()
+	}
+	return p.File.Lines()
+}
+
+// line describes display row i, the unit the renderer and every coordinate
+// conversion work in. It reports the session line the row draws, the byte
+// range [lo,hi) of that line shown on the row, and whether the row is a fold
+// standing in for a hidden run.
+//
+// Three kinds of row exist:
+//
+//   - session-backed: sessionLine >= 0, the row draws that session line bytes
+//     [lo,hi);
+//   - fold: sessionLine < 0 and fold true, a marker for a hidden session run;
+//   - composition-only: sessionLine < 0 and fold false, bytes that exist only
+//     in the composition (a restored deletion), with no session line behind
+//     them.
+//
+// With no projection every row is session line i in full.
+func (p *Pane) line(i int) (sessionLine, lo, hi int, fold bool) {
+	if p.disp == nil {
+		if i < 0 || i >= p.File.Lines() {
+			return i, 0, 0, false
+		}
+		return i, 0, len(p.File.Line(i)), false
+	}
+	if i < 0 || i >= p.disp.Lines() {
+		return i, 0, 0, false
+	}
+	d := p.disp.At(i)
+	if d.SessionLine < 0 {
+		return -1, 0, 0, d.Fold != 0
+	}
+	return d.SessionLine, d.Lo, d.Hi, false
+}
+
+// Fold reports the hidden run a fold display row stands for: its change set and
+// the number of session bytes it hides. ok is false on any row that is not a
+// fold, and always false with no projection.
+func (p *Pane) Fold(i int) (group uint64, hiddenBytes int, ok bool) {
+	if p.disp == nil {
+		return 0, 0, false
+	}
+	return p.disp.Fold(i)
+}
+
+// DispOfDocLine maps a session line to the first display row that shows it, or
+// -1 when a fold hides the line entirely. The gutter and the review list keep
+// their marks in session coordinates and use this to place them on the
+// projected screen.
+func (p *Pane) DispOfDocLine(sessionLine int) int {
+	if sessionLine < 0 || sessionLine >= p.File.Lines() {
+		return -1
+	}
+	if p.disp == nil {
+		return sessionLine
+	}
+	return p.disp.DispOfDocLine(sessionLine)
+}
+
+// dispLineOf maps a byte offset to the display row that draws it. With no
+// projection it is the document line; with one, DispOfDoc resolves a mid-line
+// fold to the exact sub-row rather than the session line first row.
+func (p *Pane) dispLineOf(off int) int {
+	if p.disp == nil {
+		return p.File.LineOf(off)
+	}
+	if line, _ := p.disp.DispOfDoc(off); line >= 0 && line < p.disp.Lines() {
+		return line
+	}
+	if line := p.disp.DispOfDocLine(p.File.LineOf(off)); line >= 0 && line < p.disp.Lines() {
+		return line
+	}
+	return 0
+}
+
+// dispPos maps a document offset to a display row and the display column
+// within that row, for the unwrapped caret and vertical motion. A fold or
+// composition-only row answers column zero: neither draws a session byte the
+// caret could sit on.
+func (p *Pane) dispPos(off int) (line, col int) {
+	if p.disp == nil {
+		return p.File.LineCol(off)
+	}
+	line = p.dispLineOf(off)
+	sl, lo, _, _ := p.line(line)
+	if sl < 0 {
+		return line, 0
+	}
+	full := p.File.Line(sl)
+	within := clamp(off-p.File.LineStart(sl), 0, len(full))
+	hints := p.File.HintCols(sl)
+	col = p.File.Cols.ColOfHints(full, within, hints) - p.File.Cols.ColOfHints(full, lo, hints)
+	return line, col
+}
+
+// docAt maps a display row and column back to a document offset. A
+// session-backed row converts through the column machinery, so it stays the
+// inverse of dispPos; a fold or composition-only row defers to the map, which
+// yields the run session cursor so a click can never land inside text the row
+// does not draw. With no projection it is File.OffsetAt exactly.
+func (p *Pane) docAt(line, col int) int {
+	if p.disp == nil {
+		return p.File.OffsetAt(line, col)
+	}
+	if line < 0 {
+		return 0
+	}
+	if line >= p.disp.Lines() {
+		return p.File.Len()
+	}
+	sl, lo, hi, _ := p.line(line)
+	if sl < 0 {
+		return p.disp.DocAt(line, col)
+	}
+	text := p.File.Line(sl)[lo:hi]
+	return p.File.LineStart(sl) + lo + p.File.Cols.OffsetOf(text, col)
+}
+
+// snapOut moves off out of a hidden run to the nearest edge, so a motion that
+// would land inside text the display does not draw stops beside it instead.
+// dir < 0 takes the leading edge, dir > 0 the trailing one, and 0 the nearer.
+// A composition-only row has no session bytes to be inside; it snaps to the
+// row session cursor.
+func (p *Pane) snapOut(off, dir int) int {
+	if p.disp == nil {
+		return off
+	}
+	line := p.dispLineOf(off)
+	sl, _, _, fold := p.line(line)
+	if sl >= 0 {
+		return off
+	}
+	start := p.docAt(line, 0)
+	if !fold {
+		return start // composition-only: its session cursor
+	}
+	_, hidden, ok := p.Fold(line)
+	if !ok || hidden <= 0 {
+		return start
+	}
+	end := start + hidden
+	if off <= start {
+		return start
+	}
+	if off >= end {
+		return end
+	}
+	switch {
+	case dir < 0:
+		return start
+	case dir > 0:
+		return end
+	case off-start <= end-off:
+		return start
+	default:
+		return end
+	}
+}
+
 // Resize sets the visible area in cells.
 func (p *Pane) Resize(cols, rows int) {
-	p.Viewport.Resize(cols, rows, p.File.Lines())
+	p.Viewport.Resize(cols, rows, p.displayLines())
 	if p.Wrap {
 		// A width change alters how many rows the top line occupies. Clamping
 		// it is the whole cost of a resize under this design: there is no
@@ -151,8 +352,8 @@ func (p *Pane) FollowCursor() {
 		p.followCursorWrapped()
 		return
 	}
-	line, col := p.File.LineCol(p.Cursors.Primary().Head)
-	p.Viewport.ScrollTo(line, col, p.File.Lines())
+	line, col := p.dispPos(p.Cursors.Primary().Head)
+	p.Viewport.ScrollTo(line, col, p.displayLines())
 }
 
 // InsertText types at every cursor, replacing selections.

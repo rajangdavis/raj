@@ -725,6 +725,7 @@ func FuzzProjectAgainstOracle(f *testing.F) {
 				if orc.overlap {
 					continue // the contract does not define the composition here
 				}
+				checkSegments(t, s, p)
 				if got := proj.Text(); got != orc.text {
 					t.Fatalf("%v: composition %q, oracle %q\nlog=%v", p, got, orc.text, log)
 				}
@@ -848,4 +849,208 @@ func TestStateRunsIndexesSeveralOrigins(t *testing.T) {
 	if got := s.stateRuns(pieces, origins); !slices.Equal(got, want) {
 		t.Fatalf("stateRuns = %+v, want %+v", got, want)
 	}
+}
+
+// --- segments ---------------------------------------------------------------
+
+// checkSegments asserts the alignment contract Segments promises: the runs start
+// at zero, advance the session and composition cursors in step, and together
+// cover both texts. A Hide run consumes session bytes and produces none; a
+// Restore run produces composition bytes and consumes none; a kept run does both
+// and its two texts agree.
+func checkSegments(t *testing.T, s *Session, p Policy) {
+	t.Helper()
+	d := s.Project(p)
+	sessionText := s.Buffer().Slice(0, s.Buffer().Len())
+	comp := d.Text()
+	segs := d.Segments()
+	if !s.HasDecisions() {
+		if segs != nil {
+			t.Fatalf("%v: Segments = %v, want nil with no decisions", p, segs)
+		}
+		return
+	}
+	if segs == nil {
+		if len(comp) != 0 || len(sessionText) != 0 {
+			t.Fatalf("%v: Segments nil with decisions and a non-empty text", p)
+		}
+		return
+	}
+	disp, doc := 0, 0
+	for i, g := range segs {
+		if g.Disp != disp {
+			t.Fatalf("%v: segment %d Disp %d, want %d", p, i, g.Disp, disp)
+		}
+		if g.Doc != doc {
+			t.Fatalf("%v: segment %d Doc %d, want %d", p, i, g.Doc, doc)
+		}
+		switch {
+		case g.Hide:
+			if g.Len <= 0 || g.DLen != 0 {
+				t.Fatalf("%v: segment %d Hide with Len %d DLen %d", p, i, g.Len, g.DLen)
+			}
+			doc += g.Len
+		case g.Restore:
+			if g.Len != 0 || g.DLen <= 0 {
+				t.Fatalf("%v: segment %d Restore with Len %d DLen %d", p, i, g.Len, g.DLen)
+			}
+			if g.Disp+g.DLen > len(comp) {
+				t.Fatalf("%v: segment %d Restore past the composition", p, i)
+			}
+			disp += g.DLen
+		default:
+			if g.Len <= 0 || g.Len != g.DLen {
+				t.Fatalf("%v: segment %d kept with Len %d DLen %d", p, i, g.Len, g.DLen)
+			}
+			if g.Doc+g.Len > len(sessionText) || g.Disp+g.DLen > len(comp) {
+				t.Fatalf("%v: segment %d runs past an end", p, i)
+			}
+			if comp[g.Disp:g.Disp+g.DLen] != sessionText[g.Doc:g.Doc+g.Len] {
+				t.Fatalf("%v: segment %d kept bytes disagree: %q vs %q",
+					p, i, comp[g.Disp:g.Disp+g.DLen], sessionText[g.Doc:g.Doc+g.Len])
+			}
+			disp += g.DLen
+			doc += g.Len
+		}
+	}
+	if disp != len(comp) {
+		t.Fatalf("%v: segments cover %d composition bytes, Text is %d", p, disp, len(comp))
+	}
+	if doc != len(sessionText) {
+		t.Fatalf("%v: segments cover %d session bytes, buffer is %d", p, doc, len(sessionText))
+	}
+}
+
+// An excluded insertion becomes one Hide run between the bytes that survive it.
+func TestProjectSegmentsHideInsertion(t *testing.T) {
+	s := NewSession(NewNaive("AB"))
+	s.Begin()
+	s.Insert(Agent, 1, "xy")
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	segs := s.Project(AcceptedOnly).Segments()
+	want := []ProjSeg{
+		{Doc: 0, Disp: 0, Len: 1, DLen: 1, Group: 0, State: Accepted},
+		{Doc: 1, Disp: 1, Len: 2, DLen: 0, Group: id, State: Proposed, Hide: true},
+		{Doc: 3, Disp: 1, Len: 1, DLen: 1, Group: 0, State: Accepted},
+	}
+	if !slices.Equal(segs, want) {
+		t.Fatalf("segments = %+v, want %+v", segs, want)
+	}
+	if n := countHide(segs); n != 1 {
+		t.Fatalf("fold runs = %d, want 1", n)
+	}
+	checkSegments(t, s, AcceptedOnly)
+}
+
+// An excluded deletion becomes a Restore run, session-less bytes put back where
+// the deletion was.
+func TestProjectSegmentsRestoreDeletion(t *testing.T) {
+	s := NewSession(NewNaive("ABC"))
+	s.Begin()
+	s.Delete(User, 1, 1) // "B"
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	segs := s.Project(AcceptedOnly).Segments()
+	want := []ProjSeg{
+		{Doc: 0, Disp: 0, Len: 1, DLen: 1, Group: 0, State: Accepted},
+		{Doc: 1, Disp: 1, Len: 0, DLen: 1, Group: id, State: Proposed, Restore: true},
+		{Doc: 1, Disp: 2, Len: 1, DLen: 1, Group: 0, State: Accepted},
+	}
+	if !slices.Equal(segs, want) {
+		t.Fatalf("segments = %+v, want %+v", segs, want)
+	}
+	if got := s.Project(AcceptedOnly).Text(); got != "ABC" {
+		t.Fatalf("composition %q, want %q", got, "ABC")
+	}
+	checkSegments(t, s, AcceptedOnly)
+}
+
+// Every policy's segments obey the alignment contract, on a journal with an
+// excluded insertion, an included one and a rejected one.
+func TestProjectSegmentsCoverTheComposition(t *testing.T) {
+	s := NewSession(NewNaive("AB"))
+	s.Begin()
+	s.Insert(Agent, 1, "xy")
+	s.End()
+	s.MarkGroup(s.LastGroup(), Proposed)
+
+	s.Begin()
+	s.Insert(User, 4, "Z")
+	s.End()
+
+	s.Begin()
+	s.Insert(Agent, 0, "W")
+	s.End()
+	s.MarkGroup(s.LastGroup(), Rejected)
+
+	for _, p := range []Policy{AcceptedOnly, AcceptedAndProposed, Annotated} {
+		checkSegments(t, s, p)
+	}
+	if n := countHide(s.Project(AcceptedAndProposed).Segments()); n != 1 {
+		t.Fatalf("edit view fold runs = %d, want 1 (only the rejected insertion)", n)
+	}
+	if n := countHide(s.Project(AcceptedOnly).Segments()); n != 2 {
+		t.Fatalf("agreed view fold runs = %d, want 2 (proposed and rejected)", n)
+	}
+}
+
+// With no decisions the projection is the identity, so Segments is nil, exactly
+// as States is.
+func TestProjectSegmentsNilWithoutDecisions(t *testing.T) {
+	s := NewSession(NewNaive("AB"))
+	s.Begin()
+	s.Insert(Agent, 1, "xy")
+	s.End()
+	for _, p := range []Policy{AcceptedOnly, AcceptedAndProposed, Annotated} {
+		if got := s.Project(p).Segments(); got != nil {
+			t.Fatalf("%v: Segments = %v, want nil with no decisions", p, got)
+		}
+	}
+}
+
+// countHide is the number of fold runs a segment list carries.
+func countHide(segs []ProjSeg) (n int) {
+	for _, g := range segs {
+		if g.Hide {
+			n++
+		}
+	}
+	return n
+}
+
+// HiddenLines counts the newlines in a hidden run's session bytes, so a display
+// projection can number the session lines the fold spans without carrying the
+// hidden text.
+func TestProjectSegmentsHiddenLines(t *testing.T) {
+	s := NewSession(NewNaive("L0\nL4\n"))
+	s.Begin()
+	s.Insert(Agent, 3, "L1\nL2\nL3\n")
+	s.End()
+	s.MarkGroup(s.LastGroup(), Rejected)
+
+	segs := s.Project(AcceptedOnly).Segments()
+	var hide *ProjSeg
+	for i := range segs {
+		g := &segs[i]
+		if g.Hide {
+			if hide != nil {
+				t.Fatalf("more than one hidden run: %+v", segs)
+			}
+			hide = g
+		} else if g.HiddenLines != 0 {
+			t.Fatalf("non-hide segment %+v carries HiddenLines", g)
+		}
+	}
+	if hide == nil {
+		t.Fatalf("no hidden run in %+v", segs)
+	}
+	if hide.Len != 9 || hide.HiddenLines != 3 {
+		t.Fatalf("hidden run = %+v, want Len 9 with 3 newlines", hide)
+	}
+	checkSegments(t, s, AcceptedOnly)
 }

@@ -1,6 +1,7 @@
 package editor
 
 import (
+	"fmt"
 	"strconv"
 
 	"raj/internal/piecetable"
@@ -76,7 +77,14 @@ func DefaultTheme() Theme {
 
 // GutterWidth is the space reserved for line numbers, sized to the document.
 func (p *Pane) GutterWidth() int {
-	return len(strconv.Itoa(p.File.Lines())) + 2
+	// The number drawn is a session line number, so the width has to fit the
+	// document even when folds make the display shorter than it; a split line
+	// can also make the display longer, so take the larger of the two.
+	n := p.File.Lines()
+	if d := p.displayLines(); d > n {
+		n = d
+	}
+	return len(strconv.Itoa(n)) + 2
 }
 
 // Render draws the pane into a rectangle of the screen.
@@ -118,21 +126,43 @@ func (p *Pane) RenderFocused(s *ui.Screen, x, y, w, h int, th Theme, focused boo
 	// runs once per frame, and the rows below tint from the result.
 	p.pending = p.PendingMarks()
 
-	// Rows, not lines. When wrapping is off every line is one row and this
-	// degenerates to the old loop; when it is on, the first line starts above
-	// the pane by TopRow so a tall paragraph can be entered partway.
+	// Rows, not lines. When wrapping is off every display row is one row and
+	// this degenerates to the old loop; when it is on, the first row starts
+	// above the pane by TopRow so a tall paragraph can be entered partway.
+	//
+	// Three kinds of display row: a session-backed row draws the session line
+	// slice, syntax, hints and tints and all; a fold row draws a dim marker for
+	// bytes the view hides; a composition-only row draws composition text the
+	// session no longer holds, plainly and with a blank gutter.
 	row := -p.Viewport.TopRow
-	for line := p.Viewport.Top; line < p.File.Lines() && row < h; line++ {
+	for line := p.Viewport.Top; line < p.displayLines() && row < h; line++ {
+		sessionLine, dlo, _, fold := p.line(line)
+		if sessionLine < 0 {
+			if row >= 0 {
+				// Neither non-session row has a line number of its own, so the
+				// gutter stays blank: numbering a restored run from the session
+				// line at its cursor would repeat the number already drawn for
+				// the surrounding session rows.
+				p.drawGutter(s, x, y+row, gut, sessionLine, curLine, th, false)
+				if fold {
+					p.drawFold(s, x+gut, y+row, textW, line, th)
+				} else {
+					p.drawCompLine(s, x+gut, y+row, textW, line, th)
+				}
+			}
+			row++
+			continue
+		}
 		breaks, text := p.lineBreaks(p.wrapBuf, line)
 		p.wrapBuf = breaks
 		for k := 0; k <= len(breaks) && row < h; k++ {
 			lo, hi := view.RowBounds(breaks, len(text), k)
 			if row >= 0 {
-				// The gutter carries the line number on the first row only;
-				// continuation rows get a blank one, so the numbers still count
-				// lines rather than rows.
-				p.drawGutter(s, x, y+row, gut, line, curLine, th, k == 0)
-				p.drawLine(s, x+gut, y+row, textW, line, lo, hi, sel, heads, brackets, th)
+				// The gutter carries the line number on the first row of the
+				// session line only; continuation rows, wrapped or after a
+				// fold, get a blank one, so the numbers count lines not rows.
+				p.drawGutter(s, x, y+row, gut, sessionLine, curLine, th, k == 0 && dlo == 0)
+				p.drawLine(s, x+gut, y+row, textW, sessionLine, dlo+lo, dlo+hi, sel, heads, brackets, th)
 			}
 			row++
 		}
@@ -149,7 +179,7 @@ func (p *Pane) placeCaret(s *ui.Screen, x, y, w, h int) {
 		p.placeCaretWrapped(s, x, y, w, h)
 		return
 	}
-	line, col := p.File.LineCol(p.Cursors.Primary().Head)
+	line, col := p.dispPos(p.Cursors.Primary().Head)
 	row := line - p.Viewport.Top
 	sx := x + col - p.Viewport.Left
 	if row < 0 || row >= h || sx < x || sx >= x+w {
@@ -180,6 +210,46 @@ func (p *Pane) placeCaretWrapped(s *ui.Screen, x, y, w, h int) {
 		return
 	}
 	s.SetCursor(x+col, y+row)
+}
+
+// drawFold renders a hidden run as one dim row. The marker is deliberately
+// quieter than text: it stands for bytes the edit view does not show, and the
+// label names the state and the size so a reader knows a decision put it
+// there. Edit mode only ever folds rejected runs, so rejected is the fallback.
+func (p *Pane) drawFold(s *ui.Screen, x, y, w, line int, th Theme) {
+	state := "rejected"
+	n := 0
+	if group, hidden, ok := p.Fold(line); ok {
+		n = hidden
+		if group != 0 {
+			state = p.File.Session().GroupState(group).String()
+		}
+	}
+	label := fmt.Sprintf("⋯ %s · %d bytes ⋯", state, n)
+	style := th.Text.Plus(ui.Dim)
+	s.Fill(x, y, w, 1, style)
+	s.SetString(x, y, label, style, w)
+}
+
+// drawCompLine draws a composition-only row: bytes the composition restored
+// that the session no longer holds, so there is no session line to take syntax
+// or hints from. The text is the row own; it is expanded the same way as a
+// session line so horizontal scroll and the caret agree with every other row.
+func (p *Pane) drawCompLine(s *ui.Screen, x, y, w, line int, th Theme) {
+	expanded, _ := p.File.Cols.Expand(p.disp.RowText(line))
+	col := 0
+	for _, r := range expanded {
+		if col < p.Viewport.Left {
+			col++
+			continue
+		}
+		screenX := x + col - p.Viewport.Left
+		if screenX >= x+w {
+			break
+		}
+		s.Set(screenX, y, r, th.Text)
+		col++
+	}
 }
 
 func (p *Pane) drawGutter(s *ui.Screen, x, y, w, line, curLine int, th Theme, number bool) {

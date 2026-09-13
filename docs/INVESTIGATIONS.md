@@ -935,3 +935,54 @@ Environment-gated diagnostics in the full-screen editor go to a **file**, never
 to stdout or stderr. `RAJ_TIMING` names a path; `1` means a documented default
 path under the user state directory; unset or empty means off, and an
 unopenable path means off as well — never a fallback to a terminal stream.
+
+## Direction — reconciled overlays, a git-like store, a queryable code map (2026-09-13, not scheduled)
+
+Directions the user raised, recorded so they are not relitigated from scratch.
+None is scheduled; the working agreement at the top of RECURSIVE_RAJ.md applies.
+
+### Overlap is prevented today; reconciliation is the eventual model
+
+Every agent change is a layer over a base (accepted / proposed / rejected) and
+the lease refuses an edit that intersects another pending or rejected span.
+That *prevents* overlap; it does not *reconcile* it. The eventual goal is agents
+whose edits overlap the same base and are merged afterward, the way branches
+are. Two things to hold when that day comes:
+
+- It is the "visible text is the document" fork: a reconciled overlay changes
+  bytes the other side also changed, so merging or rejecting can move text and
+  the caret with it, and re-placing a reversed span can wedge — the failure the
+  current state-flip design retired.
+- The projection machinery built for F3b-ii (segments, folds, the display map)
+  is the substrate that makes overlaps *visible* rather than surprising; a
+  reconciled model needs it, not a parallel one.
+
+Not today. Recorded so the lease decision reads as deliberate staging.
+
+### A git-like store behind the record interface
+
+The deferred "SQLite session store" is the natural home for a git-shaped
+persistent model, and the record interface exists so the engine can change:
+
+- **blob** = a buffer version (the piece table is already content-addressable);
+- **tree** = path -> blob, i.e. directory tracking, which makes
+  create/delete/rename first-class file operations instead of host actions;
+- **commit / ref** = a session checkpoint or a branch; **fork** = copy a ref,
+  the "op log as the forkable artifact" direction;
+- **git sync** = import/export commits at the boundary, layered on a read-only
+  diff first.
+
+Slice it inert-first: fold the session and journal into the store behind the
+record interface (with a migration), then trees and file-lifecycle, then git
+sync.
+
+### A queryable code map
+
+The LSP client already exists and the socket already exposes
+`lsp hover|definition|references|completion|diagnostics`, so the first step is
+more queries, not a new index: add `workspace/symbol` and repo-wide
+`references` over `raj ctl`, and see whether agents get what they need. A
+persisted index in the store (symbols/refs, populated from LSP plus
+`internal/symbols`/`internal/search`) earns its place only for whole-repo
+analyses, no-language-server queries, or agent planning — not before the
+queries prove insufficient.

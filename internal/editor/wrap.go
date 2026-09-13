@@ -46,24 +46,67 @@ func (p *Pane) TextWidth() int { return p.Viewport.Cols }
 // buf lets the renderer reuse one slice across every line of a frame; a 63-row
 // line cost 1016 bytes and 7 allocations through a fresh append.
 func (p *Pane) lineBreaks(buf []int, line int) ([]int, string) {
-	text := p.File.Line(line)
+	sl, lo, hi, fold := p.line(line)
+	if sl < 0 {
+		// A fold or composition-only row is always a single row: a fold has no
+		// text, and a composition-only row carries the composition text that
+		// RowsInLine deliberately keeps out of the wrap machinery.
+		if fold || p.disp == nil {
+			return nil, ""
+		}
+		return nil, p.disp.RowText(line)
+	}
+	text := p.File.Line(sl)[lo:hi]
 	if !p.Wrap {
 		return nil, text
 	}
 	return p.File.Cols.AppendWrap(buf[:0], text, p.textWidth(), WrapPolicy), text
 }
 
-// RowsInLine is the visual row count of a line: always one when wrapping is off.
+// RowsInLine is the visual row count of a display line: one when wrapping is
+// off, and always one for a fold or composition-only row.
 func (p *Pane) RowsInLine(line int) int {
-	if !p.Wrap {
+	sl, lo, hi, _ := p.line(line)
+	if sl < 0 || !p.Wrap {
 		return 1
 	}
-	return p.File.Cols.WrapRows(p.File.Line(line), p.textWidth(), WrapPolicy)
+	return p.File.Cols.WrapRows(p.File.Line(sl)[lo:hi], p.textWidth(), WrapPolicy)
 }
 
-// cursorRowCol locates an offset as a visual row within its line, plus the
-// display column within that row.
+// cursorRowCol locates an offset as a visual row within its display line, plus
+// the display column within that row. With a projection the row is a display
+// row, and a fold or composition-only row is a single row answering column
+// zero: neither draws a session byte the caret could sit on.
 func (p *Pane) cursorRowCol(off int) (line, row, col int) {
+	if p.disp == nil {
+		return p.cursorRowColDoc(off)
+	}
+	line = p.dispLineOf(off)
+	sl, lo, hi, _ := p.line(line)
+	if sl < 0 {
+		return line, 0, 0
+	}
+	full := p.File.Line(sl)
+	within := clamp(off-p.File.LineStart(sl), 0, len(full))
+	text := full[lo:hi]
+	rel := clamp(within-lo, 0, len(text))
+	if !p.Wrap {
+		hints := p.File.HintCols(sl)
+		col = p.File.Cols.ColOfHints(full, within, hints) - p.File.Cols.ColOfHints(full, lo, hints)
+		return line, 0, col
+	}
+	var buf [64]int
+	breaks := p.File.Cols.AppendWrap(buf[:0], text, p.textWidth(), WrapPolicy)
+	row, col = p.File.Cols.RowOfBreaks(breaks, text, rel)
+	if hs := p.File.HintCols(sl); len(hs) > 0 && row == 0 && lo == 0 {
+		col = p.File.Cols.ColOfHints(full, within, hs)
+	}
+	return line, row, col
+}
+
+// cursorRowColDoc is cursorRowCol against the raw session, for a pane with no
+// projection. It is the identity of the projected path.
+func (p *Pane) cursorRowColDoc(off int) (line, row, col int) {
 	line = p.File.LineOf(off)
 	text := p.File.Line(line)
 	within := off - p.File.LineStart(line)
@@ -90,7 +133,7 @@ func (p *Pane) stepRow(line, row, dir int) (int, int) {
 		if row+1 < p.RowsInLine(line) {
 			return line, row + 1
 		}
-		if line+1 < p.File.Lines() {
+		if line+1 < p.displayLines() {
 			return line + 1, 0
 		}
 		return line, row
@@ -177,7 +220,7 @@ func (p *Pane) clampWrapTop() {
 	if v.Top < 0 {
 		v.Top, v.TopRow = 0, 0
 	}
-	if max := p.File.Lines() - 1; v.Top > max {
+	if max := p.displayLines() - 1; v.Top > max {
 		v.Top = max
 		if v.Top < 0 {
 			v.Top = 0
@@ -228,17 +271,32 @@ func (p *Pane) moveVerticalWrapped(delta int, extend bool) {
 		for i := 0; i < n; i++ {
 			line, row = p.stepRow(line, row, dir)
 		}
-		text := p.File.Line(line)
+		sl, lo, hi, _ := p.line(line)
+		if sl < 0 {
+			// A fold or composition-only row is a single row: land on the
+			// session cursor the map names, never inside text it does not draw.
+			at := p.docAt(line, 0)
+			if at < 0 {
+				at = 0
+			}
+			c.Head = at
+			if !extend {
+				c.Anchor = c.Head
+			}
+			c.Goal = col
+			return c
+		}
+		text := p.File.Line(sl)[lo:hi]
 		var buf [64]int
 		breaks := p.File.Cols.AppendWrap(buf[:0], text, p.textWidth(), WrapPolicy)
 		within := p.File.Cols.OffsetAtRow(breaks, text, row, col)
 		// A hinted line fits one row, so its hints apply to the column being
 		// resolved and OffsetOfHints is the inverse of the caret column; an
 		// un-hinted wrapped line keeps the plain conversion.
-		if hs := p.File.HintCols(line); len(hs) > 0 && row == 0 {
+		if hs := p.File.HintCols(sl); len(hs) > 0 && row == 0 && lo == 0 {
 			within = p.File.Cols.OffsetOfHints(text, col, hs)
 		}
-		c.Head = p.File.LineStart(line) + within
+		c.Head = p.File.LineStart(sl) + lo + within
 		if !extend {
 			c.Anchor = c.Head
 		}

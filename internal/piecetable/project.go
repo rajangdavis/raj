@@ -37,13 +37,65 @@ type StateRun struct {
 	State    GroupState
 }
 
+// ProjSeg is one run of the alignment between the session's own text and a
+// projection of it. Concatenating Text()[Disp:Disp+DLen] over the segments
+// reproduces Text(), and for every segment that is neither Hide nor Restore the
+// composition bytes equal the session bytes at Doc.
+//
+// A run is exactly one of three things:
+//
+//   - kept: Len == DLen > 0, the bytes are in both the session and the
+//     composition and sit at Doc and Disp respectively;
+//   - Hide: an excluded insertion that survived in the session, Len > 0 and
+//     DLen == 0 — the session bytes at Doc are not in the composition, and the
+//     display renders them as one fold row;
+//   - Restore: an excluded deletion put back, Len == 0 and DLen > 0 — the
+//     composition holds bytes at Disp the session no longer holds.
+//
+// The slice is the projection's own and a snapshot: it is built once, when the
+// projection is, and a later decision does not reach back into it.
+type ProjSeg struct {
+	Doc, Disp int        // session-byte and composition-byte starts
+	Len, DLen int        // session bytes consumed, composition bytes produced
+	Group     uint64     // change set that owns the run, 0 for base bytes
+	State     GroupState // that set's state at projection time
+	Hide      bool       // excluded insertion: Len > 0, DLen == 0
+	Restore   bool       // excluded deletion put back: Len == 0, DLen > 0
+	// HiddenLines is the number of '\n' bytes in the hidden run's session bytes
+	// [Doc, Doc+Len). It is nonzero only for a Hide segment, and lets a display
+	// projection number the session lines that follow a fold without carrying
+	// the hidden text itself. Zero for every other segment.
+	HiddenLines int
+}
+
+// projOrigin says where one composition piece came from while Project folds the
+// session into a composition: the session byte it starts at, or -1 once bytes a
+// deletion removed are put back. The group and state are the owning set's, so a
+// run can be labelled without walking the journal again.
+type projOrigin struct {
+	doc   int
+	group uint64
+	state GroupState
+}
+
+// hiddenRun is a session range an excluded insertion contributed and the
+// composition drops: the input to one Hide segment. lines is the number of
+// newlines among those session bytes, read back from the session store.
+type hiddenRun struct {
+	doc, length int
+	group       uint64
+	state       GroupState
+	lines       int
+}
+
 // DerivedProject is one composition of the session under one policy. It is a
 // snapshot: deriving it never mutates the session, and a later decision
 // (MarkGroup) does not reach back into an existing projection. Project always
 // returns a usable value; the zero value is not one.
 type DerivedProject struct {
-	comp   *Naive
-	states []StateRun // nil unless the policy was Annotated
+	comp     *Naive
+	states   []StateRun // nil unless the policy was Annotated
+	segments []ProjSeg  // nil on the no-decisions path, like the short-circuit
 }
 
 // Project derives the composition of the session under p. It starts from the
@@ -69,34 +121,50 @@ func (s *Session) Project(p Policy) DerivedProject {
 	// reach into.
 	comp := &Naive{store: s.Store()}
 	comp.pieces = s.buf.pieceRange(0, s.buf.Len())
-	// origins records which change set inserted which store range, for the
-	// Annotated runs. Annotated excludes nothing, so its composition is the
-	// view and every live edit's ranges are candidates; stateRuns resolves each
-	// surviving piece to the set that wrote it.
+	// origins records which change set inserted which store range. Every policy
+	// needs them now: a kept run reports its owning set and state in the
+	// segments, not only in the annotated view.
 	var origins []insOrigin
-	if p == Annotated {
-		for _, o := range s.journal {
-			if o.Kind != KindEdit || !s.live(o.Seq) {
-				continue
-			}
-			for _, r := range o.Ins {
-				origins = append(origins, insOrigin{
-					buf: r.Buf, start: r.Start, end: r.Start + r.Length, group: o.Group,
-				})
-			}
+	for _, o := range s.journal {
+		if o.Kind != KindEdit || !s.live(o.Seq) {
+			continue
 		}
+		for _, r := range o.Ins {
+			origins = append(origins, insOrigin{
+				buf: r.Buf, start: r.Start, end: r.Start + r.Length, group: o.Group,
+			})
+		}
+	}
+	index := newOriginIndex(origins)
+	// prov runs parallel to comp.pieces and says where each piece came from: the
+	// session byte it starts at, or -1 once a restored deletion puts bytes back
+	// the session no longer holds. It is what lets Segments align the two texts
+	// without copying either.
+	prov := make([]projOrigin, len(comp.pieces))
+	doc := 0
+	for i, piece := range comp.pieces {
+		group, state := uint64(0), Accepted
+		if g, ok := index.ownerOf(piece); ok {
+			group, state = g, s.GroupState(g)
+		}
+		prov[i] = projOrigin{doc: doc, group: group, state: state}
+		doc += piece.Length
 	}
 	// Newest first: each excluded edit is removed from a view that still
 	// contains it, after every later decision has already been undone.
+	var hidden []hiddenRun
 	for i := len(s.journal) - 1; i >= 0; i-- {
 		o := s.journal[i]
 		if o.Kind != KindEdit || !s.live(o.Seq) || s.included(o, p) {
 			continue
 		}
-		at, removed := unapplyRemoveIns(comp, o.Ins)
+		at, removed, kept, dropped := unapplyRemoveIns(comp, prov, o.Ins)
+		prov = kept
+		hidden = append(hidden, dropped...)
 		if removed {
 			if o.DelLen() > 0 {
-				comp.insertRecs(at, append([]PieceRec(nil), o.Del...))
+				prov = insertRecsProv(comp, prov, at, append([]PieceRec(nil), o.Del...),
+					projOrigin{doc: -1, group: o.Group, state: s.GroupState(o.Group)})
 			}
 			continue
 		}
@@ -114,9 +182,11 @@ func (s *Session) Project(p Policy) DerivedProject {
 		} else if n := comp.Len(); mapped > n {
 			mapped = n
 		}
-		comp.insertRecs(mapped, append([]PieceRec(nil), o.Del...))
+		prov = insertRecsProv(comp, prov, mapped, append([]PieceRec(nil), o.Del...),
+			projOrigin{doc: -1, group: o.Group, state: s.GroupState(o.Group)})
 	}
 	d := DerivedProject{comp: comp}
+	d.segments = buildSegments(comp.pieces, prov, hidden)
 	if p == Annotated {
 		d.states = s.stateRuns(comp.pieces, origins)
 	}
@@ -127,27 +197,158 @@ func (s *Session) Project(p Policy) DerivedProject {
 // excluded edit inserted, and reports the document offset of the first piece it
 // dropped, or -1 when none of the edit's inserted bytes survive. Filtering in
 // place is safe because the range reads each element before the write cursor
-// can reach it.
-func unapplyRemoveIns(comp *Naive, ins []PieceRec) (at int, removed bool) {
+// can reach it. kept mirrors the surviving comp.pieces and dropped records the
+// session bytes the removal hides, one entry per piece removed, including the
+// number of newlines among them.
+func unapplyRemoveIns(comp *Naive, prov []projOrigin, ins []PieceRec) (at int, removed bool, kept []projOrigin, dropped []hiddenRun) {
 	if len(ins) == 0 {
-		return -1, false
+		return -1, false, prov, nil
 	}
 	at, removed = -1, false
 	out := comp.pieces[:0]
+	kept = prov[:0]
 	off := 0
-	for _, piece := range comp.pieces {
+	for k, piece := range comp.pieces {
 		if insOwns(ins, piece) {
 			if at < 0 {
 				at = off
 			}
 			removed = true
+			if pr := prov[k]; pr.doc >= 0 && piece.Length > 0 {
+				dropped = append(dropped, hiddenRun{
+					doc: pr.doc, length: piece.Length, group: pr.group, state: pr.state,
+					lines: countNewlines(comp.store.Slice(Author(piece.Buf), piece.Start, piece.Length)),
+				})
+			}
 			continue
 		}
 		out = append(out, piece)
+		kept = append(kept, prov[k])
 		off += piece.Length
 	}
 	comp.pieces = out
-	return at, removed
+	return at, removed, kept, dropped
+}
+
+// countNewlines counts the '\n' bytes in b. A hidden run's bytes are live in the
+// session store — the same bytes a Restore segment reads — so the count spans
+// the session lines the fold hides.
+func countNewlines(b []byte) (n int) {
+	for _, c := range b {
+		if c == '\n' {
+			n++
+		}
+	}
+	return n
+}
+
+// insertRecsProv is comp.insertRecs plus the provenance bookkeeping that keeps
+// prov the same length as comp.pieces and aligned with it. A split at pos
+// splits the provenance record the same way, with the right half starting off
+// bytes into the session range; the inserted records carry meta, which for a
+// restored deletion marks them session-less. An insertion at or past the end has
+// no piece to split, so the appended records simply follow the run.
+func insertRecsProv(comp *Naive, prov []projOrigin, pos int, recs []PieceRec, meta projOrigin) []projOrigin {
+	if len(recs) == 0 {
+		return prov
+	}
+	i, off := comp.locate(pos)
+	comp.insertRecs(pos, recs)
+	out := make([]projOrigin, 0, len(prov)+len(recs)+1)
+	out = append(out, prov[:i]...)
+	if off > 0 {
+		left := prov[i]
+		right := left
+		if left.doc >= 0 {
+			right.doc = left.doc + off
+		}
+		out = append(out, left, right)
+	}
+	for range recs {
+		out = append(out, meta)
+	}
+	if i < len(prov) {
+		if off <= 0 {
+			out = append(out, prov[i])
+		}
+		out = append(out, prov[i+1:]...)
+	}
+	return out
+}
+
+// buildSegments turns the folded composition back into the run alignment
+// Segments reports. It walks the kept and restored pieces in composition order,
+// filling each hidden run in at the session gap where its bytes were removed;
+// adjacent pieces merge when their owning set and state agree and their session
+// and composition offsets stay contiguous, so a run is one segment rather than
+// one per piece. A merged hidden run adds its newline counts.
+func buildSegments(pieces []PieceRec, prov []projOrigin, hidden []hiddenRun) []ProjSeg {
+	if len(hidden) > 1 {
+		sort.Slice(hidden, func(i, j int) bool { return hidden[i].doc < hidden[j].doc })
+		merged := make([]hiddenRun, 0, len(hidden))
+		for _, h := range hidden {
+			if n := len(merged); n > 0 && merged[n-1].doc+merged[n-1].length == h.doc &&
+				merged[n-1].group == h.group && merged[n-1].state == h.state {
+				merged[n-1].length += h.length
+				merged[n-1].lines += h.lines
+				continue
+			}
+			merged = append(merged, h)
+		}
+		hidden = merged
+	}
+	var segs []ProjSeg
+	disp, doc, hi := 0, 0, 0
+	flush := func(before int) {
+		for hi < len(hidden) && hidden[hi].doc < before {
+			h := hidden[hi]
+			segs = append(segs, ProjSeg{
+				Doc: h.doc, Disp: disp, Len: h.length, DLen: 0,
+				Group: h.group, State: h.state, Hide: true, HiddenLines: h.lines,
+			})
+			doc = h.doc + h.length
+			hi++
+		}
+	}
+	n := min(len(prov), len(pieces))
+	for i := range n {
+		piece := pieces[i]
+		pr := prov[i]
+		if pr.doc < 0 {
+			segs = append(segs, ProjSeg{
+				Doc: doc, Disp: disp, Len: 0, DLen: piece.Length,
+				Group: pr.group, State: pr.state, Restore: true,
+			})
+			disp += piece.Length
+			continue
+		}
+		flush(pr.doc)
+		if len(segs) > 0 {
+			last := &segs[len(segs)-1]
+			if !last.Hide && !last.Restore && last.Group == pr.group && last.State == pr.state &&
+				last.Doc+last.Len == pr.doc {
+				last.Len += piece.Length
+				last.DLen += piece.Length
+				disp += piece.Length
+				doc = pr.doc + piece.Length
+				continue
+			}
+		}
+		segs = append(segs, ProjSeg{
+			Doc: pr.doc, Disp: disp, Len: piece.Length, DLen: piece.Length,
+			Group: pr.group, State: pr.state,
+		})
+		disp += piece.Length
+		doc = pr.doc + piece.Length
+	}
+	for ; hi < len(hidden); hi++ {
+		h := hidden[hi]
+		segs = append(segs, ProjSeg{
+			Doc: h.doc, Disp: disp, Len: h.length, DLen: 0,
+			Group: h.group, State: h.state, Hide: true, HiddenLines: h.lines,
+		})
+	}
+	return segs
 }
 
 // projectNoDecisions is Project for a session with no decisions. Every live
@@ -299,6 +500,14 @@ func (d DerivedProject) Spans() []Span { return d.comp.Spans(0, d.comp.Len()) }
 // was decided about it. nil unless the policy was Annotated. The slice is the
 // projection's own; treat it as read-only.
 func (d DerivedProject) States() []StateRun { return d.states }
+
+// Segments reports the projection as runs aligned with the session's own text:
+// where each kept run sits in both, where an excluded insertion hides session
+// bytes, and where an excluded deletion puts composition-only bytes back. nil
+// on the no-decisions path, where the projection is the session's own view and
+// there is nothing to align. The slice is the projection's own; treat it as
+// read-only.
+func (d DerivedProject) Segments() []ProjSeg { return d.segments }
 
 // Leased reports which change set, if any, owns the bytes in [pos, pos+length)
 // as a read-only run — a lease. A pending or rejected span is atomic: an edit

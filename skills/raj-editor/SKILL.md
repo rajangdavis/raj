@@ -30,9 +30,12 @@ Lists what is open, with sizes and whether each has unsaved changes. If it exits
 non-zero, raj is not running with `--control`; fall back to your normal file
 tools rather than telling the user to restart their editor.
 
-Nothing else works on a file that is not in that list. `raj ctl open
-<absolute-path>` adds one — which also puts it on the user's screen, so do it
-when you mean to, not to paper over a wrong path.
+Inspection does not need `open`. `read`, `version` and `lsp diagnostics` load a
+closed file on demand — no tab, nothing on the user's screen — so read freely.
+`raj ctl open <path>` is the verb that shows a file: it loads the file and
+focuses a tab, so use it when you mean to put the file in front of the user, not
+to make a path readable. A pending proposal also opens a tab on its own, because
+the file now has something for the user to decide.
 
 Every command takes an optional path; omit it for the buffer the user is
 currently looking at. Add `-json` to any command for machine-readable output.
@@ -562,7 +565,7 @@ unchanged.
 | `read the buffer before writing it` | Run `read` or `version` on that path first. |
 | `apply needs a base version` | Pass `-base` from the version `read` returned. |
 | `hunks could not be placed` | The user typed while you worked; nothing was written. Re-read and redo against the new version. |
-| `no open buffer for ...` | `raj ctl open` it first, or check `buffers` for the exact path. |
+| `no open buffer for ...` | The path is missing, outside the workspace, or unreadable; check the spelling against `search`. `read`/`version`/`lsp diagnostics` load an existing file on demand, so you rarely need `open`. |
 | `is not under <root>` | The path or glob leaves the workspace. Not permitted. |
 | `unauthorized` | `RAJ_CONTROL_TOKEN` is unset or wrong. You cannot recover from this yourself; tell the user. |
 | `exec is refused over TCP` | Run the command with your own shell instead. |
@@ -609,7 +612,9 @@ directly into an `apply` span without recomputing offsets itself.
 Only a structural hunk — a whole function, a comment block — genuinely wants
 `apply`, and then the offsets are measured against the bytes the `read`
 returned; deriving them is left to the driver, out of scope for this skill.
-Read-gate the `apply`, and re-read the seam after it lands.
+Read-gate the `apply`, and re-read the seam after it lands. Neither needs a
+prior `open`: `read` loads the file headlessly, and `apply` announces a tab the
+moment the proposal lands.
 
 ### Read-gate every apply, and let -base do the rebasing
 
@@ -740,12 +745,13 @@ make the review surface what actually changed:
   the first (or the most consequential); the user scrolls from there. `goto`
   confirms with "moved ... cursor to LINE", so a landed jump is verifiable
   rather than assumed.
-- **Close the files that have no changes.** Files opened for the work but left
-  with nothing to show get `raj ctl close <path>`, so the tab bar ends up
-  listing exactly the files awaiting review. This is safe by construction:
-  `close` is refused while a buffer has unsaved work, so a file with pending
-  proposals cannot be closed — only change-free files actually close. Check
-  `raj ctl buffers` before closing that a file really has nothing pending.
+- **Close the tabs you opened but did not need.** Because inspection loads
+  without a tab, only the files you `open`ed to show — or that hold pending
+  proposals — have one. Close those with nothing to show (`raj ctl close
+  <path>`) so the tab bar lists exactly the files awaiting review. This is safe
+  by construction: `close` is refused while a buffer has unsaved work, so a file
+  with pending proposals cannot be closed. Check `raj ctl buffers` before
+  closing that a file really has nothing pending.
 
 What is still missing is a way to reveal a *span* or to make the jump
 automatic: either `raj ctl reveal <path> -start N -end N`, or an option on

@@ -8,6 +8,19 @@ lives in RAJ_FEEDBACK.md; its actionable items are in the section below.
 RECURSIVE_RAJ.md first (identity, rebuild boundary, editing discipline, swarm
 workflow), then works the active plan in the next section.
 
+## Direction (documented, not scheduled)
+
+- [ ] **Reconciliation UX — layer toggles + conflict navigator.** Design note in
+  `docs/RECONCILIATION-UX.md`: generalise the composition from
+  accepted/proposed/rejected to layer selection, built on the F3b-ii projection
+  and the "Overlap reporting for swarms" item. Open questions for the user.
+- [ ] **Agent verb-surface audit — implement the safe simplifications.**
+  Findings in `docs/AGENT-VERB-AUDIT.md`: localise paths in every `-json` shape,
+  per-verb usage that shows positionals and the default target, one `-json`
+  field contract, document `clear`/`open -create`, and line/col in apply/edit
+  replies. Do it under the working agreement, before designing reconciliation
+  verbs.
+
 ## Active plan — recursive raj (2026-09-10, second instance)
 
 Open work:
@@ -872,6 +885,12 @@ C); `lsp references`; `edit -base` and miss-point reporting; `/tmp/opencode`;
 the `find`/file-listing verb; and the `search` `ByteStart`-vs-`LineStart`,
 `groups`-vs-`diff` and `read -lines` reports (fixed by the three `[~]` items
 above). The rest of the feedback is context in `docs/RAJ_FEEDBACK.md`.
+
+- [ ] **No file-lifecycle verbs: create/delete/rename.** An agent adding modules
+  or removing dead files must hand the work to the host. `open -create` covers
+  creation server-side (it needs the rebuilt container client and parent-dir
+  handling); `delete` and `rename` do not exist. Design and the open decisions
+  are in `docs/RAJ_FEEDBACK.md` ("File lifecycle verbs").
 
 ## Wave B proposals, 2026-09-11 (review verb, save-lag timing, inlay toggle)
 

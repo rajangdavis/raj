@@ -13,11 +13,13 @@ import (
 // cannot drift apart.
 func (p *Pane) MoveTo(fn func(Cursor, *File) int, extend bool) {
 	p.Cursors.Apply(func(c Cursor) Cursor {
-		c.Head = clamp(fn(c, p.File), 0, p.File.Len())
+		// A motion must not park the caret inside a run the display folds
+		// away; snapOut moves it to the nearest edge of such a run.
+		c.Head = p.snapOut(clamp(fn(c, p.File), 0, p.File.Len()), 0)
 		if !extend {
 			c.Anchor = c.Head
 		}
-		_, col := p.File.LineCol(c.Head)
+		_, col := p.dispPos(c.Head)
 		c.Goal = col
 		return c
 	})
@@ -32,12 +34,16 @@ func (p *Pane) MoveVertical(delta int, extend bool) {
 		return
 	}
 	p.Cursors.Apply(func(c Cursor) Cursor {
-		line, col := p.File.LineCol(c.Head)
+		line, col := p.dispPos(c.Head)
 		if c.Goal > col {
 			col = c.Goal // remember the column we wanted, not the one we got
 		}
-		target := clamp(line+delta, 0, p.File.Lines()-1)
-		c.Head = p.File.OffsetAt(target, col)
+		max := p.displayLines() - 1
+		if max < 0 {
+			max = 0
+		}
+		target := clamp(line+delta, 0, max)
+		c.Head = p.docAt(target, col)
 		if !extend {
 			c.Anchor = c.Head
 		}
@@ -54,7 +60,7 @@ func (p *Pane) CharLeft(extend bool) {
 			lo, _ := c.Range()
 			return lo
 		}
-		return p.prevBoundary(c.Head)
+		return p.snapOut(p.prevBoundary(c.Head), -1)
 	}, extend)
 }
 
@@ -64,7 +70,7 @@ func (p *Pane) CharRight(extend bool) {
 			_, hi := c.Range()
 			return hi
 		}
-		return p.nextBoundary(c.Head)
+		return p.snapOut(p.nextBoundary(c.Head), +1)
 	}, extend)
 }
 
@@ -119,7 +125,7 @@ func (p *Pane) ScrollPage(dir int) {
 	if rows < 2 {
 		rows = 2
 	}
-	p.Viewport.ScrollBy((rows-1)*dir, p.File.Lines())
+	p.Viewport.ScrollBy((rows-1)*dir, p.displayLines())
 }
 
 // ScrollRows moves the view by rows without moving the cursor, for the wheel.
@@ -128,7 +134,7 @@ func (p *Pane) ScrollPage(dir int) {
 // navigating: dragging the cursor along would change what the next keystroke
 // edits, and the cursor would arrive somewhere the user never chose.
 func (p *Pane) ScrollRows(rows int) {
-	p.Viewport.ScrollBy(rows, p.File.Lines())
+	p.Viewport.ScrollBy(rows, p.displayLines())
 }
 
 func (p *Pane) MovePage(dir int, extend bool) {
@@ -137,7 +143,7 @@ func (p *Pane) MovePage(dir int, extend bool) {
 		rows = 2
 	}
 	step := (rows - 1) * dir
-	p.Viewport.ScrollBy(step, p.File.Lines())
+	p.Viewport.ScrollBy(step, p.displayLines())
 	p.MoveVertical(step, extend)
 }
 
@@ -209,12 +215,12 @@ func (p *Pane) SplitIntoLines() {
 // which is the cmd+alt+up/down gesture.
 func (p *Pane) AddCursorVertical(delta int) {
 	for _, c := range p.Cursors.All() {
-		line, col := p.File.LineCol(c.Head)
+		line, col := p.dispPos(c.Head)
 		target := line + delta
-		if target < 0 || target >= p.File.Lines() {
+		if target < 0 || target >= p.displayLines() {
 			continue
 		}
-		off := p.File.OffsetAt(target, col)
+		off := p.docAt(target, col)
 		p.Cursors.Add(off, off)
 	}
 }
