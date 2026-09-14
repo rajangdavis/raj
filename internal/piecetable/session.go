@@ -94,9 +94,6 @@ func (s *Session) Version() Version { return Version(len(s.journal)) }
 // Journal exposes the applied history. The slice must not be modified.
 func (s *Session) Journal() []Op { return s.journal }
 
-// commit applies an op and records it. Seq is assigned here so it always equals
-// the version the op produced minus one, making journal[v:] exactly "everything
-// that happened since v".
 // Begin opens an undo transaction; every op committed until the matching End
 // undoes as one step. Nesting is counted, so an action built from smaller
 // actions still collapses to a single step.
@@ -114,11 +111,23 @@ func (s *Session) End() {
 	}
 }
 
-func (s *Session) commit(o Op) Version {
-	if s.depth == 0 {
-		s.group++
+// commit records an op in the current group: commitInto with no group to join.
+func (s *Session) commit(o Op) Version { return s.commitInto(o, 0) }
+
+// commitInto applies an op and records it. group == 0 joins the current group,
+// bumping it when no Begin is open, exactly as an ordinary edit does; a
+// non-zero group joins that existing change set instead, which is how an
+// amendment folds into the proposal it refines rather than opening a second
+// one. Seq is assigned here so it always equals the version the op produced
+// minus one, making journal[v:] exactly "everything that happened since v".
+func (s *Session) commitInto(o Op, group uint64) Version {
+	if group == 0 {
+		if s.depth == 0 {
+			s.group++
+		}
+		group = s.group
 	}
-	o.Group = s.group
+	o.Group = group
 	o.Seq = Version(len(s.journal))
 	apply(s.buf, o)
 	s.journal = append(s.journal, o)
@@ -126,6 +135,18 @@ func (s *Session) commit(o Op) Version {
 		s.reversers[o.Undoes] = append(s.reversers[o.Undoes], o.Seq)
 	}
 	return s.Version()
+}
+
+// groupAuthor resolves a change set's author the way Groups does: the first
+// editorial member's author, undo and redo skipped. It reports false when the
+// journal holds no member for id.
+func (s *Session) groupAuthor(id uint64) (Author, bool) {
+	for _, o := range s.journal {
+		if o.Group == id && o.Kind == KindEdit {
+			return o.Author, true
+		}
+	}
+	return 0, false
 }
 
 // Insert records author's insertion of text at pos.
@@ -212,9 +233,21 @@ func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version,
 		// A pending or rejected span is a read-only lease: a hunk that would
 		// land in one is refused, so the composition stays overlap-free, and
 		// the conflict names the set whose decision has to come first.
+		//
+		// The one exception is a writer amending its own proposed set: the
+		// refinement belongs to the same reviewable unit, so the op joins that
+		// set (join) rather than being refused. Another author's set, and a set
+		// already Rejected, still refuse — un-rejecting takes the clear gesture
+		// and a fresh decision, not another edit. A hunk that catches any other
+		// lease too is not a clean amendment and still conflicts, which is what
+		// leasedElsewhere checks.
+		var join uint64
 		if g, leased := s.Leased(start, end-start); leased {
-			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, Group: g})
-			continue
+			if owner, own := s.groupAuthor(g); !own || owner != author || s.GroupState(g) != Proposed || s.leasedElsewhere(start, end-start, g) {
+				conflicts = append(conflicts, Conflict{Index: i, Hunk: h, Group: g})
+				continue
+			}
+			join = g
 		}
 		op := Op{Author: author, Pos: start}
 		if end > start {
@@ -224,7 +257,7 @@ func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version,
 			off := s.buf.Store().Append(author, []byte(h.Text))
 			op.Ins = []PieceRec{{Buf: int(author), Start: off, Length: len(h.Text)}}
 		}
-		s.commit(op)
+		s.commitInto(op, join)
 	}
 	return s.Version(), conflicts
 }

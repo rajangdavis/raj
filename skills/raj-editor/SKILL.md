@@ -358,21 +358,42 @@ when you have a batch, or when you are replaying one you recorded.
 
 ## Say who you are
 
-You do not have to — identity is automatic. The host plugin
-(plugins/raj-gate.ts) injects, captures and scrubs `RAJ_IDENTITY` per session:
-the first `raj ctl` runs unpinned, the server mints a durable `tok_...`, and
-the plugin captures the adopt line before it reaches the model, reinjecting
-the token on later shells. Do NOT pass `-as`, export `RAJ_IDENTITY`, or run
-`who -as X -name Y`: each session and subagent already gets a distinct author
-id and its own tint.
+Identity is explicit. Mint a key once at the start of your run:
 
-Why it still works: **every `raj ctl` invocation is a fresh connection**, and
-an anonymous connection mints a fresh author id from a `uint8` space capped at
-256 — per-author state (dump snapshots) does not survive between invocations,
-proposals scatter across dead ids, and the space itself drains (one delegated
-session burned ~130). The durable token the plugin manages is what keeps your
-author id stable across those connections, so per-author state like dump
-snapshots and your attribution stick. The plugin handles this; you just work.
+    raj ctl register
+
+It prints a short random key and binds it on the server. Pass `-as <key>` on
+every later call:
+
+    raj ctl read -as raj-1a2b3c4d docs/TODO.md
+
+Why: **every `raj ctl` invocation is a fresh connection**, and an anonymous
+connection mints a fresh author id from a `uint8` space capped at 256 — so
+without `-as` your proposals scatter across dead ids, per-author state (dump
+snapshots) does not survive between calls, and the space drains. One
+`register` per run plus `-as` on every call keeps your author stable.
+
+`register` will not hand you a key another participant already owns; if you
+want a specific one, `register -as mykey` binds it deliberately. `-name NAME`
+sets your display name in `who`.
+
+## Claim the files you will write
+
+Socket writes are restricted to your claim set. Declare the files before your
+first write in a run:
+
+    raj ctl claim -as <key> path/a.go path/b.go
+
+- An explicit write to a path outside the set is refused: `not in your claim
+  set (...); claim -add <path>`.
+- A **pathless** write is allowed only when exactly one file is claimed, and
+  then it targets that file. None claimed says `claim a file first`; several
+  says `claim set has N files; name one`.
+- Reads are never gated. `claim` with no operands reports the set; `claim
+  -add` extends it; `claim -clear` releases it. A file you create with `open
+  -create` must be added with `claim -add` before you can write it.
+- The set is in-memory and resets when the editor restarts, so re-claim after
+  a restart.
 
 `raj ctl who` lists everyone writing in this workspace. When more than one agent
 is connected, that is how you tell whose text is whose.
@@ -437,10 +458,12 @@ raj ctl groups /abs/path/to/file.go     # id, author, state, size
 raj ctl reject /abs/path/to/file.go -group 12
 ```
 
-`reject` backs your change out as if it had never been written — use it when you
-decide your own edit was wrong, rather than computing a reverse diff, which
-would leave both edits in the record. It can fail if a later edit overlaps
-yours; that is not retryable, so re-read and propose against the current text.
+`reject` is a decision, not an edit: it marks the set rejected and the text
+stays in the document (under the rejected tint), dropping out of the agreed
+composition. It cannot fail and cannot be wedged by a later edit. To withdraw
+your own edit from the document, follow it with `clear` (reject, then clear),
+after which the same text can be applied again — that is the alternative to
+computing a reverse diff, which would leave both edits in the record.
 
 Leave accepting to the user. It is their decision, the text is already there
 either way, and it is what unlocks saving the file — see below.
@@ -461,13 +484,13 @@ already jumped you to the first change and closed the files that have none.
   where the review matters. Ask the agent to goto its hunks as it makes them;
   if it did not, the group's byte offsets in `diff` tell you where.
 - **Accept deliberately, or back out.** `raj ctl accept <path> -group N`
-  approves one change set; `raj ctl reject <path> -group N` backs it out like
-  it was never written. The plain `save` accepts everything pending in that
-  file at once — use it when the whole pending set is reviewed, not as the
-  discovery step.
-- **When it's wrong, reject rather than edit-over.** `reject` removes the
-  proposal from the record; editing over it leaves both your fix and the
-  original diff in the history.
+  approves one change set; `raj ctl reject <path> -group N` rejects it — the
+  text stays until you `clear` the rejected set, which reverses it out. The
+  plain `save` accepts everything pending in that file at once — use it when
+  the whole pending set is reviewed, not as the discovery step.
+- **When it's wrong, reject rather than edit-over.** `reject` marks it
+  rejected; `clear` removes it from the document and the record. Editing over
+  it leaves both your fix and the original diff in the history.
 
 - **Decide a whole file at once.** `accept` and `reject` take `-all`: every
   pending set for the path is decided in one command (honor `-mine` to keep to
@@ -600,6 +623,14 @@ range, not the text. A LINE number is not an offset either: feeding the output
 of a `grep -n` dump to `-start`/`-end` lands in the wrong place — a small line
 number reads the top of the file. Take offsets from `read -json` or
 `search -json`, never from a line count.
+
+`jq` is the sharpest version of this trap, now that it is allowed for shaping
+output: its string indexing and slicing count **codepoints, not bytes**, so
+`jq` arithmetic over a line holding an em-dash or any non-ASCII character
+lands at a different byte. Query and reshape with `jq` freely (`jq -r
+'.matches[].byte_start'`), but never derive a byte offset by indexing or
+slicing text with it — take `byte_start`/`byte_end` straight from `search
+-json`.
 
 The two verbs that make offsets unnecessary in the common case are `raj ctl
 edit -old S -new S`, the exact-string replacement, and `raj ctl search -q
@@ -772,33 +803,33 @@ verb, and when one is missing the right move is to propose it rather than to
 reach for a shell workaround.
 
 A delegated subagent starts with no skill context, so the same rule has to be
-written into its brief: "use only raj ctl verbs — no node, no jq, no grep or
-sed over files, no /tmp scratch." The workarounds this kills are the ones that
-drift: parsing `read -json` with node re-implements the editor's JSON by hand,
-and grepping a `/tmp` dump reads text that is already stale. If a verb is
-genuinely missing, the subagent should stop and report the gap — that is how
-this list grows — rather than reach for a host tool.
+written into its brief: "use only raj ctl verbs for file content — no node, no
+grep or sed over files, no /tmp scratch; jq is allowed for shaping raj ctl
+-json output." The workarounds this kills are the ones that drift: parsing
+`read -json` with node re-implements the editor's JSON by hand, and grepping a
+`/tmp` dump reads text that is already stale. If a verb is genuinely missing,
+the subagent should stop and report the gap — that is how this list grows —
+rather than reach for a host tool.
 
 The prohibition has to name the temptation, not just the file access: "use only
-raj ctl verbs" invites the reading "for file access", and JSON post-processing
-slips in under "just parsing tool output". Briefs should say: no interpreters
-(python/node/jq) anywhere in the pipeline, including on `raj ctl` output; if
-the output is hard to consume, that is a verb-surface gap to report. A query
-flag on the verb (`read -json -field text`, in the spirit of the flat-record
-item) is the sanctioned shape, not a pipe to an interpreter.
+raj ctl verbs" invites the reading "for file access", so say explicitly that no
+interpreter (python/node) may touch file content. jq is the one exception,
+allowed for shaping `raj ctl -json` output; a query flag on the verb
+(`read -json -field text`, in the spirit of the flat-record item) is still the
+sanctioned shape for anything the CLI should answer itself. If the output is
+hard to consume even with jq, that is a verb-surface gap to report.
 
-Concrete gaps, current as of the live server (commit `42f9c653`; verify with
-`raj ctl version` rather than trusting this list's age):
+Closed gaps — current as of the live server (commit `42f9c653`; verify with
+`raj ctl version` rather than trusting this list's age). Kept here so a stale
+skills file does not send an agent back to a shell tool for something
+`raj ctl` already does:
 
-- **Pretty-printing JSON.** `jq` is the usual suspect, and is absent from a
-  hardened container. `raj ctl ... -json` is already machine-readable, but it
-  is one object per reply, not pretty-printed; consume it directly rather than
-  re-formatting it. A driver that needs byte offsets uses `search -json`
-  (`ByteStart`/`ByteEnd` per hit) instead of recomputing them.
-
-Closed gaps — kept here so a stale skills file does not send an agent back to
-a shell tool for something `raj ctl` already does:
-
+- **Pretty-printing JSON.** `jq` is available in the container and is allowed
+  for shaping `raj ctl -json` output. `raj ctl ... -json` is already
+  machine-readable; pipe it through `jq` when you want it pretty. It is for
+  querying and reshaping only — its string indexing counts codepoints, not
+  bytes, so never compute an `apply` offset with it. Take `byte_start`/
+  `byte_end` from `search -json` (see "Byte offsets, not string offsets").
 - **Reading a line range.** `raj ctl read -lines A,B` (1-based inclusive; a
   bare `A` reads to the end) is live. Use it instead of `sed -n` / `head | tail`.
 - **Counting bytes or lines.** `raj ctl version -json` returns `bytes` and

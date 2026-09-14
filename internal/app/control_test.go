@@ -33,10 +33,30 @@ func (h *harness) dial(t *testing.T) *client {
 	return &client{t: t, c: c}
 }
 
-// do sends a request and pumps the event loop until the answer arrives. The
-// pumping is the point: a reply that needed no event thread would mean the
-// request was executed somewhere it should not have been.
+// do sends a request, claiming the write target first when the Guard gates it.
+// A socket apply, patch or clear needs the claim set of the author to hold its
+// path — that rule is enforced in internal/control, so the tests here are about
+// what a write does, not about the gate. The claim rides this same connection,
+// so it binds to the author the write will use; a pathless write targets the
+// active buffer, which is what the host resolves an empty path to. The pumping
+// is the point: a reply that needed no event thread would mean the request was
+// executed somewhere it should not have been.
 func (c *client) do(h *harness, req control.Request) control.Response {
+	if req.Op == "apply" || req.Op == "patch" || req.Op == "clear" {
+		path := req.Path
+		if path == "" {
+			path = h.Tabs.Active().File.Path
+		}
+		if res := c.roundtrip(h, control.Request{Op: "claim", Paths: []string{path}}); !res.OK {
+			c.t.Fatalf("claim %q: %+v", path, res)
+		}
+	}
+	return c.roundtrip(h, req)
+}
+
+// roundtrip is one request over the socket, pumping the event loop until the
+// answer arrives.
+func (c *client) roundtrip(h *harness, req control.Request) control.Response {
 	c.t.Helper()
 	type result struct {
 		res control.Response
@@ -967,10 +987,14 @@ func TestControlLeaseRefusalCarriesTheGroup(t *testing.T) {
 		t.Fatalf("no proposal listed: %+v", gs.Groups)
 	}
 
-	// A second hunk overlapping that span is refused, not rebased through it.
-	read = c.do(h, control.Request{Op: "text"})
+	// A second hunk from a different writer, overlapping that span, is refused,
+	// not rebased through it: the lease stops another hand overwriting the
+	// proposal before it is decided. (The proposer's own amendment folds into
+	// the set instead; that is covered in the piece table's tests.)
+	c2 := h.dial(t)
+	read = c2.do(h, control.Request{Op: "text"})
 	base = read.Version
-	res := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+	res := c2.do(h, control.Request{Op: "apply", Path: path, Base: &base,
 		Hunks: []control.Hunk{{Start: 0, End: 11, Text: "goodbye"}}})
 	if res.OK || len(res.Conflicts) != 1 {
 		t.Fatalf("apply = %+v, want one lease refusal", res)
@@ -1157,7 +1181,7 @@ func TestHeadlessEvictionReloads(t *testing.T) {
 		paths = append(paths, path)
 	}
 	for _, path := range paths {
-		if _, _, _, err := hh.Read(path, -1, -1, 0, 0, false); err != nil {
+		if _, _, _, err := hh.Read(path, control.FirstAgent, -1, -1, 0, 0, false); err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
 	}
@@ -1167,7 +1191,7 @@ func TestHeadlessEvictionReloads(t *testing.T) {
 	if _, ok := h.findHeadless(paths[0]); ok {
 		t.Errorf("the oldest headless buffer survived eviction")
 	}
-	if _, _, _, err := hh.Read(paths[0], -1, -1, 0, 0, false); err != nil {
+	if _, _, _, err := hh.Read(paths[0], control.FirstAgent, -1, -1, 0, 0, false); err != nil {
 		t.Fatalf("reload %s: %v", paths[0], err)
 	}
 	if _, ok := h.findHeadless(paths[0]); !ok {

@@ -59,6 +59,9 @@ const (
 	hReviewList = 0x10 // review: list the pending sets without entering the mode
 	hAnnotated  = 0x11 // read: return the annotated composition and its state runs
 	hCreate     = 0x12 // open: make a buffer for a path that is not on disk yet
+	hPaths      = 0x13 // claim: the operand paths, one record per file
+	hClaimAdd   = 0x14 // claim: extend the set instead of replacing it
+	hClaimClear = 0x15 // claim: release the whole set
 
 	// response fields
 	hExit           = 0x20
@@ -102,6 +105,9 @@ const (
 	hStatesJSON     = 0x46 // read -annotated: the JSON-encoded []StateRun
 	hConflictGroup  = 0x47 // apply: sparse lease owner per conflict, one number per conflict
 	hBufferHeadless = 0x48 // buffers: sparse paths of buffers with no tab
+	hClaims         = 0x49 // claim: the resulting set, in stable order
+	hClaimWarnings  = 0x4a // claim: operands skipped, one warning per path
+	hClaimOverlaps  = 0x4b // claim: other identities sharing a claimed path
 
 )
 
@@ -131,6 +137,7 @@ var verbCodes = map[string]byte{
 	"dump": 26, "patch": 27,
 	"lsp": 28, "lspprep": 29,
 	"diff": 30, "review": 31, "clear": 32,
+	"claim": 33,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -211,6 +218,8 @@ func encodeHeader(h Header) []byte {
 	flag(hReviewList, h.ReviewList)
 	flag(hAnnotated, h.Annotated)
 	flag(hCreate, h.Create)
+	flag(hClaimAdd, h.ClaimAdd)
+	flag(hClaimClear, h.ClaimClear)
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
 	// dump with -start 0 asks for the head of the file, an absent one asks for
@@ -260,6 +269,13 @@ func encodeHeader(h Header) []byte {
 			w.Str(a)
 		}
 		ops = append(ops, Op8{hArgv, w.Done()})
+	}
+	if len(h.Paths) > 0 {
+		var w prog.Writer
+		for _, p := range h.Paths {
+			w.Str(p)
+		}
+		ops = append(ops, Op8{hPaths, w.Done()})
 	}
 	if q := h.Query; q != nil {
 		var w prog.Writer
@@ -322,6 +338,27 @@ func encodeHeader(h Header) []byte {
 			w.Num(int(m.From)).Str(m.Text)
 		}
 		ops = append(ops, Op8{hMessages, w.Done()})
+	}
+	if len(h.Claims) > 0 {
+		var w prog.Writer
+		for _, p := range h.Claims {
+			w.Str(p)
+		}
+		ops = append(ops, Op8{hClaims, w.Done()})
+	}
+	if len(h.ClaimWarnings) > 0 {
+		var w prog.Writer
+		for _, s := range h.ClaimWarnings {
+			w.Str(s)
+		}
+		ops = append(ops, Op8{hClaimWarnings, w.Done()})
+	}
+	if len(h.ClaimOverlaps) > 0 {
+		var w prog.Writer
+		for _, o := range h.ClaimOverlaps {
+			w.Str(o.Path).Str(o.Identity).Num(int(o.Author))
+		}
+		ops = append(ops, Op8{hClaimOverlaps, w.Done()})
 	}
 	if len(h.Buffers) > 0 {
 		var w prog.Writer
@@ -516,6 +553,10 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Annotated = true
 		case hCreate:
 			h.Create = true
+		case hClaimAdd:
+			h.ClaimAdd = true
+		case hClaimClear:
+			h.ClaimClear = true
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
@@ -574,6 +615,14 @@ func decodeHeader(b []byte) (Header, error) {
 				h.Argv = append(h.Argv, r.Str())
 			}
 			if err := recordsOK(r, "argv"); err != nil {
+				return Header{}, err
+			}
+		case hPaths:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Paths = append(h.Paths, r.Str())
+			}
+			if err := recordsOK(r, "paths"); err != nil {
 				return Header{}, err
 			}
 		case hQuery:
@@ -643,6 +692,31 @@ func decodeHeader(b []byte) (Header, error) {
 				h.Messages = append(h.Messages, Message{From: uint8(r.Num()), Text: r.Str()})
 			}
 			if err := recordsOK(r, "messages"); err != nil {
+				return Header{}, err
+			}
+		case hClaims:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Claims = append(h.Claims, r.Str())
+			}
+			if err := recordsOK(r, "claims"); err != nil {
+				return Header{}, err
+			}
+		case hClaimWarnings:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.ClaimWarnings = append(h.ClaimWarnings, r.Str())
+			}
+			if err := recordsOK(r, "claim warnings"); err != nil {
+				return Header{}, err
+			}
+		case hClaimOverlaps:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.ClaimOverlaps = append(h.ClaimOverlaps, ClaimOverlap{
+					Path: r.Str(), Identity: r.Str(), Author: uint8(r.Num())})
+			}
+			if err := recordsOK(r, "claim overlaps"); err != nil {
 				return Header{}, err
 			}
 		case hBuffers:

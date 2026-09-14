@@ -1,6 +1,7 @@
 package control
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -50,14 +51,16 @@ const ctlUsage = `usage: raj ctl <command> [options]
   buffers                    files open in the editor; a headless buffer has no tab
   read [path]                the buffer view, loaded on demand; -annotated adds per-run states, -start/-end/-lines for a span
   open <path>                show a file: load it and focus a tab; -create makes a buffer for a path not on disk
+  claim [path]...            set the working set; -add extends it, -clear releases it
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
   close [path]                close a buffer; refused while it has unsaved work
   whoami                     the author id this connection writes as
+  register [-as KEY]         mint an explicit identity key; -as binds a chosen one
   who [-live]                everyone writing in this workspace; -live filters to connected
   recv                       wait for the user to say something, then print it
   groups [path]              change sets in a buffer, and their state
   accept [path] -group N     agree to a change set; -all for every pending one
-  reject [path] -group N     back one out; -all for every pending one
+  reject [path] -group N     mark a set rejected; -all for every pending one
   clear [path] -group N      hard-purge a rejected change set; -all for every rejected one
   diff [path]                pending change sets as old→new text, for review
   review [path]              enter review mode and list pending change sets; -json lists without entering
@@ -85,6 +88,12 @@ pending proposal is what puts a tab on a buffer nobody asked to see.
 
 Path may be omitted for the buffer the user is looking at.
 
+Rejecting a change set is a decision, not an edit: reject marks the set
+rejected and the text stays in the document. clear is the hard purge, reversing
+the set out so the same text can be applied again — so redo work that came back
+rejected with reject, clear, then apply once more. open -create is how a path
+that is not on disk yet gets a buffer.
+
 The editor is found automatically, or named with -addr or RAJ_CONTROL_ADDR:
 a socket path, or tcp://host:port for a raj outside this container. A TCP
 editor also wants RAJ_CONTROL_TOKEN set to the token it printed on startup.
@@ -100,6 +109,19 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 
 	fs := flag.NewFlagSet("raj ctl "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintf(out, "usage: raj ctl %s", cmd)
+		if op := verbOperand[cmd]; op != "" {
+			fmt.Fprintf(out, " %s", op)
+		}
+		fmt.Fprintln(out, " [options]")
+		if strings.Contains(verbOperand[cmd], "[path]") && cmd != "claim" {
+			fmt.Fprintln(out, "\nwith no path, targets the buffer the user is looking at.")
+		}
+		fmt.Fprintln(out)
+		fs.PrintDefaults()
+	}
 	socket := fs.String("socket", "", "path to the editor's control socket")
 	addr := fs.String("addr", "", "the editor's control address: a socket path, or tcp://host:port")
 	asJSON := fs.Bool("json", false, "machine-readable output")
@@ -122,6 +144,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
 	annotated := fs.Bool("annotated", false, "read: add the per-run change set and state of the view")
 	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
+	claimAdd := fs.Bool("add", false, "claim: extend the current set instead of replacing it")
+	claimClear := fs.Bool("clear", false, "claim: release the whole set")
 	textArg := fs.String("text", "", "apply: replacement text")
 	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
 	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
@@ -143,6 +167,9 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		argv, rest = rest[i+1:], rest[:i]
 	}
 	if err := fs.Parse(reorder(fs, rest)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	path := fs.Arg(0)
@@ -185,13 +212,17 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	// it for the rest of the process and say so once, so the harness can pin
 	// it next run. A failed hello changes nothing: the connection works on
 	// anonymously, exactly as it did before this handshake.
-	bind := firstOf(*identity, os.Getenv("RAJ_IDENTITY"))
-	if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: *name}); err == nil && hi.Err == "" {
-		if bind == "" && hi.Identity != "" {
-			adoptedIdentity = hi.Identity
-			fmt.Fprintf(stderr, "set RAJ_IDENTITY=%s\n", hi.Identity)
+	// register is the explicit path: it mints and binds its own key below, so
+	// the generic bind is skipped and no anonymous adopted token is printed.
+	if cmd != "register" {
+		bind := firstOf(*identity, os.Getenv("RAJ_IDENTITY"))
+		if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: *name}); err == nil && hi.Err == "" {
+			if bind == "" && hi.Identity != "" {
+				adoptedIdentity = hi.Identity
+				fmt.Fprintf(stderr, "set RAJ_IDENTITY=%s\n", hi.Identity)
+			}
+			warnVersionSkew(stderr, hi.SrcVersion)
 		}
-		warnVersionSkew(stderr, hi.SrcVersion)
 	}
 
 	switch cmd {
@@ -236,6 +267,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return 2
 	case "close":
 		return simple(c, Request{Op: "close", Path: path}, "closed", stdout, stderr, *asJSON)
+	case "claim":
+		return claimCmd(c, fs.Args(), *claimAdd, *claimClear, stdout, stderr, *asJSON)
 	case "save":
 
 		return simple(c, Request{Op: "save", Path: path}, "saved", stdout, stderr, *asJSON)
@@ -331,6 +364,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "%d\n", res.Author)
 		return 0
+	case "register":
+		return registerCmd(c, *identity, *name, stdout, stderr, *asJSON)
 	case "search":
 		// A bare positional is never a path here — search takes none — so it
 		// is the pattern typed in the wrong place, and accepting it silently
@@ -374,6 +409,55 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	return 2
 }
 
+// claimCmd sets, extends, clears or reports this identity's claim set: the
+// files it declares it is working on. Claims are not locks — another writer
+// may hold the same file — so an overlap is reported rather than refused, and a
+// path that is not on disk is warned about and skipped, leaving the rest of the
+// command to land.
+func claimCmd(c *Client, paths []string, add, clear bool, stdout, stderr io.Writer, asJSON bool) int {
+	if add && clear {
+		fmt.Fprintln(stderr, "raj ctl claim: -add and -clear are alternatives")
+		return 2
+	}
+	res, err := c.Do(Request{Op: "claim", Paths: paths, ClaimAdd: add, ClaimClear: clear})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	claims := res.Claims
+	if claims == nil {
+		claims = []string{}
+	}
+	if asJSON {
+		out := map[string]any{"ok": true, "claims": claims}
+		if len(res.ClaimWarnings) > 0 {
+			out["warnings"] = res.ClaimWarnings
+		}
+		if len(res.ClaimOverlaps) > 0 {
+			out["overlaps"] = res.ClaimOverlaps
+		}
+		return emit(stdout, out)
+	}
+	if len(claims) == 0 {
+		fmt.Fprintln(stdout, "claim set is empty")
+	} else {
+		fmt.Fprintf(stdout, "claimed %d file(s):\n", len(claims))
+		for _, p := range claims {
+			fmt.Fprintf(stdout, "  %s\n", p)
+		}
+	}
+	for _, w := range res.ClaimWarnings {
+		fmt.Fprintf(stderr, "raj ctl claim: warning — %s\n", w)
+	}
+	for _, o := range res.ClaimOverlaps {
+		who := o.Identity
+		if who == "" {
+			who = fmt.Sprintf("author %d", o.Author)
+		}
+		fmt.Fprintf(stderr, "raj ctl claim: %s is also claimed by %s\n", o.Path, who)
+	}
+	return 0
+}
+
 // argLimit is how many positional operands a verb takes, and what to say about
 // one it does not. A verb absent from the map takes none; goto and lsp are
 // absent too, because their extra operands are positions rather than a stray
@@ -387,21 +471,49 @@ var argLimit = map[string]struct {
 	n    int
 	hint string
 }{
-	"read":    {1, "read takes a path; a byte span goes to -start/-end, a line range to -lines"},
-	"dump":    {1, "dump takes a path; the span goes to -start/-end"},
-	"version": {1, "version takes a path and nothing else"},
-	"open":    {1, "open takes a path and nothing else"},
-	"close":   {1, "close takes a path and nothing else"},
-	"save":    {1, "save takes a path and nothing else"},
-	"groups":  {1, "groups takes a path and nothing else"},
-	"accept":  {1, "accept takes a path; the change set id goes to -group"},
-	"reject":  {1, "reject takes a path; the change set id goes to -group"},
-	"clear":   {1, "clear takes a path; the change set id goes to -group"},
-	"diff":    {1, "diff takes a path and nothing else"},
-	"review":  {1, "review takes a path and nothing else"},
-	"patch":   {1, "patch takes a path; the snapshot id goes to -dump"},
-	"apply":   {1, "apply takes a path; offsets go to -base/-start/-end"},
-	"edit":    {1, "edit takes a path; the strings go to -old/-new"},
+	"read":     {1, "read takes a path; a byte span goes to -start/-end, a line range to -lines"},
+	"dump":     {1, "dump takes a path; the span goes to -start/-end"},
+	"version":  {1, "version takes a path and nothing else"},
+	"open":     {1, "open takes a path and nothing else"},
+	"close":    {1, "close takes a path and nothing else"},
+	"save":     {1, "save takes a path and nothing else"},
+	"groups":   {1, "groups takes a path and nothing else"},
+	"accept":   {1, "accept takes a path; the change set id goes to -group"},
+	"reject":   {1, "reject takes a path; the change set id goes to -group"},
+	"clear":    {1, "clear takes a path; the change set id goes to -group"},
+	"diff":     {1, "diff takes a path and nothing else"},
+	"review":   {1, "review takes a path and nothing else"},
+	"patch":    {1, "patch takes a path; the snapshot id goes to -dump"},
+	"apply":    {1, "apply takes a path; offsets go to -base/-start/-end"},
+	"edit":     {1, "edit takes a path; the strings go to -old/-new"},
+	"register": {0, "register takes no path; the key goes to -as, or one is minted"},
+}
+
+// verbOperand is each verb's positional operands, spelled as the top-level
+// usage spells them. It exists for the per-verb usage: the flag package prints
+// only flags, so without it `raj ctl edit -h` never shows that edit can take a
+// path, nor that omitting one targets the buffer on screen. A verb absent from
+// the map takes no positional.
+var verbOperand = map[string]string{
+	"read":     "[path]",
+	"open":     "<path>",
+	"claim":    "[path]...",
+	"goto":     "[path] LINE[:COL]",
+	"close":    "[path]",
+	"groups":   "[path]",
+	"accept":   "[path]",
+	"reject":   "[path]",
+	"clear":    "[path]",
+	"diff":     "[path]",
+	"review":   "[path]",
+	"version":  "[path]",
+	"dump":     "[path]",
+	"patch":    "[path]",
+	"apply":    "[path]",
+	"edit":     "[path]",
+	"save":     "[path]",
+	"lsp":      "MODE [path] LINE:COL",
+	"register": "[-as KEY]",
 }
 
 // refuseExtraArgs rejects a positional operand the verb does not take, so a
@@ -445,6 +557,87 @@ func identityOf(flagVal string) string {
 		return adoptedIdentity
 	}
 	return "anon-cli"
+}
+
+// registerCmd mints an explicit short identity key and binds it with a hello,
+// so the caller can pass -as <key> on every later call and keep one author id.
+// A minted key is drawn client-side, short, lowercase hex and shell-safe, and
+// is checked against the registry so it cannot land on an existing identity; a
+// caller-chosen key (-as) binds that instead, deliberately and without the
+// check, which makes register idempotent for that key.
+func registerCmd(c *Client, chosen, name string, stdout, stderr io.Writer, asJSON bool) int {
+	if name == "" {
+		name = "raj"
+	}
+	key := chosen
+	if key == "" {
+		minted, err := mintRegisterKey(c, randomRegisterKey)
+		if err != nil {
+			fmt.Fprintln(stderr, "raj ctl register:", err)
+			return 1
+		}
+		key = minted
+	}
+	res, err := c.Do(Request{Op: "hello", Identity: key, Name: name})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	warnVersionSkew(stderr, res.SrcVersion)
+	if asJSON {
+		return emit(stdout, map[string]any{"key": key, "author": res.Author, "name": name})
+	}
+	fmt.Fprintf(stdout, "key: %s\nauthor: %d\nuse it on every call: raj ctl <verb> -as %s ...\n",
+		key, res.Author, key)
+	return 0
+}
+
+// registerMintAttempts bounds how many random keys register will draw before
+// giving up, so a registry that somehow owns every candidate cannot spin.
+const registerMintAttempts = 5
+
+// randomRegisterKey draws one short key: raj- plus four random bytes as
+// lowercase hex.
+func randomRegisterKey() (string, error) {
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "raj-" + hex.EncodeToString(buf), nil
+}
+
+// mintRegisterKey draws a key no listed participant already owns. It reads the
+// registry with the same hello the who verb sends — the only op that carries
+// the participant list — and redraws on a collision, up to
+// registerMintAttempts times. The listing hello carries no identity of its
+// own, so it does not join or adopt one just to look; on a local socket an
+// empty identity is how the server lists without binding.
+func mintRegisterKey(c *Client, draw func() (string, error)) (string, error) {
+	for attempt := 0; attempt < registerMintAttempts; attempt++ {
+		key, err := draw()
+		if err != nil {
+			return "", err
+		}
+		res, err := c.Do(Request{Op: "hello"})
+		if err != nil {
+			return "", err
+		}
+		if res.Err != "" {
+			return "", errors.New(res.Err)
+		}
+		taken := false
+		for _, p := range res.Participants {
+			if p.Identity == key {
+				// A gone row counts too: joining it would hand back an author
+				// id another writer already used.
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			return key, nil
+		}
+	}
+	return "", fmt.Errorf("could not find an unused key in %d attempts; pass -as KEY to choose one", registerMintAttempts)
 }
 
 // warnVersionSkew notes a ctl/editor build mismatch. A warning, not a refusal:
@@ -1619,13 +1812,13 @@ func edit(c *Client, path, old, newText string, all bool, stdout, stderr io.Writ
 	offsets := IndexAll(res.Text(), old)
 	switch {
 	case len(offsets) == 0:
-		fmt.Fprintln(stderr, "raj ctl edit: that text does not appear in the buffer.\n"+
+		fmt.Fprintf(stderr, "raj ctl edit: that text does not appear in %s.\n"+
 			"Read it again and copy the text exactly, including indentation — this file\n"+
-			"may indent with tabs where you assumed spaces.")
+			"may indent with tabs where you assumed spaces.", editTarget(path))
 		return 1
 	case len(offsets) > 1 && !all:
-		fmt.Fprintf(stderr, "raj ctl edit: that text appears %d times. Include more surrounding\n"+
-			"context to make it unique, or pass -all to replace every occurrence.\n", len(offsets))
+		fmt.Fprintf(stderr, "raj ctl edit: that text appears %d times in %s. Include more surrounding\n"+
+			"context to make it unique, or pass -all to replace every occurrence.\n", len(offsets), editTarget(path))
 		return 1
 	}
 
@@ -1638,6 +1831,16 @@ func edit(c *Client, path, old, newText string, all bool, stdout, stderr io.Writ
 	base := res.Version
 	ap, err := c.Do(Request{Op: "apply", Path: path, Base: &base, Hunks: hunks})
 	return reportApply(ap, err, len(hunks), echo, stdout, stderr, asJSON)
+}
+
+// editTarget names the buffer an edit ran against, for an error message. An
+// omitted path means the focused buffer; the client cannot learn the path the
+// server resolved it to without a wire field, so it names what it sent.
+func editTarget(path string) string {
+	if path == "" {
+		return "the buffer the user is looking at"
+	}
+	return path
 }
 
 // fail turns a transport error or an editor refusal into an exit code. They are

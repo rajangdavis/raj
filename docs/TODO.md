@@ -60,13 +60,15 @@ focused task.
 - [ ] **Phase 1b — decisions as state flips and leases.** `RejectGroup` marks
   `Rejected` (no reversal, cannot fail); `AcceptGroup` can un-reject; a pending,
   rejected or invalidated span is a read-only lease, so an edit or `apply` that
-  intersects one is refused. `save` writes `Project(AcceptedOnly)`; `read`
+  intersects one is refused — except a writer amending its own `Proposed` set,
+  which joins it instead (2026-09-13). `save` writes `Project(AcceptedOnly)`; `read`
   defaults to accepted with an annotated flag; the edit view is
   `AcceptedAndProposed` with inert spans hidden as atomic folds, Review is
   `Annotated`; `cmd+ctl+k` clears rejected, `cmd+ctl+l` clears invalidated.
   - **Done (F3b-i, 2026-09-12):** the state flips (`RejectGroup` marks
     `Rejected`; `AcceptGroup` un-rejects; `ClearRejected` reverses + drops),
-    region leases (`Session.Leased`; an intersecting edit/`apply` is refused),
+    region leases (`Session.Leased`; an intersecting edit/`apply` is refused,
+    except a same-author amendment of its own `Proposed` set),
     `save` = `Project(AcceptedOnly)`, `read` = the buffer view with `-annotated`
     states, and `cmd+ctl+k`.
   - [ ] **F3b-ii — the presentation half.** Edit mode renders
@@ -443,19 +445,15 @@ missing is addressing and state.
   intersect is a mechanical fact. Report it to both with the other's author id
   and the span. The editor must not arbitrate which is right: that is semantic,
   and voting built in here would be wrong in ways nobody can debug.
-- [ ] **`claim` and `watch`.** An agent announces the files it is about to touch;
-  others are told. Streaming frames and cancellation already exist, so a pushed
-  event is nearly free and beats polling — this is the use case that justifies
-  the notifications item above. The fuller design from the last driver
-  session: an agent declares intent (file, optional spans) before writing; the
-  editor records the claim, makes it queryable over the socket, and reconciles
-  overlapping edits through the rebase walk — conflict, not clamp. It
-  generalises the dump/patch version-pin to a shared coordination surface and
-  derives its span record from the same group-ranges work as the proposals
-  remainder. Open design questions for the user: span granularity (file plus
-  refineable spans?), advisory versus enforced overlap, and claim lifetime
-  (tie to connection liveness). Design doc and verb spec before
-  implementation.
+- [ ] **`claim` and `watch`.** An agent announces the files it is about to
+  touch; others are told. Streaming frames and cancellation already exist, so a
+  pushed event is nearly free and beats polling — this is the use case that
+  justifies the notifications item above. **Scope settled 2026-09-13 and
+  narrowed:** enforced file-level claims (no spans, no TTL, no overlap
+  refusal), reads free, pathless writes only when exactly one file is claimed,
+  `open -create` auto-extends, in-memory per identity (journal later), with
+  mkdir/rmdir/delete/rename planned and claim-gated. Design and work items:
+  `docs/CLAIM-SPEC.md`. `watch` (the push) stays separate.
 - [~] **Which composition does `read` return?** Decided: `AcceptedOnly` by
   default, with an explicit annotated flag (spec §6, §12). Implementation lands
   with phase 1b; the argument stands — an agent proposes against the agreed
@@ -537,6 +535,12 @@ missing is addressing and state.
   as `raj ctl version` with no path (server build info rather than buffer
   version), or keep it handshake-only so there is exactly one place the
   comparison lives?
+- **Identity design — superseded 2026-09-13 by explicit `register`/`-as`.** The
+  server-minted/absorbed design in this bullet and the `[~]` one below is no
+  longer the direction: `raj ctl register` mints a short random key and the
+  caller passes `-as <key>` on every call, the plugin only gates raj-spawned
+  subagents, and a byID check in `register` handles collisions. Kept for the
+  decision history.
 - [ ] **Server-minted agent identity, in the same handshake.** Same `hello`
   wire change as the version handshake, shipped as one proposal — both are
   metadata the handshake should carry. Verified live: one session of `raj ctl`
@@ -795,9 +799,15 @@ Search:
 - [ ] **`search` carries no buffer version.** A concurrent proposal shifted a
   match between the `search` and the later `read`, and the caller could not
   tell. A version per hit or per file would make the drift detectable.
-- [ ] **The whole-buffer search `-json` uses Go field names** (`Path`,
-  `ByteStart`, `LineStart`) while `-jsonl` uses snake_case. Unify them, or
-  state which is the contract.
+- [x] **The whole-buffer search `-json` uses Go field names** — done
+  2026-09-13: `SearchMatch`/`TruncatedFile`/`ExecStats`/`DirtyBuffer` carry
+  snake_case json tags, so `-json` and `-jsonl` agree.
+- [ ] **No verb returns a line range's byte span.** `search -json` reports a
+  hit's `byte_start` (the match) and its line's `line_start`, and `read -lines`
+  returns text with no offsets, so replacing a whole indented block means
+  computing the end offset yourself — and using the match offset by mistake
+  leaves the leading tabs behind. Return the line's byte range (start and end)
+  for a `-lines` read or a line-addressed hit.
 - [ ] **New `raj ctl` against an old server warns falsely on `-include`.**
   `Considered` rides header field 0x42; an old server never sets it, so every
   `-include` search looks like zero files considered. `warnVersionSkew` is the
@@ -831,14 +841,15 @@ Diagnostics:
 
 Dated notes, 2026-09-12 (layered-proposals 1a wave):
 
-- [ ] **`lsp diagnostics` goes permanently stale after an apply.** Following an
-  agent `apply`, every later call answers `the language server has not been told
-  about the current text yet` (occasionally `status: stale`), so the per-hunk
-  syntax check silently stops running for the rest of the session. A blocking
-  `lsp hover` on the file does force the server to sync — that is the workaround
-  the 1b F1 subagent found — but it is undocumented and costs a round trip.
-  Riding the version bump, or a `diagnostics -sync` flag, would close it. Hit by
-  the 1a and 1b agents on every file.
+- [~] **`lsp diagnostics` goes stale after an apply — fixed 2026-09-13 by the
+  idle-tick sync; `-sync` still open.** The server now receives every open
+  document whose version moved on the idle tick (`App.syncDirtyDocs`, only for
+  servers already live), so diagnostics is a real reading without a hover:
+  verified live — a socket `apply` to a non-focused buffer read `not been told
+  about the current text yet`, then `ok` one tick later. What remains is the
+  driver-facing half: `lsp diagnostics -sync` to sync and wait for the publish
+  needs request/header/prog wire fields and is deferred, so a caller can still
+  see `stale` for the publish beat and must poll.
 - [ ] **A saved buffer can still carry proposed sets.** After a rebuild and
   restart, `buffers` reported `saved` for `internal/piecetable/project_test.go`
   while `groups`/`diff` showed two `proposed` sets whose ops read `moved past

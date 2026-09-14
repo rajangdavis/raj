@@ -728,6 +728,11 @@ func (a *App) Handle(e ui.Event) {
 		// never sit on the keystroke path.
 		a.refreshSyntax()
 		a.diskCheck()
+		// Every open document is pushed to its server here, not just the
+		// visible one, so diagnostics for a buffer the user is not looking at
+		// are a real reading. It runs before the hint request, so that request
+		// is made against a synced document.
+		a.syncDirtyDocs()
 		// Inlay hints are asked for here and only here, and only when the
 		// visible range or the document version has moved, so this is a
 		// debounce rather than a request per keystroke.

@@ -146,6 +146,15 @@ type Header struct {
 	// presence flag like ReviewList, so a peer that does not know it omits it
 	// and keeps the refusing default.
 	Create bool
+	// Paths is the claim op's operand list, one file per record. ClaimAdd
+	// and ClaimClear are its mode flags: with neither, the list replaces the
+	// set; ClaimAdd extends it and ClaimClear releases it. A claim with an
+	// empty list and neither flag reports the set, so all three default to
+	// the reporting request. Presence flags like Create, so a peer that does
+	// not know them omits them and keeps the replacing default.
+	Paths      []string
+	ClaimAdd   bool
+	ClaimClear bool
 
 	// LSPMode names the lsp sub-operation on a request; LSPJSON carries the
 	// JSON-encoded answer back on a response. Neither needs the body: they are
@@ -171,6 +180,14 @@ type Header struct {
 	Stats        ExecStats
 	Participants []Participant
 	Groups       []Group
+	// Claims, ClaimWarnings and ClaimOverlaps are the claim verb's answer:
+	// the resulting set, the operands skipped, and the other identities
+	// sharing a claimed path. Sparse like every other response list: an empty
+	// one is not sent, so a peer that does not know the fields reads no
+	// claims rather than an error.
+	Claims        []string
+	ClaimWarnings []string
+	ClaimOverlaps []ClaimOverlap
 
 	// Messages is what a parked recv answers with. They stay in the header
 	// rather than moving to the body: a message is text a person typed into a
@@ -365,6 +382,7 @@ func EncodeRequest(req Request) (Header, []byte) {
 		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
 		Annotated: req.Annotated, Create: req.Create,
+		Paths: req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
@@ -406,7 +424,8 @@ func DecodeRequest(f Frame) (Request, error) {
 		Start: f.Header.Start, End: f.Header.End,
 		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
-		Annotated: f.Header.Annotated, Create: f.Header.Create}
+		Annotated: f.Header.Annotated, Create: f.Header.Create,
+		Paths: f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -450,6 +469,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
 		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON,
 		StatesJSON: res.StatesJSON,
+		Claims:     res.Claims, ClaimWarnings: res.ClaimWarnings, ClaimOverlaps: res.ClaimOverlaps,
 		SrcVersion: res.SrcVersion, Identity: res.Identity}
 	var body []byte
 	if res.Stream != 0 {
@@ -485,7 +505,9 @@ func DecodeResponse(f Frame) (Response, error) {
 		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
 		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON,
 		StatesJSON: f.Header.StatesJSON,
-		SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
+		Claims:     f.Header.Claims, ClaimWarnings: f.Header.ClaimWarnings,
+		ClaimOverlaps: f.Header.ClaimOverlaps,
+		SrcVersion:    f.Header.SrcVersion, Identity: f.Header.Identity}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

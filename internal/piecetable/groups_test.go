@@ -576,3 +576,119 @@ func TestApplyDiffRefusesALease(t *testing.T) {
 		t.Errorf("text = %q, want the boundary insert to land", got)
 	}
 }
+
+// A writer amending its own pending proposal is not refused by the lease: the
+// refinement folds into the same change set, so refining a just-applied edit
+// stays one reviewable unit instead of forcing reject -> clear -> re-apply. A
+// second amendment to the same set folds too, and Last keeps advancing.
+func TestApplyDiffAmendsOwnProposal(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	// Refine the set's own text: "socket" becomes "port".
+	_, conflicts := s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("amending own proposal conflicted: %+v", conflicts)
+	}
+	if got := text(s); got != "hello port\n" {
+		t.Errorf("text = %q, want the amendment applied", got)
+	}
+	gs := s.Groups()
+	if len(gs) != 1 {
+		t.Fatalf("groups = %+v, want the amendment folded into the one set", gs)
+	}
+	if gs[0].ID != id || gs[0].Author != Agent {
+		t.Errorf("group = %+v, want the original proposal %d", gs[0], id)
+	}
+	if gs[0].Ops != 2 {
+		t.Errorf("ops = %d, want the amendment counted as a member", gs[0].Ops)
+	}
+	if gs[0].Bytes != -1 {
+		t.Errorf("bytes = %d, want the net change -1", gs[0].Bytes)
+	}
+	if gs[0].Last <= gs[0].First {
+		t.Errorf("last = %d, want it advanced past first %d", gs[0].Last, gs[0].First)
+	}
+
+	// A later amendment of the same set folds too, and Last keeps advancing.
+	_, conflicts = s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 10, Text: "PORT"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("second amendment conflicted: %+v", conflicts)
+	}
+	if got := text(s); got != "hello PORT\n" {
+		t.Errorf("text = %q after the second amendment", got)
+	}
+	gs = s.Groups()
+	if len(gs) != 1 || gs[0].ID != id || gs[0].Ops != 3 {
+		t.Fatalf("groups = %+v, want the three-member set %d", gs, id)
+	}
+	if gs[0].Last != 2 {
+		t.Errorf("last = %d after the second amendment, want 2", gs[0].Last)
+	}
+}
+
+// The amend exception is narrow: a set the same writer already rejected is not
+// resurrected by an edit. Un-rejecting is a decision and removing the text is
+// clear, so a new apply into the rejected run still refuses.
+func TestApplyDiffRefusesOwnRejectedSet(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	if !s.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	v0 := s.Version()
+
+	_, conflicts := s.ApplyDiff(Agent, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 1 || conflicts[0].Group != id {
+		t.Fatalf("conflicts = %+v, want the rejected set to refuse", conflicts)
+	}
+	if s.Version() != v0 {
+		t.Errorf("version moved on a refused hunk: %d -> %d", v0, s.Version())
+	}
+	if got := text(s); got != "hello socket\n" {
+		t.Errorf("text = %q, want the rejected text unchanged", got)
+	}
+}
+
+// The amend exception is per-set: a hunk that also catches another writer's
+// proposed run is not a clean amendment and still refuses. Leased reports only
+// the first intersecting run, so the guard has to look for a second one
+// (leasedElsewhere); folding the hunk in would overwrite that writer's text.
+func TestApplyDiffRefusesAHunkSpanningTwoLeases(t *testing.T) {
+	s := groupSession(t, "aaa bbb ccc\n")
+	base := s.Version()
+
+	// Two disjoint proposals: the agent's "AAA" and the user's "BBB".
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 0, End: 3, Text: "AAA"}})
+	agentSet := s.LastGroup()
+	s.MarkGroup(agentSet, Proposed)
+	s.ApplyDiff(User, base, []Hunk{{Start: 4, End: 7, Text: "BBB"}})
+	userSet := s.LastGroup()
+	s.MarkGroup(userSet, Proposed)
+	if got := text(s); got != "AAA BBB ccc\n" {
+		t.Fatalf("setup produced %q", got)
+	}
+	v0 := s.Version()
+
+	// The agent's hunk starts in its own set but spans the user's too, so it is
+	// refused: the user's run is a lease it does not own.
+	_, conflicts := s.ApplyDiff(Agent, v0, []Hunk{{Start: 0, End: 7, Text: "XXX"}})
+	if len(conflicts) != 1 {
+		t.Fatalf("conflicts = %+v, want one refusal for the second lease", conflicts)
+	}
+	if conflicts[0].Group == 0 {
+		t.Errorf("conflict = %+v, want it to name a lease", conflicts[0])
+	}
+	if s.Version() != v0 {
+		t.Errorf("version moved on a refused hunk: %d -> %d", v0, s.Version())
+	}
+	if got := text(s); got != "AAA BBB ccc\n" {
+		t.Errorf("text = %q, want both proposals unchanged", got)
+	}
+}

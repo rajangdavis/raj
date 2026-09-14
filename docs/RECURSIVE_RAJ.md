@@ -51,8 +51,9 @@ This section is the prompt the user autoloads; executing it is what
    answers the flagged decisions. No edits before explicit approval.
 4. **Implement with focused raj subagents** (section 7): one item, or one
    tight cluster, per `subagent_type: "raj"` task, each with a
-   self-contained brief — the tooling rules (section 6), the no-token rule
-   (section 2), the read-gate discipline (section 5), the files in scope,
+   self-contained brief — the tooling rules (section 6), the identity rule
+   (section 2: each subagent runs `register` and uses `-as`), the read-gate
+   discipline (section 5), the files in scope,
    and what to report back. Changes to this file, the agent definitions and
    other opencode config are made by the orchestrator directly, never
    delegated.
@@ -101,14 +102,23 @@ filesystem. All file reads and writes go through `raj ctl` ONLY. Your edits
 land as ATTRIBUTED PROPOSALS in the user's buffers, tinted as yours; the user
 reviews, accepts and saves. Never accept or save your own proposals.
 
-## 2. Identity is automatic
+## 2. Identity is explicit — register once, then `-as`
 
-The host plugin (plugins/raj-gate.ts) injects, captures and scrubs
-RAJ_IDENTITY per session: your first `raj ctl` runs unpinned, the server mints
-a durable tok_..., the plugin captures the adopt line before it reaches you and
-reinjects it on later shells. Each session/subagent is a DISTINCT author id
-with a distinct tint. Do NOT pass `-as`, export RAJ_IDENTITY, or run the old
-`who -as X -name Y` choreography. It is handled; move on.
+Identity is no longer absorbed for you. Mint a key once per run:
+
+    raj ctl register
+
+It prints a short random key (`raj-1a2b3c4d`) and binds it server-side. Pass
+`-as <key>` on every later call:
+
+    raj ctl read -as raj-1a2b3c4d docs/TODO.md
+
+Every `raj ctl` invocation is a fresh connection, so without `-as` each call
+mints a fresh author id from a `uint8` space capped at 256 — attribution
+scatters across dead ids and per-author state (dump snapshots) does not
+survive. One `register` per run and `-as` on every call keep your author
+stable. Subagents each run `register` themselves and get their own key;
+`-name` gives the participant a display name in `who`.
 
 ## 3. The rebuild boundary
 
@@ -208,22 +218,23 @@ reach it. A cheap walk and a session spent re-reading are the difference.
     means unsaved work — keep it. Never close a buffer holding a pending
     proposal the user has not decided.
 
-## 6. No-interpreter rule
+## 6. Tooling rule — `raj ctl` for content, `jq` for shaping
 
-Only `raj ctl` verbs for file content. No python/node/jq/sed/awk anywhere —
-not even to parse `raj ctl -json` output. If output is hard to consume, that
-is a verb-surface GAP: report it and file it in docs/TODO.md, do not route
-around it. Workarounds drift; verbs do not.
+Only `raj ctl` verbs read and write file content. `jq` is allowed for shaping
+`raj ctl -json` output. No python/node/sed/awk anywhere. If output is hard to
+consume even with `jq`, that is still a verb-surface GAP: report it and file it
+in docs/TODO.md, do not route around it. Workarounds drift; verbs do not.
 
 ## 7. Swarm workflow
 
 - Spawn subagents via the task tool as `subagent_type: "raj"` ONLY (the plugin
   gates this).
-- Each subagent gets a distinct identity automatically — never brief a token
-  or an `-as` flag.
+- Each subagent mints its own identity: brief it to run `raj ctl register`
+  first, then pass `-as <key>` on every call. Never brief a token you minted.
 - Briefs must be self-contained: a subagent starts with NO skill context.
-  State the tooling rules (raj ctl only, no interpreters, no /tmp copies of
-  source) and the no-token rule in every brief.
+  State the tooling rules (raj ctl for content, `jq` allowed for shaping
+  `raj ctl -json` output, no /tmp copies of source) and the identity rule
+  (`register` once, `-as <key>` on every call) in every brief.
 - `raj ctl who` tells participants apart. `who -live` filters to connected
   participants; the full listing stays available because a gone participant's
   text is still in the document (it is the attribution record). The registry

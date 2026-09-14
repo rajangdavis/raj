@@ -437,7 +437,7 @@ func resolveSpan(start, end, size int) (int, int, error) {
 //
 // Byte offsets and -lines are in the returned text's own coordinates, which is
 // why the line translation builds an index over the projection it hands back.
-func (h host) Read(path string, start, end, lineStart, lineEnd int, annotated bool) ([]control.Span, []control.StateRun, uint64, error) {
+func (h host) Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) ([]control.Span, []control.StateRun, uint64, error) {
 	p, err := h.findOrLoad(path)
 	if err != nil {
 		return nil, nil, 0, err
@@ -511,7 +511,7 @@ func clipStates(runs []piecetable.StateRun, start, end int) []control.StateRun {
 	return out
 }
 
-func (h host) Version(path string) (uint64, error) {
+func (h host) Version(path string, author uint8) (uint64, error) {
 	p, err := h.findOrLoad(path)
 	if err != nil {
 		return 0, err
@@ -792,7 +792,7 @@ func (h host) Groups(path string) ([]control.Group, error) {
 // the rendering: the spans come from the same rebase walk that applies and
 // reverses edits, so what a reviewer sees is where the change sits now, not
 // where it was written.
-func (h host) Diff(path string) ([]control.DiffGroup, error) {
+func (h host) Diff(path string, author uint8) ([]control.DiffGroup, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return nil, err

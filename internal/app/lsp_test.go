@@ -660,3 +660,46 @@ func TestAcceptServerEditCoversTypedExtension(t *testing.T) {
 		t.Errorf("line = %q, want handleEdit — the typed extension should be replaced", got)
 	}
 }
+
+// The idle scan pushes a document to its server only when a live server
+// already has it open and the buffer has moved past it. The decision is pure,
+// so the cases can be stated without a language server.
+func TestNeedsSync(t *testing.T) {
+	cases := []struct {
+		name           string
+		open           bool
+		synced, buffer int
+		want           bool
+	}{
+		{"not open", false, 0, 5, false},
+		{"open and current", true, 5, 5, false},
+		{"open and behind", true, 4, 5, true},
+		{"open and ahead", true, 6, 5, true},
+	}
+	for _, tc := range cases {
+		if got := needsSync(tc.open, tc.synced, tc.buffer); got != tc.want {
+			t.Errorf("%s: needsSync(%v, %d, %d) = %v, want %v",
+				tc.name, tc.open, tc.synced, tc.buffer, got, tc.want)
+		}
+	}
+}
+
+// The idle scan must never start a language server, and must not search PATH
+// either: the lookup is byID-only, so a fresh editor with no server costs one
+// map probe per pane. A registered server that is not live yet is skipped
+// without a panic.
+func TestSyncDirtyDocsNeverStartsAServer(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.syncDirtyDocs()
+	if n := len(h.servers.byID); n != 0 {
+		t.Fatalf("the idle scan registered %d server(s) with none running", n)
+	}
+	// The states a start leaves behind while the handshake is in flight or
+	// after a crash: an entry with no sync, and one whose sync has no live
+	// connection. Neither may be treated as live.
+	id := lsp.LanguageID(h.Pane().File.Path)
+	h.servers.byID[id] = &langServer{srv: &lsp.Server{}}
+	h.syncDirtyDocs()
+	h.servers.byID[id] = &langServer{srv: &lsp.Server{}, sync: lsp.NewSync(nil, lsp.SyncFull)}
+	h.syncDirtyDocs()
+}

@@ -55,6 +55,13 @@ type fakeEditor struct {
 	// headless names docs the fake reports as loaded with no tab, so the CLI
 	// buffers output can be tested on the field that says so.
 	headless map[string]bool
+	// claims is the fake's working set, and lastClaim the request that last
+	// touched it, so a CLI test can assert the wire fields. claimWarnings and
+	// claimOverlaps are canned answers the CLI can be tested on.
+	claims        []string
+	lastClaim     Request
+	claimWarnings []string
+	claimOverlaps []ClaimOverlap
 	// groups is the canned change-set list `groups` returns; decided records
 	// every id accept/reject was called with, in order; decideErr makes a named
 	// group fail, standing in for a reject a later edit wedged.
@@ -299,6 +306,29 @@ func (f *fakeEditor) run(req Request) Response {
 		return Response{OK: true, Groups: append([]Group(nil), f.groups...)}
 	case "lspprep":
 		return Response{OK: true, LSP: fakeLSP{json: f.lspJSON}}
+	case "claim":
+		f.lastClaim = req
+		switch {
+		case req.ClaimClear:
+			f.claims = nil
+		case req.ClaimAdd:
+			for _, p := range req.Paths {
+				dup := false
+				for _, q := range f.claims {
+					if q == p {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					f.claims = append(f.claims, p)
+				}
+			}
+		case len(req.Paths) > 0:
+			f.claims = append([]string(nil), req.Paths...)
+		}
+		return Response{OK: true, Claims: append([]string(nil), f.claims...),
+			ClaimWarnings: f.claimWarnings, ClaimOverlaps: f.claimOverlaps}
 	}
 	return Response{Err: "unknown op " + req.Op}
 }
@@ -688,6 +718,86 @@ func TestCLIJSON(t *testing.T) {
 	}
 }
 
+// claim sets, extends, clears and reports the working set, and the flags reach
+// the wire as the request fields the host reads.
+func TestCLIClaim(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "a\n", "/w/b.go": "b\n"})
+
+	out, errs, code := run(t, "claim", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("claim code %d: %s", code, errs)
+	}
+	if strings.Join(ed.lastClaim.Paths, ",") != "/w/a.go,/w/b.go" ||
+		ed.lastClaim.ClaimAdd || ed.lastClaim.ClaimClear {
+		t.Errorf("claim request = %+v", ed.lastClaim)
+	}
+	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "/w/b.go") {
+		t.Errorf("claim output = %q, want both paths", out)
+	}
+
+	// -add extends, and the CLI prints the resulting set.
+	out, errs, code = run(t, "claim", "-add", "/w/c.go")
+	if code != 0 || !ed.lastClaim.ClaimAdd {
+		t.Fatalf("claim -add code %d, request %+v: %s", code, ed.lastClaim, errs)
+	}
+	if !strings.Contains(out, "/w/c.go") || !strings.Contains(out, "/w/a.go") {
+		t.Errorf("claim -add output = %q, want the extended set", out)
+	}
+
+	// report: no operands and no flags.
+	ed.lastClaim = Request{}
+	out, _, code = run(t, "claim")
+	if code != 0 || len(ed.lastClaim.Paths) != 0 || ed.lastClaim.ClaimAdd || ed.lastClaim.ClaimClear {
+		t.Errorf("claim report request = %+v", ed.lastClaim)
+	}
+	if !strings.Contains(out, "claimed") {
+		t.Errorf("claim report output = %q", out)
+	}
+
+	// -clear releases the set.
+	out, errs, code = run(t, "claim", "-clear")
+	if code != 0 || !ed.lastClaim.ClaimClear {
+		t.Fatalf("claim -clear code %d, request %+v: %s", code, ed.lastClaim, errs)
+	}
+	if !strings.Contains(out, "empty") {
+		t.Errorf("claim -clear output = %q, want an empty-set note", out)
+	}
+}
+
+// The two mode flags are alternatives, and a warning and an overlap are
+// surfaced rather than swallowed.
+func TestCLIClaimFlagsAndReports(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "a\n"})
+	if _, errs, code := run(t, "claim", "-add", "-clear"); code != 2 || !strings.Contains(errs, "alternatives") {
+		t.Errorf("claim -add -clear: code %d, stderr %q", code, errs)
+	}
+
+	// The per-verb help names the operand, and does not claim a missing path
+	// targets the buffer on screen — claim reports instead.
+	if _, errs, code := run(t, "claim", "-h"); code != 0 ||
+		!strings.Contains(errs, "raj ctl claim [path]...") || strings.Contains(errs, "looking at") {
+		t.Errorf("claim -h: code %d, stderr %q", code, errs)
+	}
+
+	ed.claimWarnings = []string{"/w/gone.go skipped: no such file"}
+	ed.claimOverlaps = []ClaimOverlap{{Path: "/w/a.go", Identity: "bob", Author: 3}}
+	out, errs, code := run(t, "claim", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("claim code %d: %s", code, errs)
+	}
+	if !strings.Contains(errs, "gone.go") || !strings.Contains(errs, "bob") {
+		t.Errorf("claim warnings/overlaps = stdout %q stderr %q", out, errs)
+	}
+
+	// -json carries the same three parts structurally.
+	out, _, code = run(t, "claim", "-json", "/w/a.go")
+	if code != 0 || !strings.Contains(out, `"claims"`) ||
+		!strings.Contains(out, `"warnings"`) || !strings.Contains(out, `"overlaps"`) ||
+		!strings.Contains(out, `"identity": "bob"`) {
+		t.Errorf("json claim = %q, code %d", out, code)
+	}
+}
+
 // diff is the review surface: each pending group renders as old→new lines
 // under its id, author and span; -json returns the structured form.
 func TestCLIDiffRendersPendingChanges(t *testing.T) {
@@ -724,6 +834,23 @@ func TestCLIUsage(t *testing.T) {
 	}
 	if out, _, code := run(t, "help"); code != 0 || !strings.Contains(out, "edit") {
 		t.Errorf("help: code %d, stdout %q", code, out)
+	}
+}
+
+// A verb's -h is the flag package's usage with the positional made explicit.
+// The flag package lists only flags, so without that line a caller cannot tell
+// that edit takes an optional path, nor what omitting one targets.
+func TestVerbHelpNamesTheOptionalPath(t *testing.T) {
+	if _, errs, code := run(t, "edit", "-h"); code != 0 {
+		t.Fatalf("edit -h exited %d, want 0", code)
+	} else if !strings.Contains(errs, "raj ctl edit [path]") ||
+		!strings.Contains(errs, "buffer the user is looking at") {
+		t.Errorf("edit -h = %q, want the positional and the default target", errs)
+	}
+	// A verb whose path is required says so, rather than offering a default
+	// target it does not have.
+	if _, errs, _ := run(t, "open", "-h"); strings.Contains(errs, "with no path") {
+		t.Errorf("open -h = %q, but open needs a path", errs)
 	}
 }
 
@@ -880,9 +1007,66 @@ func TestSearchReportsTruncatedFiles(t *testing.T) {
 		t.Fatalf("json code %d: %s", code, errs)
 	}
 	if !strings.Contains(out, `"truncated": [`) ||
-		!strings.Contains(out, `"Total": 1434`) ||
-		!strings.Contains(out, `"Shown": 2`) {
+		!strings.Contains(out, `"total": 1434`) ||
+		!strings.Contains(out, `"shown": 2`) {
 		t.Errorf("json = %q, want the truncated list", out)
+	}
+}
+
+// localise rewrites every path in a response into the caller's view. The
+// fields that hide a path are the ones a nested document or a prose error
+// carries: the truncated file list, the encoded diff, and an editor refusal.
+// Each is covered here, and the diff's hunk text is checked to prove a
+// path-like Old or New is not rewritten along with the Group path beside it.
+func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
+	var c Client
+	c.SetMapper(Mapper{Local: "/workspace", Editor: "/Users/rajan/src/raj"})
+
+	res := Response{
+		Root:      "/Users/rajan/src/raj",
+		Truncated: []TruncatedFile{{Path: "/Users/rajan/src/raj/big.md", Shown: 2, Total: 9}},
+		DiffJSON: `[{"id":7,"path":"/Users/rajan/src/raj/a.go","author":2,` +
+			`"state":"proposed","ops":1,"bytes":1,"first":1,"last":1,` +
+			`"hunks":[{"start":0,"end":0,"old":"/Users/rajan/src/raj in text","new":""}],"moved":0}]`,
+		Err: "no open buffer for /Users/rajan/src/raj/a.go",
+	}
+	c.localise(&res)
+
+	if res.Root != "/workspace" {
+		t.Errorf("Root = %q", res.Root)
+	}
+	if got := res.Truncated[0].Path; got != "/workspace/big.md" {
+		t.Errorf("Truncated.Path = %q", got)
+	}
+	if got := res.Err; got != "no open buffer for /workspace/a.go" {
+		t.Errorf("Err = %q", got)
+	}
+	var diffs []DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatalf("DiffJSON did not parse: %v", err)
+	}
+	if len(diffs) != 1 {
+		t.Fatalf("DiffJSON holds %d groups, want 1", len(diffs))
+	}
+	if diffs[0].Path != "/workspace/a.go" {
+		t.Errorf("DiffGroup.Path = %q", diffs[0].Path)
+	}
+	// The hunk's Old text is content, not a path, and must survive untouched —
+	// the thing a string replace inside the encoded JSON would have corrupted.
+	if got := diffs[0].Hunks[0].Old; got != "/Users/rajan/src/raj in text" {
+		t.Errorf("DiffHunk.Old = %q, want it left alone", got)
+	}
+}
+
+// A root that is only a character prefix of a longer directory name is not a
+// path inside the mapped tree, and rewriting it would corrupt the message.
+func TestLocaliseErrLeavesNonBoundaryAlone(t *testing.T) {
+	var c Client
+	c.SetMapper(Mapper{Local: "/workspace", Editor: "/Users/rajan/src/raj"})
+	res := Response{Err: "no open buffer for /Users/rajan/src/rajx/a.go"}
+	c.localise(&res)
+	if res.Err != "no open buffer for /Users/rajan/src/rajx/a.go" {
+		t.Errorf("Err = %q, want the out-of-tree path untouched", res.Err)
 	}
 }
 
@@ -1070,6 +1254,153 @@ func TestWhoamiPrintsTheID(t *testing.T) {
 	}
 }
 
+// register mints an explicit key and binds it, and -as pins a caller-chosen
+// key so repeated calls are the same writer. The fake editor runs the real
+// server, so the hello/author binding under test is the shipped one.
+func TestRegisterMintsAndBindsAKey(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	out, errs, code := run(t, "register", "-json")
+	if code != 0 {
+		t.Fatalf("register exited %d: %s", code, errs)
+	}
+	var got struct {
+		Key    string `json:"key"`
+		Author uint8  `json:"author"`
+		Name   string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("register -json = %q: %v", out, err)
+	}
+	suffix := strings.TrimPrefix(got.Key, "raj-")
+	if len(got.Key) != len("raj-")+8 || strings.Trim(suffix, "0123456789abcdef") != "" {
+		t.Errorf("key = %q, want raj- plus 8 lowercase hex chars", got.Key)
+	}
+	if got.Name != "raj" {
+		t.Errorf("name = %q, want the default", got.Name)
+	}
+	if got.Author < FirstAgent {
+		t.Errorf("author = %d, want an agent id", got.Author)
+	}
+
+	// An explicit -as skips the duplicate-key guard: the key may already
+	// belong to a participant and register still binds it, because the choice
+	// belongs to the caller. Claim mykey on another connection first.
+	owner, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	claim, err := owner.Do(Request{Op: "hello", Identity: "mykey", Name: "claimed"})
+	if err != nil || !claim.OK {
+		t.Fatalf("claiming mykey: res=%+v err=%v", claim, err)
+	}
+	inUse := owner.Author()
+	if inUse < FirstAgent {
+		t.Fatalf("claimed author = %d", inUse)
+	}
+	reused, _, code := run(t, "register", "-as", "mykey", "-json")
+	if code != 0 {
+		t.Fatalf("register -as an in-use key exited %d", code)
+	}
+	var gotReused struct {
+		Key    string `json:"key"`
+		Author uint8  `json:"author"`
+	}
+	if err := json.Unmarshal([]byte(reused), &gotReused); err != nil {
+		t.Fatal(err)
+	}
+	if gotReused.Key != "mykey" || gotReused.Author != inUse {
+		t.Errorf("register -as mykey = %s, want key mykey and author %d", reused, inUse)
+	}
+
+	// The same chosen key on two calls is the same author, and the reply is
+	// identical because the key is not random.
+	first, _, code := run(t, "register", "-as", "mykey", "-json")
+	if code != 0 {
+		t.Fatalf("register -as exited %d", code)
+	}
+	second, _, code := run(t, "register", "-as", "mykey", "-json")
+	if code != 0 {
+		t.Fatalf("register -as exited %d", code)
+	}
+	if first != second {
+		t.Errorf("register -as mykey is not stable:\n first %s\nsecond %s", first, second)
+	}
+	var pinned struct {
+		Author uint8 `json:"author"`
+	}
+	if err := json.Unmarshal([]byte(first), &pinned); err != nil {
+		t.Fatal(err)
+	}
+	if pinned.Author < FirstAgent {
+		t.Errorf("pinned author = %d, want an agent id", pinned.Author)
+	}
+}
+
+// The human-readable form of register names the key and how to use it, not the
+// anonymous adopt line the generic bind prints for other verbs.
+func TestRegisterPrintsTheKey(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	out, errs, code := run(t, "register")
+	if code != 0 {
+		t.Fatalf("register exited %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "key: raj-") || !strings.Contains(out, "-as raj-") {
+		t.Errorf("register = %q, want the key and the -as line", out)
+	}
+	if strings.Contains(errs, "RAJ_IDENTITY") {
+		t.Errorf("register printed an adopt line: %q", errs)
+	}
+}
+
+// A generated key that collides with an existing identity is redrawn, and the
+// retry loop is bounded so a registry that owns every candidate cannot spin.
+func TestMintRegisterKeyRetriesAndBounds(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	// Claim the first candidate so mintRegisterKey has to redraw past it.
+	owner, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if _, err := owner.Do(Request{Op: "hello", Identity: "raj-aaaaaaaa", Name: "taken"}); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// First draw collides, second is free: the free one comes back.
+	draws := []string{"raj-aaaaaaaa", "raj-bbbbbbbb"}
+	key, err := mintRegisterKey(c, func() (string, error) {
+		next := draws[0]
+		draws = draws[1:]
+		return next, nil
+	})
+	if err != nil {
+		t.Fatalf("mintRegisterKey: %v", err)
+	}
+	if key != "raj-bbbbbbbb" {
+		t.Errorf("key = %q, want the second draw", key)
+	}
+
+	// Every draw collides: the loop gives up at the bound.
+	_, err = mintRegisterKey(c, func() (string, error) { return "raj-aaaaaaaa", nil })
+	if err == nil {
+		t.Fatal("a permanent collision was accepted")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d attempts", registerMintAttempts)) {
+		t.Errorf("error = %q, want the attempt bound", err)
+	}
+}
+
 // setDirty makes the shared policy see unsaved buffers.
 func (f *fakeEditor) setDirty(d ...DirtyBuffer) {
 	f.policyMem.dirty = d
@@ -1226,7 +1557,7 @@ func TestExecStatsOverTheWire(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("stats exited %d", code)
 	}
-	if !strings.Contains(out, "Stale") || !strings.Contains(out, "AgentOnly") {
+	if !strings.Contains(out, "stale") || !strings.Contains(out, "agent_only") {
 		t.Errorf("stats = %q", out)
 	}
 }

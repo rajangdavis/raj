@@ -36,6 +36,13 @@ func fullHeader() Header {
 		StatesJSON:   `[{"off":0,"len":5,"group":0,"state":"accepted"}]`,
 		ReviewList:   true,
 		Annotated:    true,
+
+		Paths:         []string{"/w/a.go", "/w/b.go"},
+		ClaimAdd:      true,
+		ClaimClear:    true,
+		Claims:        []string{"/w/a.go"},
+		ClaimWarnings: []string{"/w/gone.go skipped"},
+		ClaimOverlaps: []ClaimOverlap{{Path: "/w/a.go", Identity: "bob", Author: 4}},
 	}
 }
 
@@ -284,7 +291,7 @@ func TestEveryVerbHasACode(t *testing.T) {
 	for _, op := range []string{
 		"ping", "buffers", "text", "open", "apply", "save", "version", "search",
 		"groups", "accept", "reject", "clear", "exec", "execcheck", "stats", "hello",
-		"cancel", "recv", "snapshot", "prog", "diff", "review",
+		"cancel", "recv", "snapshot", "prog", "diff", "review", "claim",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)

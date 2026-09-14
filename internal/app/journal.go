@@ -151,12 +151,12 @@ func (a *App) appendJournal(p *editor.Pane) {
 }
 
 // startTap opens or creates the log for a buffer's path and returns the
-// frontier it already holds, so the next append knows what is new. An existing
-// log whose frontier does not line up with the live session is refused rather
-// than appended to (it was not replayed into this buffer, so appending would
-// misaddress the store). A log whose base hash does not match the buffer's
-// origin is rotated out of the way first and a fresh one created against the
-// current bytes, because its ops no longer describe this document.
+// frontier it already holds, so the next append knows what is new. A log is
+// reused only when its base hash matches the buffer's origin and its frontier
+// lines up with the live session. Any other log describing this path -- a base
+// that names different bytes, or one this buffer did not replay -- is archived
+// rather than appended to (appending would misaddress the store) and a fresh
+// log is created against the current bytes.
 func (a *App) startTap(p *editor.Pane) *logTap {
 	path := p.File.Path
 	store := p.File.Session().Store()
@@ -181,28 +181,32 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 		}
 		if base.Hash == want {
 			tap := tapFromLog(l)
-			if !tap.matches(p.File.Session()) {
-				a.status = path + " has an op log that was not restored; not capturing"
-				return nil
-			}
-			if l.Damaged {
-				if err := l.Truncate(); err != nil {
+			if tap.matches(p.File.Session()) {
+				if l.Damaged {
+					if err := l.Truncate(); err != nil {
+						a.status = "journal: " + err.Error()
+						return nil
+					}
+				}
+				w, err := journal.OpenWriter(logPath)
+				if err != nil {
 					a.status = "journal: " + err.Error()
 					return nil
 				}
+				tap.w = w
+				a.putTap(path, tap)
+				return tap
 			}
-			w, err := journal.OpenWriter(logPath)
-			if err != nil {
-				a.status = "journal: " + err.Error()
-				return nil
-			}
-			tap.w = w
-			a.putTap(path, tap)
-			return tap
+			// The log's base matches but it recorded a session this buffer did
+			// not replay: a stale log left by an earlier session that a close
+			// should have removed. Archive it and capture fresh below rather
+			// than refusing to journal this buffer for the rest of its life.
+			a.status = "journal: " + filepath.Base(path) + " had a stale op log; archived, capturing fresh"
 		}
-		// The log describes bytes this buffer no longer has. Rotate it out of
-		// the way and lay a fresh base under the current origin below, rather
-		// than appending ops into a frame that never saw them.
+		// The log cannot be reused -- its base describes different bytes, or it
+		// describes a session this buffer did not replay. Rotate it out of the
+		// way and lay a fresh base under the current origin below, rather than
+		// appending ops into a frame that never saw them.
 		if a.archiveLog(logPath) == "" {
 			return nil
 		}
@@ -433,17 +437,20 @@ func (a *App) closeJournal(p *editor.Pane) {
 	}
 	a.appendJournal(p)
 	t := a.journals[p.File.Path]
-	if t == nil {
-		return
+	if t != nil {
+		if err := t.w.Close(); err != nil {
+			a.status = "journal: " + err.Error()
+		}
+		delete(a.journals, p.File.Path)
 	}
-	if err := t.w.Close(); err != nil {
-		a.status = "journal: " + err.Error()
-	}
+	// A clean buffer can carry a log from an earlier session -- one this
+	// function left behind because there was no live tap -- so remove the file
+	// whether or not a tap is open. Leaving it makes a later reopen hit the
+	// stale-log refusal in startTap.
 	logPath := filepath.Join(a.journalDir(), journalName(p.File.Path))
 	if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
 		a.status = "journal: " + err.Error()
 	}
-	delete(a.journals, p.File.Path)
 }
 
 // closeJournals flushes and closes every open log, on quit.
@@ -558,6 +565,12 @@ func (a *App) restoreLog(logPath string) {
 	if at := p.Cursors.Primary().Head; at > p.File.Len() {
 		p.Cursors.Set(p.File.Len(), p.File.Len())
 	}
+	// The restored session is exactly the frontier the log recorded, so install
+	// the tap now. Without it the first edit after a restart would reach
+	// startTap with the session already advanced past the log and archive a log
+	// that should be appended to. At this moment matches still holds, so
+	// startTap's reuse branch takes the log; a nil return has set the status.
+	a.startTap(p)
 	a.TouchSession()
 }
 

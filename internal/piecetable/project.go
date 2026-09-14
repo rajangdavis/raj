@@ -544,3 +544,26 @@ func (s *Session) Leased(pos, length int) (group uint64, ok bool) {
 	}
 	return 0, false
 }
+
+// leasedElsewhere reports whether [pos,pos+length) intersects a non-accepted
+// run whose group is not except: a second lease sharing the range. Leased
+// returns only the first intersecting run, so an own-proposal amendment has to
+// confirm no other writer's run is caught up in the same hunk before it is
+// allowed to fold in.
+func (s *Session) leasedElsewhere(pos, length int, except uint64) bool {
+	if !s.HasDecisions() {
+		return false
+	}
+	if length < 0 {
+		length = 0
+	}
+	for _, r := range s.Project(Annotated).States() {
+		if r.State == Accepted || r.Len <= 0 || r.Group == except {
+			continue
+		}
+		if pos < r.Off+r.Len && r.Off < pos+length {
+			return true
+		}
+	}
+	return false
+}

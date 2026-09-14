@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -83,10 +85,12 @@ type BufferHost interface {
 	// Project(Annotated), because apply's hunks are in the view frame;
 	// Annotated additionally returns the per-run owner and state alongside the
 	// spans. The agreed composition as the default is a future change.
-	Read(path string, start, end, lineStart, lineEnd int, annotated bool) (spans []Span, states []StateRun, version uint64, err error)
+	Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) (spans []Span, states []StateRun, version uint64, err error)
 
-	// Version is what a later Apply bases on, without moving the bytes.
-	Version(path string) (uint64, error)
+	// Version is what a later Apply bases on, without moving the bytes. It
+	// records the read under author, so asking for a version counts as that
+	// writer having seen the buffer.
+	Version(path string, author uint8) (uint64, error)
 
 	// Apply rebases hunks written against base onto the current document.
 	// Hunks are rejected independently; the conflicts say which.
@@ -98,9 +102,10 @@ type BufferHost interface {
 	// Groups lists the change sets in a buffer, oldest first.
 	Groups(path string) ([]Group, error)
 
-	// Decide accepts or rejects a change set. Rejection is undo addressed by
-	// group: the members are rebased through everything that landed after them
-	// and rolled back together if any cannot be placed.
+	// Decide accepts or rejects a change set. Both are pure state flips: a
+	// rejection marks the set rejected and the text stays in the document,
+	// dropping out of the agreed composition; it cannot fail or be wedged.
+	// Clear is the operation that reverses a rejected set out.
 	Decide(path string, group uint64, accept bool) error
 
 	// Clear hard-purges a rejected change set: the set's ops are reversed out
@@ -111,8 +116,9 @@ type BufferHost interface {
 
 	// Diff renders the buffer's pending change sets as old→new hunks in
 	// current coordinates: the review surface for what Groups only lists.
-	// An empty result means no changes await a decision.
-	Diff(path string) ([]DiffGroup, error)
+	// An empty result means no changes await a decision. Like Read, it records
+	// the read under author.
+	Diff(path string, author uint8) ([]DiffGroup, error)
 
 	// Review returns the buffer's pending change sets and, unless listOnly,
 	// enters Review mode at the first one. The list is what `groups` shows
@@ -188,16 +194,43 @@ type Guard struct {
 	// without one falls back to the id-range rule.
 	Participants *Registry
 
-	// read records which paths this connection has read, and at what version.
-	// Read-before-write is the check that stops a blind edit: offsets are
-	// meaningless except in the coordinates of a version somebody looked at,
-	// and a caller that never read is submitting numbers it invented.
-	mu    sync.Mutex
-	read  map[string]bool
-	stats ExecStats
+	// read records, per writer, which paths that writer has read, and at what
+	// version. Read-before-write is the check that stops a blind edit: offsets
+	// are meaningless except in the coordinates of a version somebody looked
+	// at, and a caller that never read is submitting numbers it invented. It
+	// is keyed by the durable author rather than the connection or the app, so
+	// a read by one writer never satisfies another writer's write gate.
+	//
+	// claims is the claim op's per-identity working set: the files each author
+	// has declared it is editing. It sits beside read under the same mutex
+	// because both are per-writer state the Guard owns, and a claim is keyed
+	// the same way — by durable author, not by connection. It is in-memory and
+	// resets with the process. The write verbs enforce it through claimTarget,
+	// and save is deliberately not gated; the reads never consult it.
+	mu     sync.Mutex
+	read   map[uint8]map[string]bool
+	claims map[uint8]map[string]bool
+	stats  ExecStats
 }
 
-func NewGuard(h BufferHost) *Guard { return &Guard{Host: h, read: map[string]bool{}} }
+func NewGuard(h BufferHost) *Guard {
+	return &Guard{Host: h, read: map[uint8]map[string]bool{}, claims: map[uint8]map[string]bool{}}
+}
+
+// markRead records that author has seen name, so that author's later write is
+// not blind. It is keyed by the durable author, not the connection: a read by
+// one writer must never satisfy the write gate for another.
+func (g *Guard) markRead(author uint8, name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.read == nil {
+		g.read = map[uint8]map[string]bool{}
+	}
+	if g.read[author] == nil {
+		g.read[author] = map[string]bool{}
+	}
+	g.read[author][name] = true
+}
 
 func (g *Guard) Root() string      { return g.Host.Root() }
 func (g *Guard) Buffers() []Buffer { return g.Host.Buffers() }
@@ -247,6 +280,48 @@ func (g *Guard) canonical(path string) (string, error) {
 	return resolved, nil
 }
 
+// claimTarget resolves the file a text write may touch and enforces the claim
+// set of the writing author. It is the gate for the write verbs, not for reads:
+// the explicit path is canonicalised exactly as it was before claims existed
+// (resolved, then checked in-root) and must be in the set, while a pathless
+// write targets the sole claimed file, so it never falls back to the buffer the
+// user is looking at.
+//
+// The refusals are concrete on purpose: the set is named so a caller can see
+// what it did claim, and an empty set says what to do first. Read, Version,
+// Diff and Dump never consult a claim and keep the focused-buffer default a
+// read has always had.
+func (g *Guard) claimTarget(author uint8, path string) (string, error) {
+	g.mu.Lock()
+	claims := sortedPaths(g.claims[author])
+	g.mu.Unlock()
+
+	if path != "" {
+		name, err := g.canonical(path)
+		if err != nil {
+			return "", err
+		}
+		if len(claims) == 0 {
+			return "", errors.New("claim a file first")
+		}
+		for _, p := range claims {
+			if p == name {
+				return name, nil
+			}
+		}
+		return "", fmt.Errorf("not in your claim set (%s); claim -add <path>", strings.Join(claims, ", "))
+	}
+
+	switch len(claims) {
+	case 0:
+		return "", errors.New("claim a file first")
+	case 1:
+		return claims[0], nil
+	default:
+		return "", fmt.Errorf("claim set has %d files; name one", len(claims))
+	}
+}
+
 func (g *Guard) Open(path string, create bool) (uint64, error) {
 	// Open names a file that may not be a buffer yet, so unlike every other
 	// verb there is no Resolve to canonicalise it. A relative path is made
@@ -282,33 +357,29 @@ func (g *Guard) Close(path string) error {
 	return g.Host.Close(name)
 }
 
-func (g *Guard) Read(path string, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
+func (g *Guard) Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
 	name, err := g.canonical(path)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	spans, states, v, err := g.Host.Read(name, start, end, lineStart, lineEnd, annotated)
+	spans, states, v, err := g.Host.Read(name, author, start, end, lineStart, lineEnd, annotated)
 	if err == nil {
-		g.mu.Lock()
-		g.read[name] = true
-		g.mu.Unlock()
+		g.markRead(author, name)
 	}
 	return spans, states, v, err
 }
 
-func (g *Guard) Version(path string) (uint64, error) {
+func (g *Guard) Version(path string, author uint8) (uint64, error) {
 	name, err := g.canonical(path)
 	if err != nil {
 		return 0, err
 	}
-	v, err := g.Host.Version(name)
+	v, err := g.Host.Version(name, author)
 	if err == nil {
 		// Asking for a version is asking for coordinates, which is the thing
 		// read-before-write is checking for. A caller that took the version
 		// deliberately is not editing blind.
-		g.mu.Lock()
-		g.read[name] = true
-		g.mu.Unlock()
+		g.markRead(author, name)
 	}
 	return v, err
 }
@@ -323,25 +394,21 @@ func (g *Guard) Dump(path string, start, end int, author uint8) (uint64, uint64,
 	}
 	id, v, text, hash, err := g.Host.Dump(name, start, end, author)
 	if err == nil {
-		g.mu.Lock()
-		g.read[name] = true
-		g.mu.Unlock()
+		g.markRead(author, name)
 	}
 	return id, v, text, hash, err
 }
 
 // Diff is a read in the read-before-write sense, like Dump: it hands back
 // chunks of the buffer's text and records that the caller has seen them.
-func (g *Guard) Diff(path string) ([]DiffGroup, error) {
+func (g *Guard) Diff(path string, author uint8) ([]DiffGroup, error) {
 	name, err := g.canonical(path)
 	if err != nil {
 		return nil, err
 	}
-	diffs, err := g.Host.Diff(name)
+	diffs, err := g.Host.Diff(name, author)
 	if err == nil {
-		g.mu.Lock()
-		g.read[name] = true
-		g.mu.Unlock()
+		g.markRead(author, name)
 	}
 	return diffs, err
 }
@@ -374,7 +441,7 @@ func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uin
 	} else if author < FirstAgent {
 		return 0, nil, fmt.Errorf("author %d is not an agent id", author)
 	}
-	name, err := g.canonical(path)
+	name, err := g.claimTarget(author, path)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -401,12 +468,12 @@ func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uin
 	} else if author < FirstAgent {
 		return 0, nil, fmt.Errorf("author %d is not an agent id", author)
 	}
-	name, err := g.canonical(path)
+	name, err := g.claimTarget(author, path)
 	if err != nil {
 		return 0, nil, err
 	}
 	g.mu.Lock()
-	seen := g.read[name]
+	seen := g.read[author][name]
 	g.mu.Unlock()
 	if !seen {
 		return 0, nil, errors.New("read the buffer before writing it: offsets only mean " +
@@ -488,11 +555,12 @@ func (g *Guard) Save(path string) (uint64, error) {
 }
 
 // Clear hard-purges a rejected change set, addressed by group rather than by
-// the caret. Like Save it is a write, so the path is canonicalised the same
-// way; the host owns the rejection state and reports a set that is not
-// rejected or that a later edit has wedged.
-func (g *Guard) Clear(path string, group uint64) error {
-	name, err := g.canonical(path)
+// the caret. It is a write, so it runs the claim gate like Apply and Patch:
+// only a claimed file can have text reversed out over the socket. The host
+// owns the rejection state and reports a set that is not rejected or that a
+// later edit has wedged.
+func (g *Guard) Clear(path string, author uint8, group uint64) error {
+	name, err := g.claimTarget(author, path)
 	if err != nil {
 		return err
 	}
@@ -563,6 +631,172 @@ func (g *Guard) Stats() ExecStats {
 	return g.stats
 }
 
+// Claim sets, extends, clears or reports an author's claim set: the files that
+// identity declares it is working on. A path is made absolute against the
+// workspace root and checked in-root without loading a buffer — a claim says
+// what is about to be edited, so it must not make the editor open anything. A
+// path that is not on disk is named in warnings and skipped, so the rest of
+// the command still lands.
+//
+// The set comes back in stable (sorted) order, along with the other writers
+// whose sets share a path, resolved to a display name (or the identity key
+// when no name is set) when a registry is available. Claims are not locks, so an overlap is a report and not a refusal.
+// The write verbs enforce the set in claimTarget: apply, patch and clear each
+// resolve their target through it, so a socket write cannot touch a file the
+// caller has not claimed. save is the human decision and is not gated.
+func (g *Guard) Claim(author uint8, paths []string, add, clear bool) (claims, warnings []string, overlaps []ClaimOverlap, err error) {
+	if len(paths) == 0 && !add && !clear {
+		claims = g.claimSet(author)
+		return claims, nil, g.claimOverlaps(author, claims), nil
+	}
+	if clear {
+		g.clearClaims(author)
+		return nil, nil, nil, nil
+	}
+	kept := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, raw := range paths {
+		p, cerr := g.claimPath(raw)
+		if cerr != nil {
+			return nil, nil, nil, cerr
+		}
+		if _, serr := os.Stat(p); serr != nil {
+			warnings = append(warnings, fmt.Sprintf("%s skipped: %v", p, serr))
+			continue
+		}
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		kept = append(kept, p)
+	}
+	if add {
+		claims = g.addClaims(author, kept)
+	} else {
+		g.setClaims(author, kept)
+		claims = g.claimSet(author)
+	}
+	return claims, warnings, g.claimOverlaps(author, claims), nil
+}
+
+// claimPath canonicalises a claim operand the way every other verb spells a
+// path: a relative name is made absolute against the workspace root, cleaned,
+// and checked in-root. It deliberately does not go through Host.Resolve, which
+// loads or opens a buffer; a claim is a declaration about a file, not a request
+// to read it.
+func (g *Guard) claimPath(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("claim needs a path")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(g.Host.Root(), path)
+	}
+	path = filepath.Clean(path)
+	if err := g.inRoot(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// claimSet returns an author's set in stable order. It takes the lock, so it
+// is also the read side the add and set helpers below defer to.
+func (g *Guard) claimSet(author uint8) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return sortedPaths(g.claims[author])
+}
+
+func (g *Guard) setClaims(author uint8, paths []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.claims == nil {
+		g.claims = map[uint8]map[string]bool{}
+	}
+	set := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		set[p] = true
+	}
+	g.claims[author] = set
+}
+
+func (g *Guard) addClaims(author uint8, paths []string) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.claims == nil {
+		g.claims = map[uint8]map[string]bool{}
+	}
+	if g.claims[author] == nil {
+		g.claims[author] = map[string]bool{}
+	}
+	for _, p := range paths {
+		g.claims[author][p] = true
+	}
+	return sortedPaths(g.claims[author])
+}
+
+func (g *Guard) clearClaims(author uint8) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.claims, author)
+}
+
+// claimOverlaps names the other authors holding any of paths. Names are
+// resolved from the registry after the set is snapshotted under the lock, so a
+// registry lookup never nests inside it; the display name is preferred over the
+// identity key, which is a random token for a registered harness.
+func (g *Guard) claimOverlaps(author uint8, paths []string) []ClaimOverlap {
+	if len(paths) == 0 {
+		return nil
+	}
+	g.mu.Lock()
+	var out []ClaimOverlap
+	for other, set := range g.claims {
+		if other == author {
+			continue
+		}
+		for _, p := range paths {
+			if set[p] {
+				out = append(out, ClaimOverlap{Path: p, Author: other})
+			}
+		}
+	}
+	g.mu.Unlock()
+	if g.Participants != nil {
+		for i := range out {
+			if p, ok := g.Participants.Get(out[i].Author); ok {
+				// Prefer the display name when one is set: a registered key is a
+				// random token, and a person reading an overlap wants the name
+				// the harness introduced itself under.
+				if p.Name != "" {
+					out[i].Identity = p.Name
+				} else {
+					out[i].Identity = p.Identity
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return out[i].Author < out[j].Author
+	})
+	return out
+}
+
+// sortedPaths flattens a claim set into the stable order the wire reports.
+func sortedPaths(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Dispatch turns one decoded request into a response. It is the only place the
 // verbs are interpreted, so the socket adapter and an in-process caller cannot
 // diverge about what an op means.
@@ -612,7 +846,7 @@ func Dispatch(g *Guard, req Request) Response {
 		if req.LineEnd != nil {
 			lineEnd = *req.LineEnd
 		}
-		spans, states, v, err := g.Read(req.Path, start, end, lineStart, lineEnd, req.Annotated)
+		spans, states, v, err := g.Read(req.Path, req.Author, start, end, lineStart, lineEnd, req.Annotated)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -636,7 +870,7 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		return Response{OK: true, Groups: groups}
 	case "diff":
-		diffs, err := g.Diff(req.Path)
+		diffs, err := g.Diff(req.Path, req.Author)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -673,10 +907,16 @@ func Dispatch(g *Guard, req Request) Response {
 		if req.Group == 0 {
 			return Response{Err: "clear needs a group id; list them with `groups`"}
 		}
-		if err := g.Clear(req.Path, req.Group); err != nil {
+		if err := g.Clear(req.Path, req.Author, req.Group); err != nil {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}
+	case "claim":
+		claims, warnings, overlaps, err := g.Claim(req.Author, req.Paths, req.ClaimAdd, req.ClaimClear)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true, Claims: claims, ClaimWarnings: warnings, ClaimOverlaps: overlaps}
 	case "stats":
 		return Response{OK: true, Stats: g.Stats()}
 	case "execcheck":
@@ -708,7 +948,7 @@ func Dispatch(g *Guard, req Request) Response {
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
-		v, err := g.Version(name)
+		v, err := g.Version(name, req.Author)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -731,7 +971,7 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: "apply needs a base version; read the buffer or ask for its version first"}
 		}
 		if len(req.Hunks) == 0 {
-			v, err := g.Version(req.Path)
+			v, err := g.Version(req.Path, req.Author)
 			return done(v, err)
 		}
 		v, conflicts, err := g.Apply(req.Path, req.Author, *req.Base, req.Hunks)

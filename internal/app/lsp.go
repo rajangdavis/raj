@@ -99,6 +99,31 @@ func (s *servers) running(path string) *langServer {
 	return ls
 }
 
+// live returns the server already running for the language of a path, without
+// starting one and without checking whether the binary is on PATH. It is the
+// liveness test in state with the two things state adds for its callers removed
+// -- the PATH search and the reason there is no server -- for a caller that only
+// needs to know whether a server is already there. The idle sync walks every
+// open pane on every tick, and a PATH search per pane per tick is the cost this
+// avoids: a path whose server was never started has no entry to find, so
+// nothing is lost.
+func (s *servers) live(path string) *langServer {
+	id := lsp.LanguageID(path)
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls := s.byID[id]
+	if ls == nil || ls.srv == nil || ls.sync == nil {
+		return nil
+	}
+	if ls.srv.Conn() == nil {
+		return nil
+	}
+	return ls
+}
+
 // for_ returns the server for a path's language, starting it if needed, along
 // with why it is or is not available.
 func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
@@ -289,6 +314,64 @@ func (a *App) syncDoc(ls *langServer, p *editor.Pane) bool {
 	last, _ := ls.sync.Version(path)
 	ls.sync.Change(path, text, version, editsSince(sess, piecetable.Version(last)))
 	return true
+}
+
+// syncDirtyDocs brings any open document that a live server already knows
+// about up to the current text of the buffer. It runs from the idle tick, so a
+// buffer the user is not looking at is synced too: diagnostics are answered
+// from what the server last published, and a server that was never told about
+// an edit cannot publish for it. The visible pane already reaches a sync
+// through the inlay-hint request; this gives every open pane the same
+// guarantee, and runs first so the hint request sees a synced document.
+//
+// It never starts a server. A server starts on a request that needs one, and
+// an idle tick that spawned one for every open tab would turn having a file
+// open into a subprocess launch, which is the cost this editor deliberately
+// declines to pay. The lookup is live, not for_: it reads the byID table and
+// never touches PATH, and a path with no live server is simply skipped.
+//
+// The version compare in front of each pane is what keeps the scan cheap: an
+// unchanged buffer costs one integer comparison, so this can run every tick.
+// It does not compare text, because that would materialise every open buffer.
+// A reload restarts a session version numbering, so an equal version over new
+// text is possible; this guard cannot see that without the materialisation it
+// exists to avoid.
+func (a *App) syncDirtyDocs() {
+	for _, p := range a.Tabs.All() {
+		a.syncDirtyPane(p)
+	}
+	// Headless buffers cost the same one comparison and are skipped unless a
+	// live server already has the document open, so including them cannot
+	// start anything.
+	for _, p := range a.headless {
+		a.syncDirtyPane(p)
+	}
+}
+
+// syncDirtyPane syncs one pane if a live server has its document open and
+// behind. A pane with no path, no live server, or no open document is left
+// untouched.
+func (a *App) syncDirtyPane(p *editor.Pane) {
+	path := a.docPath(p)
+	if path == "" {
+		return
+	}
+	ls := a.servers.live(path)
+	if ls == nil {
+		return
+	}
+	synced, open := ls.sync.Version(path)
+	if !needsSync(open, synced, int(p.File.Session().Version())) {
+		return
+	}
+	a.syncDoc(ls, p)
+}
+
+// needsSync reports whether a document the server has open is behind the
+// buffer. It is pure so the rule is testable without a language server: only a
+// live, open document needs a push, and only when its version has moved.
+func needsSync(open bool, syncedVersion, bufVersion int) bool {
+	return open && syncedVersion != bufVersion
 }
 
 // editsSince renders the journal window (since, present] as LSP edits, in

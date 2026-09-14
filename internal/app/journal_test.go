@@ -580,3 +580,153 @@ func TestJournalRestoreKeepsUnsavedLog(t *testing.T) {
 		t.Errorf("the log backing a restored tab went missing: %v", err)
 	}
 }
+
+// A log whose base matches the buffer's origin but whose session was not the
+// replay of that log is stale -- the leftover an earlier close used to leave.
+// Editing the buffer must archive it and start a fresh log rather than refuse
+// to capture for the rest of the buffer's life.
+func TestJournalStaleLogIsArchivedAndCaptureResumes(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("XY")
+	h.flushJournal(p)
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+
+	// A second app over the same workspace opens the file fresh. Its origin is
+	// the disk bytes the log's base names, but its session is not the replay
+	// the log recorded, so startTap must not reuse the log.
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.OpenFile(p.File.Path)
+
+	q := a.Pane()
+	f := q.File
+	f.Begin()
+	f.ApplyDiff(piecetable.User, f.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 0, Text: "Z"}})
+	f.End()
+	a.flushJournal(q)
+
+	if got := a.Status(); !strings.Contains(got, "had a stale op log; archived, capturing fresh") {
+		t.Errorf("status = %q, want the stale-log note", got)
+	}
+	if got := archivedLogs(t, a); len(got) != 1 {
+		t.Errorf("archived logs = %d, want the stale one", len(got))
+	}
+	if a.journals[q.File.Path] == nil {
+		t.Fatal("no fresh tap after archiving the stale log")
+	}
+	l, err := journal.Open(logPath)
+	if err != nil {
+		t.Fatalf("opening the fresh log: %v", err)
+	}
+	base, ok := baseOf(l)
+	if !ok {
+		t.Fatal("the fresh log has no base record")
+	}
+	if base.Hash != hashBytes([]byte("base\n")) {
+		t.Errorf("fresh base hash = %q, want the origin digest", base.Hash)
+	}
+	sess := buildSession(l)
+	if sess == nil {
+		t.Fatal("buildSession refused the fresh log")
+	}
+	if got, want := sess.Buffer().Slice(0, sess.Buffer().Len()), q.File.Text(); got != want {
+		t.Errorf("captured text = %q, want %q (capture did not resume)", got, want)
+	}
+}
+
+// closeJournal must remove the log even when the buffer has no live tap: a
+// clean buffer can carry a log from an earlier session, and leaving it makes a
+// later reopen hit the stale-log refusal.
+func TestJournalCloseRemovesLogWithoutTap(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.press("super+s") // save first, so the buffer is clean
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("no log before the close: %v", err)
+	}
+
+	// Model the clean buffer that carries a log but has no live tap.
+	delete(h.journals, p.File.Path)
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("log vanished before closeJournal: %v", err)
+	}
+
+	h.closeJournal(p)
+
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Errorf("closeJournal with no tap left the log on disk (err=%v)", err)
+	}
+}
+
+// The ordinary restore path still works: a log that matches the restored
+// session is reused and appended to, not archived, and capture continues.
+func TestJournalRestoredLogIsReusedNotArchived(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.flushJournal(p)
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+	// A real restart has the tab in the session, so record it.
+	h.sessionTick(time.Now())
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	q := a.Pane()
+	if q == nil {
+		t.Fatal("the log did not restore")
+	}
+	if got := q.File.Text(); got != "Xbase\n" {
+		t.Fatalf("restored text = %q, want Xbase\\n", got)
+	}
+	before := readLog(t, h, q.File.Path)
+
+	// The first edit after a restore goes through startTap with no live tap:
+	// the matching log must be reused rather than rotated away.
+	f := q.File
+	f.Begin()
+	f.ApplyDiff(piecetable.User, f.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 0, Text: "Y"}})
+	f.End()
+	a.flushJournal(q)
+
+	if got := archivedLogs(t, a); len(got) != 0 {
+		t.Errorf("reuse archived the log: %d entries", len(got))
+	}
+	if a.journals[q.File.Path] == nil {
+		t.Fatal("no tap after editing a restored buffer")
+	}
+	after, err := journal.Open(logPath)
+	if err != nil {
+		t.Fatalf("opening the reused log: %v", err)
+	}
+	sess := buildSession(after)
+	if sess == nil {
+		t.Fatal("buildSession refused the reused log")
+	}
+	if got, want := sess.Buffer().Slice(0, sess.Buffer().Len()), q.File.Text(); got != want {
+		t.Errorf("reused log text = %q, want %q", got, want)
+	}
+	if len(after.Records) <= len(before.Records) {
+		t.Errorf("records after = %d, want more than %d (capture did not append)",
+			len(after.Records), len(before.Records))
+	}
+}

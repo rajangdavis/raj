@@ -2,11 +2,13 @@ package control
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -150,6 +152,12 @@ func (c *Client) write(req Request) error {
 	}
 	req.Path = c.paths.ToEditor(req.Path)
 	req.Dir = c.paths.ToEditor(req.Dir)
+	// claim names a list of files rather than the one Path, so each operand is
+	// translated too: a container calling the editor at /workspace would
+	// otherwise hand over paths the editor refuses as outside its root.
+	for i := range req.Paths {
+		req.Paths[i] = c.paths.ToEditor(req.Paths[i])
+	}
 	h, body := EncodeRequest(req)
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -252,6 +260,77 @@ func (c *Client) localise(res *Response) {
 	for i := range res.Groups {
 		res.Groups[i].Path = c.paths.FromEditor(res.Groups[i].Path)
 	}
+	for i := range res.Truncated {
+		res.Truncated[i].Path = c.paths.FromEditor(res.Truncated[i].Path)
+	}
+	// The claim answer names files the caller asked about, so they come back in
+	// its spelling too; a warning is prose built from an editor absolute path,
+	// so it goes through the same root-prefix rewrite Err uses.
+	for i := range res.Claims {
+		res.Claims[i] = c.paths.FromEditor(res.Claims[i])
+	}
+	for i := range res.ClaimWarnings {
+		res.ClaimWarnings[i] = c.localiseErr(res.ClaimWarnings[i])
+	}
+	for i := range res.ClaimOverlaps {
+		res.ClaimOverlaps[i].Path = c.paths.FromEditor(res.ClaimOverlaps[i].Path)
+	}
+	// DiffJSON is a nested document, not a path: unmarshal it, rebase the
+	// Group paths it carries, and marshal it back. A string replace inside the
+	// encoded JSON would rewrite a hunk's Old or New text, which is content.
+	if res.DiffJSON != "" {
+		var diffs []DiffGroup
+		if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err == nil {
+			for i := range diffs {
+				diffs[i].Path = c.paths.FromEditor(diffs[i].Path)
+			}
+			if b, err := json.Marshal(diffs); err == nil {
+				res.DiffJSON = string(b)
+			}
+		}
+	}
+	// Err is prose, not a path, but the editor builds it from absolute paths.
+	// Rewrite the mapped root at a path boundary so a refusal names the
+	// caller's spelling, and leave a longer name that merely starts with the
+	// root's characters alone.
+	res.Err = c.localiseErr(res.Err)
+}
+
+// localiseErr rewrites the editor root wherever it appears as a whole path
+// prefix in a message, leaving every other byte of the prose intact. Only call
+// it with an active mapper: it assumes Editor and Local are distinct.
+func (c *Client) localiseErr(s string) string {
+	root := c.paths.Editor
+	if root == "" {
+		return s
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(s, root)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		end := i + len(root)
+		b.WriteString(s[:i])
+		// A path boundary is the end of the string, a separator, or any byte
+		// that cannot extend a path name; anything else means the root is only
+		// a character prefix of a longer sibling name.
+		if end == len(s) || s[end] == '/' || !pathByte(s[end]) {
+			b.WriteString(c.paths.Local)
+		} else {
+			b.WriteString(s[i:end])
+		}
+		s = s[end:]
+	}
+}
+
+// pathByte reports whether b may appear in a path name, so a root followed by
+// one is the start of a longer name rather than the root itself.
+func pathByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' ||
+		b >= '0' && b <= '9' || b == '.' || b == '_' || b == '-' ||
+		b == '~' || b == '+'
 }
 
 // Author is the id this connection writes as, or 0 before the first exchange.

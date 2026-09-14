@@ -175,6 +175,16 @@ applied at an offset that has moved. Edits arriving here are attributed to the
 agent, not the user: they carry the agent tint and the user's undo does not
 swallow them.
 
+Rejecting a change set is a decision, not an edit. `raj ctl reject` marks the
+set rejected and it leaves the agreed composition, but the text stays in the
+document under the rejected tint; `raj ctl clear` is the hard purge, reversing
+the set out of the document and dropping the decision, after which the same
+text can be proposed again. So redoing work that came back rejected is
+`reject`, `clear`, then `apply` once more. `raj ctl open -create` is the way to
+name a path that is not on disk yet: without it `open` reaches only a buffer or
+file that already exists, and a path that is neither is refused as a typo
+rather than made into an empty buffer for a misspelled name to become later.
+
 Off unless asked for. Authorisation is the socket's file mode, so anything
 running as you can drive the editor — the same trust boundary as your shell.
 

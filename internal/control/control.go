@@ -108,6 +108,14 @@ type Request struct {
 	// disk is a name to make a new empty buffer for rather than a typo to
 	// refuse. Absent means open reaches only something that already exists.
 	Create bool
+	// Paths, ClaimAdd and ClaimClear are the claim op: the file-level working
+	// set an identity declares it is editing. Paths is the set, replaced by
+	// default and extended when ClaimAdd is set; ClaimClear releases it. A
+	// claim that carries none of the three reports the current set. The state
+	// is per identity, keyed by Author.
+	Paths      []string
+	ClaimAdd   bool
+	ClaimClear bool
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
@@ -170,10 +178,10 @@ type DiffHunk struct {
 // DirtyBuffer is an unsaved buffer, and whether every unsaved run in it was
 // written by an agent rather than by the human.
 type DirtyBuffer struct {
-	Path string
+	Path string `json:"path"`
 	// AgentOnly is true when no dirty span is the user's. It is the measurement
 	// the exec policy is waiting on, not yet a licence to flush.
-	AgentOnly bool
+	AgentOnly bool `json:"agent_only"`
 }
 
 // ExecStats counts how often a command ran against files that did not match the
@@ -184,9 +192,9 @@ type DirtyBuffer struct {
 // have been flushing an agent's own work. Neither is acted on: the command runs
 // either way and the caller is told.
 type ExecStats struct {
-	Runs      int
-	Stale     int
-	AgentOnly int
+	Runs      int `json:"runs"`
+	Stale     int `json:"stale"`
+	AgentOnly int `json:"agent_only"`
 }
 
 // SearchQuery is a search over the workspace. The fields mirror the editor's
@@ -207,23 +215,23 @@ type SearchQuery struct {
 
 // SearchMatch is one hit. Text is the whole line it was found on.
 type SearchMatch struct {
-	Path      string
-	Line      int // 1-based
-	Col       int // byte offset of the match within Text
-	Len       int
-	LineStart int // byte offset of the start of the hit line within the file
-	ByteStart int // byte offset of the match within the file
-	ByteEnd   int // one past the last byte of the match within the file
-	Text      string
+	Path      string `json:"path"`
+	Line      int    `json:"line"` // 1-based
+	Col       int    `json:"col"`  // byte offset of the match within Text
+	Len       int    `json:"len"`
+	LineStart int    `json:"line_start"` // byte offset of the start of the hit line within the file
+	ByteStart int    `json:"byte_start"` // byte offset of the match within the file
+	ByteEnd   int    `json:"byte_end"`   // one past the last byte of the match within the file
+	Text      string `json:"text"`
 }
 
 // TruncatedFile is one file the per-file cap cut down: Shown is how many rows
 // the search reported, Total how many matches the file holds. It is what makes
 // a capped file distinguishable from one that holds exactly the cap.
 type TruncatedFile struct {
-	Path  string
-	Shown int
-	Total int
+	Path  string `json:"path"`
+	Shown int    `json:"shown"`
+	Total int    `json:"total"`
 }
 
 // Span is one authored run of the document. Reads come back as spans rather
@@ -389,6 +397,16 @@ type LSPCaller interface {
 	Run(ctx context.Context) (json []byte, err error)
 }
 
+// ClaimOverlap names another identity that has claimed a path this one also
+// claims. Claims are not locks, so two writers may hold the same file; this
+// is how the second one learns who else is there. Identity is resolved from
+// the participant registry when one is available and is empty otherwise.
+type ClaimOverlap struct {
+	Path     string `json:"path"`
+	Identity string `json:"identity"`
+	Author   uint8  `json:"author"`
+}
+
 // Response is one line out. Err is a string rather than a code because the
 // consumer is a human at a socket at least as often as it is a program.
 type Response struct {
@@ -440,6 +458,13 @@ type Response struct {
 	Stats        ExecStats
 	Participants []Participant
 	Groups       []Group
+	// Claims is an identity's claim set in stable order, and ClaimWarnings the
+	// per-path notes for operands that were skipped (a claim path that is not
+	// on disk). ClaimOverlaps names the other writers sharing one of those
+	// paths. All three are the claim verb's answer.
+	Claims        []string
+	ClaimWarnings []string
+	ClaimOverlaps []ClaimOverlap
 	// SrcVersion is the revision the server was built from. connection.send
 	// stamps it on every response, so a client learns it on any frame, not
 	// just the handshake. Identity is on the hello reply only: the token the

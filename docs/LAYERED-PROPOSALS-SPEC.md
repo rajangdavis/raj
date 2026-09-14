@@ -319,9 +319,13 @@ Resolved 2026-09-12 (supersedes 2, 4 and 6; retires the promote rule):
 
 1. **Leases make spans disjoint.** A pending, rejected or invalidated span is an
    atomic read-only run. An edit or an agent `apply` whose range intersects one
-   is refused (a status note in the editor, a conflict over the socket). To
-   touch that text the set must first be accepted or rejected. Overlap is
-   therefore prevented, not resolved, and the projection never chooses an anchor.
+   is refused (a status note in the editor, a conflict over the socket), with
+   one exception added 2026-09-13: a writer amending its **own** `Proposed` set
+   is allowed, and the new ops join that set rather than opening a second one
+   (`Session.ApplyDiff` -> `commitInto`). Another writer's set, and a `Rejected`
+   set, still refuse; a hunk that also catches another writer's lease still
+   refuses (`leasedElsewhere`). Overlap is therefore prevented, not resolved,
+   and the projection never chooses an anchor.
 2. **Rejected and invalidated spans are hidden from the edit view and annotated
    in Review mode.** Edit mode shows accepted + proposed; Review mode shows every
    state with its annotation; `save`/`read`/`exec` still see `AcceptedOnly`.
