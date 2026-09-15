@@ -71,6 +71,11 @@ type Header struct {
 	// the special case is gone.
 	Path string
 
+	// NewPath is rename's destination: the second path, alongside Path. It
+	// is a byte string like Path and crosses the same way, sparsely, so a peer
+	// that does not know the verb omits it and a peer that does reads it.
+	NewPath string
+
 	// Author identifies the writer. 0 means unset; the editor assigns one per
 	// connection and refuses a request that names a different one.
 	Author uint8
@@ -146,6 +151,12 @@ type Header struct {
 	// presence flag like ReviewList, so a peer that does not know it omits it
 	// and keeps the refusing default.
 	Create bool
+
+	// Discard is close's switch for a buffer with unsaved changes: absent
+	// refuses the close and leaves the work, present drops the buffer and the
+	// work in it. It crosses as a presence flag like Create, so a peer that
+	// does not know it omits it and keeps the refusing default.
+	Discard bool
 	// Paths is the claim op's operand list, one file per record. ClaimAdd
 	// and ClaimClear are its mode flags: with neither, the list replaces the
 	// set; ClaimAdd extends it and ClaimClear releases it. A claim with an
@@ -155,6 +166,11 @@ type Header struct {
 	Paths      []string
 	ClaimAdd   bool
 	ClaimClear bool
+	// Withdraw is delete's switch for retracting this identity's pending
+	// proposal instead of making one. It crosses as a presence flag like
+	// Create, so a peer that does not know it omits it and keeps the
+	// proposing default.
+	Withdraw bool
 
 	// LSPMode names the lsp sub-operation on a request; LSPJSON carries the
 	// JSON-encoded answer back on a response. Neither needs the body: they are
@@ -188,6 +204,18 @@ type Header struct {
 	Claims        []string
 	ClaimWarnings []string
 	ClaimOverlaps []ClaimOverlap
+	// Deletions is the pending-deletion list: each path an agent has proposed
+	// to remove and who proposed it. Sparse like the claim lists: an empty
+	// one is not sent, so a peer that does not know the field reads no
+	// proposals rather than an error.
+	Deletions []Deletion
+	// DirRemovals is the pending-dir-removal list, the rmdir analogue of
+	// Deletions. Sparse the same way: an empty one is not sent.
+	DirRemovals []DirRemoval
+	// Proposals is the unified pending surface, a flat tagged list over the
+	// pending change sets, file deletions and dir-removals. Sparse like the
+	// lists above: an empty one is not sent.
+	Proposals []Proposal
 
 	// Messages is what a parked recv answers with. They stay in the header
 	// rather than moving to the body: a message is text a person typed into a
@@ -204,7 +232,14 @@ type Header struct {
 	Final bool
 
 	// Response fields.
-	OK      bool
+	OK bool
+	// Remains is close -discard's answer: whether a file is still on disk at
+	// the discarded buffer's path. Sparse like every response bool: a false is
+	// not sent, so a peer that does not know the field reads no remainder.
+	Remains bool
+	// Created is open's answer: whether the call made a new buffer rather than
+	// focusing one already loaded. Sparse like Remains.
+	Created bool
 	Err     string
 	Root    string
 	PID     int
@@ -252,8 +287,14 @@ type MatchMeta struct {
 	PathLen   int `json:"path_len"`
 	TextLen   int `json:"text_len"`
 	LineStart int `json:"line_start"`
+	LineEnd   int `json:"line_end"`
 	ByteStart int `json:"byte_start"`
 	ByteEnd   int `json:"byte_end"`
+	// Version is the open document's buffer revision, or 0 for disk. It rides
+	// in the sparse hMatchVersion field rather than in the hMatches record:
+	// records are positional, so appending a number there would shift every
+	// hit after the first for a reader that predates the field.
+	Version uint64 `json:"version"`
 }
 
 // SpanMeta is one authored run of the document.
@@ -381,12 +422,13 @@ func EncodeRequest(req Request) (Header, []byte) {
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
 		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
-		Annotated: req.Annotated, Create: req.Create,
+		Annotated: req.Annotated, Create: req.Create, Discard: req.Discard,
 		Paths: req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
+		Withdraw: req.Withdraw,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
-		Path: req.Path}
+		Path: req.Path, NewPath: req.NewPath}
 	if req.Start != nil {
 		h.Start = req.Start
 	}
@@ -417,15 +459,16 @@ func EncodeRequest(req Request) (Header, []byte) {
 }
 
 func DecodeRequest(f Frame) (Request, error) {
-	req := Request{ID: f.Header.ID, Op: f.Header.Op, Path: f.Header.Path,
+	req := Request{ID: f.Header.ID, Op: f.Header.Op, Path: f.Header.Path, NewPath: f.Header.NewPath,
 		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
 		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
 		Start: f.Header.Start, End: f.Header.End,
 		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
-		Annotated: f.Header.Annotated, Create: f.Header.Create,
-		Paths: f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear}
+		Annotated: f.Header.Annotated, Create: f.Header.Create, Discard: f.Header.Discard,
+		Paths: f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear,
+		Withdraw: f.Header.Withdraw}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -460,7 +503,8 @@ func DecodeRequest(f Frame) (Request, error) {
 // EncodeResponse puts the document bytes in the body, span by span, so a read
 // carries authorship in the shape the store holds it.
 func EncodeResponse(res Response) (Header, []byte) {
-	h := Header{ID: res.ID, OK: res.OK, Err: res.Err, Root: res.Root, PID: res.PID,
+	h := Header{ID: res.ID, OK: res.OK, Remains: res.Remains, Created: res.Created,
+		Err: res.Err, Root: res.Root, PID: res.PID,
 		Version: res.Version, Bytes: res.Bytes, Lines: res.Lines,
 		Buffers: res.Buffers, Conflicts: res.Conflicts,
 		Files: res.Files, Considered: res.Considered, Capped: res.Capped,
@@ -470,6 +514,10 @@ func EncodeResponse(res Response) (Header, []byte) {
 		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON,
 		StatesJSON: res.StatesJSON,
 		Claims:     res.Claims, ClaimWarnings: res.ClaimWarnings, ClaimOverlaps: res.ClaimOverlaps,
+		Deletions:   res.Deletions,
+		DirRemovals: res.DirRemovals,
+		Proposals:   res.Proposals,
+
 		SrcVersion: res.SrcVersion, Identity: res.Identity}
 	var body []byte
 	if res.Stream != 0 {
@@ -481,7 +529,8 @@ func EncodeResponse(res Response) (Header, []byte) {
 	for _, m := range res.Matches {
 		h.Matches = append(h.Matches, MatchMeta{Line: m.Line, Col: m.Col, Len: m.Len,
 			PathLen: len(m.Path), TextLen: len(m.Text),
-			LineStart: m.LineStart, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
+			LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
+			Version: m.Version})
 		body = append(body, m.Path...)
 		body = append(body, m.Text...)
 	}
@@ -493,7 +542,8 @@ func EncodeResponse(res Response) (Header, []byte) {
 }
 
 func DecodeResponse(f Frame) (Response, error) {
-	res := Response{ID: f.Header.ID, OK: f.Header.OK, Err: f.Header.Err, Root: f.Header.Root,
+	res := Response{ID: f.Header.ID, OK: f.Header.OK, Remains: f.Header.Remains,
+		Created: f.Header.Created, Err: f.Header.Err, Root: f.Header.Root,
 		PID: f.Header.PID, Version: f.Header.Version,
 		Bytes: f.Header.Bytes, Lines: f.Header.Lines,
 		Buffers: f.Header.Buffers, Conflicts: f.Header.Conflicts,
@@ -507,7 +557,11 @@ func DecodeResponse(f Frame) (Response, error) {
 		StatesJSON: f.Header.StatesJSON,
 		Claims:     f.Header.Claims, ClaimWarnings: f.Header.ClaimWarnings,
 		ClaimOverlaps: f.Header.ClaimOverlaps,
-		SrcVersion:    f.Header.SrcVersion, Identity: f.Header.Identity}
+		Deletions:     f.Header.Deletions,
+		DirRemovals:   f.Header.DirRemovals,
+		Proposals:     f.Header.Proposals,
+
+		SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)
@@ -531,7 +585,8 @@ func DecodeResponse(f Frame) (Response, error) {
 		res.Matches = append(res.Matches, SearchMatch{
 			Path: string(runs[outRuns+2*i]), Text: string(runs[outRuns+2*i+1]),
 			Line: m.Line, Col: m.Col, Len: m.Len,
-			LineStart: m.LineStart, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd})
+			LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
+			Version: m.Version})
 	}
 	for i, m := range f.Header.Spans {
 		res.Spans = append(res.Spans, Span{Text: string(runs[matchRuns+i]), Author: m.Author})

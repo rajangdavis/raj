@@ -2,6 +2,8 @@
 package explorer
 
 import (
+	"hash/fnv"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,13 @@ type Tree struct {
 	Root     string
 	expanded map[string]bool
 	entries  []Entry
+
+	// sig digests the names and kinds of the children of every expanded
+	// directory -- the listing the tree was last built from. ChangedOnDisk
+	// compares a fresh digest against it. Names, not mtimes: the tree shows
+	// names, and a file whose contents changed keeps its name, so no refresh
+	// is needed for it (an open buffer's disk change is diskCheck's job).
+	sig uint64
 
 	// ChangedOnly filters to files differing from git HEAD, plus anything
 	// edited this session. Sessions without a repository fall back to the
@@ -123,12 +132,17 @@ func (t *Tree) Refresh() {
 	}
 	t.entries = t.entries[:0]
 	t.walk(t.Root, 0)
+	t.sig = t.signature()
 }
 
-func (t *Tree) walk(dir string, depth int) {
+// children lists a directory's visible entries, directories first and each
+// group sorted by name, with the hidden policy applied. Listing and ordering
+// live in one place so walk and signature cannot disagree about what the tree
+// considers a child.
+func (t *Tree) children(dir string) []os.DirEntry {
 	items, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return nil
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].IsDir() != items[j].IsDir() {
@@ -136,12 +150,20 @@ func (t *Tree) walk(dir string, depth int) {
 		}
 		return items[i].Name() < items[j].Name()
 	})
+	kept := items[:0]
 	for _, it := range items {
-		name := it.Name()
-		path := filepath.Join(dir, name)
-		if t.Hidden.HiddenPath(t.Root, path, it.IsDir()) {
+		if t.Hidden.HiddenPath(t.Root, filepath.Join(dir, it.Name()), it.IsDir()) {
 			continue
 		}
+		kept = append(kept, it)
+	}
+	return kept
+}
+
+func (t *Tree) walk(dir string, depth int) {
+	for _, it := range t.children(dir) {
+		name := it.Name()
+		path := filepath.Join(dir, name)
 		if it.IsDir() {
 			if t.ChangedOnly && !t.hasChanged(path) {
 				continue
@@ -158,6 +180,39 @@ func (t *Tree) walk(dir string, depth int) {
 		}
 		t.entries = append(t.entries, Entry{path, name, depth, false, false})
 	}
+}
+
+// ChangedOnDisk reports whether the host filesystem moved under the tree since
+// it was last built: a name added, removed or renamed in an expanded directory.
+// It reads directory listings only -- no file stats, no git -- so the idle tick
+// can afford to ask. A file's changed contents do not count: the tree shows
+// names, and an open buffer's disk change is diskCheck's business.
+func (t *Tree) ChangedOnDisk() bool { return t.signature() != t.sig }
+
+// signature digests the names and kinds of the children of every expanded
+// directory, recursively. It is deliberately independent of the ChangedOnly
+// filter: that filter is git state, and recomputing it on every idle tick is
+// the cost this check exists to avoid.
+func (t *Tree) signature() uint64 {
+	h := fnv.New64a()
+	var walk func(dir string)
+	walk = func(dir string) {
+		for _, it := range t.children(dir) {
+			path := filepath.Join(dir, it.Name())
+			io.WriteString(h, path)
+			h.Write([]byte{0})
+			if it.IsDir() {
+				h.Write([]byte{'d'})
+				if t.expanded[path] {
+					walk(path)
+				}
+				continue
+			}
+			h.Write([]byte{'f'})
+		}
+	}
+	walk(t.Root)
+	return h.Sum64()
 }
 
 func (t *Tree) isChanged(path string) bool {

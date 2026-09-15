@@ -155,7 +155,7 @@ func TestInitialize(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	res, err := f.conn.Initialize(ctx, "file:///w", nil)
+	res, err := f.conn.Initialize(ctx, "file:///w", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +170,47 @@ func TestInitialize(t *testing.T) {
 	}
 	// initialized must follow, or servers that wait for it never start.
 	waitFor(t, func() bool { return has(f.methods(), "initialized") })
+}
+
+// initializationOptions goes out when the caller sets it and is omitted when
+// nil: gopls's inlay hints are off unless asked for here, and a server that
+// does not expect the field should not receive a null.
+func TestInitializeSendsOptions(t *testing.T) {
+	f := newFake(t)
+	got := make(chan map[string]json.RawMessage, 1)
+	f.on("initialize", func(m *Message) (any, *ResponseError) {
+		var p map[string]json.RawMessage
+		_ = json.Unmarshal(m.Params, &p)
+		got <- p
+		return map[string]any{"capabilities": map[string]any{}}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := f.conn.Initialize(ctx, "file:///w", nil,
+		map[string]any{"hints": map[string]any{"assignVariableTypes": true}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if _, ok := p["initializationOptions"]; !ok {
+			t.Errorf("initialize params = %s, want initializationOptions present", p)
+		}
+	case <-ctx.Done():
+		t.Fatal("initialize never reached the server")
+	}
+
+	if _, err := f.conn.Initialize(ctx, "file:///w", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if _, ok := p["initializationOptions"]; ok {
+			t.Errorf("initialize params = %s, want initializationOptions omitted for nil", p)
+		}
+	case <-ctx.Done():
+		t.Fatal("second initialize never reached the server")
+	}
 }
 
 // A capability may be a boolean or an options object, so presence is not

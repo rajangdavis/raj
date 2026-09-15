@@ -53,6 +53,35 @@ func TestUnsavedEditIsFound(t *testing.T) {
 	}
 }
 
+// Every hit names the buffer revision of the document it was found in, so a
+// caller can tell the document moved between the search and a later read. A
+// file read from disk has no buffer behind it and reports 0; a clean open
+// buffer is read from disk but still names its revision.
+func TestHitsCarryTheOpenBufferVersion(t *testing.T) {
+	root := docsTree(t, map[string]string{"a.go": "package a\n\nvar needle = 1\n"})
+	path := filepath.Join(root, "a.go")
+
+	disk := RunStreamVersioned(context.Background(), root, Query{Text: "needle"}, nil, nil, nil)
+	if len(disk.Matches) != 1 || disk.Matches[0].Version != 0 {
+		t.Fatalf("disk hit = %+v, want one hit at version 0", disk.Matches)
+	}
+
+	open := RunStreamVersioned(context.Background(), root, Query{Text: "needle"},
+		Docs{path: "package a\n\nvar needle = 2\n"}, DocVersions{path: 41}, nil)
+	if len(open.Matches) != 1 {
+		t.Fatalf("open hit = %+v, want one hit", open.Matches)
+	}
+	if open.Matches[0].Version != 41 {
+		t.Errorf("open hit version = %d, want 41", open.Matches[0].Version)
+	}
+
+	clean := RunStreamVersioned(context.Background(), root, Query{Text: "needle"},
+		nil, DocVersions{path: 7}, nil)
+	if len(clean.Matches) != 1 || clean.Matches[0].Version != 7 {
+		t.Errorf("clean hit = %+v, want one hit at version 7", clean.Matches)
+	}
+}
+
 // The other half, and the one that is easy to forget: a match that is only on
 // disk is stale. Reporting it sends you to a line that no longer says that.
 func TestDeletedTextIsNotReported(t *testing.T) {
@@ -202,5 +231,86 @@ func TestNoOpenDocumentsMatchesRunContext(t *testing.T) {
 				got.Total(), got.Files, got.Considered,
 				want.Total(), want.Files, want.Considered)
 		}
+	}
+}
+
+// RunStream's callback is the seam the pane paints through, so it has to hand
+// over each matching file's hits once, in walk order, and nothing for a file
+// that held none. Concatenating the batches must reproduce the finished result
+// exactly: a streamed list is the same answer, only earlier.
+func TestRunStreamEmitsPerFileBatches(t *testing.T) {
+	root := docsTree(t, map[string]string{
+		"a.go":     "needle one\nneedle two\n",
+		"b.go":     "nothing to see\n",
+		"c.go":     "needle three\n",
+		"sub/d.go": "needle four\n",
+	})
+
+	// RunStream calls emit on the walking goroutine, which is this one, so
+	// collecting into a slice needs no lock.
+	var batches [][]Match
+	res := RunStream(context.Background(), root, Query{Text: "needle"}, nil,
+		func(batch []Match) {
+			batches = append(batches, append([]Match(nil), batch...))
+		})
+
+	if res.Files != 3 {
+		t.Fatalf("finished result spans %d files, want 3", res.Files)
+	}
+	if len(batches) != 3 {
+		t.Fatalf("emitted %d batches, want one per matching file (3)", len(batches))
+	}
+	var streamed []Match
+	for i, batch := range batches {
+		if len(batch) == 0 {
+			t.Fatalf("batch %d is empty; a file that matched nothing should emit nothing", i)
+		}
+		for _, m := range batch {
+			if m.Path != batch[0].Path {
+				t.Fatalf("batch %d mixes files %q and %q", i, batch[0].Path, m.Path)
+			}
+		}
+		streamed = append(streamed, batch...)
+	}
+	if len(streamed) != len(res.Matches) {
+		t.Fatalf("streamed %d matches, the finished result holds %d", len(streamed), len(res.Matches))
+	}
+	for i := range streamed {
+		if streamed[i].Path != res.Matches[i].Path || streamed[i].Line != res.Matches[i].Line {
+			t.Errorf("match %d streamed as %s:%d, finished as %s:%d",
+				i, streamed[i].Path, streamed[i].Line,
+				res.Matches[i].Path, res.Matches[i].Line)
+		}
+	}
+}
+
+// The per-file cap is a display limit, not a stopping point: a streamed batch
+// carries at most MaxPerFile rows, while the finished result still counts every
+// hit, so the pane's "N of M" header survives streaming unchanged.
+func TestRunStreamBatchRespectsThePerFileCap(t *testing.T) {
+	root := docsTree(t, map[string]string{})
+	var body []byte
+	for range MaxPerFile * 3 {
+		body = append(body, "needle\n"...)
+	}
+	hog := filepath.Join(root, "hog.txt")
+	if err := os.WriteFile(hog, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var batches [][]Match
+	res := RunStream(context.Background(), root, Query{Text: "needle"}, nil,
+		func(batch []Match) {
+			batches = append(batches, append([]Match(nil), batch...))
+		})
+
+	if len(batches) != 1 {
+		t.Fatalf("emitted %d batches for one file, want 1", len(batches))
+	}
+	if got := len(batches[0]); got != MaxPerFile {
+		t.Errorf("streamed %d rows, want the per-file cap %d", got, MaxPerFile)
+	}
+	if got, want := res.Total(), MaxPerFile*3; got != want {
+		t.Errorf("Total() = %d, want the true %d", got, want)
 	}
 }

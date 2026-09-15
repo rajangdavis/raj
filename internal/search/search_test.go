@@ -215,6 +215,49 @@ func TestRunFallbackReportsLineStart(t *testing.T) {
 	}
 }
 
+// LineEnd is one past the last byte of the hit's line, excluding the newline,
+// measured on the raw line. Text is trimmed of trailing space, so
+// LineStart+len(Text) lands before the line's real end; a whole-line replace
+// built on it would leave the trailing whitespace behind.
+func TestRunReportsLineEndWithTrailingSpace(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "x.txt"), []byte("head\nneedle here   \ntail\n"), 0o644)
+	res := Run(dir, Query{Text: "needle"})
+	if len(res.Matches) != 1 {
+		t.Fatalf("got %d matches", len(res.Matches))
+	}
+	m := res.Matches[0]
+	// "head\n" is 5 bytes; the raw line "needle here   " is 14.
+	if m.LineStart != 5 || m.LineEnd != 19 {
+		t.Errorf("line_start=%d line_end=%d, want 5 and 19", m.LineStart, m.LineEnd)
+	}
+	if got := m.LineEnd - m.LineStart; got != 14 {
+		t.Errorf("line span = %d, want the raw line's 14", got)
+	}
+	if m.LineEnd <= m.LineStart+len(m.Text) {
+		t.Errorf("line_end=%d does not extend past the trimmed text end %d",
+			m.LineEnd, m.LineStart+len(m.Text))
+	}
+}
+
+// The per-line fallback computes the line bound positionally too: the Kelvin
+// sign forces it for a query containing "k", and trailing whitespace on the hit
+// line must still fall inside LineEnd.
+func TestRunFallbackReportsLineEnd(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "x.txt"), []byte("\u212A\n\task   \n"), 0o644)
+	res := Run(dir, Query{Text: "ask"})
+	if len(res.Matches) != 1 {
+		t.Fatalf("got %d matches", len(res.Matches))
+	}
+	m := res.Matches[0]
+	// The Kelvin sign is three bytes, so line 2 starts at 4; the raw line
+	// "\task   " is 7 bytes and ends at 11.
+	if m.LineStart != 4 || m.LineEnd != 11 {
+		t.Errorf("line_start=%d line_end=%d, want 4 and 11", m.LineStart, m.LineEnd)
+	}
+}
+
 func TestRunEmptyQuery(t *testing.T) {
 	if res := Run(fixture(t), Query{}); len(res.Matches) != 0 {
 		t.Error("an empty query should match nothing")

@@ -201,6 +201,11 @@ func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlAddr string
 	if path != "" {
 		a.OpenFile(path)
 	}
+	// Start the servers for the languages already open — restored tabs and any
+	// file named on the command line — off the event thread, so the first
+	// request does not wait on a cold handshake. Not in Run: tests run that and
+	// would spawn a server in the test process.
+	a.WarmServers()
 	return a.Run()
 }
 

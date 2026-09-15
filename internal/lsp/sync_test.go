@@ -430,6 +430,67 @@ func TestSave(t *testing.T) {
 	waitFor(t, func() bool { return len(f.notes("textDocument/didSave")) >= 1 })
 }
 
+// Changed tells the server that files under its workspace changed on disk, so
+// it drops any cached copy and reloads them. The editor writes with a temp-file
+// rename, which the server's own watcher does not always see, so this is the
+// client's half of file watching; type 2 is "changed".
+func TestChanged(t *testing.T) {
+	f := newFake(t)
+	s := NewSync(f.conn, SyncFull)
+
+	// No paths is a no-op rather than an empty notification: there is nothing
+	// for the server to reload.
+	if err := s.Changed(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.notes("workspace/didChangeWatchedFiles")); got != 0 {
+		t.Errorf("sent %d watched-files notifications for no paths", got)
+	}
+
+	s.Changed("/w/a.go", "/w/deep/b.go")
+	waitFor(t, func() bool { return len(f.notes("workspace/didChangeWatchedFiles")) >= 1 })
+
+	n := f.notes("workspace/didChangeWatchedFiles")[0]
+	raw, ok := n["changes"].([]any)
+	if !ok {
+		t.Fatalf("changes = %T, want a list", n["changes"])
+	}
+	if len(raw) != 2 {
+		t.Fatalf("changes = %v, want one per path", raw)
+	}
+	want := []string{URI("/w/a.go"), URI("/w/deep/b.go")}
+	for i, c := range raw {
+		m := c.(map[string]any)
+		if m["uri"] != want[i] {
+			t.Errorf("change %d uri = %v, want %v", i, m["uri"], want[i])
+		}
+		if m["type"] != float64(2) {
+			t.Errorf("change %d type = %v, want 2 (changed)", i, m["type"])
+		}
+	}
+}
+
+// The watched-files notification does not depend on the document being open
+// with the server, unlike Save; a path the server has never heard of still has
+// to be reloaded from disk.
+func TestChangedWithoutAnOpenDocument(t *testing.T) {
+	f, s := syncFixture(t)
+	s.Changed("/w/never-opened.go")
+	waitFor(t, func() bool { return len(f.notes("workspace/didChangeWatchedFiles")) >= 1 })
+}
+
+// A dead connection reports closed rather than panicking, the same contract the
+// other notifications keep.
+func TestChangedOnANilConnection(t *testing.T) {
+	nilSync := NewSync(nil, SyncFull)
+	if err := nilSync.Changed("/w/a.go"); err != ErrClosed {
+		t.Errorf("err = %v, want ErrClosed", err)
+	}
+	if err := nilSync.Changed(); err != ErrClosed {
+		t.Errorf("err on an empty list = %v, want ErrClosed", err)
+	}
+}
+
 // The advertised sync kind is honoured rather than assumed, and the protocol
 // allows either a number or an options object.
 func TestSyncKindOf(t *testing.T) {

@@ -57,7 +57,9 @@ type App struct {
 	// 5.3 ms per keystroke against 2 MB of open buffers.
 	completeCache *complete.Cache
 
-	// servers is the language servers for this workspace, started on demand.
+	// servers is the language servers for this workspace: started on demand by
+	// a request that needs one, or eagerly by WarmServers for the languages of
+	// the files already open at launch.
 	// lspGen is the cancellation generation: an answer whose generation has
 	// moved on describes a position the cursor has left, and is dropped.
 	servers *servers
@@ -155,6 +157,11 @@ type App struct {
 	// frame that paints the buffer clean. Zero whenever timing is off.
 	saveDoneAt time.Time
 
+	// treeScanAt is when the explorer tree was last compared to the
+	// filesystem, so the idle tick rescans it at a bounded rate instead of
+	// every frame.
+	treeScanAt time.Time
+
 	// NoRestore disables reading and writing the session file, for --no-restore
 	// and for tests that must not touch a workspace they did not create.
 	NoRestore bool
@@ -195,6 +202,29 @@ type App struct {
 	// guard is the validation chokepoint in front of the buffer host. One per
 	// app, so read-before-write is remembered across requests.
 	guard *control.Guard
+
+	// pendingDeletions is the workspace-level set of paths an agent has
+	// proposed to delete, keyed by the canonical path, each carrying the
+	// proposing author. It is not a change set: a deletion is a path-level
+	// fact that outlives any buffer, so it lives on the app rather than in a
+	// session. In-memory, like the claim set; a restart forgets it. A
+	// proposal records here and changes nothing on disk — the unlink happens
+	// only when the user approves, in the deletion gate (W4b-2).
+	pendingDeletions map[string]control.Deletion
+
+	// pendingDirRemovals is the workspace-level set of directories an agent
+	// has proposed to remove, keyed by the canonical directory path, each
+	// carrying the proposing author. It is the rmdir analogue of
+	// pendingDeletions: a subtree-level fact rather than a change set, and
+	// in-memory, so a restart forgets it. rmdir only records here; nothing is
+	// removed until the user approves in the review tab.
+	pendingDirRemovals map[string]control.DirRemoval
+
+	// deletionPromptPane is the active pane the deletion gate last evaluated.
+	// The tracked pane is what makes the gate once per focus: a pane that has
+	// not changed leaves it alone, and focusing the path again re-raises the
+	// question. Nil until the gate has looked at a pane.
+	deletionPromptPane *editor.Pane
 
 	// snapshots holds dump results keyed by id, and snapSeq mints the ids. They
 	// are per-author (Patch checks the writer owns the id), and the map lives
@@ -302,6 +332,7 @@ func (a *App) OpenFile(path string) {
 	// drift.
 	if p, ok := a.findHeadless(path); ok {
 		a.announce(p)
+		a.maybePromptDeletion()
 		return
 	}
 	p, err := a.Tabs.Open(path)
@@ -332,6 +363,7 @@ func (a *App) OpenFile(path string) {
 	// position is a scroll, a missing tab is a file you have to find again.
 	a.TouchSession()
 	a.status = ""
+	a.maybePromptDeletion()
 }
 
 // refuse says why a file was not opened, and puts focus back where it came from
@@ -728,6 +760,9 @@ func (a *App) Handle(e ui.Event) {
 		// never sit on the keystroke path.
 		a.refreshSyntax()
 		a.diskCheck()
+		// A file created outside raj appears in the tree within a second
+		// rather than waiting for raj's own next write.
+		a.syncFileTree(time.Now())
 		// Every open document is pushed to its server here, not just the
 		// visible one, so diagnostics for a buffer the user is not looking at
 		// are a real reading. It runs before the hint request, so that request
@@ -743,6 +778,10 @@ func (a *App) Handle(e ui.Event) {
 	case ui.Quit:
 		a.quit = true
 	}
+	// The deletion gate is evaluated after every event, not only on a tab
+	// switch: a socket request can land a proposal with no keystroke to hang
+	// the question on, and a focus moved by the pointer has no chord either.
+	a.maybePromptDeletion()
 }
 
 // handleKey resolves a chord in the focused scope, then gives the global
@@ -1366,7 +1405,19 @@ func (a *App) saveActive(then func(saved bool)) {
 		a.saveAs(p, then)
 		return
 	}
-	a.writeTo(p, p.File.Path, then)
+	a.saveNamed(p, then)
+}
+
+// saveNamed writes a buffer that already has a path, offering to create a
+// missing parent directory exactly as save-as does.
+//
+// Without this, saving a buffer whose directory does not exist yet failed with
+// the raw writeAtomic ENOENT against a path the buffer already carried — which
+// reads as a no-op, leaves the buffer dirty, and loses the content when the tab
+// is closed without saving. ensureParent already exists for save-as; a normal
+// save reaching it is the whole fix.
+func (a *App) saveNamed(p *editor.Pane, then func(saved bool)) {
+	a.ensureParent(p.File.Path, then, func() { a.writeTo(p, p.File.Path, then) })
 }
 
 // saveAs asks where an unnamed buffer should go.
@@ -1596,6 +1647,7 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 	// react without polling. Best-effort: a delivery failure is not a save
 	// failure, and with no control listener this is nothing.
 	a.notifySaved(p.File.Path)
+	a.lspSaved(p)
 	// The user pressing save is the approval. Nothing else in the editor can
 	// write this file — an agent's own save is refused while its change sets
 	// are proposed — so reaching here means a human chose to put these bytes on
@@ -1877,6 +1929,29 @@ func (a *App) diskCheck() {
 		if p.File.Path != "" && p.File.DiskChanged() {
 			p.MarkDiskStale()
 		}
+	}
+}
+
+// treeScanInterval bounds how often the idle tick checks the explorer against
+// the filesystem. A second is fast enough that a file created in another window
+// shows up while the user is looking, and slow enough that the scan is a
+// rounding error on the idle budget. The scan reads only the expanded
+// directories' listings, not the repository.
+const treeScanInterval = time.Second
+
+// syncFileTree refreshes the explorer when the host filesystem moved under it:
+// a file created, removed or renamed outside raj. The idle tick runs many times
+// a second, so the check is throttled; the tree's own scan is listings-only.
+func (a *App) syncFileTree(now time.Time) {
+	if a.Explorer == nil || a.Explorer.Tree == nil {
+		return
+	}
+	if now.Sub(a.treeScanAt) < treeScanInterval {
+		return
+	}
+	a.treeScanAt = now
+	if a.Explorer.Tree.ChangedOnDisk() {
+		a.Explorer.Tree.Refresh()
 	}
 }
 

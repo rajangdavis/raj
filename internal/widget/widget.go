@@ -1,6 +1,10 @@
 package widget
 
-import "raj/internal/ui"
+import (
+	"strings"
+
+	"raj/internal/ui"
+)
 
 // Theme is the palette the shared widgets draw with. Everything defaults to the
 // terminal's own colours except where a boundary has to be visible.
@@ -218,4 +222,82 @@ func TruncateLeft(text string, w int) string {
 		i = nextBoundary(text, i)
 	}
 	return "…" + text[i:]
+}
+
+// Wrap breaks text into display lines no wider than w columns, so a message or
+// a path longer than the dialog that holds it is read whole across rows rather
+// than cut with an ellipsis. It breaks at spaces where there is one and inside
+// a word where there is not, which is what lets an absolute path with no spaces
+// survive. An explicit newline always starts a new line. w <= 0 yields a single
+// empty line so a caller still reserves a row.
+func Wrap(text string, w int) []string {
+	if w <= 0 {
+		return []string{""}
+	}
+	var out []string
+	for _, para := range strings.Split(text, "\n") {
+		if para == "" {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, wrapLine(para, w)...)
+	}
+	return out
+}
+
+// wrapLine breaks one paragraph, which carries no newline.
+func wrapLine(s string, w int) []string {
+	var out []string
+	line, cols := "", 0
+	for _, word := range strings.Fields(s) {
+		wc := runeCols(word)
+		if wc > w {
+			if line != "" {
+				out = append(out, line)
+				line, cols = "", 0
+			}
+			chunks := splitCols(word, w)
+			out = append(out, chunks[:len(chunks)-1]...)
+			line, cols = chunks[len(chunks)-1], runeCols(chunks[len(chunks)-1])
+			continue
+		}
+		switch {
+		case line == "":
+			line, cols = word, wc
+		case cols+1+wc <= w:
+			line, cols = line+" "+word, cols+1+wc
+		default:
+			out = append(out, line)
+			line, cols = word, wc
+		}
+	}
+	if line != "" {
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		out = append(out, "")
+	}
+	return out
+}
+
+// splitCols cuts one word into chunks of at most w columns, at rune boundaries,
+// so a single path with no break in it can still be wrapped.
+func splitCols(s string, w int) []string {
+	var out []string
+	start, cols := 0, 0
+	for i, r := range s {
+		rw := ui.RuneWidth(r)
+		if rw < 1 {
+			rw = 1
+		}
+		if cols+rw > w {
+			if i > start {
+				out = append(out, s[start:i])
+			}
+			start, cols = i, 0
+		}
+		cols += rw
+	}
+	out = append(out, s[start:])
+	return out
 }

@@ -1,8 +1,11 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"raj/internal/control"
 	"raj/internal/lsp"
@@ -304,5 +307,125 @@ func TestDiagnosticsStatus(t *testing.T) {
 				t.Errorf("status %q carried no detail", got)
 			}
 		})
+	}
+}
+
+// A caller waiting for a publish is released by the next setVersion for its
+// path, and the channel is cleared so a later publish has nobody to notify.
+func TestWaitForWakesOnPublish(t *testing.T) {
+	d := newDiagnostics()
+	got := make(chan bool, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		got <- d.waitFor(ctx, "/w/a.go")
+	}()
+
+	// The publish must follow the registration, so wait for the waiter to be
+	// visible rather than racing the goroutine's start against it.
+	limit := time.Now().Add(time.Second)
+	for {
+		d.mu.Lock()
+		n := len(d.waiters["/w/a.go"])
+		d.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(limit) {
+			t.Fatal("waitFor never registered a waiter")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	d.setVersion("/w/a.go", nil, nil)
+	if ok := <-got; !ok {
+		t.Error("waitFor returned false after a publish")
+	}
+	d.mu.Lock()
+	n := len(d.waiters["/w/a.go"])
+	d.mu.Unlock()
+	if n != 0 {
+		t.Errorf("the publish left %d waiter(s) registered", n)
+	}
+}
+
+// A wait with no publish gives up when its context is done, and does not leave
+// the dead waiter registered for a later publish to close.
+func TestWaitForGivesUpOnCancelledContext(t *testing.T) {
+	d := newDiagnostics()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if d.waitFor(ctx, "/w/a.go") {
+		t.Fatal("waitFor returned true with a cancelled context and no publish")
+	}
+	d.mu.Lock()
+	n := len(d.waiters["/w/a.go"])
+	d.mu.Unlock()
+	if n != 0 {
+		t.Errorf("a cancelled wait left %d waiter(s) registered", n)
+	}
+}
+
+// The diagnostics caller judges the cache before waiting and recomputes after a
+// publish. The transition the control path depends on is an unpublished path
+// becoming the reading a matching-version publish carries; a publish for any
+// other version stays stale.
+func TestReadingRecomputesAfterPublish(t *testing.T) {
+	d := newDiagnostics()
+	if status, _, _ := d.reading("/w/a.go", 5); status != control.LSPStatusUnpublished {
+		t.Fatalf("status before a publish = %q, want %q", status, control.LSPStatusUnpublished)
+	}
+
+	v := 5
+	d.setVersion("/w/a.go", []lsp.Diagnostic{diag(2, sevError, "boom")}, &v)
+	status, detail, items := d.reading("/w/a.go", 5)
+	if status != control.LSPStatusOK {
+		t.Fatalf("status after the publish = %q, want %q", status, control.LSPStatusOK)
+	}
+	if detail != "" {
+		t.Errorf("an ok reading carried detail %q", detail)
+	}
+	if len(items) != 1 || items[0].Message != "boom" {
+		t.Errorf("items = %v, want the published diagnostic", items)
+	}
+
+	v = 6
+	d.setVersion("/w/a.go", nil, &v)
+	if status, _, _ := d.reading("/w/a.go", 5); status != control.LSPStatusStale {
+		t.Errorf("status for a later-version publish = %q, want %q", status, control.LSPStatusStale)
+	}
+}
+
+// lspCaller.Run is where the diagnostics wait lives, so one call returns the
+// reading a publish carries instead of making the driver poll. The publish is
+// released after a short pause so the common path — request, wait, wake — is
+// the one exercised; a publish that beats the wait is taken by the pre-wait
+// read and still returns ok.
+func TestDiagnosticsRunReturnsThePublishedReading(t *testing.T) {
+	d := newDiagnostics()
+	c := lspCaller{
+		mode: "diagnostics", status: control.LSPStatusUnpublished,
+		store: d, path: "/w/a.go", buf: 5,
+	}
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		v := 5
+		d.setVersion("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "boom")}, &v)
+	}()
+
+	raw, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var out control.LSPResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if out.Status != control.LSPStatusOK {
+		t.Fatalf("status = %q, want %q", out.Status, control.LSPStatusOK)
+	}
+	if len(out.Diags) != 1 || out.Diags[0].Message != "boom" {
+		t.Errorf("diags = %v, want the published item", out.Diags)
 	}
 }

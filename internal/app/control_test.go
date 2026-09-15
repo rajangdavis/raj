@@ -42,7 +42,7 @@ func (h *harness) dial(t *testing.T) *client {
 // is the point: a reply that needed no event thread would mean the request was
 // executed somewhere it should not have been.
 func (c *client) do(h *harness, req control.Request) control.Response {
-	if req.Op == "apply" || req.Op == "patch" || req.Op == "clear" {
+	if req.Op == "apply" || req.Op == "patch" || req.Op == "clear" || req.Op == "rename" {
 		path := req.Path
 		if path == "" {
 			path = h.Tabs.Active().File.Path
@@ -126,6 +126,51 @@ func TestControlReadsBuffers(t *testing.T) {
 	}
 	if txt := c.do(h, control.Request{Op: "text"}); txt.Text() != "hello\nworld\n" {
 		t.Errorf("text = %q", txt.Text())
+	}
+}
+
+// Every path-taking verb resolves the spellings alike: the absolute path the
+// editor reports, a workspace-relative spelling, and the editor's own
+// canonical spelling all reach the same buffer. This is the resolution seam
+// the Guard and the app host share, so a verb added later cannot join relative
+// paths against the process's working directory or refuse a path it has
+// already canonicalised.
+func TestControlPathSpellingsResolveAlike(t *testing.T) {
+	h := controlHarness(t, "alpha\nbeta\n")
+	c := h.dial(t)
+	abs := h.Tabs.Active().File.Path
+	rel, err := filepath.Rel(h.root, abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spellings := []struct{ name, path string }{
+		{"absolute", abs},
+		{"relative", rel},
+		{"canonical", h.Tabs.Active().File.Path},
+	}
+	for _, op := range []string{"text", "version", "groups", "diff", "dump"} {
+		for _, s := range spellings {
+			res := c.roundtrip(h, control.Request{Op: op, Path: s.path})
+			if !res.OK {
+				t.Errorf("%s %s (%q) = %+v", op, s.name, s.path, res)
+			}
+		}
+	}
+	// review lists without entering the mode, and a caret move resolves through
+	// the same seam.
+	for _, s := range spellings {
+		if res := c.roundtrip(h, control.Request{Op: "review", Path: s.path, ReviewList: true}); !res.OK {
+			t.Errorf("review %s (%q) = %+v", s.name, s.path, res)
+		}
+		if res := c.roundtrip(h, control.Request{Op: "goto", Path: s.path, Line: 2}); !res.OK {
+			t.Errorf("goto %s (%q) = %+v", s.name, s.path, res)
+		}
+	}
+	// A relative claim is stored canonically, so a later write spelled either
+	// way passes the same membership check.
+	claim := c.roundtrip(h, control.Request{Op: "claim", Paths: []string{rel}})
+	if !claim.OK || len(claim.Claims) != 1 || claim.Claims[0] != abs {
+		t.Fatalf("claim %q = %+v, want the canonical %q", rel, claim, abs)
 	}
 }
 
@@ -629,6 +674,156 @@ func TestControlSearchPathScopesAndRefusesEscape(t *testing.T) {
 	}
 }
 
+// mkdir makes a directory, with any missing parents, under the root, so an
+// agent can create a package before it has a file to put in it. It is not
+// claim-gated: a directory is not a file and does not hold a buffer yet. An
+// existing directory is a no-op, and an outside-the-root path is refused
+// without touching the filesystem.
+func TestControlMkdirCreatesDirectories(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+
+	res := c.do(h, control.Request{Op: "mkdir", Path: filepath.Join("newpkg", "inner")})
+	if !res.OK {
+		t.Fatalf("mkdir = %+v", res)
+	}
+	dir := filepath.Join(h.root, "newpkg", "inner")
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		t.Fatalf("mkdir did not create %s: stat = %v, %v", dir, st, err)
+	}
+
+	// An existing directory is not an error: a caller cannot cheaply know
+	// whether the directory it is about to write into is already there.
+	if res := c.do(h, control.Request{Op: "mkdir", Path: filepath.Join("newpkg", "inner")}); !res.OK {
+		t.Errorf("mkdir of an existing directory = %+v, want success", res)
+	}
+
+	// Out of root is a refusal, and nothing is created.
+	outside := filepath.Join(h.root, "..", "escaped")
+	res = c.do(h, control.Request{Op: "mkdir", Path: outside})
+	if res.OK || !strings.Contains(res.Err, "not under") {
+		t.Fatalf("mkdir outside the root = %+v, want a refusal naming the root", res)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Errorf("an out-of-root mkdir created %s (err=%v)", outside, err)
+	}
+}
+
+// delete records a workspace-level pending deletion over the real socket: the
+// proposal survives across requests and lists with its author, and withdraw
+// removes it. The file on disk is untouched throughout — W4b-1 records; the
+// prompt and the unlink are W4b-2.
+func TestControlDeleteProposesWithoutUnlinking(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	// Claim first: delete is claim-gated, like a text write.
+	if res := c.roundtrip(h, control.Request{Op: "claim", Paths: []string{path}}); !res.OK {
+		t.Fatalf("claim = %+v", res)
+	}
+	if res := c.roundtrip(h, control.Request{Op: "delete", Path: path}); !res.OK {
+		t.Fatalf("delete = %+v", res)
+	}
+	// Idempotent: the second proposal is a no-op, so the list still holds one.
+	if res := c.roundtrip(h, control.Request{Op: "delete", Path: path}); !res.OK {
+		t.Fatalf("second delete = %+v", res)
+	}
+	list := c.roundtrip(h, control.Request{Op: "deletions"})
+	if !list.OK || len(list.Deletions) != 1 {
+		t.Fatalf("deletions = %+v, want one", list)
+	}
+	if d := list.Deletions[0]; d.Path != path || d.Author != c.c.Author() {
+		t.Errorf("pending = %+v, want %s proposed by %d", d, path, c.c.Author())
+	}
+	// The file is still on disk: delete only records a proposal.
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("delete removed the file: %v", err)
+	}
+	if got := h.Pane().File.Text(); got != "hello\n" {
+		t.Errorf("buffer = %q, want it untouched", got)
+	}
+
+	// The proposer withdraws; the pending set empties.
+	if res := c.roundtrip(h, control.Request{Op: "delete", Path: path, Withdraw: true}); !res.OK {
+		t.Fatalf("withdraw = %+v", res)
+	}
+	list = c.roundtrip(h, control.Request{Op: "deletions"})
+	if len(list.Deletions) != 0 {
+		t.Errorf("after withdraw, deletions = %+v, want none", list.Deletions)
+	}
+}
+
+// delete is claim-gated even over the socket: an unclaimed path is refused and
+// nothing is recorded. The refusal is the strict one the write verbs give when
+// the set is empty.
+func TestControlDeleteNeedsAClaim(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	res := c.roundtrip(h, control.Request{Op: "delete", Path: path})
+	if res.OK || !strings.Contains(res.Err, "claim a file first") {
+		t.Errorf("delete with no claim = %+v, want the strict refusal", res)
+	}
+	if list := c.roundtrip(h, control.Request{Op: "deletions"}); len(list.Deletions) != 0 {
+		t.Errorf("a refused delete recorded something: %+v", list.Deletions)
+	}
+}
+
+// rmdir records a workspace-level pending dir-removal over the real socket: the
+// proposal survives across requests and lists with its author, and withdraw
+// removes it. Nothing on disk is touched throughout — W4c-2 records; the
+// review tab and the actual removal are a later wave.
+func TestControlRmdirProposesWithoutRemoving(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+
+	dir := filepath.Join(h.root, "pkg")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim the directory first: rmdir is claim-gated, and claiming a dir
+	// records the dir itself as the entry the gate checks.
+	if res := c.roundtrip(h, control.Request{Op: "claim", Paths: []string{dir}}); !res.OK {
+		t.Fatalf("claim = %+v", res)
+	}
+	if res := c.roundtrip(h, control.Request{Op: "rmdir", Path: dir}); !res.OK {
+		t.Fatalf("rmdir = %+v", res)
+	}
+	// Idempotent: the second proposal is a no-op.
+	if res := c.roundtrip(h, control.Request{Op: "rmdir", Path: dir}); !res.OK {
+		t.Fatalf("second rmdir = %+v", res)
+	}
+	list := c.roundtrip(h, control.Request{Op: "rmdirs"})
+	if !list.OK || len(list.DirRemovals) != 1 {
+		t.Fatalf("rmdirs = %+v, want one", list)
+	}
+	if d := list.DirRemovals[0]; d.Path != dir || d.Author != c.c.Author() {
+		t.Errorf("pending = %+v, want %s proposed by %d", d, dir, c.c.Author())
+	}
+	// The directory and its file are still on disk: rmdir only records.
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("rmdir removed the directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.go")); err != nil {
+		t.Errorf("rmdir removed a file under the directory: %v", err)
+	}
+
+	// The proposer withdraws; the pending set empties.
+	if res := c.roundtrip(h, control.Request{Op: "rmdir", Path: dir, Withdraw: true}); !res.OK {
+		t.Fatalf("withdraw = %+v", res)
+	}
+	list = c.roundtrip(h, control.Request{Op: "rmdirs"})
+	if len(list.DirRemovals) != 0 {
+		t.Errorf("after withdraw, rmdirs = %+v, want none", list.DirRemovals)
+	}
+}
+
 // End to end: an agent's edit arrives as a proposal, is listed as one, and can
 // be rejected — a decision that keeps the text in the document and drops the
 // set from the agreed composition, unlike the clear gesture that purges it.
@@ -660,6 +855,10 @@ func TestAgentEditsArriveAsProposals(t *testing.T) {
 	if proposal.ID == 0 {
 		t.Fatalf("no proposal listed: %+v", res.Groups)
 	}
+	// The listing answers how big the set is without a second diff call.
+	if proposal.Hunks != 1 || proposal.Moved != 0 {
+		t.Errorf("proposal hunks/moved = %d/%d, want 1/0", proposal.Hunks, proposal.Moved)
+	}
 
 	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: proposal.ID}); !r.OK {
 		t.Fatalf("reject = %+v", r)
@@ -690,6 +889,73 @@ func TestAgentEditsArriveAsProposals(t *testing.T) {
 	}
 	if !rejected {
 		t.Errorf("annotated states = %+v, want a rejected run", runs)
+	}
+}
+
+// groupByState returns the single change set in state st, failing the test
+// when there is not exactly one. A test about one set's counts should not
+// guess which of several it got.
+func groupByState(t *testing.T, h *harness, c *client, path, state string) control.Group {
+	t.Helper()
+	var found []control.Group
+	for _, g := range c.do(h, control.Request{Op: "groups", Path: path}).Groups {
+		if g.State == state {
+			found = append(found, g)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("groups in state %q = %+v, want exactly one", state, found)
+	}
+	return found[0]
+}
+
+// A decided set still reports its counts. An accepted set's members are live in
+// the journal, so a later edit that overwrites one counts as moved exactly as
+// it would while the set was pending; a rejected set is projected the same way
+// because the decision changes its standing, not whether its bytes are there.
+// This is the decided counterpart to the proposed-set case above.
+func TestControlGroupsCountsDecidedSets(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	read := c.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	first := groupByState(t, h, c, path, "proposed")
+	if first.Hunks != 1 || first.Moved != 0 {
+		t.Fatalf("proposed hunks/moved = %d/%d, want 1/0", first.Hunks, first.Moved)
+	}
+
+	if r := c.do(h, control.Request{Op: "accept", Path: path, Group: first.ID}); !r.OK {
+		t.Fatalf("accept = %+v", r)
+	}
+	if g := groupByState(t, h, c, path, "accepted"); g.ID != first.ID || g.Hunks != 1 || g.Moved != 0 {
+		t.Errorf("accepted group = %+v, want id %d with 1 hunk and 0 moved", g, first.ID)
+	}
+
+	// A later edit replaces every byte of the accepted member's text, so it is
+	// moved rather than placed.
+	read = c.do(h, control.Request{Op: "text"})
+	base = read.Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 12, Text: "there"}}}); !r.OK {
+		t.Fatalf("second apply = %+v", r)
+	}
+	if g := groupByState(t, h, c, path, "accepted"); g.ID != first.ID || g.Hunks != 0 || g.Moved != 1 {
+		t.Errorf("accepted group after overwrite = %+v, want 0 hunks and 1 moved", g)
+	}
+
+	// Rejecting the second set does not zero its counts either.
+	second := groupByState(t, h, c, path, "proposed")
+	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: second.ID}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
+	if g := groupByState(t, h, c, path, "rejected"); g.ID != second.ID || g.Hunks != 1 || g.Moved != 0 {
+		t.Errorf("rejected group = %+v, want id %d with 1 hunk and 0 moved", g, second.ID)
 	}
 }
 
@@ -741,6 +1007,9 @@ func TestControlDiffRendersPendingChanges(t *testing.T) {
 	if d.Hunks[0].Start != 6 || d.Hunks[0].End != 12 {
 		t.Errorf("hunk span = %d..%d, want 6..12", d.Hunks[0].Start, d.Hunks[0].End)
 	}
+	if d.Hunks[0].Line != 1 || d.Hunks[0].EndLine != 1 {
+		t.Errorf("hunk lines = L%d..L%d, want L1..L1", d.Hunks[0].Line, d.Hunks[0].EndLine)
+	}
 
 	// Rejected, the set is no longer pending and the diff is clean again.
 	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: d.ID}); !r.OK {
@@ -752,6 +1021,47 @@ func TestControlDiffRendersPendingChanges(t *testing.T) {
 	}
 	if len(diffs) != 0 {
 		t.Errorf("diffs after reject = %+v, want none", diffs)
+	}
+}
+
+// A member a later edit overwrote whole has no current span, but the review
+// surface still shows what it wrote: dropping it to a bare count left a
+// reviewer with nothing to look at.
+func TestControlDiffKeepsMovedMemberAsWritten(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	read := c.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}); !r.OK {
+		t.Fatalf("first apply = %+v", r)
+	}
+	// Replace the whole inserted run: nothing of the first member survives, so
+	// it is moved, not shown at a span that no longer means anything.
+	read = c.do(h, control.Request{Op: "text"})
+	base = read.Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 12, Text: "there"}}}); !r.OK {
+		t.Fatalf("second apply = %+v", r)
+	}
+
+	res := c.do(h, control.Request{Op: "diff", Path: path})
+	var diffs []control.DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatalf("diff payload is not JSON: %v", err)
+	}
+	var found bool
+	for _, d := range diffs {
+		for _, mh := range d.MovedHunks {
+			if mh.Old == "world" && mh.New == "socket" && mh.Start == -1 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("diffs = %+v, want the first member kept as written", diffs)
 	}
 }
 
@@ -865,6 +1175,70 @@ func TestControlOpenAcceptsARelativePath(t *testing.T) {
 	}
 	if got := h.Tabs.Count(); got != before {
 		t.Errorf("tab count = %d, want %d — the relative path opened a duplicate", got, before)
+	}
+}
+
+// open without -create refuses a path that is neither a buffer nor a file, so a
+// typo cannot quietly become a phantom tab. -create is the caller saying it
+// means to make a new buffer, and only then does the tab appear.
+func TestControlOpenRefusesAMissingPathWithoutCreate(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	missing := filepath.Join(dir, "typo.go")
+	before := h.Tabs.Count()
+
+	r := c.do(h, control.Request{Op: "open", Path: missing})
+	if r.OK {
+		t.Fatalf("open of a missing path without -create = %+v, want a refusal", r)
+	}
+	if !strings.Contains(r.Err, "pass -create") {
+		t.Errorf("refusal = %q, want it to point at -create", r.Err)
+	}
+	if got := h.Tabs.Count(); got != before {
+		t.Errorf("tab count = %d after the refusal, want %d — a phantom buffer was made", got, before)
+	}
+
+	if r := c.do(h, control.Request{Op: "open", Path: missing, Create: true}); !r.OK {
+		t.Fatalf("open -create = %+v", r)
+	}
+	if got := h.Tabs.Active().File.Path; got != missing {
+		t.Errorf("active path = %q after open -create, want %q", got, missing)
+	}
+}
+
+// open's wire answer says which of the two things it did: made a new buffer or
+// focused one already loaded. A driver writing a file for the first time needs
+// to tell a create from a focus, or a name it only meant to make looks like a
+// file that was there all along.
+func TestControlOpenReportsCreated(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	// An already-open buffer is focused, not created.
+	if r := c.do(h, control.Request{Op: "open", Path: path}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	} else if r.Created {
+		t.Error("open of an existing buffer reported a create")
+	}
+
+	// A new buffer with -create is reported as made.
+	dir := filepath.Dir(path)
+	fresh := filepath.Join(dir, "fresh.go")
+	r := c.do(h, control.Request{Op: "open", Path: fresh, Create: true})
+	if !r.OK {
+		t.Fatalf("open -create = %+v", r)
+	}
+	if !r.Created {
+		t.Error("open -create did not report the buffer as created")
+	}
+
+	// A second open of it focuses: not created again.
+	if r := c.do(h, control.Request{Op: "open", Path: fresh}); !r.OK {
+		t.Fatalf("second open = %+v", r)
+	} else if r.Created {
+		t.Error("a second open reported a create")
 	}
 }
 
@@ -1031,6 +1405,45 @@ func TestControlReviewEntersTheMode(t *testing.T) {
 	}
 	if h.mode != ModeEdit {
 		t.Errorf("mode = %v after review -json, want it left in Edit", h.mode)
+	}
+}
+
+// review [path] enters Review mode on the named buffer, not whatever was in
+// front: it focuses the buffer first, so the mode badge and the jump belong to
+// the same tab as the listed sets. Without this, reviewing a background file
+// listed its sets while the caret jumped in the active tab.
+func TestControlReviewFocusesTheNamedBuffer(t *testing.T) {
+	h := controlHarness(t, reviewFixture)
+	c := h.dial(t)
+	first := h.Tabs.Active().File.Path
+
+	// A second file, with a proposal of its own, becomes active by its own
+	// open. Propose against it, then bring the first back in front so the
+	// review asks for a background buffer.
+	second := filepath.Join(filepath.Dir(first), "second.go")
+	h.OpenFile(second)
+	h.typeText("hello world\n")
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	h.drain()
+
+	h.OpenFile(first)
+	h.drain()
+	if got := h.Tabs.Active().File.Path; got != first {
+		t.Fatalf("setup: active = %q, want the first buffer", got)
+	}
+
+	r := c.do(h, control.Request{Op: "review", Path: second})
+	if !r.OK {
+		t.Fatalf("review of a background path = %+v", r)
+	}
+	if len(r.Groups) != 1 || r.Groups[0].Path != second {
+		t.Fatalf("groups = %+v, want the second buffer's set", r.Groups)
+	}
+	if h.mode != ModeReview {
+		t.Errorf("mode = %v after review, want Review", h.mode)
+	}
+	if got := h.Tabs.Active().File.Path; got != second {
+		t.Errorf("active = %q after review of %q, want the named buffer focused", got, second)
 	}
 }
 
@@ -1249,5 +1662,278 @@ func TestControlGotoTouchesTheSession(t *testing.T) {
 	}
 	if !h.sessionDirty {
 		t.Error("a socket goto left the session untouched")
+	}
+}
+
+// A hunk's offsets are in the base version's coordinates, so the bounds check
+// has to measure against the length the base had, not the current text. A
+// driver that read the empty version 0 and then submitted an offset past it
+// must be refused: the buffer is 11 bytes now, and a current-length check is
+// what let the out-of-range offset be rebased to EOF instead.
+func TestApplyValidatesAgainstTheBaseLength(t *testing.T) {
+	h := controlHarness(t, "")
+	c := h.dial(t)
+
+	base := c.do(h, control.Request{Op: "text"}).Version // 0: the empty document
+	if r := c.do(h, control.Request{
+		Op:    "apply",
+		Base:  &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "hello world"}},
+	}); !r.OK {
+		t.Fatalf("setup apply = %+v", r)
+	}
+
+	// Offset 5 is out of range for base 0, though it is inside the current
+	// "hello world". The same base pointer: the base did not move.
+	r := c.do(h, control.Request{
+		Op:    "apply",
+		Base:  &base,
+		Hunks: []control.Hunk{{Start: 5, End: 5, Text: "X"}},
+	})
+	if r.OK || !strings.Contains(r.Err, "offset out of range") {
+		t.Fatalf("stale offset = OK %v err %q, want offset out of range", r.OK, r.Err)
+	}
+	if got := h.text(); got != "hello world" {
+		t.Errorf("buffer = %q, want the refused hunk to have changed nothing", got)
+	}
+}
+
+// A rename carries an open clean buffer: the file moves, the pane keeps its
+// text and version, and the path it is keyed on follows. The tab is the same
+// object, so the session records the new name rather than a reopened one.
+func TestControlRenameCarriesACleanBuffer(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	p := h.Tabs.Active()
+	old := p.File.Path
+	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
+	version := p.File.Session().Version()
+	h.sessionDirty = false
+
+	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if !r.OK {
+		t.Fatalf("rename = %+v", r)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("old path still on disk (err=%v)", err)
+	}
+	if data, err := os.ReadFile(newPath); err != nil || string(data) != "hello\n" {
+		t.Errorf("new path on disk = %q, err %v", data, err)
+	}
+	if p.File.Path != newPath {
+		t.Errorf("pane path = %q, want %q", p.File.Path, newPath)
+	}
+	if got := p.File.Session().Version(); got != version {
+		t.Errorf("version = %d, want %d — the buffer was reopened, not carried", got, version)
+	}
+	if h.Tabs.Active() != p {
+		t.Error("the tab did not follow the rename")
+	}
+	if !h.sessionDirty {
+		t.Error("a carried rename did not mark the session for rewriting")
+	}
+}
+
+// A dirty buffer is refused: the rename would move the file out from under
+// unsaved text, and there is no force path. Nothing moves.
+func TestControlRenameRefusesADirtyBuffer(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	h.typeText("x")
+	p := h.Tabs.Active()
+	old := p.File.Path
+	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
+
+	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if r.OK {
+		t.Fatal("a dirty buffer was renamed")
+	}
+	if !strings.Contains(strings.ToLower(r.Err), "unsaved") {
+		t.Errorf("refusal = %q, want it to name the unsaved changes", r.Err)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Errorf("the refused rename moved the file: %v", err)
+	}
+}
+
+// A buffer holding a pending change set is refused the same way: the proposed
+// text exists only in the buffer, and renaming the file does not materialise it.
+func TestControlRenameRefusesPendingSets(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	read := c.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := c.do(h, control.Request{
+		Op:    "apply",
+		Base:  &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "x"}},
+	}); !r.OK {
+		t.Fatalf("setup apply = %+v", r)
+	}
+	p := h.Tabs.Active()
+	old := p.File.Path
+	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
+
+	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if r.OK {
+		t.Fatal("a buffer with pending change sets was renamed")
+	}
+	if !strings.Contains(r.Err, "pending") {
+		t.Errorf("refusal = %q, want it to name the pending sets", r.Err)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Errorf("the refused rename moved the file: %v", err)
+	}
+}
+
+// A buffer whose file is not on disk — open -create makes one — has nothing to
+// move, so the rename is the pane's path alone and works even while the buffer
+// is dirty: the work stays in the piece table and follows the name. Refusing it
+// forced a driver to close -discard and leave the old name behind.
+func TestControlRenameCarriesANotYetSavedBuffer(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	old := filepath.Join(dir, "fresh.go")
+
+	if r := c.do(h, control.Request{Op: "open", Path: old, Create: true}); !r.OK {
+		t.Fatalf("open -create = %+v", r)
+	}
+	p := h.Tabs.Active()
+	h.typeText("draft\n")
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("open -create wrote a file: %v", err)
+	}
+
+	newPath := filepath.Join(dir, "renamed.go")
+	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if !r.OK {
+		t.Fatalf("rename of a not-yet-saved buffer = %+v, want it carried", r)
+	}
+	if p.File.Path != newPath {
+		t.Errorf("pane path = %q, want %q", p.File.Path, newPath)
+	}
+	if got := p.File.Text(); got != "draft" {
+		t.Errorf("buffer text = %q, want the unsaved draft preserved", got)
+	}
+	if h.Tabs.Active() != p {
+		t.Error("the tab did not follow the rename")
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("rename wrote a file for a buffer that had none: %v", err)
+	}
+}
+
+// close -discard drops the buffer but leaves the file on disk, and the editor
+// says so, so a driver that recreated the content under a new name does not
+// leave a duplicate behind silently.
+func TestControlCloseDiscardNotesTheFileThatRemains(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	h.typeText("x") // dirty, so a plain close would refuse
+
+	r := c.do(h, control.Request{Op: "close", Path: path, Discard: true})
+	if !r.OK {
+		t.Fatalf("close -discard = %+v", r)
+	}
+	if !r.Remains {
+		t.Error("close -discard did not report that a file remains")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("discard removed the file: %v", err)
+	}
+	if got := h.Status(); !strings.Contains(got, "still on disk") {
+		t.Errorf("status = %q, want it to say the file remains", got)
+	}
+}
+
+// A discarded buffer that never reached disk has nothing to report: there is no
+// file to leave behind.
+func TestControlCloseDiscardQuietWhenNothingRemains(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	fresh := filepath.Join(dir, "fresh.go")
+	if r := c.do(h, control.Request{Op: "open", Path: fresh, Create: true}); !r.OK {
+		t.Fatalf("open -create = %+v", r)
+	}
+	if r := c.do(h, control.Request{Op: "close", Path: fresh, Discard: true}); !r.OK {
+		t.Fatalf("close -discard = %+v", r)
+	} else if r.Remains {
+		t.Error("close -discard of a buffer with no file reported a remainder")
+	}
+	if got := h.Status(); strings.Contains(got, "still on disk") {
+		t.Errorf("status = %q, want no remainder note for a buffer with no file", got)
+	}
+}
+
+// A file nobody has open is a plain filesystem move: no tab appears, and the
+// bytes are at the new name.
+func TestControlRenameMovesAnUnopenedFile(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	old := filepath.Join(dir, "loose.go")
+	if err := os.WriteFile(old, []byte("loose\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newPath := filepath.Join(dir, "moved.go")
+
+	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if !r.OK {
+		t.Fatalf("rename = %+v", r)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("old path still on disk (err=%v)", err)
+	}
+	if data, err := os.ReadFile(newPath); err != nil || string(data) != "loose\n" {
+		t.Errorf("new path on disk = %q, err %v", data, err)
+	}
+	if got := h.Tabs.Count(); got != 1 {
+		t.Errorf("tab count = %d, want 1 — an unopened rename opened a tab", got)
+	}
+}
+
+// The old name has to be in the caller's claim set, so an agent cannot move a
+// file it never declared.
+func TestControlRenameRefusesAnUnclaimedOld(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	old := h.Tabs.Active().File.Path
+	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
+
+	r := c.roundtrip(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if r.OK {
+		t.Fatal("a rename of an unclaimed file was allowed")
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Errorf("the refused rename moved the file: %v", err)
+	}
+}
+
+// A case-only rename goes through the two-step in renameFile even on a
+// case-sensitive filesystem, so the destination spelling is what lands on disk.
+// The assertion does not depend on the filesystem folding case: it only checks
+// that the two-hop move arrived where it was asked to and the pane followed.
+func TestControlRenameCaseOnly(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+	p := h.Tabs.Active()
+	old := p.File.Path
+	newPath := filepath.Join(filepath.Dir(old), "TEST.GO")
+
+	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if !r.OK {
+		t.Fatalf("case-only rename = %+v", r)
+	}
+	// The old spelling is deliberately not asserted absent: on a
+	// case-insensitive filesystem it still resolves to the same file. What
+	// matters is that the new spelling reads back and the pane followed.
+	if data, err := os.ReadFile(newPath); err != nil || string(data) != "hello\n" {
+		t.Errorf("new path on disk = %q, err %v", data, err)
+	}
+	if p.File.Path != newPath {
+		t.Errorf("pane path = %q, want %q", p.File.Path, newPath)
 	}
 }

@@ -25,10 +25,13 @@ import (
 
 // servers is the language servers for this workspace, one per language.
 //
-// Started on the first request that needs one rather than at launch: most
-// sessions never ask for a hover, and paying gopls's startup on every launch to
-// serve the sessions that do is the wrong trade. It also means a broken server
-// costs nothing until it is asked for.
+// A server starts on the first request that needs one: most sessions never ask
+// for a hover, and paying gopls's startup on every launch to serve the sessions
+// that do is the wrong trade. It also means a broken server costs nothing until
+// it is asked for. The one exception is WarmServers, which starts the servers
+// for the languages of the files already open at launch — a launch with a Go
+// file pays gopls's startup up front, in exchange for diagnostics and the
+// first request not waiting on a cold handshake.
 type servers struct {
 	root string
 	mu   sync.Mutex
@@ -61,8 +64,72 @@ var command = map[string][]string{
 	"cpp":             {"clangd"},
 }
 
+// serverInitOptions is a language's initializationOptions: the settings a server
+// needs to turn on something the editor renders but the server leaves off by
+// default. gopls is the case today — every inlay hint is disabled unless asked
+// for — so the hint kinds the editor can draw are enabled here. A language with
+// nothing to configure gets nil, and Initialize omits the field.
+func serverInitOptions(languageID string) any {
+	if languageID != "go" {
+		return nil
+	}
+	return map[string]any{
+		"hints": map[string]any{
+			"assignVariableTypes":    true,
+			"rangeVariableTypes":     true,
+			"compositeLiteralFields": true,
+			"constantValues":         true,
+		},
+	}
+}
+
 func newServers(root string) *servers {
 	return &servers{root: root, byID: map[string]*langServer{}}
+}
+
+// openLanguages is the distinct language ids of a set of panes, in first-seen
+// order. WarmServers starts one server per language rather than per pane: two
+// Go files share a server, and a blank buffer or a file type with no language
+// contributes nothing to start. It is pure so the ordering and the skipping can
+// be tested without touching PATH or spawning a process.
+func openLanguages(panes []*editor.Pane) []string {
+	var langs []string
+	seen := map[string]bool{}
+	for _, p := range panes {
+		if p == nil || p.File == nil {
+			continue
+		}
+		id := lsp.LanguageID(p.File.Path)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		langs = append(langs, id)
+	}
+	return langs
+}
+
+// WarmServers starts a server for every language among the files already open,
+// so the first hover, diagnostic or completion does not wait on a cold
+// handshake. It is called once from main after the session is restored and any
+// file named on the command line is open. It must not be called from App.Run or
+// RestoreSession: tests run those, and a warm start there would spawn gopls
+// inside a test process.
+//
+// for_ starts asynchronously and returns at once, so this does not block; a
+// language with no entry in command is skipped, and no panes is a no-op.
+func (a *App) WarmServers() {
+	panes := append(append([]*editor.Pane{}, a.Tabs.All()...), a.headless...)
+	for _, id := range openLanguages(panes) {
+		// Any one path of the language will do: a server is keyed on the
+		// language, and the handshake takes the workspace root, not the file.
+		for _, p := range panes {
+			if p != nil && p.File != nil && lsp.LanguageID(p.File.Path) == id {
+				a.servers.for_(a.docPath(p), func() { a.host.Post(ui.Wake{}) })
+				break
+			}
+		}
+	}
 }
 
 // serverState is why there is or is not a server, which the caller turns into
@@ -147,6 +214,7 @@ func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 	if ls == nil {
 		ls = &langServer{srv: &lsp.Server{
 			Command: argv[0], Args: argv[1:], Dir: s.root, Notify: notify,
+			Options: serverInitOptions(id),
 		}}
 		s.byID[id] = ls
 	}
@@ -174,38 +242,6 @@ func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 		// should do about it: try again.
 		return nil, serverStarting
 	}
-}
-
-// state reports the server already handling a path's language without starting
-// one, so a caller that must not spawn a process can still say why there is no
-// answer. Diagnostics use it: the published cache is meaningful only for a
-// server already running, and a read that started one would report "starting"
-// on a first call while looking like it had answered.
-func (s *servers) state(path string) (*langServer, serverState) {
-	id := lsp.LanguageID(path)
-	if id == "" {
-		return nil, serverNone
-	}
-	argv, ok := command[id]
-	if !ok {
-		return nil, serverNone
-	}
-	if _, err := exec.LookPath(argv[0]); err != nil {
-		return nil, serverMissing
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ls := s.byID[id]
-	if ls == nil {
-		return nil, serverNotStarted
-	}
-	if ls.srv.Conn() != nil && ls.sync != nil {
-		return ls, serverReady
-	}
-	if ls.srv.GaveUp() {
-		return nil, serverGaveUp
-	}
-	return nil, serverStarting
 }
 
 // message is what to show for a state, or "" when there is nothing to say.
@@ -316,13 +352,15 @@ func (a *App) syncDoc(ls *langServer, p *editor.Pane) bool {
 	return true
 }
 
-// syncDirtyDocs brings any open document that a live server already knows
-// about up to the current text of the buffer. It runs from the idle tick, so a
-// buffer the user is not looking at is synced too: diagnostics are answered
-// from what the server last published, and a server that was never told about
-// an edit cannot publish for it. The visible pane already reaches a sync
-// through the inlay-hint request; this gives every open pane the same
-// guarantee, and runs first so the hint request sees a synced document.
+// syncDirtyDocs registers each open dirty document with a live server and
+// brings one the server already knows about up to the current text of the
+// buffer. It runs from the idle tick, so a buffer the user is not looking at is
+// registered too: diagnostics are answered from what the server last published,
+// and a server that was never told about a document cannot publish for it. A
+// clean buffer matches disk, so a server reading the file itself is already
+// right and is left closed; only a dirty one is opened. The visible pane already
+// reaches a sync through the inlay-hint request; this gives every open pane the
+// same guarantee, and runs first so the hint request sees a synced document.
 //
 // It never starts a server. A server starts on a request that needs one, and
 // an idle tick that spawned one for every open tab would turn having a file
@@ -330,27 +368,29 @@ func (a *App) syncDoc(ls *langServer, p *editor.Pane) bool {
 // declines to pay. The lookup is live, not for_: it reads the byID table and
 // never touches PATH, and a path with no live server is simply skipped.
 //
-// The version compare in front of each pane is what keeps the scan cheap: an
-// unchanged buffer costs one integer comparison, so this can run every tick.
-// It does not compare text, because that would materialise every open buffer.
-// A reload restarts a session version numbering, so an equal version over new
-// text is possible; this guard cannot see that without the materialisation it
-// exists to avoid.
+// The version compare in front of a document the server has open is what keeps
+// the scan cheap: an unchanged buffer costs one integer comparison, so this can
+// run every tick. It does not compare text, because that would materialise every
+// open buffer. A reload restarts a session version numbering, so an equal
+// version over new text is possible; this guard cannot see that without the
+// materialisation it exists to avoid.
 func (a *App) syncDirtyDocs() {
 	for _, p := range a.Tabs.All() {
 		a.syncDirtyPane(p)
 	}
-	// Headless buffers cost the same one comparison and are skipped unless a
-	// live server already has the document open, so including them cannot
-	// start anything.
+	// Headless buffers — control-socket proposals among them — follow the same
+	// rule, so a live server learns their text too. Neither list can start a
+	// server: the lookup is live and finds only one already running.
 	for _, p := range a.headless {
 		a.syncDirtyPane(p)
 	}
 }
 
-// syncDirtyPane syncs one pane if a live server has its document open and
-// behind. A pane with no path, no live server, or no open document is left
-// untouched.
+// syncDirtyPane registers or syncs one pane with a live server. A dirty pane
+// the server has not opened is opened with the buffer's text; one the server
+// already has is pushed when the buffer has moved past the version it saw. A
+// pane with no path, no live server, a clean unopened buffer, or an unchanged
+// open document is left untouched.
 func (a *App) syncDirtyPane(p *editor.Pane) {
 	path := a.docPath(p)
 	if path == "" {
@@ -361,17 +401,48 @@ func (a *App) syncDirtyPane(p *editor.Pane) {
 		return
 	}
 	synced, open := ls.sync.Version(path)
-	if !needsSync(open, synced, int(p.File.Session().Version())) {
+	if !needsSync(open, p.File.ViewDirty(), synced, int(p.File.Session().Version())) {
 		return
 	}
 	a.syncDoc(ls, p)
 }
 
-// needsSync reports whether a document the server has open is behind the
-// buffer. It is pure so the rule is testable without a language server: only a
-// live, open document needs a push, and only when its version has moved.
-func needsSync(open bool, syncedVersion, bufVersion int) bool {
-	return open && syncedVersion != bufVersion
+// needsSync reports whether a live server has to be told about a pane's text.
+// It is pure so the rule is testable without a language server: a dirty
+// document the server has not opened needs a push to register it, and an open
+// one needs a push only when its version has moved. A clean buffer matches
+// disk, so opening it would tell the server nothing it cannot read itself.
+func needsSync(open, dirty bool, syncedVersion, bufVersion int) bool {
+	return (!open && dirty) || (open && syncedVersion != bufVersion)
+}
+
+// lspSaved tells the live language server that a buffer reached disk.
+//
+// Two notifications, because servers differ in how they read a save. Changed is
+// the watching half: the editor writes with a temp-file rename, which a server's
+// own watcher does not always see, so a server that reads the file from disk has
+// to be told to drop its cached copy. Save is the synchronisation half, sent
+// only for a document the server has open: didSave is what runs the slower
+// checks a server skips while typing, and the capability we advertise promises
+// it. Both are best-effort — a notification that fails is not a save that
+// failed.
+func (a *App) lspSaved(p *editor.Pane) {
+	if p == nil || p.File == nil {
+		return
+	}
+	path := a.docPath(p)
+	if path == "" {
+		return // an unnamed buffer was never on disk for a server to read
+	}
+	// live, not for_: a save is no reason to start a server nothing asked for.
+	ls := a.servers.live(path)
+	if ls == nil || ls.sync == nil {
+		return
+	}
+	_ = ls.sync.Changed(path)
+	if ls.sync.IsOpen(path) {
+		_ = ls.sync.Save(path, p.File.Text())
+	}
 }
 
 // editsSince renders the journal window (since, present] as LSP edits, in

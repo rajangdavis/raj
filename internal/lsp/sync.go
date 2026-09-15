@@ -217,6 +217,24 @@ func (s *Sync) Save(path, text string) error {
 	})
 }
 
+// Changed tells the server that files under its workspace changed on disk, so
+// it drops any cached copy and reloads them. The editor writes with a
+// temp-file rename, which the server's own watcher does not always see; this is
+// the client's half of file watching. LSP file-event type 2 is "changed".
+func (s *Sync) Changed(paths ...string) error {
+	if s.conn == nil {
+		return ErrClosed
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	changes := make([]map[string]any, 0, len(paths))
+	for _, p := range paths {
+		changes = append(changes, map[string]any{"uri": URI(p), "type": 2})
+	}
+	return s.conn.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes})
+}
+
 // Close tells the server to forget a document, which also tells it to drop the
 // diagnostics it published for one — otherwise a closed file's problems stay on
 // screen with nothing to clear them.

@@ -118,31 +118,7 @@ func (s *Session) HasDecisions() bool { return len(s.groupState) > 0 }
 func (s *Session) Groups() []Group {
 	byID := map[uint64]*Group{}
 	for _, o := range s.journal {
-		if o.Kind != KindEdit {
-			continue
-		}
-		g, ok := byID[o.Group]
-		if !ok {
-			g = &Group{ID: o.Group, Author: o.Author, State: s.GroupState(o.Group),
-				First: o.Seq, Last: o.Seq}
-			byID[o.Group] = g
-		}
-		if o.Seq < g.First {
-			g.First = o.Seq
-		}
-		if o.Seq > g.Last {
-			g.Last = o.Seq
-		}
-		if !s.live(o.Seq) {
-			continue // reversed since: it is in the journal but not in the text
-		}
-		g.Ops++
-		for _, r := range o.Ins {
-			g.Bytes += r.Length
-		}
-		for _, r := range o.Del {
-			g.Bytes -= r.Length
-		}
+		s.addMember(byID, o)
 	}
 	out := make([]Group, 0, len(byID))
 	for _, g := range byID {
@@ -150,6 +126,66 @@ func (s *Session) Groups() []Group {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].First < out[j].First })
 	return out
+}
+
+// GroupDiff projects one named change set by the same rebase walk DiffPending
+// uses, whatever its state. The Group field is the set as Groups lists it, and
+// Hunks and Moved mean for a decided set exactly what they mean for a pending
+// one: Hunks counts the runs of its live members' inserted bytes that survive
+// in the document now, Moved counts the members a later edit overwrote whole.
+//
+// A rejected set is not composed into the agreed text, but rejecting is a
+// decision, not an edit: its bytes are still live in the buffer, so the walk
+// still describes them. "Surviving" here is about the text and not the
+// decision, so a rejected set reports what it would contribute if it were in;
+// that is the honest reading, and it keeps a decided set's listing as
+// informative as a pending set's. An accepted set is the same walk with its
+// bytes already in the agreed text. It reports false when the journal holds no
+// member for id.
+func (s *Session) GroupDiff(id uint64) (GroupDiff, bool) {
+	byID := map[uint64]*Group{}
+	for _, o := range s.journal {
+		if o.Group == id {
+			s.addMember(byID, o)
+		}
+	}
+	g, ok := byID[id]
+	if !ok {
+		return GroupDiff{}, false
+	}
+	return s.projectGroup(*g), true
+}
+
+// addMember folds one journal op into its change set's running listing, or
+// creates the listing on first sight. It is the one place the fold lives, so
+// Groups and GroupDiff cannot disagree about which ops count, how many bytes
+// they net, or which are live.
+func (s *Session) addMember(byID map[uint64]*Group, o Op) {
+	if o.Kind != KindEdit {
+		return
+	}
+	g, ok := byID[o.Group]
+	if !ok {
+		g = &Group{ID: o.Group, Author: o.Author, State: s.GroupState(o.Group),
+			First: o.Seq, Last: o.Seq}
+		byID[o.Group] = g
+	}
+	if o.Seq < g.First {
+		g.First = o.Seq
+	}
+	if o.Seq > g.Last {
+		g.Last = o.Seq
+	}
+	if !s.live(o.Seq) {
+		return // reversed since: it is in the journal but not in the text
+	}
+	g.Ops++
+	for _, r := range o.Ins {
+		g.Bytes += r.Length
+	}
+	for _, r := range o.Del {
+		g.Bytes -= r.Length
+	}
 }
 
 // Pending lists the change sets that still need a decision: proposed, with a
@@ -222,23 +258,47 @@ func (s *Session) AcceptGroup(id uint64) {
 // Unlike RejectGroup this really edits, because removing the bytes is the
 // point: the reversal can wedge behind a later change and return false. It
 // acts only on a set currently Rejected, so a false means either that the set
-// was not rejected to begin with or that a reversal genuinely wedged. A set
-// with no live members left to reverse — its edits were undone — has nothing
-// to wedge, so clearing it drops the decision and succeeds. False is not
-// retryable: the caller has to look at what happened since.
+// was not rejected to begin with or that a reversal genuinely wedged -- a live
+// member moved past what a rebase can carry, including one whose only
+// surviving record is a bad offset. A set with no live member ops left -- its
+// edits were undone -- has nothing to wedge, so clearing it drops the decision
+// and succeeds. False is not retryable: the caller has to look at what
+// happened since.
 func (s *Session) ClearRejected(id uint64) bool {
 	if s.GroupState(id) != Rejected {
 		return false
 	}
-	if len(s.reverseMembers(id, KindUndo, nil)) == 0 {
+	// The "already gone" case is no live member ops, the same notion Groups
+	// counts as Ops: an op in the journal, of kind KindEdit, not reversed by a
+	// live undo or redo. reverseMembers is not that test -- its kind filter can
+	// come back empty for a set whose members still exist -- so asking it was
+	// how a live set used to be marked Accepted and its text orphaned under a
+	// tombstone no one can remove.
+	if !s.hasLiveMembers(id) {
 		s.MarkGroup(id, Accepted)
 		return true
 	}
+	// Live members remain, so the reversal really has to happen. reverseGroup
+	// fails when one cannot be placed; that failure has to surface rather than
+	// be swallowed by dropping the decision, or the purge is in name only.
 	if !s.reverseGroup(id, KindUndo, nil) {
 		return false
 	}
 	s.MarkGroup(id, Accepted)
 	return true
+}
+
+// hasLiveMembers reports whether a change set still holds a live editorial
+// member, the same notion Groups counts as Ops: a journal op of kind KindEdit
+// that no live undo or redo has reversed. Undo and redo ops are the mechanism,
+// not members, so they never keep a set alive.
+func (s *Session) hasLiveMembers(id uint64) bool {
+	for _, o := range s.journal {
+		if o.Group == id && o.Kind == KindEdit && s.live(o.Seq) {
+			return true
+		}
+	}
+	return false
 }
 
 // DiffHunk is one surviving run of a change set as old→new text, in the
@@ -252,11 +312,17 @@ type DiffHunk struct {
 
 // GroupDiff is a change set rendered for review: the group as Groups lists
 // it, one hunk per surviving run of its member ops, and a count of members the
-// buffer has moved past entirely.
+// buffer has moved past entirely. MovedHunks carries the recorded old→new text
+// of those moved members, as written, so a reviewer sees the proposal even
+// though no current span can locate it.
 type GroupDiff struct {
 	Group Group
 	Hunks []DiffHunk
 	Moved int
+	// MovedHunks is the as-written text of the members counted in Moved.
+	// Start and End are -1: a later edit overwrote where they sat, so there is
+	// no honest place to point at.
+	MovedHunks []DiffHunk
 }
 
 // projectGroup renders one proposed group: each live member's surviving runs
@@ -271,11 +337,21 @@ func (s *Session) projectGroup(g Group) GroupDiff {
 		hunks := s.projectMember(o)
 		if len(hunks) == 0 {
 			d.Moved++
+			d.MovedHunks = append(d.MovedHunks, s.writtenHunk(o))
 			continue
 		}
 		d.Hunks = append(d.Hunks, hunks...)
 	}
 	return d
+}
+
+// writtenHunk is a moved member as it was written: the text the op removed and
+// the text it added, with no current span, because a later edit overwrote
+// where it sat. projectMember returns nil exactly when nothing of the inserted
+// text survives, so this is the one place the recorded text is still worth
+// handing a reviewer.
+func (s *Session) writtenHunk(o Op) DiffHunk {
+	return DiffHunk{Start: -1, End: -1, Old: s.recsText(o.Del), New: s.recsText(o.Ins)}
 }
 
 // projectMember carries one live member op into the present. A pure deletion

@@ -101,6 +101,31 @@ func TestReviewFallsBackToAllVisible(t *testing.T) {
 	}
 }
 
+// The bulk reject decides every proposed set on screen, re-reading the pending
+// projection as it goes and unwinding newest-first rather than walking a list
+// that a reversal can invalidate.
+func TestReviewBulkRejectDecidesEveryVisibleSet(t *testing.T) {
+	h := newHarness(t, "one\ntwo\nthree\n")
+	first := propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "UNO"})
+	second := propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "TRES"})
+	p := h.Pane()
+	p.Cursors.Set(4, 4) // line 1, between the two sets
+	h.drain()           // lay the pane out, or the viewport has 0 rows and nothing is visible
+
+	h.press("ctrl+super+/")
+	if marks := p.PendingMarks(); len(marks) != 0 {
+		t.Errorf("marks after the bulk reject = %+v, want none", marks)
+	}
+	for _, id := range []uint64{first, second} {
+		if st := p.File.Session().GroupState(id); st != piecetable.Rejected {
+			t.Errorf("group %d state = %v, want rejected", id, st)
+		}
+	}
+	if got := h.Status(); !strings.Contains(got, "rejected 2 of 2") {
+		t.Errorf("status = %q, want the count of what was decided", got)
+	}
+}
+
 // A caret on the line a hunk touches decides that hunk even when it is not
 // inside the span: line covering, not byte covering.
 func TestCaretOnTheLineIsEnough(t *testing.T) {

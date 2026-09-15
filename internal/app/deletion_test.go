@@ -1,0 +1,316 @@
+package app
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"raj/internal/piecetable"
+	"raj/internal/ui"
+)
+
+// The deletion gate, driven through the same event path a keystroke takes: a
+// pending proposal is recorded, the prompt appears when the path is opened or
+// focused, and the answer decides whether the file survives.
+
+// proposeDeletion records a pending deletion for the active buffer's path,
+// proposed by an agent, and returns the path. The gate raises immediately when
+// that path is the one on screen, so a test can either answer here or focus
+// away first.
+func proposeDeletion(t *testing.T, h *harness) string {
+	t.Helper()
+	p := h.Pane()
+	if p == nil {
+		t.Fatal("no active buffer")
+	}
+	if err := h.App.ProposeDeletion(p.File.Path, uint8(piecetable.Agent+7)); err != nil {
+		t.Fatal(err)
+	}
+	return p.File.Path
+}
+
+// A pending deletion for the file already on screen raises the gate at once,
+// and the clean buffer is offered both answers.
+func TestDeletionProposalForOpenFileRaisesPrompt(t *testing.T) {
+	h := newHarness(t, "hello\n")
+	proposeDeletion(t, h)
+	if !h.Prompt.Open {
+		t.Fatal("a deletion proposal for the open file did not raise the gate")
+	}
+	if got := h.Prompt.Title(); got != "Delete file" {
+		t.Errorf("title = %q, want Delete file", got)
+	}
+	h.drain()
+	screen := h.host.Text()
+	if !strings.Contains(screen, "proposed deleting test.go") {
+		t.Errorf("the prompt does not name the file:\n%s", screen)
+	}
+	if !strings.Contains(screen, removeForever) {
+		t.Errorf("a clean buffer did not offer %q:\n%s", removeForever, screen)
+	}
+	if !strings.Contains(screen, ignoreForNow) {
+		t.Errorf("the prompt does not offer %q:\n%s", ignoreForNow, screen)
+	}
+}
+
+// A path nobody has open waits for an open: the gate depends on the file being
+// shown, not on a timer.
+func TestDeletionPromptWaitsForOpen(t *testing.T) {
+	h := newHarness(t, "one\n")
+	other := filepath.Join(h.root, "other.go")
+	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.App.ProposeDeletion(other, uint8(piecetable.Agent)); err != nil {
+		t.Fatal(err)
+	}
+	if h.Prompt.Open {
+		t.Fatal("a proposal for a file nobody has open raised the gate too early")
+	}
+
+	h.OpenFile(other)
+	if !h.Prompt.Open {
+		t.Fatal("opening the path with a pending deletion did not raise the gate")
+	}
+	h.drain()
+	if !strings.Contains(h.host.Text(), "proposed deleting other.go") {
+		t.Errorf("the prompt does not name the opened file:\n%s", h.host.Text())
+	}
+}
+
+// Ignore is the whole answer: the file keeps working and the proposal stays,
+// and the gate does not reappear until the focus moves.
+func TestIgnoreLeavesFileAndProposal(t *testing.T) {
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+	if !h.Prompt.Open {
+		t.Fatal("setup: no gate")
+	}
+	if got := h.Prompt.Selected(); got != ignoreForNow {
+		t.Errorf("default answer = %q, want %q", got, ignoreForNow)
+	}
+	h.press("enter")
+
+	if h.Prompt.Open {
+		t.Fatal("Ignore left the dialog open")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("Ignore removed the file: %v", err)
+	}
+	if got := h.Pane().File.Text(); got != "hello\n" {
+		t.Errorf("buffer = %q, want it untouched", got)
+	}
+	got := h.Deletions()
+	if len(got) != 1 || got[0].Path != path {
+		t.Errorf("pending deletions after Ignore = %+v, want the proposal kept", got)
+	}
+	// Same focus: the question does not come straight back.
+	h.maybePromptDeletion()
+	if h.Prompt.Open {
+		t.Error("the gate reappeared without a focus change")
+	}
+}
+
+// Remove forever unlinks the file, drops the buffer and clears the proposal.
+func TestRemoveForeverUnlinksAndDropsBuffer(t *testing.T) {
+	t.Setenv("RAJ_TRASH", "")
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+	if !h.Prompt.Open {
+		t.Fatal("setup: no gate")
+	}
+	h.press("right") // select Remove forever
+	if got := h.Prompt.Selected(); got != removeForever {
+		t.Fatalf("selected = %q, want %q", got, removeForever)
+	}
+	h.press("enter")
+
+	if h.Prompt.Open {
+		t.Fatal("the gate stayed open after Remove forever")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still on disk after Remove forever (err=%v)", err)
+	}
+	if got := h.Tabs.Count(); got != 0 {
+		t.Errorf("tab count = %d, want the buffer gone", got)
+	}
+	if got := h.Deletions(); len(got) != 0 {
+		t.Errorf("pending deletions after Remove forever = %+v, want none", got)
+	}
+}
+
+// A dirty buffer offers only Ignore: there is no force path, and the file
+// survives even though the prompt was answered.
+func TestRemoveForeverRefusedWhenDirty(t *testing.T) {
+	h := newHarness(t, "hello\n")
+	h.typeText("x")
+	path := proposeDeletion(t, h)
+	if !h.Prompt.Open {
+		t.Fatal("setup: no gate")
+	}
+	if safe, why := deletionSafe(h.Pane()); safe || why == "" {
+		t.Errorf("deletionSafe(dirty) = %v, %q; want a refusal with a reason", safe, why)
+	}
+	h.drain()
+	screen := h.host.Text()
+	if strings.Contains(screen, removeForever) {
+		t.Errorf("a dirty buffer offered %q:\n%s", removeForever, screen)
+	}
+	if !strings.Contains(screen, "Unsaved changes") {
+		t.Errorf("the prompt does not say why Remove forever is missing:\n%s", screen)
+	}
+	// Right is a no-op with one button; enter answers Ignore.
+	h.press("right", "enter")
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the file was removed despite unsaved changes: %v", err)
+	}
+	if got := h.Deletions(); len(got) != 1 {
+		t.Errorf("pending deletions = %+v, want the proposal kept", got)
+	}
+}
+
+// A buffer with a change set still awaiting a decision is not removable
+// either; the listing names the set rather than only counting it.
+func TestRemoveForeverRefusedWithPendingSet(t *testing.T) {
+	h := newHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	path := proposeDeletion(t, h)
+	if !h.Prompt.Open {
+		t.Fatal("setup: no gate")
+	}
+	if safe, why := deletionSafe(h.Pane()); safe || why == "" {
+		t.Errorf("deletionSafe(pending) = %v, %q; want a refusal", safe, why)
+	}
+	h.drain()
+	screen := h.host.Text()
+	if strings.Contains(screen, removeForever) {
+		t.Errorf("a buffer with a pending set offered %q:\n%s", removeForever, screen)
+	}
+	if !strings.Contains(screen, "pending set") {
+		t.Errorf("the prompt does not name the pending set:\n%s", screen)
+	}
+	h.press("enter") // Ignore
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the file was removed despite a pending set: %v", err)
+	}
+}
+
+// The gate returns when the path is focused again after the focus moved away.
+func TestDeletionPromptReturnsOnNextFocus(t *testing.T) {
+	h := newHarness(t, "one\n")
+	other := filepath.Join(h.root, "other.go")
+	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(other) // test.go is now a background tab
+	target := h.Tabs.All()[0]
+	if target.File.Path == other {
+		target = h.Tabs.All()[1]
+	}
+	if err := h.App.ProposeDeletion(target.File.Path, uint8(piecetable.Agent)); err != nil {
+		t.Fatal(err)
+	}
+	if h.Prompt.Open {
+		t.Fatal("a proposal for a background tab raised the gate over another file")
+	}
+
+	// Focus the path; the gate is evaluated after the event, the same way a
+	// tab click or chord would reach it.
+	h.Tabs.Focus(target)
+	h.Handle(ui.Tick{})
+	if !h.Prompt.Open {
+		t.Fatal("focusing the path with a pending deletion did not raise the gate")
+	}
+	h.press("enter") // Ignore for now
+
+	// Focus away and back: the question returns.
+	for _, p := range h.Tabs.All() {
+		if p != target {
+			h.Tabs.Focus(p)
+		}
+	}
+	h.Handle(ui.Tick{})
+	h.Tabs.Focus(target)
+	h.Handle(ui.Tick{})
+	if !h.Prompt.Open {
+		t.Error("the gate did not return on the next focus")
+	}
+}
+
+// The safety predicate on a genuinely clean buffer is what makes the removal
+// path reachable at all.
+func TestDeletionSafeOnCleanBuffer(t *testing.T) {
+	h := newHarness(t, "hello\n")
+	if safe, why := deletionSafe(h.Pane()); !safe || why != "" {
+		t.Errorf("deletionSafe(clean) = %v, %q; want true and no reason", safe, why)
+	}
+}
+
+// RAJ_TRASH=1 moves the removed file into the workspace trash rather than
+// unlinking it, under a timestamped name that keeps the original basename. The
+// removal still drops the buffer and clears the proposal.
+func TestRemoveForeverTrashesWhenEnabled(t *testing.T) {
+	t.Setenv("RAJ_TRASH", "1")
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+	if !h.Prompt.Open {
+		t.Fatal("setup: no gate")
+	}
+	h.press("right") // select Remove forever
+	if got := h.Prompt.Selected(); got != removeForever {
+		t.Fatalf("selected = %q, want %q", got, removeForever)
+	}
+	h.press("enter")
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still at the original path after a trashing removal (err=%v)", err)
+	}
+	trash := filepath.Join(h.root, ".raj", "trash")
+	entries, err := os.ReadDir(trash)
+	if err != nil {
+		t.Fatalf("reading trash dir %s: %v", trash, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("trash holds %d file(s), want exactly 1: %+v", len(entries), entries)
+	}
+	data, err := os.ReadFile(filepath.Join(trash, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != "hello\n" {
+		t.Errorf("trashed content = %q, want %q", got, "hello\n")
+	}
+	if got := h.Tabs.Count(); got != 0 {
+		t.Errorf("tab count = %d, want the buffer gone", got)
+	}
+	if got := h.Deletions(); len(got) != 0 {
+		t.Errorf("pending deletions = %+v, want none", got)
+	}
+}
+
+// Any value other than the exact "1" -- unset, or a near miss like "0" or
+// "true" -- is the ordinary hard unlink, and nothing lands under .raj/trash/.
+func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
+	for _, val := range []string{"", "0", "true", "yes"} {
+		t.Run("RAJ_TRASH="+val, func(t *testing.T) {
+			t.Setenv("RAJ_TRASH", val)
+			h := newHarness(t, "hello\n")
+			path := proposeDeletion(t, h)
+			if !h.Prompt.Open {
+				t.Fatal("setup: no gate")
+			}
+			h.press("right", "enter")
+
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("file still on disk after Remove forever (err=%v)", err)
+			}
+			trash := filepath.Join(h.root, ".raj", "trash")
+			if entries, err := os.ReadDir(trash); err == nil {
+				t.Errorf("trash dir exists with %d entr(ies) for RAJ_TRASH=%q; want none", len(entries), val)
+			} else if !os.IsNotExist(err) {
+				t.Errorf("reading trash dir: %v", err)
+			}
+		})
+	}
+}

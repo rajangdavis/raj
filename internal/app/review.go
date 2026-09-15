@@ -37,15 +37,40 @@ func (a *App) reviewProposed(accept bool) {
 	}
 	// Nothing under the caret: decide every proposed change on screen, so a
 	// review pass is read-then-one-chord rather than one chord per change.
+	// The visible set is captured once — that is what the user saw, and the
+	// gesture may only decide those sets — but a reject re-reads the pending
+	// projection after each reversal and unwinds newest-first, mirroring the
+	// socket's `reject -all`. List order alone goes stale under the walk: a
+	// set can only come out once every later edit that overlaps it is gone.
 	visible := a.proposalsVisible(p)
 	if len(visible) == 0 {
 		a.status = "no proposed changes here"
 		return
 	}
-	n := 0
+	wanted := make(map[uint64]bool, len(visible))
 	for _, m := range visible {
-		if a.decideProposed(p, m.Group, accept) {
-			n++
+		wanted[m.Group] = true
+	}
+	n := 0
+	if accept {
+		// Accepting is order-independent: the text is already in the
+		// document, so the decision only clears a mark.
+		for _, m := range visible {
+			if a.decideProposed(p, m.Group, true) {
+				n++
+			}
+		}
+	} else {
+		attempted := map[uint64]bool{}
+		for {
+			id, ok := newestWanted(p.File, wanted, attempted)
+			if !ok {
+				break
+			}
+			attempted[id] = true
+			if a.decideProposed(p, id, false) {
+				n++
+			}
 		}
 	}
 	verb := "accepted"
@@ -53,6 +78,28 @@ func (a *App) reviewProposed(accept bool) {
 		verb = "rejected"
 	}
 	a.status = fmt.Sprintf("%s %d of %d proposed change set(s) on screen", verb, n, len(visible))
+}
+
+// newestWanted picks the newest still-pending change set this bulk walk wants
+// and has not attempted yet. It re-reads Session.DiffPending on every call, so
+// a reversal that takes a set out of the pending projection is seen rather than
+// worked from a list captured before it. DiffPending lists oldest-first, so the
+// last match is the newest; newest-first is the order a reversal needs, because
+// an earlier set can be blocked by a later overlapping one and the later has to
+// come out first. attempted keeps the loop finite when a set cannot come out at
+// all.
+func newestWanted(f *editor.File, wanted, attempted map[uint64]bool) (uint64, bool) {
+	var id uint64
+	found := false
+	for _, d := range f.Session().DiffPending() {
+		if len(d.Hunks) == 0 {
+			continue // no surviving text: nothing left to reverse
+		}
+		if wanted[d.Group.ID] && !attempted[d.Group.ID] {
+			id, found = d.Group.ID, true
+		}
+	}
+	return id, found
 }
 
 // decidedStatus is the one-line confirmation for a single decision.
@@ -325,7 +372,7 @@ func (a *App) reviewSave(p *editor.Pane, pending []piecetable.Group, then func(s
 				a.saveAs(p, then)
 				return
 			}
-			a.writeTo(p, p.File.Path, then)
+			a.saveNamed(p, then)
 		})
 }
 

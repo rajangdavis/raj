@@ -247,3 +247,28 @@ func TestFuzzConcurrentAuthors(t *testing.T) {
 		}
 	}
 }
+
+// LengthAt reports the document length at a past version. That is the number a
+// stale apply has to validate its offsets against: the base is not the current
+// text, and a version the journal never reached has no length at all.
+func TestLengthAtTracksNetDeltas(t *testing.T) {
+	for name, s := range sessions("hello") {
+		if got, ok := s.LengthAt(0); !ok || got != 5 {
+			t.Fatalf("%s: LengthAt(0) = %d, %v; want 5, true", name, got, ok)
+		}
+		s.Insert(Agent, 5, " world") // +6: "hello world"
+		s.Delete(User, 0, 5)         // -5: " world"
+		if got, ok := s.LengthAt(1); !ok || got != 11 {
+			t.Errorf("%s: LengthAt(1) = %d, %v; want 11, true", name, got, ok)
+		}
+		if got, ok := s.LengthAt(2); !ok || got != 6 {
+			t.Errorf("%s: LengthAt(2) = %d, %v; want 6, true", name, got, ok)
+		}
+		if got, ok := s.LengthAt(s.Version()); !ok || got != s.Buffer().Len() {
+			t.Errorf("%s: LengthAt(current) = %d, %v; want %d, true", name, got, ok, s.Buffer().Len())
+		}
+		if got, ok := s.LengthAt(s.Version() + 1); ok || got != 0 {
+			t.Errorf("%s: LengthAt(past) = %d, %v; want 0, false", name, got, ok)
+		}
+	}
+}

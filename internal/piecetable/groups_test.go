@@ -479,6 +479,80 @@ func TestDiffPendingAutoRejectsOverwrittenSet(t *testing.T) {
 	}
 }
 
+// GroupDiff projects a decided set by the same walk the pending projection
+// uses, so an accepted set reports the runs it contributes rather than zero:
+// Hunks is what survives in the document now, Moved is what a later edit has
+// overwritten. A rejected set is projected the same way — rejecting decides
+// the set's standing, not whether its bytes are live.
+func TestGroupDiffProjectsDecidedSets(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.End()
+	id := s.LastGroup()
+	s.AcceptGroup(id)
+
+	d, ok := s.GroupDiff(id)
+	if !ok {
+		t.Fatalf("GroupDiff(%d) = not found", id)
+	}
+	if d.Group.State != Accepted {
+		t.Errorf("state = %v, want accepted", d.Group.State)
+	}
+	if d.Moved != 0 || len(d.Hunks) != 1 {
+		t.Fatalf("accepted diff = %+v, want one placed hunk", d)
+	}
+	if hk := d.Hunks[0]; hk.Old != "world" || hk.New != "socket" {
+		t.Errorf("hunk old/new = %q/%q, want world/socket", hk.Old, hk.New)
+	}
+
+	// A rejected set keeps its live bytes, so the projection is unchanged.
+	s.MarkGroup(id, Rejected)
+	d, ok = s.GroupDiff(id)
+	if !ok {
+		t.Fatalf("GroupDiff(%d) after rejecting = not found", id)
+	}
+	if d.Group.State != Rejected {
+		t.Errorf("state = %v, want rejected", d.Group.State)
+	}
+	if d.Moved != 0 || len(d.Hunks) != 1 {
+		t.Errorf("rejected diff = %+v, want the same placed hunk", d)
+	}
+}
+
+// A decided member a later edit overwrote whole still counts as moved, the
+// same as a pending one: the counts describe the text, not the decision.
+func TestGroupDiffCountsAMovedMemberOfADecidedSet(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.End()
+	id := s.LastGroup()
+	s.AcceptGroup(id)
+
+	// Replace every byte of the accepted member's inserted text.
+	s.Delete(User, 6, len("socket"))
+	s.Insert(User, 6, "port")
+
+	d, ok := s.GroupDiff(id)
+	if !ok {
+		t.Fatalf("GroupDiff(%d) = not found", id)
+	}
+	if d.Moved != 1 || len(d.Hunks) != 0 {
+		t.Errorf("diff = %+v, want the member counted as moved", d)
+	}
+	if len(d.MovedHunks) != 1 || d.MovedHunks[0].Old != "world" || d.MovedHunks[0].New != "socket" {
+		t.Errorf("moved hunks = %+v, want the member as written", d.MovedHunks)
+	}
+
+	// An id the journal never held is refused rather than reported as empty.
+	if _, ok := s.GroupDiff(id + 1000); ok {
+		t.Errorf("GroupDiff(%d) = found, want false for an unknown set", id+1000)
+	}
+}
+
 // A member whose inserted text is entirely gone is counted as moved, and a set
 // with another surviving member keeps that count rather than hiding it.
 func TestDiffPendingCountsAMovedMemberAmongSurvivors(t *testing.T) {
@@ -690,5 +764,48 @@ func TestApplyDiffRefusesAHunkSpanningTwoLeases(t *testing.T) {
 	}
 	if got := text(s); got != "AAA BBB ccc\n" {
 		t.Errorf("text = %q, want both proposals unchanged", got)
+	}
+}
+
+// A rejected set whose only member was recorded with an offset past the
+// document cannot be reversed: its rebased span lies beyond the text, so the
+// inverse's removeRange clamps to a no-op and marking the set Accepted would
+// leave the text orphaned under a tombstone no one can remove. ClearRejected
+// has to report the wedge instead, and keep the decision.
+//
+// This is the session-level state the host now refuses to create: a hunk
+// submitted against a base it does not fit (offset 5 against the empty base 0)
+// is carried to EOF rather than refused, so the op's Pos (16) outlives the
+// document it was written in.
+func TestClearRejectedRefusesAWedgedSet(t *testing.T) {
+	s := groupSession(t, "")
+	if _, c := s.ApplyDiff(Agent, 0, []Hunk{{Start: 0, End: 0, Text: "hello world"}}); len(c) != 0 {
+		t.Fatalf("setup insert conflicts: %+v", c)
+	}
+	if _, c := s.ApplyDiff(Agent, 0, []Hunk{{Start: 5, End: 5, Text: "X"}}); len(c) != 0 {
+		t.Fatalf("setup offset conflicts: %+v", c)
+	}
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	if !s.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+
+	if got := text(s); got != "hello worldX" {
+		t.Fatalf("setup produced %q, want the X carried to EOF", got)
+	}
+	// The set still holds a live member; it is only the projection that cannot
+	// place it. That is what the old live check mistook for "nothing left".
+	if gs := s.Groups(); len(gs) != 2 || gs[1].Ops != 1 {
+		t.Fatalf("groups = %+v, want the second set still holding a live member", gs)
+	}
+	if s.ClearRejected(id) {
+		t.Error("clearing a set that cannot be reversed reported success")
+	}
+	if got := text(s); got != "hello worldX" {
+		t.Errorf("text = %q after a refused clear, want it unchanged", got)
+	}
+	if got := s.GroupState(id); got != Rejected {
+		t.Errorf("state = %v after a refused clear, want it to stay rejected", got)
 	}
 }

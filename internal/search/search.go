@@ -23,8 +23,15 @@ type Match struct {
 	Col       int    // byte offset of the match within Text
 	Len       int
 	LineStart int // byte offset of the start of the hit line within the file
+	LineEnd   int // one past the last byte of the hit line, excluding the newline
 	ByteStart int // byte offset of the match within the file
 	ByteEnd   int // one past the last byte of the match within the file
+	// Version is the buffer revision the open document was at when the hit was
+	// found, or 0 for a file read from disk with no open buffer behind it. It
+	// lets a caller see that the text moved between the search and a later
+	// read, rather than trusting a hit against a document that has since
+	// changed under it.
+	Version uint64
 }
 
 // Query describes a search.
@@ -149,6 +156,13 @@ func (r Result) Truncated() []FileCount {
 // and the search reads bytes that cannot change under it.
 type Docs map[string]string
 
+// DocVersions is the buffer revision each open document was at when the
+// snapshot was taken, keyed by absolute path. It sits beside Docs rather than
+// inside it so the pane's own search, which has no use for versions, keeps the
+// plain map. A path with no entry — which includes every file read from disk —
+// reports version 0, the one value that cannot be a real buffer revision.
+type DocVersions map[string]uint64
+
 // Run searches root with no way to stop it. Prefer RunContext: an interactive
 // search is abandoned far more often than it is read.
 func Run(root string, q Query) Result { return RunContext(context.Background(), root, q) }
@@ -190,6 +204,20 @@ func RunDocs(ctx context.Context, root string, q Query, open Docs) Result {
 // emit may be nil. It is called on the walking goroutine, so a slow callback
 // slows the search; a caller that might block should hand off.
 func RunStream(ctx context.Context, root string, q Query, open Docs, emit func([]Match)) Result {
+	return runStream(ctx, root, q, open, nil, emit)
+}
+
+// RunStreamVersioned is RunStream with the buffer version of every open
+// document, so a hit reports the revision it was found in rather than only
+// where it was. A caller that read a hit and then a buffer at a different
+// version knows the text moved; without the number it cannot tell.
+func RunStreamVersioned(ctx context.Context, root string, q Query, open Docs,
+	versions DocVersions, emit func([]Match)) Result {
+	return runStream(ctx, root, q, open, versions, emit)
+}
+
+func runStream(ctx context.Context, root string, q Query, open Docs,
+	versions DocVersions, emit func([]Match)) Result {
 	var res Result
 	// sent tracks how much of res.Matches the callback has seen, so each file
 	// emits only what it added.
@@ -276,7 +304,7 @@ func RunStream(ctx context.Context, root string, q Query, open Docs, emit func([
 		}
 		res.Considered++
 		delete(pending, path)
-		record(path, scanOne(path, open, m, &buf, &res), &res)
+		record(path, scanOne(path, open, versions, m, &buf, &res), &res)
 		flush()
 		return nil
 	})
@@ -303,7 +331,7 @@ func RunStream(ctx context.Context, root string, q Query, open Docs, emit func([
 			return res
 		}
 		res.Considered++
-		record(path, scanOne(path, open, m, &buf, &res), &res)
+		record(path, scanOne(path, open, versions, m, &buf, &res), &res)
 		flush()
 	}
 	return res
@@ -322,13 +350,15 @@ func record(path string, total int, res *Result) {
 }
 
 // scanOne searches a path from the open document if there is one, and from disk
-// otherwise.
-func scanOne(path string, open Docs, m matcher, buf *[]byte, res *Result) (total int) {
+// otherwise. The version is the open buffer's, or zero for a file read from
+// disk, and it rides on every hit so a caller can tell the document moved.
+func scanOne(path string, open Docs, versions DocVersions, m matcher, buf *[]byte, res *Result) (total int) {
+	version := versions[path]
 	if text, ok := open[path]; ok {
-		_, total = scanData(path, []byte(text), m, res)
+		_, total = scanData(path, version, []byte(text), m, res)
 		return total
 	}
-	_, total = scan(path, m, buf, res)
+	_, total = scan(path, version, m, buf, res)
 	return total
 }
 
@@ -398,7 +428,7 @@ func compile(q Query) (*regexp.Regexp, error) {
 // scan reports how many matches it recorded and how many the file actually
 // holds. The two differ once a file passes MaxPerFile, and the difference is
 // the whole point: the pane can then say how much it is not showing.
-func scan(path string, m matcher, buf *[]byte, res *Result) (found, total int) {
+func scan(path string, version uint64, m matcher, buf *[]byte, res *Result) (found, total int) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0
@@ -409,20 +439,20 @@ func scan(path string, m matcher, buf *[]byte, res *Result) (found, total int) {
 	if err != nil {
 		return 0, 0
 	}
-	return scanData(path, data, m, res)
+	return scanData(path, version, data, m, res)
 }
 
 // scanData is the sweep itself, over bytes that are already in hand. It is
 // separate from scan because an open document arrives as memory rather than as
 // a file, and everything after the read is identical for both.
-func scanData(path string, data []byte, m matcher, res *Result) (found, total int) {
+func scanData(path string, version uint64, data []byte, m matcher, res *Result) (found, total int) {
 	if len(data) > MaxFileSize || bytes.IndexByte(data, 0) >= 0 {
 		return 0, 0 // too big, or a NUL byte somewhere: binary
 	}
 
 	hay, lineFallback := m.prepare(data)
 	if lineFallback != nil {
-		return scanLines(path, lineFallback, data, res)
+		return scanLines(path, version, lineFallback, data, res)
 	}
 
 	line, lineStart, from := 1, 0, 0
@@ -462,7 +492,9 @@ func scanData(path string, data []byte, m matcher, res *Result) (found, total in
 				Text: strings.TrimRight(string(text), " \t"),
 				Col:  start - lineStart, Len: end - start,
 				LineStart: lineStart,
+				LineEnd:   lineEnd,
 				ByteStart: start, ByteEnd: end,
+				Version: version,
 			})
 			found++
 		}
@@ -506,7 +538,7 @@ func readAll(f *os.File, buf *[]byte) ([]byte, error) {
 // bytes under a case-insensitive query, where folding in place would change
 // byte offsets. Only such files pay the per-line regexp cost, and only for
 // themselves.
-func scanLines(path string, m matcher, data []byte, res *Result) (found, total int) {
+func scanLines(path string, version uint64, m matcher, data []byte, res *Result) (found, total int) {
 	for line, off := 1, 0; off <= len(data); line++ {
 		end := len(data)
 		if nl := bytes.IndexByte(data[off:], '\n'); nl >= 0 {
@@ -525,7 +557,9 @@ func scanLines(path string, m matcher, data []byte, res *Result) (found, total i
 					Text: strings.TrimRight(string(raw), " \t"),
 					Col:  start, Len: stop - start,
 					LineStart: off,
+					LineEnd:   end,
 					ByteStart: off + start, ByteEnd: off + stop,
+					Version: version,
 				})
 				found++
 			}

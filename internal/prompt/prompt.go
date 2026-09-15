@@ -255,30 +255,125 @@ func (p *Prompt) moveRow(d int) {
 // burying the buttons is how they stop being reachable.
 const reviewMaxRows = 8
 
-// reviewWindow is the slice of rows the dialog draws, with the current one
-// always inside it.
-func (p *Prompt) reviewWindow() (first, shown int) {
+// reviewWindowFor is the slice of rows the dialog draws, with the current one
+// always inside it, and how many rows it can afford. Two caps, not one: rows
+// stop at reviewMaxRows so the buttons are never buried, and the wrapped height
+// must fit listingBudget so the box does not outgrow the screen and vanish.
+// Width is part of it because an absolute path wraps to two lines, and a count
+// of rows that ignores that is not a height.
+func (p *Prompt) reviewWindowFor(w, rows int) (first, shown int) {
 	shown = len(p.rows)
 	if shown > reviewMaxRows {
 		shown = reviewMaxRows
 	}
-	if p.row >= shown {
-		first = p.row - shown + 1
+	budget := p.listingBudget(w, rows)
+	for shown > 0 {
+		if p.row >= shown {
+			first = p.row - shown + 1
+		} else {
+			first = 0
+		}
+		if max := len(p.rows) - shown; first > max {
+			first = max
+		}
+		if p.wrappedHeight(first, shown, w) <= budget {
+			break
+		}
+		shown--
 	}
-	if first > len(p.rows)-shown {
-		first = len(p.rows) - shown
+	if shown <= 0 {
+		return 0, 0
 	}
 	return first, shown
 }
 
-// buttonsAt is where the options sit, counted in dialog rows: after the
-// listing when there is one, where they have always sat otherwise.
-func (p *Prompt) buttonsAt() int {
-	if p.kind == review {
-		_, shown := p.reviewWindow()
-		return 2 + shown
+// wrappedHeight is the dialog rows a window of the listing occupies once every
+// row is wrapped, which is the number the box has to budget for.
+func (p *Prompt) wrappedHeight(first, shown, w int) int {
+	n := 0
+	for i := 0; i < shown; i++ {
+		n += len(widget.Wrap(p.rows[first+i], w-4))
 	}
-	return buttonRow
+	return n
+}
+
+// listingBudget is how many wrapped dialog rows the listing may occupy: the
+// screen, less the two border rows, the gate message and the three rows the
+// review box spends on title, buttons and their gap. It is clamped at zero so a
+// message that already fills the dialog simply shows no listing rather than
+// overrunning it.
+func (p *Prompt) listingBudget(w, rows int) int {
+	n := rows - 2 - len(p.messageLinesFor(w, rows)) - 3
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// messageLines wraps the message to the dialog's inner width. The dialog grows
+// to hold every line, because the gate messages are sentences whose point is in
+// the last word -- "1 pending set." -- and an ellipsis cuts exactly that.
+func (p *Prompt) messageLines(w int) []string {
+	return widget.Wrap(p.message, w-4)
+}
+
+// messageLinesFor wraps the message the same way, but clamps it to the rows the
+// dialog can actually hold. A gate message is ordinarily a short sentence; this
+// is the pathological case, and a box that bails and draws nothing is a worse
+// failure than a message whose tail is cut. The ellipsis marks where it was.
+//
+// The reserve is the box's non-message rows: three for review (title, buttons,
+// their border) and four for confirm, which keeps a blank line before its
+// buttons. Clamping to the review figure alone would leave a confirm one row
+// too tall, so the kind picks it. box, Render and ClickAt all read this, so the
+// height they compute and the lines they draw are the same.
+func (p *Prompt) messageLinesFor(w, rows int) []string {
+	reserve := 3
+	if p.kind == confirm {
+		reserve = 4
+	}
+	lines := p.messageLines(w)
+	if max := rows - 2 - reserve; max < len(lines) {
+		if max <= 0 {
+			return nil
+		}
+		lines = lines[:max]
+		lines[max-1] = widget.Truncate(lines[max-1]+"…", w-4)
+	}
+	return lines
+}
+
+// listingLines wraps each visible review row in turn. One row can occupy more
+// than one dialog line, which is what lets an absolute path be read whole
+// instead of cut to a prefix.
+func (p *Prompt) listingLines(w, rows int) [][]string {
+	first, shown := p.reviewWindowFor(w, rows)
+	out := make([][]string, shown)
+	for i := 0; i < shown; i++ {
+		out[i] = widget.Wrap(p.rows[first+i], w-4)
+	}
+	return out
+}
+
+// listingHeight is the number of dialog rows the review listing occupies once
+// its rows are wrapped and the window is shrunk to the budget. It is what the
+// box spends on the listing, so it must be the same window everything else
+// draws and clicks.
+func (p *Prompt) listingHeight(w, rows int) int {
+	n := 0
+	for _, lines := range p.listingLines(w, rows) {
+		n += len(lines)
+	}
+	return n
+}
+
+// buttonsAt is where the options sit, counted in dialog rows: after the wrapped
+// message and, when there is one, the wrapped listing.
+func (p *Prompt) buttonsAt(w, rows int) int {
+	if p.kind == review {
+		return 1 + len(p.messageLinesFor(w, rows)) + p.listingHeight(w, rows)
+	}
+	return len(p.messageLinesFor(w, rows)) + 2
 }
 
 func (p *Prompt) answer() string {
@@ -314,22 +409,23 @@ func (p *Prompt) box(cols, rows int) (x, y, w, h int, ok bool) {
 		w = cols - 4
 	}
 	h = 5
-	if p.kind == ask {
+	switch p.kind {
+	case ask:
 		h = 1 + widget.Height + 2 // the field draws its own three-row border
-	}
-	if p.kind == review {
-		// The listing sits between the question and the buttons.
-		_, shown := p.reviewWindow()
-		h = 4 + shown
+	case confirm:
+		// The message wraps, so the box is as tall as it needs -- clamped to
+		// the screen, because a box taller than the screen draws nothing.
+		h = len(p.messageLinesFor(w, rows)) + 4
+	case review:
+		// The message and the listing both wrap; the listing is windowed to
+		// what is left after the message, so the box always fits.
+		h = len(p.messageLinesFor(w, rows)) + p.listingHeight(w, rows) + 3
 	}
 	if w < 24 || h > rows-2 {
 		return 0, 0, 0, 0, false
 	}
 	return (cols - w) / 2, (rows - h) / 2, w, h, true
 }
-
-// buttonRow is where Confirm draws its options, relative to the dialog's top.
-const buttonRow = 3
 
 // ClickAt handles a press at a screen cell while a dialog is open. It reports
 // whether the press was inside it — a dialog is modal, so a press outside is
@@ -351,19 +447,28 @@ func (p *Prompt) ClickAt(cols, rows, col, row int) bool {
 		p.input.ClickAt(dx-2, dy-1, w-4)
 		return true
 	}
-	if p.kind == review && dy >= 2 && dy < p.buttonsAt() {
+	if p.kind == review {
 		// A press on a row selects it, and the follow-up hook fires the same as
-		// an arrow would — the pointer is not a shortcut past the listing.
-		first, _ := p.reviewWindow()
-		if idx := first + dy - 2; idx < len(p.rows) {
-			p.row = idx
-			if p.moved != nil {
-				p.moved(p.row)
+		// an arrow would — the pointer is not a shortcut past the listing. A
+		// wrapped row takes several lines, so find the one dy lands on.
+		listTop := 1 + len(p.messageLinesFor(w, rows))
+		if dy >= listTop && dy < p.buttonsAt(w, rows) {
+			first, _ := p.reviewWindowFor(w, rows)
+			line := listTop
+			for i, lines := range p.listingLines(w, rows) {
+				if dy < line+len(lines) {
+					p.row = first + i
+					if p.moved != nil {
+						p.moved(p.row)
+					}
+					break
+				}
+				line += len(lines)
 			}
+			return true
 		}
-		return true
 	}
-	if dy == p.buttonsAt() {
+	if dy == p.buttonsAt(w, rows) {
 		for i, sp := range p.buttons(w) {
 			if dx >= sp.Start && dx < sp.End {
 				p.sel = i
@@ -424,21 +529,32 @@ func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 		s.SetString(x+2, y+1+widget.Height, "enter  save      esc  cancel", th.Dim, w-4)
 		return
 	}
-	s.SetString(x+2, y+1, widget.Truncate(p.message, w-4), th.Text, w-4)
+	// The message wraps across rows and the box was sized from the same clamped
+	// lines, so it reads whole -- unless it is longer than the screen, where the
+	// last visible line is ellipsised so the box still appears.
+	line := y + 1
+	for _, text := range p.messageLinesFor(w, rows) {
+		s.SetString(x+2, line, text, th.Text, w-4)
+		line++
+	}
 	if p.kind == review {
-		// The listing between the question and the buttons; the current row is
-		// highlighted and its index named in the title below.
-		first, shown := p.reviewWindow()
-		for i := 0; i < shown; i++ {
-			idx := first + i
+		// The listing between the question and the buttons; a row too long for
+		// one line continues onto the next, and the current row is highlighted
+		// and its index named in the title. The window is the same one box and
+		// ClickAt computed, so the drawn rows and the pressable rows agree.
+		first, _ := p.reviewWindowFor(w, rows)
+		for i, lines := range p.listingLines(w, rows) {
 			style := th.Text
-			if idx == p.row {
+			if first+i == p.row {
 				style = th.Selected
 			}
-			s.SetString(x+2, y+2+i, widget.Truncate(p.rows[idx], w-4), style, w-4)
+			for _, text := range lines {
+				s.SetString(x+2, line, text, style, w-4)
+				line++
+			}
 		}
 	}
-	p.renderButtons(s, x, y+p.buttonsAt(), w, th)
+	p.renderButtons(s, x, y+p.buttonsAt(w, rows), w, th)
 }
 
 func (p *Prompt) renderButtons(s *ui.Screen, x, y, w int, th widget.Theme) {

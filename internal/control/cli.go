@@ -50,10 +50,20 @@ const ctlUsage = `usage: raj ctl <command> [options]
   list                       running editors and their workspaces
   buffers                    files open in the editor; a headless buffer has no tab
   read [path]                the buffer view, loaded on demand; -annotated adds per-run states, -start/-end/-lines for a span
-  open <path>                show a file: load it and focus a tab; -create makes a buffer for a path not on disk
+  open <path>                show a file: load it and focus a tab; -create makes a buffer for a path not on disk; prints opened or created
+  mkdir <dir>                create a directory, and any missing parents, under the workspace root
+  rename <old> <new>         move a file within the workspace, carrying an open clean buffer; alias: mv
+  delete <path>              propose deleting a file for the user to review; claim-gated
+  delete -withdraw <path>    retract a pending deletion you proposed
+  deletions                  list the pending deletions (path and author)
+  rmdir <dir>                propose removing a directory and its subtree for review; claim-gated
+  rmdir -withdraw <dir>      retract a pending dir-removal you proposed
+  rmdirs                     list the pending dir-removals (dir and author)
+  proposals [-mine]          every pending proposal: change sets, deletions, dir-removals
+
   claim [path]...            set the working set; -add extends it, -clear releases it
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
-  close [path]                close a buffer; refused while it has unsaved work
+  close [path]                close a buffer; refused while it has unsaved work, -discard drops it anyway and reports whether the file remains
   whoami                     the author id this connection writes as
   register [-as KEY]         mint an explicit identity key; -as binds a chosen one
   who [-live]                everyone writing in this workspace; -live filters to connected
@@ -71,12 +81,17 @@ const ctlUsage = `usage: raj ctl <command> [options]
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] -dump N       replace a snapshot's text; the editor diffs and applies
   lsp MODE [path] LINE:COL   hover, definition, references, completion, or diagnostics [path]
-  apply [path] -base N [-start N -end N [-text S | -text-file F]]
-                             replace bytes [start,end) with text
+  lsp inlay-hints [path] [-lines A,B]
+                             inlay hints for a file or a 1-based inclusive line range
+  apply [path] -base N [-start N -end N [-text S | -text-file F | -- TEXT]]
+                             replace bytes [start,end) with text; -- passes a
+                             body beginning with "-"
   apply [path] -base N -hunks F
                              replace each span in a JSON Lines file: one
                              {"start":S,"end":E,"text":"..."} per line, - for stdin
-  edit [path] -old S -new S  replace an exact string (convenience over apply)
+  edit [path] -old S -new S  replace an exact string (convenience over apply);
+                             -- OLD NEW passes strings beginning with "-", and
+                             -verbatim strips one trailing newline from a file
   save [path]                write a buffer to disk
   exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
   stats                      what the exec policy has cost this session
@@ -144,6 +159,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
 	annotated := fs.Bool("annotated", false, "read: add the per-run change set and state of the view")
 	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
+	discard := fs.Bool("discard", false, "close: discard unsaved changes instead of refusing the close")
+	withdraw := fs.Bool("withdraw", false, "delete: retract your pending deletion instead of proposing one")
 	claimAdd := fs.Bool("add", false, "claim: extend the current set instead of replacing it")
 	claimClear := fs.Bool("clear", false, "claim: release the whole set")
 	textArg := fs.String("text", "", "apply: replacement text")
@@ -156,15 +173,31 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	oldFile := fs.String("old-file", "", "edit: read -old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read -new from a file, or - for stdin")
 	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject/clear: every change set")
-	mine := fs.Bool("mine", false, "groups: only the connection's own change sets")
+	mine := fs.Bool("mine", false, "groups, proposals: only the connection's own change sets")
+	state := fs.String("state", "", "groups: only sets in this state: proposed, accepted or rejected")
+	pendingOnly := fs.Bool("pending", false, "groups: only sets still awaiting a decision")
+	verbatim := fs.Bool("verbatim", false, "apply/edit: strip one trailing newline read from a file or stdin")
 	live := fs.Bool("live", false, "who: only participants connected right now, not every id the process has minted")
 	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
 	// Everything after "--" is another program's argv and must reach it intact:
 	// `raj ctl exec -- go test -run X` has to give go its own -run, not have it
 	// parsed as ours or shuffled by reorder.
 	var argv []string
-	if i := indexOf(rest, "--"); i >= 0 {
-		argv, rest = rest[i+1:], rest[:i]
+	if cmd == "exec" {
+		if i := indexOf(rest, "--"); i >= 0 {
+			argv, rest = rest[i+1:], rest[:i]
+		}
+	}
+	// edit and apply take a replacement body that may begin with "-" or "--".
+	// Everything after a "--" is that body, taken literally: it never reaches
+	// reorder or the flag package, so it cannot be read as a flag nor refused
+	// as a stray operand.
+	var textOperands []string
+	if cmd == "edit" || cmd == "apply" {
+		if i := indexOf(rest, "--"); i >= 0 {
+			textOperands = append([]string(nil), rest[i+1:]...)
+			rest = rest[:i]
+		}
 	}
 	if err := fs.Parse(reorder(fs, rest)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -235,8 +268,82 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
 			return 2
 		}
-		return simple(c, Request{Op: "open", Path: path, Create: *create},
-			"opened "+path, stdout, stderr, *asJSON)
+		return openCmd(c, path, *create, stdout, stderr, *asJSON)
+	case "mkdir":
+		if path == "" {
+			fmt.Fprintln(stderr, "raj ctl mkdir: needs a path")
+			return 2
+		}
+		return simple(c, Request{Op: "mkdir", Path: path}, "created "+path, stdout, stderr, *asJSON)
+	case "rename", "mv":
+		if path == "" || fs.Arg(1) == "" {
+			fmt.Fprintf(stderr, "raj ctl %s: needs an old and a new path\n", cmd)
+			return 2
+		}
+		return renameCmd(c, path, fs.Arg(1), stdout, stderr, *asJSON)
+	case "delete":
+		if path == "" {
+			fmt.Fprintln(stderr, "raj ctl delete: needs a path")
+			return 2
+		}
+		return deleteCmd(c, path, *withdraw, stdout, stderr, *asJSON)
+	case "deletions":
+		return deletionsCmd(c, stdout, stderr, *asJSON)
+	case "rmdir":
+		if path == "" {
+			fmt.Fprintln(stderr, "raj ctl rmdir: needs a directory path")
+			return 2
+		}
+		return rmdirCmd(c, path, *withdraw, stdout, stderr, *asJSON)
+	case "rmdirs":
+		return rmdirsCmd(c, stdout, stderr, *asJSON)
+	case "proposals":
+		res, err := c.Do(Request{Op: "proposals"})
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		props := res.Proposals
+		if props == nil {
+			props = []Proposal{}
+		}
+		if *mine {
+			props = mineProposals(props, c.Author())
+			if props == nil {
+				props = []Proposal{}
+			}
+		}
+		if *asJSON {
+			return emit(stdout, props)
+		}
+		if len(props) == 0 {
+			fmt.Fprintln(stdout, "no pending proposals")
+			return 0
+		}
+		for _, k := range []struct{ kind, label string }{
+			{"set", "change sets:"},
+			{"delete", "pending deletions:"},
+			{"rmdir", "pending dir-removals:"},
+		} {
+			head := false
+			for _, p := range props {
+				if p.Kind != k.kind {
+					continue
+				}
+				if !head {
+					fmt.Fprintln(stdout, k.label)
+					head = true
+				}
+				switch {
+				case p.Kind == "set" && p.Start >= 0:
+					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tbytes %d..%d\n", p.Path, p.Group, p.Author, p.Start, p.End)
+				case p.Kind == "set":
+					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\n", p.Path, p.Group, p.Author)
+				default:
+					fmt.Fprintf(stdout, "%s\tauthor %d\n", p.Path, p.Author)
+				}
+			}
+		}
+		return 0
 	case "goto":
 		if pos := fs.Arg(1); pos != "" {
 			line, col, ok := ctlPosition(pos)
@@ -266,7 +373,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
 		return 2
 	case "close":
-		return simple(c, Request{Op: "close", Path: path}, "closed", stdout, stderr, *asJSON)
+		return closeCmd(c, path, *discard, stdout, stderr, *asJSON)
 	case "claim":
 		return claimCmd(c, fs.Args(), *claimAdd, *claimClear, stdout, stderr, *asJSON)
 	case "save":
@@ -288,6 +395,21 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			res.Stats.Runs, res.Stats.Stale, res.Stats.AgentOnly)
 		return 0
 	case "groups":
+		if *state != "" {
+			switch *state {
+			case "proposed", "accepted", "rejected":
+			default:
+				fmt.Fprintf(stderr, "raj ctl groups: -state must be proposed, accepted or rejected, not %q\n", *state)
+				return 2
+			}
+		}
+		if *pendingOnly {
+			if *state != "" && *state != "proposed" {
+				fmt.Fprintln(stderr, "raj ctl groups: -pending and -state conflict unless -state is proposed")
+				return 2
+			}
+			*state = "proposed"
+		}
 		res, err := c.Do(Request{Op: "groups", Path: path})
 		if code := fail(stderr, res, err); code != 0 {
 			return code
@@ -295,12 +417,24 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		if *mine {
 			res.Groups = mineOnly(res.Groups, c.Author())
 		}
+		if res.Groups == nil {
+			res.Groups = []Group{}
+		}
+		if *state != "" {
+			kept := make([]Group, 0, len(res.Groups))
+			for _, g := range res.Groups {
+				if g.State == *state {
+					kept = append(kept, g)
+				}
+			}
+			res.Groups = kept
+		}
 		if *asJSON {
 			return emit(stdout, res.Groups)
 		}
 		for _, g := range res.Groups {
-			fmt.Fprintf(stdout, "%d\tauthor %d\t%s\t%d ops\t%+d bytes\n",
-				g.ID, g.Author, g.State, g.Ops, g.Bytes)
+			fmt.Fprintf(stdout, "%d\tauthor %d\t%s\t%d ops\t%+d bytes\t%d hunks\t%d moved\n",
+				g.ID, g.Author, g.State, g.Ops, g.Bytes, g.Hunks, g.Moved)
 		}
 		return 0
 	case "accept", "reject", "clear":
@@ -395,11 +529,12 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "patch":
 		return patchCmd(c, path, *dumpID, *textArg, *textFile, stdout, stderr, *asJSON)
 	case "lsp":
-		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), stdout, stderr, *asJSON)
+		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, stdout, stderr, *asJSON)
 	case "apply":
-		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile, fs, stdout, stderr, *asJSON)
+		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile,
+			textOperands, *verbatim, fs, stdout, stderr, *asJSON)
 	case "edit":
-		o, n, code := editText(*old, *newText, *oldFile, *newFile, stderr)
+		o, n, code := editText(*old, *newText, *oldFile, *newFile, textOperands, *verbatim, stderr)
 		if code != 0 {
 			return code
 		}
@@ -412,8 +547,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 // claimCmd sets, extends, clears or reports this identity's claim set: the
 // files it declares it is working on. Claims are not locks — another writer
 // may hold the same file — so an overlap is reported rather than refused, and a
-// path that is not on disk is warned about and skipped, leaving the rest of the
-// command to land.
+// path that is neither on disk nor an open buffer is warned about and skipped,
+// leaving the rest of the command to land.
 func claimCmd(c *Client, paths []string, add, clear bool, stdout, stderr io.Writer, asJSON bool) int {
 	if add && clear {
 		fmt.Fprintln(stderr, "raj ctl claim: -add and -clear are alternatives")
@@ -458,6 +593,113 @@ func claimCmd(c *Client, paths []string, add, clear bool, stdout, stderr io.Writ
 	return 0
 }
 
+// deleteCmd proposes a pending deletion, or withdraws one this identity
+// proposed. The file is not removed: delete is a review primitive, and the
+// user approves the removal in the editor. The path is claim-gated in the
+// Guard, so an agent can only propose removing a file it declared.
+func deleteCmd(c *Client, path string, withdraw bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "delete", Path: path, Withdraw: withdraw})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw})
+	}
+	if withdraw {
+		fmt.Fprintf(stdout, "withdrew the pending deletion of %s\n", path)
+		return 0
+	}
+	fmt.Fprintf(stdout, "proposed deleting %s; the file stays until the user approves\n", path)
+	return 0
+}
+
+// deletionsCmd lists the pending deletions, naming the path and the author who
+// proposed it, so a driver can see them without opening the file. The listing
+// is ungated; whether a caller may withdraw one is the Guard's business.
+func deletionsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "deletions"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	deletions := res.Deletions
+	if deletions == nil {
+		deletions = []Deletion{}
+	}
+	if asJSON {
+		return emit(stdout, deletions)
+	}
+	if len(deletions) == 0 {
+		fmt.Fprintln(stdout, "no pending deletions")
+		return 0
+	}
+	for _, d := range deletions {
+		fmt.Fprintf(stdout, "%s\t(proposed by author %d)\n", d.Path, d.Author)
+	}
+	return 0
+}
+
+// rmdirCmd proposes a pending dir-removal, or withdraws one this identity
+// proposed. Nothing is removed: rmdir is a review primitive, and the user
+// approves the removal in the editor's review tab. The path is claim-gated in
+// the Guard, with the directory itself as the claim entry (§11).
+func rmdirCmd(c *Client, path string, withdraw bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "rmdir", Path: path, Withdraw: withdraw})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw})
+	}
+	if withdraw {
+		fmt.Fprintf(stdout, "withdrew the pending dir-removal of %s\n", path)
+		return 0
+	}
+	fmt.Fprintf(stdout, "proposed removing %s; the directory stays until the user approves\n", path)
+	return 0
+}
+
+// rmdirsCmd lists the pending dir-removals, naming the directory and the
+// author who proposed it, so a driver can see them without opening anything.
+// The listing is ungated; whether a caller may withdraw one is the Guard's
+// business.
+func rmdirsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "rmdirs"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	removals := res.DirRemovals
+	if removals == nil {
+		removals = []DirRemoval{}
+	}
+	if asJSON {
+		return emit(stdout, removals)
+	}
+	if len(removals) == 0 {
+		fmt.Fprintln(stdout, "no pending dir-removals")
+		return 0
+	}
+	for _, d := range removals {
+		fmt.Fprintf(stdout, "%s\t(proposed by author %d)\n", d.Path, d.Author)
+	}
+	return 0
+}
+
+// renameCmd moves a file within the workspace, carrying an open clean buffer
+// with it. Two paths cross the wire: the old in Path and the new in NewPath.
+// The Guard gates the old on the caller's claim set and refuses a destination
+// that already exists, so this is the same working-set discipline as a write.
+func renameCmd(c *Client, old, newPath string, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "rename", Path: old, NewPath: newPath})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "old": old, "new": newPath})
+	}
+	fmt.Fprintf(stdout, "renamed %s to %s\n", old, newPath)
+	return 0
+}
+
 // argLimit is how many positional operands a verb takes, and what to say about
 // one it does not. A verb absent from the map takes none; goto and lsp are
 // absent too, because their extra operands are positions rather than a stray
@@ -471,22 +713,30 @@ var argLimit = map[string]struct {
 	n    int
 	hint string
 }{
-	"read":     {1, "read takes a path; a byte span goes to -start/-end, a line range to -lines"},
-	"dump":     {1, "dump takes a path; the span goes to -start/-end"},
-	"version":  {1, "version takes a path and nothing else"},
-	"open":     {1, "open takes a path and nothing else"},
-	"close":    {1, "close takes a path and nothing else"},
-	"save":     {1, "save takes a path and nothing else"},
-	"groups":   {1, "groups takes a path and nothing else"},
-	"accept":   {1, "accept takes a path; the change set id goes to -group"},
-	"reject":   {1, "reject takes a path; the change set id goes to -group"},
-	"clear":    {1, "clear takes a path; the change set id goes to -group"},
-	"diff":     {1, "diff takes a path and nothing else"},
-	"review":   {1, "review takes a path and nothing else"},
-	"patch":    {1, "patch takes a path; the snapshot id goes to -dump"},
-	"apply":    {1, "apply takes a path; offsets go to -base/-start/-end"},
-	"edit":     {1, "edit takes a path; the strings go to -old/-new"},
-	"register": {0, "register takes no path; the key goes to -as, or one is minted"},
+	"read":      {1, "read takes a path; a byte span goes to -start/-end, a line range to -lines"},
+	"dump":      {1, "dump takes a path; the span goes to -start/-end"},
+	"version":   {1, "version takes a path and nothing else"},
+	"open":      {1, "open takes a path and nothing else"},
+	"mkdir":     {1, "mkdir takes a directory path and nothing else"},
+	"delete":    {1, "delete takes a path; pass -withdraw to retract a proposal"},
+	"deletions": {0, "deletions takes no operands; it lists every pending deletion"},
+	"rmdir":     {1, "rmdir takes a directory path; pass -withdraw to retract a proposal"},
+	"rmdirs":    {0, "rmdirs takes no operands; it lists every pending dir-removal"},
+	"proposals": {0, "proposals takes no operands; -mine limits the list to this identity's own"},
+	"rename":    {2, "rename takes <old> and <new> paths"},
+	"mv":        {2, "mv takes <old> and <new> paths"},
+	"close":     {1, "close takes a path and nothing else"},
+	"save":      {1, "save takes a path and nothing else"},
+	"groups":    {1, "groups takes a path and nothing else"},
+	"accept":    {1, "accept takes a path; the change set id goes to -group"},
+	"reject":    {1, "reject takes a path; the change set id goes to -group"},
+	"clear":     {1, "clear takes a path; the change set id goes to -group"},
+	"diff":      {1, "diff takes a path and nothing else"},
+	"review":    {1, "review takes a path and nothing else"},
+	"patch":     {1, "patch takes a path; the snapshot id goes to -dump"},
+	"apply":     {1, "apply takes a path; offsets go to -base/-start/-end, and text to -text/-text-file or after --"},
+	"edit":      {1, "edit takes a path; the strings go to -old/-new, or both after --"},
+	"register":  {0, "register takes no path; the key goes to -as, or one is minted"},
 }
 
 // verbOperand is each verb's positional operands, spelled as the top-level
@@ -497,6 +747,11 @@ var argLimit = map[string]struct {
 var verbOperand = map[string]string{
 	"read":     "[path]",
 	"open":     "<path>",
+	"mkdir":    "<dir>",
+	"rename":   "<old> <new>",
+	"mv":       "<old> <new>",
+	"delete":   "<path>",
+	"rmdir":    "<dir>",
 	"claim":    "[path]...",
 	"goto":     "[path] LINE[:COL]",
 	"close":    "[path]",
@@ -509,8 +764,8 @@ var verbOperand = map[string]string{
 	"version":  "[path]",
 	"dump":     "[path]",
 	"patch":    "[path]",
-	"apply":    "[path]",
-	"edit":     "[path]",
+	"apply":    "[path] [TEXT]",
+	"edit":     "[path] [OLD NEW]",
 	"save":     "[path]",
 	"lsp":      "MODE [path] LINE:COL",
 	"register": "[-as KEY]",
@@ -762,10 +1017,56 @@ func ctlAtoi(s string) (int, bool) {
 	return n, len(s) > 0
 }
 
+// readTextFile reads a -text-file/-old-file/-new-file argument, with "-"
+// meaning stdin. verbatim strips exactly the one trailing newline a heredoc or
+// echo appends; without it the bytes are handed over untouched, so callers
+// that already account for the newline see no change.
+func readTextFile(name string, verbatim bool) (string, error) {
+	var data []byte
+	var err error
+	if name == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		data, err = os.ReadFile(name)
+	}
+	if err != nil {
+		return "", err
+	}
+	s := string(data)
+	if verbatim {
+		s = strings.TrimSuffix(s, "\n")
+	}
+	return s, nil
+}
+
 // editText resolves -old/-new against their file forms. Flags carry a one-line
 // replacement fine; anything with newlines in it is painful to quote through a
 // shell, and an agent writing a heredoc into a file is the shape that works.
-func editText(old, newText, oldFile, newFile string, stderr io.Writer) (string, string, int) {
+//
+// pos are the operands after the path, which fill -old then -new when those
+// are not given; they are how a body beginning with "-" gets in past the flag
+// parser, as `edit PATH -- OLD NEW`. verbatim strips one trailing newline from
+// a file or stdin read, the one a heredoc or echo appends.
+func editText(old, newText, oldFile, newFile string, pos []string, verbatim bool, stderr io.Writer) (string, string, int) {
+	next := 0
+	take := func() string {
+		if next >= len(pos) {
+			return ""
+		}
+		s := pos[next]
+		next++
+		return s
+	}
+	if old == "" && oldFile == "" {
+		old = take()
+	}
+	if newText == "" && newFile == "" {
+		newText = take()
+	}
+	if next < len(pos) {
+		fmt.Fprintf(stderr, "raj ctl edit: unexpected argument %q — the strings go to -old/-new, or as OLD NEW operands after --\n", pos[next])
+		return "", "", 2
+	}
 	readArg := func(flagVal, file, name string) (string, int) {
 		if file == "" {
 			return flagVal, 0
@@ -774,18 +1075,12 @@ func editText(old, newText, oldFile, newFile string, stderr io.Writer) (string, 
 			fmt.Fprintf(stderr, "raj ctl edit: -%s and -%s-file are alternatives\n", name, name)
 			return "", 2
 		}
-		var data []byte
-		var err error
-		if file == "-" {
-			data, err = io.ReadAll(os.Stdin)
-		} else {
-			data, err = os.ReadFile(file)
-		}
+		s, err := readTextFile(file, verbatim)
 		if err != nil {
 			fmt.Fprintln(stderr, "raj ctl edit:", err)
 			return "", 1
 		}
-		return string(data), 0
+		return s, 0
 	}
 	o, code := readArg(old, oldFile, "old")
 	if code != 0 {
@@ -1060,6 +1355,18 @@ func mineOnly(groups []Group, author uint8) []Group {
 	return kept
 }
 
+// mineProposals keeps the proposals this connection wrote, the `proposals
+// -mine` view over the unified listing, mirroring mineOnly for `groups`.
+func mineProposals(props []Proposal, author uint8) []Proposal {
+	var kept []Proposal
+	for _, p := range props {
+		if p.Author == author {
+			kept = append(kept, p)
+		}
+	}
+	return kept
+}
+
 // doSearch prints hits in the grep format every tool already parses:
 // path:line:col:text. The overlay means a hit can be in a buffer the user has
 // not saved, which is the point — an agent that grepped the filesystem would
@@ -1077,7 +1384,8 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 			for _, m := range batch {
 				enc.Encode(map[string]any{
 					"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
-					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "line_start": m.LineStart, "text": m.Text,
+					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "line_start": m.LineStart, "line_end": m.LineEnd,
+					"version": m.Version, "text": m.Text,
 				})
 				n++
 			}
@@ -1100,6 +1408,13 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 	// the two call for opposite fixes, so say which one happened.
 	if q.Include != "" && res.Considered == 0 {
 		fmt.Fprintln(stderr, "search: warning: -include pattern(s) matched no files")
+	}
+	// A literal search that finds nothing but whose pattern carries regex
+	// syntax is usually a regex typed without -regex: the engine treats the
+	// metacharacters as text and matches nothing. Say so once, and only when
+	// files really were searched, so it cannot fire on a genuinely empty walk.
+	if !q.Regex && res.Considered > 0 && len(res.Matches) == 0 && hasRegexMeta(q.Text) {
+		fmt.Fprintf(stderr, "search: no matches; %q contains regex metacharacters — retry with -regex\n", q.Text)
 	}
 	if !jsonl && asJSON {
 		return emit(stdout, map[string]any{
@@ -1125,16 +1440,32 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 	return 0
 }
 
+// hasRegexMeta reports whether a literal search pattern carries characters a
+// regex engine would read as syntax, which is the tell that a caller meant
+// -regex and forgot it.
+func hasRegexMeta(s string) bool {
+	return strings.ContainsAny(s, `\.+*?()|[]{}^$`)
+}
+
 // apply is the direct write: offsets, and the version they were measured in.
 func apply(c *Client, path string, base uint64, start, end int, textArg, textFile, hunksFile string,
-	fs *flag.FlagSet, stdout, stderr io.Writer, asJSON bool) int {
+	pos []string, verbatim bool, fs *flag.FlagSet, stdout, stderr io.Writer, asJSON bool) int {
 	if !flagSet(fs, "base") {
 		fmt.Fprintln(stderr, "raj ctl apply: -base is required.\n"+
 			"Offsets only mean something in the coordinates of a version you have read;\n"+
 			"get one with `raj ctl read -json` or `raj ctl version`.")
 		return 2
 	}
+	if len(pos) > 1 {
+		fmt.Fprintf(stderr, "raj ctl apply: expected at most one replacement operand, got %d\n", len(pos))
+		return 2
+	}
 	if hunksFile != "" {
+		if len(pos) == 1 {
+			fmt.Fprintln(stderr, "raj ctl apply: -hunks carries its own text; "+
+				"a replacement operand cannot go with it")
+			return 2
+		}
 		return applyHunks(c, path, base, hunksFile, fs, stdout, stderr, asJSON)
 	}
 	if start < 0 || end < start {
@@ -1142,23 +1473,24 @@ func apply(c *Client, path string, base uint64, start, end int, textArg, textFil
 		return 2
 	}
 	text := textArg
+	if len(pos) == 1 {
+		if textArg != "" || textFile != "" {
+			fmt.Fprintln(stderr, "raj ctl apply: an operand and -text/-text-file are alternatives")
+			return 2
+		}
+		text = pos[0]
+	}
 	if textFile != "" {
 		if textArg != "" {
 			fmt.Fprintln(stderr, "raj ctl apply: -text and -text-file are alternatives")
 			return 2
 		}
-		var data []byte
-		var err error
-		if textFile == "-" {
-			data, err = io.ReadAll(os.Stdin)
-		} else {
-			data, err = os.ReadFile(textFile)
-		}
+		data, err := readTextFile(textFile, verbatim)
 		if err != nil {
 			fmt.Fprintln(stderr, "raj ctl apply:", err)
 			return 1
 		}
-		text = string(data)
+		text = data
 	}
 	res, err := c.Do(Request{Op: "apply", Path: path, Base: &base,
 		Hunks: []Hunk{{Start: start, End: end, Text: text}}})
@@ -1374,16 +1706,35 @@ func diffCmd(c *Client, path string, stdout, stderr io.Writer, asJSON bool) int 
 		fmt.Fprintf(stdout, "group %d\tauthor %d\t%s\t%d ops\t%+d bytes\n",
 			g.ID, g.Author, g.State, g.Ops, g.Bytes)
 		for _, h := range g.Hunks {
-			fmt.Fprintf(stdout, "@@ %d..%d @@\n", h.Start, h.End)
+			fmt.Fprintf(stdout, "@@ %s @@\n", diffHeader(h))
+			writeDiffLines(stdout, "-", h.Old)
+			writeDiffLines(stdout, "+", h.New)
+		}
+		for _, h := range g.MovedHunks {
+			fmt.Fprintln(stdout, "@@ moved: no current span, as written @@")
 			writeDiffLines(stdout, "-", h.Old)
 			writeDiffLines(stdout, "+", h.New)
 		}
 		if g.Moved > 0 {
-			fmt.Fprintf(stdout, "  note: %d op(s) moved past what a rebase can carry; "+
-				"review the buffer directly\n", g.Moved)
+			if len(g.MovedHunks) > 0 {
+				fmt.Fprintf(stdout, "  note: %d op(s) moved past what a rebase can carry; "+
+					"shown above as written, not where they are now\n", g.Moved)
+			} else {
+				fmt.Fprintf(stdout, "  note: %d op(s) moved past what a rebase can carry\n", g.Moved)
+			}
 		}
 	}
 	return 0
+}
+
+// diffHeader names a hunk for the @@ line. A hunk with line coordinates prints
+// the 1-based range and the byte span; one from a server that did not compute
+// lines falls back to bytes alone rather than claiming line 0.
+func diffHeader(h DiffHunk) string {
+	if h.Line <= 0 || h.EndLine <= 0 {
+		return fmt.Sprintf("bytes %d..%d", h.Start, h.End)
+	}
+	return fmt.Sprintf("L%d..L%d (bytes %d..%d)", h.Line, h.EndLine, h.Start, h.End)
 }
 
 // writeDiffLines prints one diff line per line of text. An empty side prints
@@ -1398,19 +1749,39 @@ func writeDiffLines(w io.Writer, prefix, text string) {
 	}
 }
 
-// doLSP asks the language server for hover text, a definition, references, completions, or
-// the cached diagnostics for a path. The answer is JSON already; -json prints
-// it whole and the plain path pretty-prints it, so a script and a person read
-// the same result.
-func doLSP(c *Client, mode, path, pos string, stdout, stderr io.Writer, asJSON bool) int {
+// doLSP asks the language server for hover text, a definition, references,
+// completions, the cached diagnostics for a path, or the inlay hints over a
+// whole file or a line range. The answer is JSON already; -json prints it whole
+// and the plain path pretty-prints it, so a script and a person read the same
+// result. inlay-hints is the one mode whose plain form is line-oriented: a hint
+// is one line of text, and a JSON object per line reads worse.
+func doLSP(c *Client, mode, path, pos, lines string, stdout, stderr io.Writer, asJSON bool) int {
 	switch mode {
-	case "hover", "definition", "references", "completion", "diagnostics":
+	case "hover", "definition", "references", "completion", "diagnostics", "inlay-hints":
 	default:
-		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, references, completion or diagnostics")
+		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, references, completion, diagnostics or inlay-hints")
 		return 2
 	}
 	line, col := 0, 0
-	if mode != "diagnostics" {
+	var lineStart, lineEnd *int
+	switch mode {
+	case "diagnostics":
+		// No position and no range: diagnostics is asked about the whole file.
+	case "inlay-hints":
+		// A range request. A bare A reads from A to the end; A,B is the
+		// 1-based inclusive range, mirroring read -lines.
+		if lines != "" {
+			a, b, hasEnd, ok := ctlLines(lines)
+			if !ok {
+				fmt.Fprintln(stderr, "raj ctl lsp: -lines wants A or A,B, 1-based inclusive")
+				return 2
+			}
+			lineStart = &a
+			if hasEnd {
+				lineEnd = &b
+			}
+		}
+	default:
 		if pos == "" {
 			fmt.Fprintln(stderr, "raj ctl lsp: needs a position, LINE:COL")
 			return 2
@@ -1422,7 +1793,8 @@ func doLSP(c *Client, mode, path, pos string, stdout, stderr io.Writer, asJSON b
 		}
 		line, col = l, cl
 	}
-	res, err := c.Do(Request{Op: "lsp", Path: path, Line: line, Col: col, LSPMode: mode})
+	res, err := c.Do(Request{Op: "lsp", Path: path, Line: line, Col: col, LSPMode: mode,
+		LineStart: lineStart, LineEnd: lineEnd})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -1449,6 +1821,14 @@ func doLSP(c *Client, mode, path, pos string, stdout, stderr io.Writer, asJSON b
 	}
 	if asJSON {
 		fmt.Fprintln(stdout, res.LSPJSON)
+		return 0
+	}
+	if mode == "inlay-hints" {
+		// One hint per line — its editor position and the label text — because
+		// a hint is one line of text and a JSON object per line reads worse.
+		for _, h := range out.Hints {
+			fmt.Fprintf(stdout, "%d:%d %s\n", h.Line, h.Col, h.Text)
+		}
 		return 0
 	}
 	return emit(stdout, out)
@@ -1581,6 +1961,11 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 	res, err := c.Do(Request{Op: "buffers"})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
+	}
+	// An empty set is an empty list, not JSON null: every other listing
+	// guards this, so a script can index an empty result without a special case.
+	if res.Buffers == nil {
+		res.Buffers = []Buffer{}
 	}
 	if asJSON {
 		// Health, not just size: a per-buffer brace balance, computed from the
@@ -1799,6 +2184,54 @@ func simple(c *Client, req Request, ok string, stdout, stderr io.Writer, asJSON 
 		return 0
 	}
 	fmt.Fprintln(stdout, ok)
+	return 0
+}
+
+// openCmd shows a file and says which of the two things open can do happened:
+// created makes a new buffer, opened focuses one that was already loaded. A
+// driver writing a file for the first time needs to tell them apart — a typo
+// with -create and a focus of the buffer an earlier call made both look like
+// success otherwise. The word is the plain-text answer; -json carries the
+// boolean the editor reported.
+func openCmd(c *Client, path string, create bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "open", Path: path, Create: create})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	verb := "opened"
+	if res.Created {
+		verb = "created"
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "version": res.Version,
+			"created": res.Created})
+	}
+	fmt.Fprintln(stdout, verb+" "+path)
+	return 0
+}
+
+// closeCmd closes a buffer and, with -discard, says whether a file is still on
+// disk at its path. Discarding drops the buffer and leaves the file exactly as
+// it was, so a driver that recreated the content under a new name would
+// otherwise leave a silent duplicate behind; the boolean is the machine answer
+// and the plain-text note is the person's.
+func closeCmd(c *Client, path string, discard bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "close", Path: path, Discard: discard})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "version": res.Version,
+			"remains": res.Remains})
+	}
+	if res.Remains {
+		if path == "" {
+			path = "the buffer"
+		}
+		fmt.Fprintln(stdout, "closed "+path+"; the file is still on disk")
+		return 0
+	}
+	fmt.Fprintln(stdout, "closed")
 	return 0
 }
 

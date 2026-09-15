@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -96,9 +97,8 @@ func (a *App) Tell(to uint8, text string) error {
 // session started without --control.
 //
 // The path is the whole message: a driver knows what it asked for and needs to
-// know which save landed. It is a helper rather than an inline loop so the
-// control save path can call it too once that path shares App.write's
-// bookkeeping — see host.Save.
+// know which save landed. It is a helper rather than an inline loop so both
+// save paths — App.write and host.Save — announce in one place.
 func (a *App) notifySaved(path string) {
 	if a.control == nil {
 		return
@@ -272,7 +272,7 @@ func (h host) Resolve(path string) (string, error) {
 	return p.File.Path, nil
 }
 
-func (h host) Open(path string, create bool) (uint64, error) {
+func (h host) Open(path string, create bool) (uint64, bool, error) {
 	// A path names a file on disk, and a file can be spelled several ways —
 	// through a symlink, through .., through the tab's own form. Reopening one
 	// that is already open should focus its tab rather than stack a duplicate:
@@ -284,7 +284,7 @@ func (h host) Open(path string, create bool) (uint64, error) {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		for _, p := range h.a.Tabs.All() {
 			if sameFile(resolved, p.File.Path) && h.a.Tabs.Focus(p) {
-				return uint64(p.File.Session().Version()), nil
+				return uint64(p.File.Session().Version()), false, nil
 			}
 		}
 	}
@@ -295,7 +295,7 @@ func (h host) Open(path string, create bool) (uint64, error) {
 	if p, err := h.find(path); err == nil {
 		h.a.announceIfHeadless(p)
 		h.a.Tabs.Focus(p)
-		return uint64(p.File.Session().Version()), nil
+		return uint64(p.File.Session().Version()), false, nil
 	}
 	// Without -create, open reaches only something that already exists: a
 	// buffer already open (which may have been created earlier and never
@@ -305,7 +305,7 @@ func (h host) Open(path string, create bool) (uint64, error) {
 	// one.
 	if !create {
 		if _, err := os.Stat(path); err != nil {
-			return 0, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
+			return 0, false, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
 		}
 	}
 	h.a.OpenFile(path)
@@ -313,9 +313,11 @@ func (h host) Open(path string, create bool) (uint64, error) {
 	if err != nil {
 		// OpenFile reports its own refusals to the user; the caller gets the
 		// same answer rather than a success for a tab that is not there.
-		return 0, fmt.Errorf("could not open %s", path)
+		return 0, false, fmt.Errorf("could not open %s", path)
 	}
-	return uint64(p.File.Session().Version()), nil
+	// A tab appeared where none existed, so this call made a buffer rather
+	// than focusing one: created is what tells the driver the difference.
+	return uint64(p.File.Session().Version()), true, nil
 }
 
 // sameFile reports whether two paths name one file. Both are resolved first:
@@ -401,6 +403,329 @@ func (h host) Close(path string) error {
 	}
 	return fmt.Errorf("%w: %s", control.ErrNoBuffer, path)
 }
+
+// CloseDiscard removes a buffer without saving it, discarding unsaved changes
+// and any pending change sets. It is the machine form of the editor's
+// close-without-save: the file on disk is untouched, the buffer goes away, and
+// closeDoc forgets the journal, the LSP document and the diagnostics the same
+// way an ordinary close does. It deliberately skips the dirty guard Close
+// keeps, which is the point — the caller has decided to drop the work.
+func (h host) CloseDiscard(path string) (bool, error) {
+	p, err := h.find(path)
+	if err != nil {
+		return false, err
+	}
+	// No dirty check: discarding the unsaved edits is the point, and the
+	// journal closeDoc removes is what forgets any pending change sets, so a
+	// proposal that was never accepted does not come back on reopen.
+	if h.a.dropHeadless(p) {
+		return h.a.noteDiscardRemainder(p.File.Path), nil
+	}
+	for i, q := range h.a.Tabs.All() {
+		if q == p {
+			name := p.File.Path
+			h.a.closeDoc(p)
+			h.a.Tabs.CloseIndex(i)
+			h.a.TouchSession()
+			return h.a.noteDiscardRemainder(name), nil
+		}
+	}
+	return false, fmt.Errorf("%w: %s", control.ErrNoBuffer, path)
+}
+
+// noteDiscardRemainder says, on the status line, when a discarded buffer still
+// has a file on disk, and returns whether it does. close -discard drops the
+// buffer and leaves the file exactly as it was, so a driver that recreated the
+// content under a new name can otherwise leave the old name behind as a silent
+// duplicate. The fact also rides close's wire answer as Response.Remains; the
+// status line is the on-screen record for the person at the keyboard, and the
+// return value is what the host reports to the caller. It is deliberately
+// quiet for a buffer that never reached disk: nothing remains, and there is
+// nothing to report.
+func (a *App) noteDiscardRemainder(path string) bool {
+	if path == "" {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	a.status = "closed " + filepath.Base(path) + "; the file is still on disk"
+	return true
+}
+
+// Mkdir creates a directory, with any missing parents, under the workspace
+// root. It is a filesystem change rather than a buffer one, so no buffer is
+// loaded and the guard has already canonicalised the path and checked it
+// in-root. os.MkdirAll makes an existing directory a no-op rather than an
+// error, which is what a caller wants when it cannot cheaply know whether the
+// directory it is about to write into already exists. The explorer lists the
+// tree, so it is refreshed to show the new directory; creating a directory is
+// not session state, and the save-as path that also makes one refreshes
+// without touching the session either.
+func (h host) Mkdir(path string) error {
+	path = h.canonicalPath(path)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	h.a.Explorer.Tree.Refresh()
+	return nil
+}
+
+// Rename moves a file within the workspace. A file nobody has open is an
+// ordinary os.Rename. A file with an open clean buffer is carried: the rename
+// happens first, then the pane's path follows the file, and everything keyed on
+// the old path is forgotten.
+//
+// A buffer whose file is not on disk — open -create makes one before any bytes
+// exist — has no file to move, so the rename is the pane's path alone and works
+// even while the buffer is dirty: the work stays in the piece table and follows
+// the name. Refusing this was what forced a driver that wanted a new name to
+// close -discard and leave the old file behind as a duplicate.
+//
+// A dirty buffer over an existing file, or one holding a pending change set, is
+// still refused and nothing is moved — there is no force path, because the
+// on-disk bytes and the buffer would otherwise be reconciled by nobody.
+func (h host) Rename(old, new string) error {
+	old, new = h.canonicalPath(old), h.canonicalPath(new)
+	p, err := h.find(old)
+	if err != nil {
+		// Not open: nothing follows the name but the file itself.
+		if rerr := renameFile(old, new); rerr != nil {
+			return rerr
+		}
+		h.a.Explorer.Tree.Refresh()
+		return nil
+	}
+	if _, statErr := os.Stat(p.File.Path); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return statErr
+		}
+		// No file on disk: carry the pane's name without touching the
+		// filesystem. closeDoc forgets everything keyed on the old path,
+		// exactly as the ordinary carry below does, and SetPath is the
+		// whole move.
+		h.a.closeDoc(p)
+		p.File.SetPath(new)
+		h.a.Explorer.Tree.Refresh()
+		h.a.TouchSession()
+		return nil
+	}
+	if ok, why := deletionSafe(p); !ok {
+		return fmt.Errorf("%s cannot be renamed: %s", p.File.Path, why)
+	}
+	if err := renameFile(old, new); err != nil {
+		return err
+	}
+	// Forget everything keyed on the OLD path before the name moves. closeDoc
+	// flushes and removes the old journal, tells the language server the old
+	// document is gone, and clears the old diagnostics and inlays. The pane
+	// itself is kept, so the piece table, version and session tab follow the
+	// rename instead of the file being reopened under its new name.
+	h.a.closeDoc(p)
+	p.File.SetPath(new)
+	h.a.Explorer.Tree.Refresh()
+	h.a.TouchSession()
+	return nil
+}
+
+// renameFile moves old to new on disk. A rename that changes only the case of
+// the name can be a no-op on a case-insensitive filesystem — the kernel treats
+// the two names as one and leaves the old spelling — so it goes through a
+// temporary name in the same directory to force the change. Both hops stay in
+// one directory, which keeps them on one filesystem and so renameable.
+func renameFile(old, new string) error {
+	if !strings.EqualFold(old, new) || old == new {
+		return os.Rename(old, new)
+	}
+	tmp := new + ".raj-rename"
+	if err := os.Rename(old, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, new); err != nil {
+		// Put the file back rather than leaving it under the temporary name:
+		// the first hop is the recoverable half, the second is the one that
+		// failed.
+		_ = os.Rename(tmp, old)
+		return err
+	}
+	return nil
+}
+
+// ProposeDeletion records a pending deletion for path, proposed by author. It
+// does not unlink anything: delete is a review primitive and the user decides
+// whether the file goes. It is idempotent — a second proposal for the same
+// path leaves the original author in place, so two agents racing to propose
+// one removal do not rewrite who asked.
+func (a *App) ProposeDeletion(path string, author uint8) error {
+	if a.pendingDeletions == nil {
+		a.pendingDeletions = map[string]control.Deletion{}
+	}
+	if _, ok := a.pendingDeletions[path]; ok {
+		return nil
+	}
+	a.pendingDeletions[path] = control.Deletion{Path: path, Author: author}
+	// A proposal for the file already on screen is raised now rather than at
+	// the next focus: the gate must not wait for a focus change that may never
+	// come. A path open only in the background waits for its turn, so the
+	// question never lands over a file the user was not looking at.
+	if p := a.openDeletionPane(path); p != nil && p == a.Tabs.Active() {
+		a.deletionPromptPane = nil
+		a.maybePromptDeletion()
+	}
+	return nil
+}
+
+// WithdrawDeletion removes the pending deletion for path when author proposed
+// it. A path that is not pending is a no-op; one proposed by another writer is
+// refused, so an agent cannot retract a peer's proposal.
+func (a *App) WithdrawDeletion(path string, author uint8) error {
+	d, ok := a.pendingDeletions[path]
+	if !ok {
+		return nil
+	}
+	if d.Author != author {
+		return fmt.Errorf("pending deletion of %s was proposed by author %d, not this writer", path, d.Author)
+	}
+	delete(a.pendingDeletions, path)
+	return nil
+}
+
+// Deletions lists the workspace's pending deletions in stable path order, so
+// the wire and a reader see the same order every time.
+func (a *App) Deletions() []control.Deletion {
+	if len(a.pendingDeletions) == 0 {
+		return nil
+	}
+	out := make([]control.Deletion, 0, len(a.pendingDeletions))
+	for _, d := range a.pendingDeletions {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// ProposeDeletion, WithdrawDeletion and Deletions bridge the BufferHost to the
+// app's workspace-level pending-deletion set. They are the only way the
+// socket reaches that state, like every other method on host.
+func (h host) ProposeDeletion(path string, author uint8) error {
+	return h.a.ProposeDeletion(path, author)
+}
+
+func (h host) WithdrawDeletion(path string, author uint8) error {
+	return h.a.WithdrawDeletion(path, author)
+}
+
+func (h host) Deletions() []control.Deletion { return h.a.Deletions() }
+
+// ProposeDirRemoval records a pending dir-removal for path, proposed by
+// author. It removes nothing: rmdir is a review primitive and the user decides
+// whether the subtree goes. Idempotent — a second proposal for the same path
+// leaves the original author in place, so two agents racing to propose one
+// removal do not rewrite who asked.
+func (a *App) ProposeDirRemoval(path string, author uint8) error {
+	if a.pendingDirRemovals == nil {
+		a.pendingDirRemovals = map[string]control.DirRemoval{}
+	}
+	if _, ok := a.pendingDirRemovals[path]; ok {
+		return nil
+	}
+	a.pendingDirRemovals[path] = control.DirRemoval{Path: path, Author: author}
+	// A directory has no pane to focus, so the gate raises immediately rather
+	// than waiting for a focus change that will never come. A question already
+	// on screen is never interrupted; the check runs again on the next
+	// proposal.
+	if !a.Prompt.Open {
+		a.promptDirRemoval(control.DirRemoval{Path: path, Author: author})
+	}
+	return nil
+}
+
+// WithdrawDirRemoval removes the pending dir-removal for path when author
+// proposed it. A path that is not pending is a no-op; one proposed by another
+// writer is refused, so an agent cannot retract a peer's proposal.
+func (a *App) WithdrawDirRemoval(path string, author uint8) error {
+	d, ok := a.pendingDirRemovals[path]
+	if !ok {
+		return nil
+	}
+	if d.Author != author {
+		return fmt.Errorf("pending dir-removal of %s was proposed by author %d, not this writer", path, d.Author)
+	}
+	delete(a.pendingDirRemovals, path)
+	return nil
+}
+
+// DirRemovals lists the workspace's pending dir-removals in stable path order,
+// so the wire and a reader see the same order every time.
+func (a *App) DirRemovals() []control.DirRemoval {
+	if len(a.pendingDirRemovals) == 0 {
+		return nil
+	}
+	out := make([]control.DirRemoval, 0, len(a.pendingDirRemovals))
+	for _, d := range a.pendingDirRemovals {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// Proposals is the unified pending surface: one flat tagged list over every
+// open buffer's pending change sets, the pending file deletions and the
+// pending dir-removals. It is read-only and ungated; each kind can still be
+// listed on its own. A change set's span is the min start and max end across
+// its rebased hunks, or -1/-1 when a later edit has moved every member past,
+// so a caller knows to ask `diff` for the text.
+func (a *App) Proposals() []control.Proposal {
+	var out []control.Proposal
+	panes := append(append([]*editor.Pane{}, a.Tabs.All()...), a.headless...)
+	for _, p := range panes {
+		sess := p.File.Session()
+		at := map[uint64]int{}
+		for _, g := range sess.Pending() {
+			at[g.ID] = len(out)
+			out = append(out, control.Proposal{
+				Kind: "set", Path: p.File.Path, Author: uint8(g.Author), Group: g.ID,
+				Start: -1, End: -1,
+			})
+		}
+		for _, d := range sess.DiffPending() {
+			i, ok := at[d.Group.ID]
+			if !ok {
+				continue
+			}
+			for _, hk := range d.Hunks {
+				if out[i].Start < 0 || hk.Start < out[i].Start {
+					out[i].Start = hk.Start
+				}
+				if hk.End > out[i].End {
+					out[i].End = hk.End
+				}
+			}
+		}
+	}
+	for _, d := range a.Deletions() {
+		out = append(out, control.Proposal{Kind: "delete", Path: d.Path, Author: d.Author, Start: -1, End: -1})
+	}
+	for _, d := range a.DirRemovals() {
+		out = append(out, control.Proposal{Kind: "rmdir", Path: d.Path, Author: d.Author, Start: -1, End: -1})
+	}
+	return out
+}
+
+// ProposeDirRemoval, WithdrawDirRemoval and DirRemovals bridge the BufferHost
+// to the app's workspace-level pending-dir-removal set, exactly as the
+// deletion triple bridges pendingDeletions.
+func (h host) ProposeDirRemoval(path string, author uint8) error {
+	return h.a.ProposeDirRemoval(path, author)
+}
+
+func (h host) WithdrawDirRemoval(path string, author uint8) error {
+	return h.a.WithdrawDirRemoval(path, author)
+}
+
+func (h host) DirRemovals() []control.DirRemoval { return h.a.DirRemovals() }
+
+func (h host) Proposals() []control.Proposal { return h.a.Proposals() }
 
 // resolveSpan clamps a byte span to [0, size], refusing the ones no clamp can
 // save. A negative start means the whole buffer; a negative end means to the
@@ -531,7 +856,15 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	// A proposal the user has to decide about must be visible: a headless
 	// buffer is announced before the change set lands, never left hidden.
 	h.a.announceIfHeadless(p)
+	// A hunk's offsets are in the coordinates of base, not of the document as
+	// it stands now, so the bounds check has to measure against the length the
+	// base had. A base past the journal has no such length -- the session never
+	// produced it -- so fall back to the current text and let ApplyDiff report
+	// the conflicts instead of refusing a version it might still place.
 	size := len(p.File.Text())
+	if n, ok := p.File.Session().LengthAt(piecetable.Version(base)); ok {
+		size = n
+	}
 	pt := make([]piecetable.Hunk, 0, len(hunks))
 	for i, x := range hunks {
 		if _, _, serr := resolveSpan(x.Start, x.End, size); serr != nil {
@@ -705,22 +1038,32 @@ func (h host) Dirty() []control.DirtyBuffer {
 // Snapshot copies the dirty buffers. Called on the event thread, and cheap:
 // only buffers that differ from disk are worth overlaying, and there are a
 // dozen of those against thousands of files.
+//
+// The version is recorded for every open tab, not only the dirty ones: a hit
+// in a clean buffer still names the revision it was found in, so a caller can
+// tell the buffer moved between the search and a later read.
 func (h host) Snapshot() control.Searcher {
 	docs := search.Docs{}
+	versions := search.DocVersions{}
 	for _, p := range h.a.Tabs.All() {
-		if p.File.Path != "" && p.File.ViewDirty() {
+		if p.File.Path == "" {
+			continue
+		}
+		versions[p.File.Path] = uint64(p.File.Session().Version())
+		if p.File.ViewDirty() {
 			docs[p.File.Path] = p.File.Text()
 		}
 	}
-	return snapshotSearcher{root: h.a.root, docs: docs}
+	return snapshotSearcher{root: h.a.root, docs: docs, versions: versions}
 }
 
 // snapshotSearcher walks off the event thread against the copy it was handed,
 // so the editor stays responsive for the seconds a search takes and a cancel
 // can be serviced while it runs.
 type snapshotSearcher struct {
-	root string
-	docs search.Docs
+	root     string
+	docs     search.Docs
+	versions search.DocVersions
 }
 
 func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
@@ -729,15 +1072,16 @@ func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 	if err != nil {
 		return 0, 0, false, nil, err
 	}
-	res := search.RunStream(ctx, root, search.Query{
+	res := search.RunStreamVersioned(ctx, root, search.Query{
 		Text: q.Text, Include: q.Include, Exclude: q.Exclude,
 		Regex: q.Regex, Case: q.Case, Word: q.Word,
-	}, s.docs, func(batch []search.Match) {
+	}, s.docs, s.versions, func(batch []search.Match) {
 		out := make([]control.SearchMatch, 0, len(batch))
 		for _, m := range batch {
 			out = append(out, control.SearchMatch{
 				Path: m.Path, Line: m.Line, Col: m.Col, Len: m.Len,
-				LineStart: m.LineStart, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd, Text: m.Text})
+				LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
+				Version: m.Version, Text: m.Text})
 		}
 		emit(out)
 	})
@@ -777,12 +1121,30 @@ func (h host) Groups(path string) ([]control.Group, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One projection of the pending sets answers "how many hunks, how many
+	// moved", so a caller does not need a second `diff` call just for the
+	// counts. A set already decided is not in DiffPending, so project its own
+	// members the same way; its counts would otherwise read zero and say the
+	// set contributed nothing when it did.
+	counts := map[uint64][2]int{}
+	for _, d := range p.File.Session().DiffPending() {
+		counts[d.Group.ID] = [2]int{len(d.Hunks), d.Moved}
+	}
 	var out []control.Group
 	for _, g := range p.File.Session().Groups() {
+		c, ok := counts[g.ID]
+		if !ok {
+			// Accepted or rejected: not pending, but its members are still in
+			// the journal, so the same projection applies.
+			if d, found := p.File.Session().GroupDiff(g.ID); found {
+				c = [2]int{len(d.Hunks), d.Moved}
+			}
+		}
 		out = append(out, control.Group{
 			ID: g.ID, Path: p.File.Path, Author: uint8(g.Author),
 			State: g.State.String(), Ops: g.Ops, Bytes: g.Bytes,
 			First: uint64(g.First), Last: uint64(g.Last),
+			Hunks: c[0], Moved: c[1],
 		})
 	}
 	return out, nil
@@ -808,19 +1170,46 @@ func (h host) Diff(path string, author uint8) ([]control.DiffGroup, error) {
 			Moved: g.Moved,
 		}
 		for _, hk := range g.Hunks {
+			line, endLine := diffLines(p.File, hk.Start, hk.End)
 			dg.Hunks = append(dg.Hunks, control.DiffHunk{
-				Start: hk.Start, End: hk.End, Old: hk.Old, New: hk.New})
+				Start: hk.Start, End: hk.End, Line: line, EndLine: endLine,
+				Old: hk.Old, New: hk.New})
+		}
+		for _, hk := range g.MovedHunks {
+			dg.MovedHunks = append(dg.MovedHunks, control.DiffHunk{
+				Start: -1, End: -1, Old: hk.Old, New: hk.New})
 		}
 		out = append(out, dg)
 	}
 	return out, nil
 }
 
+// diffLines converts a hunk's byte span into 1-based line coordinates using
+// the buffer's current line map, so a reviewer can name the hunk without a
+// second read. A zero-width hunk sits on one line; otherwise the span covers
+// up to the byte before End, the last line the replaced text held.
+func diffLines(f *editor.File, start, end int) (line, endLine int) {
+	line = f.LineOf(start) + 1
+	e := end
+	if e > start {
+		e = end - 1
+	}
+	endLine = f.LineOf(e) + 1
+	if endLine < line {
+		endLine = line
+	}
+	return line, endLine
+}
+
 // Review returns a buffer's pending change sets and, unless listOnly, enters
 // Review mode at the first one. It is the socket form of the cmd+r toggle and
 // the proposals picker: the list is what `groups` shows filtered to the sets
 // still awaiting a decision, and EnterReview is the same enter path the chord
-// takes, so the two surfaces cannot drift.
+// takes, so the two surfaces cannot drift. EnterReview acts on the active tab,
+// so entering focuses the buffer the path names first: a `review [path]` for a
+// background file would otherwise list that file's sets while the mode badge
+// and the jump belonged to whatever was in front. A headless buffer is
+// announced first, so there is a tab to focus.
 func (h host) Review(path string, listOnly bool) ([]control.Group, error) {
 	p, err := h.find(path)
 	if err != nil {
@@ -835,6 +1224,8 @@ func (h host) Review(path string, listOnly bool) ([]control.Group, error) {
 		})
 	}
 	if !listOnly {
+		h.a.announceIfHeadless(p)
+		h.a.Tabs.Focus(p)
 		h.a.EnterReview()
 	}
 	return out, nil
@@ -907,9 +1298,11 @@ func (h host) Clear(path string, group uint64) error {
 // makes a save legitimate is that somebody agreed to the change, not which
 // table row the caller occupies.
 //
-// A UI save announces itself to connected drivers via App.notifySaved; this
-// path does not, because it does not share App.write's bookkeeping yet. When
-// it does, the same call belongs here.
+// A save from here announces itself the same way App.write's does: connected
+// drivers hear via App.notifySaved, and the live language server hears via
+// App.lspSaved. It still does not share the rest of App.write's bookkeeping —
+// the journal and AcceptPending have no meaning for a buffer whose proposed
+// changes were refused above.
 func (h host) Save(path string) (uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
@@ -922,14 +1315,19 @@ func (h host) Save(path string) (uint64, error) {
 	if err := p.File.Save(); err != nil {
 		return 0, err
 	}
+	// The bytes reached disk; both announcements are best-effort, like App.write's.
+	h.a.notifySaved(p.File.Path)
+	h.a.lspSaved(p)
 	return uint64(p.File.Session().Version()), nil
 }
 
 // LSP prepares a blocking language-server request for a 1-based line and
-// column. Diagnostics returns the cached state without touching the server; the
-// others sync the document and capture the server connection and position so
-// the request runs off the event thread. A nil caller with a non-nil error is
-// a clean "no server" or "not ready" answer the driver can retry.
+// column. Every mode syncs the document and captures what the request needs so
+// it runs off the event thread; diagnostics wears the one difference — it
+// returns the published state and never waits here — but it still registers the
+// queried buffer, because a server cannot publish for a document it has never
+// been given. A nil caller with a non-nil error is a clean "no server" or "not
+// ready" answer the driver can retry.
 func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, error) {
 	switch mode {
 	case "hover", "definition", "references", "completion", "diagnostics":
@@ -945,12 +1343,17 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 		return nil, fmt.Errorf("no path for this buffer")
 	}
 	if mode == "diagnostics" {
-		// The cached state, never a request: a diagnostic set is what the server
-		// last published, and the plan's rule is that this mode never blocks. No
-		// server is started here either, so the answer must say which state it
-		// is: a missing or not-yet-running server also has no diagnostics, and
-		// reporting an empty list would read as a clean file.
-		ls, st := h.a.servers.state(lpath)
+		// Diagnostics starts a server when none is running, so a first ask is
+		// answered by a start rather than by "not started" forever. for_ returns
+		// nil with a reason while it comes up — starting, missing, none or gave
+		// up — and the caller retries; only a live server comes back non-nil,
+		// and then the sync and bounded wait below apply. A diagnostic set is
+		// what the server last sent, so this mode never blocks here on the
+		// answer. The queried buffer is still registered with the live server
+		// before the cache is read, so a control-path document the server has
+		// never seen can be published for; that is a notification write, not a
+		// request the event thread waits on.
+		ls, st := h.a.servers.for_(lpath, func() { h.a.host.Post(ui.Wake{}) })
 		if ls == nil {
 			return lspCaller{mode: "diagnostics", status: lspStatus(st), detail: st.message(lpath)}, nil
 		}
@@ -964,7 +1367,7 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 		if v, ok := h.a.diags.publishedVersion(lpath); ok {
 			pubVersion = &v
 		}
-		// state returns a server only alongside a live sync, so this branch is
+		// for_ returns a server only alongside a live sync, so this branch is
 		// unreachable today; guarding it keeps a nil dereference off the event
 		// thread if that invariant ever changes.
 		if ls.sync == nil {
@@ -974,16 +1377,27 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 				detail: "the language server is not ready",
 			}, nil
 		}
+		// Register the queried buffer with the live server before reading the
+		// publish: the reading the caller wants is for the text in front of it,
+		// and a document the server has not opened can never be published for.
+		// The wait for the server's answer happens off the event thread in Run.
+		if !h.a.syncDoc(ls, p) {
+			return nil, fmt.Errorf("could not synchronise the document with the server")
+		}
+		bufVersion := int(p.File.Session().Version())
 		synced, _ := ls.sync.Version(lpath)
 		status, detail := diagnosticsStatus(
 			h.a.diags.published(lpath), pubVersion,
-			synced, int(p.File.Session().Version()),
+			synced, bufVersion,
 		)
 		return lspCaller{
 			mode:   "diagnostics",
 			status: status,
 			detail: detail,
 			diags:  h.a.diags.forPath(lpath),
+			store:  h.a.diags,
+			path:   lpath,
+			buf:    bufVersion,
 		}, nil
 	}
 	if line < 1 || col < 1 {
@@ -1009,6 +1423,106 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 	return lspCaller{mode: mode, conn: conn, path: lpath, pos: pos}, nil
 }
 
+// LSPInlayHints prepares a range-scoped inlay-hint request, the range variant
+// of host.LSP. It follows the same shape — find or load the buffer, sync it so
+// the server sees unsaved text, locate a live server — and returns a caller
+// that runs the blocking request off the event thread.
+//
+// lineStart and lineEnd are 1-based inclusive lines, zero meaning the start or
+// the end of the file. The server's positions come back in UTF-16, so the
+// caller also carries a conversion to 1-based editor line and display column,
+// pinned to a text snapshot taken here: the answer arrives on another
+// goroutine, and the live buffer must not be read from there.
+func (h host) LSPInlayHints(path string, lineStart, lineEnd int) (control.LSPCaller, error) {
+	p, err := h.findOrLoad(path)
+	if err != nil {
+		return nil, err
+	}
+	lpath := h.a.docPath(p)
+	if lpath == "" {
+		return nil, fmt.Errorf("no path for this buffer")
+	}
+	ls, st := h.a.servers.for_(lpath, func() { h.a.host.Post(ui.Wake{}) })
+	if ls == nil {
+		if msg := st.message(lpath); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, fmt.Errorf("language server not available")
+	}
+	if !h.a.syncDoc(ls, p) {
+		return nil, fmt.Errorf("could not synchronise the document with the server")
+	}
+	conn := ls.srv.Conn()
+	if conn == nil {
+		return nil, fmt.Errorf("language server not ready")
+	}
+
+	lines := p.File.Lines()
+	top, bottom := 0, lines
+	if lineStart > 0 {
+		top = lineStart - 1
+	}
+	if lineEnd > 0 {
+		bottom = lineEnd
+	}
+	if top < 0 {
+		top = 0
+	}
+	if top > lines {
+		top = lines
+	}
+	if bottom > lines {
+		bottom = lines
+	}
+	if bottom < top {
+		bottom = top
+	}
+	rng := h.a.hintRange(p, top, bottom)
+
+	// Snapshot the bytes and the column map now, so the conversion runs against
+	// the text the range was measured on rather than a buffer the editor may
+	// have moved past.
+	text := p.File.Text()
+	doc := lsp.NewDocument(text)
+	cols := p.File.Cols
+	toHint := func(hint lsp.InlayHint) control.LSPHint {
+		off := doc.Offset(hint.Pos)
+		line := doc.Position(off).Line
+		start := doc.Offset(lsp.Position{Line: line, Character: 0})
+		end := len(text)
+		if line+1 < doc.Lines() {
+			end = doc.Offset(lsp.Position{Line: line + 1, Character: 0}) - 1
+		}
+		if end < start {
+			end = start
+		}
+		if off < start {
+			off = start
+		}
+		if off > end {
+			off = end
+		}
+		out := control.LSPHint{
+			Line: line + 1, Col: cols.ColOf(text[start:end], off-start) + 1,
+			Text: hint.Text, Kind: hint.Kind,
+			PaddingLeft: hint.PaddingLeft, PaddingRight: hint.PaddingRight,
+			Tooltip: hint.Tooltip,
+		}
+		for _, te := range hint.Edits {
+			lo, hi := doc.Span(te.Range)
+			out.Edits = append(out.Edits, control.LSPHintEdit{Start: lo, End: hi, Text: te.NewText})
+		}
+		return out
+	}
+	return lspCaller{mode: "inlay-hints", conn: conn, path: lpath, rng: rng, toHint: toHint}, nil
+}
+
+// diagnosticsWait bounds how long the diagnostics caller waits for the publish
+// that answers it. A server that has not spoken within this window gets the
+// honest stale or unpublished status instead of holding the caller open; a
+// publish already on its way normally lands well inside it.
+const diagnosticsWait = 2 * time.Second
+
 // lspCaller runs one blocking language-server request off the event thread. It
 // is what host.LSP hands the connection, so a slow server blocks the driver's
 // request, not the editor.
@@ -1020,12 +1534,48 @@ type lspCaller struct {
 	diags  []lsp.Diagnostic
 	status string
 	detail string
+	// store, path and buf carry the diagnostics wait: the request registers the
+	// buffer and returns the publish so far, and Run waits briefly for the next
+	// one and judges it against the version that was registered. store is nil
+	// when there is no live server to wait on.
+	store *diagnostics
+	buf   int
+	// rng and toHint carry an inlay-hints answer: the range the request asked
+	// about, and the conversion of one server hint into the 1-based editor
+	// coordinates the driver reads. toHint is built on the event thread and
+	// closes over a text snapshot, so Run never touches the live buffer.
+	rng    lsp.Range
+	toHint func(lsp.InlayHint) control.LSPHint
 }
 
 func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 	var out control.LSPResult
 	switch c.mode {
 	case "diagnostics":
+		// A publish is asynchronous: the request registered the document just
+		// now, and the server's reading may not have arrived by the time this
+		// goroutine runs. Wait briefly for the next one rather than making the
+		// caller poll, and only when the status says the answer is not a
+		// reading of the current text.
+		if c.status != control.LSPStatusOK && c.store != nil {
+			if status, detail, items := c.store.reading(c.path, c.buf); status == control.LSPStatusOK {
+				// A publish landed between the request and this goroutine; take
+				// it instead of waiting for another.
+				c.status, c.detail, c.diags = status, detail, items
+			} else {
+				ctx, cancel := context.WithTimeout(ctx, diagnosticsWait)
+				woke := c.store.waitFor(ctx, c.path)
+				cancel()
+				if woke {
+					c.status, c.detail, c.diags = c.store.reading(c.path, c.buf)
+				} else if status, detail, items := c.store.reading(c.path, c.buf); status == control.LSPStatusOK {
+					// A publish can land between the request's first reading
+					// and waitFor's registration; take it rather than reporting
+					// the older status after the wait.
+					c.status, c.detail, c.diags = status, detail, items
+				}
+			}
+		}
 		out.Status = c.status
 		out.Detail = c.detail
 		out.Diags = make([]control.LSPDiag, 0, len(c.diags))
@@ -1087,6 +1637,18 @@ func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 			out.Items = append(out.Items, control.LSPItem{
 				Label: it.Label, Detail: it.Detail, Kind: completionKindName(it.Kind),
 			})
+		}
+		return json.Marshal(out)
+	case "inlay-hints":
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		hints, err := lsp.RequestInlayHints(ctx, c.conn, c.path, c.rng)
+		if err != nil {
+			return nil, err
+		}
+		out.Hints = make([]control.LSPHint, 0, len(hints))
+		for _, hint := range hints {
+			out.Hints = append(out.Hints, c.toHint(hint))
 		}
 		return json.Marshal(out)
 	}

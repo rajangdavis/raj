@@ -112,6 +112,88 @@ func TestAnnotatedReadFlagSurvives(t *testing.T) {
 	}
 }
 
+// The delete verb's withdraw flag must survive, or `delete -withdraw` would
+// propose a deletion instead of retracting one.
+func TestDeleteWithdrawSurvives(t *testing.T) {
+	h, body := EncodeRequest(Request{Op: "delete", Path: "/w/a.go", Withdraw: true})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeRequest(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Op != "delete" || !got.Withdraw || got.Path != "/w/a.go" {
+		t.Errorf("got %+v, want delete /w/a.go withdraw", got)
+	}
+	// Absence must read as propose, not withdraw.
+	h, body = EncodeRequest(Request{Op: "delete", Path: "/w/a.go"})
+	buf.Reset()
+	WriteFrame(&buf, h, body)
+	f, _ = ReadFrame(&buf)
+	if got, _ = DecodeRequest(f); got.Withdraw {
+		t.Error("absent flag read as withdraw")
+	}
+}
+
+// The pending-deletion list crosses as its own sparse field, each record's
+// path and author intact.
+func TestDeletionsResponseRoundTrips(t *testing.T) {
+	want := []Deletion{{Path: "/w/a.go", Author: 2}, {Path: "/w/b.go", Author: 5}}
+	h, body := EncodeResponse(Response{ID: 4, OK: true, Deletions: want})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Deletions) != len(want) {
+		t.Fatalf("deletions = %+v, want %+v", got.Deletions, want)
+	}
+	for i := range want {
+		if got.Deletions[i] != want[i] {
+			t.Errorf("deletion %d = %+v, want %+v", i, got.Deletions[i], want[i])
+		}
+	}
+}
+
+// The unified pending list crosses as one sparse field, every tagged record's
+// kind, path, author, group and span intact — including the -1 span a set every
+// member of which a later edit has moved past reports.
+func TestProposalsResponseRoundTrips(t *testing.T) {
+	want := []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 2, Group: 7, Start: 1, End: 4},
+		{Kind: "set", Path: "/w/b.go", Author: 2, Group: 8, Start: -1, End: -1},
+		{Kind: "delete", Path: "/w/c.go", Author: 5, Start: -1, End: -1},
+	}
+	h, body := EncodeResponse(Response{ID: 4, OK: true, Proposals: want})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Proposals) != len(want) {
+		t.Fatalf("proposals = %+v, want %+v", got.Proposals, want)
+	}
+	for i := range want {
+		if got.Proposals[i] != want[i] {
+			t.Errorf("proposal %d = %+v, want %+v", i, got.Proposals[i], want[i])
+		}
+	}
+}
+
 // The reason document bytes are not in the JSON.
 //
 // A buffer is a byte string. Go's encoder replaces anything that is not valid
@@ -387,6 +469,32 @@ func TestResponseCarriesTruncatedFiles(t *testing.T) {
 	}
 }
 
+// Remains and Created are close -discard's and open's answers. They are sparse
+// presence flags, so EncodeResponse or DecodeResponse dropping one compiles and
+// silently tells a driver nothing was left behind, or that a create was a mere
+// focus.
+func TestResponseCarriesRemainsAndCreated(t *testing.T) {
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Remains: true, Created: true})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Remains || !got.Created {
+		t.Errorf("remains/created = %v/%v, want both true", got.Remains, got.Created)
+	}
+
+	// Absent is false, not an error: a peer that does not know the fields, or a
+	// close with nothing left behind, reads no remainder.
+	h, body = EncodeResponse(Response{ID: 9, OK: true, Final: true})
+	got, err = DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Remains || got.Created {
+		t.Errorf("remains/created = %v/%v, want both false when absent", got.Remains, got.Created)
+	}
+}
+
 // StatesJSON is the annotated read's per-run owner and state. It rides as one
 // header string; forgetting it in EncodeResponse or DecodeResponse compiles
 // and silently strips the states from `read -annotated`.
@@ -402,12 +510,13 @@ func TestResponseCarriesStatesJSON(t *testing.T) {
 	}
 }
 
-// A search hit's line start crosses the response boundary like its other
-// offsets. EncodeResponse or DecodeResponse dropping it compiles and leaves
-// every hit at zero, which is the wrong anchor an agent would build on.
+// A search hit's line range crosses the response boundary like its other
+// offsets. EncodeResponse or DecodeResponse dropping LineStart or LineEnd
+// compiles and leaves every hit at zero, which is the wrong anchor an agent
+// would build on.
 func TestResponseCarriesMatchLineStart(t *testing.T) {
 	want := []SearchMatch{{
-		Path: "/w/a.go", Line: 2, Col: 1, Len: 6, LineStart: 9,
+		Path: "/w/a.go", Line: 2, Col: 1, Len: 6, LineStart: 9, LineEnd: 20,
 		ByteStart: 10, ByteEnd: 16, Text: "\tneedle here",
 	}}
 	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Matches: want})
@@ -417,6 +526,27 @@ func TestResponseCarriesMatchLineStart(t *testing.T) {
 	}
 	if len(got.Matches) != 1 {
 		t.Fatalf("matches = %+v, want %+v", got.Matches, want)
+	}
+	if got.Matches[0] != want[0] {
+		t.Errorf("match = %+v, want %+v", got.Matches[0], want[0])
+	}
+}
+
+// A hit's buffer version crosses the response boundary too: a hit found in an
+// open buffer names the revision it was read at, and EncodeResponse dropping
+// the field would compile and leave every hit looking like it came off disk.
+func TestResponseCarriesMatchVersion(t *testing.T) {
+	want := []SearchMatch{{
+		Path: "/w/a.go", Line: 2, Col: 1, Len: 6, ByteStart: 10, ByteEnd: 16,
+		Version: 41, Text: "needle",
+	}}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Matches: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != 1 || got.Matches[0].Version != 41 {
+		t.Fatalf("matches = %+v, want one hit at version 41", got.Matches)
 	}
 	if got.Matches[0] != want[0] {
 		t.Errorf("match = %+v, want %+v", got.Matches[0], want[0])

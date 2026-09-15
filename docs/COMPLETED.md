@@ -1533,3 +1533,169 @@ harness. Both now wait on the thing they are actually about.
   `Path` is set in the `EncodeRequest` header literal, with a comment
   explaining why, and the regression case rides `TestFrameRoundTrip`; host
   verification rides the next `make check`.
+
+- [x] **Explicit identity — `register` and `-as` (2026-09-13).** `raj ctl
+  register` mints a short random key and binds it server-side; the caller
+  passes `-as <key>` on every call, and each subagent runs `register` itself.
+  Replaces identity absorption for agents: one key per run keeps a stable
+  author id across reconnects, a spawned child never inherits the parent's id,
+  and the `byID` check in `register` keeps keys unique. (Motivation, from a
+  prior absorb-everything design: one anonymous-driven run minted 253 dead
+  author ids; `-as` stops the churn.)
+- [x] **Claim gate — `claim` verb and enforced writes (W1/W2/W3, 2026-09-13).**
+  `raj ctl claim <path>...` records enforced file-level claims (no spans, no
+  TTL, no overlap refusal). Reads stay free; `apply`/`edit` against an
+  unclaimed path refuses with `claim a file first`; a pathless write is allowed
+  only when exactly one file is claimed; `open -create` auto-extends the set.
+  In-memory per identity (journal persistence later). Enforcement broke
+  `TestControlAppliesAnEdit`, which the user fixed host-side on the 2026-09-14
+  rebuild. Design: `docs/CLAIM-SPEC.md`.
+- [x] **LSP idle-tick auto-sync (2026-09-13).** `App.syncDirtyDocs` pushes every
+  open document whose version moved to the language server on the idle tick, so
+  `lsp diagnostics` reads current text without an explicit sync.
+- [x] **Journal self-heal + `close` removes the log (2026-09-13).** A buffer
+  whose journal no longer matches is reconciled on open instead of warning "op
+  log was not restored; not capturing", and closing a buffer drops its journal
+  log. Confirmed live: no more journal warning.
+- [x] **`close -discard` (2026-09-13).** Drops a dirty buffer without saving
+  (wire `0x16`, `BufferHost.CloseDiscard`, `Guard.Discard`).
+- [x] **Base-relative `apply` validation + honest `clear` (2026-09-13).**
+  `Session.LengthAt(base)` supplies the span-validation length, so `apply -base`
+  is checked against the base rather than the current buffer; `rebasedInverse`
+  refuses an inverse outside the document and `ClearRejected` tests
+  `hasLiveMembers`, so `clear` no longer reports success on a tombstone set.
+- [x] **`claim` accepts open-but-unsaved buffers; save into a missing directory
+  (2026-09-13).** `Guard.openBuffer` accepts a path on disk OR an open buffer,
+  so an agent can claim a file it just created; `saveNamed` routes named saves
+  through `ensureParent`, offering to create a missing parent.
+- [x] **`search` line-end (2026-09-13).** `SearchMatch.LineEnd` (wire sparse
+  `0x4d`) reports one past the line's last byte, newline-excluded, so a whole
+  line is addressable from `search` alone.
+- [x] **File lifecycle — `mkdir`, `delete`/`deletions`, `rename`/`mv`
+  (2026-09-13/14).** W4a `mkdir <dir>` (parents, workspace-root only, ungated).
+  W4b `delete <path>` records a workspace-level pending deletion (idempotent,
+  first proposer wins, carries author) instead of unlinking; `deletions` lists
+  them and `delete -withdraw` removes a proposal; a prompt gate
+  (`internal/app/deletion.go`) raises "proposed deleting <file>" with Ignore
+  for now / Remove forever on open or focus, refusing Remove forever while the
+  buffer is dirty or holds pending sets; `RAJ_TRASH=1` (exact) moves a removal
+  to `.raj/trash/` under a timestamped name instead of unlinking. W4c-1
+  `rename <old> <new>` (alias `mv`) renames a claimed file, carrying a clean
+  open buffer and refusing a dirty one, with a two-step case-only rename.
+  W4c-2 `rmdir`/`rmdirs` landed 2026-09-14 with the read-only review tab
+  (subtree listing, `[remove] [cancel]`, all-or-nothing safety, whole-dir
+  `RAJ_TRASH`) and is live; directory rename and `run -prog` reachability
+  remain. Design: `docs/FILE-LIFECYCLE-SPEC.md`.
+- [x] **`proposals` — one flat listing over the pending surface (2026-09-15).**
+  `raj ctl proposals [-mine]` rolls the proposed change sets (`set`),
+  `deletions` (`delete`) and `rmdirs` (`rmdir`) into one flat tagged list, with
+  per-kind human headers and a `-json` shape
+  `{kind,path,author,group,start,end}` (`-1/-1` span for a set with no
+  projectable hunk). A read-only rollup (`App.Proposals`) with a stable
+  `Guard.Proposals` sort; no new store and no `run -prog` opcode. Wire:
+  `hProposals = 0x4f`, verb code 40, the `BufferHost` interface and both
+  implementers, plus `client.go` path rebasing. Design:
+  `docs/PROPOSALS-SPEC.md`. Verified live 2026-09-15: empty/`set`/`delete`
+  round-trips, `-mine`, and no regression in
+  `deletions`/`rmdirs`/`groups`/`version`/`buffers`.
+- [x] **The dir gate hides `Remove forever` like the file gate (2026-09-15).**
+  `promptDirRemoval` computes `dirRemovalSafe` at raise time, offers the
+  destructive answer only when the subtree is clean, and puts the reason in the
+  prompt message rather than a post-answer status line. The message was then
+  shortened to `proposed removing <dir>.` because `Prompt.Render` truncates the
+  message at `w-4` (68 columns); that truncation is since fixed by the prompt
+  wrapping (2026-09-15, below).
+- [x] **`raj ctl review [path]` socket verb (2026-09-15).** Enters Review mode
+  over the control channel and lists the pending sets; threaded through the
+  eight layers (`OpReview`/`OpReviewList`, request field `hReviewList`,
+  `Host.Review`, the `memHost` fake), with `App.EnterReview` the one enter path
+  shared by the cmd+r chord and the socket; `-json` lists without entering the
+  mode. Live: the verb answers and appears in `raj ctl -h`. Retires the
+  Active-plan D3 bullet.
+- [x] **`search -path DIR` (2026-09-15).** Limits the walk to a directory under
+  the workspace root; `-include`/`-exclude` globs remain for filtering. A caller
+  caller's root-mapped spelling is translated too: `Client.toEditor` maps
+  `Query.Path`.
+- [x] **`raj ctl edit -h` shows its positional `[path]` (2026-09-15).** Usage
+  now prints `usage: raj ctl edit [path]` plus "with no path, targets the buffer
+  the user is looking at."
+- [x] **`edit -old-file`/`-new-file` take stdin (2026-09-15).** Both flag helps
+  say "or - for stdin", so a multi-line edit no longer needs a shell-quoted
+  inline `-new`.
+- [x] **Inspection loads buffers headlessly (2026-09-12).** `control.Buffer`
+  gains `Headless` (wire field `hBufferHeadless`, 0x48), so `buffers`/`buffers
+  -json` report a loaded buffer with no tab: `read`, `version` and `lsp
+  diagnostics` no longer need `open` first, and a tab appears when a buffer
+  holds pending proposals. The `raj-editor` skill's read-before-write wording
+  now treats `open` as show rather than a prerequisite.
+
+- [x] **`-text-file -` verbatim (2026-09-15).** A `-verbatim` flag strips exactly
+  one trailing newline, so a heredoc payload meant as a one-line literal no
+  longer gains one.
+- [x] **`search` hints `-regex` on a zero-match literal with metacharacters
+  (2026-09-15).** The CLI names the `-regex` retry instead of returning a bare
+  empty result.
+- [x] **`search` carries a buffer version per hit (2026-09-15).**
+  `SearchMatch.Version` rides the sparse `hMatchVersion` (0x50) field, so drift
+  between a search and a later read is visible.
+- [x] **`diff` hunks carry line numbers (2026-09-15).** `DiffHunk.Line`/`EndLine`
+  render as `@@ L1..L2 (bytes A..B) @@`.
+- [x] **`diff` renders moved hunks instead of a bare count (2026-09-15).**
+  `MovedHunks` are emitted as-written, so a new file edited after insertion no
+  longer shows nothing.
+- [x] **`groups` reports hunks/moved and a state filter (2026-09-15).**
+  `Group.Hunks`/`Moved` (decided sets too) plus CLI `-pending`/`-state`.
+- [x] **`raj ctl lsp inlay-hints [-lines A,B]` (2026-09-15).** Threaded through
+  the eight layers; gopls hints are enabled via `initializationOptions` and were
+  verified live returning real hints.
+- [x] **`edit`/`apply` take `--` as a terminator (2026-09-15).** Replacement
+  text that begins a line with `-` or `--` is no longer parsed as an operand.
+- [x] **`rmdir`/`delete` stat the operand's file type (2026-09-15).**
+  `Guard.checkOperandKind` refuses a non-directory `rmdir` operand.
+- [x] **`rename` carries a not-yet-saved buffer; `close -discard` reports
+  `Remains` (2026-09-15).** `rename` moves a brand-new `open -create` buffer and
+  `Response.Remains` (0x51) tells the driver a disk file survives the discard;
+  `Remains` verified live.
+- [x] **Forward `claim` for a not-yet-existing file (2026-09-15).** A path that
+  is neither on disk nor an open buffer can be claimed before it is created.
+- [x] **Review-listing rows wrap and the box is height-aware (2026-09-15).**
+  Prompt rows no longer truncate at ~68 columns.
+- [x] **The prompt message line wraps (2026-09-15).** It is clamped with an
+  ellipsis only at the screen edge, with a height cap.
+- [x] **`buffers -json` returns `[]`, not `null`, for an empty set (2026-09-15).**
+  The nil slice is guarded to an empty one.
+- [x] **`raj ctl review [path]` focuses the named buffer first (2026-09-15).**
+  `host.Review` switches to it before entering Review mode.
+- [x] **Keyboard bulk review re-reads newest-first (2026-09-15).**
+  `reviewProposed` mirrors the `reject -all` fix.
+- [x] **A save signals the driver (2026-09-15).** `App.notifySaved` posts
+  `saved <path>` via `Tell`, now also from `host.Save`.
+- [x] **The dir gate passes absolute rows again (2026-09-15).**
+  `dirRemovalPaths` returns absolute paths now that prompt rows wrap.
+- [x] **`open` refuses a missing path without `-create` and says created vs
+  opened (2026-09-15).** `host.Open` stats and refuses, an app regression test
+  covers it, and `open` prints `created`/`opened` with `Created` (0x52) in
+  `-json`; verified live.
+- [x] **`lsp diagnostics` reads the current text — dark and post-apply
+  staleness fixed (2026-09-15).** The idle scan registers dirty docs
+  (`needsSync` takes a `dirty` bit), and the diagnostics request starts/syncs
+  its server and waits for the publish, so a reading reflects the current text;
+  an unsaved-buffer error was reported live.
+- [x] **Cross-buffer diagnostics staleness (2026-09-15).** Addressed by the idle
+  scan registering dirty docs plus the save-announce
+  (`workspace/didChangeWatchedFiles` + `didSave`); the definitive host check is
+  an edit-and-save of a defining file while a dependent is open.
+- [x] **Line-index corruption after apply/reject/patch cycles (2026-09-15).**
+  `host.Decide`/`App.decideProposed` no longer call `Session.RejectGroup`
+  directly, and `ApplyDiff` anchors its catch-up at the entry version.
+- [x] **`reject -all` drives newest-first (2026-09-15).** The bulk reject walks
+  the pending `diff` projection newest-first and re-reads it after each
+  reversal.
+- [x] **`search` hits carry a source-computed line start (2026-09-15).**
+  `LineStart` rides sparse wire field 0x45; `ByteStart`/`ByteEnd` stay
+  matched-substring coordinates.
+- [x] **Inlay-hints toggle (2026-09-15).** `keys.ToggleInlayHints`
+  (shift+super+i, cmd+shift+i, ctrl+shift+i), per-pane `p.Hints`, persisted as
+  `session.Tab.Hints`, with toggle and session tests; gopls now returns real
+  hints, verified live.
+

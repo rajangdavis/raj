@@ -49,17 +49,35 @@ type fakeEditor struct {
 	// lspJSON is the canned answer an lsp request returns, verbatim, so a test
 	// can drive the CLI's diagnostics handling without a language server.
 	lspJSON string
+	// lastLSP records the lspprep request, so a CLI test can assert that the
+	// inlay-hints mode and its -lines range reached the wire.
+	lastLSP Request
 	// truncated is the per-file truncation the fake search reports, so the CLI
 	// can be tested on a walk that cut a file down without a real one.
 	truncated []TruncatedFile
+	// created and remains are the answers open and close -discard give: whether
+	// open made a new buffer, and whether a discarded buffer's file is still on
+	// disk. The fake has no app, so these are set by the test.
+	created bool
+	remains bool
 	// headless names docs the fake reports as loaded with no tab, so the CLI
 	// buffers output can be tested on the field that says so.
 	headless map[string]bool
 	// claims is the fake's working set, and lastClaim the request that last
 	// touched it, so a CLI test can assert the wire fields. claimWarnings and
 	// claimOverlaps are canned answers the CLI can be tested on.
-	claims        []string
-	lastClaim     Request
+	claims    []string
+	lastClaim Request
+	// mkdirs records every mkdir request path, so a CLI test can assert the
+	// verb reaches the wire with its operand intact. The fake has no
+	// filesystem; the real MkdirAll semantics are covered in internal/app.
+	mkdirs        []string
+	lastRename    Request
+	lastDelete    Request
+	deletions     []Deletion
+	lastRmdir     Request
+	dirRemovals   []DirRemoval
+	proposals     []Proposal
 	claimWarnings []string
 	claimOverlaps []ClaimOverlap
 	// groups is the canned change-set list `groups` returns; decided records
@@ -200,6 +218,7 @@ func (f *fakeEditor) run(req Request) Response {
 		}
 		return res
 	case "open":
+		created := false
 		if _, ok := f.docs[path]; !ok {
 			if !req.Create {
 				// The fake has no disk, so not-in-docs is the missing file the
@@ -207,8 +226,12 @@ func (f *fakeEditor) run(req Request) Response {
 				return Response{Err: "no open buffer or file at " + path}
 			}
 			f.docs[path], f.vers[path] = "", 1
+			created = true
 		}
-		return Response{OK: true, Version: f.vers[path]}
+		if f.created {
+			created = true // a test can force a create answer regardless
+		}
+		return Response{OK: true, Version: f.vers[path], Created: created}
 	case "goto":
 		return Response{OK: true}
 	case "apply":
@@ -304,7 +327,13 @@ func (f *fakeEditor) run(req Request) Response {
 			f.mode = "review"
 		}
 		return Response{OK: true, Groups: append([]Group(nil), f.groups...)}
+	case "close":
+		// The fake has no app; the remainder answer is what a test sets, so the
+		// CLI wording can be driven without a disk.
+		delete(f.docs, path)
+		return Response{OK: true, Remains: req.Discard && f.remains}
 	case "lspprep":
+		f.lastLSP = req
 		return Response{OK: true, LSP: fakeLSP{json: f.lspJSON}}
 	case "claim":
 		f.lastClaim = req
@@ -329,6 +358,24 @@ func (f *fakeEditor) run(req Request) Response {
 		}
 		return Response{OK: true, Claims: append([]string(nil), f.claims...),
 			ClaimWarnings: f.claimWarnings, ClaimOverlaps: f.claimOverlaps}
+	case "mkdir":
+		f.mkdirs = append(f.mkdirs, req.Path)
+		return Response{OK: true}
+	case "rename":
+		f.lastRename = req
+		return Response{OK: true}
+	case "delete":
+		f.lastDelete = req
+		return Response{OK: true}
+	case "deletions":
+		return Response{OK: true, Deletions: append([]Deletion(nil), f.deletions...)}
+	case "rmdir":
+		f.lastRmdir = req
+		return Response{OK: true}
+	case "rmdirs":
+		return Response{OK: true, DirRemovals: append([]DirRemoval(nil), f.dirRemovals...)}
+	case "proposals":
+		return Response{OK: true, Proposals: append([]Proposal(nil), f.proposals...)}
 	}
 	return Response{Err: "unknown op " + req.Op}
 }
@@ -377,6 +424,20 @@ func TestCLIBuffersReportsHeadless(t *testing.T) {
 	out, _, code = run(t, "buffers", "-json")
 	if code != 0 || !strings.Contains(out, "\"headless\": true") {
 		t.Errorf("json buffers = %q, code %d", out, code)
+	}
+}
+
+// An empty set is [] in JSON like every other listing, not null: a script that
+// indexes the result should not need a nil check for one verb alone.
+func TestCLIBuffersEmptyJSONIsAList(t *testing.T) {
+	newFakeEditor(t, map[string]string{})
+
+	out, errs, code := run(t, "buffers", "-json")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if strings.TrimSpace(out) != "[]" {
+		t.Errorf("empty buffers -json = %q, want []", strings.TrimSpace(out))
 	}
 }
 
@@ -449,6 +510,100 @@ func TestCLIEditByString(t *testing.T) {
 	}
 	if got := ed.docs["/w/a.go"]; got != "package a\n\nfunc g() {}\n" {
 		t.Errorf("buffer = %q", got)
+	}
+}
+
+// A replacement body beginning with "-" is literal text after --, not an
+// operand the parser should refuse; the ordinary flag terminator is how it
+// gets past reorder.
+func TestCLIEditPositionalTextAfterTerminator(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
+
+	_, errs, code := run(t, "edit", "/w/a.go", "-old", "func f()", "--", "- item")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "package a\n\n- item {}\n" {
+		t.Errorf("buffer = %q", got)
+	}
+}
+
+// Two operands after -- fill -old and -new in order, without a flag.
+func TestCLIEditPositionalOldAndNew(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "a b c\n"})
+
+	if _, errs, code := run(t, "edit", "/w/a.go", "--", "b", "- two"); code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "a - two c\n" {
+		t.Errorf("buffer = %q", got)
+	}
+}
+
+// apply takes its replacement text as the one operand after --.
+func TestCLIApplyPositionalTextAfterTerminator(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+
+	_, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "5", "--", "- item")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "- item world\n" {
+		t.Errorf("buffer = %q", got)
+	}
+}
+
+// -text-file ends with the newline the file or heredoc carries; -verbatim
+// strips exactly that one, so a one-line replacement does not split a line.
+func TestCLIApplyVerbatimTextFile(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	dir := t.TempDir()
+	f := filepath.Join(dir, "text")
+	if err := os.WriteFile(f, []byte("hi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "5",
+		"-text-file", f, "-verbatim"); code != 0 {
+		t.Fatalf("verbatim code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "hi world\n" {
+		t.Errorf("buffer = %q, want the trailing newline stripped", got)
+	}
+
+	// Without the flag the bytes are untouched, which is the old behaviour.
+	ed.docs["/w/a.go"], ed.vers["/w/a.go"] = "hello world\n", 1
+	if _, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "5",
+		"-text-file", f); code != 0 {
+		t.Fatalf("plain code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "hi\n world\n" {
+		t.Errorf("buffer = %q, want the newline kept", got)
+	}
+}
+
+// The heredoc shape piped on stdin ends with the newline the shell added;
+// -verbatim removes exactly it.
+func TestCLIApplyVerbatimStdin(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString("hi\n"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	old := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = old }()
+
+	if _, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "5",
+		"-text-file", "-", "-verbatim"); code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "hi world\n" {
+		t.Errorf("buffer = %q, want the newline stripped", got)
 	}
 }
 
@@ -532,6 +687,71 @@ func TestCLILSPDiagnosticsOldServerIsRefused(t *testing.T) {
 	}
 }
 
+// Inlay hints come back as JSON like the other lsp modes, and the plain form
+// is line-oriented: one hint per line, its 1-based editor position then the
+// label.
+func TestCLILSPInlayHintsPlainAndJSON(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"hints":[{"line":2,"col":5,"text":"string","kind":1,"tooltip":"inferred type"}]}`
+	out, errs, code := run(t, "lsp", "inlay-hints", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if out != "2:5 string\n" {
+		t.Errorf("plain output = %q, want %q", out, "2:5 string\n")
+	}
+
+	out, errs, code = run(t, "lsp", "inlay-hints", "/w/a.go", "-json")
+	if code != 0 {
+		t.Fatalf("-json code = %d, stderr %q", code, errs)
+	}
+	if !strings.Contains(out, `"text":"string"`) || !strings.Contains(out, `"line":2`) {
+		t.Errorf("-json output = %q, want the structured hint", out)
+	}
+}
+
+// -lines A,B restricts the request to a 1-based inclusive range, and the range
+// reaches the host on the lspprep request. A bare A leaves the end unset, so
+// the host reads to the end of the file.
+func TestCLILSPInlayHintsLinesReachTheWire(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"hints":[]}`
+	if _, errs, code := run(t, "lsp", "inlay-hints", "/w/a.go", "-lines", "3,9"); code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.LSPMode != "inlay-hints" {
+		t.Errorf("mode = %q, want inlay-hints", ed.lastLSP.LSPMode)
+	}
+	if ed.lastLSP.LineStart == nil || *ed.lastLSP.LineStart != 3 {
+		t.Errorf("LineStart = %v, want 3", ed.lastLSP.LineStart)
+	}
+	if ed.lastLSP.LineEnd == nil || *ed.lastLSP.LineEnd != 9 {
+		t.Errorf("LineEnd = %v, want 9", ed.lastLSP.LineEnd)
+	}
+
+	if _, _, code := run(t, "lsp", "inlay-hints", "/w/a.go", "-lines", "4"); code != 0 {
+		t.Fatalf("bare -lines code = %d", code)
+	}
+	if ed.lastLSP.LineStart == nil || *ed.lastLSP.LineStart != 4 {
+		t.Errorf("bare -lines LineStart = %v, want 4", ed.lastLSP.LineStart)
+	}
+	if ed.lastLSP.LineEnd != nil {
+		t.Errorf("bare -lines LineEnd = %v, want nil (read to the end)", ed.lastLSP.LineEnd)
+	}
+}
+
+// A malformed -lines is a usage error, not a silent whole-file request.
+func TestCLILSPInlayHintsBadLines(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	_, errs, code := run(t, "lsp", "inlay-hints", "/w/a.go", "-lines", "0")
+	if code != 2 {
+		t.Errorf("code = %d, want 2 (usage) for -lines 0", code)
+	}
+	if !strings.Contains(errs, "-lines") {
+		t.Errorf("stderr = %q, want the -lines hint", errs)
+	}
+}
+
 // A bare positional is the pattern typed in the wrong place: search takes
 // no path, so accepting it silently would run a different search than was
 // meant — the refusal names both flags the caller might have wanted.
@@ -578,6 +798,33 @@ func TestSearchIncludeWarningStaysQuietWhenFilesWereSearched(t *testing.T) {
 	}
 	if strings.Contains(errs, "-include") {
 		t.Errorf("stderr = %q, want no include warning", errs)
+	}
+}
+
+// A literal pattern with regex metacharacters that matches nothing is usually a
+// regex typed without -regex; the hint names the flag rather than leaving the
+// caller to guess why a pattern that reads like a regex found nothing.
+func TestSearchHintsRegexOnMetacharacterMiss(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "func f() {}\n"})
+
+	_, errs, code := run(t, "search", "-q", `func (a \*App)`)
+	if code != 1 {
+		t.Errorf("code = %d, want 1 (no hits)", code)
+	}
+	if !strings.Contains(errs, "-regex") {
+		t.Errorf("stderr = %q, want the -regex hint", errs)
+	}
+
+	// A plain literal with no metacharacters stays quiet: it really is absent.
+	_, errs, code = run(t, "search", "-q", "absent")
+	if code != 1 || strings.Contains(errs, "-regex") {
+		t.Errorf("plain miss: code %d, stderr %q, want no hint", code, errs)
+	}
+
+	// A regex that matches prints no hint.
+	_, errs, code = run(t, "search", "-q", "func", "-regex")
+	if code != 0 || strings.Contains(errs, "-regex") {
+		t.Errorf("-regex hit: code %d, stderr %q, want no hint", code, errs)
 	}
 }
 
@@ -803,20 +1050,24 @@ func TestCLIClaimFlagsAndReports(t *testing.T) {
 func TestCLIDiffRendersPendingChanges(t *testing.T) {
 	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
 	ed.diffJSON = `[{"id":7,"path":"/w/a.go","author":2,"state":"proposed","ops":1,` +
-		`"bytes":1,"first":1,"last":1,"hunks":[{"start":6,"end":11,"old":"world","new":"earth"}],"moved":0}]`
+		`"bytes":1,"first":1,"last":1,"hunks":[{"start":6,"end":11,"line":1,"end_line":1,` +
+		`"old":"world","new":"earth"}],"moved":1,` +
+		`"moved_hunks":[{"start":-1,"end":-1,"old":"gone","new":"lost"}]}]`
 
 	out, errs, code := run(t, "diff", "/w/a.go")
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, errs)
 	}
-	for _, want := range []string{"group 7", "author 2", "@@ 6..11 @@", "-world", "+earth"} {
+	for _, want := range []string{"group 7", "author 2", "@@ L1..L1 (bytes 6..11) @@",
+		"-world", "+earth", "@@ moved: no current span, as written @@", "-gone", "+lost"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("diff output %q missing %q", out, want)
 		}
 	}
 
 	out, _, code = run(t, "diff", "-json", "/w/a.go")
-	if code != 0 || !strings.Contains(out, `"old": "world"`) || !strings.Contains(out, `"new": "earth"`) {
+	if code != 0 || !strings.Contains(out, `"old": "world"`) || !strings.Contains(out, `"new": "earth"`) ||
+		!strings.Contains(out, `"moved_hunks"`) || !strings.Contains(out, `"new": "lost"`) {
 		t.Errorf("json diff = %q, code %d", out, code)
 	}
 
@@ -825,6 +1076,47 @@ func TestCLIDiffRendersPendingChanges(t *testing.T) {
 	out, _, code = run(t, "diff", "/w/a.go")
 	if code != 0 || !strings.Contains(out, "no pending changes") {
 		t.Errorf("clean diff = %q, code %d", out, code)
+	}
+}
+
+// groups carries each set hunk and moved counts and can be narrowed to the
+// sets still awaiting a decision, so a caller need not follow it with diff.
+func TestCLIGroupsCountsAndStateFilter(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.groups = []Group{
+		{ID: 1, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, Bytes: 4, First: 1, Last: 1, Hunks: 1},
+		{ID: 2, Path: "/w/a.go", Author: 2, State: "accepted", Ops: 1, Bytes: 4, First: 2, Last: 2, Hunks: 2, Moved: 1},
+		{ID: 3, Path: "/w/a.go", Author: 3, State: "rejected", Ops: 1, Bytes: 4, First: 3, Last: 3},
+	}
+
+	out, errs, code := run(t, "groups", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "1 hunks") || !strings.Contains(out, "0 moved") {
+		t.Errorf("groups output %q does not carry the hunk/moved counts", out)
+	}
+
+	out, _, code = run(t, "groups", "-pending", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("-pending code %d", code)
+	}
+	if !strings.Contains(out, "1\tauthor 2\tproposed") {
+		t.Errorf("-pending dropped the proposed set: %q", out)
+	}
+	if strings.Contains(out, "accepted") || strings.Contains(out, "rejected") {
+		t.Errorf("-pending kept a decided set: %q", out)
+	}
+
+	out, _, code = run(t, "groups", "-state", "rejected", "-json", "/w/a.go")
+	if code != 0 || !strings.Contains(out, `"state": "rejected"`) ||
+		strings.Contains(out, `"state": "proposed"`) {
+		t.Errorf("groups -state rejected = %q, code %d", out, code)
+	}
+
+	if _, errs, code := run(t, "groups", "-state", "bogus", "/w/a.go"); code != 2 ||
+		!strings.Contains(errs, "must be proposed, accepted or rejected") {
+		t.Errorf("bad -state: code %d, stderr %q", code, errs)
 	}
 }
 
@@ -899,6 +1191,10 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 	for k, v := range f.docs {
 		docs[k] = v
 	}
+	vers := make(map[string]uint64, len(f.vers))
+	for k, v := range f.vers {
+		vers[k] = v
+	}
 	gate := f.gate
 	truncated := append([]TruncatedFile(nil), f.truncated...)
 	f.searchPath = q.Path
@@ -932,7 +1228,7 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 		if gate != nil {
 			// Emit one batch, then wait: the caller gets a partial result and
 			// can cancel while the rest is outstanding.
-			emit([]SearchMatch{{Path: p, Line: 1, Text: t}})
+			emit([]SearchMatch{{Path: p, Line: 1, Version: vers[p], Text: t}})
 			select {
 			case <-ctx.Done():
 				f.mu.Lock()
@@ -944,7 +1240,8 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 		}
 		for i, line := range strings.Split(t, "\n") {
 			if c := strings.Index(line, q.Text); c >= 0 {
-				emit([]SearchMatch{{Path: p, Line: i + 1, Col: c, Len: len(q.Text), Text: line}})
+				emit([]SearchMatch{{Path: p, Line: i + 1, Col: c, Len: len(q.Text),
+					Version: vers[p], Text: line}})
 			}
 		}
 		files++
@@ -1010,6 +1307,48 @@ func TestSearchReportsTruncatedFiles(t *testing.T) {
 		!strings.Contains(out, `"total": 1434`) ||
 		!strings.Contains(out, `"shown": 2`) {
 		t.Errorf("json = %q, want the truncated list", out)
+	}
+}
+
+// A hit names the buffer version it was found in, so a caller can tell the
+// document moved between the search and a later read. Both machine forms carry
+// it: the whole JSON object and the streaming NDJSON.
+func TestSearchJSONCarriesBufferVersion(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+
+	out, errs, code := run(t, "search", "-q", "needle", "-json")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"version": 1`) {
+		t.Errorf("json = %q, want the hit's buffer version", out)
+	}
+
+	out, errs, code = run(t, "search", "-q", "needle", "-jsonl")
+	if code != 0 {
+		t.Fatalf("jsonl code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"version":1`) {
+		t.Errorf("jsonl = %q, want the hit's buffer version", out)
+	}
+}
+
+// -path is the caller's spelling, not the editor's: the client maps it like
+// every other path operand, so an absolute directory under the caller's root
+// scopes the walk instead of being refused as outside the workspace.
+func TestSearchPathIsRootMapped(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+	t.Setenv(RootMapEnv, "/workspace=/w")
+
+	_, errs, code := run(t, "search", "-q", "needle", "-path", "/workspace")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	ed.mu.Lock()
+	got := ed.searchPath
+	ed.mu.Unlock()
+	if got != "/w" {
+		t.Errorf("searchPath = %q, want the editor spelling /w", got)
 	}
 }
 
@@ -2044,6 +2383,295 @@ func TestCLIOpenRefusesMissingPathWithoutCreate(t *testing.T) {
 	}
 	if _, ok := ed.docs["/w/new.go"]; !ok {
 		t.Errorf("open -create created no buffer")
+	}
+	if !strings.Contains(out, "created /w/new.go") {
+		t.Errorf("stdout = %q, want it to say the buffer was created", out)
+	}
+}
+
+// open says which of the two things it did: created a new buffer, or focused
+// one already loaded. The plain word and the -json boolean are the same fact,
+// so a driver that meant to write a new file can tell it from a focus.
+func TestCLIOpenSaysCreatedVersusOpened(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+
+	out, errs, code := run(t, "open", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("open = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "opened /w/a.go") {
+		t.Errorf("stdout = %q, want opened for an existing buffer", out)
+	}
+
+	out, _, code = run(t, "open", "/w/new.go", "-create")
+	if code != 0 {
+		t.Fatalf("open -create = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "created /w/new.go") {
+		t.Errorf("stdout = %q, want created for a new buffer", out)
+	}
+
+	out, _, code = run(t, "open", "/w/new2.go", "-create", "-json")
+	if code != 0 {
+		t.Fatalf("open -json = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"created": true`) {
+		t.Errorf("json = %q, want created true", out)
+	}
+
+	out, _, code = run(t, "open", "/w/a.go", "-json")
+	if code != 0 {
+		t.Fatalf("open -json = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"created": false`) {
+		t.Errorf("json = %q, want created false", out)
+	}
+}
+
+// close -discard says whether a file remains on disk at the discarded buffer's
+// path, so a driver that recreated the content under a new name learns the old
+// name is left behind. The word is the person's, the boolean the machine's.
+func TestCLICloseDiscardReportsRemainder(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.remains = true
+
+	out, errs, code := run(t, "close", "/w/a.go", "-discard")
+	if code != 0 {
+		t.Fatalf("close -discard = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "still on disk") {
+		t.Errorf("stdout = %q, want it to say the file remains", out)
+	}
+
+	out, _, code = run(t, "close", "/w/a.go", "-discard", "-json")
+	if code != 0 {
+		t.Fatalf("close -json = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"remains": true`) {
+		t.Errorf("json = %q, want remains true", out)
+	}
+
+	// A close with nothing left behind says nothing extra.
+	newFakeEditor(t, map[string]string{"/w/b.go": "y\n"})
+	out, _, code = run(t, "close", "/w/b.go", "-discard")
+	if code != 0 {
+		t.Fatalf("close -discard = %d", code)
+	}
+	if strings.Contains(out, "still on disk") {
+		t.Errorf("stdout = %q, want no remainder note", out)
+	}
+	if strings.TrimSpace(out) != "closed" {
+		t.Errorf("stdout = %q, want a plain closed", out)
+	}
+}
+
+// mkdir carries its directory operand to the wire and prints what it made. It
+// is the fix for open -create on a path whose parent does not exist: make the
+// package directory first, then the files inside it.
+func TestCLIMkdir(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+
+	out, errs, code := run(t, "mkdir", "pkg/sub")
+	if code != 0 {
+		t.Fatalf("mkdir: code = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "created pkg/sub") {
+		t.Errorf("stdout = %q, want it to name the directory", out)
+	}
+	if len(ed.mkdirs) != 1 || ed.mkdirs[0] != "pkg/sub" {
+		t.Errorf("the wire carried %v, want [pkg/sub]", ed.mkdirs)
+	}
+
+	out, errs, code = run(t, "mkdir")
+	if code != 2 || !strings.Contains(errs, "needs a path") {
+		t.Errorf("mkdir with no operand: code = %d, stderr = %q", code, errs)
+	}
+}
+
+// rename carries two paths to the wire — the old in Path and the new in
+// NewPath — prints what moved, and takes mv as an alias.
+func TestCLIRename(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+
+	out, errs, code := run(t, "rename", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("rename: code = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "/w/b.go") {
+		t.Errorf("stdout = %q, want both paths named", out)
+	}
+	if ed.lastRename.Op != "rename" || ed.lastRename.Path != "/w/a.go" || ed.lastRename.NewPath != "/w/b.go" {
+		t.Errorf("the wire carried %+v, want /w/a.go -> /w/b.go", ed.lastRename)
+	}
+
+	// mv is the same verb under the other name.
+	out, errs, code = run(t, "mv", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("mv: code = %d: %s", code, errs)
+	}
+	if ed.lastRename.Op != "rename" || ed.lastRename.NewPath != "/w/b.go" {
+		t.Errorf("mv carried %+v, want the rename op", ed.lastRename)
+	}
+
+	// One operand is a usage error, not a rename to a guessed name.
+	_, errs, code = run(t, "rename", "/w/a.go")
+	if code != 2 || !strings.Contains(errs, "old and a new") {
+		t.Errorf("rename with one operand: code = %d, stderr = %q", code, errs)
+	}
+
+	// A third operand is refused rather than ignored.
+	_, errs, code = run(t, "rename", "/w/a.go", "/w/b.go", "/w/c.go")
+	if code != 2 || !strings.Contains(errs, "unexpected argument") {
+		t.Errorf("rename with three operands: code = %d, stderr = %q", code, errs)
+	}
+}
+
+// delete carries its path and -withdraw to the wire, prints what it did, and
+// deletions lists what is pending with the proposing author. The fake records
+// the delete request so the flag is asserted on the wire, not only in output.
+func TestCLIDeleteAndDeletions(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	out, errs, code := run(t, "delete", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("delete: code = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "/w/a.go") {
+		t.Errorf("delete output = %q, want it to name the path", out)
+	}
+	if ed.lastDelete.Op != "delete" || ed.lastDelete.Path != "/w/a.go" || ed.lastDelete.Withdraw {
+		t.Errorf("the wire carried %+v, want a propose for /w/a.go", ed.lastDelete)
+	}
+
+	out, errs, code = run(t, "delete", "-withdraw", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("delete -withdraw: code = %d: %s", code, errs)
+	}
+	if ed.lastDelete.Path != "/w/a.go" || !ed.lastDelete.Withdraw {
+		t.Errorf("the wire carried %+v, want a withdraw for /w/a.go", ed.lastDelete)
+	}
+	if !strings.Contains(out, "withdrew") {
+		t.Errorf("withdraw output = %q, want it to say so", out)
+	}
+
+	// The listing names the path and the proposing author.
+	ed.deletions = []Deletion{{Path: "/w/a.go", Author: 7}}
+	out, errs, code = run(t, "deletions")
+	if code != 0 {
+		t.Fatalf("deletions: code = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "7") {
+		t.Errorf("deletions output = %q, want the path and author", out)
+	}
+
+	// -json is the machine form.
+	out, _, code = run(t, "deletions", "-json")
+	if code != 0 || !strings.Contains(out, "\"path\": \"/w/a.go\"") || !strings.Contains(out, "\"author\": 7") {
+		t.Errorf("deletions -json = %q (code %d)", out, code)
+	}
+
+	// No operand is a usage error.
+	if _, _, code = run(t, "delete"); code != 2 {
+		t.Errorf("delete with no operand: code = %d, want 2", code)
+	}
+}
+
+// rmdirs lists pending dir-removals with the proposing author. The fake
+// records the rmdir request so the flag is asserted on the wire, not only in
+// output.
+func TestCLIRmdirAndRmdirs(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	out, errs, code := run(t, "rmdir", "/w/pkg")
+	if code != 0 {
+		t.Fatalf("rmdir: code = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "/w/pkg") {
+		t.Errorf("rmdir output = %q, want it to name the directory", out)
+	}
+	if ed.lastRmdir.Op != "rmdir" || ed.lastRmdir.Path != "/w/pkg" || ed.lastRmdir.Withdraw {
+		t.Errorf("the wire carried %+v, want a propose for /w/pkg", ed.lastRmdir)
+	}
+
+	out, errs, code = run(t, "rmdir", "-withdraw", "/w/pkg")
+	if code != 0 {
+		t.Fatalf("rmdir -withdraw: code = %d: %s", code, errs)
+	}
+	if ed.lastRmdir.Path != "/w/pkg" || !ed.lastRmdir.Withdraw {
+		t.Errorf("the wire carried %+v, want a withdraw for /w/pkg", ed.lastRmdir)
+	}
+	if !strings.Contains(out, "withdrew") {
+		t.Errorf("withdraw output = %q, want it to say so", out)
+	}
+
+	// The listing names the directory and the proposing author.
+	ed.dirRemovals = []DirRemoval{{Path: "/w/pkg", Author: 7}}
+	out, errs, code = run(t, "rmdirs")
+	if code != 0 {
+		t.Fatalf("rmdirs: code = %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "/w/pkg") || !strings.Contains(out, "7") {
+		t.Errorf("rmdirs output = %q, want the directory and author", out)
+	}
+
+	// -json is the machine form.
+	out, _, code = run(t, "rmdirs", "-json")
+	if code != 0 || !strings.Contains(out, "\"path\": \"/w/pkg\"") || !strings.Contains(out, "\"author\": 7") {
+		t.Errorf("rmdirs -json = %q (code %d)", out, code)
+	}
+
+	// No operand is a usage error.
+	if _, _, code = run(t, "rmdir"); code != 2 {
+		t.Errorf("rmdir with no operand: code = %d, want 2", code)
+	}
+}
+
+// proposals is the one flat listing over the pending surface: per-kind human
+// headers and a tagged JSON list.
+func TestCLIProposals(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	ed.proposals = []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 4, Group: 7, Start: 1, End: 4},
+		{Kind: "delete", Path: "/w/b.go", Author: 5, Start: -1, End: -1},
+		{Kind: "rmdir", Path: "/w/sub", Author: 5, Start: -1, End: -1},
+	}
+
+	out, errs, code := run(t, "proposals")
+	if code != 0 {
+		t.Fatalf("proposals: code = %d: %s", code, errs)
+	}
+	for _, want := range []string{
+		"change sets:", "pending deletions:", "pending dir-removals:",
+		"/w/a.go", "group 7", "author 4", "bytes 1..4", "/w/b.go", "/w/sub",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("proposals output %q missing %q", out, want)
+		}
+	}
+
+	out, _, code = run(t, "proposals", "-json")
+	if code != 0 || !strings.Contains(out, "\"kind\": \"set\"") || !strings.Contains(out, "\"group\": 7") {
+		t.Errorf("proposals -json = %q (code %d)", out, code)
+	}
+}
+
+// mineProposals is the `proposals -mine` filter, the proposals analogue of
+// mineOnly. It is unit-tested rather than driven over a connection because each
+// raj ctl invocation is a fresh connection with its own author id, so a whoami
+// in one run cannot predict the id the next run will write as.
+func TestMineProposalsKeepsTheCallers(t *testing.T) {
+	props := []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 4, Group: 1},
+		{Kind: "delete", Path: "/w/b.go", Author: 5},
+		{Kind: "rmdir", Path: "/w/sub", Author: 4},
+	}
+	got := mineProposals(props, 4)
+	if len(got) != 2 || got[0].Path != "/w/a.go" || got[1].Path != "/w/sub" {
+		t.Errorf("mineProposals = %+v, want a.go and sub", got)
+	}
+	if mineProposals(props, 9) != nil {
+		t.Errorf("mineProposals with no match = %+v, want nil", mineProposals(props, 9))
 	}
 }
 

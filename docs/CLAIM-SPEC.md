@@ -1,7 +1,8 @@
-# Claim — design note and verb spec (draft)
+# Claim — design note and verb spec
 
-Status: draft for review, 2026-09-13. Supersedes the earlier enforced/TTL
-version. No code yet; the verb and wire need a host rebuild.
+Status: built and live 2026-09-13/14 (rebuilt and host-verified). Supersedes
+the earlier enforced/TTL version. `claim`/`-add`/`-clear`, Guard enforcement,
+and `open -create` auto-extend are in the binary; see COMPLETED.md.
 
 ## 1. Purpose
 
@@ -35,8 +36,15 @@ stays `Session.Leased`'s reactive job).
 
 - `raj ctl claim <path>...` — set the working set (replace). Relative/absolute/
   editor spellings resolve as every verb does; each path is validated in-root.
-  A path that does not exist is warned per-path and skipped; existing paths are
-  still claimed and the command succeeds.
+  A path that is neither on disk nor an already-open buffer is warned per-path
+  and skipped; a path that exists on disk, or that is already open (a buffer
+  created with `open -create` before it is saved), is claimed and the command
+  succeeds.
+- `raj ctl claim <dir>` — a directory operand walks the subtree and claims each
+  file under it (a snapshot at claim time; a file created afterwards is not
+  auto-claimed). The directory path is also held as a set entry, so `rmdir
+  <dir>` is one `claimCheck` on the dir itself (see
+  `docs/FILE-LIFECYCLE-SPEC.md` §11).
 - `raj ctl claim -add <path>...` — extend the current set.
 - `raj ctl claim -clear` — release it.
 - `raj ctl claim` (no operands) — report the current set (and other live
@@ -73,10 +81,12 @@ stays `Session.Leased`'s reactive job).
   see the lifecycle plan; for now the parent-dir handling of `open -create` is
   an open implementation point.
 
-## 6. File lifecycle (planned — not built)
+## 6. File lifecycle
 
-Plan the mkdir/rmdir/delete/rename equivalents now, gate them on the claim,
-and decide the semantics:
+`mkdir`, `delete` and `rename` are built (2026-09-13/14); `rmdir` is specced
+(`docs/FILE-LIFECYCLE-SPEC.md` §11) and being built. The concrete, built
+semantics live in `docs/FILE-LIFECYCLE-SPEC.md`; the proposed rules below are
+kept as the decision history they became:
 
 - `mkdir <dir>` — create a directory (with missing parents). Dirs are not text
   and are not claimed; proposed rule: allowed anywhere under the workspace

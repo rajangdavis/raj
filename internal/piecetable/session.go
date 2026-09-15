@@ -91,6 +91,25 @@ func (s *Session) Buffer() Buffer { return s.buf }
 func (s *Session) Store() *Store    { return s.buf.Store() }
 func (s *Session) Version() Version { return Version(len(s.journal)) }
 
+// LengthAt reports the document length at version v: the origin length plus
+// each op's net byte delta up to that point. ok is false when v is past the
+// journal, a version this session never produced.
+//
+// A stale base's length is not the current document's length, so a caller
+// validating offsets has to measure against this rather than against the
+// buffer as it stands: an offset the base never held must be refused instead
+// of being rebased into the present at EOF.
+func (s *Session) LengthAt(v Version) (int, bool) {
+	if v > Version(len(s.journal)) {
+		return 0, false
+	}
+	n := s.origLen
+	for _, o := range s.journal[:v] {
+		n += o.Delta()
+	}
+	return n, true
+}
+
 // Journal exposes the applied history. The slice must not be modified.
 func (s *Session) Journal() []Op { return s.journal }
 
@@ -558,7 +577,13 @@ func (s *Session) live(seq Version) bool {
 func (s *Session) rebasedInverse(o Op) (Op, bool) {
 	inv := o.Inverse()
 	start, end, _, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
-	if !ok || end-start != o.InsLen() {
+	// The rebased span has to be inside the document for the inverse to be
+	// placeable. It does not always end up there: an op recorded with a Pos
+	// past the document (a bad offset accepted against the wrong base) maps
+	// to a span beyond the end, and removeRange clamps it to a no-op.
+	// Committing that inverse would report success while the text stayed and
+	// the op went dead, so refuse rather than lie.
+	if !ok || end-start != o.InsLen() || end > s.buf.Len() {
 		return Op{}, false
 	}
 	inv.Pos = start

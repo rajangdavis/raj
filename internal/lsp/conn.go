@@ -348,13 +348,18 @@ type InitializeResult struct {
 // tens of seconds and a server that is slow to start is not a server that is
 // broken. It is finite because one that never answers must not leave the
 // feature permanently pending with no way to tell.
-func (c *Conn) Initialize(ctx context.Context, rootURI string, caps any) (*InitializeResult, error) {
+func (c *Conn) Initialize(ctx context.Context, rootURI string, caps, options any) (*InitializeResult, error) {
 	var res InitializeResult
 	params := map[string]any{
 		"processId":    nil,
 		"rootUri":      rootURI,
 		"capabilities": caps,
 		"clientInfo":   map[string]string{"name": "raj"},
+	}
+	// Omitted rather than sent as null: a server that does not expect the field
+	// is better off never seeing it, and an absent one is the default anyway.
+	if options != nil {
+		params["initializationOptions"] = options
 	}
 	if err := c.Call(ctx, "initialize", params, &res); err != nil {
 		return nil, err

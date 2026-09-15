@@ -14,7 +14,7 @@ import (
 func fullHeader() Header {
 	base := uint64(41)
 	return Header{
-		ID: 7, Op: "apply", Path: "/w/main.go", Author: 3, Token: "t0ken",
+		ID: 7, Op: "apply", Path: "/w/main.go", NewPath: "/w/renamed.go", Author: 3, Token: "t0ken",
 		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent",
 		Argv: []string{"go", "test", "./..."}, Dir: "/w",
 		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true},
@@ -25,17 +25,21 @@ func fullHeader() Header {
 		Dirty:        []DirtyBuffer{{Path: "/w/a.go", AgentOnly: true}, {Path: "/w/b.go"}},
 		Stats:        ExecStats{Runs: 5, Stale: 1, AgentOnly: 2},
 		Participants: []Participant{{ID: 1, Identity: "i", Name: "n", Kind: KindAgent, Connected: true}},
-		Groups:       []Group{{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 3, Bytes: 40, First: 1, Last: 9}},
+		Groups:       []Group{{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 3, Bytes: 40, First: 1, Last: 9, Hunks: 2, Moved: 1}},
 		Messages:     []Message{{From: 1, Text: "hello"}},
 		Buffers:      []Buffer{{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Pending: 2, Moved: 1, Lines: 5}},
 		Truncated:    []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}},
-		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, ByteStart: 10, ByteEnd: 14}},
+		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, LineEnd: 18, ByteStart: 10, ByteEnd: 14, Version: 6}},
 		Conflicts:    []Conflict{{Index: 1, At: 8, Group: 7, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
 		DiffJSON:     `[{"id":4,"hunks":[{"start":1,"end":2,"old":"a","new":"b"}],"moved":0}]`,
 		StatesJSON:   `[{"off":0,"len":5,"group":0,"state":"accepted"}]`,
 		ReviewList:   true,
 		Annotated:    true,
+		Discard:      true,
+		Withdraw:     true,
+		Remains:      true,
+		Created:      true,
 
 		Paths:         []string{"/w/a.go", "/w/b.go"},
 		ClaimAdd:      true,
@@ -43,6 +47,12 @@ func fullHeader() Header {
 		Claims:        []string{"/w/a.go"},
 		ClaimWarnings: []string{"/w/gone.go skipped"},
 		ClaimOverlaps: []ClaimOverlap{{Path: "/w/a.go", Identity: "bob", Author: 4}},
+		Deletions:     []Deletion{{Path: "/w/a.go", Author: 4}},
+		DirRemovals:   []DirRemoval{{Path: "/w/sub", Author: 4}},
+		Proposals: []Proposal{
+			{Kind: "set", Path: "/w/a.go", Author: 3, Group: 4, Start: -1, End: -1},
+			{Kind: "delete", Path: "/w/b.go", Author: 4, Start: 7, End: 9},
+		},
 	}
 }
 
@@ -83,6 +93,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		got, want any
 	}{
 		{"id", got.ID, want.ID}, {"op", got.Op, want.Op}, {"path", got.Path, want.Path},
+		{"newpath", got.NewPath, want.NewPath},
 		{"author", got.Author, want.Author}, {"token", got.Token, want.Token},
 		{"cancel", got.Cancel, want.Cancel}, {"group", got.Group, want.Group},
 		{"identity", got.Identity, want.Identity}, {"name", got.Name, want.Name},
@@ -98,6 +109,9 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"statesjson", got.StatesJSON, want.StatesJSON},
 		{"reviewlist", got.ReviewList, want.ReviewList},
 		{"annotated", got.Annotated, want.Annotated},
+		{"withdraw", got.Withdraw, want.Withdraw},
+		{"remains", got.Remains, want.Remains},
+		{"created", got.Created, want.Created},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
@@ -108,6 +122,15 @@ func TestHeaderRoundTrip(t *testing.T) {
 	}
 	if len(got.Spans) != 2 || got.Spans[1] != want.Spans[1] {
 		t.Errorf("spans = %+v", got.Spans)
+	}
+	if len(got.Deletions) != 1 || got.Deletions[0] != want.Deletions[0] {
+		t.Errorf("deletions = %+v, want %+v", got.Deletions, want.Deletions)
+	}
+	if len(got.DirRemovals) != 1 || got.DirRemovals[0] != want.DirRemovals[0] {
+		t.Errorf("dir removals = %+v, want %+v", got.DirRemovals, want.DirRemovals)
+	}
+	if len(got.Proposals) != 2 || got.Proposals[0] != want.Proposals[0] || got.Proposals[1] != want.Proposals[1] {
+		t.Errorf("proposals = %+v, want %+v", got.Proposals, want.Proposals)
 	}
 }
 
@@ -292,6 +315,9 @@ func TestEveryVerbHasACode(t *testing.T) {
 		"ping", "buffers", "text", "open", "apply", "save", "version", "search",
 		"groups", "accept", "reject", "clear", "exec", "execcheck", "stats", "hello",
 		"cancel", "recv", "snapshot", "prog", "diff", "review", "claim",
+		"mkdir", "delete", "deletions", "rename",
+		"proposals",
+		"rmdir", "rmdirs",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)
@@ -359,6 +385,50 @@ func TestHeaderKeepsMatchLineStart(t *testing.T) {
 	want := []MatchMeta{
 		{Line: 1, Col: 0, Len: 6, PathLen: 4, LineStart: 0, ByteStart: 0, ByteEnd: 6},
 		{Line: 2, Col: 1, Len: 6, PathLen: 4, LineStart: 9, ByteStart: 10, ByteEnd: 16},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Matches: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != len(want) {
+		t.Fatalf("decoded %d matches, want %d", len(got.Matches), len(want))
+	}
+	for i := range want {
+		if got.Matches[i] != want[i] {
+			t.Errorf("match %d = %+v, want %+v", i, got.Matches[i], want[i])
+		}
+	}
+}
+
+// A match's LineEnd rides in its own sparse field, so a zero end must survive
+// next to a nonzero one and each end must stay with its own hit.
+func TestHeaderKeepsMatchLineEnd(t *testing.T) {
+	want := []MatchMeta{
+		{Line: 1, Col: 0, Len: 6, PathLen: 4, LineStart: 0, LineEnd: 0, ByteStart: 0, ByteEnd: 6},
+		{Line: 2, Col: 1, Len: 6, PathLen: 4, LineStart: 9, LineEnd: 21, ByteStart: 10, ByteEnd: 16},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Matches: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != len(want) {
+		t.Fatalf("decoded %d matches, want %d", len(got.Matches), len(want))
+	}
+	for i := range want {
+		if got.Matches[i] != want[i] {
+			t.Errorf("match %d = %+v, want %+v", i, got.Matches[i], want[i])
+		}
+	}
+}
+
+// A match's buffer version rides in its own sparse field, so a disk hit's zero
+// must survive next to a buffer hit's revision, and each version must stay with
+// its own hit rather than shift onto the next.
+func TestHeaderKeepsMatchVersion(t *testing.T) {
+	want := []MatchMeta{
+		{Line: 1, Col: 0, Len: 6, PathLen: 4, ByteStart: 0, ByteEnd: 6},
+		{Line: 2, Col: 1, Len: 6, PathLen: 4, LineStart: 9, ByteStart: 10, ByteEnd: 16, Version: 41},
+		{Line: 3, Col: 1, Len: 6, PathLen: 4, LineStart: 20, ByteStart: 21, ByteEnd: 27, Version: 42},
 	}
 	got, err := decodeHeader(encodeHeader(Header{Matches: want}))
 	if err != nil {

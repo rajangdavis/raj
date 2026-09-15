@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,8 +50,10 @@ type BufferHost interface {
 	// Open puts a path in a tab and returns its version. create says a path
 	// that is neither a buffer nor a file on disk is a name to make a new
 	// empty buffer for; without it such a path is refused rather than
-	// silently becoming a buffer nothing can read.
-	Open(path string, create bool) (uint64, error)
+	// silently becoming a buffer nothing can read. created reports whether
+	// this call made a new buffer rather than focusing one that was already
+	// loaded, so a driver that meant to create a file can tell the two apart.
+	Open(path string, create bool) (version uint64, created bool, err error)
 
 	// Goto moves the cursor in a buffer to a 1-based line and column. Zero
 	// means "the editor decides": a missing line keeps the cursor's own, a
@@ -61,6 +64,61 @@ type BufferHost interface {
 	// close is a silent data loss, and the editor's close-anyway prompt has no
 	// machine form.
 	Close(path string) error
+
+	// CloseDiscard removes a buffer without saving, discarding unsaved
+	// changes and any pending change sets. It is the machine form of the
+	// editor's close-without-save, for a driver that has decided not to keep
+	// the work; the file on disk is left exactly as it is. remains reports
+	// whether that file is still on disk afterwards, so a driver that
+	// recreated the content under a new name learns the old name is left
+	// behind rather than only from the editor's status line.
+	CloseDiscard(path string) (remains bool, err error)
+
+	// Mkdir creates a directory and any missing parents under the workspace
+	// root. It is a filesystem change rather than a buffer one, so it names a
+	// path directly and never loads one; an existing directory is not an
+	// error, matching os.MkdirAll. The host refreshes what lists the tree so
+	// the new directory appears.
+	Mkdir(path string) error
+
+	// Rename moves a file within the workspace. An open clean buffer is
+	// carried: its pane path, journal, LSP document and session tab follow the
+	// new name rather than being reopened under it. A dirty buffer, or one
+	// holding a pending change set, is refused with the reason — there is no
+	// force path. A path nobody has open is an ordinary filesystem rename.
+	Rename(old, new string) error
+
+	// ProposeDeletion records a pending deletion for path, proposed by
+	// author, and does not unlink anything. Delete is a review primitive: the
+	// user decides whether the file goes. Idempotent, so a second proposal
+	// for the same path is a no-op.
+	ProposeDeletion(path string, author uint8) error
+
+	// WithdrawDeletion removes author's pending deletion for path. A path
+	// that is not pending is a no-op; one proposed by another writer is
+	// refused, so an agent cannot retract a peer's proposal.
+	WithdrawDeletion(path string, author uint8) error
+
+	// Deletions lists the pending deletions.
+	Deletions() []Deletion
+
+	// ProposeDirRemoval records a pending dir-removal for path, proposed by
+	// author, and removes nothing. It is the rmdir analogue of
+	// ProposeDeletion: the user decides whether the subtree goes. Idempotent,
+	// so a second proposal for the same path is a no-op.
+	ProposeDirRemoval(path string, author uint8) error
+
+	// WithdrawDirRemoval removes author's pending dir-removal for path. A
+	// path that is not pending is a no-op; one proposed by another writer is
+	// refused, so an agent cannot retract a peer's proposal.
+	WithdrawDirRemoval(path string, author uint8) error
+
+	// DirRemovals lists the pending dir-removals.
+	DirRemovals() []DirRemoval
+	// Proposals is a read-only rollup over every open buffer's pending change
+	// sets plus the pending file deletions and dir-removals. It is ungated,
+	// like Deletions: a driver may see what is waiting without a claim.
+	Proposals() []Proposal
 
 	// Read returns the document as authored spans AND the version they were
 	// read at.
@@ -145,6 +203,15 @@ type BufferHost interface {
 	// the server, which is the mode that never blocks. A nil caller with a
 	// non-nil error is a clean "no server" or "server not ready" answer.
 	LSP(path string, line, col int, mode string) (LSPCaller, error)
+
+	// LSPInlayHints prepares a range-scoped inlay-hint request for a file.
+	// lineStart and lineEnd are 1-based inclusive lines; zero means the start
+	// or the end of the file, so both zero asks about the whole file. Like LSP
+	// it syncs the document first, so the hints describe unsaved text, and
+	// returns a caller that runs the blocking request off the event thread. A
+	// nil caller with a non-nil error is a clean "no server" or "not ready"
+	// answer to retry.
+	LSPInlayHints(path string, lineStart, lineEnd int) (LSPCaller, error)
 
 	// Dirty lists unsaved buffers and whether the human wrote any of the
 	// unsaved text in each. Called on the event thread, immediately before a
@@ -292,26 +359,20 @@ func (g *Guard) canonical(path string) (string, error) {
 // Diff and Dump never consult a claim and keep the focused-buffer default a
 // read has always had.
 func (g *Guard) claimTarget(author uint8, path string) (string, error) {
-	g.mu.Lock()
-	claims := sortedPaths(g.claims[author])
-	g.mu.Unlock()
-
 	if path != "" {
 		name, err := g.canonical(path)
 		if err != nil {
 			return "", err
 		}
-		if len(claims) == 0 {
-			return "", errors.New("claim a file first")
+		if err := g.claimCheck(author, name); err != nil {
+			return "", err
 		}
-		for _, p := range claims {
-			if p == name {
-				return name, nil
-			}
-		}
-		return "", fmt.Errorf("not in your claim set (%s); claim -add <path>", strings.Join(claims, ", "))
+		return name, nil
 	}
 
+	g.mu.Lock()
+	claims := sortedPaths(g.claims[author])
+	g.mu.Unlock()
 	switch len(claims) {
 	case 0:
 		return "", errors.New("claim a file first")
@@ -322,7 +383,27 @@ func (g *Guard) claimTarget(author uint8, path string) (string, error) {
 	}
 }
 
-func (g *Guard) Open(path string, create bool) (uint64, error) {
+// claimCheck reports whether name is in author's claim set, naming the set in
+// its refusal exactly as claimTarget does. It is the membership half of the
+// gate, split from the resolve step so delete can run it against a path
+// canonicalised without loading a buffer: deleting a file is not a text write,
+// and recording a proposal must not have to read the file it names.
+func (g *Guard) claimCheck(author uint8, name string) error {
+	g.mu.Lock()
+	claims := sortedPaths(g.claims[author])
+	g.mu.Unlock()
+	if len(claims) == 0 {
+		return errors.New("claim a file first")
+	}
+	for _, p := range claims {
+		if p == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("not in your claim set (%s); claim -add <path>", strings.Join(claims, ", "))
+}
+
+func (g *Guard) Open(path string, create bool) (uint64, bool, error) {
 	// Open names a file that may not be a buffer yet, so unlike every other
 	// verb there is no Resolve to canonicalise it. A relative path is made
 	// absolute against the root here, the rule the host applies to every other
@@ -332,9 +413,216 @@ func (g *Guard) Open(path string, create bool) (uint64, error) {
 		path = filepath.Join(g.Host.Root(), path)
 	}
 	if err := g.inRoot(path); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	return g.Host.Open(path, create)
+}
+
+// Mkdir creates a directory, with any missing parents, under the workspace
+// root. A directory is not text and is not a buffer, so it is canonicalised
+// without loading one: a relative name is joined against the root, cleaned, and
+// checked in-root with the same check every other path gets. The claim gate is
+// deliberately absent — a claim is about a file, and a new directory has no
+// file to claim yet — so a caller may make a package directory before it has a
+// file to put in it. Out of root is a refusal, not a clamp.
+func (g *Guard) Mkdir(path string) error {
+	if path == "" {
+		return errors.New("mkdir needs a path")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(g.Host.Root(), path)
+	}
+	path = filepath.Clean(path)
+	if err := g.inRoot(path); err != nil {
+		return err
+	}
+	return g.Host.Mkdir(path)
+}
+
+// Rename moves a claimed path within the workspace.
+//
+// It is claim-gated on the OLD name like a text write — the path must be in the
+// caller's set — but deliberately does NOT require read-before-write: no
+// offset is at stake, and the host carries an open clean buffer across the
+// rename rather than reopening it. Both names are canonicalised by claimPath,
+// which checks them in-root without loading a buffer, so a rename does not have
+// to open the file it moves. Out of root is a refusal, not a clamp.
+//
+// The destination must not already exist: a rename onto another file would
+// clobber a path the caller never claimed, and no verb may do that silently.
+// The exception is a case-only rename on a case-insensitive filesystem, where
+// the destination and the source resolve to one file; refusing that would make
+// `a.go -> A.go` impossible there, so it is allowed and the host uses the
+// two-step rename. On success the caller's claim set follows old to new, so the
+// working set names the file that now exists; on failure it is left untouched.
+func (g *Guard) Rename(old, new string, author uint8) error {
+	if old == "" {
+		return errors.New("rename needs an old path")
+	}
+	if new == "" {
+		return errors.New("rename needs a new path")
+	}
+	src, err := g.claimPath(old)
+	if err != nil {
+		return err
+	}
+	dst, err := g.claimPath(new)
+	if err != nil {
+		return err
+	}
+	if err := g.claimCheck(author, src); err != nil {
+		return err
+	}
+	if dstInfo, derr := os.Stat(dst); derr == nil {
+		// Refuse unless the destination is the same file as the source, which
+		// is what a case-only rename looks like on a case-insensitive
+		// filesystem. There the two spellings resolve to one file, and
+		// refusing would make the case change impossible to express.
+		srcInfo, serr := os.Stat(src)
+		if serr != nil || !os.SameFile(srcInfo, dstInfo) {
+			return fmt.Errorf("%s already exists", dst)
+		}
+	} else if !os.IsNotExist(derr) {
+		return derr
+	}
+	if err := g.Host.Rename(src, dst); err != nil {
+		return err
+	}
+	g.renameClaim(author, src, dst)
+	return nil
+}
+
+// Delete proposes a pending deletion for a claimed path, or withdraws this
+// identity's proposal. It is claim-gated like a text write — the path must be
+// in the caller's claim set — because the claim is the record of what an agent
+// declared it would touch. It deliberately does NOT require read-before-write:
+// deleting is not a text write and no offset is at stake. The path is
+// canonicalised by claimPath, which checks it in-root without loading a buffer,
+// so proposing a deletion does not have to open the file it names.
+func (g *Guard) Delete(path string, author uint8, withdraw bool) error {
+	if path == "" {
+		return errors.New("delete needs a path")
+	}
+	name, err := g.claimPath(path)
+	if err != nil {
+		return err
+	}
+	if err := g.claimCheck(author, name); err != nil {
+		return err
+	}
+	if withdraw {
+		return g.Host.WithdrawDeletion(name, author)
+	}
+	if err := g.checkOperandKind(name, false); err != nil {
+		return err
+	}
+	return g.Host.ProposeDeletion(name, author)
+}
+
+// Deletions lists the pending deletions in stable path order. It is ungated: a
+// driver may see what is waiting without holding a claim on any of it.
+func (g *Guard) Deletions() []Deletion {
+	out := g.Host.Deletions()
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// Rmdir proposes a pending dir-removal for a claimed directory, or withdraws
+// this identity's proposal. It is the rmdir analogue of Delete: the directory
+// itself is a claim entry (claim <dir> records it, per §11), so the gate is one
+// claimCheck on the dir. Like Delete it deliberately does NOT require
+// read-before-write: a dir-removal is not a text write and no offset is at
+// stake. The path is canonicalised by claimPath, which checks it in-root
+// without loading a buffer.
+func (g *Guard) Rmdir(path string, author uint8, withdraw bool) error {
+	if path == "" {
+		return errors.New("rmdir needs a path")
+	}
+	name, err := g.claimPath(path)
+	if err != nil {
+		return err
+	}
+	if err := g.claimCheck(author, name); err != nil {
+		return err
+	}
+	if withdraw {
+		return g.Host.WithdrawDirRemoval(name, author)
+	}
+	if err := g.checkOperandKind(name, true); err != nil {
+		return err
+	}
+	return g.Host.ProposeDirRemoval(name, author)
+}
+
+// Rmdirs lists the pending dir-removals in stable path order. It is ungated,
+// like Deletions.
+func (g *Guard) Rmdirs() []DirRemoval {
+	out := g.Host.DirRemovals()
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// checkOperandKind stats a file-operation operand and refuses the wrong kind:
+// delete names a file, rmdir names a directory. Without this the record was made
+// without looking, so a path that is really a file could be proposed for
+// removal as a directory and vice versa, and only the human prompt would catch
+// the mistake. wantDir says which kind the verb is for.
+//
+// A path that is not on disk is allowed. A proposal is forward-looking — a
+// claim may name a file the writer is about to create, and open -create makes a
+// buffer before any bytes exist — so there is no file type to check yet, and
+// refusing would make the verb unusable in exactly the window the claim set
+// covers. The human prompt is the real gate once the path exists.
+//
+// Only the proposing path checks. A withdrawal has to keep working after the
+// file is gone, so it never reaches here.
+func (g *Guard) checkOperandKind(name string, wantDir bool) error {
+	info, err := os.Stat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if wantDir {
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory; rmdir removes directories (use delete for a file)", name)
+		}
+		return nil
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory; delete removes files (use rmdir for a directory)", name)
+	}
+	return nil
+}
+
+// Proposals rolls the three pending listings into one flat tagged list: each
+// open buffer's pending change sets, the pending file deletions and the
+// pending dir-removals. It is a read-only view, ungated like Deletions, and
+// the order is deterministic — kind (set, delete, rmdir), then path, then
+// group id — so a caller can compare two listings directly.
+func (g *Guard) Proposals() []Proposal {
+	out := g.Host.Proposals()
+	rank := func(kind string) int {
+		switch kind {
+		case "set":
+			return 0
+		case "delete":
+			return 1
+		default:
+			return 2
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if ri, rj := rank(out[i].Kind), rank(out[j].Kind); ri != rj {
+			return ri < rj
+		}
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return out[i].Group < out[j].Group
+	})
+	return out
 }
 
 // Goto routes a cursor move through the same resolution every other verb
@@ -355,6 +643,18 @@ func (g *Guard) Close(path string) error {
 		return err
 	}
 	return g.Host.Close(name)
+}
+
+// Discard closes a buffer without saving, discarding unsaved changes and any
+// pending change sets. It is not a text write — nothing is written and no
+// offset is checked — so it does not run the claim gate; the file on disk is
+// left exactly as it is.
+func (g *Guard) Discard(path string) (bool, error) {
+	name, err := g.canonical(path)
+	if err != nil {
+		return false, err
+	}
+	return g.Host.CloseDiscard(name)
 }
 
 func (g *Guard) Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
@@ -635,8 +935,11 @@ func (g *Guard) Stats() ExecStats {
 // identity declares it is working on. A path is made absolute against the
 // workspace root and checked in-root without loading a buffer — a claim says
 // what is about to be edited, so it must not make the editor open anything. A
-// path that is not on disk is named in warnings and skipped, so the rest of
-// the command still lands.
+// syntactically valid in-root path is claimed whether or not it is on disk yet:
+// a claim is forward-looking, so the buffer open -create makes and the file a
+// writer is about to create are both claimable. Only a stat that fails for a
+// reason other than absence — a permission error, say — is named in warnings
+// and skipped, so the rest of the command still lands.
 //
 // The set comes back in stable (sorted) order, along with the other writers
 // whose sets share a path, resolved to a display name (or the identity key
@@ -655,20 +958,45 @@ func (g *Guard) Claim(author uint8, paths []string, add, clear bool) (claims, wa
 	}
 	kept := make([]string, 0, len(paths))
 	seen := make(map[string]bool, len(paths))
+	keep := func(p string) {
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		kept = append(kept, p)
+	}
 	for _, raw := range paths {
 		p, cerr := g.claimPath(raw)
 		if cerr != nil {
 			return nil, nil, nil, cerr
 		}
-		if _, serr := os.Stat(p); serr != nil {
+		info, serr := os.Stat(p)
+		if serr != nil && !os.IsNotExist(serr) {
+			// A stat that failed for a reason other than absence is a real
+			// problem — a permission error on a path that may well exist —
+			// so it is named and skipped rather than claimed blind.
 			warnings = append(warnings, fmt.Sprintf("%s skipped: %v", p, serr))
 			continue
 		}
-		if seen[p] {
-			continue
+		// The directory operand rule (§11, §3): a claimed directory is itself
+		// a set entry — so rmdir <dir> is one claimCheck on the dir — and its
+		// subtree is claimed too, as a snapshot: each regular file under it is
+		// claimed now, and a file created afterwards is not. The walk does not
+		// follow symlinks, and subdirectories are walked but not claimed. A
+		// path not on disk has no subtree yet: it is claimed on its own and
+		// the walk waits for it to exist.
+		keep(p)
+		if serr == nil && info.IsDir() {
+			filepath.WalkDir(p, func(sub string, d fs.DirEntry, err error) error {
+				if err != nil || sub == p {
+					return nil
+				}
+				if d.Type().IsRegular() {
+					keep(sub)
+				}
+				return nil
+			})
 		}
-		seen[p] = true
-		kept = append(kept, p)
 	}
 	if add {
 		claims = g.addClaims(author, kept)
@@ -738,6 +1066,23 @@ func (g *Guard) clearClaims(author uint8) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.claims, author)
+}
+
+// renameClaim replaces old with new in author's working set, after a rename
+// the host reported as done. Putting new in and old out is the point: the set
+// is a record of what the caller is editing, and after the rename the file it
+// names is new. A set that does not hold old is left alone rather than having a
+// claim invented for it, and a failed rename never reaches here, so the set is
+// untouched on every failure path.
+func (g *Guard) renameClaim(author uint8, old, new string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	set := g.claims[author]
+	if set == nil || !set[old] {
+		return
+	}
+	delete(set, old)
+	set[new] = true
 }
 
 // claimOverlaps names the other authors holding any of paths. Names are
@@ -810,8 +1155,38 @@ func Dispatch(g *Guard, req Request) Response {
 		if req.Path == "" {
 			return Response{Err: "open needs a path"}
 		}
-		v, err := g.Open(req.Path, req.Create)
-		return done(v, err)
+		v, created, err := g.Open(req.Path, req.Create)
+		if err != nil {
+			return done(v, err)
+		}
+		res := done(v, nil)
+		res.Created = created
+		if req.Create {
+			// A create is the declaration of intent the spec names: extend
+			// the caller's claim with the file it just made, in the same
+			// canonical spelling claim stores, so no second command is
+			// needed. Canonicalisation cannot normally fail here — Open
+			// already checked the same path in-root — but if it does, the
+			// open still stands and the claim simply did not extend; that
+			// is a warning, not a failed open.
+			name, cerr := g.claimPath(req.Path)
+			if cerr != nil {
+				return Response{OK: true, Version: v, Created: created,
+					ClaimWarnings: []string{"claim not extended: " + cerr.Error()}}
+			}
+			g.addClaims(req.Author, []string{name})
+		}
+		return res
+	case "mkdir":
+		if err := g.Mkdir(req.Path); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "rename":
+		if err := g.Rename(req.Path, req.NewPath, req.Author); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
 	case "goto":
 		name, err := g.canonical(req.Path)
 		if err != nil {
@@ -822,6 +1197,13 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		return Response{OK: true}
 	case "close":
+		if req.Discard {
+			remains, err := g.Discard(req.Path)
+			if err != nil {
+				return Response{Err: err.Error()}
+			}
+			return Response{OK: true, Remains: remains}
+		}
 		name, err := g.canonical(req.Path)
 		if err != nil {
 			return Response{Err: err.Error()}
@@ -911,6 +1293,22 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}
+	case "delete":
+		if err := g.Delete(req.Path, req.Author, req.Withdraw); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "deletions":
+		return Response{OK: true, Deletions: g.Deletions()}
+	case "rmdir":
+		if err := g.Rmdir(req.Path, req.Author, req.Withdraw); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "rmdirs":
+		return Response{OK: true, DirRemovals: g.Rmdirs()}
+	case "proposals":
+		return Response{OK: true, Proposals: g.Proposals()}
 	case "claim":
 		claims, warnings, overlaps, err := g.Claim(req.Author, req.Paths, req.ClaimAdd, req.ClaimClear)
 		if err != nil {
@@ -938,7 +1336,23 @@ func Dispatch(g *Guard, req Request) Response {
 		// Internal: the lsp path asks the event thread to sync the document and
 		// locate the server, then runs the request off it. No wire
 		// representation, like snapshot.
-		caller, err := g.Host.LSP(req.Path, req.Line, req.Col, req.LSPMode)
+		var caller LSPCaller
+		var err error
+		if req.LSPMode == "inlay-hints" {
+			// A range request: LineStart/LineEnd carry the 1-based inclusive
+			// lines, zero meaning the start or the end of the file. The
+			// position fields are not used.
+			lineStart, lineEnd := 0, 0
+			if req.LineStart != nil {
+				lineStart = *req.LineStart
+			}
+			if req.LineEnd != nil {
+				lineEnd = *req.LineEnd
+			}
+			caller, err = g.Host.LSPInlayHints(req.Path, lineStart, lineEnd)
+		} else {
+			caller, err = g.Host.LSP(req.Path, req.Line, req.Col, req.LSPMode)
+		}
 		if err != nil {
 			return Response{Err: err.Error()}
 		}

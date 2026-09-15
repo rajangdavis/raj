@@ -391,3 +391,20 @@ func TestHeadlessStatErrorKeepsCache(t *testing.T) {
 		t.Fatal("the unreadable buffer was dropped from the registry")
 	}
 }
+
+// A file created outside raj appears in the explorer once the idle scan runs,
+// with no raj action to trigger a refresh.
+func TestSyncFileTreePicksUpANewFile(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	added := filepath.Join(h.root, "added.go")
+	if err := os.WriteFile(added, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.syncFileTree(time.Now().Add(2 * time.Second))
+	for _, e := range h.Explorer.Tree.Entries() {
+		if e.Path == added {
+			return
+		}
+	}
+	t.Errorf("a file created outside raj is not in the tree")
+}

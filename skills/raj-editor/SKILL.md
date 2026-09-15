@@ -539,11 +539,14 @@ raj ctl lsp diagnostics /abs/path/to/file.go
 
 Positions are 1-based `line:col` in the editor's own coordinates; the host maps
 them to the server's UTF-16 grid for you. Hover, definition and completion
-block for the server's answer; `diagnostics` returns the last-known cached state and never blocks, and its
-answer carries a `status`: only `ok` is a real reading, so an empty list is
-"no problems" only when the status says so — `starting`/`missing`/`no-server`
-is refused rather than read as clean. A file type with no server is a clean error, not a
-hang. Results come back as JSON — add `-json` to read the structured form.
+block for the server's answer. `diagnostics` starts the server if none is
+running, registers the buffer so the reading is of its unsaved text, and waits
+briefly (about two seconds) for the server's publish; its answer carries a
+`status`: only `ok` is a real reading, so an empty list is "no problems" only
+when the status says so. A cold start answers `starting`, and the caller
+retries; `missing`/`no-server` is refused rather than read as clean. A file type
+with no server is a clean error, not a hang. Results come back as JSON — add
+`-json` to read the structured form.
 
 Use this rather than parsing compiler output or grepping for a definition: the
 answer reflects the buffer as it is now, unsaved edits included.
@@ -636,9 +639,12 @@ The two verbs that make offsets unnecessary in the common case are `raj ctl
 edit -old S -new S`, the exact-string replacement, and `raj ctl search -q
 PATTERN`, which locates text in the editor's own coordinates. Use them first.
 
-For the search path, `raj ctl search -q PATTERN -json` now reports
-`byte_start` and `byte_end` per hit, so an agent can turn a search result
-directly into an `apply` span without recomputing offsets itself.
+For the search path, `raj ctl search -q PATTERN -json` reports per hit both
+the match (`byte_start`..`byte_end`) and its line (`line_start`..`line_end`),
+so an agent can turn a search result directly into an `apply` span without
+recomputing offsets itself — use `byte_*` for the matched substring and
+`line_*` for a whole-line block. The hit `text` is the line trimmed of
+trailing space, so never derive the line end from `line_start + len(text)`.
 
 Only a structural hunk — a whole function, a comment block — genuinely wants
 `apply`, and then the offsets are measured against the bytes the `read`
@@ -780,9 +786,11 @@ make the review surface what actually changed:
   without a tab, only the files you `open`ed to show — or that hold pending
   proposals — have one. Close those with nothing to show (`raj ctl close
   <path>`) so the tab bar lists exactly the files awaiting review. This is safe
-  by construction: `close` is refused while a buffer has unsaved work, so a file
-  with pending proposals cannot be closed. Check `raj ctl buffers` before
-  closing that a file really has nothing pending.
+  by construction: plain `close` is refused while a buffer has unsaved work, so
+  a file with pending proposals cannot be closed that way. Check `raj ctl
+  buffers` before closing that a file really has nothing pending. `close
+  -discard` drops a buffer without saving; it discards unsaved work and pending
+  proposals, so use it only to abandon a buffer deliberately.
 
 What is still missing is a way to reveal a *span* or to make the jump
 automatic: either `raj ctl reveal <path> -start N -end N`, or an option on
@@ -840,7 +848,9 @@ skills file does not send an agent back to a shell tool for something
   Use these instead of a `/tmp` copy plus hand-computed `apply` spans.
 - **Language-server queries.** `raj ctl lsp hover|definition|completion
   <path> <line:col>` and `lsp diagnostics <path>` ask the editor's own LSP
-  client over the socket. Diagnostics return the cached state and never block.
+  client over the socket. Diagnostics starts a server if none is running, syncs
+  the buffer, and waits briefly for the publish; a cold start answers
+  `starting`, so retry.
 
 Rule of thumb: if an agent — or a subagent it spawned — pipes anything other
 than `raj ctl`, it is a candidate for a new flag or verb. Document the gap and

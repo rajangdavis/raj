@@ -8,8 +8,10 @@ import (
 	"testing"
 
 	"raj/internal/control"
+	"raj/internal/editor"
 	"raj/internal/lsp"
 	"raj/internal/piecetable"
+	"raj/internal/tabs"
 )
 
 // The rule the whole integration follows: no language feature may make the
@@ -661,25 +663,28 @@ func TestAcceptServerEditCoversTypedExtension(t *testing.T) {
 	}
 }
 
-// The idle scan pushes a document to its server only when a live server
-// already has it open and the buffer has moved past it. The decision is pure,
-// so the cases can be stated without a language server.
+// The idle scan registers a dirty document the server has not opened, and
+// pushes one the server already has when the buffer has moved past the version
+// it saw. The decision is pure, so the cases can be stated without a language
+// server — there is no fake server in this package to drive a live sync, so the
+// registration rule is pinned here.
 func TestNeedsSync(t *testing.T) {
 	cases := []struct {
 		name           string
-		open           bool
+		open, dirty    bool
 		synced, buffer int
 		want           bool
 	}{
-		{"not open", false, 0, 5, false},
-		{"open and current", true, 5, 5, false},
-		{"open and behind", true, 4, 5, true},
-		{"open and ahead", true, 6, 5, true},
+		{"not open and dirty", false, true, 0, 5, true},
+		{"not open and clean", false, false, 0, 5, false},
+		{"open and current", true, true, 5, 5, false},
+		{"open and behind", true, false, 4, 5, true},
+		{"open and ahead", true, false, 6, 5, true},
 	}
 	for _, tc := range cases {
-		if got := needsSync(tc.open, tc.synced, tc.buffer); got != tc.want {
-			t.Errorf("%s: needsSync(%v, %d, %d) = %v, want %v",
-				tc.name, tc.open, tc.synced, tc.buffer, got, tc.want)
+		if got := needsSync(tc.open, tc.dirty, tc.synced, tc.buffer); got != tc.want {
+			t.Errorf("%s: needsSync(%v, %v, %d, %d) = %v, want %v",
+				tc.name, tc.open, tc.dirty, tc.synced, tc.buffer, got, tc.want)
 		}
 	}
 }
@@ -702,4 +707,96 @@ func TestSyncDirtyDocsNeverStartsAServer(t *testing.T) {
 	h.syncDirtyDocs()
 	h.servers.byID[id] = &langServer{srv: &lsp.Server{}, sync: lsp.NewSync(nil, lsp.SyncFull)}
 	h.syncDirtyDocs()
+}
+
+// lspSaved on an editor with no live server must do nothing: a save is no
+// reason to start a language server, and a pane with no path has nothing on
+// disk anyway. There is no fake LSP server in this package to observe the
+// notification — the wire itself is covered by the lsp package's TestChanged.
+func TestLSPSavedWithoutAServerIsHarmless(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.lspSaved(h.Pane())
+	// A pane with no path, one with no File, and no pane at all are the same
+	// no-op: each has nothing on disk for a server to hear about.
+	h.lspSaved(&editor.Pane{File: &editor.File{}})
+	h.lspSaved(&editor.Pane{})
+	h.lspSaved(nil)
+	if n := len(h.servers.byID); n != 0 {
+		t.Errorf("lspSaved registered %d server(s) with none running", n)
+	}
+}
+
+// openLanguages is the distinct language ids of the open panes, in the order
+// they are first seen. WarmServers starts one server per language, so a nil
+// pane, an unnamed buffer and a file type with no language must not appear in
+// the list, and two files of one language must appear once.
+func TestOpenLanguages(t *testing.T) {
+	pane := func(path string) *editor.Pane {
+		return &editor.Pane{File: &editor.File{Path: path}}
+	}
+	cases := []struct {
+		name  string
+		panes []*editor.Pane
+		want  []string
+	}{
+		{"none", nil, nil},
+		{"nil pane and nil file", []*editor.Pane{nil, {}}, nil},
+		{"no language", []*editor.Pane{pane("Makefile"), pane("notes.txt"), pane("")}, nil},
+		{"distinct in first-seen order", []*editor.Pane{pane("a.go"), pane("b.rs"), pane("c.py")}, []string{"go", "rust", "python"}},
+		{"duplicates collapse to the first", []*editor.Pane{pane("a.go"), pane("b.go"), pane("c.rs"), pane("d.go")}, []string{"go", "rust"}},
+		{"empty ids skipped between", []*editor.Pane{pane("a.go"), pane("README"), pane("b.rs")}, []string{"go", "rust"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := openLanguages(tc.panes)
+			if len(got) != len(tc.want) {
+				t.Fatalf("openLanguages = %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("openLanguages = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// WarmServers with nothing open must touch no server registry. It is not run
+// against a harness that has real files: for_ would spawn a real language server
+// if one is installed, so the spawn path is deliberately left uncovered here —
+// the pure helper above is where the language selection is pinned, and this
+// covers the empty case that must be a no-op.
+func TestWarmServersWithNoPanesStartsNothing(t *testing.T) {
+	a := &App{Tabs: tabs.New(2), servers: newServers("/w")}
+	a.WarmServers()
+	if n := len(a.servers.byID); n != 0 {
+		t.Fatalf("WarmServers registered %d server(s) with no panes", n)
+	}
+}
+
+// serverInitOptions turns gopls's inlay hints on — gopls is the one server that
+// ships them all disabled — and configures nothing for a language with no such
+// need, so the initialize params omit the field rather than send a null.
+func TestServerInitOptionsTurnOnGoplsHints(t *testing.T) {
+	opts, ok := serverInitOptions("go").(map[string]any)
+	if !ok {
+		t.Fatalf("serverInitOptions(go) = %#v, want a map", serverInitOptions("go"))
+	}
+	hints, ok := opts["hints"].(map[string]any)
+	if !ok {
+		t.Fatalf("go options = %#v, want a hints map", opts)
+	}
+	for _, name := range []string{
+		"assignVariableTypes", "rangeVariableTypes",
+		"compositeLiteralFields", "constantValues",
+	} {
+		if hints[name] != true {
+			t.Errorf("hints[%q] = %v, want true", name, hints[name])
+		}
+	}
+	for _, id := range []string{"rust", "python", ""} {
+		if got := serverInitOptions(id); got != nil {
+			t.Errorf("serverInitOptions(%q) = %#v, want nil", id, got)
+		}
+	}
 }

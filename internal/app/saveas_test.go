@@ -141,6 +141,68 @@ func TestFailedSaveRestoresThePath(t *testing.T) {
 	}
 }
 
+// ---------- saving a named buffer whose directory is gone ----------
+
+// A buffer that already has a path used to skip the missing-directory handling
+// that save-as had: cmd+s wrote straight at the path, the raw ENOENT came back
+// as a no-op, and the buffer stayed dirty until closing the tab threw the work
+// away. A normal save now reaches the same prompt.
+func TestSaveNamedOffersToCreateAMissingDirectory(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	// The file never existed, so there is no disk stamp to conflict with: the
+	// only thing missing is the directory a plain save would write into.
+	path := filepath.Join(h.Explorer.Tree.Root, "gone", "notes.md")
+	h.OpenFile(path)
+	h.typeText("draft\n")
+
+	h.press("super+s")
+	if !h.Prompt.Open {
+		t.Fatalf("no dialog for a missing directory; status = %q", h.Status())
+	}
+	answer(h, prompt.Create)
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the file was not written: %v", err)
+	}
+	if !strings.Contains(string(body), "draft") {
+		t.Errorf("contents = %q, want the buffer text", body)
+	}
+	if h.Pane().File.Dirty() {
+		t.Error("the buffer is still dirty after a successful save")
+	}
+}
+
+// Declining the create question reports the save as not having happened and
+// leaves nothing behind — the same contract ensureParent gives save-as, now on
+// the path a caller about to close a tab depends on.
+func TestSaveNamedDecliningReportsNotSaved(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	path := filepath.Join(h.Explorer.Tree.Root, "gone", "notes.md")
+	h.OpenFile(path)
+	h.typeText("draft\n")
+
+	called, saved := false, true
+	h.saveActive(func(ok bool) { called, saved = true, ok })
+	if !h.Prompt.Open {
+		t.Fatalf("no dialog for a missing directory; status = %q", h.Status())
+	}
+	answer(h, prompt.Cancel)
+
+	if !called {
+		t.Fatal("the save reported nothing")
+	}
+	if saved {
+		t.Error("a declined save reported success")
+	}
+	if _, err := os.Stat(filepath.Dir(path)); err == nil {
+		t.Error("a directory was created after the question was declined")
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("a file was written after the question was declined")
+	}
+}
+
 // ---------- tab completion ----------
 
 // Tab in a path field completes, which is what made save-as feel like a text

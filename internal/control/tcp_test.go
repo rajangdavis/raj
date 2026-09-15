@@ -367,6 +367,20 @@ func TestExplicitRootMapWins(t *testing.T) {
 	if err != nil || res.Err != "" {
 		t.Fatalf("read: %v %q", err, res.Err)
 	}
+
+	// search -path is a path operand like any other: the caller's spelling is
+	// mapped, so it scopes the walk rather than being refused as outside the
+	// editor's root.
+	if _, err := c.DoStream(Request{Op: "search",
+		Query: &SearchQuery{Text: "x", Path: "/mnt/code/internal"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ed.mu.Lock()
+	got := ed.searchPath
+	ed.mu.Unlock()
+	if got != "/w/internal" {
+		t.Errorf("search path = %q, want the editor spelling /w/internal", got)
+	}
 }
 
 // Nothing is inferred over a Unix socket, whatever the editor's root says: a

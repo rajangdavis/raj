@@ -22,6 +22,13 @@ type Server struct {
 	// Notify wakes the event loop when the server has something to say.
 	Notify func()
 
+	// Options is the server's initializationOptions, sent in the initialize
+	// params. It is the one per-language seam: a server that ships a feature
+	// off by default is turned on here, because the editor renders the feature
+	// but the server will not offer it unasked. gopls's inlay hints are the
+	// case today. nil omits the field.
+	Options any
+
 	mu       sync.Mutex
 	conn     *Conn
 	cmd      *exec.Cmd
@@ -84,7 +91,7 @@ func (s *Server) Start(ctx context.Context, rootURI string, caps any) (*Initiali
 	s.conn, s.cmd = conn, cmd
 	s.mu.Unlock()
 
-	res, err := conn.Initialize(ctx, rootURI, caps)
+	res, err := conn.Initialize(ctx, rootURI, caps, s.Options)
 	if err != nil {
 		conn.Close()
 		s.mu.Lock()

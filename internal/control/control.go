@@ -66,6 +66,11 @@ type Request struct {
 	ID   int
 	Op   string
 	Path string
+	// NewPath is rename's destination: the second path operand, which no other
+	// verb carries. It is encoded sparsely like every other string field, so a
+	// peer that does not know the verb omits it and a peer that does reads it
+	// alongside Path.
+	NewPath string
 	// Author is the writer this request claims to be. Zero means "whatever the
 	// connection was assigned"; naming a different one is refused, which is the
 	// check that stops one agent's text being attributed to another.
@@ -108,6 +113,12 @@ type Request struct {
 	// disk is a name to make a new empty buffer for rather than a typo to
 	// refuse. Absent means open reaches only something that already exists.
 	Create bool
+
+	// Discard, on a close, says to drop a buffer even though it has unsaved
+	// changes: the machine form of the editor's close-without-save. Absent is
+	// the ordinary close, which refuses a dirty buffer. It is not a text
+	// write, so it is deliberately not gated on claims or a prior read.
+	Discard bool
 	// Paths, ClaimAdd and ClaimClear are the claim op: the file-level working
 	// set an identity declares it is editing. Paths is the set, replaced by
 	// default and extended when ClaimAdd is set; ClaimClear releases it. A
@@ -116,6 +127,11 @@ type Request struct {
 	Paths      []string
 	ClaimAdd   bool
 	ClaimClear bool
+	// Withdraw, on a delete, retracts this identity's pending deletion for
+	// Path instead of proposing one. It crosses as a presence flag like
+	// Create, so a peer that does not know it omits it and keeps the
+	// proposing default.
+	Withdraw bool
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
@@ -141,7 +157,9 @@ type Request struct {
 }
 
 // Group is a change set: what one apply, or one user action, did. Reviewable as
-// a unit because that is already the unit undo reverses.
+// a unit because that is already the unit undo reverses. Hunks and Moved are
+// the pending projection: how many surviving runs its members cover now, and
+// how many a later edit moved past entirely; both are zero for a decided set.
 type Group struct {
 	ID     uint64 `json:"id"`
 	Path   string `json:"path"`
@@ -151,28 +169,37 @@ type Group struct {
 	Bytes  int    `json:"bytes"`
 	First  uint64 `json:"first"`
 	Last   uint64 `json:"last"`
+	Hunks  int    `json:"hunks"`
+	Moved  int    `json:"moved"`
 }
 
 // DiffGroup is one pending change set rendered for review: the Group as
 // `groups` lists it, plus one hunk per member op that still sits where it was
 // written. Moved counts members the buffer has moved past — later edits
-// reached inside their text, so no honest span exists and they are omitted
-// rather than shown where they are not.
+// reached inside their text, so no honest span exists; MovedHunks carries
+// those members recorded old→new text anyway, without coordinates, so a
+// reviewer still sees what was written rather than a bare count.
 type DiffGroup struct {
 	Group
-	Hunks []DiffHunk `json:"hunks"`
-	Moved int        `json:"moved"`
+	Hunks      []DiffHunk `json:"hunks"`
+	Moved      int        `json:"moved"`
+	MovedHunks []DiffHunk `json:"moved_hunks"`
 }
 
 // DiffHunk is one member of a change set as old→new text. Start and End are
 // byte offsets in the buffer's current coordinates, locating the replacement
-// now; Old is the text the op removed and New the text it added. A pure
-// insertion has Old empty; a pure deletion has New empty and Start == End.
+// now; Line and EndLine are the 1-based lines that span covers, so a hunk can
+// be named without another read. Old is the text the op removed and New the
+// text it added. A pure insertion has Old empty; a pure deletion has New empty
+// and Start == End. A moved hunk, one no rebase can locate, has Start and End
+// both -1 and Line and EndLine both 0.
 type DiffHunk struct {
-	Start int    `json:"start"`
-	End   int    `json:"end"`
-	Old   string `json:"old"`
-	New   string `json:"new"`
+	Start   int    `json:"start"`
+	End     int    `json:"end"`
+	Line    int    `json:"line"`
+	EndLine int    `json:"end_line"`
+	Old     string `json:"old"`
+	New     string `json:"new"`
 }
 
 // DirtyBuffer is an unsaved buffer, and whether every unsaved run in it was
@@ -213,15 +240,24 @@ type SearchQuery struct {
 	Word  bool
 }
 
-// SearchMatch is one hit. Text is the whole line it was found on.
+// SearchMatch is one hit. LineStart..LineEnd bound the whole line the hit was
+// found on, and ByteStart..ByteEnd bound the match within it. Text is that line
+// trimmed of trailing space, so it can end before LineEnd.
+//
+// Version is the buffer revision of the open document the hit was found in, or
+// 0 for a file read from disk with no buffer behind it. It is what lets a
+// caller tell that the document moved between the search and a later read: a
+// hit whose file now reports a different version is stale and must be re-found.
 type SearchMatch struct {
 	Path      string `json:"path"`
 	Line      int    `json:"line"` // 1-based
 	Col       int    `json:"col"`  // byte offset of the match within Text
 	Len       int    `json:"len"`
 	LineStart int    `json:"line_start"` // byte offset of the start of the hit line within the file
+	LineEnd   int    `json:"line_end"`   // one past the last byte of the hit line, excluding the newline
 	ByteStart int    `json:"byte_start"` // byte offset of the match within the file
 	ByteEnd   int    `json:"byte_end"`   // one past the last byte of the match within the file
+	Version   uint64 `json:"version"`    // buffer version the hit was found in, or 0 for disk
 	Text      string `json:"text"`
 }
 
@@ -338,6 +374,7 @@ type LSPResult struct {
 	Locations []LSPLocation `json:"locations,omitempty"` // definition/references
 	Items     []LSPItem     `json:"items,omitempty"`     // completion
 	Diags     []LSPDiag     `json:"diagnostics,omitempty"`
+	Hints     []LSPHint     `json:"hints,omitempty"`
 	// Status says whether a diagnostics answer is a real reading of the
 	// server's state. It is set only for diagnostics, and never left empty
 	// there: "ok" means the list is current, so an empty list means no
@@ -378,6 +415,30 @@ type LSPItem struct {
 	Kind   string `json:"kind,omitempty"`
 }
 
+// LSPHint is one inlay hint, flattened to the fields a driver needs: a 1-based
+// editor position to anchor it at, the label text, and the server's own
+// corrections to the document. Padding flags are carried as the server sent
+// them because they are part of the label's spacing rather than an editor
+// preference; a driver that only prints labels can ignore them.
+type LSPHint struct {
+	Line         int           `json:"line"`
+	Col          int           `json:"col"`
+	Text         string        `json:"text"`
+	Kind         int           `json:"kind,omitempty"`
+	PaddingLeft  bool          `json:"paddingLeft,omitempty"`
+	PaddingRight bool          `json:"paddingRight,omitempty"`
+	Tooltip      string        `json:"tooltip,omitempty"`
+	Edits        []LSPHintEdit `json:"textEdits,omitempty"`
+}
+
+// LSPHintEdit is one of a hint's text edits, as an editor byte span and the
+// text that replaces it, so a driver never resolves an LSP position itself.
+type LSPHintEdit struct {
+	Start int    `json:"start"`
+	End   int    `json:"end"`
+	Text  string `json:"text"`
+}
+
 // LSPDiag is one problem in a file.
 type LSPDiag struct {
 	Line     int    `json:"line"`
@@ -405,6 +466,39 @@ type ClaimOverlap struct {
 	Path     string `json:"path"`
 	Identity string `json:"identity"`
 	Author   uint8  `json:"author"`
+}
+
+// Deletion is one pending deletion: a path an agent has proposed to remove and
+// the author who proposed it. It is not a change set — a deletion is a
+// path-level fact, not text inside one buffer — so it rides its own list
+// rather than appearing as a Group.
+type Deletion struct {
+	Path   string `json:"path"`
+	Author uint8  `json:"author"`
+}
+
+// DirRemoval is one pending dir-removal: a directory an agent has proposed to
+// remove, and the author who proposed it. It is the rmdir analogue of a
+// Deletion: a subtree-level fact, not text in one buffer, so it rides its own
+// list. rmdir only records the proposal — nothing is removed until the user
+// approves in the review tab.
+type DirRemoval struct {
+	Path   string `json:"path"`
+	Author uint8  `json:"author"`
+}
+
+// Proposal is one entry in the unified pending surface: a change set still
+// awaiting a decision, a pending file deletion, or a pending directory
+// removal. Kind names which. Group and Start/End describe a change set;
+// Start/End are -1 when no honest span exists (a set every member of which a
+// later edit has moved past), so a caller knows to ask `diff` instead.
+type Proposal struct {
+	Kind   string `json:"kind"` // "set" | "delete" | "rmdir"
+	Path   string `json:"path"`
+	Author uint8  `json:"author"`
+	Group  uint64 `json:"group"`
+	Start  int    `json:"start"`
+	End    int    `json:"end"`
 }
 
 // Response is one line out. Err is a string rather than a code because the
@@ -465,6 +559,20 @@ type Response struct {
 	Claims        []string
 	ClaimWarnings []string
 	ClaimOverlaps []ClaimOverlap
+	// Deletions is the pending-deletion list: each path an agent has proposed
+	// to remove and who proposed it. Sparse like the claim lists, so a peer
+	// that does not know the field reads no proposals rather than an error.
+	Deletions []Deletion
+	// DirRemovals is the pending-dir-removal list, the rmdir analogue of
+	// Deletions: each directory an agent has proposed to remove and who
+	// proposed it. Sparse the same way, so a peer that does not know the
+	// field reads no proposals.
+	DirRemovals []DirRemoval
+	// Proposals is one flat tagged list over the three pending kinds: every
+	// open buffer's proposed change sets, the pending file deletions and the
+	// pending dir-removals. It is a read-only rollup, ungated like Deletions.
+	Proposals []Proposal
+
 	// SrcVersion is the revision the server was built from. connection.send
 	// stamps it on every response, so a client learns it on any frame, not
 	// just the handshake. Identity is on the hello reply only: the token the
@@ -495,6 +603,20 @@ type Response struct {
 	// per-run owner and state of the returned text. Nested like DiffJSON, so
 	// the run list crosses as one header string.
 	StatesJSON string
+
+	// Remains is close -discard's answer: whether a file is still on disk at
+	// the path the discarded buffer held. Discarding drops the buffer and
+	// leaves the file exactly as it was, so a driver that recreated the
+	// content under a new name learns here that the old name is still there,
+	// rather than only from the editor's status line. It is sparse by absence:
+	// a close that leaves nothing (or an ordinary close) sends no field, and a
+	// client that does not know it reads no remainder rather than an error.
+	Remains bool
+	// Created is open's answer: whether the call made a new buffer rather than
+	// focusing one that was already loaded. `raj ctl open` prints "created"
+	// versus "opened" from it, so a driver that expected a create can tell the
+	// two apart. Sparse like Remains: a view that predates it reads no field.
+	Created bool
 }
 
 // Text flattens the spans, for callers that do not care who wrote what.
@@ -1059,7 +1181,8 @@ func (c *connection) exec(req Request, emit func(Response)) {
 // caller already carries the cached state, so its Run returns without asking.
 func (c *connection) lsp(req Request, emit func(Response)) {
 	prep := c.srv.submit(Request{ID: req.ID, Op: "lspprep", Path: req.Path,
-		Line: req.Line, Col: req.Col, LSPMode: req.LSPMode})
+		Line: req.Line, Col: req.Col, LSPMode: req.LSPMode,
+		LineStart: req.LineStart, LineEnd: req.LineEnd})
 	if prep.Err != "" {
 		emit(Response{ID: req.ID, Err: prep.Err, Final: true})
 		return

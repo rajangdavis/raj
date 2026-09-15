@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,11 @@ type diagnostics struct {
 	// treats an absent version as unknown rather than as describing the first
 	// revision of the document.
 	versions map[string]*int
+	// waiters are the callers blocked on a path's next publish. The store's own
+	// mutex guards the map; a publish closes and clears the channels for that
+	// path, so a waiter wakes on the next publish and only that one. It is a
+	// notification, not a result: the waiter re-reads the store afterwards.
+	waiters map[string][]chan struct{}
 }
 
 func newDiagnostics() *diagnostics {
@@ -41,6 +47,7 @@ func newDiagnostics() *diagnostics {
 		byPath:         map[string][]lsp.Diagnostic{},
 		publishedPaths: map[string]bool{},
 		versions:       map[string]*int{},
+		waiters:        map[string][]chan struct{}{},
 	}
 }
 
@@ -83,6 +90,9 @@ func (d *diagnostics) setVersion(path string, items []lsp.Diagnostic, version *i
 		v := *version
 		d.versions[path] = &v
 	}
+	// A publish is a reading whatever it contains, so release the waiters for
+	// this path before the empty-list branch can return.
+	d.wakeWaiters(path)
 	if len(items) == 0 {
 		delete(d.byPath, path)
 		return
@@ -129,6 +139,92 @@ func (d *diagnostics) publishedVersion(path string) (int, bool) {
 		return 0, false
 	}
 	return *v, true
+}
+
+// reading is the store's current state for a document judged against version:
+// the status diagnosticsStatus would give a buffer at that version, the words
+// for it, and the items themselves. The synced and buffer versions are the same
+// value because a caller only uses this once it has told the server about that
+// exact text, which is the moment a publish for it is the reading worth
+// returning. It reuses the freshness rule rather than restating it, so the wait
+// path's recompute cannot drift from the request's own judgement.
+func (d *diagnostics) reading(path string, version int) (status, detail string, items []lsp.Diagnostic) {
+	// One lock for the publish fields and the items together: taking them
+	// separately could pair one publish's version with another's items and
+	// misjudge a fresh set as stale.
+	d.mu.Lock()
+	published := d.publishedPaths[path]
+	var pubVersion *int
+	if v, ok := d.versions[path]; ok && v != nil {
+		vv := *v
+		pubVersion = &vv
+	}
+	items = d.byPath[path]
+	d.mu.Unlock()
+
+	status, detail = diagnosticsStatus(published, pubVersion, version, version)
+	return status, detail, items
+}
+
+// waitFor blocks until the next publish for path, or until ctx is done. It
+// returns true when a publish arrived and false on cancellation or timeout. The
+// channel is registered under the same mutex setVersion holds, so a publish that
+// lands while the caller is deciding to wait still releases it: registration
+// cannot interleave with the close-and-clear a publish performs.
+func (d *diagnostics) waitFor(ctx context.Context, path string) bool {
+	ch := make(chan struct{})
+	d.mu.Lock()
+	if d.waiters == nil {
+		d.waiters = map[string][]chan struct{}{}
+	}
+	d.waiters[path] = append(d.waiters[path], ch)
+	d.mu.Unlock()
+
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		// Drop the registration before deciding, so a publish that lands after
+		// this point cannot close a channel nobody is reading. A publish that
+		// already happened closed ch and was cleared from the map, so the
+		// non-blocking check below still sees it.
+		d.mu.Lock()
+		d.dropWaiter(path, ch)
+		d.mu.Unlock()
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// wakeWaiters releases everyone waiting on a path's next publish. Closing the
+// channel rather than sending on it does not lose a release: the store mutex is
+// held, so a waiter has either not registered yet — and will read the new state
+// in its own check — or is already selecting and sees the close. Called with the
+// store mutex held.
+func (d *diagnostics) wakeWaiters(path string) {
+	for _, ch := range d.waiters[path] {
+		close(ch)
+	}
+	delete(d.waiters, path)
+}
+
+// dropWaiter forgets one waiter channel that timed out or was cancelled. Called
+// with the store mutex held.
+func (d *diagnostics) dropWaiter(path string, ch chan struct{}) {
+	list := d.waiters[path]
+	for i, c := range list {
+		if c == ch {
+			d.waiters[path] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(d.waiters[path]) == 0 {
+		delete(d.waiters, path)
+	}
 }
 
 // atLine is the most severe diagnostic on a line, and whether there is one.

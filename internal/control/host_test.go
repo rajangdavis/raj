@@ -26,6 +26,43 @@ type memHost struct {
 	diffs  []DiffGroup
 	snaps  map[uint64]snapEntry
 	seq    uint64
+
+	// unsaved marks a buffer dirty or holding a pending change set, which is
+	// what plain Close refuses and CloseDiscard drops. disk stands in for the
+	// filesystem: Save writes docs into it, so a test can tell a close that
+	// discarded the buffer from one that wrote it out.
+	unsaved map[string]bool
+	disk    map[string]string
+	saves   int
+	// mkdirs records every directory Mkdir was asked to create. memHost has no
+	// filesystem, so this is what the guard tests assert: the resolved path
+	// arrived, and a refused one never did.
+	mkdirs []string
+	// renames records every Rename the Guard passed down, so the guard tests
+	// can assert the canonical old and new arrived without a real filesystem.
+	renames []renameCall
+	// deletions is memHost's pending-deletion set, keyed by path, standing in
+	// for the app's workspace-level state. A second proposal is idempotent and
+	// keeps the first proposer, the same as the app.
+	deletions map[string]Deletion
+	// dirRemovals is memHost's pending dir-removal set, the rmdir analogue of
+	// deletions, keyed by directory path.
+	dirRemovals map[string]DirRemoval
+	// proposals is a canned unified pending list, so a Dispatch test can prove
+	// the rollup without an editor behind it.
+	proposals []Proposal
+	// hintsJSON is the canned inlay-hint answer LSPInlayHints hands back, and
+	// hintLines records the 1-based range the request carried, so a Dispatch
+	// test can assert the plumbing without a language server.
+	hintsJSON string
+	hintLines [2]int
+}
+
+// renameCall is one memHost.Rename: the canonical old and new the Guard
+// resolved, recorded so a guard test can assert the pair that crossed.
+type renameCall struct {
+	old string
+	new string
 }
 
 // snapEntry is memHost's dump record: the text captured, and where it was.
@@ -40,9 +77,10 @@ type snapEntry struct {
 
 func newMemHost(root string, docs map[string]string) *memHost {
 	h := &memHost{root: root, docs: map[string]string{}, vers: map[string]uint64{},
-		snaps: map[uint64]snapEntry{}}
+		snaps: map[uint64]snapEntry{}, unsaved: map[string]bool{}, disk: map[string]string{}}
 	for k, v := range docs {
 		h.docs[k], h.vers[k] = v, 1
+		h.disk[k] = v
 	}
 	return h
 }
@@ -71,19 +109,21 @@ func (h *memHost) Resolve(path string) (string, error) {
 	return path, nil
 }
 
-func (h *memHost) Open(path string, create bool) (uint64, error) {
+func (h *memHost) Open(path string, create bool) (uint64, bool, error) {
 	h.opens = append(h.opens, path)
+	created := false
 	if _, ok := h.docs[path]; !ok {
 		// The memHost has no disk, so the set of docs stands in for what is
 		// reachable: a path that is not already a buffer and not present is
 		// the missing file the real host stats for. create is what tells the
 		// two apart.
 		if !create {
-			return 0, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
+			return 0, false, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
 		}
 		h.docs[path], h.vers[path] = "", 1
+		created = true
 	}
-	return h.vers[path], nil
+	return h.vers[path], created, nil
 }
 
 func (h *memHost) Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
@@ -160,7 +200,11 @@ func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (u
 	return h.vers[path], nil, nil
 }
 
-func (h *memHost) Save(path string) (uint64, error) { return h.vers[path], nil }
+func (h *memHost) Save(path string) (uint64, error) {
+	h.saves++
+	h.disk[path] = h.docs[path]
+	return h.vers[path], nil
+}
 
 func (h *memHost) Dump(path string, start, end int, author uint8) (uint64, uint64, string, string, error) {
 	t, ok := h.docs[path]
@@ -223,18 +267,147 @@ func (h *memHost) Goto(path string, line, col int) error {
 	return nil
 }
 
-// Close removes the buffer. A memHost is never dirty, so the unsaved-work
-// refusal — which lives in the real host, where the piece table can answer —
-// has nothing to test against here.
-// The Guard's dirty check is what
-// tests exercise (see TestGuardRefusesCloseOfDirtyBuffer).
+// Mkdir records the directory, since memHost has no filesystem: the guard tests
+// care that the resolved path arrived and that a refused one did not.
+func (h *memHost) Mkdir(path string) error {
+	h.mkdirs = append(h.mkdirs, path)
+	return nil
+}
+
+// Rename moves a buffer's name. memHost has no journal, LSP document or session,
+// so the carry the real host does is a key move here: the text, version and
+// unsaved flag follow old to new. A name that is not a buffer is still
+// recorded — the real host would move the file on disk — so a Guard test can
+// assert the resolved pair arrived even for a path nobody has open.
+func (h *memHost) Rename(old, new string) error {
+	h.renames = append(h.renames, renameCall{old: old, new: new})
+	text, ok := h.docs[old]
+	if !ok {
+		return nil
+	}
+	version, unsaved := h.vers[old], h.unsaved[old]
+	delete(h.docs, old)
+	delete(h.vers, old)
+	delete(h.unsaved, old)
+	h.docs[new], h.vers[new] = text, version
+	if unsaved {
+		h.unsaved[new] = true
+	}
+	if d, ok := h.disk[old]; ok {
+		delete(h.disk, old)
+		h.disk[new] = d
+	}
+	return nil
+}
+
+// ProposeDeletion, WithdrawDeletion and Deletions are memHost's half of the
+// pending-deletion state. memHost never unlinks — there is no filesystem — so
+// these record exactly what the Guard passed down and no more.
+func (h *memHost) ProposeDeletion(path string, author uint8) error {
+	if h.deletions == nil {
+		h.deletions = map[string]Deletion{}
+	}
+	if _, ok := h.deletions[path]; ok {
+		return nil
+	}
+	h.deletions[path] = Deletion{Path: path, Author: author}
+	return nil
+}
+
+func (h *memHost) WithdrawDeletion(path string, author uint8) error {
+	d, ok := h.deletions[path]
+	if !ok {
+		return nil
+	}
+	if d.Author != author {
+		return fmt.Errorf("pending deletion of %s was proposed by author %d, not this writer", path, d.Author)
+	}
+	delete(h.deletions, path)
+	return nil
+}
+
+func (h *memHost) Deletions() []Deletion {
+	out := make([]Deletion, 0, len(h.deletions))
+	for _, d := range h.deletions {
+		out = append(out, d)
+	}
+	return out
+}
+
+// ProposeDirRemoval, WithdrawDirRemoval and DirRemovals are memHost's half of
+// the pending dir-removal state, mirroring the deletion triple. memHost never
+// removes anything, so these record what the Guard passed down and no more.
+func (h *memHost) ProposeDirRemoval(path string, author uint8) error {
+	if h.dirRemovals == nil {
+		h.dirRemovals = map[string]DirRemoval{}
+	}
+	if _, ok := h.dirRemovals[path]; ok {
+		return nil
+	}
+	h.dirRemovals[path] = DirRemoval{Path: path, Author: author}
+	return nil
+}
+
+func (h *memHost) WithdrawDirRemoval(path string, author uint8) error {
+	d, ok := h.dirRemovals[path]
+	if !ok {
+		return nil
+	}
+	if d.Author != author {
+		return fmt.Errorf("pending dir-removal of %s was proposed by author %d, not this writer", path, d.Author)
+	}
+	delete(h.dirRemovals, path)
+	return nil
+}
+
+func (h *memHost) DirRemovals() []DirRemoval {
+	out := make([]DirRemoval, 0, len(h.dirRemovals))
+	for _, d := range h.dirRemovals {
+		out = append(out, d)
+	}
+	return out
+}
+
+// Proposals returns memHost's canned unified pending list. The real rollup
+// lives in internal/app; this is only what the Guard's sort and Dispatch need.
+func (h *memHost) Proposals() []Proposal {
+	return append([]Proposal(nil), h.proposals...)
+}
+
+// Close removes the buffer, refusing one marked unsaved — dirty or holding a
+// pending change set — the way the real host refuses one whose piece table is
+// dirty. memHost answers that from its unsaved set; CloseDiscard is the way
+// past it, and the pair is what TestDispatchCloseDiscard exercises.
 func (h *memHost) Close(path string) error {
 	if _, ok := h.docs[path]; !ok {
 		return ErrNoBuffer
 	}
+	if h.unsaved[path] {
+		return fmt.Errorf("%s has unsaved changes; save or reject them first", path)
+	}
 	delete(h.docs, path)
 	delete(h.vers, path)
+	delete(h.unsaved, path)
 	return nil
+}
+
+// CloseDiscard removes the buffer and the unsaved work with it, mirroring the
+// real host's close-without-save. It writes nothing: disk keeps the bytes it
+// had, and no Save is called, which is what makes discarding safe for the file
+// the buffer was loaded from.
+func (h *memHost) CloseDiscard(path string) (bool, error) {
+	if _, ok := h.docs[path]; !ok {
+		return false, ErrNoBuffer
+	}
+	delete(h.docs, path)
+	delete(h.vers, path)
+	delete(h.unsaved, path)
+	// remains says a file is still on disk where the buffer's path was. The
+	// fake's disk map stands in for the filesystem, and CloseDiscard never
+	// writes it, so a doc that was loaded from (or saved into) disk reports
+	// one.
+	_, remains := h.disk[path]
+	return remains, nil
 }
 
 func guarded(t *testing.T) (*Guard, *memHost) {
@@ -242,6 +415,98 @@ func guarded(t *testing.T) (*Guard, *memHost) {
 	root := filepath.Join(string(filepath.Separator), "w")
 	h := newMemHost(root, map[string]string{filepath.Join(root, "a.go"): "hello world\n"})
 	return NewGuard(h), h
+}
+
+// A dirty buffer — or one holding a pending change set — refuses a plain
+// close, because a silent discard would lose work. close -discard is the way
+// past it: the buffer and its proposals go, and the file on disk keeps the
+// bytes it had, because nothing is written.
+func TestDispatchCloseDiscard(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	// The buffer holds an edit a save would write and a pending set nobody
+	// accepted; either way it is unsaved, and plain close must refuse.
+	h.docs[path] = "hello socket\n"
+	h.unsaved[path] = true
+
+	if c := Dispatch(g, Request{Op: "close", Path: path}); c.OK {
+		t.Fatalf("close of a dirty buffer was allowed: %+v", c)
+	}
+	if _, ok := h.docs[path]; !ok {
+		t.Fatal("a refused close dropped the buffer")
+	}
+
+	c := Dispatch(g, Request{Op: "close", Path: path, Discard: true})
+	if !c.OK {
+		t.Fatalf("close -discard = %+v", c)
+	}
+	if !c.Remains {
+		t.Error("close -discard of a buffer that was loaded from disk did not report a remainder")
+	}
+	if _, ok := h.docs[path]; ok {
+		t.Error("close -discard left the buffer open")
+	}
+	for _, b := range h.Buffers() {
+		if b.Path == path {
+			t.Errorf("close -discard left %s in Buffers()", path)
+		}
+	}
+	if h.saves != 0 {
+		t.Errorf("close -discard saved the buffer (%d save(s)); the file on disk must be untouched", h.saves)
+	}
+	if got := h.disk[path]; got != "hello world\n" {
+		t.Errorf("on-disk file = %q, want the text it was loaded with", got)
+	}
+	if c := Dispatch(g, Request{Op: "close", Path: path}); c.OK {
+		t.Errorf("second close was allowed: %+v", c)
+	}
+}
+
+// A discarded buffer that never reached disk has no remainder to report: there
+// is no file to leave behind. The wire answer's absence of the field is what a
+// driver reads as "nothing remains", which is why it must stay false here.
+func TestDispatchCloseDiscardNoRemainderForAnUnsavedBuffer(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "fresh.go")
+	if _, _, err := g.Open(path, true); err != nil {
+		t.Fatalf("open -create = %v", err)
+	}
+	delete(h.disk, path) // it exists only as a buffer
+
+	c := Dispatch(g, Request{Op: "close", Path: path, Discard: true})
+	if !c.OK {
+		t.Fatalf("close -discard = %+v", c)
+	}
+	if c.Remains {
+		t.Error("close -discard of a buffer with no file reported a remainder")
+	}
+}
+
+// open says which of the two things it did. A create makes a buffer that was
+// not there; a focus reaches one already loaded. Both are success, and a driver
+// that meant to create a file needs to tell them apart.
+func TestDispatchOpenReportsCreated(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+
+	// Already a buffer: focusing it is not a create.
+	res := Dispatch(g, Request{Op: "open", Path: path, Author: FirstAgent})
+	if !res.OK || res.Created {
+		t.Errorf("open of an existing buffer = %+v, want ok and not created", res)
+	}
+
+	// A new path with -create reports the buffer as made.
+	fresh := filepath.Join(h.root, "new.go")
+	res = Dispatch(g, Request{Op: "open", Path: fresh, Author: FirstAgent, Create: true})
+	if !res.OK || !res.Created {
+		t.Errorf("open -create = %+v, want ok and created", res)
+	}
+
+	// A second open of it focuses: not created again.
+	res = Dispatch(g, Request{Op: "open", Path: fresh, Author: FirstAgent, Create: true})
+	if !res.OK || res.Created {
+		t.Errorf("second open -create = %+v, want ok and not created", res)
+	}
 }
 
 // Escaping the workspace is a rejection, not a guess — including via "..",
@@ -254,7 +519,7 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		filepath.Join(h.root, "sub", "..", "..", "escape"),
 	}
 	for _, p := range outside {
-		if _, err := g.Open(p, false); err == nil {
+		if _, _, err := g.Open(p, false); err == nil {
 			t.Errorf("Open(%q) was allowed", p)
 		}
 		if _, _, _, err := g.Read(p, FirstAgent, -1, -1, 0, 0, false); err == nil {
@@ -276,17 +541,87 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 func TestGuardAcceptsRelativePathInsideTheRoot(t *testing.T) {
 	g, h := guarded(t)
 	want := filepath.Join(h.root, "a.go")
-	if _, err := g.Open("a.go", false); err != nil {
+	if _, _, err := g.Open("a.go", false); err != nil {
 		t.Fatalf("Open(%q) was refused: %v", "a.go", err)
 	}
 	if len(h.opens) != 1 || h.opens[0] != want {
 		t.Errorf("the host was asked to open %v, want %q", h.opens, want)
 	}
-	if _, err := g.Open(filepath.Join("..", "etc", "passwd"), false); err == nil {
+	if _, _, err := g.Open(filepath.Join("..", "etc", "passwd"), false); err == nil {
 		t.Error("a relative path that escapes the root was accepted")
 	}
 	if len(h.opens) != 1 {
 		t.Errorf("the escaping path reached the host: %v", h.opens)
+	}
+}
+
+// mkdir resolves a directory the same way every other path-taking verb does:
+// relative to the root, cleaned, and checked in-root — without loading a buffer,
+// because a directory is not one. It is not claim-gated, so a caller can make
+// the package directory before it has a file to claim.
+func TestGuardMkdirResolvesAndRefusesEscape(t *testing.T) {
+	g, h := guarded(t)
+
+	if err := g.Mkdir("pkg/sub"); err != nil {
+		t.Fatalf("Mkdir(%q) = %v", "pkg/sub", err)
+	}
+	want := filepath.Join(h.root, "pkg", "sub")
+	if len(h.mkdirs) != 1 || h.mkdirs[0] != want {
+		t.Fatalf("the host was asked to create %v, want [%q]", h.mkdirs, want)
+	}
+
+	// An absolute path inside the root names the same directory.
+	h.mkdirs = nil
+	abs := filepath.Join(h.root, "pkg", "abs")
+	if err := g.Mkdir(abs); err != nil {
+		t.Fatalf("Mkdir(%q) = %v", abs, err)
+	}
+	if len(h.mkdirs) != 1 || h.mkdirs[0] != abs {
+		t.Errorf("the host was asked to create %v, want [%q]", h.mkdirs, abs)
+	}
+
+	// Escaping the root is a refusal, and must not reach the host.
+	h.mkdirs = nil
+	for _, bad := range []string{
+		filepath.Join(h.root, "..", "etc"),
+		filepath.Join("..", "etc"),
+		filepath.Join(string(filepath.Separator), "etc"),
+		"",
+	} {
+		if err := g.Mkdir(bad); err == nil {
+			t.Errorf("Mkdir(%q) was allowed", bad)
+		}
+	}
+	if len(h.mkdirs) != 0 {
+		t.Errorf("a refused mkdir reached the host: %v", h.mkdirs)
+	}
+}
+
+// The dispatch path wires mkdir to the guard: a relative path is created under
+// the root and answers OK, an empty path is a refusal, and an escape never
+// reaches the host.
+func TestDispatchMkdir(t *testing.T) {
+	g, h := guarded(t)
+
+	res := Dispatch(g, Request{Op: "mkdir", Path: filepath.Join("pkg", "sub")})
+	if !res.OK {
+		t.Fatalf("mkdir = %+v", res)
+	}
+	want := filepath.Join(h.root, "pkg", "sub")
+	if len(h.mkdirs) != 1 || h.mkdirs[0] != want {
+		t.Errorf("the host was asked to create %v, want [%q]", h.mkdirs, want)
+	}
+
+	if res := Dispatch(g, Request{Op: "mkdir"}); res.OK || !strings.Contains(res.Err, "needs a path") {
+		t.Errorf("mkdir with no path = %+v, want a refusal", res)
+	}
+
+	h.mkdirs = nil
+	if res := Dispatch(g, Request{Op: "mkdir", Path: "../escape"}); res.OK {
+		t.Errorf("mkdir outside the root was allowed: %+v", res)
+	}
+	if len(h.mkdirs) != 0 {
+		t.Errorf("an escaping mkdir reached the host: %v", h.mkdirs)
 	}
 }
 
@@ -298,15 +633,19 @@ func TestOpenRefusesMissingPathWithoutCreate(t *testing.T) {
 	g, h := guarded(t)
 	missing := filepath.Join(h.root, "new.go")
 
-	if _, err := g.Open(missing, false); err == nil {
+	if _, created, err := g.Open(missing, false); err == nil {
 		t.Errorf("Open(%q) was allowed without -create", missing)
+	} else if created {
+		t.Errorf("a refused open reported a create")
 	}
 	if _, ok := h.docs[missing]; ok {
 		t.Errorf("a refused open still created a buffer for %q", missing)
 	}
 
-	if _, err := g.Open(missing, true); err != nil {
+	if _, created, err := g.Open(missing, true); err != nil {
 		t.Fatalf("Open(%q, create) was refused: %v", missing, err)
+	} else if !created {
+		t.Errorf("Open(%q, create) did not report the buffer as created", missing)
 	}
 	if _, ok := h.docs[missing]; !ok {
 		t.Errorf("Open(%q, create) created no buffer", missing)
@@ -651,6 +990,18 @@ func (h *memHost) LSP(path string, line, col int, mode string) (LSPCaller, error
 	return nil, fmt.Errorf("no language server for this file type")
 }
 
+// LSPInlayHints records the range the request carried and hands back the
+// canned hint answer, so the Dispatch plumbing can be exercised without a
+// language server. An empty hintsJSON is the same clean "no server" answer
+// LSP gives.
+func (h *memHost) LSPInlayHints(path string, lineStart, lineEnd int) (LSPCaller, error) {
+	h.hintLines = [2]int{lineStart, lineEnd}
+	if h.hintsJSON == "" {
+		return nil, fmt.Errorf("no language server for this file type")
+	}
+	return fakeLSP{json: h.hintsJSON}, nil
+}
+
 func (h *memHost) Dirty() []DirtyBuffer { return h.dirty }
 
 func (h *memHost) Groups(path string) ([]Group, error) { return h.groups, nil }
@@ -983,9 +1334,11 @@ func TestClaimSetAddClearReport(t *testing.T) {
 	}
 }
 
-// A path that is not on disk is named and skipped; the rest of the command
-// still lands, because a stale name is not a reason to drop the set.
-func TestClaimWarnsAndSkipsMissingPath(t *testing.T) {
+// A path that is not on disk is claimed all the same: a claim is
+// forward-looking, so a writer may claim the file it is about to create
+// without an open -create first. The in-root check is the only validation the
+// path needs, and the forward claim satisfies the write gate.
+func TestClaimAcceptsANotYetOnDiskPath(t *testing.T) {
 	g, _, p := claimGuard(t, "a.go")
 	a := p["a.go"]
 	missing := filepath.Join(g.Root(), "gone.go")
@@ -994,11 +1347,67 @@ func TestClaimWarnsAndSkipsMissingPath(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("claim = %+v", res)
 	}
-	if len(res.Claims) != 1 || res.Claims[0] != a {
-		t.Errorf("claims = %v, want only the existing path", res.Claims)
+	if len(res.Claims) != 2 || res.Claims[0] != a || res.Claims[1] != missing {
+		t.Errorf("claims = %v, want both paths", res.Claims)
 	}
-	if len(res.ClaimWarnings) != 1 || !strings.Contains(res.ClaimWarnings[0], "gone.go") {
-		t.Errorf("warnings = %v, want one naming the missing path", res.ClaimWarnings)
+	if len(res.ClaimWarnings) != 0 {
+		t.Errorf("warnings = %v, want none for a forward claim", res.ClaimWarnings)
+	}
+	if name, err := g.claimTarget(FirstAgent, missing); err != nil || name != missing {
+		t.Errorf("claimTarget(%s) = %q, %v; want the forward claim to satisfy the write gate", missing, name, err)
+	}
+}
+
+// A path that exists only as an open buffer is claimable. open -create makes a
+// buffer before any file is on disk, so its stat failure is not a missing file;
+// claiming it must succeed silently and satisfy the write gate.
+func TestClaimAcceptsAnOpenUnsavedBuffer(t *testing.T) {
+	g, h, _ := claimGuard(t)
+	path := filepath.Join(h.root, "new.go")
+
+	if res := Dispatch(g, Request{Op: "open", Path: path, Author: FirstAgent, Create: true}); !res.OK {
+		t.Fatalf("open -create = %+v", res)
+	}
+	// open -create auto-claims, so drop that and let claim be the thing under
+	// test.
+	g.clearClaims(FirstAgent)
+
+	res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{path}})
+	if !res.OK {
+		t.Fatalf("claim of an open unsaved buffer = %+v", res)
+	}
+	if len(res.ClaimWarnings) != 0 {
+		t.Errorf("warnings = %v, want none for an open buffer", res.ClaimWarnings)
+	}
+	if len(res.Claims) != 1 || res.Claims[0] != path {
+		t.Errorf("claims = %v, want [%s]", res.Claims, path)
+	}
+
+	// The claim is what the write gate needed: read, then apply.
+	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := g.Apply(path, FirstAgent, h.vers[path], []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
+		t.Fatalf("apply after claim of an open buffer was refused: %v", err)
+	}
+}
+
+// A stat that fails for a reason other than absence is a real problem — here a
+// path component that is a regular file — and is named and skipped rather than
+// claimed blind.
+func TestClaimWarnsForAnUnusablePath(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go")
+	broken := filepath.Join(p["a.go"], "child.go")
+
+	res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{broken}})
+	if !res.OK {
+		t.Fatalf("claim = %+v", res)
+	}
+	if len(res.Claims) != 0 {
+		t.Errorf("claims = %v, want none for an unusable path", res.Claims)
+	}
+	if len(res.ClaimWarnings) != 1 || !strings.Contains(res.ClaimWarnings[0], "child.go") {
+		t.Errorf("warnings = %v, want one naming the unusable path", res.ClaimWarnings)
 	}
 }
 
@@ -1012,6 +1421,120 @@ func TestClaimRefusesPathsOutsideRoot(t *testing.T) {
 	}
 	if rep := Dispatch(g, Request{Op: "claim", Author: FirstAgent}); len(rep.Claims) != 0 {
 		t.Errorf("a refused claim changed the set: %v", rep.Claims)
+	}
+}
+
+// A rename is claim-gated on the OLD name and moves the working set with it, so
+// the claim names the file that exists after the rename. No read-before-write
+// is required: no offset is at stake.
+func TestGuardRenameMovesTheClaimSet(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go")
+	old, newPath := p["a.go"], filepath.Join(g.Root(), "b.go")
+	if _, _, _, err := g.Claim(FirstAgent, []string{old}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Rename(old, newPath, FirstAgent); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if len(h.renames) != 1 || h.renames[0].old != old || h.renames[0].new != newPath {
+		t.Errorf("host got %+v, want %s -> %s", h.renames, old, newPath)
+	}
+	if got := g.claimSet(FirstAgent); len(got) != 1 || got[0] != newPath {
+		t.Errorf("claim set = %v, want [%s]", got, newPath)
+	}
+}
+
+// The old name must be in the caller's claim set: the claim is the record of
+// what an agent declared it would touch, and a rename touches the file.
+func TestGuardRenameRefusesUnclaimedOld(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go", "b.go")
+	err := g.Rename(p["a.go"], filepath.Join(g.Root(), "c.go"), FirstAgent)
+	if err == nil || !strings.Contains(err.Error(), "claim") {
+		t.Fatalf("rename of an unclaimed file = %v, want a claim refusal", err)
+	}
+	if len(h.renames) != 0 {
+		t.Errorf("the host was asked to rename anyway: %+v", h.renames)
+	}
+}
+
+// A destination that already exists belongs to somebody else: renaming onto it
+// would destroy a file the caller never claimed.
+func TestGuardRenameRefusesAnExistingDestination(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go", "b.go")
+	if _, _, _, err := g.Claim(FirstAgent, []string{p["a.go"]}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	err := g.Rename(p["a.go"], p["b.go"], FirstAgent)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("rename onto an existing file = %v, want a refusal", err)
+	}
+	if len(h.renames) != 0 {
+		t.Errorf("the host was asked to clobber: %+v", h.renames)
+	}
+	// On failure the claim set is untouched.
+	if got := g.claimSet(FirstAgent); len(got) != 1 || got[0] != p["a.go"] {
+		t.Errorf("claim set = %v, want the old path kept", got)
+	}
+}
+
+// Both names are checked in-root without loading a buffer, so an escape is a
+// refusal rather than a clamp.
+func TestGuardRenameRefusesEscape(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go")
+	if _, _, _, err := g.Claim(FirstAgent, []string{p["a.go"]}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Rename(p["a.go"], "/etc/passwd", FirstAgent); err == nil {
+		t.Error("a destination outside the root was allowed")
+	}
+	if len(h.renames) != 0 {
+		t.Errorf("the host was asked anyway: %+v", h.renames)
+	}
+}
+
+// A case-only rename is allowed even where the filesystem reports the
+// destination as already present, because that destination is the source: the
+// two spellings are one file. On a case-sensitive filesystem it is allowed
+// trivially. The host is what forces the change with the two-step.
+func TestGuardRenameAllowsACaseOnlyChange(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go")
+	if _, _, _, err := g.Claim(FirstAgent, []string{p["a.go"]}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(g.Root(), "A.go")
+	if err := g.Rename(p["a.go"], dst, FirstAgent); err != nil {
+		t.Fatalf("case-only rename: %v", err)
+	}
+	if len(h.renames) != 1 || h.renames[0].new != dst {
+		t.Errorf("host got %+v, want %s", h.renames, dst)
+	}
+}
+
+// The socket frame and the in-process Dispatch call must mean the same thing.
+func TestDispatchRename(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go")
+	old, newPath := p["a.go"], filepath.Join(g.Root(), "b.go")
+	Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{old}})
+	res := Dispatch(g, Request{Op: "rename", Path: old, NewPath: newPath, Author: FirstAgent})
+	if !res.OK {
+		t.Fatalf("dispatch rename = %+v", res)
+	}
+	if len(h.renames) != 1 || h.renames[0].old != old || h.renames[0].new != newPath {
+		t.Errorf("host got %+v", h.renames)
+	}
+}
+
+// A rename with only one path is refused before the host is asked.
+func TestGuardRenameNeedsBothPaths(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go")
+	if _, _, _, err := g.Claim(FirstAgent, []string{p["a.go"]}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Rename(p["a.go"], "", FirstAgent); err == nil {
+		t.Error("a rename with no destination was allowed")
+	}
+	if err := g.Rename("", p["a.go"], FirstAgent); err == nil {
+		t.Error("a rename with no source was allowed")
 	}
 }
 
@@ -1055,6 +1578,102 @@ func TestClaimOverlapsBetweenIdentities(t *testing.T) {
 	}
 	if rep.ClaimOverlaps[0].Identity != "bob" || rep.ClaimOverlaps[0].Path != a {
 		t.Errorf("overlap = %+v, want bob on a", rep.ClaimOverlaps[0])
+	}
+}
+
+// open -create is the declaration of intent the spec names: it makes the
+// buffer AND extends the caller's claim with it, so a write to the file it
+// just created needs no second command. From an empty set this is a set of
+// one.
+func TestOpenCreateAutoClaims(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "new.go")
+
+	base := uint64(1)
+	if res := Dispatch(g, Request{Op: "apply", Author: FirstAgent, Path: path,
+		Base: &base, Hunks: []Hunk{{Start: 0, End: 0, Text: "x"}}}); res.OK ||
+		!strings.Contains(res.Err, "claim a file first") {
+		t.Fatalf("apply with an empty claim set = %+v, want the claim refusal", res)
+	}
+
+	if res := Dispatch(g, Request{Op: "open", Path: path, Author: FirstAgent, Create: true}); !res.OK {
+		t.Fatalf("open -create = %+v", res)
+	}
+	rep := Dispatch(g, Request{Op: "claim", Author: FirstAgent})
+	if len(rep.Claims) != 1 || rep.Claims[0] != path {
+		t.Fatalf("claim set after open -create = %v, want exactly [%s]", rep.Claims, path)
+	}
+
+	// The auto-claim is enough to satisfy the write gate: read, then apply.
+	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := g.Apply(path, FirstAgent, h.vers[path], []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
+		t.Fatalf("apply after open -create was refused: %v", err)
+	}
+}
+
+// open -create is additive, like claim -add: a standing set grows by the new
+// file rather than being replaced by it.
+func TestOpenCreateExtendsAnExistingClaim(t *testing.T) {
+	g, h := guarded(t)
+	first := filepath.Join(h.root, "a.go")
+	second := filepath.Join(h.root, "b.go")
+	g.setClaims(FirstAgent, []string{first})
+
+	if res := Dispatch(g, Request{Op: "open", Path: second, Author: FirstAgent, Create: true}); !res.OK {
+		t.Fatalf("open -create = %+v", res)
+	}
+	rep := Dispatch(g, Request{Op: "claim", Author: FirstAgent})
+	if len(rep.Claims) != 2 || rep.Claims[0] != first || rep.Claims[1] != second {
+		t.Fatalf("claim set = %v, want [%s %s]", rep.Claims, first, second)
+	}
+}
+
+// A plain open is not a declaration of intent: it must leave the claim set
+// exactly as it found it, empty or not.
+func TestOpenWithoutCreateLeavesTheClaimSetAlone(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+
+	if res := Dispatch(g, Request{Op: "open", Path: path, Author: FirstAgent}); !res.OK {
+		t.Fatalf("open = %+v", res)
+	}
+	if rep := Dispatch(g, Request{Op: "claim", Author: FirstAgent}); len(rep.Claims) != 0 {
+		t.Fatalf("plain open claimed %v, want none", rep.Claims)
+	}
+
+	g.setClaims(FirstAgent, []string{path})
+	if res := Dispatch(g, Request{Op: "open", Path: path, Author: FirstAgent}); !res.OK {
+		t.Fatalf("open = %+v", res)
+	}
+	if rep := Dispatch(g, Request{Op: "claim", Author: FirstAgent}); len(rep.Claims) != 1 || rep.Claims[0] != path {
+		t.Fatalf("plain open changed the set to %v", rep.Claims)
+	}
+}
+
+// The auto-claim stores the same canonical spelling claim does, so a relative
+// open and an absolute one are one entry, not two aliases of the same file.
+func TestOpenCreateClaimUsesTheSameSpellingAsClaim(t *testing.T) {
+	g, _, p := claimGuard(t, "new.go")
+	abs := p["new.go"]
+	rel := "new.go"
+
+	if res := Dispatch(g, Request{Op: "open", Path: rel, Author: FirstAgent, Create: true}); !res.OK {
+		t.Fatalf("open -create relative = %+v", res)
+	}
+	if res := Dispatch(g, Request{Op: "open", Path: abs, Author: FirstAgent, Create: true}); !res.OK {
+		t.Fatalf("open -create absolute = %+v", res)
+	}
+	rep := Dispatch(g, Request{Op: "claim", Author: FirstAgent})
+	if len(rep.Claims) != 1 || rep.Claims[0] != abs {
+		t.Fatalf("claim set = %v, want exactly [%s]", rep.Claims, abs)
+	}
+
+	// claim names the same file the same way, so the verbs agree.
+	rep = Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{rel}})
+	if len(rep.Claims) != 1 || rep.Claims[0] != abs {
+		t.Fatalf("claim of the relative name = %v, want [%s]", rep.Claims, abs)
 	}
 }
 
@@ -1175,6 +1794,327 @@ func TestClaimGateOnClear(t *testing.T) {
 	}
 }
 
+// delete records a pending deletion for a claimed path and changes nothing on
+// disk. It is idempotent: a second proposal, even by another claimant, keeps
+// the first proposer so two agents racing to propose one removal do not rewrite
+// who asked.
+func TestDeleteProposesIdempotentlyAndLists(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go", "b.go")
+	a, b := p["a.go"], p["b.go"]
+	g.setClaims(FirstAgent, []string{a, b})
+
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent}); !res.OK {
+		t.Fatalf("delete = %+v", res)
+	}
+	// A second delete of the same path is a no-op and the first author stands.
+	other := uint8(FirstAgent + 1)
+	g.setClaims(other, []string{a, b})
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: other}); !res.OK {
+		t.Fatalf("idempotent delete = %+v", res)
+	}
+
+	list := Dispatch(g, Request{Op: "deletions"})
+	if !list.OK || len(list.Deletions) != 1 {
+		t.Fatalf("deletions = %+v, want one", list)
+	}
+	if d := list.Deletions[0]; d.Path != a || d.Author != FirstAgent {
+		t.Errorf("pending = %+v, want %s proposed by %d", d, a, FirstAgent)
+	}
+
+	// A second path lists too, and the list is in stable path order.
+	if res := Dispatch(g, Request{Op: "delete", Path: b, Author: FirstAgent}); !res.OK {
+		t.Fatalf("delete b = %+v", res)
+	}
+	list = Dispatch(g, Request{Op: "deletions"})
+	if len(list.Deletions) != 2 || list.Deletions[0].Path != a || list.Deletions[1].Path != b {
+		t.Errorf("deletions = %+v, want a then b", list.Deletions)
+	}
+}
+
+// The proposer withdraws: the entry goes, another writer cannot retract it, and
+// withdrawing something that is not pending is a no-op rather than an error.
+func TestDeleteWithdrawRemovesProposal(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go")
+	a := p["a.go"]
+	g.setClaims(FirstAgent, []string{a})
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent}); !res.OK {
+		t.Fatalf("delete = %+v", res)
+	}
+
+	// Another claimant cannot retract this writer's proposal.
+	other := uint8(FirstAgent + 1)
+	g.setClaims(other, []string{a})
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: other, Withdraw: true}); res.OK {
+		t.Errorf("withdraw by a non-proposer = %+v, want a refusal", res)
+	}
+
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent, Withdraw: true}); !res.OK {
+		t.Fatalf("withdraw = %+v", res)
+	}
+	if list := Dispatch(g, Request{Op: "deletions"}); len(list.Deletions) != 0 {
+		t.Errorf("after withdraw, deletions = %+v, want none", list.Deletions)
+	}
+	// Withdrawing again is a no-op, not an error.
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent, Withdraw: true}); !res.OK {
+		t.Errorf("second withdraw = %+v, want a no-op", res)
+	}
+}
+
+// delete is claim-gated like a text write, and it does not require
+// read-before-write: a claimed path with no prior read may be proposed, because
+// deleting is not a text write and no offset is at stake.
+func TestDeleteRequiresAClaimButNotARead(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go", "b.go")
+	a, b := p["a.go"], p["b.go"]
+	g.setClaims(FirstAgent, []string{a})
+
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent}); !res.OK {
+		t.Fatalf("delete without a read = %+v", res)
+	}
+	// The unclaimed path is refused with the set named, like a write.
+	if res := Dispatch(g, Request{Op: "delete", Path: b, Author: FirstAgent}); res.OK ||
+		!strings.Contains(res.Err, "not in your claim set") {
+		t.Errorf("delete of an unclaimed path = %+v, want the set refusal", res)
+	}
+	// Out of root is refused before the set is consulted.
+	if res := Dispatch(g, Request{Op: "delete", Path: "/etc/passwd", Author: FirstAgent}); res.OK ||
+		!strings.Contains(res.Err, "outside the workspace") {
+		t.Errorf("delete outside the root = %+v, want the root refusal", res)
+	}
+	// Neither refusal recorded anything.
+	if list := Dispatch(g, Request{Op: "deletions"}); len(list.Deletions) != 1 {
+		t.Errorf("deletions = %+v, want only the one proposal that landed", list.Deletions)
+	}
+	// An empty set says what to do first, exactly as a write does.
+	g.clearClaims(FirstAgent)
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent}); res.Err != "claim a file first" {
+		t.Errorf("delete with no claim = %+v, want the strict refusal", res)
+	}
+}
+
+// rmdir records a pending dir-removal for a claimed directory and changes
+// nothing on disk. It is idempotent: a second proposal, even by another
+// claimant, keeps the first proposer.
+func TestRmdirProposesIdempotentlyAndLists(t *testing.T) {
+	g, h := guarded(t)
+	dir := filepath.Join(h.root, "pkg")
+	g.setClaims(FirstAgent, []string{dir})
+
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: FirstAgent}); !res.OK {
+		t.Fatalf("rmdir = %+v", res)
+	}
+	// A second rmdir of the same path is a no-op and the first author stands.
+	other := uint8(FirstAgent + 1)
+	g.setClaims(other, []string{dir})
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: other}); !res.OK {
+		t.Fatalf("idempotent rmdir = %+v", res)
+	}
+
+	list := Dispatch(g, Request{Op: "rmdirs"})
+	if !list.OK || len(list.DirRemovals) != 1 {
+		t.Fatalf("rmdirs = %+v, want one", list)
+	}
+	if d := list.DirRemovals[0]; d.Path != dir || d.Author != FirstAgent {
+		t.Errorf("pending = %+v, want %s proposed by %d", d, dir, FirstAgent)
+	}
+
+	// A second directory lists too, and the list is in stable path order.
+	dir2 := filepath.Join(h.root, "pkg2")
+	g.setClaims(FirstAgent, []string{dir2})
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir2, Author: FirstAgent}); !res.OK {
+		t.Fatalf("rmdir dir2 = %+v", res)
+	}
+	list = Dispatch(g, Request{Op: "rmdirs"})
+	if len(list.DirRemovals) != 2 || list.DirRemovals[0].Path != dir || list.DirRemovals[1].Path != dir2 {
+		t.Errorf("rmdirs = %+v, want pkg then pkg2", list.DirRemovals)
+	}
+}
+
+// The proposer withdraws; another writer cannot retract it, and withdrawing
+// something that is not pending is a no-op rather than an error.
+func TestRmdirWithdrawRemovesProposal(t *testing.T) {
+	g, h := guarded(t)
+	dir := filepath.Join(h.root, "pkg")
+	g.setClaims(FirstAgent, []string{dir})
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: FirstAgent}); !res.OK {
+		t.Fatalf("rmdir = %+v", res)
+	}
+
+	other := uint8(FirstAgent + 1)
+	g.setClaims(other, []string{dir})
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: other, Withdraw: true}); res.OK {
+		t.Errorf("withdraw by a non-proposer = %+v, want a refusal", res)
+	}
+
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: FirstAgent, Withdraw: true}); !res.OK {
+		t.Fatalf("withdraw = %+v", res)
+	}
+	if list := Dispatch(g, Request{Op: "rmdirs"}); len(list.DirRemovals) != 0 {
+		t.Errorf("after withdraw, rmdirs = %+v, want none", list.DirRemovals)
+	}
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: FirstAgent, Withdraw: true}); !res.OK {
+		t.Errorf("second withdraw = %+v, want a no-op", res)
+	}
+}
+
+// A directory is not a file: delete refuses the operand and records nothing, so
+// the pending-deletion list cannot claim a directory was going to be unlinked.
+func TestDeleteRefusesADirectory(t *testing.T) {
+	g, h, _ := claimGuard(t, "a.go")
+	dir := filepath.Join(h.root, "pkg")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	g.setClaims(FirstAgent, []string{dir})
+
+	res := Dispatch(g, Request{Op: "delete", Path: dir, Author: FirstAgent})
+	if res.OK || !strings.Contains(res.Err, "directory") {
+		t.Fatalf("delete of a directory = %+v, want a kind refusal", res)
+	}
+	if list := Dispatch(g, Request{Op: "deletions"}); len(list.Deletions) != 0 {
+		t.Errorf("deletions = %+v, want none after the refusal", list.Deletions)
+	}
+}
+
+// A file is not a directory: rmdir refuses the operand, so the pending
+// dir-removal list cannot name a file as a directory to remove.
+func TestRmdirRefusesAFile(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go")
+	a := p["a.go"]
+	g.setClaims(FirstAgent, []string{a})
+
+	res := Dispatch(g, Request{Op: "rmdir", Path: a, Author: FirstAgent})
+	if res.OK || !strings.Contains(res.Err, "not a directory") {
+		t.Fatalf("rmdir of a file = %+v, want a kind refusal", res)
+	}
+	if list := Dispatch(g, Request{Op: "rmdirs"}); len(list.DirRemovals) != 0 {
+		t.Errorf("rmdirs = %+v, want none after the refusal", list.DirRemovals)
+	}
+}
+
+// A path that is not on disk has no kind to check yet. A proposal is
+// forward-looking, so both delete and rmdir accept it: the claim set is what
+// says the writer may name it, and the human prompt is the real gate.
+func TestDeleteAndRmdirAllowANotYetExistingPath(t *testing.T) {
+	g, _, _ := claimGuard(t, "a.go")
+	missingFile := filepath.Join(g.Root(), "gone.go")
+	g.setClaims(FirstAgent, []string{missingFile})
+	if res := Dispatch(g, Request{Op: "delete", Path: missingFile, Author: FirstAgent}); !res.OK {
+		t.Fatalf("delete of a forward path = %+v, want it allowed", res)
+	}
+
+	missingDir := filepath.Join(g.Root(), "gone")
+	g.setClaims(FirstAgent, []string{missingDir})
+	if res := Dispatch(g, Request{Op: "rmdir", Path: missingDir, Author: FirstAgent}); !res.OK {
+		t.Fatalf("rmdir of a forward path = %+v, want it allowed", res)
+	}
+}
+
+// Only the proposing path checks the kind: a proposal must stay retractable
+// after the file it named is gone.
+func TestWithdrawSkipsTheKindCheck(t *testing.T) {
+	g, _, p := claimGuard(t, "a.go")
+	a := p["a.go"]
+	g.setClaims(FirstAgent, []string{a})
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent}); !res.OK {
+		t.Fatalf("delete = %+v", res)
+	}
+	if err := os.Remove(a); err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g, Request{Op: "delete", Path: a, Author: FirstAgent, Withdraw: true}); !res.OK {
+		t.Fatalf("withdraw after removal = %+v, want a no-op", res)
+	}
+}
+
+// proposals is one flat list over the three pending kinds: a change set, a
+// file deletion and a dir-removal come back tagged and in kind order, whatever
+// order the host handed them over in.
+func TestProposalsRollsUpEveryKind(t *testing.T) {
+	g, h := guarded(t)
+	h.proposals = []Proposal{
+		{Kind: "rmdir", Path: "/w/sub", Author: 3, Start: -1, End: -1},
+		{Kind: "set", Path: "/w/a.go", Author: 2, Group: 5, Start: 1, End: 4},
+		{Kind: "delete", Path: "/w/b.go", Author: 4, Start: -1, End: -1},
+	}
+	list := Dispatch(g, Request{Op: "proposals"})
+	if !list.OK {
+		t.Fatalf("proposals = %+v", list)
+	}
+	want := []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 2, Group: 5, Start: 1, End: 4},
+		{Kind: "delete", Path: "/w/b.go", Author: 4, Start: -1, End: -1},
+		{Kind: "rmdir", Path: "/w/sub", Author: 3, Start: -1, End: -1},
+	}
+	if len(list.Proposals) != len(want) {
+		t.Fatalf("proposals = %+v, want %+v", list.Proposals, want)
+	}
+	for i := range want {
+		if list.Proposals[i] != want[i] {
+			t.Errorf("proposal[%d] = %+v, want %+v", i, list.Proposals[i], want[i])
+		}
+	}
+}
+
+// rmdir is claim-gated on the directory itself, like delete is on the file, and
+// it does not require read-before-write: a claimed directory with no prior read
+// may be proposed, because a dir-removal is not a text write and no offset is
+// at stake.
+func TestRmdirRequiresAClaimButNotARead(t *testing.T) {
+	g, h := guarded(t)
+	dir := filepath.Join(h.root, "pkg")
+	other := filepath.Join(h.root, "other")
+	g.setClaims(FirstAgent, []string{dir})
+
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: FirstAgent}); !res.OK {
+		t.Fatalf("rmdir without a read = %+v", res)
+	}
+	if res := Dispatch(g, Request{Op: "rmdir", Path: other, Author: FirstAgent}); res.OK ||
+		!strings.Contains(res.Err, "not in your claim set") {
+		t.Errorf("rmdir of an unclaimed dir = %+v, want the set refusal", res)
+	}
+	if res := Dispatch(g, Request{Op: "rmdir", Path: "/etc", Author: FirstAgent}); res.OK ||
+		!strings.Contains(res.Err, "outside the workspace") {
+		t.Errorf("rmdir outside the root = %+v, want the root refusal", res)
+	}
+	if list := Dispatch(g, Request{Op: "rmdirs"}); len(list.DirRemovals) != 1 {
+		t.Errorf("rmdirs = %+v, want only the one proposal that landed", list.DirRemovals)
+	}
+	g.clearClaims(FirstAgent)
+	if res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: FirstAgent}); res.Err != "claim a file first" {
+		t.Errorf("rmdir with no claim = %+v, want the strict refusal", res)
+	}
+}
+
+// claim <dir> records the directory itself as a set entry and walks the subtree
+// to claim each regular file under it — a snapshot, so a file created
+// afterwards is not auto-claimed. Subdirectories are walked but not claimed,
+// and symlinks are not followed.
+func TestClaimDirExpandsToDirAndFiles(t *testing.T) {
+	root := t.TempDir()
+	h := newMemHost(root, nil)
+	g := NewGuard(h)
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(filepath.Join(sub, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(sub, "inner", "b.go")
+	for _, f := range []string{filepath.Join(sub, "a.go"), inner} {
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{sub}})
+	if !res.OK {
+		t.Fatalf("claim dir = %+v", res)
+	}
+	want := []string{sub, filepath.Join(sub, "a.go"), inner}
+	if got := strings.Join(res.Claims, ","); got != strings.Join(want, ",") {
+		t.Errorf("claims = %v, want the dir plus each file %v", res.Claims, want)
+	}
+}
+
 // The opcode path is not a second write surface: a program compiles to the same
 // Request Dispatch gates, so an apply in a batch cannot bypass a claim.
 func TestProgrammaticApplyCannotBypassClaims(t *testing.T) {
@@ -1253,6 +2193,35 @@ func TestDispatchDiff(t *testing.T) {
 	}
 }
 
+// review returns the pending sets and, in its plain form, enters the mode. The
+// set list is the pending projection `groups` reports filtered to the sets
+// still awaiting a decision; -json (ReviewList) returns them without entering.
+// The memHost fake has no app mode, so what this checks is the answer shape and
+// that both forms reach the host.
+func TestDispatchReview(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.groups = []Group{
+		{ID: 7, Path: path, Author: FirstAgent, State: "proposed", Ops: 1, Bytes: 1},
+		{ID: 9, Path: path, Author: FirstAgent, State: "accepted", Ops: 1, Bytes: 1},
+	}
+
+	res := Dispatch(g, Request{Op: "review", Path: path, ReviewList: true})
+	if !res.OK {
+		t.Fatalf("review -json = %+v", res)
+	}
+	if len(res.Groups) != 1 || res.Groups[0].ID != 7 {
+		t.Errorf("review groups = %+v, want only the still-proposed set 7", res.Groups)
+	}
+
+	// The plain form reports the same list; entering the mode is the app's
+	// business and its absence here is what memHost models.
+	res = Dispatch(g, Request{Op: "review", Path: path})
+	if !res.OK || len(res.Groups) != 1 {
+		t.Errorf("review = %+v, want the same one proposed set", res)
+	}
+}
+
 // A dump hands back a whole chunk and an id; a patch returns the edited whole
 // text and the editor diffs and applies it, so a driver never derives offsets
 // nor matches old text.
@@ -1303,6 +2272,38 @@ func TestDispatchLSPNoServer(t *testing.T) {
 		t.Errorf("lsp without a server was OK: %+v", res)
 	}
 	_ = h
+}
+
+// An inlay-hints request reaches the host's range variant with the lines the
+// request carried, and its caller's canned answer comes back as LSPJSON. The
+// real conversion to editor coordinates is exercised on the editor's machine,
+// where a language server can run.
+func TestDispatchLSPInlayHints(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.hintsJSON = `{"hints":[{"line":2,"col":5,"text":"string","kind":1,"tooltip":"inferred type"}]}`
+	a, b := 3, 9
+	res := Dispatch(g, Request{Op: "lspprep", Path: path, LSPMode: "inlay-hints",
+		LineStart: &a, LineEnd: &b})
+	if !res.OK || res.LSP == nil {
+		t.Fatalf("lspprep inlay-hints = %+v", res)
+	}
+	if h.hintLines != [2]int{3, 9} {
+		t.Errorf("host saw lines %v, want [3 9]", h.hintLines)
+	}
+	data, err := res.LSP.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out LSPResult
+	if uerr := json.Unmarshal(data, &out); uerr != nil {
+		t.Fatalf("answer is not JSON: %v", uerr)
+	}
+	if len(out.Hints) != 1 || out.Hints[0].Line != 2 || out.Hints[0].Col != 5 ||
+		out.Hints[0].Text != "string" || out.Hints[0].Kind != 1 ||
+		out.Hints[0].Tooltip != "inferred type" {
+		t.Errorf("hints = %+v", out.Hints)
+	}
 }
 
 // DiffLines turns old text into new as byte hunks; the round trip through the

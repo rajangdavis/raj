@@ -146,23 +146,45 @@ func (c *Client) DoStream(req Request, onBatch func([]SearchMatch)) (Response, e
 
 // write serialises one frame onto the socket. Separate from mu so a cancel can
 // overtake the request it cancels.
+//
+// It is also the single outbound path seam: every request field that names a
+// path is translated here and nowhere else, so a verb cannot be added that
+// forgets one. The three spellings a caller may use all mean the same file — a
+// relative path, which the editor resolves against its own workspace root; an
+// absolute path in this process's view, rewritten through the map; and one
+// already in the editor's spelling, left alone because it is not under the
+// local root. Response paths come back the other way in localise.
 func (c *Client) write(req Request) error {
 	if req.Token == "" {
 		req.Token = c.token
 	}
-	req.Path = c.paths.ToEditor(req.Path)
-	req.Dir = c.paths.ToEditor(req.Dir)
+	req.Path = c.toEditor(req.Path)
+	req.NewPath = c.toEditor(req.NewPath)
+	req.Dir = c.toEditor(req.Dir)
 	// claim names a list of files rather than the one Path, so each operand is
 	// translated too: a container calling the editor at /workspace would
 	// otherwise hand over paths the editor refuses as outside its root.
 	for i := range req.Paths {
-		req.Paths[i] = c.paths.ToEditor(req.Paths[i])
+		req.Paths[i] = c.toEditor(req.Paths[i])
+	}
+	// search -path scopes the walk, and the editor validates it against its own
+	// root; a caller's absolute spelling has to be translated exactly as Path
+	// is, or it is refused as "outside the workspace".
+	if req.Query != nil {
+		req.Query.Path = c.toEditor(req.Query.Path)
 	}
 	h, body := EncodeRequest(req)
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return WriteFrame(c.conn, h, body)
 }
+
+// toEditor maps one path from this process's view into the editor's. It is the
+// outbound half of the path seam, applied only here so the verbs cannot
+// disagree. A relative or empty path is returned unchanged: the editor resolves
+// a relative path against its own workspace root, and "" means the buffer the
+// user is looking at.
+func (c *Client) toEditor(p string) string { return c.paths.ToEditor(p) }
 
 // Cancel abandons an in-flight request by id, without waiting for it — which is
 // the whole point, and why it does not take the sequencing lock.
@@ -274,6 +296,15 @@ func (c *Client) localise(res *Response) {
 	}
 	for i := range res.ClaimOverlaps {
 		res.ClaimOverlaps[i].Path = c.paths.FromEditor(res.ClaimOverlaps[i].Path)
+	}
+	for i := range res.Deletions {
+		res.Deletions[i].Path = c.paths.FromEditor(res.Deletions[i].Path)
+	}
+	for i := range res.DirRemovals {
+		res.DirRemovals[i].Path = c.paths.FromEditor(res.DirRemovals[i].Path)
+	}
+	for i := range res.Proposals {
+		res.Proposals[i].Path = c.paths.FromEditor(res.Proposals[i].Path)
 	}
 	// DiffJSON is a nested document, not a path: unmarshal it, rebase the
 	// Group paths it carries, and marshal it back. A string replace inside the

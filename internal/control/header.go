@@ -62,6 +62,9 @@ const (
 	hPaths      = 0x13 // claim: the operand paths, one record per file
 	hClaimAdd   = 0x14 // claim: extend the set instead of replacing it
 	hClaimClear = 0x15 // claim: release the whole set
+	hDiscard    = 0x16 // close: drop unsaved changes instead of refusing the close
+	hWithdraw   = 0x17 // delete: retract this identity's proposal instead of making one
+	hNewPath    = 0x18 // rename: the destination path, alongside Path
 
 	// response fields
 	hExit           = 0x20
@@ -108,7 +111,13 @@ const (
 	hClaims         = 0x49 // claim: the resulting set, in stable order
 	hClaimWarnings  = 0x4a // claim: operands skipped, one warning per path
 	hClaimOverlaps  = 0x4b // claim: other identities sharing a claimed path
-
+	hDeletions      = 0x4c // deletions: pending removals, one {path, author} per record
+	hMatchLineEnd   = 0x4d // search: sparse byte offset one past each hit line end within the file
+	hDirRemovals    = 0x4e // rmdirs: pending dir-removals, one {path, author} per record
+	hProposals      = 0x4f // proposals: unified pending list, one {kind, path, author, group, start, end} per record
+	hMatchVersion   = 0x50 // search: sparse buffer version per hit, in hit order
+	hRemains        = 0x51 // close -discard: a file is still on disk at the discarded buffer's path
+	hCreated        = 0x52 // open: a new buffer was made rather than an existing one focused
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -137,7 +146,11 @@ var verbCodes = map[string]byte{
 	"dump": 26, "patch": 27,
 	"lsp": 28, "lspprep": 29,
 	"diff": 30, "review": 31, "clear": 32,
-	"claim": 33,
+	"claim":  33,
+	"mkdir":  34,
+	"delete": 35, "deletions": 36,
+	"rename": 37,
+	"rmdir":  38, "rmdirs": 39, "proposals": 40,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -204,6 +217,7 @@ func encodeHeader(h Header) []byte {
 		str(hOpName, h.Op)
 	}
 	str(hPath, h.Path)
+	str(hNewPath, h.NewPath)
 	num(hAuthor, int(h.Author))
 	str(hToken, h.Token)
 	if h.Base != nil {
@@ -218,8 +232,10 @@ func encodeHeader(h Header) []byte {
 	flag(hReviewList, h.ReviewList)
 	flag(hAnnotated, h.Annotated)
 	flag(hCreate, h.Create)
+	flag(hDiscard, h.Discard)
 	flag(hClaimAdd, h.ClaimAdd)
 	flag(hClaimClear, h.ClaimClear)
+	flag(hWithdraw, h.Withdraw)
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
 	// dump with -start 0 asks for the head of the file, an absent one asks for
@@ -246,6 +262,8 @@ func encodeHeader(h Header) []byte {
 	num(hOutLen, h.OutLen)
 	flag(hFinal, h.Final)
 	flag(hOK, h.OK)
+	flag(hRemains, h.Remains)
+	flag(hCreated, h.Created)
 	str(hErr, h.Err)
 	str(hRoot, h.Root)
 	num(hPID, h.PID)
@@ -325,7 +343,8 @@ func encodeHeader(h Header) []byte {
 		for _, g := range h.Groups {
 			state, ok := code(stateCodes, g.State)
 			w.Num(int(g.ID)).Str(g.Path).Num(int(g.Author)).Num(int(state)).
-				Num(g.Ops).Num(g.Bytes).Num(int(g.First)).Num(int(g.Last))
+				Num(g.Ops).Num(g.Bytes).Num(int(g.First)).Num(int(g.Last)).
+				Num(g.Hunks).Num(g.Moved)
 			if !ok {
 				w.Str(g.State)
 			}
@@ -360,6 +379,28 @@ func encodeHeader(h Header) []byte {
 		}
 		ops = append(ops, Op8{hClaimOverlaps, w.Done()})
 	}
+	if len(h.Deletions) > 0 {
+		var w prog.Writer
+		for _, d := range h.Deletions {
+			w.Str(d.Path).Num(int(d.Author))
+		}
+		ops = append(ops, Op8{hDeletions, w.Done()})
+	}
+	if len(h.DirRemovals) > 0 {
+		var w prog.Writer
+		for _, d := range h.DirRemovals {
+			w.Str(d.Path).Num(int(d.Author))
+		}
+		ops = append(ops, Op8{hDirRemovals, w.Done()})
+	}
+	if len(h.Proposals) > 0 {
+		var w prog.Writer
+		for _, p := range h.Proposals {
+			w.Str(p.Kind).Str(p.Path).Num(int(p.Author)).Num(int(p.Group)).Num(p.Start).Num(p.End)
+		}
+		ops = append(ops, Op8{hProposals, w.Done()})
+	}
+
 	if len(h.Buffers) > 0 {
 		var w prog.Writer
 		for _, b := range h.Buffers {
@@ -438,6 +479,37 @@ func encodeHeader(h Header) []byte {
 		if anyStart {
 			ops = append(ops, Op8{hMatchLineStart, starts.Done()})
 		}
+
+		// LineEnd rides the same sparse way, for the same reason. It is sent
+		// only when some hit's line does not end at offset zero, so an omitted
+		// field means every line end was zero.
+		var ends prog.Writer
+		anyEnd := false
+		for _, m := range h.Matches {
+			if m.LineEnd != 0 {
+				anyEnd = true
+			}
+			ends.Num(m.LineEnd)
+		}
+		if anyEnd {
+			ops = append(ops, Op8{hMatchLineEnd, ends.Done()})
+		}
+
+		// Version rides the same sparse way, one number per hit, sent only when
+		// some hit names a nonzero buffer revision. A hit on a file read from
+		// disk carries zero, which is not a revision any buffer can hold, so an
+		// omitted field means every hit was the disk's.
+		var vers prog.Writer
+		anyVersion := false
+		for _, m := range h.Matches {
+			if m.Version != 0 {
+				anyVersion = true
+			}
+			vers.Num(int(m.Version))
+		}
+		if anyVersion {
+			ops = append(ops, Op8{hMatchVersion, vers.Done()})
+		}
 	}
 	if len(h.Conflicts) > 0 {
 		var w prog.Writer
@@ -506,6 +578,12 @@ func decodeHeader(b []byte) (Header, error) {
 	// merge after every op, so their position relative to hMatches does not
 	// matter.
 	var lineStarts []int
+	// Match line ends arrive the same sparse way, one number per hit, merged
+	// after every op like the starts.
+	var lineEnds []int
+	// Match buffer versions arrive the same sparse way, one number per hit,
+	// merged after every op like the offsets above.
+	var matchVersions []int
 	// Conflict lease owners arrive the same way, one number per conflict, so
 	// their position relative to hConflicts does not matter either.
 	var conflictGroups []int
@@ -522,6 +600,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Op = string(op.Payload)
 		case hPath:
 			h.Path = string(op.Payload)
+		case hNewPath:
+			h.NewPath = string(op.Payload)
 		case hAuthor:
 			h.Author = uint8(prog.ReadNumber(op.Payload))
 		case hToken:
@@ -553,10 +633,14 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Annotated = true
 		case hCreate:
 			h.Create = true
+		case hDiscard:
+			h.Discard = true
 		case hClaimAdd:
 			h.ClaimAdd = true
 		case hClaimClear:
 			h.ClaimClear = true
+		case hWithdraw:
+			h.Withdraw = true
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
@@ -576,6 +660,10 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Final = true
 		case hOK:
 			h.OK = true
+		case hRemains:
+			h.Remains = true
+		case hCreated:
+			h.Created = true
 		case hErr:
 			h.Err = string(op.Payload)
 		case hRoot:
@@ -676,6 +764,7 @@ func decodeHeader(b []byte) (Header, error) {
 				state := r.Num()
 				g.Ops, g.Bytes = r.Num(), r.Num()
 				g.First, g.Last = uint64(r.Num()), uint64(r.Num())
+				g.Hunks, g.Moved = r.Num(), r.Num()
 				if state == 0 {
 					g.State = r.Str()
 				} else {
@@ -717,6 +806,34 @@ func decodeHeader(b []byte) (Header, error) {
 					Path: r.Str(), Identity: r.Str(), Author: uint8(r.Num())})
 			}
 			if err := recordsOK(r, "claim overlaps"); err != nil {
+				return Header{}, err
+			}
+		case hDeletions:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Deletions = append(h.Deletions, Deletion{
+					Path: r.Str(), Author: uint8(r.Num())})
+			}
+			if err := recordsOK(r, "deletions"); err != nil {
+				return Header{}, err
+			}
+		case hDirRemovals:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.DirRemovals = append(h.DirRemovals, DirRemoval{
+					Path: r.Str(), Author: uint8(r.Num())})
+			}
+			if err := recordsOK(r, "dir removals"); err != nil {
+				return Header{}, err
+			}
+		case hProposals:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Proposals = append(h.Proposals, Proposal{
+					Kind: r.Str(), Path: r.Str(), Author: uint8(r.Num()),
+					Group: uint64(r.Num()), Start: r.Num(), End: r.Num()})
+			}
+			if err := recordsOK(r, "proposals"); err != nil {
 				return Header{}, err
 			}
 		case hBuffers:
@@ -773,6 +890,22 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "match line starts"); err != nil {
 				return Header{}, err
 			}
+		case hMatchLineEnd:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				lineEnds = append(lineEnds, r.Num())
+			}
+			if err := recordsOK(r, "match line ends"); err != nil {
+				return Header{}, err
+			}
+		case hMatchVersion:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				matchVersions = append(matchVersions, r.Num())
+			}
+			if err := recordsOK(r, "match versions"); err != nil {
+				return Header{}, err
+			}
 		case hConflicts:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -820,6 +953,16 @@ func decodeHeader(b []byte) (Header, error) {
 	for i, ls := range lineStarts {
 		if i < len(h.Matches) {
 			h.Matches[i].LineStart = ls
+		}
+	}
+	for i, le := range lineEnds {
+		if i < len(h.Matches) {
+			h.Matches[i].LineEnd = le
+		}
+	}
+	for i, v := range matchVersions {
+		if i < len(h.Matches) {
+			h.Matches[i].Version = uint64(v)
 		}
 	}
 	for i, g := range conflictGroups {
