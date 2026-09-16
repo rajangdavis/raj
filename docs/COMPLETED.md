@@ -1369,6 +1369,27 @@ harness. Both now wait on the thing they are actually about.
 
 ## Control socket and agent driving
 
+- [x] **`revert` — a writer discards its own live pieces.** `raj ctl revert
+  [-mine|-author N]` reverses every change set the calling writer holds,
+  newest-first, journaled as the reversal (not a second forward edit); claim-
+  gated, and the socket refuses a frame naming a different author. Host-verified
+  2026-09-15: `-mine` emptied the buffer, a foreign `-author` was refused, the
+  own id worked, no proposals remained.
+- [x] **Two listeners on one queue.** `control.ListenAll` opens every address
+  (Unix socket plus each `--control-addr`) on one `Server`, `Paths()` returns
+  them all with `Path()` the primary (socket first), and `Close` closes and
+  unlinks each; per-connection transport gates unchanged.
+- [x] **`raj ctl token`.** Reads the running server's TCP secret over the local
+  socket (the `token` op, answered on the reading goroutine, `Response.Token`),
+  so a container driver no longer scrapes startup stderr. `--control-addr
+  tcp://…` is additive, so the socket keeps listening alongside the port;
+  deliberate change: TCP-without-socket is no longer expressible.
+- [x] **Authored-text cleanup.** `File.RevertAuthor` syncs the index on a wedge
+  that followed earlier drops (journal-version guard, not just `block.Group`);
+  `host.Revert`'s wedge branch normalizes cursors and marks the tree; `token`
+  has a wire code (42) and is in `TestEveryVerbHasACode`; dead `listenUnix`
+  removed; `Header.Author`/`Request.Author` docs state exactly what is checked.
+
 - [x] **`touchedLines` includes a line the selection only touches at column 0.**
   Fixed and verified (go test green): the guard mirrors `motion.go`'s
   `SplitIntoLines` — `last := LineOf(hi); if last > LineOf(lo) && hi ==
@@ -1512,7 +1533,7 @@ harness. Both now wait on the thing they are actually about.
   decides that hunk by line proximity (deletions reachable); caret-off
   decides all proposed changes on screen and reports the count.
   internal/app/review.go. Found pre-existing on 2026-09-10.
-- [x] **Phase 0 — recursive-raj prompt autoloads.** RECURSIVE_RAJ.md gained skill frontmatter and a §0 standing-workflow section, and opencode/agents/raj.md a bootstrap paragraph gated to primary sessions, so a fresh session lists the raj-recursive skill and opens with the standing workflow. Verified live 2026-09-10.
+- [x] **Phase 0 — recursive-raj prompt autoloads.** RECURSIVE-RAJ.md gained skill frontmatter and a §0 standing-workflow section, and opencode/agents/raj.md a bootstrap paragraph gated to primary sessions, so a fresh session lists the raj-recursive skill and opens with the standing workflow. Verified live 2026-09-10.
 - [x] **Phase 1 — control-surface correctness.** `resolveSpan` bounds-checks `apply`/`read`/`dump`; the `Start`/`End`/`LineStart`/`LineEnd` presence fix makes `read`/`dump -start 0` return the head; `who -live` filters to connected participants; `buffers -json` carries a brace `tally`. Host-verified 2026-09-10.
 - [x] **Phase 2 — handshake batch.** `SrcVersion` stamped on every response with a CLI skew warning on mismatch; server-minted identity adopted into `RAJ_IDENTITY`; gone ids recycled at the 255 cap, skipping id 1 so an agent never recycles onto the local human. Host-verified 2026-09-10.
 - [x] **Phase 3(b) — save read-back-and-compare.** `writeAtomic` reads the file back after rename+fsync and fails the save on a mismatch or an unreadable file ("save verification failed"), behind an injectable `readFile` seam for tests. Host-verified.
@@ -1595,7 +1616,7 @@ harness. Both now wait on the thing they are actually about.
   `Guard.Proposals` sort; no new store and no `run -prog` opcode. Wire:
   `hProposals = 0x4f`, verb code 40, the `BufferHost` interface and both
   implementers, plus `client.go` path rebasing. Design:
-  `docs/PROPOSALS-SPEC.md`. Verified live 2026-09-15: empty/`set`/`delete`
+  `docs/LAYERED-PROPOSALS-SPEC.md`. Verified live 2026-09-15: empty/`set`/`delete`
   round-trips, `-mine`, and no regression in
   `deletions`/`rmdirs`/`groups`/`version`/`buffers`.
 - [x] **The dir gate hides `Remove forever` like the file gate (2026-09-15).**
@@ -1698,4 +1719,51 @@ harness. Both now wait on the thing they are actually about.
   (shift+super+i, cmd+shift+i, ctrl+shift+i), per-pane `p.Hints`, persisted as
   `session.Tab.Hints`, with toggle and session tests; gopls now returns real
   hints, verified live.
+- [x] **Documents consolidation (2026-09-15).** Renamed `RECURSIVE-RAJ.md` and `AGENT-FEEDBACK.md`, folded `PROPOSALS-SPEC.md` into `LAYERED-PROPOSALS-SPEC.md` §14, `AGENT-VERB-AUDIT.md` into `AGENT-FEEDBACK.md`, and `RECONCILIATION-UX.md` into `INVESTIGATIONS.md`; added the `docs/README.md` index and its placement rule. The between-wave review pass verified every fold, then proposed deleting the three folded source docs and the stale root `KEYBINDINGS.md` the wave left behind.
+- [x] **F3b-ii D2a — wire the display projection to the app mode, memoised (2026-09-15).** `internal/editor/pane.go` adds `Pane.UpdateDisplay(policy)`, keyed on `(Session().Version(), File.DecisionGeneration(), policy)` with `dispKeyValid` guarding the zero value and `displayBuilds` counting real rebuilds; `SetDisplay` records the key beside `disp` so no caller can refresh one without the other. `internal/app/mode.go` adds `App.displayPolicy()` (`ModeReview → Annotated`, else `AcceptedAndProposed`), and `internal/app/render.go` `drawEditor` calls `UpdateDisplay` after its nil-pane guard and before `fitHints`/`RenderFocused`, so every measurement sees the projection. Tests cover a memo hit, each key part moving on its own (version, decision generation, policy), the identity projection, and mode-driven rendering (`TestDrawProjectsByMode`). Host `make check` green 2026-09-15. Folds are live in Edit mode; the app consumers still comparing session lines to display rows are the D2b item.
+- [x] **F3b-ii D2a review pass — reload invalidates the display memo (2026-09-15).** `Pane.Reload` replaced the session and then followed the caret through the projection built from the old document; `Pane.invalidateDisplay` now clears `disp` and its key before `FollowCursor`, with `TestPaneReloadInvalidatesTheDisplayProjection`. The startup journal restore swap is pre-frame and still relies on that.
 
+- [x] **`ls` and `search -hidden` (2026-09-16).** `raj ctl ls [path]` lists a
+  directory's immediate children with directories marked `/` and `-json`
+  carrying `{name,path,dir,size}` (size for regular files only), honouring
+  `internal/hidden` with `-hidden`; `search -hidden` drops the same policy.
+  Verified live against the rebuilt editor: `ls /work/.raj` is empty where
+  `-hidden` lists the journal and logs, `ls` refuses a file and a missing path,
+  and a root search returns nothing for `.git` where `-hidden` returns it.
+  See `docs/AGENT-FEEDBACK.md`.
+- [x] **`lsp diagnostics` no longer answers a false `ok` (2026-09-16).** A
+  publish/sync sequence (`internal/app/diagnostics.go`) plus `syncDoc`'s
+  `noteSynced` and `lsp.Sync.Pinned` date a versionless gopls publish against
+  the last text the server was told about, so its on-disk clean set cannot
+  answer for an edited buffer. Verified live: a throwaway non-compiling buffer
+  reported its type error with `status: ok` instead of `ok` with an empty list.
+  See `docs/AGENT-FEEDBACK.md`.
+- [x] **`ls` + diagnostics review pass (2026-09-16).** `ls -h` now states its
+  real default (the workspace root, `internal/control/cli.go`) instead of the
+  generic focused-buffer note, and `snapshotSearcher.Search`/`SearchHidden`
+  share one `runSearch` body so the two walks cannot drift
+  (`internal/app/{ls,control}.go`); the capability interface is retained. In
+  buffers for the user's save; host `make check` is the gate.
+- [x] **Advisory-lease reporting — a successful overlapping `apply` warns
+  (2026-09-16).** `Session.ApplyDiff`/`File.ApplyDiff` return a third `[]Block`;
+  `host.Apply` maps it to `Response.Warnings` on the sparse `hApplyWarnings`
+  field (0x5b, a separate argument op, so an old reader drops it whole while the
+  positional `hConflicts` records still parse); the CLI `apply` prints
+  `note: overlapped change set N (author A, bytes s..e)` and `-json` carries
+  `warnings`. Spec §12.1 and §7b updated. Live-verified against the rebuilt
+  editor with two identities: the overlap warns with group, author and the span
+  the superseded run held when the hunk landed; a clean apply and a same-author
+  amendment carry none; a `Rejected` span still refuses. `patch` reusing the
+  warning is folded in by the 2026-09-16 reporting review pass (host rebuild
+  pending). See `docs/AGENT-FEEDBACK.md`.
+- [x] **Order-independent own+other leases and the advisory-lease follow-ups
+  (2026-09-16).** `Session.ApplyDiff` reads every caught Proposed run through
+  `proposedSpans`, so a hunk over the writer's own draft and a peer's refuses
+  against the own set whichever run the projection meets first, and the
+  advisory path applies only when every caught proposed run belongs to another
+  author; `Rejected` still wins. `recv -json` cancellation exits 3 with `[]`;
+  the supersession notice ships no path (set, span and author only);
+  `host.Patch`'s all-refused guard is pinned by
+  `TestControlPatchAllRefusedDoesNotReproposePriorSet`. Live-verified in both
+  orders on scratch buffers with three identities against the rebuilt editor
+  and a matching client. See `docs/AGENT-FEEDBACK.md`.

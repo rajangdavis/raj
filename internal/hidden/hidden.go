@@ -30,11 +30,18 @@ const File = ".raj/hidden"
 
 // defaults are the patterns applied before any configuration is read.
 //
-// Only two kinds of thing are here: version-control metadata, which is not
-// source and is enormous, and dependency or cache directories that are
-// machine-generated. Notably absent is the blanket dotfile rule: a dotfile at
-// the root of a repository is usually configuration someone maintains by hand.
+// Three kinds of thing are here: raj's own state under .raj — the journal,
+// trash and session, which are the editor's scratch rather than the
+// repository's; version-control metadata, which is not source and is
+// enormous; and dependency or cache directories that are machine-generated.
+// Notably absent is the blanket dotfile rule: a dotfile at the root of a
+// repository is usually configuration someone maintains by hand.
 var defaults = []string{
+	// The scratch under .raj — journal logs, trash, session — but not
+	// .raj/hidden, the user's own configuration file, which stays visible so
+	// the file that configures the editor can be opened from it.
+	".raj/*",
+	"!.raj/hidden",
 	".git/",
 	".hg/",
 	".svn/",
@@ -77,6 +84,12 @@ type Rules struct {
 
 // Default returns the built-in rules.
 func Default() *Rules { return parse(strings.Join(defaults, "\n"), nil) }
+
+// Everything returns rules that hide nothing: the policy for a caller that
+// asked to include hidden entries. It is not the same as nil, which means the
+// built-in defaults; Everything is the -hidden switch's answer, spelled as one
+// *Rules so every caller applies it through the same Hidden method.
+func Everything() *Rules { return &Rules{} }
 
 // Parse reads patterns from text, one per line. Blank lines and lines starting
 // with `#` are ignored. The defaults are applied first, so a file only has to

@@ -6,6 +6,7 @@ import (
 
 	"raj/internal/editor"
 	"raj/internal/keys"
+	"raj/internal/piecetable"
 )
 
 // Mode is the application-level editing mode. Edit is the editor as it has
@@ -59,6 +60,22 @@ func (a *App) EnterReview() {
 	// A set with no surviving projection is auto-rejected, so an empty cycle
 	// really does mean there is nothing left to review.
 	a.status = "no proposed changes"
+}
+
+// displayPolicy is the composition the pane renders in the current mode. Edit
+// shows the accepted and proposed text together: a proposal is live text the
+// human is working against until they decide it. Review annotates every live
+// edit, rejected runs included, so a review reads the whole picture in place
+// rather than losing the rejected text behind a fold.
+//
+// It is a method on App, not a constant, because the policy is a function of
+// the mode and the mode is application state; the draw path calls this before
+// the pane renders so a mode switch and the pixels cannot disagree.
+func (a *App) displayPolicy() piecetable.Policy {
+	if a.mode == ModeReview {
+		return piecetable.Annotated
+	}
+	return piecetable.AcceptedAndProposed
 }
 
 // mutatesText reports whether an editor action changes the document text.

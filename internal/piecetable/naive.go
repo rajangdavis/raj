@@ -4,9 +4,9 @@ import "strings"
 
 // Naive is a piece table over a plain slice. Every structural edit is an O(n)
 // slice splice and every lookup is an O(n) scan, so it is unusable as the
-// resident structure — EDIT-BUFFER-STRATEGY.md §5 rules it out at a million
-// pieces. It exists because it is obviously correct: Doc is fuzzed against it,
-// so the tree's O(log n) machinery has something to be wrong against.
+// resident structure — it is ruled out at a million pieces. It exists because
+// it is obviously correct: Doc is fuzzed against it, so the tree's O(log n)
+// machinery has something to be wrong against.
 type Naive struct {
 	store  *Store
 	pieces []PieceRec

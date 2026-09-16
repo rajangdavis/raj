@@ -288,10 +288,11 @@ func TestSearchArgumentsCompileInAnyOrder(t *testing.T) {
 	}
 }
 
-// The four verbs that stay out, and the compiler refuses them by the ordinary
-// unknown-verb rule rather than by a special case.
+// A verb this build has not allocated is refused by the ordinary unknown-verb
+// rule rather than by a special case: the table now ends at OpExec, and these
+// codes are past it.
 func TestVerbsThatStayOutOfPrograms(t *testing.T) {
-	for _, code := range []byte{0x95, 0x96, 0xff} { // unallocated verb range; the table ends at OpClear
+	for _, code := range []byte{0x97, 0x98, 0xff} { // unallocated verb range; the table now ends at OpExec
 		p := prog.Encode([]prog.Op{{Code: code}})
 		if _, err := Requests(p, 1); !errors.Is(err, prog.ErrUnknownVerb) {
 			t.Errorf("verb %#x = %v, want ErrUnknownVerb", code, err)
@@ -334,5 +335,88 @@ func TestGotoAndCloseCompileAsProgramVerbs(t *testing.T) {
 		if len(reqs) != 1 || reqs[0].Op != tc.want {
 			t.Errorf("verb %#x = %+v, want one request with op %q", tc.code, reqs, tc.want)
 		}
+	}
+}
+
+// exec used to be the one verb no program could reach, because its argv is a
+// list and the opcode table had no repeated-argument shape. arg gives it one:
+// each arg appends an element, and exec consumes the accumulated list.
+func TestProgramAccumulatesArgvForExec(t *testing.T) {
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpArg, Payload: []byte("echo")},
+		{Code: prog.OpArg, Payload: []byte("hi")},
+		{Code: prog.OpExec},
+		{Code: prog.OpSave}, // the next verb must not inherit the argv
+	})
+	reqs, err := Requests(p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("compiled %d requests, want 2", len(reqs))
+	}
+	if reqs[0].Op != "exec" {
+		t.Fatalf("first request op = %q, want exec", reqs[0].Op)
+	}
+	if got := strings.Join(reqs[0].Argv, " "); got != "echo hi" {
+		t.Errorf("exec argv = %q, want %q", got, "echo hi")
+	}
+	if len(reqs[1].Argv) != 0 {
+		t.Errorf("the save inherited the exec argv: %+v", reqs[1].Argv)
+	}
+}
+
+// find compiles like the other query verbs: the path, query and flags
+// accumulate and the verb consumes them.
+func TestProgramCompilesFind(t *testing.T) {
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpQuery, Payload: []byte("needle")},
+		{Code: prog.OpFlags, Payload: []byte{prog.FlagCase}},
+		{Code: prog.OpFind},
+	})
+	reqs, err := Requests(p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0].Op != "find" {
+		t.Fatalf("find program = %+v, want one find", reqs)
+	}
+	if reqs[0].Query == nil || reqs[0].Query.Text != "needle" || !reqs[0].Query.Case {
+		t.Errorf("find query = %+v", reqs[0].Query)
+	}
+	if reqs[0].Path != "/w/a.go" {
+		t.Errorf("find path = %q", reqs[0].Path)
+	}
+}
+
+// A find inside a program runs: the answer carries the first match's byte span
+// and the match count, so a later read can be spanned against it.
+func TestProgramRunsFind(t *testing.T) {
+	f := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\nhello again\n"})
+	c, err := Dial(f.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpQuery, Payload: []byte("hello")},
+		{Code: prog.OpFind},
+	})
+	res, err := c.Do(Request{Op: "prog", Program: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK || !res.Found {
+		t.Fatalf("find = %+v, want found", res)
+	}
+	if res.FindStart != 0 || res.FindEnd != len("hello") {
+		t.Errorf("span = [%d,%d), want [0,%d)", res.FindStart, res.FindEnd, len("hello"))
+	}
+	if res.FindCount != 2 {
+		t.Errorf("count = %d, want 2", res.FindCount)
 	}
 }

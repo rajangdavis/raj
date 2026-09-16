@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"raj/internal/control"
 	"raj/internal/lsp"
 	"raj/internal/problems"
 )
@@ -35,6 +36,19 @@ type diagnostics struct {
 	// treats an absent version as unknown rather than as describing the first
 	// revision of the document.
 	versions map[string]*int
+	// seq numbers every publish as it arrives, which gives two publishes a
+	// total order even when neither carries a version. It is the only way to
+	// date a versionless publish, and gopls produces those for a file at
+	// version 0 — including its analysis of the on-disk copy, which is not
+	// necessarily the buffer.
+	seq int
+	// publishSeq is the seq of the newest publish for a path, and syncSeq the
+	// seq at the moment the editor last told the server about that path's
+	// current text. A versionless publish at or before syncSeq cannot be proven
+	// to describe the current text, so it is stale rather than clean.
+	publishSeq map[string]int
+	syncSeq    map[string]int
+
 	// waiters are the callers blocked on a path's next publish. The store's own
 	// mutex guards the map; a publish closes and clears the channels for that
 	// path, so a waiter wakes on the next publish and only that one. It is a
@@ -47,6 +61,8 @@ func newDiagnostics() *diagnostics {
 		byPath:         map[string][]lsp.Diagnostic{},
 		publishedPaths: map[string]bool{},
 		versions:       map[string]*int{},
+		publishSeq:     map[string]int{},
+		syncSeq:        map[string]int{},
 		waiters:        map[string][]chan struct{}{},
 	}
 }
@@ -80,6 +96,13 @@ func (d *diagnostics) setVersion(path string, items []lsp.Diagnostic, version *i
 	if d.publishedPaths == nil {
 		d.publishedPaths = map[string]bool{}
 	}
+	// Every publish takes the next seq, so a versionless one can be ordered
+	// against the sync that told the server what the buffer now holds.
+	d.seq++
+	if d.publishSeq == nil {
+		d.publishSeq = map[string]int{}
+	}
+	d.publishSeq[path] = d.seq
 	d.publishedPaths[path] = true
 	if version == nil {
 		delete(d.versions, path)
@@ -109,6 +132,19 @@ func (d *diagnostics) setVersion(path string, items []lsp.Diagnostic, version *i
 		return a.Character < b.Character
 	})
 	d.byPath[path] = sorted
+}
+
+// noteSynced records that the editor has just told the server about a path's
+// current text. A versionless publish at or before this point cannot be a
+// reading of that text: it may be the server's analysis of the on-disk file,
+// which is exactly the set gopls emits with no version at file version 0.
+func (d *diagnostics) noteSynced(path string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.syncSeq == nil {
+		d.syncSeq = map[string]int{}
+	}
+	d.syncSeq[path] = d.seq
 }
 
 // forPath is the problems in a file.
@@ -153,17 +189,54 @@ func (d *diagnostics) reading(path string, version int) (status, detail string, 
 	// separately could pair one publish's version with another's items and
 	// misjudge a fresh set as stale.
 	d.mu.Lock()
+	status, detail = d.freshnessLocked(path, version, version)
+	items = d.byPath[path]
+	d.mu.Unlock()
+	return status, detail, items
+}
+
+// status is the freshness of a path's last publish judged against the version
+// the server was last told about and the buffer's own. It is the request path's
+// half of reading, and differs from it only in taking the two versions
+// separately rather than assuming the sync already happened.
+func (d *diagnostics) status(path string, syncedVersion, bufVersion int) (string, string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.freshnessLocked(path, syncedVersion, bufVersion)
+}
+
+// freshnessLocked is the shared judgement, called with d.mu held. It is the
+// pure diagnosticsStatus rule plus the sequence rule for a publish that carried
+// no version. A versionless publish cannot be dated by version, so it counts as
+// a reading only if it arrived after the editor last told the server about the
+// current text and the buffer has no edits. gopls omits the version for a file
+// at version 0, and "version 0" is both the on-disk copy and an unedited
+// buffer, so reading its on-disk analysis as clean for an edited buffer is the
+// false ok this exists to prevent.
+func (d *diagnostics) freshnessLocked(path string, syncedVersion, bufVersion int) (status, detail string) {
 	published := d.publishedPaths[path]
 	var pubVersion *int
 	if v, ok := d.versions[path]; ok && v != nil {
 		vv := *v
 		pubVersion = &vv
 	}
-	items = d.byPath[path]
-	d.mu.Unlock()
-
-	status, detail = diagnosticsStatus(published, pubVersion, version, version)
-	return status, detail, items
+	status, detail = diagnosticsStatus(published, pubVersion, syncedVersion, bufVersion)
+	if status != control.LSPStatusOK {
+		return status, detail
+	}
+	if pubVersion == nil {
+		// A versionless publish is a reading only of an unedited buffer, and
+		// only if it arrived after the sync. gopls omits the version for a
+		// file at version 0 — both the on-disk copy and an unedited buffer —
+		// so a buffer with edits (version > 0) can never be answered by one:
+		// the server has not republished for the text just sent. Treating its
+		// on-disk set as clean is the false ok this rule exists to prevent.
+		if d.publishSeq[path] <= d.syncSeq[path] || bufVersion != 0 {
+			return control.LSPStatusStale,
+				"the language server's last publish carried no version and does not describe the current text"
+		}
+	}
+	return status, detail
 }
 
 // waitFor blocks until the next publish for path, or until ctx is done. It
@@ -274,6 +347,8 @@ func (d *diagnostics) clear(path string) {
 	delete(d.byPath, path)
 	delete(d.publishedPaths, path)
 	delete(d.versions, path)
+	delete(d.publishSeq, path)
+	delete(d.syncSeq, path)
 }
 
 // severityRank orders severities by how much they matter, lowest first.

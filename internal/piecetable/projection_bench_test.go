@@ -69,7 +69,7 @@ func BenchmarkProjection(b *testing.B) {
 						b.ReportAllocs()
 						b.ResetTimer()
 						for i := 0; i < b.N; i++ {
-							_, conflicts := s.ApplyDiff(User, base, hunks)
+							_, conflicts, _ := s.ApplyDiff(User, base, hunks)
 							if len(conflicts) != 1 {
 								b.Fatalf("hunk did not hit a lease: %d conflicts", len(conflicts))
 							}

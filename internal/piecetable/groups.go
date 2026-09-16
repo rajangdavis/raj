@@ -64,6 +64,17 @@ type Group struct {
 	// Bytes is the net change in document length, so a listing can say "+40"
 	// without the caller replaying anything.
 	Bytes int
+	// Invalid marks a still-Proposed set whose recorded edit no longer fits
+	// the current composition: every live member has been moved past what a
+	// rebase can carry, so no hunk of it survives. It is orthogonal to State
+	// and recomputed, never stored -- clear the colliding edit (reject, undo,
+	// un-reject) and it goes away. InvalidBy names the live set whose edit now
+	// occupies the range and where that set sits, or nil when no single
+	// collider can be named. An invalid set is already dropped from Pending,
+	// and so from the agreed composition; it is reported, never cascaded or
+	// clamped.
+	Invalid   bool
+	InvalidBy *Overlap
 }
 
 // LastGroup is the group the most recent commit joined, so a caller that just
@@ -125,7 +136,90 @@ func (s *Session) Groups() []Group {
 		out = append(out, *g)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].First < out[j].First })
+	s.markInvalid(out)
 	return out
+}
+
+// markInvalid recomputes the Invalid flag of every proposed set in gs from the
+// current journal.
+//
+// Invalid is the same per-member evidence Pending already uses to drop a set:
+// a proposed group with live members but not one surviving hunk, i.e. every
+// member moved past what a rebase can carry. One predicate, not a second rule
+// beside it, so the two listings cannot disagree about whether work survives.
+// Deriving it from the journal and the decisions rather than storing it in the
+// journal is what lets it clear when the colliding edit goes away.
+//
+// A set overwritten by several edits names the first live edit the rebase walk
+// stops at as its collider rather than listing every one: the point is to name
+// what to clear, not to cascade.
+func (s *Session) markInvalid(gs []Group) {
+	at := make(map[uint64]int, len(gs))
+	for i := range gs {
+		at[gs[i].ID] = i
+	}
+	survives := map[uint64]bool{}
+	collider := map[uint64]Overlap{}
+	for _, o := range s.journal {
+		if o.Kind != KindEdit || !s.live(o.Seq) {
+			continue
+		}
+		i, ok := at[o.Group]
+		if !ok || gs[i].State != Proposed || gs[i].Ops == 0 {
+			continue
+		}
+		if len(s.projectMember(o)) > 0 {
+			survives[o.Group] = true
+			continue
+		}
+		if _, seen := collider[o.Group]; !seen {
+			if ov, ok := s.invalidBy(o); ok {
+				collider[o.Group] = ov
+			}
+		}
+	}
+	for i := range gs {
+		if gs[i].State != Proposed || gs[i].Ops == 0 {
+			continue
+		}
+		gs[i].Invalid = !survives[gs[i].ID]
+		// Only an invalid set carries a collider: a set with a surviving hunk
+		// may still have lost a member, but it is not superseded and naming a
+		// collider would misreport it as one.
+		if gs[i].Invalid {
+			if ov, ok := collider[gs[i].ID]; ok {
+				gs[i].InvalidBy = &ov
+			}
+		}
+	}
+}
+
+// invalidBy names the live change set that consumed a moved member's recorded
+// edit, and where that set now sits.
+//
+// It reuses the rebase walk that decides the member is moved: carrying the
+// member's inserted span forward from the version just after it reports the
+// first live edit that deleted into it, and blockFor turns that op into its
+// set, author and projected span. A member with no insertion, or a wedge the
+// walk attributes to a reversal rather than a live edit, has no set to name;
+// it reports false and the set stays invalid without a collider.
+func (s *Session) invalidBy(o Op) (Overlap, bool) {
+	if o.InsLen() == 0 {
+		return Overlap{}, false
+	}
+	_, _, damage, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
+	if ok || damage == 0 || int(damage) >= len(s.journal) {
+		return Overlap{}, false
+	}
+	bad := s.journal[damage]
+	if bad.Kind != KindEdit || !s.live(bad.Seq) {
+		return Overlap{}, false
+	}
+	b := s.blockFor(damage)
+	if b.Group == 0 {
+		return Overlap{}, false
+	}
+	return Overlap{Group: b.Group, Author: b.Author, Start: b.Start, End: b.End}, true
 }
 
 // GroupDiff projects one named change set by the same rebase walk DiffPending
@@ -153,7 +247,12 @@ func (s *Session) GroupDiff(id uint64) (GroupDiff, bool) {
 	if !ok {
 		return GroupDiff{}, false
 	}
-	return s.projectGroup(*g), true
+	// Recompute the set-level Invalid flag the same way Groups does, so a
+	// caller reaching this set directly sees the same listing as one reaching
+	// it through DiffPending.
+	one := []Group{*g}
+	s.markInvalid(one)
+	return s.projectGroup(one[0]), true
 }
 
 // addMember folds one journal op into its change set's running listing, or
@@ -197,6 +296,9 @@ func (s *Session) addMember(byID map[uint64]*Group, o Op) {
 // agree to in either case, and reporting it would block a save on a change
 // that is not there. The state stays Proposed as a record; only the claim on
 // the user's decision is dropped, and it comes back if that edit is undone.
+// The second case is the one Group.Invalid names: the hunk test below and the
+// flag are the same per-member projection, so Pending cannot disagree with the
+// `groups` listing about which proposed sets have work left.
 func (s *Session) Pending() []Group {
 	var out []Group
 	for _, d := range s.DiffPending() {
@@ -265,8 +367,18 @@ func (s *Session) AcceptGroup(id uint64) {
 // and succeeds. False is not retryable: the caller has to look at what
 // happened since.
 func (s *Session) ClearRejected(id uint64) bool {
+	ok, _ := s.ClearRejectedBlock(id)
+	return ok
+}
+
+// ClearRejectedBlock is ClearRejected plus, when the reversal wedges, the live
+// change set whose span overlaps a member that could not be placed. The block
+// is zero when the set was not rejected to begin with, or when no live member
+// is left to reverse; a non-zero Group is the report a caller re-proposes
+// against.
+func (s *Session) ClearRejectedBlock(id uint64) (bool, Block) {
 	if s.GroupState(id) != Rejected {
-		return false
+		return false, Block{}
 	}
 	// The "already gone" case is no live member ops, the same notion Groups
 	// counts as Ops: an op in the journal, of kind KindEdit, not reversed by a
@@ -276,16 +388,64 @@ func (s *Session) ClearRejected(id uint64) bool {
 	// tombstone no one can remove.
 	if !s.hasLiveMembers(id) {
 		s.MarkGroup(id, Accepted)
-		return true
+		return true, Block{}
 	}
 	// Live members remain, so the reversal really has to happen. reverseGroup
 	// fails when one cannot be placed; that failure has to surface rather than
 	// be swallowed by dropping the decision, or the purge is in name only.
-	if !s.reverseGroup(id, KindUndo, nil) {
-		return false
+	ok, block := s.reverseGroupBlock(id, KindUndo, nil)
+	if !ok {
+		return false, block
 	}
 	s.MarkGroup(id, Accepted)
-	return true
+	return true, Block{}
+}
+
+// RevertAuthor is the inverse of attribution: it discards every live piece
+// author wrote, reversing their whole contribution out of the document and
+// recording the reversal in the journal. It is the reversal machinery clear
+// uses — reverseGroup and rebasedInverse — applied to each change set the
+// author still holds, newest first, so a later set that overlaps an earlier one
+// comes out before the earlier one can move.
+//
+// It returns whether anything was reversed and, when a member could not be
+// placed, the live change set whose span overlaps it: the same report
+// ClearRejectedBlock gives, rather than clamping a wedge. Each change set is
+// reversed all or nothing; the sets are independent, so a wedge stops the walk
+// and names the blocker, leaving any sets already dropped dropped. The caller
+// clears the blocker and reverts again for the rest.
+//
+// A set the revert emptied — the author's own proposed or rejected set — has
+// its decision dropped, because a set with no live member has nothing left to
+// decide. A set that still holds another author's live members keeps its
+// decision.
+func (s *Session) RevertAuthor(author Author) (bool, Block) {
+	// The author's live editorial change sets, in journal order. A member, not
+	// the set's nominal author, decides membership: a group two writers
+	// contributed to is still partly this author's.
+	var ids []uint64
+	seen := map[uint64]bool{}
+	for _, o := range s.journal {
+		if o.Kind != KindEdit || o.Author != author || !s.live(o.Seq) {
+			continue
+		}
+		if !seen[o.Group] {
+			seen[o.Group] = true
+			ids = append(ids, o.Group)
+		}
+	}
+	// Newest first: a later set can overlap an earlier one and has to come out
+	// before the earlier can move.
+	for i := len(ids) - 1; i >= 0; i-- {
+		ok, block := s.reverseGroupBlock(ids[i], KindUndo, byAuthor(author))
+		if !ok {
+			return false, block
+		}
+		if !s.hasLiveMembers(ids[i]) {
+			s.MarkGroup(ids[i], Accepted)
+		}
+	}
+	return len(ids) > 0, Block{}
 }
 
 // hasLiveMembers reports whether a change set still holds a live editorial
@@ -447,6 +607,197 @@ func (s *Session) DiffPending() []GroupDiff {
 			continue
 		}
 		out = append(out, s.projectGroup(g))
+	}
+	return out
+}
+
+// Block names a live change set that overlaps work a verb was trying to do.
+// Group is the blocking set, Author its writer, and Start/End the current span
+// of its surviving projection. Zero Group means the blocker could not be named
+// as a set -- a reversal that failed for a reason other than an overlap.
+type Block struct {
+	Group      uint64
+	Author     Author
+	Start, End int
+}
+
+// blockFor turns the journal seq rebase reported as damage into the live change
+// set that owns that op: its group, its author, and the current span of its
+// surviving projection, so a caller learns what has to move before the blocked
+// work can go in. Zero reports no block.
+func (s *Session) blockFor(at Version) Block {
+	if at == 0 || int(at) >= len(s.journal) {
+		return Block{}
+	}
+	o := s.journal[at]
+	b := Block{Group: o.Group, Author: o.Author}
+	hunks := s.projectMember(o)
+	if len(hunks) == 0 {
+		return b
+	}
+	lo, hi := hunks[0].Start, hunks[0].End
+	for _, h := range hunks[1:] {
+		if h.Start < lo {
+			lo = h.Start
+		}
+		if h.End > hi {
+			hi = h.End
+		}
+	}
+	b.Start, b.End = lo, hi
+	return b
+}
+
+// Overlap names another live change set whose projected range intersects one
+// set's, and where. Group and Author are the other set; Start and End bound the
+// shared span in the buffer's current coordinates.
+type Overlap struct {
+	Group      uint64
+	Author     Author
+	Start, End int
+}
+
+// PendingOverlaps maps each pending change set to the other pending sets whose
+// projected ranges intersect it.
+//
+// The editor reports an overlap rather than resolving it: nothing here clamps,
+// merges, reorders or refuses anything, and the read-only lease in ApplyDiff
+// still decides what may be written. Two sets still awaiting a decision that
+// claim the same bytes is a fact a person has to settle, and it is carried on
+// both sets so the earlier writer sees it on its next query rather than only
+// the later one. A set that is not pending is not paired: only a pending set
+// still has the option to move.
+//
+// The range of a member is the bounding of the runs it still owns (the same
+// runs DiffPending reports): a member a later insertion split still covers the
+// gap between its own runs, where two sets can meet, but a neighbour's text
+// flush against the member's end is not swallowed into its range.
+func (s *Session) PendingOverlaps() map[uint64][]Overlap {
+	type memberSpan struct {
+		group      uint64
+		author     Author
+		start, end int
+	}
+	var spans []memberSpan
+	for _, g := range s.Groups() {
+		if g.State != Proposed || g.Ops == 0 {
+			continue
+		}
+		for _, o := range s.journal {
+			if o.Group != g.ID || o.Kind != KindEdit || !s.live(o.Seq) {
+				continue
+			}
+			// The span is the bounding of the member's surviving runs -- the
+			// same runs DiffPending reports -- not the raw rebased [lo,hi).
+			// The raw range absorbs a later insertion flush against the
+			// member's end, which would report a neighbour's adjacent text as
+			// an overlap; bounding the owned runs keeps a split member's gap
+			// without swallowing the set next to it.
+			hunks := s.projectMember(o)
+			if len(hunks) == 0 {
+				continue
+			}
+			lo, hi := hunks[0].Start, hunks[0].End
+			for _, h := range hunks[1:] {
+				if h.Start < lo {
+					lo = h.Start
+				}
+				if h.End > hi {
+					hi = h.End
+				}
+			}
+			spans = append(spans, memberSpan{group: g.ID, author: o.Author, start: lo, end: hi})
+		}
+	}
+	out := map[uint64][]Overlap{}
+	for i := range spans {
+		for j := i + 1; j < len(spans); j++ {
+			a, b := spans[i], spans[j]
+			if a.group == b.group {
+				continue
+			}
+			lo, hi, ok := hunkOverlap(DiffHunk{Start: a.start, End: a.end},
+				DiffHunk{Start: b.start, End: b.end})
+			if !ok {
+				continue
+			}
+			out[a.group] = addOverlap(out[a.group], Overlap{Group: b.group, Author: b.author, Start: lo, End: hi})
+			out[b.group] = addOverlap(out[b.group], Overlap{Group: a.group, Author: a.author, Start: lo, End: hi})
+		}
+	}
+	for _, ovs := range out {
+		sort.Slice(ovs, func(i, j int) bool { return ovs[i].Group < ovs[j].Group })
+	}
+	return out
+}
+
+// addOverlap merges one intersection into a set's list, keeping a single entry
+// per other set and widening its span to cover every place the two meet.
+func addOverlap(list []Overlap, o Overlap) []Overlap {
+	for i := range list {
+		if list[i].Group != o.Group {
+			continue
+		}
+		if o.Start < list[i].Start {
+			list[i].Start = o.Start
+		}
+		if o.End > list[i].End {
+			list[i].End = o.End
+		}
+		return list
+	}
+	return append(list, o)
+}
+
+// hunkOverlap reports the span two hunks share, if any. The rule is the
+// half-open one Leased uses: [s,e) shares with [s2,e2) exactly where
+// max(s,s2) < min(e,e2). A zero-width hunk -- a pure deletion, or a probe -- is
+// a point, and shares only when it lies strictly inside the other range, which
+// is the same boundary an insertion flush against a run's edge clears.
+func hunkOverlap(a, b DiffHunk) (int, int, bool) {
+	lo, hi := a.Start, a.End
+	if b.Start > lo {
+		lo = b.Start
+	}
+	if b.End < hi {
+		hi = b.End
+	}
+	if lo < hi {
+		return lo, hi, true
+	}
+	if a.Start == a.End && b.Start < a.Start && a.Start < b.End {
+		return a.Start, a.Start, true
+	}
+	if b.Start == b.End && a.Start < b.Start && b.Start < a.End {
+		return b.Start, b.Start, true
+	}
+	return 0, 0, false
+}
+
+// proposedSpans reports every distinct Proposed change set whose run intersects
+// [pos, pos+length), each once, with its owning author and the run's bounds.
+// A hunk that lands needs every draft it moved past, so this reports them all.
+// Runs of one set collapse to a single entry: a set is
+// superseded once however many of its places the hunk covers, and the span is
+// the first run the hunk catches, which is where the set sat when it landed.
+func (s *Session) proposedSpans(pos, length int) []Block {
+	if !s.HasDecisions() {
+		return nil
+	}
+	if length < 0 {
+		length = 0
+	}
+	var out []Block
+	seen := map[uint64]bool{}
+	for _, r := range s.Project(Annotated).States() {
+		if r.State != Proposed || r.Len <= 0 || seen[r.Group] {
+			continue
+		}
+		if pos < r.Off+r.Len && r.Off < pos+length {
+			seen[r.Group] = true
+			owner, _ := s.groupAuthor(r.Group)
+			out = append(out, Block{Group: r.Group, Author: owner, Start: r.Off, End: r.Off + r.Len})
+		}
 	}
 	return out
 }

@@ -15,7 +15,9 @@ Protocol-only ops with no CLI verb: `ping` (used by `whoami`), `text` (the `read
 
 ## Friction → root cause
 
-1. **Path spelling is not all translated (path resolution).** Relative, `/work`-absolute and editor-spelled paths all resolve *inbound* — `read` verified for all three — and `buffers`/`groups` come back `/work`-spelled. But `diff -json`'s `path`, `search -json`'s `truncated[].Path`, and every error string keep `/Users/...`. Cause: `Client.localise` (client.go) rewrites a fixed field list (`Root`, `Buffers`, `Matches`, `Dirty`, `Groups`) and misses nested `DiffJSON`, `Truncated` and `Err`. One seam, applied unevenly. README claims "what `search` prints is something the agent can open" — `truncated` already contradicts it.
+1. **Path spelling is not all translated (path resolution).** Relative, `/work`-absolute and editor-spelled paths all resolve *inbound* — `read` verified for all three — and `buffers`/`groups` come back `/work`-spelled. But `diff -json`'s `path`, `search -json`'s `truncated[].Path`, and every error string keep `/Users/...`. Cause: `Client.localise` (client.go) rewrites a fixed field list (`Root`, `Buffers`, `Matches`, `Dirty`, `Groups`) and misses nested `DiffJSON`, `Truncated` and `Err`. One seam, applied unevenly. README claims "what `search` prints is something the agent can open" — `truncated` already contradicts it. (Fixed 2026-09-15: `localise`
+now covers the nested `DiffJSON`, `Truncated` and `LSPJSON` shapes and `Err`
+text.)
 2. **The default target is silent (defaults/discovery).** `apply`/`edit`/`read`/`save`/`close` take an optional positional; omit it and the verb targets whatever tab is active. Verified live: `edit -old <absent>` with no path read the active buffer, and the refusal says "the buffer" without naming it. `-h` prints only the shared FlagSet, so no verb's positional is shown.
 3. **Verb redundancy.** `read`/`version`/`dump` overlap; `apply`/`edit`/`patch`/`run` are four write doors; `open -create` is the only create and "create" is not a verb; `groups`/`diff`/`review` list the same sets three ways; `accept`/`reject`/`clear` are three decisions over one state machine.
 4. **Lease and error recovery.** Writing over **another writer's** proposal refuses with "change set N owns this text; accept or reject it first"; recovery is reject → `clear` → re-apply. Writing over your **own** `Proposed` set now amends it instead (2026-09-13). `clear` exists but is documented only on its usage line. The session's reported `accepted 0 ops` artifact did not reproduce (the string is absent from the tree).
@@ -41,13 +43,31 @@ Protocol-only ops with no CLI verb: `ping` (used by `whoami`), `text` (the `read
 
 ## Safe now (no semantics change)
 
-- Extend `localise` to nested `DiffJSON`/`Truncated` and to `Err` text.
-- Per-verb usage text: positionals plus the default target; name the buffer in default-target refusals.
-- One `-json` field-naming contract; the three Go-name verbs move to it.
-- Document the `clear` recovery path and `open -create` in README and the skill.
-- Add the affected line/col to `apply`/`edit` replies.
+Status 2026-09-15: bullets 1–4 done, bullet 5 deferred. Raw findings and the
+wire/design questions in `docs/RAJ_FEEDBACK.md`.
+
+- [done 2026-09-15] Extend `localise` to nested `DiffJSON`/`Truncated` and to
+  `Err` text. Those landed before this date; the 2026-09-15 pass also mapped
+  nested `LSPJSON` location paths, the one `Response` shape still missed.
+- [done 2026-09-15] Per-verb usage text: positionals plus the default target;
+  name the buffer in default-target refusals. The usage half was already in
+  place; the naming half is `targetName`/`activePath` in `internal/control/cli.go`.
+- [done 2026-09-13, verified 2026-09-15] One `-json` field-naming contract; the
+  three Go-name verbs move to it. All exported wire/JSON structs carry
+  snake_case tags.
+- [done 2026-09-15] Document the `clear` recovery path and `open -create` in
+  README and the skill. README already had both; the skill gained the
+  `open -create` sentence in its open paragraph.
+- [reclassified 2026-09-15: needs a design pass] Add the affected line/col to
+  `apply`/`edit` replies. A single sparse field cannot carry per-hunk positions,
+  and the wire shape plus the resulting-coordinate semantics need a decision.
+  See `docs/RAJ_FEEDBACK.md`.
 
 ## Needs a design pass
+
+- Line/col on `apply`/`edit` replies (moved here 2026-09-15): per-hunk versus a
+  single span, byte column versus editor column, and what a no-op or stale-base
+  hunk reports.
 
 - Making the write target explicit (mandatory path or `-active`), which decides the footgun permanently.
 - Merging `read`/`version`/`dump` and collapsing the write verbs onto one door.
@@ -67,7 +87,7 @@ Protocol-only ops with no CLI verb: `ping` (used by `whoami`), `text` (the `read
 - A typo'd `open` is refused unless `-create` (verified live).
 - Rebuilt client: `-create` is parsed and forwarded; the "no create verb" report was a stale container binary.
 - Registry: gone ids recycled at the 255 cap skipping id 1; `Registry.Seed` keeps attribution across restart (COMPLETED.md).
-- Relative/absolute/editor-spelled paths all resolve inbound (`read` verified); only response-side spelling lags (cause 1).
+- Relative/absolute/editor-spelled paths all resolve inbound (`read` verified), and response-side spelling is translated too (`localise` covers nested `DiffJSON`/`Truncated`/`LSPJSON` and `Err` since 2026-09-15).
 - Identity: version handshake, server-minted `tok_...`, per-session `RAJ_IDENTITY` absorption by the plugin.
 - `reject -all` newest-first, line-index corruption, search `LineStart` — in tree, host verification pending (TODO `[~]`).
 

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"raj/internal/keys"
 	"raj/internal/ui"
 	"raj/internal/widget"
 )
@@ -191,5 +192,129 @@ func TestMessageClampFitsScreen(t *testing.T) {
 	}
 	if lines := c.messageLinesFor(w, 12); len(lines) > 12-2-4 {
 		t.Errorf("confirm message is %d lines, want <= %d", len(lines), 12-2-4)
+	}
+}
+
+// A Suggest hook lists a directory's entries under the field as it is typed, so
+// a name can be seen before enough of it has been typed to complete.
+func TestAskListsSuggestionsUnderTheField(t *testing.T) {
+	p := New()
+	p.AskList("Save as", "/work/", nil, func(string) []Candidate {
+		return []Candidate{
+			{Text: "/work/main.go", Display: "main.go"},
+			{Text: "/work/pkg/", Display: "pkg/", Dir: true},
+		}
+	}, nil)
+
+	s := ui.NewScreen(80, 24)
+	p.Render(s, 80, 24, widget.DefaultTheme())
+	x, y, w, _, ok := p.box(80, 24)
+	if !ok {
+		t.Fatal("dialog does not fit")
+	}
+	field := y + 1 + widget.Height
+	for i, want := range []string{"main.go", "pkg/"} {
+		if got := rowText(s, x, w, field+i); got != want {
+			t.Errorf("listing row %d = %q, want %q", i, got, want)
+		}
+	}
+	// The hint stays under the listing rather than being overwritten by it.
+	if got := rowText(s, x, w, field+2); !strings.Contains(got, "esc  cancel") {
+		t.Errorf("hint row = %q, want the hint under the listing", got)
+	}
+}
+
+// Typing narrows the listing: what is offered is the entries matching the text
+// so far, not the whole directory.
+func TestAskSuggestionsTrackTheText(t *testing.T) {
+	p := New()
+	p.AskList("Save as", "/work/", nil, func(text string) []Candidate {
+		if strings.HasSuffix(text, "re") {
+			return []Candidate{{Text: "/work/README.md", Display: "README.md"}}
+		}
+		return []Candidate{
+			{Text: "/work/main.go", Display: "main.go"},
+			{Text: "/work/README.md", Display: "README.md"},
+		}
+	}, nil)
+
+	p.Handle(keys.None, "re")
+	s := ui.NewScreen(80, 24)
+	p.Render(s, 80, 24, widget.DefaultTheme())
+	x, y, w, _, _ := p.box(80, 24)
+	field := y + 1 + widget.Height
+	if got := rowText(s, x, w, field); got != "README.md" {
+		t.Errorf("listing row = %q, want README.md", got)
+	}
+	if got := rowText(s, x, w, field+1); strings.Contains(got, "main.go") {
+		t.Errorf("listing was not filtered: %q", got)
+	}
+}
+
+// An arrow steps into the listing; choosing a directory fills the field and
+// keeps the question open, so the listing becomes that directory's contents.
+func TestAskChoosingADirectoryDescends(t *testing.T) {
+	p := New()
+	p.AskList("Save as", "/work/", nil, func(text string) []Candidate {
+		if text == "/work/pkg/" {
+			return []Candidate{{Text: "/work/pkg/a.go", Display: "a.go"}}
+		}
+		return []Candidate{
+			{Text: "/work/main.go", Display: "main.go"},
+			{Text: "/work/pkg/", Display: "pkg/", Dir: true},
+		}
+	}, nil)
+
+	p.Handle(keys.LineDown, "") // highlight main.go
+	p.Handle(keys.LineDown, "") // highlight pkg/
+	p.Handle(keys.Confirm, "")
+	if !p.Open {
+		t.Fatal("choosing a directory closed the question")
+	}
+	if got := p.Text(); got != "/work/pkg/" {
+		t.Errorf("field = %q, want the chosen directory", got)
+	}
+	if len(p.cands) != 1 || p.cands[0].Display != "a.go" {
+		t.Errorf("listing = %v, want the directory's contents", p.cands)
+	}
+}
+
+// Choosing a file answers with its full text: the highlight is what makes enter
+// take a listed entry rather than the typed prefix.
+func TestAskChoosingAFileAnswers(t *testing.T) {
+	p := New()
+	var answer string
+	var ok bool
+	p.AskList("Save as", "/work/", nil, func(string) []Candidate {
+		return []Candidate{
+			{Text: "/work/main.go", Display: "main.go"},
+			{Text: "/work/notes.md", Display: "notes.md"},
+		}
+	}, func(a string, o bool) { answer, ok = a, o })
+
+	p.Handle(keys.LineDown, "")
+	p.Handle(keys.LineDown, "") // notes.md
+	p.Handle(keys.Confirm, "")
+	if p.Open {
+		t.Fatal("choosing a file did not answer")
+	}
+	if !ok || answer != "/work/notes.md" {
+		t.Errorf("answer = %q ok = %v, want /work/notes.md", answer, ok)
+	}
+}
+
+// Enter with nothing highlighted still answers with the field, so a listing
+// that happens to contain the typed name cannot change the answer.
+func TestAskEnterWithoutAHighlightUsesTheField(t *testing.T) {
+	p := New()
+	var answer string
+	var ok bool
+	p.AskList("Save as", "/work/notes.md", nil, func(string) []Candidate {
+		return []Candidate{{Text: "/work/notes.md", Display: "notes.md"}}
+	}, func(a string, o bool) { answer, ok = a, o })
+
+	p.Handle(keys.Confirm, "")
+	if !ok || answer != "/work/notes.md" {
+		t.Errorf("answer = %q ok = %v, want the typed text", answer, ok)
 	}
 }

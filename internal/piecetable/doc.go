@@ -3,9 +3,9 @@ package piecetable
 import "strings"
 
 // Doc is the resident buffer: pieces live as fixed-width records inside the
-// leaves of an order-statistics B-tree (EDIT-BUFFER-STRATEGY.md §6). Structural
-// edits are O(log n) plus a bounded in-leaf memmove, lookups are one descent,
-// and the whole thing is ~19.5 B/piece with no per-piece allocation.
+// leaves of an order-statistics B-tree. Structural edits are O(log n) plus a
+// bounded in-leaf memmove, lookups are one descent, and the whole thing is
+// ~19.5 B/piece with no per-piece allocation.
 //
 // Doc owns the editing semantics; PieceBTree owns the index. The split matters
 // because the tree knows nothing about text — it moves fixed-width records and

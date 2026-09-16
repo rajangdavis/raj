@@ -425,3 +425,163 @@ func TestSaveWithoutPendingSkipsReview(t *testing.T) {
 		t.Errorf("status = %q, want the save to have gone through", h.Status())
 	}
 }
+
+// foldFixtureText is a tall buffer of identical lines: a two-line fold above a
+// deep proposal moves the proposal's display row one above its session line,
+// which is the difference the review maps must honour. Offsets in the tests
+// below are derived from this layout.
+func foldFixtureText() string { return strings.Repeat("xxxxxxxxxx\n", 40) }
+
+// A rejected two-line insertion at the top folds to one row: session line s
+// then draws at display row s-1. The proposal below replaces original line 29,
+// which is session line 31 and display row 30.
+const (
+	foldInsertAt    = 0
+	foldProposalAt  = 323 // 4 (the hidden run) + 11*29, the start of original line 29
+	foldProposalLn  = 31
+	foldProposalRow = 30
+)
+
+// proposeBelowAFold rejects a two-line insertion at the top and proposes a
+// change below it, then lays the frame out so the projection is live.
+func proposeBelowAFold(t *testing.T, h *harness) {
+	t.Helper()
+	p := h.Pane()
+	hidden := propose(t, h, piecetable.Hunk{
+		Start: foldInsertAt, End: foldInsertAt, Text: "X\nY\n",
+	})
+	if !p.File.RejectGroup(hidden) {
+		t.Fatal("rejecting the fold's set failed")
+	}
+	propose(t, h, piecetable.Hunk{
+		Start: foldProposalAt, End: foldProposalAt + len("xxxxxxxxxx"), Text: "PROPOSED",
+	})
+	h.Draw()
+}
+
+// A proposal below a fold is on screen when its display row is, not when its
+// session line is: the viewport window is rows, and the fold above the set
+// moved the row.
+func TestProposalsVisibleProjectsBelowAFold(t *testing.T) {
+	h := newHarness(t, foldFixtureText())
+	proposeBelowAFold(t, h)
+	p := h.Pane()
+
+	marks := p.PendingMarks()
+	if len(marks) != 1 {
+		t.Fatalf("pending marks = %d, want the one proposal", len(marks))
+	}
+	if marks[0].Line != foldProposalLn {
+		t.Fatalf("mark session line = %d, want %d", marks[0].Line, foldProposalLn)
+	}
+	if got := p.DispOfDocLine(foldProposalLn); got != foldProposalRow {
+		t.Fatalf("display row = %d, want %d: the fold must shift it up one", got, foldProposalRow)
+	}
+
+	// A one-row window exactly on the display row. The session line is below
+	// the window, so a session-line visibility test would miss the set.
+	p.Viewport.Top, p.Viewport.Rows = foldProposalRow, 1
+	if p.Viewport.Visible(foldProposalLn) {
+		t.Fatal("setup: the session line is in the window; the two maps cannot be told apart")
+	}
+	got := h.proposalsVisible(p)
+	if len(got) != 1 || got[0].Line != foldProposalLn {
+		t.Errorf("proposalsVisible = %+v, want the set at display row %d", got, foldProposalRow)
+	}
+}
+
+// The cycle's jump lands the caret file-true — on the set's session line — and
+// centres the viewport on the row that draws it, so the fold above the set does
+// not scroll to the wrong place.
+func TestCycleProposedJumpsToTheProjectedRow(t *testing.T) {
+	h := newHarness(t, foldFixtureText())
+	proposeBelowAFold(t, h)
+	p := h.Pane()
+	p.Cursors.Set(0, 0)
+	h.Draw()
+
+	h.press("ctrl+super+.")
+
+	caret := p.Cursors.Primary().Head
+	if line := p.File.LineOf(caret); line != foldProposalLn {
+		t.Fatalf("caret session line = %d, want %d", line, foldProposalLn)
+	}
+	row, _ := p.DispPos(caret)
+	if row != foldProposalRow {
+		t.Fatalf("caret display row = %d, want %d", row, foldProposalRow)
+	}
+	want := row - p.Viewport.Rows/2
+	if want < 0 {
+		want = 0
+	}
+	if got := p.Viewport.Top; got != want {
+		t.Errorf("viewport top = %d, want %d: centred on display row %d, not session line %d",
+			got, want, row, foldProposalLn)
+	}
+}
+
+// A proposal a fold hides has no row to land on, so the review walk skips it
+// rather than clamping onto the fold row it would otherwise share.
+func TestProposalInAFoldIsSkipped(t *testing.T) {
+	h := newHarness(t, "one\ntwo\nthree\n")
+	propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "P\nQ\n"})
+	p := h.Pane()
+
+	// The policy asked for here excludes the proposal, so its whole run hides
+	// behind a fold. The app's own Edit policy shows proposals; this is the
+	// guard the map demands for the policy that does not.
+	p.SetDisplay(piecetable.AcceptedOnly)
+	if got := p.DispOfDocLine(p.PendingMarks()[0].Line); got != -1 {
+		t.Fatalf("setup: proposal line maps to row %d, want -1 (hidden)", got)
+	}
+	if got := proposalGroups(p); len(got) != 0 {
+		t.Errorf("proposalGroups = %+v, want the hidden set skipped", got)
+	}
+	if got := h.proposalsVisible(p); len(got) != 0 {
+		t.Errorf("proposalsVisible = %+v, want the hidden set skipped", got)
+	}
+
+	h.press("ctrl+super+.")
+	if got := h.Status(); !strings.Contains(got, "no proposed changes") {
+		t.Errorf("status = %q, want the cycle to report nothing to step to", got)
+	}
+}
+
+// With a pending proposal but no fold the projection still places each session
+// line on its own display row, so every conversion the review maps make is the
+// raw session coordinate and the review behaves as it did before folds existed.
+func TestReviewMapsAreIdentityWithoutDecisions(t *testing.T) {
+	h := newHarness(t, reviewFixture)
+	// Replace the whole line. The shared reviewAt/reviewOld hunk cuts "world"
+	// out of the middle of the line, and the projection then lays the before
+	// and after composition segments on separate rows, so the row count is no
+	// longer the line count. A boundary on the line's own start and end keeps
+	// one row per line, which is what this identity test is about; the pending
+	// mark is all it needs from the edit.
+	propose(t, h, piecetable.Hunk{Start: 0, End: len("hello world"), Text: "hello socket"})
+	p := h.Pane()
+	h.Draw()
+
+	if got := p.DisplayLines(); got != p.File.Lines() {
+		t.Fatalf("display lines = %d, want the %d session lines", got, p.File.Lines())
+	}
+	if got := p.DispOfDocLine(0); got != 0 {
+		t.Errorf("DispOfDocLine(0) = %d, want 0", got)
+	}
+	marks := p.PendingMarks()
+	if len(marks) != 1 {
+		t.Fatalf("pending marks = %d, want 1", len(marks))
+	}
+	if got := marks[0].DispLine(p); got != marks[0].Line {
+		t.Errorf("DispLine = %d, want the session line %d", got, marks[0].Line)
+	}
+
+	p.Viewport.Top, p.Viewport.Rows = 0, p.File.Lines()
+	if got := h.proposalsVisible(p); len(got) != 1 {
+		t.Errorf("proposalsVisible = %+v, want the one proposal", got)
+	}
+	reviewJump(p, 1)
+	if line := p.File.LineOf(p.Cursors.Primary().Head); line != 0 {
+		t.Errorf("caret line = %d after a jump to line 1, want 0", line)
+	}
+}

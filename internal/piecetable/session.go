@@ -227,11 +227,21 @@ type Hunk struct {
 type Conflict struct {
 	Index int
 	Hunk  Hunk
-	At    Version // the op that invalidated the range
+	// At is the op that invalidated the range, for the stale-offset case. A
+	// lease refusal invalidates nothing — the range is intact and simply
+	// someone else's — so At is zero there and the owner below is what the
+	// caller acts on instead.
+	At Version
 	// Group names the change set that owns the range as a read-only lease when
 	// the conflict is a lease refusal; zero otherwise. It tells a caller which
 	// decision has to be made before the hunk can land.
 	Group uint64
+	// Author is the owning set's writer and Start/End the current rebased span
+	// of the run that refused the hunk, when Group is non-zero. They are zero
+	// for a stale-offset conflict. Reporting them here saves the caller a
+	// second call to learn who holds the text and where it is.
+	Author     Author
+	Start, End int
 }
 
 // ApplyDiff applies hunks written against version base.
@@ -241,32 +251,87 @@ type Conflict struct {
 // applied in order and each is rebased from base against everything already in
 // the journal, including earlier hunks from this same diff — so overlapping
 // hunks within one diff conflict with each other, which is what you want.
-func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version, []Conflict) {
+//
+// A hunk that replaces nothing with nothing — Start == End and empty text — is
+// skipped before it can commit. It is not a change, so it must not open a
+// change set or join one; a batch of only no-ops leaves the journal untouched
+// and a mixed batch applies only the real hunks.
+//
+// Warnings are the third channel. When a hunk lands over another writer's
+// Proposed run -- the advisory lease -- every distinct set it moved past is
+// named there by group, author and the span it held when the hunk landed, once
+// per set however many hunks in the batch catch it. A conflict is a refusal; a
+// warning is a success the caller has to know about; a clean apply has neither.
+// The advisory applies only when every Proposed run a hunk catches belongs to
+// another writer: a hunk that also catches the writer's own Proposed set is not
+// a clean amendment and refuses, whatever the run order.
+func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version, []Conflict, []Block) {
 	var conflicts []Conflict
+	var warnings []Block
+	warned := map[uint64]bool{}
 	for i, h := range hunks {
+		if h.Start == h.End && h.Text == "" {
+			continue
+		}
 		start, end, at, ok := s.rebase(h.Start, h.End, base)
 		if !ok {
 			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, At: at})
 			continue
 		}
-		// A pending or rejected span is a read-only lease: a hunk that would
-		// land in one is refused, so the composition stays overlap-free, and
-		// the conflict names the set whose decision has to come first.
+		// A pending or rejected span is a read-only lease, but the two states
+		// are different walls. A Rejected span is the human's decision, not a
+		// draft, so a hunk that catches one is refused and the rejection wins
+		// over any Proposed draft the hunk also catches. A Proposed run is
+		// advisory: the editing author's op applies in its own new group, the
+		// original set's overlapping members are left moved past what a rebase
+		// can carry, and the returned warnings name every set it moved past.
 		//
-		// The one exception is a writer amending its own proposed set: the
-		// refinement belongs to the same reviewable unit, so the op joins that
-		// set (join) rather than being refused. Another author's set, and a set
-		// already Rejected, still refuse — un-rejecting takes the clear gesture
-		// and a fresh decision, not another edit. A hunk that catches any other
-		// lease too is not a clean amendment and still conflicts, which is what
-		// leasedElsewhere checks.
+		// A writer amending its own Proposed set is the one hunk that joins:
+		// the refinement belongs to the same reviewable unit, so the op folds
+		// into that set rather than opening a second one. That exception is
+		// order-independent: it holds only when every intersecting Proposed
+		// run is the writer's own. A hunk that also catches another writer's
+		// draft is not a clean amendment and refuses against the own set,
+		// whichever run is met first -- otherwise run order would sometimes
+		// land the hunk and silently supersede the writer's own draft.
+		// proposedSpans reports every distinct intersecting Proposed set, so
+		// one pass is the evidence for both the amendment and the refusal.
 		var join uint64
-		if g, leased := s.Leased(start, end-start); leased {
-			if owner, own := s.groupAuthor(g); !own || owner != author || s.GroupState(g) != Proposed || s.leasedElsewhere(start, end-start, g) {
-				conflicts = append(conflicts, Conflict{Index: i, Hunk: h, Group: g})
-				continue
+		if rg, rs, re, rejected := s.rejectedLease(start, end-start); rejected {
+			ra, _ := s.groupAuthor(rg)
+			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, Group: rg,
+				Author: ra, Start: rs, End: re})
+			continue
+		}
+		spans := s.proposedSpans(start, end-start)
+		var own Block
+		for _, w := range spans {
+			if w.Author == author {
+				own = w
+				break
 			}
-			join = g
+		}
+		switch {
+		case own.Group != 0 && len(spans) > 1:
+			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, Group: own.Group,
+				Author: own.Author, Start: own.Start, End: own.End})
+			continue
+		case own.Group != 0:
+			join = own.Group
+		default:
+			// Every caught Proposed run is another writer's draft, not a
+			// wall: the hunk commits below in the editing author's own new
+			// group, and every distinct set it moved past is named once, so a
+			// caller told about one overlap is not left to find the others in
+			// groups/diff later. The dedupe is per set across the whole batch:
+			// two hunks that catch one set name it once.
+			for _, w := range spans {
+				if warned[w.Group] {
+					continue
+				}
+				warned[w.Group] = true
+				warnings = append(warnings, w)
+			}
 		}
 		op := Op{Author: author, Pos: start}
 		if end > start {
@@ -278,7 +343,7 @@ func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version,
 		}
 		s.commitInto(op, join)
 	}
-	return s.Version(), conflicts
+	return s.Version(), conflicts, warnings
 }
 
 // rebase carries [start, end) from version base to the present, and reports the
@@ -524,6 +589,15 @@ func (s *Session) reverseMembers(group uint64, want OpKind, keep func(Author) bo
 // rejecting a change set means the whole set, which is the only reading under
 // which "reject" is a decision about a proposal rather than about a person.
 func (s *Session) reverseGroup(group uint64, want OpKind, keep func(Author) bool) bool {
+	ok, _ := s.reverseGroupBlock(group, want, keep)
+	return ok
+}
+
+// reverseGroupBlock is reverseGroup plus, when a member cannot be placed, the
+// live change set whose span overlaps it. The block is the report a caller
+// needs to say what has to move first; reverseGroup throws it away, and the
+// undo and redo callers have no use for it.
+func (s *Session) reverseGroupBlock(group uint64, want OpKind, keep func(Author) bool) (bool, Block) {
 	members := s.reverseMembers(group, want, keep)
 	s.Begin()
 	defer s.End()
@@ -534,20 +608,20 @@ func (s *Session) reverseGroup(group uint64, want OpKind, keep func(Author) bool
 	// rolls the whole group back instead.
 	var applied []Version
 	for i := len(members) - 1; i >= 0; i-- {
-		inv, ok := s.rebasedInverse(members[i])
+		inv, at, ok := s.rebasedInverseAt(members[i])
 		if !ok {
-			s.rollback(applied, members)
-			return false
+			s.rollback(applied)
+			return false, s.blockFor(at)
 		}
 		applied = append(applied, s.Version())
 		s.commit(inv)
 	}
-	return len(applied) > 0
+	return len(applied) > 0, Block{}
 }
 
-// rollback undoes a partial group reversal, newest first, restoring the flags
-// each step set.
-func (s *Session) rollback(applied []Version, members []Op) {
+// rollback undoes a partial reversal, newest first, restoring the flags each
+// step set.
+func (s *Session) rollback(applied []Version) {
 	for j := len(applied) - 1; j >= 0; j-- {
 		op := s.journal[applied[j]]
 		back, ok := s.rebasedInverse(op)
@@ -575,8 +649,17 @@ func (s *Session) live(seq Version) bool {
 // is in the coordinates of the version it was applied at, so everything since
 // has to be replayed over it.
 func (s *Session) rebasedInverse(o Op) (Op, bool) {
+	inv, _, ok := s.rebasedInverseAt(o)
+	return inv, ok
+}
+
+// rebasedInverseAt is rebasedInverse plus the seq of the op rebase reported as
+// having damaged the range when it cannot be placed, so a caller can name what
+// blocked it (see blockFor). A failure with no damaging op -- a Pos past the
+// document -- reports zero.
+func (s *Session) rebasedInverseAt(o Op) (Op, Version, bool) {
 	inv := o.Inverse()
-	start, end, _, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
+	start, end, at, ok := s.rebase(o.Pos, o.Pos+o.InsLen(), o.Seq+1)
 	// The rebased span has to be inside the document for the inverse to be
 	// placeable. It does not always end up there: an op recorded with a Pos
 	// past the document (a bad offset accepted against the wrong base) maps
@@ -584,10 +667,10 @@ func (s *Session) rebasedInverse(o Op) (Op, bool) {
 	// Committing that inverse would report success while the text stayed and
 	// the op went dead, so refuse rather than lie.
 	if !ok || end-start != o.InsLen() || end > s.buf.Len() {
-		return Op{}, false
+		return Op{}, at, false
 	}
 	inv.Pos = start
-	return inv, true
+	return inv, 0, true
 }
 
 // LastOp is the most recently applied op. Callers that maintain derived state —

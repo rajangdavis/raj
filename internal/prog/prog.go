@@ -101,6 +101,7 @@ const (
 	OpDumpID     = 0x0f // varint: a snapshot id from a prior dump, for patch
 	OpLSPMode    = 0x10 // string: hover, definition, completion or diagnostics
 	OpReviewList = 0x11 // flag: review returns the list only, entering no mode
+	OpArg        = 0x12 // one argv element for exec; repeated, they accumulate
 
 	// verbs (0x80–0xff) are the driver verbs, refused when unknown
 	OpPing    = 0x80
@@ -124,6 +125,8 @@ const (
 	OpDiff    = 0x92 // pending change sets as old→new text, for review
 	OpReview  = 0x93 // pending change sets and, unless list-only, review mode
 	OpClear   = 0x94 // hard-purge a rejected change set
+	OpFind    = 0x95 // locate a pattern in the buffer and answer its byte span
+	OpExec    = 0x96 // run a command; its argv accumulates from arg ops
 
 )
 
@@ -152,7 +155,8 @@ var names = map[byte]string{
 	OpGoto:  "goto", OpClose: "close", OpLine: "line", OpCol: "col",
 	OpDumpID: "dump-id", OpDump: "dump", OpPatch: "patch",
 	OpLSPMode: "lsp-mode", OpLSP: "lsp", OpDiff: "diff",
-	OpReviewList: "review-list", OpReview: "review", OpClear: "clear",
+	OpReviewList: "review-list", OpArg: "arg", OpReview: "review", OpClear: "clear",
+	OpFind: "find", OpExec: "exec",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

@@ -196,8 +196,13 @@ func (e *editor) open(name string) {
 	time.Sleep(settle)
 }
 
-// binary builds raj once and caches the path for the whole run.
-var builtBinary string
+// binary builds raj once and caches the path for the whole run. builtDir is the
+// temp tree it lives in; TestMain removes it when the run ends, so a smoke run
+// does not leave a raj-smoke* tree behind it.
+var (
+	builtBinary string
+	builtDir    string
+)
 
 func binary(t *testing.T) string {
 	t.Helper()
@@ -214,7 +219,7 @@ func binary(t *testing.T) string {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build raj: %v\n%s", err, out)
 	}
-	builtBinary = path
+	builtBinary, builtDir = path, dir
 	return path
 }
 

@@ -1,4 +1,4 @@
-,# File lifecycle — design note and verb spec
+# File lifecycle — design note and verb spec
 
 Status: built 2026-09-13/14 (rebuilt and host-verified). Companion to
 `docs/CLAIM-SPEC.md` (the claim gate the lifecycle verbs are gated on). W4a

@@ -509,9 +509,15 @@ func (a *App) showCompletion(p *editor.Pane, minPrefix int) bool {
 		return false
 	}
 	head := p.Cursors.Primary().Head
-	line := p.File.LineOf(head)
-	col := head - p.File.LineStart(line)
-	prefix := complete.PrefixAt(p.File.Line(line), col)
+	// The popup is placed in display rows and columns: a fold above the caret
+	// shifts every row after it, so anchoring on the session line would put the
+	// list a row off. With no decisions DispPos is File.LineCol exactly, so a
+	// clean buffer is unchanged.
+	line, col := p.DispPos(head)
+	// The prefix stays in session bytes: PrefixAt indexes the line's text, and
+	// a hidden run is not on screen to be completed from.
+	sessionLine := p.File.LineOf(head)
+	prefix := complete.PrefixAt(p.File.Line(sessionLine), head-p.File.LineStart(sessionLine))
 	if len(prefix) < minPrefix {
 		a.hideCompletion()
 		return false
@@ -1294,9 +1300,21 @@ func (a *App) jumpTo(line int) {
 	if p == nil || line <= 0 {
 		return
 	}
+	// Out of range clamps to the end, as the old LineStart/Center path did:
+	// only a line that exists but a fold hides is skipped.
+	if last := p.File.Lines() - 1; last >= 0 && line-1 > last {
+		line = last + 1
+	}
+	// line is a 1-based session line; the viewport works in display rows. A
+	// line hidden inside a fold has no row to land on, so the jump is skipped
+	// rather than clamped onto the fold marker.
+	row := p.DispOfDocLine(line - 1)
+	if row < 0 {
+		return
+	}
 	off := p.File.LineStart(line - 1)
 	p.Cursors.Set(off, off)
-	p.Viewport.Center(line-1, p.File.Lines())
+	p.Viewport.Center(row, p.DisplayLines())
 }
 
 // ---------- file lifecycle ----------
@@ -1767,10 +1785,11 @@ func (a *App) ask(title, initial string, done func(string, bool)) {
 	a.Prompt.Ask(title, initial, done) // a plain question completes nothing
 }
 
-// askPath is ask for a question whose answer is a file path, so tab completes.
+// askPath is ask for a question whose answer is a file path, so tab completes
+// and the directory being typed into is listed.
 func (a *App) askPath(title, initial string, done func(string, bool)) {
 	a.beforePrompt()
-	a.Prompt.AskComplete(title, initial, a.completePath, done)
+	a.Prompt.AskList(title, initial, a.completePath, a.pathCandidates, done)
 }
 
 // completePath extends a partially typed path, for tab in a save-as field.
@@ -1817,6 +1836,46 @@ func (a *App) completePath(text string) string {
 		common += string(filepath.Separator)
 	}
 	return dir + common
+}
+
+// pathCandidates lists the entries of the directory a save-as field names,
+// filtered to those matching the partial name, so the field shows what is
+// already there rather than only completing once enough of a name has been
+// typed to be unambiguous.
+//
+// It mirrors completePath's rules — the same directory resolution, the same
+// hidden-file rule — because a listing and a completion that disagreed about
+// which entries exist would be worse than either alone.
+func (a *App) pathCandidates(text string) []prompt.Candidate {
+	dir, base := filepath.Split(text)
+	abs := dir
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(a.root, dir)
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return nil
+	}
+	var out []prompt.Candidate
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") && !strings.HasPrefix(base, ".") {
+			continue
+		}
+		if !strings.HasPrefix(e.Name(), base) {
+			continue
+		}
+		c := prompt.Candidate{Text: dir + e.Name(), Display: e.Name()}
+		if e.IsDir() {
+			// A trailing separator both shows it is a directory and makes
+			// choosing it descend: the field then names the directory and the
+			// next listing is its contents.
+			c.Text += string(filepath.Separator)
+			c.Display += string(filepath.Separator)
+			c.Dir = true
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // sharedPrefix is the longest prefix two names agree on, in bytes.

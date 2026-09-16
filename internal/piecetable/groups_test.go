@@ -1,6 +1,9 @@
 package piecetable
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func groupSession(t *testing.T, text string) *Session {
 	t.Helper()
@@ -616,18 +619,21 @@ func TestDiffPendingProjectsATrimmedRun(t *testing.T) {
 	}
 }
 
-// An apply whose hunk lands inside a leased run conflicts, names the set, and
-// leaves the document and the version alone. An insertion flush with the run's
-// first byte is outside the lease and still lands.
+// An apply whose hunk lands inside a Rejected run conflicts, names the set, and
+// leaves the document and the version alone. A rejection is locked, unlike an
+// advisory Proposed run (TestApplyDiffAppliesOverAnotherAuthorsProposal above).
+// An insertion flush with the run's first byte is outside the lease and lands.
 func TestApplyDiffRefusesALease(t *testing.T) {
 	s := groupSession(t, "hello world\n")
 	base := s.Version()
 	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
 	id := s.LastGroup()
-	s.MarkGroup(id, Proposed)
+	if !s.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
 	v0 := s.Version()
 
-	_, conflicts := s.ApplyDiff(User, v0, []Hunk{{Start: 8, End: 10, Text: "XX"}})
+	_, conflicts, _ := s.ApplyDiff(User, v0, []Hunk{{Start: 8, End: 10, Text: "XX"}})
 	if len(conflicts) != 1 {
 		t.Fatalf("conflicts = %+v, want one lease refusal", conflicts)
 	}
@@ -642,7 +648,7 @@ func TestApplyDiffRefusesALease(t *testing.T) {
 	}
 
 	// The run starts at 6; an insertion there sits before it, not in it.
-	_, conflicts = s.ApplyDiff(User, s.Version(), []Hunk{{Start: 6, End: 6, Text: ">"}})
+	_, conflicts, _ = s.ApplyDiff(User, s.Version(), []Hunk{{Start: 6, End: 6, Text: ">"}})
 	if len(conflicts) != 0 {
 		t.Fatalf("boundary insert conflicted: %+v", conflicts)
 	}
@@ -663,7 +669,7 @@ func TestApplyDiffAmendsOwnProposal(t *testing.T) {
 	s.MarkGroup(id, Proposed)
 
 	// Refine the set's own text: "socket" becomes "port".
-	_, conflicts := s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 12, Text: "port"}})
+	_, conflicts, _ := s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 12, Text: "port"}})
 	if len(conflicts) != 0 {
 		t.Fatalf("amending own proposal conflicted: %+v", conflicts)
 	}
@@ -688,7 +694,7 @@ func TestApplyDiffAmendsOwnProposal(t *testing.T) {
 	}
 
 	// A later amendment of the same set folds too, and Last keeps advancing.
-	_, conflicts = s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 10, Text: "PORT"}})
+	_, conflicts, _ = s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 10, Text: "PORT"}})
 	if len(conflicts) != 0 {
 		t.Fatalf("second amendment conflicted: %+v", conflicts)
 	}
@@ -718,7 +724,7 @@ func TestApplyDiffRefusesOwnRejectedSet(t *testing.T) {
 	}
 	v0 := s.Version()
 
-	_, conflicts := s.ApplyDiff(Agent, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	_, conflicts, _ := s.ApplyDiff(Agent, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
 	if len(conflicts) != 1 || conflicts[0].Group != id {
 		t.Fatalf("conflicts = %+v, want the rejected set to refuse", conflicts)
 	}
@@ -731,9 +737,10 @@ func TestApplyDiffRefusesOwnRejectedSet(t *testing.T) {
 }
 
 // The amend exception is per-set: a hunk that also catches another writer's
-// proposed run is not a clean amendment and still refuses. Leased reports only
-// the first intersecting run, so the guard has to look for a second one
-// (leasedElsewhere); folding the hunk in would overwrite that writer's text.
+// proposed run is not a clean amendment and still refuses. The guard reads every
+// intersecting Proposed run (proposedSpans), not just the first, so it sees the
+// second one whichever order the projection reports; folding the hunk in would
+// overwrite that writer's text.
 func TestApplyDiffRefusesAHunkSpanningTwoLeases(t *testing.T) {
 	s := groupSession(t, "aaa bbb ccc\n")
 	base := s.Version()
@@ -752,7 +759,7 @@ func TestApplyDiffRefusesAHunkSpanningTwoLeases(t *testing.T) {
 
 	// The agent's hunk starts in its own set but spans the user's too, so it is
 	// refused: the user's run is a lease it does not own.
-	_, conflicts := s.ApplyDiff(Agent, v0, []Hunk{{Start: 0, End: 7, Text: "XXX"}})
+	_, conflicts, _ := s.ApplyDiff(Agent, v0, []Hunk{{Start: 0, End: 7, Text: "XXX"}})
 	if len(conflicts) != 1 {
 		t.Fatalf("conflicts = %+v, want one refusal for the second lease", conflicts)
 	}
@@ -764,6 +771,539 @@ func TestApplyDiffRefusesAHunkSpanningTwoLeases(t *testing.T) {
 	}
 	if got := text(s); got != "AAA BBB ccc\n" {
 		t.Errorf("text = %q, want both proposals unchanged", got)
+	}
+}
+
+// A hunk that spans the editing writer's own Proposed set and another writer's
+// must refuse whichever run the projection meets first. The advisory lease is
+// only for a draft the hunk does not own. The own set is found among all the
+// caught Proposed runs, so an own run met first refuses and one met second must
+// refuse just the same rather
+// than land and silently supersede the writer's own draft. Both orders name the
+// writer's own set. Modelled on TestApplyDiffRefusesAHunkSpanningTwoLeases (the
+// own+other refusal) and TestApplyDiffWarnsOverAnotherAuthorsProposal (the
+// two-draft setup).
+func TestApplyDiffRefusesOwnAndOtherProposalEitherOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		own, other Hunk
+		setupText  string
+	}{
+		{"own first", Hunk{Start: 0, End: 3, Text: "AAA"}, Hunk{Start: 8, End: 11, Text: "BBB"}, "AAA bbb BBB\n"},
+		{"other first", Hunk{Start: 8, End: 11, Text: "AAA"}, Hunk{Start: 0, End: 3, Text: "BBB"}, "BBB bbb AAA\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := groupSession(t, "aaa bbb ccc\n")
+			base := s.Version()
+
+			// The editing author's own proposal, wherever this order puts it.
+			if _, c, _ := s.ApplyDiff(Agent, base, []Hunk{tc.own}); len(c) != 0 {
+				t.Fatalf("own proposal conflicted: %+v", c)
+			}
+			ownSet := s.LastGroup()
+			s.MarkGroup(ownSet, Proposed)
+
+			// Another writer's proposal on the other run.
+			if _, c, _ := s.ApplyDiff(Author(3), s.Version(), []Hunk{tc.other}); len(c) != 0 {
+				t.Fatalf("other proposal conflicted: %+v", c)
+			}
+			otherSet := s.LastGroup()
+			s.MarkGroup(otherSet, Proposed)
+			if otherSet == ownSet {
+				t.Fatalf("setup folded both proposals into one set %d", ownSet)
+			}
+			if got := text(s); got != tc.setupText {
+				t.Fatalf("setup produced %q, want %q", got, tc.setupText)
+			}
+			v0 := s.Version()
+
+			// The editing author's hunk spans both runs; whichever is met
+			// first, it is not a clean amendment and refuses against the own set.
+			_, conflicts, warnings := s.ApplyDiff(Agent, v0, []Hunk{{Start: 0, End: 11, Text: "XXX"}})
+			if len(conflicts) != 1 {
+				t.Fatalf("conflicts = %+v, want one refusal for the own+other span", conflicts)
+			}
+			if got := conflicts[0].Group; got != ownSet {
+				t.Errorf("conflict group = %d, want the writer's own set %d", got, ownSet)
+			}
+			if got := conflicts[0].Author; got != Agent {
+				t.Errorf("conflict author = %d, want the editing author %d", got, Agent)
+			}
+			if len(warnings) != 0 {
+				t.Errorf("warnings = %+v, want none on a refusal", warnings)
+			}
+			if s.Version() != v0 {
+				t.Errorf("version moved on a refused hunk: %d -> %d", v0, s.Version())
+			}
+			if got := text(s); got != tc.setupText {
+				t.Errorf("text = %q, want both proposals unchanged", got)
+			}
+		})
+	}
+}
+
+// Another writer's Proposed run is a draft, not a wall: an apply over it lands
+// in the editing author's own new group, and the overwritten set's member is
+// left moved past what a rebase can carry. There is no conflict; the reply
+// carries a warning naming the superseded set, which
+// TestApplyDiffWarnsOverAnotherAuthorsProposal pins, and the moved count
+// remains the review-surface record.
+func TestApplyDiffAppliesOverAnotherAuthorsProposal(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	v0 := s.Version()
+
+	_, conflicts, _ := s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want the advisory proposal to allow the apply", conflicts)
+	}
+	if s.Version() <= v0 {
+		t.Errorf("version = %d, want it advanced past %d", s.Version(), v0)
+	}
+	if got := text(s); got != "hello port\n" {
+		t.Errorf("text = %q, want the user's overwrite applied", got)
+	}
+	// The agreed composition is deliberately not asserted here: a proposal
+	// whose inserted run an accepted edit consumed is the overlap the Invalid
+	// flag names (spec 12.3), so the set's exclusion and its collider are
+	// pinned by TestInvalidWhollyOverwrittenProposal instead.
+
+	// The user's op is its own change set, not folded into the agent's.
+	gs := s.Groups()
+	if len(gs) != 2 {
+		t.Fatalf("groups = %+v, want the user's apply to open a second set", gs)
+	}
+	last := gs[len(gs)-1]
+	if last.Author != User || last.ID == id {
+		t.Errorf("last group = %+v, want a new set by %d, not the agent's %d", last, User, id)
+	}
+
+	// The agent's set survives as a superseded proposal, its member moved.
+	diffs := s.DiffPending()
+	if len(diffs) != 1 || diffs[0].Group.ID != id {
+		t.Fatalf("diffs = %+v, want the agent's set reported as moved", diffs)
+	}
+	if diffs[0].Moved != 1 || len(diffs[0].Hunks) != 0 {
+		t.Errorf("diff = %+v, want the overwritten member counted as moved", diffs[0])
+	}
+}
+
+// A second writer apply over a first Proposed run succeeds, and the reply names
+// the set it moved past: the group, its author and the span the run holds at
+// the moment the hunk lands. This is the warning half of the advisory lease.
+// Modelled on TestApplyDiffAppliesOverAnotherAuthorsProposal, which pins the
+// apply itself.
+func TestApplyDiffWarnsOverAnotherAuthorsProposal(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	v0 := s.Version()
+
+	_, conflicts, warnings := s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want the advisory proposal to allow the apply", conflicts)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %+v, want one naming the superseded set", warnings)
+	}
+	w := warnings[0]
+	if w.Group != id || w.Author != Agent {
+		t.Errorf("warning = %+v, want set %d by agent %d", w, id, Agent)
+	}
+	// The span is the run bounds when the hunk landed: "socket" at 6..12.
+	if w.Start != 6 || w.End != 12 {
+		t.Errorf("warning span = %d..%d, want the superseded run 6..12", w.Start, w.End)
+	}
+}
+
+// A single hunk that lands across two different writers' Proposed sets names
+// both: reporting only the first would leave the second moved past silently.
+// Each set is named once. Modelled on TestApplyDiffRefusesAHunkSpanningTwoLeases
+// (the same two-set setup, but with the editing writer owning neither set so
+// the hunk lands) and on TestApplyDiffWarnsOverAnotherAuthorsProposal (the
+// warning shape).
+func TestApplyDiffWarnsOverEveryProposedSet(t *testing.T) {
+	s := groupSession(t, "aaa bbb ccc\n")
+	base := s.Version()
+
+	// Two disjoint proposals by two different writers.
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 0, End: 3, Text: "AAA"}})
+	first := s.LastGroup()
+	s.MarkGroup(first, Proposed)
+	s.ApplyDiff(Author(3), base, []Hunk{{Start: 4, End: 7, Text: "BBB"}})
+	second := s.LastGroup()
+	s.MarkGroup(second, Proposed)
+	v0 := s.Version()
+
+	// A third writer's single hunk spans both.
+	_, conflicts, warnings := s.ApplyDiff(Author(4), v0, []Hunk{{Start: 0, End: 7, Text: "XXX"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want both drafts advisory", conflicts)
+	}
+	if len(warnings) != 2 {
+		t.Fatalf("warnings = %+v, want both superseded sets", warnings)
+	}
+	byGroup := map[uint64]Block{}
+	for _, w := range warnings {
+		byGroup[w.Group] = w
+	}
+	if w, ok := byGroup[first]; !ok || w.Author != Agent {
+		t.Errorf("warning for %d = %+v, want it by agent %d", first, w, Agent)
+	}
+	if w, ok := byGroup[second]; !ok || w.Author != Author(3) {
+		t.Errorf("warning for %d = %+v, want it by author 3", second, w)
+	}
+	if _, ok := byGroup[second]; ok && (byGroup[second].Start != 4 || byGroup[second].End != 7) {
+		t.Errorf("warning span for %d = %d..%d, want the second run 4..7",
+			second, byGroup[second].Start, byGroup[second].End)
+	}
+}
+
+// One Proposed set with two surviving runs, caught by two hunks in one batch,
+// is named once: the set is superseded once, not once per hunk. Modelled on
+// TestApplyDiffWarnsOverAnotherAuthorsProposal, with the two-run set built as
+// one Begin/End change set.
+func TestApplyDiffWarnsOnceForASetCaughtTwice(t *testing.T) {
+	s := groupSession(t, "aaa bbb ccc\n")
+	base := s.Version()
+
+	// One proposal, two disjoint runs, one change set.
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{
+		{Start: 0, End: 3, Text: "AAA"},
+		{Start: 4, End: 7, Text: "BBB"},
+	})
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	v0 := s.Version()
+
+	// A second writer's batch touches each run with its own hunk.
+	_, conflicts, warnings := s.ApplyDiff(Author(3), v0, []Hunk{
+		{Start: 0, End: 3, Text: "XXX"},
+		{Start: 4, End: 7, Text: "YYY"},
+	})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want the draft advisory", conflicts)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %+v, want the one set named once", warnings)
+	}
+	if warnings[0].Group != id || warnings[0].Author != Agent {
+		t.Errorf("warning = %+v, want set %d by agent %d", warnings[0], id, Agent)
+	}
+}
+
+// Amending a writer own Proposed set is the one advisory overlap that is not a
+// warning: the refinement folds into the same set, so no second set is
+// superseded. Modelled on TestApplyDiffAmendsOwnProposal.
+func TestApplyDiffAmendDoesNotWarn(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	_, conflicts, warnings := s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want the amendment to fold in", conflicts)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %+v, want none for an own-set amendment", warnings)
+	}
+}
+
+// A clean apply reports no warnings: the advisory channel must stay silent
+// unless a hunk really landed over another Proposed span. Modelled on
+// TestApplyDiffClean.
+func TestApplyDiffCleanHasNoWarnings(t *testing.T) {
+	s := groupSession(t, "aaa bbb ccc")
+	base := s.Version()
+	_, conflicts, warnings := s.ApplyDiff(Agent, base, []Hunk{{Start: 0, End: 3, Text: "XXX"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want a clean apply", conflicts)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %+v, want none for a clean apply", warnings)
+	}
+}
+
+// A Rejected span still refuses, so the overlap that warns for a Proposed draft
+// reports a conflict for a decision and no warning at all. The two cases must
+// not collapse into one. Modelled on TestApplyDiffRefusesALease.
+func TestApplyDiffRefusalIsNotAWarning(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	if !s.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	v0 := s.Version()
+
+	_, conflicts, warnings := s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 1 || conflicts[0].Group != id {
+		t.Fatalf("conflicts = %+v, want the rejected set to refuse", conflicts)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %+v, want none for a refusal", warnings)
+	}
+	if s.Version() != v0 {
+		t.Errorf("version moved on a refused hunk: %d -> %d", v0, s.Version())
+	}
+}
+
+// A Proposed set every member of which a later accepted edit has overwritten is
+// invalid: recomputed from the journal, never stored, so a listing names it and
+// the live set whose edit now occupies its range. Pending already drops it; the
+// flag names the same fact and keeps its inserted text out of both
+// compositions. Modelled on TestApplyDiffAppliesOverAnotherAuthorsProposal
+// (which pins the superseded member as moved) and on
+// TestProjectPoliciesDifferOnProposedGroup (the per-policy split).
+func TestInvalidWhollyOverwrittenProposal(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	v0 := s.Version()
+	s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	collider := s.LastGroup()
+
+	g, ok := findGroup(s, superseded)
+	if !ok {
+		t.Fatalf("group %d not listed", superseded)
+	}
+	if !g.Invalid {
+		t.Fatalf("superseded set = %+v, want invalid", g)
+	}
+	if g.InvalidBy == nil || g.InvalidBy.Group != collider {
+		t.Fatalf("invalid by = %+v, want the colliding set %d", g.InvalidBy, collider)
+	}
+	if g.InvalidBy.Start != 6 || g.InvalidBy.End != 10 {
+		t.Errorf("colliding span = %d..%d, want the live run 6..10",
+			g.InvalidBy.Start, g.InvalidBy.End)
+	}
+	for _, p := range s.Pending() {
+		if p.ID == superseded {
+			t.Errorf("invalid set %d is still pending", superseded)
+		}
+	}
+	if got := s.Project(AcceptedAndProposed).Text(); strings.Contains(got, "socket") {
+		t.Errorf("edit composition %q still holds the invalid set's text", got)
+	}
+	if got := s.Project(AcceptedOnly).Text(); strings.Contains(got, "socket") {
+		t.Errorf("agreed composition %q still holds the invalid set's text", got)
+	}
+}
+
+// A Proposed set only partly overwritten is not invalid: its surviving member
+// is still there to accept, and the set must not be labelled with a collider
+// just because a sibling member was consumed. Modelled on
+// TestApplyDiffAppliesOverAnotherAuthorsProposal, with a two-member set so the
+// surviving half of the predicate is exercised rather than a lone member.
+func TestPartlyOverwrittenProposalSurvives(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.Begin()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 0, End: 0, Text: "// "}})
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+	v0 := s.Version()
+	// The user overwrites the first member's inserted run; the second survives
+	// ahead of it.
+	s.ApplyDiff(User, v0, []Hunk{{Start: 9, End: 15, Text: "port"}})
+
+	if got := text(s); got != "// hello port\n" {
+		t.Fatalf("setup produced %q", got)
+	}
+	g, ok := findGroup(s, id)
+	if !ok {
+		t.Fatalf("group %d not listed", id)
+	}
+	if g.Ops != 2 {
+		t.Fatalf("group = %+v, want both members live", g)
+	}
+	if g.Invalid {
+		t.Errorf("partly overwritten set = %+v, want not invalid", g)
+	}
+	if g.InvalidBy != nil {
+		t.Errorf("invalid by = %+v, want nil for a surviving set", g.InvalidBy)
+	}
+	var pending bool
+	for _, p := range s.Pending() {
+		if p.ID == id {
+			pending = true
+		}
+	}
+	if !pending {
+		t.Errorf("set %d dropped from Pending though a member survives", id)
+	}
+}
+
+// Invalid is derived, so clearing the colliding edit clears the flag and the
+// superseded set returns as work to decide. Modelled on
+// TestClearRejectedBacksOutTheWholeGroup for the reject-then-clear gesture and
+// on TestInvalidWhollyOverwrittenProposal for the setup.
+func TestInvalidClearsWhenColliderClears(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	v0 := s.Version()
+	s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	collider := s.LastGroup()
+
+	if g, _ := findGroup(s, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if !s.ClearRejected(collider) {
+		t.Fatal("clear of the collider failed")
+	}
+	if got := text(s); got != "hello socket\n" {
+		t.Fatalf("after clearing the collider text = %q, want the proposal back", got)
+	}
+	g, _ := findGroup(s, superseded)
+	if g.Invalid {
+		t.Errorf("set %d stayed invalid after the colliding edit was cleared", superseded)
+	}
+	if g.InvalidBy != nil {
+		t.Errorf("invalid by = %+v, want nil after the collider cleared", g.InvalidBy)
+	}
+	var pending bool
+	for _, p := range s.Pending() {
+		if p.ID == superseded {
+			pending = true
+		}
+	}
+	if !pending {
+		t.Errorf("set %d did not return to Pending after the collider cleared", superseded)
+	}
+}
+
+// Naming a set invalid is derived from the same per-member projection the
+// composition uses, so it must not perturb the composition: under every policy
+// the projection still agrees with the fold oracle where the contract defines
+// it, and the run lengths still agree where it does not. Modelled on the
+// per-step checks in FuzzProjectAgainstOracle.
+func TestInvalidKeepsProjectionInvariants(t *testing.T) {
+	const orig = "hello world\n"
+	s := groupSession(t, orig)
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	v0 := s.Version()
+	s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+
+	if g, ok := findGroup(s, superseded); !ok || !g.Invalid {
+		t.Fatalf("set %d = %+v (listed %v), want invalid", superseded, g, ok)
+	}
+	for _, p := range []Policy{AcceptedOnly, AcceptedAndProposed, Annotated} {
+		proj := s.Project(p)
+		orc := foldProjectOracle(orig, s, p)
+		if got, want := s.Buffer().Slice(0, s.Buffer().Len()), orc.view; got != want {
+			t.Fatalf("%v: oracle replay %q diverged from the buffer %q", p, want, got)
+		}
+		if proj.Len() != len(orc.text) {
+			t.Fatalf("%v: Len %d, oracle %d", p, proj.Len(), len(orc.text))
+		}
+		if orc.overlap {
+			continue // the contract does not define the composition here
+		}
+		checkSegments(t, s, p)
+		if got := proj.Text(); got != orc.text {
+			t.Fatalf("%v: composition %q, oracle %q", p, got, orc.text)
+		}
+	}
+}
+
+// findGroup returns the listed set with id, or false when the journal holds
+// none. Test-local, so the invalid tests read the listing the way a caller
+// does.
+func findGroup(s *Session, id uint64) (Group, bool) {
+	for _, g := range s.Groups() {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return Group{}, false
+}
+
+// A Rejected span is the human's decision, not a draft, so it still refuses an
+// apply even though an intersecting Proposed run would be advisory. When one
+// hunk catches both, the rejection wins and the conflict names the rejecting
+// set, rather than sending the caller to accept a draft that is not the block.
+func TestApplyDiffRefusesARejectedLeaseBesideAProposal(t *testing.T) {
+	s := groupSession(t, "aaa bbb ccc\n")
+	base := s.Version()
+
+	// The agent proposes "AAA"; the user rejects "BBB".
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 0, End: 3, Text: "AAA"}})
+	agentSet := s.LastGroup()
+	s.MarkGroup(agentSet, Proposed)
+	s.ApplyDiff(User, base, []Hunk{{Start: 4, End: 7, Text: "BBB"}})
+	userSet := s.LastGroup()
+	if !s.RejectGroup(userSet) {
+		t.Fatal("reject failed")
+	}
+	if got := text(s); got != "AAA BBB ccc\n" {
+		t.Fatalf("setup produced %q", got)
+	}
+	v0 := s.Version()
+
+	// The agent's hunk starts in its own Proposed run and spans the rejected
+	// one too: the rejection wins.
+	_, conflicts, _ := s.ApplyDiff(Agent, v0, []Hunk{{Start: 0, End: 7, Text: "XXX"}})
+	if len(conflicts) != 1 {
+		t.Fatalf("conflicts = %+v, want the rejection to refuse the hunk", conflicts)
+	}
+	if conflicts[0].Group != userSet {
+		t.Errorf("conflict group = %d, want the rejected set %d, not the proposal %d",
+			conflicts[0].Group, userSet, agentSet)
+	}
+	if s.Version() != v0 {
+		t.Errorf("version moved on a refused hunk: %d -> %d", v0, s.Version())
+	}
+	if got := text(s); got != "AAA BBB ccc\n" {
+		t.Errorf("text = %q, want both sets unchanged", got)
+	}
+}
+
+// The advisory change does not touch the same-author join: a writer amending
+// its own Proposed set still folds the op into that set rather than opening a
+// second one.
+func TestApplyDiffAmendsOwnProposalWithoutANewGroup(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	_, conflicts, _ := s.ApplyDiff(Agent, s.Version(), []Hunk{{Start: 6, End: 12, Text: "port"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("amending own proposal conflicted: %+v", conflicts)
+	}
+	gs := s.Groups()
+	if len(gs) != 1 {
+		t.Fatalf("groups = %+v, want the amendment to join the one set", gs)
+	}
+	if gs[0].ID != id || gs[0].Ops != 2 {
+		t.Errorf("group = %+v, want set %d with both members", gs[0], id)
+	}
+	if got := text(s); got != "hello port\n" {
+		t.Errorf("text = %q, want the amendment applied", got)
 	}
 }
 
@@ -779,10 +1319,10 @@ func TestApplyDiffRefusesAHunkSpanningTwoLeases(t *testing.T) {
 // document it was written in.
 func TestClearRejectedRefusesAWedgedSet(t *testing.T) {
 	s := groupSession(t, "")
-	if _, c := s.ApplyDiff(Agent, 0, []Hunk{{Start: 0, End: 0, Text: "hello world"}}); len(c) != 0 {
+	if _, c, _ := s.ApplyDiff(Agent, 0, []Hunk{{Start: 0, End: 0, Text: "hello world"}}); len(c) != 0 {
 		t.Fatalf("setup insert conflicts: %+v", c)
 	}
-	if _, c := s.ApplyDiff(Agent, 0, []Hunk{{Start: 5, End: 5, Text: "X"}}); len(c) != 0 {
+	if _, c, _ := s.ApplyDiff(Agent, 0, []Hunk{{Start: 5, End: 5, Text: "X"}}); len(c) != 0 {
 		t.Fatalf("setup offset conflicts: %+v", c)
 	}
 	id := s.LastGroup()
@@ -807,5 +1347,269 @@ func TestClearRejectedRefusesAWedgedSet(t *testing.T) {
 	}
 	if got := s.GroupState(id); got != Rejected {
 		t.Errorf("state = %v after a refused clear, want it to stay rejected", got)
+	}
+}
+
+// A rejected set can also be wedged by a later live edit that overlaps it, and
+// ClearRejectedBlock names that edit's set, author and span so the caller knows
+// what to clear first. A pure deletion leases nothing, so a later deletion of
+// overlapping original text is the reachable shape of the block.
+func TestClearRejectedBlockNamesTheBlocker(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	s.Begin()
+	s.Delete(Agent, 6, 5) // remove "world"
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Rejected)
+
+	s.Delete(User, 0, 11) // a later edit removes the whole line
+
+	ok, block := s.ClearRejectedBlock(id)
+	if ok {
+		t.Fatal("clearing a wedged set reported success")
+	}
+	if block.Group == 0 {
+		t.Fatalf("block = %+v, want the blocking set named", block)
+	}
+	if block.Author != User {
+		t.Errorf("block author = %d, want the user's %d", block.Author, User)
+	}
+	if got := s.GroupState(id); got != Rejected {
+		t.Errorf("state = %v, want it kept Rejected", got)
+	}
+}
+
+// Two pending sets whose rebased member ranges intersect are reported on both,
+// with the other's author, and nothing is clamped or merged: the editor does
+// not arbitrate.
+func TestPendingOverlapsNamesBothSets(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	s.Begin()
+	s.Insert(Agent, 0, "AA")
+	s.End()
+	a := s.LastGroup()
+	s.MarkGroup(a, Proposed)
+
+	// B inserts inside the span A's member now covers. A direct Insert is used
+	// because ApplyDiff would refuse it as a lease; the overlap is the fact
+	// under test, not the route to it.
+	s.Begin()
+	s.Insert(Agent+1, 1, "BB")
+	s.End()
+	b := s.LastGroup()
+	s.MarkGroup(b, Proposed)
+
+	ovs := s.PendingOverlaps()
+	if len(ovs[a]) != 1 || ovs[a][0].Group != b || ovs[a][0].Author != Agent+1 {
+		t.Errorf("overlaps[%d] = %+v, want set %d by %d", a, ovs[a], b, Agent+1)
+	}
+	if len(ovs[b]) != 1 || ovs[b][0].Group != a || ovs[b][0].Author != Agent {
+		t.Errorf("overlaps[%d] = %+v, want set %d by %d", b, ovs[b], a, Agent)
+	}
+	if ovs[a][0].Start == ovs[a][0].End {
+		t.Errorf("overlap span = %d..%d, want the shared range", ovs[a][0].Start, ovs[a][0].End)
+	}
+}
+
+// Two sets that abut without sharing a byte are not an overlap. The earlier
+// set's range is the text it still owns, not the neighbour's insertion flush
+// against its end -- the rebased bounding range would have swallowed it.
+func TestPendingOverlapsIgnoresAdjacentSets(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	s.Begin()
+	s.Insert(Agent, 0, "AA")
+	s.End()
+	a := s.LastGroup()
+	s.MarkGroup(a, Proposed)
+
+	s.Begin()
+	s.Insert(Agent+1, 2, "BB")
+	s.End()
+	b := s.LastGroup()
+	s.MarkGroup(b, Proposed)
+
+	if ovs := s.PendingOverlaps(); len(ovs[a]) != 0 || len(ovs[b]) != 0 {
+		t.Errorf("adjacent sets reported as overlapping: %+v", ovs)
+	}
+}
+
+// RevertAuthor is the inverse of attribution: it reverses every live piece the
+// named author wrote, keeps everyone else's, and records the reversal in the
+// journal rather than holding a second forward edit. A set the revert emptied
+// drops its decision, so the writer's own proposal stops being pending.
+func TestRevertAuthorDropsItsPiecesKeepsOthers(t *testing.T) {
+	s := groupSession(t, "")
+	s.Insert(User, 0, "user")    // the user's, first
+	s.Insert(Agent, 4, "agent")  // the pieces to drop
+	s.Insert(Agent+1, 9, "peer") // a peer's, at the end
+	if got := text(s); got != "useragentpeer" {
+		t.Fatalf("setup produced %q", got)
+	}
+	// The agent's set is a proposal; reverting it drops the decision too. It is
+	// the second group, after the user's.
+	s.MarkGroup(s.Groups()[1].ID, Proposed)
+
+	before := s.Version()
+	if ok, _ := s.RevertAuthor(Agent); !ok {
+		t.Fatal("revert of a live author reported nothing to do")
+	}
+	if got := text(s); got != "userpeer" {
+		t.Errorf("after revert = %q, want only the agent's pieces gone", got)
+	}
+	if s.Version() <= before {
+		t.Error("revert did not advance the journal")
+	}
+	// The reversal is recorded: the last op undoes the agent's member rather
+	// than being a second insertion beside it.
+	last := s.Journal()[s.Version()-1]
+	if last.Kind != KindUndo || last.Undoes == 0 {
+		t.Errorf("last op = %+v, want a recorded reversal", last)
+	}
+	if got := s.Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v after revert, want none", got)
+	}
+}
+
+// Reverting an author with nothing live to reverse reports false and changes
+// nothing, the same shape as a clear of an already-gone set.
+func TestRevertAuthorWithNothingLiveReportsFalse(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Insert(Agent, 0, "X")
+	if !s.Undo(Agent) {
+		t.Fatal("undo failed")
+	}
+	before := text(s)
+	if ok, _ := s.RevertAuthor(Agent); ok {
+		t.Error("revert of an author with no live pieces reported success")
+	}
+	if got := text(s); got != before {
+		t.Errorf("text = %q, want it unchanged", got)
+	}
+}
+
+// A later edit that removes the bytes a member needs wedges the revert. The
+// block names the live set whose span overlaps it, so the caller learns what to
+// clear first; the reversal is reported rather than clamped, and the text is
+// left exactly as it was.
+func TestRevertAuthorReportsAWedgedReversal(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	s.Begin()
+	s.Delete(Agent, 6, 5) // the agent removes "world"
+	s.End()
+	id := s.LastGroup()
+
+	s.Delete(User, 0, 11) // a later edit removes the whole line
+
+	before := text(s)
+	ok, block := s.RevertAuthor(Agent)
+	if ok {
+		t.Fatal("reverting a wedged author reported success")
+	}
+	if block.Group == 0 {
+		t.Fatalf("block = %+v, want the blocking set named", block)
+	}
+	if block.Author != User {
+		t.Errorf("block author = %d, want the user's %d", block.Author, User)
+	}
+	if got := text(s); got != before {
+		t.Errorf("text = %q after a refused revert, want it unchanged", got)
+	}
+	if got := s.GroupState(id); got != Accepted {
+		t.Errorf("state = %v, want the agent's decision untouched", got)
+	}
+}
+
+// A wedge part-way through the newest-first walk is still a partial reversal:
+// the newer set is reversed and dropped before the walk stops on the older one.
+// The journal has moved even though ok is false, so the caller cannot read
+// false as "nothing happened". This wedge is named (block.Group != 0), which
+// File.RevertAuthor syncs for on its own; the version comparison there covers
+// only the unnamed case, which the public API cannot build.
+func TestRevertAuthorPartialWedgeLeavesNewerSetReversed(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+
+	s.Begin()
+	s.Delete(Agent, 6, 5) // the older set: removes "world"
+	s.End()
+	older := s.LastGroup()
+
+	s.Begin()
+	s.Insert(Agent, 0, "Z") // the newer set: reversed first, and it lands
+	s.End()
+	newer := s.LastGroup()
+	s.MarkGroup(newer, Proposed)
+
+	s.Delete(User, 6, 2) // the wedge: removes " \n" from "Zhello \n"
+	wedge := s.LastGroup()
+
+	if got := text(s); got != "Zhello" {
+		t.Fatalf("setup produced %q", got)
+	}
+	before := s.Version()
+	ok, block := s.RevertAuthor(Agent)
+	if ok {
+		t.Fatal("reverting an author whose older set is wedged reported success")
+	}
+	// The newer set came out before the walk reached the wedge and stays out;
+	// the older set's reversal never ran, so its removal of "world" stands.
+	if got := text(s); got != "hello" {
+		t.Errorf("after revert = %q, want only the newer set's piece gone", got)
+	}
+	if s.Version() <= before {
+		t.Error("the journal did not move before the wedge; that partial reversal is what the File-level guard has to sync for")
+	}
+	if !s.hasLiveMembers(older) {
+		t.Error("the wedged older set was dropped even though its reversal never ran")
+	}
+	if got := s.GroupState(newer); got != Accepted {
+		t.Errorf("newer set state = %v, want the emptied set's decision dropped", got)
+	}
+	// The block names the live set the older reversal could not be placed
+	// through: the user's group, its author, and the point the wedge sits at
+	// now (the newer set's reversal shifted it).
+	if block.Group != wedge {
+		t.Errorf("block group = %d, want the wedging set %d", block.Group, wedge)
+	}
+	if block.Author != User {
+		t.Errorf("block author = %d, want the user's %d", block.Author, User)
+	}
+	if block.Start != 5 || block.End != 5 {
+		t.Errorf("block span = %d..%d, want the wedging deletion's point 5..5", block.Start, block.End)
+	}
+}
+
+// A set shared by two writers keeps its decision through a revert: only the
+// reverted author's members come out, and because the set still holds the other
+// author's live member, hasLiveMembers keeps the decision instead of marking
+// the whole set Accepted.
+func TestRevertAuthorKeepsASharedGroupsDecision(t *testing.T) {
+	s := groupSession(t, "hello\n")
+	s.Begin()
+	s.Insert(Agent, 0, "A")
+	s.Insert(User, 1, "B") // one set, two authors
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	if got := text(s); got != "ABhello\n" {
+		t.Fatalf("setup produced %q", got)
+	}
+	if ok, _ := s.RevertAuthor(Agent); !ok {
+		t.Fatal("revert of the shared set reported nothing to do")
+	}
+	// Only the agent's member is reversed; the user's survives.
+	if got := text(s); got != "Bhello\n" {
+		t.Errorf("after revert = %q, want only the agent's piece gone", got)
+	}
+	if !s.hasLiveMembers(id) {
+		t.Error("the set reports no live member, but the user's op survives")
+	}
+	if got := s.GroupState(id); got != Proposed {
+		t.Errorf("state = %v, want the shared set's decision kept", got)
+	}
+	// Still addressable as a pending set: the user's surviving member is what
+	// there is left to decide on.
+	if got := s.Pending(); len(got) != 1 || got[0].ID != id {
+		t.Errorf("pending = %+v, want the shared set %d still pending", got, id)
 	}
 }

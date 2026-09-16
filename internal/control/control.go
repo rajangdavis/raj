@@ -72,8 +72,10 @@ type Request struct {
 	// alongside Path.
 	NewPath string
 	// Author is the writer this request claims to be. Zero means "whatever the
-	// connection was assigned"; naming a different one is refused, which is the
-	// check that stops one agent's text being attributed to another.
+	// connection was assigned". Only revert compares a non-zero claim to the
+	// connection's real author and refuses a mismatch, because it discards that
+	// writer's pieces. A few verbs compare it to a stored record's owner, but
+	// the field is trusted for attribution, so tightening that is a TODO.
 	Author uint8
 	Base   *uint64
 	Hunks  []Hunk
@@ -132,6 +134,11 @@ type Request struct {
 	// Create, so a peer that does not know it omits it and keeps the
 	// proposing default.
 	Withdraw bool
+	// Hidden, on ls, includes entries the hidden policy would skip — the same
+	// include-hidden switch search carries in its query. It crosses as a
+	// presence flag like Create, so a peer that does not know it omits it and
+	// keeps the filtered default.
+	Hidden bool
 
 	// Identity and Name introduce a participant. Identity is durable across
 	// connections; Name is for display.
@@ -160,6 +167,8 @@ type Request struct {
 // a unit because that is already the unit undo reverses. Hunks and Moved are
 // the pending projection: how many surviving runs its members cover now, and
 // how many a later edit moved past entirely; both are zero for a decided set.
+// Invalid names a still-proposed set with no surviving hunk at all, and
+// InvalidBy the live set whose edit consumed it.
 type Group struct {
 	ID     uint64 `json:"id"`
 	Path   string `json:"path"`
@@ -171,6 +180,36 @@ type Group struct {
 	Last   uint64 `json:"last"`
 	Hunks  int    `json:"hunks"`
 	Moved  int    `json:"moved"`
+	// Overlaps names the other live change sets whose projected ranges
+	// intersect this one's, with the bytes where they meet. Two sets awaiting a
+	// decision that claim the same text is a fact the editor reports and does
+	// not resolve: the lease still decides what may be written and a person
+	// still decides each set. It is a pointer so Group stays comparable, and
+	// nil when nothing overlaps.
+	Overlaps *GroupOverlaps `json:"overlaps,omitempty"`
+	// Invalid marks a still-Proposed set every live member of which a later
+	// edit has moved past, so no hunk survives to accept. It is derived, not a
+	// fourth state: clear the colliding edit and it clears with it. InvalidBy
+	// names the live set whose edit now occupies the range, or is nil when no
+	// single collider can be named. Both fields are sparse on the wire; see
+	// hGroupInvalid in header.go.
+	Invalid   bool          `json:"invalid,omitempty"`
+	InvalidBy *GroupOverlap `json:"invalid_by,omitempty"`
+}
+
+// GroupOverlap names another live change set whose projected range intersects a
+// set's, and the bytes where the two meet in the buffer's current coordinates.
+type GroupOverlap struct {
+	Group  uint64 `json:"group"`
+	Author uint8  `json:"author"`
+	Start  int    `json:"start"`
+	End    int    `json:"end"`
+}
+
+// GroupOverlaps is one change set's overlap list, wrapped so the Group field
+// that carries it stays a comparable pointer.
+type GroupOverlaps struct {
+	Sets []GroupOverlap `json:"sets"`
 }
 
 // DiffGroup is one pending change set rendered for review: the Group as
@@ -238,6 +277,12 @@ type SearchQuery struct {
 	Regex bool
 	Case  bool
 	Word  bool
+	// Hidden includes paths the internal/hidden policy would skip, for the
+	// -hidden switch; false is the policy in force. It is a bool rather than
+	// the rules themselves because the rules are the editor's to load, not the
+	// caller's to send. Sparse by absence, so a peer that does not know it
+	// keeps the filtered default.
+	Hidden bool
 }
 
 // SearchMatch is one hit. LineStart..LineEnd bound the whole line the hit was
@@ -353,18 +398,41 @@ type BraceTally struct {
 // Conflict is a hunk that could not be rebased onto the current version. At is
 // the version of the op that invalidated the range, not a byte offset — it tells
 // a driver what it missed, so it can re-read from there rather than resubmitting
-// the whole diff blind.
+// the whole diff blind. A lease refusal names no invalidating op, so At is zero
+// there: it is not a real version, and the owner below is what the caller acts
+// on instead.
 //
 // Group names the change set whose read-only lease refused the hunk, when that
 // is why it could not land; zero means the ordinary stale-offset conflict. It is
 // the difference between "read again and resubmit" and "someone has to accept or
 // reject this text first", which are opposite instructions for a driver.
+//
+// Author and Start/End describe that owning set when Group is non-zero: who
+// wrote the text and the current rebased span of the run that refused the hunk.
+// They are zero for a stale-offset conflict, where there is no owner to name.
+// Carrying them here saves the caller a second `groups` call just to learn who
+// holds the bytes and where they are.
 type Conflict struct {
-	Index int    `json:"index"`
-	At    uint64 `json:"at"`
-	Group uint64 `json:"group,omitempty"`
-	Hunk  Hunk   `json:"hunk"`
+	Index  int    `json:"index"`
+	At     uint64 `json:"at"`
+	Group  uint64 `json:"group,omitempty"`
+	Author uint8  `json:"author,omitempty"`
+	Start  int    `json:"start,omitempty"`
+	End    int    `json:"end,omitempty"`
+	Hunk   Hunk   `json:"hunk"`
 }
+
+// BlockError reports that a verb was refused because a live change set overlaps
+// the work it was trying to do. Clear returns it when a rejected set cannot be
+// reversed out because a later live set sits on top of its members; Conflict
+// carries the blocking set in the same owner-and-span shape a lease refusal
+// uses, so the socket reports it rather than flattening it to a sentence.
+type BlockError struct {
+	Conflict Conflict
+	Message  string
+}
+
+func (e *BlockError) Error() string { return e.Message }
 
 // LSPResult is one language-server answer, exactly one field set per mode. Its
 // JSON tags matter: the CLI marshals it straight to a driver, so the field
@@ -487,6 +555,17 @@ type DirRemoval struct {
 	Author uint8  `json:"author"`
 }
 
+// Entry is one child in a directory listing: its name, its absolute path and
+// whether it is a directory. Size is set only for a regular file, so a
+// directory, a symlink, a device and a fifo all omit it rather than reporting
+// the directory's or the link's own byte count as though it were content.
+type Entry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Dir  bool   `json:"dir"`
+	Size *int64 `json:"size,omitempty"`
+}
+
 // Proposal is one entry in the unified pending surface: a change set still
 // awaiting a decision, a pending file deletion, or a pending directory
 // removal. Kind names which. Group and Start/End describe a change set;
@@ -527,9 +606,25 @@ type Response struct {
 	Version   uint64
 	// Bytes and Lines describe the buffer a version answers for, so a driver
 	// can size an apply span or find the end of a file without a read.
-	Bytes     int
-	Lines     int
+	Bytes int
+	Lines int
+	// Found, FindStart, FindEnd and FindCount are find's answer: whether the
+	// pattern occurred at all, the first match's byte span, and how many
+	// matches the buffer holds (including the first). Found is sparse, so its
+	// absence reads as not found; the span is taken from the omitted-zero
+	// defaults, and Version is the revision the span was measured in.
+	Found     bool
+	FindStart int
+	FindEnd   int
+	FindCount int
 	Conflicts []Conflict
+	// Warnings names the other writers' Proposed change sets a successful
+	// apply landed over: the advisory-lease half of the reply. Each warning is
+	// the overlapped set's group, author and the span it holds now, the same
+	// owner-and-span shape a Conflict carries for a refusal. It is sparse: a
+	// clean apply sends none, so a peer that does not know the field reads no
+	// warnings rather than an error, and a warning is never a refusal.
+	Warnings []GroupOverlap
 	// DumpID is the snapshot id a dump returned, and Hash the hash of the
 	// snapshot's text, so a caller can verify the bytes it holds before editing
 	// them and name them back to a patch.
@@ -572,6 +667,11 @@ type Response struct {
 	// open buffer's proposed change sets, the pending file deletions and the
 	// pending dir-removals. It is a read-only rollup, ungated like Deletions.
 	Proposals []Proposal
+	// Entries is ls's answer: the immediate children of the directory the
+	// request named, sorted by name. Sparse like the lists above, so an empty
+	// directory sends none and a peer that does not know the field reads no
+	// entries rather than an error.
+	Entries []Entry
 
 	// SrcVersion is the revision the server was built from. connection.send
 	// stamps it on every response, so a client learns it on any frame, not
@@ -617,6 +717,12 @@ type Response struct {
 	// versus "opened" from it, so a driver that expected a create can tell the
 	// two apart. Sparse like Remains: a view that predates it reads no field.
 	Created bool
+	// Token is the running server's TCP secret, returned by the "token" op.
+	// It is how a driver in a container gets the secret without scraping the
+	// editor's startup stderr: a local script on the Unix socket reads it
+	// and hands it over. Empty on a Unix-only server, which has no secret to
+	// give. Sparse by absence, so a peer that predates the verb reads none.
+	Token string
 }
 
 // Text flattens the spans, for callers that do not care who wrote what.
@@ -692,13 +798,19 @@ type Server struct {
 	// the command itself.
 	AllowRemoteExec bool
 
-	path    string
-	network string
-	token   string
-	ln      net.Listener
+	path  string
+	paths []string
+	token string
+	// lns is every listener the server accepts on, and socks the Unix paths it
+	// must unlink when it closes. More than one listener is how one session is
+	// driven from both sides of a container boundary — the socket where the
+	// filesystem authorises, the port where a shared token does — and every
+	// listener accepts into the same queue and participant registry.
+	lns    []net.Listener
+	socks  []string
+	remote bool
 
 	mu     sync.Mutex
-	anon   int
 	queue  []*Pending
 	closed bool
 }
@@ -725,6 +837,20 @@ func (s *Server) Send(to uint8, text string) error {
 		return fmt.Errorf("%s is not a driver", p.Name)
 	}
 	return s.Mail.Post(to, Message{From: AuthorUser, Text: text})
+}
+
+// PostNotice queues an automatic notice from the editor to a participant: the
+// other writer into the same mailbox Send fills. It is not something a person
+// said, so it names AuthorOriginal as the sender and skips Send's registry
+// checks. The recipient is a superseded proposal's author, which may be a
+// provisional connection with no registry row, and the mailbox is keyed on the
+// author id alone. Best-effort like Send's callers -- a full box is an error
+// the caller drops, because the write it describes has already landed.
+func (s *Server) PostNotice(to uint8, text string) error {
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("nothing to send")
+	}
+	return s.Mail.Post(to, Message{From: AuthorOriginal, Text: text})
 }
 
 // Drivers lists the participants a message can be sent to, connected first.
@@ -769,87 +895,150 @@ func DefaultPath() string {
 // refuses any request that does not carry it. See addr.go for why that is the
 // same check rather than a new one.
 func Listen(addr string, notify func()) (*Server, error) {
+	return ListenAll([]string{addr}, notify)
+}
+
+// ListenAll starts a server on every address at once, sharing one request
+// queue, one participant registry and one token.
+//
+// The point is to let a session be driven from more than one place: a local
+// script on the Unix socket, where the filesystem authorises, and a driver in a
+// container on the port, where a token stands in for it. Every listener
+// accepts into the same queue, so a request does not care which transport
+// carried it except where it must — the token check, the remote-exec refusal
+// and anonymous identity minting are per-connection, keyed on the transport
+// the connection arrived on.
+//
+// One address is the common case and behaves exactly as it did before.
+func ListenAll(addrs []string, notify func()) (*Server, error) {
 	if notify == nil {
 		return nil, errors.New("control: Notify is required")
 	}
-	if network, address := ParseAddr(addr); network == "tcp" {
-		return listenTCP(address, notify)
+	s := &Server{Notify: notify, Participants: NewRegistry()}
+	for _, addr := range addrs {
+		if addr == "" {
+			s.Close()
+			return nil, errors.New("control: empty listen address")
+		}
+		if err := s.add(addr); err != nil {
+			s.Close()
+			return nil, err
+		}
 	}
-	return listenUnix(addr, notify)
+	if len(s.lns) == 0 {
+		return nil, errors.New("control: no listen address")
+	}
+	return s, nil
 }
 
-func listenUnix(path string, notify func()) (*Server, error) {
+// add opens one listener and starts its accept loop. The first listener to open
+// is the primary: it is what Path reports and what a client given a single
+// address is handed.
+func (s *Server) add(addr string) error {
+	if network, address := ParseAddr(addr); network == "tcp" {
+		return s.addTCP(address)
+	}
+	return s.addUnix(addr)
+}
+
+func (s *Server) addUnix(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
+		return err
 	}
 	// A leftover socket from a crashed process of the same pid would make Listen
 	// fail. Removing one that is still live would steal it, so probe first.
 	if _, err := os.Stat(path); err == nil {
 		if c, derr := net.DialTimeout("unix", path, 200*time.Millisecond); derr == nil {
 			c.Close()
-			return nil, fmt.Errorf("control: %s is already in use", path)
+			return fmt.Errorf("control: %s is already in use", path)
 		}
 		os.Remove(path)
 	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
-		return nil, err
+		return err
 	}
-	s := &Server{Notify: notify, path: path, network: "unix", ln: ln, Participants: NewRegistry()}
-	go s.accept()
-	return s, nil
+	s.lns = append(s.lns, ln)
+	s.paths = append(s.paths, path)
+	s.socks = append(s.socks, path)
+	if s.path == "" {
+		s.path = path
+	}
+	go s.accept(ln, "unix")
+	return nil
 }
 
+// listenTCP is the one-address form on a bare host:port; ListenAll is the
+// general form.
 func listenTCP(address string, notify func()) (*Server, error) {
+	return ListenAll([]string{tcpScheme + address}, notify)
+}
+
+func (s *Server) addTCP(address string) error {
 	// The environment wins so the token can be pinned: a container is started
 	// with its environment already fixed, and a token the editor invented after
-	// the fact cannot be got into one without restarting it.
-	token := os.Getenv(TokenEnv)
-	if token == "" {
-		var err error
-		if token, err = NewToken(); err != nil {
-			return nil, err
+	// the fact cannot be got into one without restarting it. One token for the
+	// whole server: a second TCP listener is the same secret, not a second one.
+	if s.token == "" {
+		s.token = os.Getenv(TokenEnv)
+		if s.token == "" {
+			var err error
+			if s.token, err = NewToken(); err != nil {
+				return err
+			}
 		}
 	}
 	ln, err := net.Listen("tcp", address)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// Path reports the resolved address, not the requested one, so a port of 0
 	// — which is what a test wants, and what avoids a collision — comes back as
 	// something a client can actually dial.
-	s := &Server{Notify: notify, path: TCPAddr(ln.Addr()), network: "tcp",
-		token: token, ln: ln, Participants: NewRegistry()}
-	go s.accept()
-	return s, nil
+	dial := TCPAddr(ln.Addr())
+	s.lns = append(s.lns, ln)
+	s.paths = append(s.paths, dial)
+	if s.path == "" {
+		s.path = dial
+	}
+	s.remote = true
+	go s.accept(ln, "tcp")
+	return nil
 }
 
-// Path is where the server is listening, in the form a client can dial.
+// Path is where the server is listening, in the form a client can dial: the
+// primary listener, the first address it opened.
 func (s *Server) Path() string { return s.path }
+
+// Paths is every address the server is listening on, primary first. It is a
+// copy, so a caller cannot reorder or truncate what the server holds.
+func (s *Server) Paths() []string { return append([]string(nil), s.paths...) }
 
 // Token is the secret a TCP client must present, and empty for a Unix socket.
 func (s *Server) Token() string { return s.token }
 
-// Remote reports whether this server is reachable off this process's
-// filesystem, which is what makes a request untrusted enough to need a token
-// and an `exec` worth refusing.
-func (s *Server) Remote() bool { return s.network == "tcp" }
+// Remote reports whether this server has a listener reachable off this
+// process's filesystem, which is what makes a request untrusted enough to
+// need a token and an `exec` worth refusing. A given request may still have
+// arrived on the local socket of a two-listener server; the transport a
+// connection arrived on is what decides its gates.
+func (s *Server) Remote() bool { return s.remote }
 
-func (s *Server) accept() {
+func (s *Server) accept(ln net.Listener, network string) {
 	for {
-		conn, err := s.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return // closed
 		}
-		go s.serve(conn)
+		go s.serve(conn, network)
 	}
 }
 
-func (s *Server) serve(conn net.Conn) {
+func (s *Server) serve(conn net.Conn, network string) {
 	defer conn.Close()
 	// Each connection is one writer, assigned an author id for its lifetime.
 	// Attribution is therefore a property of who is connected rather than of
@@ -857,11 +1046,25 @@ func (s *Server) serve(conn net.Conn) {
 	// Provisional until the client identifies itself. A connection that never
 	// says who it is still gets an id, so an anonymous one-off client works —
 	// it just does not survive a reconnect as the same writer.
-	author := s.nextAuthor()
-	// The defer reads author when it runs, not when it is set: the hello path
-	// below rebinds it to the durable identity, and the row to release when
-	// the connection ends is whichever one it is bound to then.
-	defer func() { s.Participants.Leave(author) }()
+	author, err := s.reserveAuthor()
+	if err != nil {
+		// No id to attribute this connection to. Refusing is the only safe
+		// answer: falling back to a shared id would put two writers on one
+		// author, which is the collision the registry exists to prevent.
+		return
+	}
+	// bound is whether hello has rebound this connection to a durable identity.
+	// Until then author is a reserved id with no row and Release is what frees
+	// it; after, Leave marks the durable row disconnected and keeps it for
+	// attribution. The defer reads both when it runs.
+	bound := false
+	defer func() {
+		if bound {
+			s.Participants.Leave(author)
+		} else {
+			s.Participants.Release(author)
+		}
+	}()
 
 	// Reading and writing are separated because a streamed search takes
 	// seconds and a cancel has to arrive during it. A loop that read a frame,
@@ -880,7 +1083,8 @@ func (s *Server) serve(conn net.Conn) {
 		}
 	})
 
-	c := &connection{srv: s, out: out, author: author, running: map[int]context.CancelFunc{}}
+	c := &connection{srv: s, out: out, author: author, network: network,
+		running: map[int]context.CancelFunc{}}
 	r := bufio.NewReader(conn)
 	var wg sync.WaitGroup
 	for {
@@ -896,7 +1100,7 @@ func (s *Server) serve(conn net.Conn) {
 			c.send(Response{ID: f.Header.ID, Err: derr.Error(), Final: true})
 			continue
 		}
-		if !s.authorised(req) {
+		if !s.authorised(req, network) {
 			// One refusal, then the connection ends. The token is 32 random
 			// bytes, so this is not rate limiting against a guesser — it is
 			// refusing to stay in a conversation with something that cannot
@@ -904,7 +1108,19 @@ func (s *Server) serve(conn net.Conn) {
 			c.send(Response{ID: req.ID, Err: errUnauthorised, Final: true})
 			break
 		}
-		if req.Op == "exec" && s.Remote() && !s.AllowRemoteExec {
+		if req.Op == "token" {
+			// "token" is answered on the reading goroutine, like hello and
+			// cancel: the secret is the server's own and no document state is
+			// involved. It is reachable on both transports on purpose. On a
+			// Unix socket the filesystem has already authorised the caller,
+			// which is how a local script reads the token to hand to a
+			// container. Over TCP the request has already passed the check
+			// above, so the caller holds the secret it would be handed back
+			// and refusing it would protect nothing.
+			c.send(Response{ID: req.ID, OK: true, Final: true, Token: s.token})
+			continue
+		}
+		if req.Op == "exec" && network == "tcp" && !s.AllowRemoteExec {
 			c.send(Response{ID: req.ID, Err: errRemoteExec, Final: true})
 			continue
 		}
@@ -913,7 +1129,7 @@ func (s *Server) serve(conn net.Conn) {
 			// connection writes as, and touches no document state.
 			identity := req.Identity
 			var minted string
-			if identity == "" && s.Remote() {
+			if identity == "" && network == "tcp" {
 				// An anonymous TCP client gets a server-minted token: durable,
 				// so a reconnect can own the text it already wrote, and
 				// server-chosen, so no two agents collide on a name. The
@@ -938,12 +1154,19 @@ func (s *Server) serve(conn net.Conn) {
 				continue
 			}
 			if id != author {
-				// The provisional id goes back now, not at disconnect: it is
-				// recyclable at once, and the durable row just joined is the
-				// one this connection is bound to from here.
-				s.Participants.Leave(author)
+				if bound {
+					// A second hello on one connection rebinding it to a
+					// different durable identity: the old row stays for
+					// attribution but is no longer attached.
+					s.Participants.Leave(author)
+				} else {
+					// The provisional id is reserved, not a row: release it
+					// now, not at disconnect, so it is recyclable at once.
+					s.Participants.Release(author)
+				}
 			}
 			author = id
+			bound = true
 			c.mu.Lock()
 			c.author = id
 			c.mu.Unlock()
@@ -961,6 +1184,18 @@ func (s *Server) serve(conn net.Conn) {
 		}
 		if req.Author == 0 {
 			req.Author = author
+		}
+		// A revert discards the writer's own pieces, so naming a different
+		// author is a refusal rather than a fallback. Dropping another writer's
+		// accepted text is the user's decision (reject then clear), and the
+		// check lives here on the reading goroutine where the connection's real
+		// author is known, not in the handler where the claimed id is just a
+		// field. A program cannot carry a revert, so a batch is not a way round
+		// it.
+		if req.Op == "revert" && req.Author != author {
+			c.send(Response{ID: req.ID, Err: "revert discards only your own pieces; " +
+				"another writer's text is dropped with reject then clear", Final: true})
+			continue
 		}
 		wg.Add(1)
 		safe.Go(func() { defer wg.Done(); c.handle(req) })
@@ -982,6 +1217,10 @@ type connection struct {
 	srv    *Server
 	out    chan outFrame
 	author uint8
+	// network is the transport this connection arrived on: "unix" or "tcp".
+	// One server can have both listeners, so the token check, the remote-exec
+	// refusal and anonymous minting key on this rather than on the server.
+	network string
 
 	mu      sync.Mutex
 	running map[int]context.CancelFunc
@@ -1050,6 +1289,15 @@ func (c *connection) handle(req Request) {
 // while four verbs were still to come. So who gets to say Final is the caller's
 // decision, and the streaming handlers no longer reach for the socket directly.
 func (c *connection) one(req Request, emit func(Response)) {
+	// The remote-execution gate is re-checked here because the serve loop only
+	// sees the outer request: a program arrives as one "prog" frame and its
+	// exec verb would otherwise slip past the refusal that a direct exec gets.
+	// Re-checking at the single chokepoint every request passes through keeps a
+	// batch from being a way around the flag path's gate.
+	if req.Op == "exec" && c.network == "tcp" && !c.srv.AllowRemoteExec {
+		emit(Response{ID: req.ID, Err: errRemoteExec, Final: true})
+		return
+	}
 	switch req.Op {
 	case "search":
 		c.search(req, emit)
@@ -1265,32 +1513,30 @@ const (
 		"outside your sandbox — run it with your own shell instead, or start raj with --control-exec"
 )
 
-// authorised checks a request's token against the server's. Constant time, so
-// the comparison does not leak the token a byte at a time; free, since it runs
-// once per request against 64 characters.
-func (s *Server) authorised(req Request) bool {
+// authorised checks a request's token against the server's. A Unix connection
+// is already authorised by the filesystem and needs no token; only a TCP one
+// presents a token, and that is per-connection because one server can hold
+// both listeners. Constant time, so the comparison does not leak the token a
+// byte at a time; free, since it runs once per request against 64 characters.
+func (s *Server) authorised(req Request, network string) bool {
+	if network != "tcp" {
+		return true
+	}
 	if s.token == "" {
 		return true
 	}
 	return subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.token)) == 1
 }
 
-// nextAuthor hands out ids from Agent upward. Author 0 is the file as loaded
-// and 1 is the human, so a connection never gets either.
-// nextAuthor gives an unidentified connection a provisional id.
-func (s *Server) nextAuthor() uint8 {
-	id, err := s.Participants.Join(fmt.Sprintf("anon-%d", s.anonSeq()), "", KindAgent)
-	if err != nil {
-		return FirstAgent
-	}
-	return id
-}
-
-func (s *Server) anonSeq() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.anon++
-	return s.anon
+// reserveAuthor reserves a provisional author id for a connection that has not
+// declared an identity yet. Unlike nextAuthor, which minted a durable anon-N row
+// per connection and leaked one for every `raj ctl` invocation, a reserved id
+// has no row: it is freed the moment the connection binds an identity or ends.
+// The error is returned rather than swallowed — with no id available there is
+// no safe way to attribute the connection, so the caller must refuse it rather
+// than put a second writer on a fallback id.
+func (s *Server) reserveAuthor() (uint8, error) {
+	return s.Participants.Reserve()
 }
 
 // srcVersion is the VCS revision this binary was built from, read from the
@@ -1370,9 +1616,14 @@ func (s *Server) Close() error {
 	s.queue = nil
 	s.mu.Unlock()
 
-	err := s.ln.Close()
-	if s.network != "tcp" {
-		os.Remove(s.path)
+	var err error
+	for _, ln := range s.lns {
+		if cerr := ln.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	for _, path := range s.socks {
+		os.Remove(path)
 	}
 	for _, p := range parked {
 		p.Fail("editor is shutting down")

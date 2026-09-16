@@ -18,7 +18,7 @@ func text(s *Session) string { return s.Buffer().Slice(0, s.Buffer().Len()) }
 func TestApplyDiffClean(t *testing.T) {
 	for name, s := range sessions("aaa bbb ccc") {
 		base := s.Version()
-		_, conflicts := s.ApplyDiff(Agent, base, []Hunk{
+		_, conflicts, _ := s.ApplyDiff(Agent, base, []Hunk{
 			{Start: 0, End: 3, Text: "XXX"},
 			{Start: 8, End: 11, Text: "ZZZ"},
 		})
@@ -37,7 +37,7 @@ func TestApplyDiffRebasesStaleOffsets(t *testing.T) {
 	for name, s := range sessions("aaa bbb ccc") {
 		base := s.Version()
 		s.Insert(User, 0, ">>>") // ">>>aaa bbb ccc", shifts everything by 3
-		_, conflicts := s.ApplyDiff(Agent, base, []Hunk{{Start: 8, End: 11, Text: "ZZZ"}})
+		_, conflicts, _ := s.ApplyDiff(Agent, base, []Hunk{{Start: 8, End: 11, Text: "ZZZ"}})
 		if len(conflicts) != 0 {
 			t.Fatalf("%s: unexpected conflicts %+v", name, conflicts)
 		}
@@ -52,7 +52,7 @@ func TestApplyDiffRejectsOnlyTheConflictingHunk(t *testing.T) {
 	for name, s := range sessions("aaa bbb ccc") {
 		base := s.Version()
 		s.Delete(User, 4, 3) // remove "bbb", the middle hunk's target
-		v, conflicts := s.ApplyDiff(Agent, base, []Hunk{
+		v, conflicts, _ := s.ApplyDiff(Agent, base, []Hunk{
 			{Start: 0, End: 3, Text: "XXX"},
 			{Start: 4, End: 7, Text: "YYY"},
 			{Start: 8, End: 11, Text: "ZZZ"},
@@ -75,7 +75,7 @@ func TestBoundaryEditsDoNotConflict(t *testing.T) {
 	for name, s := range sessions("aaabbb") {
 		base := s.Version()
 		s.Insert(User, 3, "-") // exactly between the two ranges
-		_, conflicts := s.ApplyDiff(Agent, base, []Hunk{
+		_, conflicts, _ := s.ApplyDiff(Agent, base, []Hunk{
 			{Start: 0, End: 3, Text: "X"},
 			{Start: 3, End: 6, Text: "Y"},
 		})
@@ -92,7 +92,7 @@ func TestBoundaryEditsDoNotConflict(t *testing.T) {
 // a single submission conflict rather than corrupting the document.
 func TestOverlappingHunksInOneDiff(t *testing.T) {
 	for name, s := range sessions("abcdefgh") {
-		_, conflicts := s.ApplyDiff(Agent, s.Version(), []Hunk{
+		_, conflicts, _ := s.ApplyDiff(Agent, s.Version(), []Hunk{
 			{Start: 0, End: 4, Text: "1"},
 			{Start: 2, End: 6, Text: "2"},
 		})

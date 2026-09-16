@@ -133,7 +133,7 @@ func (p *Pane) stepRow(line, row, dir int) (int, int) {
 		if row+1 < p.RowsInLine(line) {
 			return line, row + 1
 		}
-		if line+1 < p.displayLines() {
+		if line+1 < p.DisplayLines() {
 			return line + 1, 0
 		}
 		return line, row
@@ -220,7 +220,7 @@ func (p *Pane) clampWrapTop() {
 	if v.Top < 0 {
 		v.Top, v.TopRow = 0, 0
 	}
-	if max := p.displayLines() - 1; v.Top > max {
+	if max := p.DisplayLines() - 1; v.Top > max {
 		v.Top = max
 		if v.Top < 0 {
 			v.Top = 0
@@ -275,7 +275,7 @@ func (p *Pane) moveVerticalWrapped(delta int, extend bool) {
 		if sl < 0 {
 			// A fold or composition-only row is a single row: land on the
 			// session cursor the map names, never inside text it does not draw.
-			at := p.docAt(line, 0)
+			at := p.DocAt(line, 0)
 			if at < 0 {
 				at = 0
 			}

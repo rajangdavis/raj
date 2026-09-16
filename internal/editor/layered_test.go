@@ -130,16 +130,19 @@ func TestSaveAcceptsPendingProposals(t *testing.T) {
 	}
 }
 
-// Another writer's apply over a lease fails as a conflict naming the colliding
-// set and lands nothing; a hunk outside every lease still applies. (The lease
-// owner amending its own proposal is the one case the span lease allows, and
-// that is covered in the piece table's own tests.)
+// Another writer's apply over a *rejected* lease fails as a conflict naming the
+// colliding set and lands nothing; a hunk outside every lease still applies. (A
+// merely Proposed set is advisory now, so an apply over it lands and leaves the
+// set moved; that is covered in the piece table's own tests.)
 func TestApplyDiffRefusedOverALease(t *testing.T) {
 	f := NewFile("lease.go", "hello world\n", 8)
-	id := proposeAt(t, f, 6, 11, "socket") // a proposed lease over [6,12)
+	id := proposeAt(t, f, 6, 11, "socket") // a lease over [6,12)
+	if !f.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
 	before := f.Text()
 
-	conflicts := f.ApplyDiff(piecetable.User, f.Session().Version(),
+	conflicts, _ := f.ApplyDiff(piecetable.User, f.Session().Version(),
 		[]piecetable.Hunk{{Start: 7, End: 9, Text: "XY"}})
 	if len(conflicts) != 1 {
 		t.Fatalf("conflicts = %+v, want one lease refusal", conflicts)
@@ -152,7 +155,7 @@ func TestApplyDiffRefusedOverALease(t *testing.T) {
 	}
 
 	// An insertion flush with the run start is outside it and still lands.
-	if cs := f.ApplyDiff(piecetable.User, f.Session().Version(),
+	if cs, _ := f.ApplyDiff(piecetable.User, f.Session().Version(),
 		[]piecetable.Hunk{{Start: 6, End: 6, Text: ">"}}); len(cs) != 0 {
 		t.Fatalf("boundary insert conflicted: %+v", cs)
 	}

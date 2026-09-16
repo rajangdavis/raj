@@ -28,12 +28,12 @@ const headlessMax = 8
 
 // loadHeadless loads path into the registry, or returns the pane already there.
 //
-// Only a path inside the workspace is loaded. The Guard resolves -- and so
-// loads -- before it checks the root, so that check has to live here or a
-// request for a path outside the tree would read it into memory before being
-// refused. A missing, unreadable, binary or oversized file is an error; the
-// caller turns it into the same "no open buffer" a closed path already
-// answered with.
+// Only a path inside the workspace is loaded. The Guard now pre-checks the
+// resolved root in canonical before it calls Resolve, so this lexical check is
+// the backstop for loadHeadless's one caller: a path outside the tree is
+// refused before any bytes are read. A missing, unreadable, binary or
+// oversized file is an error; the caller turns it into the same "no open
+// buffer" a closed path already answered with.
 func (a *App) loadHeadless(path string) (*editor.Pane, error) {
 	if path == "" || !a.pathInRoot(path) {
 		return nil, fmt.Errorf("not a buffer path")
@@ -192,8 +192,9 @@ func (a *App) evictHeadless() {
 }
 
 // pathInRoot reports whether path is inside the workspace root, the same
-// boundary the Guard enforces. loadHeadless checks it before reading bytes,
-// because Resolve runs before the Guard's root check.
+// boundary the Guard enforces. loadHeadless checks it before reading bytes as
+// the lexical backstop; the Guard's resolved check in canonical is the gate and
+// runs before Resolve.
 func (a *App) pathInRoot(path string) bool {
 	root := filepath.Clean(a.root)
 	clean := filepath.Clean(path)

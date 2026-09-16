@@ -1,6 +1,7 @@
 package editor
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,6 +115,39 @@ func TestMixedEndingsWarn(t *testing.T) {
 	}
 	if w := f.EncodingWarning(); !strings.Contains(w, "mixed line endings") {
 		t.Fatalf("warning = %q", w)
+	}
+}
+
+// The buffer is UTF-8 with an optional BOM and LF or CRLF only, so a file that
+// is not those would be read as bytes and mangled by the first save. It is
+// refused at Open instead. The verdict itself is the sniffer's — IsBinary in
+// binary.go — but these are encodings rather than binaries, and the contract
+// they have to stay outside of lives here.
+//
+// The signals are a BOM and a NUL byte in the first sniffLen bytes, plus
+// invalid UTF-8. A UTF-16 file with neither a BOM nor a NUL in that window, or
+// a high byte past it, still slips through; detecting those is a heuristic
+// rather than the marker check these cases pin, and is left for a decision
+// (see docs/TODO.md).
+func TestOpenRefusesNonUTF8Encodings(t *testing.T) {
+	cases := map[string]string{
+		"utf16le bom ascii": "\xff\xfe" + "h\x00e\x00l\x00l\x00o\x00",
+		"utf16be bom ascii": "\xfe\xff" + "\x00h\x00e\x00l\x00l\x00o",
+		"utf16le no bom":    "h\x00e\x00l\x00l\x00o\x00",
+		"utf16 bom only":    "\xff\xfe",
+		"latin1":            "caf\xe9\n",
+		"windows1252":       "smart \x93quotes\x94\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "f.txt")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path, 4); !errors.Is(err, ErrBinary) {
+				t.Fatalf("Open() = %v, want ErrBinary", err)
+			}
+		})
 	}
 }
 

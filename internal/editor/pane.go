@@ -51,6 +51,19 @@ type Pane struct {
 	// means identity — no decisions, so display coordinates are the raw
 	// session coordinates. SetDisplay rebuilds it; edits never touch it.
 	disp *view.Projection
+	// dispKey is the memo key for disp: the session version, the decision
+	// generation and the composition policy SetDisplay built it from. They sit
+	// beside disp because the projection and the key that qualifies it are one
+	// piece of derived state, and a caller must not refresh one without the
+	// other. UpdateDisplay is the only reader.
+	dispVersion  piecetable.Version
+	dispGen      uint64
+	dispPolicy   piecetable.Policy
+	dispKeyValid bool
+	// displayBuilds counts SetDisplay calls. It exists so a test can assert the
+	// memo skipped a rebuild honestly, including on the nil identity projection
+	// where a pointer comparison cannot tell a rebuild from a no-op.
+	displayBuilds int
 	// diskStale records the file changed on disk since raj read or wrote it,
 	// set by the app idle tick and cleared by save or reload.
 	diskStale bool
@@ -148,7 +161,8 @@ func NewPane(f *File) *Pane {
 // into the display map the renderer and every coordinate conversion read. No
 // decisions yields no segments and Build returns nil, so the projection is the
 // identity of the session — disp is derived, never a second document. The
-// application calls this once per frame; tests call it directly.
+// application calls UpdateDisplay once per frame so the journal walk is
+// memoised; tests call this directly to force a rebuild.
 func (p *Pane) SetDisplay(policy piecetable.Policy) {
 	comp := p.File.Session().Project(policy)
 	segs := comp.Segments()
@@ -168,11 +182,50 @@ func (p *Pane) SetDisplay(policy piecetable.Policy) {
 		}
 	}
 	p.disp = view.Build(comp.Text(), out)
+	p.dispVersion = p.File.Session().Version()
+	p.dispGen = p.File.DecisionGeneration()
+	p.dispPolicy = policy
+	p.dispKeyValid = true
+	p.displayBuilds++
 }
 
-// displayLines is the number of display rows the projection yields, or the
+// UpdateDisplay derives the projection for policy, rebuilding only when its
+// inputs moved.
+//
+// SetDisplay walks the journal through Session.Project, so it must not run on
+// every frame. The composition is a function of three things: the session
+// version, the decision generation, and the policy. A decision (propose,
+// accept, reject, clear, revert) moves the composition without moving the
+// version, so the generation is half the key; a mode switch moves neither, so
+// the policy is the other half. The key lives on the pane rather than in the
+// application because the projection and the key that qualifies it are one
+// derived value: keeping them together means no caller can refresh one without
+// the other, and every Pane — test-built ones included — gets the memo without
+// app-side bookkeeping.
+func (p *Pane) UpdateDisplay(policy piecetable.Policy) {
+	if p.dispKeyValid {
+		v, g := p.File.Session().Version(), p.File.DecisionGeneration()
+		if p.dispPolicy == policy && p.dispVersion == v && p.dispGen == g {
+			return
+		}
+	}
+	p.SetDisplay(policy)
+}
+
+// invalidateDisplay drops the derived projection and its memo, so the next
+// UpdateDisplay rebuilds against the session as it now stands. It is for a
+// wholesale document replacement — Pane.Reload, and a restored journal — where
+// the old projection no longer describes the text and the session version need
+// not move far enough for the key to notice on its own. Until the rebuild disp
+// is nil, which is the identity: the fresh session's own coordinates.
+func (p *Pane) invalidateDisplay() {
+	p.disp = nil
+	p.dispKeyValid = false
+}
+
+// DisplayLines is the number of display rows the projection yields, or the
 // document line count when there is no projection.
-func (p *Pane) displayLines() int {
+func (p *Pane) DisplayLines() int {
 	if p.disp != nil {
 		return p.disp.Lines()
 	}
@@ -251,11 +304,11 @@ func (p *Pane) dispLineOf(off int) int {
 	return 0
 }
 
-// dispPos maps a document offset to a display row and the display column
+// DispPos maps a document offset to a display row and the display column
 // within that row, for the unwrapped caret and vertical motion. A fold or
 // composition-only row answers column zero: neither draws a session byte the
 // caret could sit on.
-func (p *Pane) dispPos(off int) (line, col int) {
+func (p *Pane) DispPos(off int) (line, col int) {
 	if p.disp == nil {
 		return p.File.LineCol(off)
 	}
@@ -271,12 +324,12 @@ func (p *Pane) dispPos(off int) (line, col int) {
 	return line, col
 }
 
-// docAt maps a display row and column back to a document offset. A
+// DocAt maps a display row and column back to a document offset. A
 // session-backed row converts through the column machinery, so it stays the
-// inverse of dispPos; a fold or composition-only row defers to the map, which
+// inverse of DispPos; a fold or composition-only row defers to the map, which
 // yields the run session cursor so a click can never land inside text the row
 // does not draw. With no projection it is File.OffsetAt exactly.
-func (p *Pane) docAt(line, col int) int {
+func (p *Pane) DocAt(line, col int) int {
 	if p.disp == nil {
 		return p.File.OffsetAt(line, col)
 	}
@@ -308,7 +361,7 @@ func (p *Pane) snapOut(off, dir int) int {
 	if sl >= 0 {
 		return off
 	}
-	start := p.docAt(line, 0)
+	start := p.DocAt(line, 0)
 	if !fold {
 		return start // composition-only: its session cursor
 	}
@@ -337,7 +390,7 @@ func (p *Pane) snapOut(off, dir int) int {
 
 // Resize sets the visible area in cells.
 func (p *Pane) Resize(cols, rows int) {
-	p.Viewport.Resize(cols, rows, p.displayLines())
+	p.Viewport.Resize(cols, rows, p.DisplayLines())
 	if p.Wrap {
 		// A width change alters how many rows the top line occupies. Clamping
 		// it is the whole cost of a resize under this design: there is no
@@ -352,8 +405,8 @@ func (p *Pane) FollowCursor() {
 		p.followCursorWrapped()
 		return
 	}
-	line, col := p.dispPos(p.Cursors.Primary().Head)
-	p.Viewport.ScrollTo(line, col, p.displayLines())
+	line, col := p.DispPos(p.Cursors.Primary().Head)
+	p.Viewport.ScrollTo(line, col, p.DisplayLines())
 }
 
 // InsertText types at every cursor, replacing selections.

@@ -71,6 +71,23 @@ func TestUnknownVerbIsRefused(t *testing.T) {
 	}
 }
 
+// The two opcodes a batch needs to locate text and to run a command: find is a
+// verb, arg is an argument, and the range byte is what tells a reader that has
+// never heard of either whether to skip it or refuse the program.
+func TestFindAndArgAreInTheRightRanges(t *testing.T) {
+	if IsVerb(OpArg) {
+		t.Errorf("OpArg %#x is in the verb range; an unknown argument must be skippable", OpArg)
+	}
+	if !IsVerb(OpFind) || !IsVerb(OpExec) {
+		t.Errorf("find and exec must be verbs: find=%v exec=%v", IsVerb(OpFind), IsVerb(OpExec))
+	}
+	for code, want := range map[byte]string{OpArg: "arg", OpFind: "find", OpExec: "exec"} {
+		if got := Name(code); got != want {
+			t.Errorf("Name(%#x) = %q, want %q", code, got, want)
+		}
+	}
+}
+
 // A batch is a repetition rather than a new shape: fifty splices in one frame,
 // where the JSON header needed fifty frames.
 func TestBatchOfApplies(t *testing.T) {

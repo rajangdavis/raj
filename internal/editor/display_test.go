@@ -3,6 +3,7 @@ package editor
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"raj/internal/piecetable"
 	"raj/internal/ui"
@@ -56,7 +57,7 @@ func TestRejectedRunBecomesOneFoldRow(t *testing.T) {
 		t.Fatal("a rejected run must build a projection")
 	}
 	folds, keeps := 0, 0
-	for i := 0; i < p.displayLines(); i++ {
+	for i := 0; i < p.DisplayLines(); i++ {
 		sl, lo, hi, fold := p.line(i)
 		if sl < 0 {
 			if !fold {
@@ -113,7 +114,7 @@ func TestRejectedDeletionRendersRestoredText(t *testing.T) {
 	}
 	folds, compRows := 0, 0
 	restored := ""
-	for i := 0; i < p.displayLines(); i++ {
+	for i := 0; i < p.DisplayLines(); i++ {
 		sl, _, _, fold := p.line(i)
 		if sl >= 0 {
 			continue
@@ -165,7 +166,7 @@ func TestOffsetAtRoundTripsPlaceCaretOnWrappedFoldedBuffer(t *testing.T) {
 func TestClickOnFoldRowSnapsToEdge(t *testing.T) {
 	p, _ := foldedPane(t, "hello world\n")
 	foldLine := -1
-	for i := 0; i < p.displayLines(); i++ {
+	for i := 0; i < p.DisplayLines(); i++ {
 		if _, _, _, fold := p.line(i); fold {
 			foldLine = i
 			break
@@ -174,7 +175,7 @@ func TestClickOnFoldRowSnapsToEdge(t *testing.T) {
 	if foldLine < 0 {
 		t.Fatal("setup: no fold row")
 	}
-	want := p.docAt(foldLine, 0)
+	want := p.DocAt(foldLine, 0)
 	if got := p.OffsetAt(3, foldLine-p.Viewport.Top); got != want {
 		t.Errorf("click on fold row = %d, want the hidden run cursor %d", got, want)
 	}
@@ -188,6 +189,9 @@ func roundTripOffsets(t *testing.T, p *Pane) {
 	for off := 0; off <= p.File.Len(); off++ {
 		if hiddenByFold(p, off) {
 			continue
+		}
+		if off < p.File.Len() && !utf8.RuneStart(p.File.Slice(off, 1)[0]) {
+			continue // inside a multi-byte rune: not an addressable position
 		}
 		p.Cursors.Set(off, off)
 		p.FollowCursor()
@@ -230,7 +234,7 @@ func TestMultiLineFoldKeepsSessionLines(t *testing.T) {
 	}
 	sawFold := false
 	got := map[string]int{}
-	for i := 0; i < p.displayLines(); i++ {
+	for i := 0; i < p.DisplayLines(); i++ {
 		sl, _, _, fold := p.line(i)
 		if sl < 0 {
 			if fold {
@@ -253,5 +257,248 @@ func TestMultiLineFoldKeepsSessionLines(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("row text %q reports session line %d, want %d", k, got[k], v)
 		}
+	}
+}
+
+// TestExportedMapIsIdentityWithoutDecisions pins the contract D2 relies on:
+// with no decisions the projection is nil and the exported map is exactly the
+// session map, so a caller can use it unconditionally.
+func TestExportedMapIsIdentityWithoutDecisions(t *testing.T) {
+	p := savedPane(t, "alpha\nbeta\ngamma\n")
+	p.SetDisplay(piecetable.AcceptedOnly)
+	if p.disp != nil {
+		t.Fatal("no decisions must leave the projection nil")
+	}
+	if got := p.DisplayLines(); got != p.File.Lines() {
+		t.Fatalf("DisplayLines = %d, want File.Lines() = %d", got, p.File.Lines())
+	}
+	for off := 0; off <= p.File.Len(); off++ {
+		wantLine, wantCol := p.File.LineCol(off)
+		line, col := p.DispPos(off)
+		if line != wantLine || col != wantCol {
+			t.Fatalf("DispPos(%d) = (%d,%d), want (%d,%d)", off, line, col, wantLine, wantCol)
+		}
+	}
+	for line := 0; line < p.File.Lines(); line++ {
+		for col := -1; col <= len(p.File.Line(line))+1; col++ {
+			if got, want := p.DocAt(line, col), p.File.OffsetAt(line, col); got != want {
+				t.Fatalf("DocAt(%d,%d) = %d, want %d", line, col, got, want)
+			}
+		}
+	}
+}
+
+// TestDecisionGenerationAdvancesOnDecision pins the second half of the memo key
+// D2 caches SetDisplay under: a decision moves the composition without moving
+// the session version, so the generation has to move for the cache to notice.
+func TestDecisionGenerationAdvancesOnDecision(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	before := p.File.DecisionGeneration()
+	id := proposeAt(t, p.File, 6, 11, "socket")
+	proposed := p.File.DecisionGeneration()
+	if proposed <= before {
+		t.Fatalf("proposal generation = %d, want past %d", proposed, before)
+	}
+	version := p.File.Session().Version()
+	p.File.AcceptGroup(id)
+	if got := p.File.DecisionGeneration(); got <= proposed {
+		t.Fatalf("accept generation = %d, want past %d", got, proposed)
+	}
+	if got := p.File.Session().Version(); got != version {
+		t.Fatalf("a decision moved the session version %d -> %d", version, got)
+	}
+}
+
+// TestOffsetAtRoundTripsPlaceCaretOnFoldedUTF8Buffer extends the caret round
+// trip to multi-byte text: a fold and wide runes together must still be inverse
+// at every character boundary.
+func TestOffsetAtRoundTripsPlaceCaretOnFoldedUTF8Buffer(t *testing.T) {
+	p, _ := foldedPane(t, "héllo wörld → 世界\n")
+	roundTripOffsets(t, p)
+}
+
+// TestExportedLineMapOnMultiLineFold checks the exported line accessors agree
+// with a multi-line fold: the hidden lines have no row, and the line after the
+// fold reports its true session line.
+func TestExportedLineMapOnMultiLineFold(t *testing.T) {
+	p := savedPane(t, "alpha\nbeta\ngamma\ndelta\n")
+	id := proposeAt(t, p.File, 6, 6, "one\ntwo\nthree\n")
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	p.SetDisplay(piecetable.AcceptedAndProposed)
+	if p.disp == nil {
+		t.Fatal("a rejected multi-line insertion must build a projection")
+	}
+	if p.DisplayLines() >= p.File.Lines() {
+		t.Fatalf("DisplayLines = %d, want fewer than the %d session lines", p.DisplayLines(), p.File.Lines())
+	}
+	if got := p.DispOfDocLine(1); got != -1 {
+		t.Errorf("DispOfDocLine(1) = %d for a hidden line, want -1", got)
+	}
+	row := p.DispOfDocLine(6)
+	if row < 0 {
+		t.Fatal("DispOfDocLine(6) = -1 for the line after the fold")
+	}
+	if sl, _, _, fold := p.line(row); sl != 6 || fold {
+		t.Errorf("row %d = (session line %d, fold %v), want session line 6", row, sl, fold)
+	}
+}
+
+// firstFoldRow finds the first fold row in the pane's current projection, or
+// -1 when nothing is folded. It reads the exported Fold accessor, so a test
+// observes the projection's effect rather than reaching into view.
+func firstFoldRow(p *Pane) int {
+	for i := 0; i < p.DisplayLines(); i++ {
+		if _, _, ok := p.Fold(i); ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestUpdateDisplaySkipsARepeatedBuild pins the memo: a second UpdateDisplay
+// with the session version, decision generation and policy all unchanged must
+// not rebuild, which is what keeps Session.Project off the per-frame path. The
+// build counter is the honest instrument here — p.disp is non-nil in this
+// fixture, so the pointer check is a second witness, not the only one.
+func TestUpdateDisplaySkipsARepeatedBuild(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	proposeAt(t, p.File, 6, 6, "XY")
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.disp == nil {
+		t.Fatal("a proposed set must build a projection")
+	}
+	builds, first := p.displayBuilds, p.disp
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.displayBuilds != builds {
+		t.Errorf("displayBuilds = %d, want %d: a no-op UpdateDisplay rebuilt", p.displayBuilds, builds)
+	}
+	if p.disp != first {
+		t.Error("a no-op UpdateDisplay replaced the projection pointer")
+	}
+}
+
+// TestUpdateDisplayRebuildsOnVersionBump: an ordinary edit moves the session
+// version without moving the decision generation, so the version half of the
+// key is what makes the next UpdateDisplay rebuild.
+func TestUpdateDisplayRebuildsOnVersionBump(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	proposeAt(t, p.File, 6, 6, "XY")
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	builds, first := p.displayBuilds, p.disp
+	p.File.Begin()
+	if !p.File.Insert(p.Author, 0, "z") {
+		t.Fatal("the setup edit was refused")
+	}
+	p.File.End()
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.displayBuilds != builds+1 {
+		t.Fatalf("displayBuilds = %d, want %d after a version bump", p.displayBuilds, builds+1)
+	}
+	if p.disp == first {
+		t.Error("the projection pointer did not move after a version bump")
+	}
+}
+
+// TestUpdateDisplayRebuildsOnDecisionGeneration: a rejection moves the
+// composition without moving the session version, so the generation half of
+// the key is what makes the next UpdateDisplay rebuild. This is the case the
+// version key alone would miss.
+func TestUpdateDisplayRebuildsOnDecisionGeneration(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	id := proposeAt(t, p.File, 6, 6, "XY")
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	builds := p.displayBuilds
+	version := p.File.Session().Version()
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	if got := p.File.Session().Version(); got != version {
+		t.Fatalf("rejecting moved the session version %d -> %d", version, got)
+	}
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.displayBuilds != builds+1 {
+		t.Fatalf("displayBuilds = %d, want %d after a decision", p.displayBuilds, builds+1)
+	}
+}
+
+// TestUpdateDisplayRebuildsOnPolicyChange: switching modes moves neither the
+// version nor the generation, so the policy is the third part of the key. The
+// rebuilt projection must also change the composition: edit mode folds the
+// rejected run away, review mode annotates it in place.
+func TestUpdateDisplayRebuildsOnPolicyChange(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	id := proposeAt(t, p.File, 6, 6, "a much longer rejected run")
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	builds := p.displayBuilds
+	if firstFoldRow(p) < 0 {
+		t.Fatal("edit mode must fold the rejected run away")
+	}
+	p.UpdateDisplay(piecetable.Annotated)
+	if p.displayBuilds != builds+1 {
+		t.Fatalf("displayBuilds = %d, want %d after a policy change", p.displayBuilds, builds+1)
+	}
+	if row := firstFoldRow(p); row >= 0 {
+		t.Errorf("row %d is folded under Annotated: a rejected run is annotated, not hidden", row)
+	}
+}
+
+// TestUpdateDisplaySkipsOnTheIdentityProjection covers the no-decisions fast
+// path through the memo: Build returns nil, so the projection cannot witness a
+// rebuild and the build counter is the only honest signal. A second call must
+// still be a key hit, and the exported map must stay the session's own.
+func TestUpdateDisplaySkipsOnTheIdentityProjection(t *testing.T) {
+	p := savedPane(t, "alpha\nbeta\n")
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.disp != nil {
+		t.Fatal("no decisions must leave the projection nil")
+	}
+	builds := p.displayBuilds
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.displayBuilds != builds {
+		t.Errorf("displayBuilds = %d, want %d: the identity path rebuilt", p.displayBuilds, builds)
+	}
+	if got := p.DisplayLines(); got != p.File.Lines() {
+		t.Errorf("DisplayLines = %d, want the identity %d", got, p.File.Lines())
+	}
+}
+
+// TestPaneReloadInvalidatesTheDisplayProjection: a reload replaces the session,
+// so the projection built from the old document no longer describes the new
+// one. The pane must drop it before FollowCursor reads the map — otherwise the
+// caret is scrolled through a file that is gone — and the next UpdateDisplay
+// must rebuild rather than trust a key that did not move.
+func TestPaneReloadInvalidatesTheDisplayProjection(t *testing.T) {
+	f, path := openTemp(t, "hello world\n")
+	p := NewPane(f)
+	p.Resize(40, 8)
+	id := proposeAt(t, p.File, 6, 6, "a much longer rejected run")
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	p.SetDisplay(piecetable.AcceptedAndProposed)
+	if p.disp == nil {
+		t.Fatal("setup: a rejected run must build a projection")
+	}
+	touch(t, path, "hello world\n")
+	if err := p.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if p.disp != nil {
+		t.Error("reload kept the projection built from the replaced document")
+	}
+	if got, want := p.DisplayLines(), p.File.Lines(); got != want {
+		t.Errorf("DisplayLines = %d after reload, want the identity %d", got, want)
+	}
+	// A second Draw must rebuild the (identity) projection, not trust the key
+	// the old document left behind.
+	builds := p.displayBuilds
+	p.UpdateDisplay(piecetable.AcceptedAndProposed)
+	if p.displayBuilds != builds+1 {
+		t.Errorf("displayBuilds = %d, want %d after a reload", p.displayBuilds, builds+1)
 	}
 }

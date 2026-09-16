@@ -2,20 +2,105 @@
 
 Open work only. Measured numbers live in BENCHMARKS.md; root causes, terminal
 findings and decisions live in INVESTIGATIONS.md. Raw, dated agent feedback
-lives in RAJ_FEEDBACK.md; its actionable items are in the section below.
+lives in AGENT-FEEDBACK.md; its actionable items are in the section below.
 
-**RECURSIVE_RAJ: start here.** A Raj agent improving raj reads
-RECURSIVE_RAJ.md first (identity, rebuild boundary, editing discipline, swarm
+**RECURSIVE-RAJ: start here.** A Raj agent improving raj reads
+RECURSIVE-RAJ.md first (identity, rebuild boundary, editing discipline, swarm
 workflow), then works the active plan in the next section.
 
 ## Direction (documented, not scheduled)
 
-- [ ] **Reconciliation UX — layer toggles + conflict navigator.** Design note in
-  `docs/RECONCILIATION-UX.md`: generalise the composition from
-  accepted/proposed/rejected to layer selection, built on the F3b-ii projection
-  and the "Overlap reporting for swarms" item. Open questions for the user.
+- [~] **Symlinks are an escape from the workspace root.** `Guard.inRoot`
+  (`internal/control/host.go:343`) is lexical (`Clean`/`Rel`), `Resolve`
+  returns a buffer's spelled path, and `writeAtomic` (`internal/editor/write.go:59`)
+  resolves and writes the target — so a symlink inside the workspace pointing
+  outside it is readable and writable through the socket, the one window an
+  agent has into the host. Decide the policy: resolve with `EvalSymlinks` and
+  refuse a target outside the root by default, with an explicit opt-in (an
+  environment variable or `.raj` config) to allow it; and stop `ls` following a
+  symlinked directory unless allowed.
+  Status 2026-09-16: implemented in `Guard.inRootResolved`/`resolveExistingPrefix`
+  (`internal/control/host.go`), with `canonical` checking before `Host.Resolve`
+  and `RAJ_ALLOW_SYMLINK_ESCAPE` as the opt-out; in buffers as `host.go` group
+  9, pending save + host verification.
+- [ ] **A dangling symlink defeats the resolved-root check (decision needed).**
+  When `EvalSymlinks` fails on a path, `resolveExistingPrefix` treats it as
+  unborn and re-appends the name to its resolved parent — so a leaf or parent
+  that is a symlink to a *nonexistent* target outside the root passes as an
+  in-root path. The window is narrow: `writeAtomic` also fails to resolve a
+  dangling link and replaces the link in-root, so no bytes escape unless the
+  target appears between the check and the save, and a read still fails. Decide
+  whether to detect a dangling link (`os.Lstat`, `ModeSymlink`) and refuse it,
+  or to keep the lexical fallback. Found by the 2026-09-16 review pass.
+- [ ] **`exec -dir` refuses a relative directory, unlike `search -path`.**
+  `Guard.CheckExec` calls `inRootResolved(dir)`, which requires an absolute
+  path, while `Guard.inRootDir` — whose doc names "exec -dir" as a spelling it
+  exists for — joins the root first, and `Mapper.ToEditor` leaves a relative
+  `Dir` relative. A relative `-dir` is therefore refused with "a path must be
+  absolute". Fix: route `CheckExec` through `inRootDir`. The line is in the
+  pending `host.go` group 9, so fix it there before saving. Found by the
+  2026-09-16 review pass.
+- [ ] **Should the human typing path follow the advisory lease? (decision
+  needed).** `apply` over another writer's `Proposed` span now lands (spec
+  §12.1), but `File.Insert`/`File.Delete`/`EditLeased` still treat every
+  non-accepted run, Proposed included, as read-only — so an agent can land where
+  the human cannot type. Edit mode already hides Rejected as folds, which is
+  why the human path is the stricter one. Decide whether typing into a draft is
+  advisory too or stays a refusal. Found by the 2026-09-16 review pass.
+- [ ] **An app-level advisory-lease test with two identities.** The behavior is
+  covered in `internal/piecetable` and `internal/editor`; `internal/app` only
+  covers the Rejected refusal, so the wire path (propose, a second identity's
+  apply lands over it, both sets listed with the superseded one moved) is
+  unpinned. Filed by the 2026-09-16 review pass and not written there because
+  the container cannot compile.
+- [ ] **Pending deletions and dir-removals need a persistent surface.** They
+  surface only as a prompt (`promptDeletion`/`promptDirRemoval`,
+  `internal/app/{delete,rmdir}.go`); miss or dismiss it and the editor has no
+  way to act on the proposal, though `raj ctl deletions`/`rmdirs` still list it
+  and it is not lost. Fold them into the review flow the way change sets are
+  (the review list already walks sets), or give them a Pending tab, so acting
+  on one is recoverable.
+- [ ] **Only revert compares the author to the connection.** The serve loop
+  refuses a foreign author only for `revert`; `patch`, `delete -withdraw` and
+  `rmdir -withdraw` compare it to a stored record's owner, and every verb trusts
+  the field for attribution, so a hand-built frame can name a peer. Hoisting the
+  check out of the revert case is a behaviour change and wants a test. Evidence
+  in `docs/AGENT-FEEDBACK.md`.
+- [ ] **Conflict navigation over git diffs (not scheduled).** The editor-side
+  layer toggles and conflict navigator are decided against for simplicity;
+  reconciling a wave's changes is a between-wave agent pass
+  (`docs/REVIEW-AGENT.md`, `docs/RECURSIVE-RAJ.md` §7b). What remains a
+  direction is navigating conflicts in terms of git diffs, with resolution
+  staying native — no work trees or branch hackery.
+- [ ] **Run the between-wave review pass each wave.** The `review` subagent is
+  defined in `opencode/agents/review.md`; experiment with one review agent per
+  wave before scaling to a swarm. Raw findings to `docs/AGENT-FEEDBACK.md`,
+  actionable to TODO, done to COMPLETED — and pay debt down, not just file it.
+- [ ] **Install the `review` agent definition (2026-09-15).** The repo has
+  `opencode/agents/review.md` and `plugins/raj-gate.ts` allows
+  `subagent_type: "review"`, but the installed config
+  (`~/.config/opencode/agents/`) holds only `raj.md`, so spawning one fails
+  with "Unknown agent type" and the between-wave pass has to run as a `raj`
+  subagent. `bldraj` should copy the whole `opencode/agents/` directory, not
+  just `raj.md`. The installed `skills/raj-review-agent/SKILL.md` is the
+  `REVIEW-AGENT.md` body with no frontmatter, so the skill does not register
+  either; ship it with `name`/`description`.
+- [ ] **A saved wave has no enumerable diff for the review pass (2026-09-15).**
+  After accept-and-save, `proposals`/`groups` are empty and `diff` lists only
+  pending change sets, while the container has no git checkout; the review
+  agent sees the wave only through its brief's file list. Either add a
+  `history`/`changes` verb or make the brief's file list the explicit contract.
+  Evidence in `docs/AGENT-FEEDBACK.md`.
+- [ ] **Guard the docs index against drift.** The documents-consolidation wave
+  left three folded source docs on disk and nothing failed: `docs/README.md`
+  simply did not list them, and `raj ctl search` was the only thing that would
+  have shown the retired names still resolved. Add a cheap host check (a Go test
+  over `docs/`) that every `docs/*.md` has a README row and every row names an
+  existing file, so a retirement that forgets the delete fails `make check`.
+  Evidence: `docs/AGENT-FEEDBACK.md`, 2026-09-15 review.
 - [ ] **Agent verb-surface audit — implement the safe simplifications.**
-  Findings in `docs/AGENT-VERB-AUDIT.md`: localise paths in every `-json` shape,
+  Findings in `docs/AGENT-FEEDBACK.md` (the 2026-09-13 verb-surface audit):
+  localise paths in every `-json` shape,
   per-verb usage that shows positionals and the default target, one `-json`
   field contract, document `clear`/`open -create`, and line/col in apply/edit
   replies. Do it under the working agreement, before designing reconciliation
@@ -56,10 +141,17 @@ focused task.
   `Rejected` (no reversal, cannot fail); `AcceptGroup` can un-reject; a pending,
   rejected or invalidated span is a read-only lease, so an edit or `apply` that
   intersects one is refused — except a writer amending its own `Proposed` set,
-  which joins it instead (2026-09-13). `save` writes `Project(AcceptedOnly)`; `read`
-  defaults to accepted with an annotated flag; the edit view is
-  `AcceptedAndProposed` with inert spans hidden as atomic folds, Review is
-  `Annotated`; `cmd+ctl+k` clears rejected, `cmd+ctl+l` clears invalidated.
+  which joins it instead (2026-09-13).
+  Advisory update 2026-09-16: for `apply` (and `patch`, which shares its diff
+  path), a `Proposed` span is advisory — the
+  hunk lands in the editing author's own set and the superseded set's members go
+  `Moved` — and only `Rejected` refuses; the human typing path stays read-only
+  over `Proposed`. The landing reply warns with the superseded set (group,
+  author and span) for `apply` and, in buffers, `patch`. Spec §12.1.
+  `save` writes `Project(AcceptedOnly)`; `read` returns the session view with
+  `-annotated` adding the state runs; the edit view is `AcceptedAndProposed`
+  with inert spans hidden as atomic folds, Review is `Annotated`;
+  `cmd+ctl+k` clears rejected, `cmd+ctl+l` clears invalidated.
   - **Done (F3b-i, 2026-09-12):** the state flips (`RejectGroup` marks
     `Rejected`; `AcceptGroup` un-rejects; `ClearRejected` reverses + drops),
     region leases (`Session.Leased`; an intersecting edit/`apply` is refused,
@@ -83,11 +175,80 @@ focused task.
     `internal/app` (`mode.go`, `render.go`, `review.go`, `keys`) — policy by
     mode, tint, and lease enforcement at commit instead of per key. Write a
     short design note fixing the fold representation and the map API first.
-- [ ] **Phase 1c — invalidation and conflict reporting.** An orthogonal,
+  - [x] **F3b-ii D2a — wire the projection to the mode, memoised (2026-09-15).**
+    `internal/editor/pane.go` adds `Pane.UpdateDisplay(policy)`, memoised on
+    `(Session().Version(), File.DecisionGeneration(), policy)`; `SetDisplay`
+    records the key beside `disp` so no caller can refresh one without the
+    other, and `displayBuilds` counts real rebuilds. `internal/app/mode.go`
+    adds `App.displayPolicy()` (`ModeReview → Annotated`, else
+    `AcceptedAndProposed`); `internal/app/render.go` `drawEditor` calls it
+    before `fitHints`/`RenderFocused`. Folds are now live in Edit mode. Tests:
+    `internal/editor/display_test.go`, `TestDrawProjectsByMode`. Host `make
+    check` green 2026-09-15; see COMPLETED.md.
+  - [ ] **F3b-ii D2b — move the app consumers onto the display map
+    (2026-09-15).** With D2a wired, every consumer still comparing session
+    coordinates to `Viewport` display rows is a row off when a fold sits above
+    the mark (`docs/F3B-II-DESIGN.md` §2 lists them). Functions to move:
+    - `internal/app/render.go` `drawDiagnosticMarks` (`it.Range.Start.Line`),
+      `drawProposalMarks` (`m.Line`), `drawCompletion`/`textArea`;
+    - `internal/app/app.go` `showCompletion` (`File.LineOf`), `jumpTo`
+      (`Viewport.Center(line-1, File.Lines())`);
+    - `internal/app/review.go` `proposalsVisible` (`Viewport.Visible(m.Line)`),
+      `cycleProposed`, `reviewPicker`, `reviewRows`, `proposalGroups`;
+    - `internal/app/control.go` `Goto`; `internal/app/inlay.go`
+      `hintLines`/`hintRange`; `internal/app/session.go`
+      `SessionState`/`scrollRatio`/restore.
+    Use `DispPos`/`DocAt`/`DispOfDocLine`/`PendingMark.DispLine` and clamp
+    against `DisplayLines()`; `drawStatus` chooses session vs display
+    explicitly. (The `Pane.Reload` half of the memo invalidation was fixed in
+    the D2a review pass; the startup `journal.go` restore swap still relies on
+    happening before the first frame.)
+- [~] **A mid-line proposal draws on its own display row(s) — merged
+  2026-09-16.** `view.Build`'s `emitContent` used to lay one display row per
+  composition segment, and two kept runs owned by different change sets never
+  merged, so an agent hunk that cuts a line (replacing "world" inside
+  "hello world") composed as `"hello " | "socket" | "\n"` and drew as two rows
+  plus the line's break — D1 behaviour the D2b freeze left alone. The decision
+  it wanted was to merge in `internal/view`: `emitContent` now absorbs every
+  following kept piece that continues the run (same composition line,
+  contiguous in composition and session, not behind a fold), so the two runs
+  draw as one row; a fold or a restore still starts its own row. In tree
+  2026-09-16 (saved), host verification pending;
+  `TestBuildMidLineReplacementMergesKeptRuns` pins the merge and the two
+  boundaries, and `checkProjectionInvariants` is unchanged. Filed by the D2b
+  review pass; see `docs/AGENT-FEEDBACK.md`.
+- [ ] **One jump path for session and display.** `App.jumpTo` and `reviewJump`
+  are two copies of the same `DispPos`-centred jump; `jumpTo` skips a line a
+  fold hides and `reviewJump` does not. Collapse them onto one map-aware
+  function with the skip rule as an argument, so the chord, the review walk and
+  `control.Goto` cannot drift.
+- [ ] **Expose the text a display row draws on `Pane`.** `showCompletion` reads
+  its prefix from session bytes (`File.Line`) because `Pane` has no accessor for
+  the row's own text (`view.Projection.RowText` sits behind `disp`). A
+  `Pane.RowText(row)` would let the completion prefix and the caret agree when a
+  fold cuts a line; until then the session read is deliberate and documented in
+  `showCompletion`.
+- [~] **Phase 1c — invalidation and conflict reporting.** An orthogonal,
   recomputed `Invalid` marks a still-`Proposed` set whose edit no longer fits
-  the current composition; it is excluded from edit/agreed and annotated in
-  Review, with the colliding span reported, never cascaded or clamped. The D4
-  promote rule is retired. Rendering and gutter polish for the new states.
+  the current composition; the colliding span is reported, never cascaded or
+  clamped, and the D4 promote rule is retired.
+  - [~] **Recomputed `Invalid` built in tree 2026-09-16, host verification
+    pending.** `markInvalid`/`invalidBy` (`internal/piecetable/groups.go`)
+    reuse the same per-member projection `Pending`/`DiffPending` drop a set on,
+    so the flag is derived and clears when the collider clears;
+    `Group.Invalid`/`InvalidBy` reach `groups`/`diff`/`proposals` and the
+    sparse `hGroupInvalid` (0x5a) wire field, and the CLI names the collider.
+    Live-verified in two identities; evidence in `docs/AGENT-FEEDBACK.md`.
+  - [ ] **`Project` does not consult `Invalid`.** A consumed insertion is
+    absent from the composition by construction, but a deletion-only invalid
+    member's composition is undefined, not excluded; decide whether to wire
+    `Invalid` into `included` or state the limit. Escalated by the 1c review
+    pass.
+  - [ ] **`review`/`proposals` cannot name an invalid set.** Both read
+    `Pending`, which drops it, so only `groups`/`diff` show it; decide whether
+    the rollup should carry it (`-annotated`, or a flag).
+  - [ ] **Edit-view fold and Review annotation for invalid sets** (the D2
+    rendering item; the invalid tint is not drawn yet).
 - [ ] **Then:** change gutter vs `HEAD`, annotated `read`/`exec`/LSP
   composition, git verbs (read-only diff first).
 - [ ] **Also open (spec §7, §10):** `session.json` into the store; compaction /
@@ -421,14 +582,27 @@ missing is addressing and state.
   stay, the range is marked, and acceptance is when the delete runs. This is
   what makes a deletion visible at all — a deleted span leaves no piece — and it
   replaces the change-gutter representation problem rather than solving it.
+  Confirmed by a 2026-09-16 smoke test that this is also the only correct fix
+  for the lease: a deletion-only change set has no inserted run, so it cannot
+  lease the range it plans to delete (a write over that range succeeds). Leasing
+  the projected zero-width point is wrong in both directions — too weak at
+  offset 0, and it would refuse legitimate writes abutted against surviving
+  text — so the range must be tracked by the deferred-deletion model first.
 - [ ] **Diff-style rendering.** Green for pending additions, red for pending
   deletions, as in a git diff. Colour carries state; the gutter carries who,
   from the participant table — with five agents everything is green and the
   colour cannot also mean identity.
-- [ ] **Overlap reporting for swarms.** Two proposals whose rebased ranges
+- [~] **Overlap reporting for swarms.** Two proposals whose rebased ranges
   intersect is a mechanical fact. Report it to both with the other's author id
   and the span. The editor must not arbitrate which is right: that is semantic,
-  and voting built in here would be wrong in ways nobody can debug.
+  and voting built in here would be wrong in ways nobody can debug. In buffers
+  2026-09-16 (Wave 2): `Session.PendingOverlaps` reports each live set's
+  counterparts via `Group.Overlaps` (`hGroupOverlaps` 0x54), shown in
+  `groups`/`diff`; a lease refusal names the owner author and span
+  (`hConflictLease` 0x53); a smoke-test false positive on adjacent sets was
+  fixed by bounding each member's surviving owned runs. Host verification
+  pending. The editor still *prevents* overlap via the lease, so the pairing is
+  latent until composition is relaxed.
 - [~] **`claim` built; `watch` remains.** `claim <path>...` records enforced
   file-level claims (no spans, no TTL, no overlap refusal); reads stay free, a
   pathless write is allowed only when exactly one file is claimed, `open
@@ -437,10 +611,13 @@ missing is addressing and state.
   `delete`/`rename` are claim-gated, `mkdir` is ungated. Built 2026-09-13/14
   (see COMPLETED.md); journal persistence of claims remains.
   `watch` (the push) stays separate. Design: `docs/CLAIM-SPEC.md`.
-- [~] **Which composition does `read` return?** Decided: `AcceptedOnly` by
-  default, with an explicit annotated flag (spec §6, §12). Implementation lands
-  with phase 1b; the argument stands — an agent proposes against the agreed
-  base, not another agent's unaccepted guesses.
+- [x] **Which composition does `read` return?** Settled 2026-09-16: the session
+  view (the whole document, session coordinates), with `-annotated` adding the
+  state runs. Returning `AcceptedOnly` would desync a driver's offsets from the
+  version `read` reports, because `apply`/`diff` operate on the session. The
+  original intent — propose against the agreed base, not a peer's unaccepted
+  guesses — is unmet by this and would need editing against a composition; that
+  is a design direction, not a wording fix.
 ~~`exec`~~ — refuse-on-dirty, naming the files, with the counter. `raj ctl stats`
   reports runs, blocks, and how many blocks were agent-authored only. What is
   left:
@@ -455,33 +632,12 @@ missing is addressing and state.
   platform-specific in a way nothing else here is.
 - [ ] **No flush mechanics.** When v2 lands it needs temp-file-plus-rename per
   dirty file, so no subprocess reads a half-written file.
-- [ ] **Discovery is a directory listing.** A driver finds editors by listing
-  `$XDG_RUNTIME_DIR/raj/` and asking each socket for its root. That is one round
-  trip per editor and cannot go stale, but it also means a driver started
-  independently has to know that convention. A `--control-socket` at a path the
-  driver chooses is the escape hatch and is probably the common case.
-
-  **It finds nothing over TCP**, and cannot: there is no directory to list on
-  the other side of a boundary. `RAJ_CONTROL_ADDR` is the only way to name a
-  remote editor, which is fine for one and unhelpful for several.
 ~~The socket assumes one filesystem~~ — `--control-addr tcp://host:port` is the
   second transport, with a token in every request header standing in for the
   file mode, and `raj ctl` translating paths between the caller's view of the
   tree and the editor's. This exists because the useful arrangement is raj on
   the host, where the terminal delivers its chords, and the driver in a
   container, where it is safe to let it run commands. What is left of it:
-- [ ] **The token is printed and never stored.** It goes to stderr at startup
-  and nowhere else, so a user who has scrolled past it has to restart raj or
-  pin `RAJ_CONTROL_TOKEN` themselves. A file would be the obvious fix and is
-  the wrong one — a file the driver could read is a file on a filesystem the
-  driver does not share, which is the situation TCP exists for. `raj ctl token`
-  reading it out of the running process is the shape that might work, and needs
-  the socket to still be listening alongside the port, which it is not.
-- [ ] **One listener, not both.** `--control-addr` replaces the socket rather
-  than adding to it, so a session driven by a container cannot also be driven
-  by a script on the host. Two listeners sharing one queue is a small change;
-  what stops it is that `Path()` then has to return two things, and every
-  caller of it assumes one.
 - [ ] **Nothing is encrypted.** The token authenticates but the frames are
   plaintext, so the buffer contents are readable to anything on the path. That
   is the right trade for a loopback port and a container bridge and the wrong
@@ -616,12 +772,40 @@ missing is addressing and state.
 - [ ] `cmd+shift+r` to reopen closed tabs, handing `cmd+shift+t` back — only
   worth doing if Ghostty actually binds it; check `+list-keybinds` first.
 
-## Agent feedback — actionable (context in RAJ_FEEDBACK.md)
+## Agent feedback — actionable (context in AGENT-FEEDBACK.md)
 
 Open items extracted from the agent feedback notes now kept in
-`docs/RAJ_FEEDBACK.md`; the raw notes, dates and explanations are there. Items
+`docs/AGENT-FEEDBACK.md`; the raw notes, dates and explanations are there. Items
 already tracked elsewhere in this file are not repeated. `- [~]` marks work
 that is in tree but still needs host verification.
+
+Revert:
+
+- [~] **Revert coverage for the partial wedge and shared-group decision.** Landed
+  2026-09-15: `TestRevertAuthorPartialWedgeLeavesNewerSetReversed` and
+  `TestRevertAuthorKeepsASharedGroupsDecision` (`internal/piecetable/groups_test.go`).
+  Host verification pending. No `internal/editor` `File.RevertAuthor` test was
+  added: the one guard it cannot otherwise reach, the unnamed-block version
+  clause, needs an op whose bad offset the public API clamps away. Evidence in
+  `docs/AGENT-FEEDBACK.md`.
+
+Defaults:
+
+- [ ] **Test the active-target naming path.** `targetName`/`activePath`
+  (`internal/control/cli.go`) name the buffer a pathless verb targets, but the
+  test fake never marks a buffer active, so the resolution is untested. Add an
+  opt-in `active` field to the fake and a pathless `edit`/`goto` assertion.
+  Flagged by the 2026-09-15 reconciler.
+
+Invalidation:
+
+- [ ] **The invalidation mapping has no app-layer test.** `host.Groups`/
+  `host.Diff` (`internal/app/control.go`) translate `piecetable.Group.Invalid`
+  and `InvalidBy` into `control.Group`; the piecetable predicate, the wire
+  field and the CLI are each unit-tested, but the mapping is live-verified
+  only. Add an app test that seeds a wholly-overwritten proposed set and
+  asserts the control group carries `Invalid` and the collider. Flagged by the
+  2026-09-16 1c review pass.
 
 Path and identity:
 
@@ -632,7 +816,7 @@ Path and identity:
   check 2026-09-15: relative, caller-mapped-absolute and editor spellings all
   resolve to the same buffer for read/version/groups/diff/dump/review/goto, and
   the original symptom no longer reproduces. Remaining: `run -prog` payload
-  paths and `LSPJSON` location paths are not mapped.
+  paths are not mapped; `LSPJSON` location paths were mapped 2026-09-15.
 
 Search:
 
@@ -653,11 +837,31 @@ Search:
   specific zero-`Considered` message, so a driver still has to recognise the
   pairing.
 
+Replies:
+
+- [ ] **Line/col in `apply`/`edit` replies needs a wire + coordinate decision.**
+  One sparse field cannot carry N hunks (`apply -hunks`, `edit -all`), so the
+  shape and the resulting-coordinate semantics are undecided; the host primitive
+  is `diffLines` in `internal/app/control.go`. Evidence in
+  `docs/AGENT-FEEDBACK.md`.
+
+- [ ] **A whole-file `patch` on a large file arrives as one coarse change set.**
+  `control.DiffLines` (`internal/control/host.go`) falls back to a single
+  `{0, len(old), newText}` hunk once `n*m > 1<<20`, so a `dump`→`patch` of a
+  ~1.7k-line file is one group spanning the whole file: it reviews as a wall of
+  +/- and its lease blocks every other writer of the file. A bounded line-diff
+  (patience/histogram) or a higher cap keeps the set small. Exposed 2026-09-16
+  by the symlink-guard wave (`host.go` group 9).
+
 Diagnostics:
 
-- [ ] **No raw-LSP verb.** No way to inspect inbound `publishDiagnostics`
-  frames or their `version` field, so the freshness assumption is
-  unverifiable from the socket. A debug verb or a trace would close it.
+- [ ] **Raw-LSP passthrough — wanted on its own merits?** The freshness concern
+  that filed this is already answered: `diagnosticsStatus`
+  (`internal/app/diagnostics.go`) is exposed as `lsp diagnostics`'s `status`
+  (`unpublished`/`stale`), which the CLI reports (`internal/control/cli.go:1880`),
+  so a driver checks the assumption without inspecting frames. What is left is
+  whether a passthrough for arbitrary server methods is worth its surface
+  (framing, lifecycle, capabilities). Decide, then file it properly or drop it.
 
 Dated notes, 2026-09-12 (layered-proposals 1a wave):
 
@@ -702,7 +906,7 @@ path-verb refusals and `FakeHost.Press` panic (Wave 3); the `-include`/
 C); `lsp references`; `edit -base` and miss-point reporting; `/tmp/opencode`;
 the `find`/file-listing verb; and the `search` `ByteStart`-vs-`LineStart`,
 `groups`-vs-`diff` and `read -lines` reports (fixed; see COMPLETED.md). The rest
-of the feedback is context in `docs/RAJ_FEEDBACK.md`.
+of the feedback is context in `docs/AGENT-FEEDBACK.md`.
 
 - [ ] **File lifecycle — remaining: directory rename, `run -prog` reachability.**
   Built and live 2026-09-13/14: `mkdir`, `delete`/`delete -withdraw`/`deletions`
@@ -722,7 +926,7 @@ of the feedback is context in `docs/RAJ_FEEDBACK.md`.
   `Guard.Proposals`, `App.Proposals`, the CLI, and `client.go` path rebasing.
   No `run -prog` opcode, matching `deletions`/`rmdirs`. Socket-verified:
   empty/`set`/`delete` round-trips and `-mine`, no regression in the old verbs.
-  See COMPLETED.md. Design: `docs/PROPOSALS-SPEC.md`.
+  See COMPLETED.md. Design: `docs/LAYERED-PROPOSALS-SPEC.md`.
 
 Dated notes, 2026-09-14 (rmdir Wave 2 — subagent friction):
 
@@ -756,12 +960,131 @@ Dated notes, 2026-09-15 (proposals Wave 4 + dir-gate subagents):
 
 Dated notes, 2026-09-15 (Wave 1 swarm — four subagents):
 
-- [ ] **A writer cannot edit a region another writer has proposed.** An `edit`
-  aimed at text another agent had just proposed was refused with `change set N
-  owns this text` (the region lease). The bytes were a different span, so even a
-  non-overlapping edit in the same file was blocked by where the hunk landed.
-  Report the owning author/span so the writer can route around it, or scope the
-  lease to the exact proposed bytes.
+- [~] **A writer cannot edit a region another writer has proposed.** The lease
+  refusal (`change set N owns this text`) was under-described: it named the
+  group but not who owned it or where. Addressed in buffers 2026-09-16
+  (Wave 2): `apply`'s conflict now carries the owning author and the current
+  rebased span (`hConflictLease` 0x53), and `groups`/`diff` report live-set
+  overlaps (`hGroupOverlaps` 0x54). Host verification pending. The lease itself
+  is unchanged — overlap is still prevented, not composed.
+
+Dated notes, 2026-09-16 (wave workflow — reconciler pass):
+
+- [ ] **Standing between-wave reconciler.** Documented as a step in
+  `docs/RECURSIVE-RAJ.md` §7b: after a wave's implementation agents report and
+  before the user saves, one reconciler agent fixes integration fallout (call
+  sites, interfaces, tests) in unleased regions and reports a ledger; the host
+  `make check` stays the final gate, and a failed check resumes the reconciler.
+  Once the pattern proves out, a thin wrapper so the pass is invoked rather
+  than remembered.
+
+Dated notes, 2026-09-16 (Wave 3a — `find`/`arg`/`exec` opcodes):
+
+- [ ] **`OpReload` is in `prog.names` but neither `knownOps` nor
+  `verbNames`.** A program using it is refused as an unknown verb (the two
+  control tables agree, so no panic), but the three opcode tables disagree
+  about the set. Reconcile them.
+- [ ] **`find` has no `verbCodes` wire code.** find is program-only today, so a
+  wire-level `Request{Op:"find"}` crosses as the text fallback rather than one
+  byte; add the code for completeness (and to `TestEveryVerbHasACode`'s list).
+- [ ] **`exec` in a program cannot set a working directory.** No `OpDir`
+  opcode exists, so `arg` accumulates `Argv` but `Dir` stays default.
+
+Dated notes, 2026-09-16 (advisory-lease reporting review pass):
+
+- [x] **CLI drops apply/patch warnings when any hunk is refused — fixed and
+  live-verified 2026-09-16.** `reportConflicts` now takes the
+  warnings and prints `noteOverlaps` to stderr (and carries `warnings` in the
+  `-json` `ok:false` reply), so a partial refusal no longer hides a hunk that
+  landed. Pinned by `TestCLIApplyRefusalStillCarriesTheWarning` and
+  `TestCLIPatchRefusalStillCarriesTheWarning`. Live 2026-09-16 with the client
+  and server now matching: a mixed batch (a hunk over a `Rejected` set
+  refused, one over a `Proposed` set landed) printed the refusal and
+  `note: overlapped change set ...` on stderr, and `-json` carried both
+  `conflicts` and `warnings`. The `run`/program path still keeps only the
+  final frame on `Response.Err`; the mailbox notice is unaffected because it
+  posts per dispatched request.
+- [~] **Warn for every superseded Proposed set and dedupe per set — built
+  2026-09-16, host verification pending.** `Session.proposedSpans`
+  (`internal/piecetable/groups.go`) reports every distinct Proposed run
+  intersecting a hunk, and `ApplyDiff` accumulates across the batch with a
+  per-set `warned` map, so one warning per set however many hunks catch it.
+  Live-verified: one hunk over two sets warned both once each; one set with
+  two runs caught by two hunks warned once. Remaining content choice: the
+  warning's span is the *first* intersecting run, not the bounding span of
+  all caught runs (`bytes 0..4` in the live dedupe where the set also held
+  `8..12`). Escalated, not decided.
+- [~] **Mailbox notification to a superseded author — built 2026-09-16, host
+  verification pending.** `Server.PostNotice` (`internal/control/control.go`)
+  posts to the existing mailbox with `Message.From = AuthorOriginal`, and
+  `App.notifySuperseded` (`internal/app/control.go`) enqueues once per
+  superseded set on a landed `apply`/`patch`; no new wire field (`hMessages`
+  0x25 carries `{from,text}`). Live: the occupant's `recv` delivered
+  `change set N (bytes s..e) was landed over by author M`, and a clean or
+  same-author apply produced no notice. `edit` is covered because it is
+  `apply` on the wire. The notice ships no path at all now (set, span and
+  author only); both path-wording gaps below are resolved.
+- [x] **All-refused `patch` guard has an app-level test (2026-09-16).**
+  `host.Patch`'s `Version() > before` guard stops an all-conflict patch from
+  marking the empty group `Begin` reserved, which would leave a phantom
+  `proposed` set in `groupState` and make `HasDecisions` true.
+  `TestControlPatchAllRefusedDoesNotReproposePriorSet` (controlHarness, a
+  rejected prior set) asserts the prior set stays rejected and `LastGroup()`
+  is not proposed; live-verified over the socket on a scratch buffer. Note:
+  the guard's failure mode is the phantom reserved group, not a flip of the
+  prior set, so only the test's second assertion discriminates.
+- [~] **`header.go` forward-compat comment corrected 2026-09-16, host
+  verification pending.** `decodeHeader`'s comment now credits its own
+  `switch` (no `default`) with dropping unknown codes and says `prog.Decode`
+  gets a nil known set ("every opcode is known"), matching `internal/prog`.
+- [x] **`recv -json` exits 3 with no message, matching text mode (2026-09-16).**
+  The cancelled branch writes the empty JSON array (so `-json` always parses)
+  and returns 3; pinned by `TestCLIRecvJSONTimeoutExitsThree` and
+  live-verified: `recv -wait 500ms -json` exited 3 with `[]`.
+- [x] **Supersession notice ships no path (2026-09-16).** Decided: say nothing
+  about the path rather than localise it, because the server only knows the
+  editor's spelling and the recipient's view of the tree is unknown. The
+  message is now `change set N (bytes s..e) was landed over by author M`,
+  pinned by `TestControlSupersededNoticeShipsNoPath` and live-verified.
+- [x] **A pathless apply/patch supersession notice omits the path (2026-09-16).**
+  Resolved by the same decision: no notice names a path, so pathless and
+  pathful requests read alike. The resolved buffer name never reaches
+  `notifySuperseded`, which is now by design rather than a gap.
+- [ ] **The container `raj` can lag the editor.** The 2026-09-16
+  advisory-lease completion review pass could not exercise the CLI
+  partial-refusal output because `/usr/local/bin/raj` predated the wave (no
+  `was landed over by author` or `proposedSpans`) while the rebuilt server had
+  it. Rework the release/rebuild step so the container client matches the
+  editor, or make the skew detectable when `srcVersion` is empty. Cleared for
+  the 2026-09-16 order-independence pass: both were rebuilt and matched (no
+  skew warning), so the live CLI checks ran.
+- [x] **Own-set + other-set resolution is order-independent (2026-09-16).**
+  Decided conflict-everywhere. `Session.ApplyDiff` reads every caught
+  Proposed run via `proposedSpans` (not the first via the removed
+  `leaseSpan`), so a hunk that catches the writer's own draft and a peer's
+  refuses against the own set whichever run the projection meets first, and
+  the advisory path applies only when every caught proposed run belongs to
+  another author. `Rejected` still wins. Pinned by
+  `TestApplyDiffRefusesOwnAndOtherProposalEitherOrder` and live-verified in
+  both orders over scratch buffers. The now-unused `leaseSpan` and
+  `leasedElsewhere` were removed in the review pass;
+  `F3B-II-DESIGN.md` now names `proposedSpans`/`rejectedLease`/`commitInto`.
+
+- [~] **Dead lease helpers removed (`leaseSpan`, `leasedElsewhere`) —
+  2026-09-16, in buffers, host verification pending.** The order-independence
+  fix orphaned both; no production or test caller remains. The design doc, the
+  `Leased` doc comment and `proposedSpans`' doc were repointed. Needs the
+  user's save and the next `make check`.
+
+- [ ] **The own+other conflict message reads as a peer's refusal.** A conflict
+  that names the writer's own set says `change set N owns this text (author
+  A, bytes s..e); accept or reject it first` — the driver cannot accept its
+  own draft, and the real action is to narrow the hunk off the peer's text.
+  `Conflict` carries only the own set's group/author/span, so the CLI cannot
+  tell own+other from a genuine lease refusal. Decide whether to add a
+  field/flag distinguishing them and reword, or leave the message. Found by
+  the 2026-09-16 order-independence review pass.
+
 
 
 
@@ -808,3 +1131,11 @@ Dated notes, 2026-09-15/16 (Wave 2 host verification):
   machine, outside the driver's container. The driver-side staleness
   substitution (a `buffers`/`read` version check before a hand-off) landed
   instead.
+
+Dated notes, 2026-09-16 (ls + hidden review pass):
+
+- [ ] **`search -path` into a hidden directory ignores the `-hidden` policy.**
+  A walk's root is never hidden, so `search -path .git` reaches `.git` without
+  `-hidden` while an unscoped `search` does not. An explicit scope is a
+  deliberate request and may be the intended override, but then `-hidden` is
+  not the only door and `search -h` should say so. Decide and state it.

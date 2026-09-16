@@ -500,7 +500,7 @@ func TestEditsSinceMultiHunkDiff(t *testing.T) {
 		}
 		return i
 	}
-	_, conflicts := sess.ApplyDiff(piecetable.User, v0, []piecetable.Hunk{
+	_, conflicts, _ := sess.ApplyDiff(piecetable.User, v0, []piecetable.Hunk{
 		// Disjoint hunks, each written against v0: a shrink, a replacement
 		// past it that the shrink moves, and a deletion past both.
 		{Start: at(doc, "two"), End: at(doc, "two") + len("two"), Text: "2"},

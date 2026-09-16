@@ -340,15 +340,31 @@ func (a *App) syncDoc(ls *langServer, p *editor.Pane) bool {
 	version := int(sess.Version())
 	text := p.File.Text()
 	if !ls.sync.IsOpen(path) {
-		return ls.sync.Open(path, id, text, version) == nil
+		if err := ls.sync.Open(path, id, text, version); err != nil {
+			return false
+		}
+		// The server has been told about this text. A versionless publish
+		// already in the store is older than that and cannot answer for it.
+		a.diags.noteSynced(path)
+		return true
+	}
+	// A server already holding this exact text needs no notification, and
+	// noting a sync for one would wrongly date its existing publish as stale.
+	last, pinned, _ := ls.sync.Pinned(path)
+	if version == last && text == pinned {
+		return true
 	}
 	// The journal window since the version the server last saw is the edit
 	// history, already in application order. A window that cannot be read —
 	// none, or a version the journal no longer reaches — is nil edits, which
 	// the sync layer reads as "history unavailable" and pays the whole
 	// document for.
-	last, _ := ls.sync.Version(path)
-	ls.sync.Change(path, text, version, editsSince(sess, piecetable.Version(last)))
+	if err := ls.sync.Change(path, text, version, editsSince(sess, piecetable.Version(last))); err != nil {
+		return false
+	}
+	// As above: a versionless publish already in the store predates this sync
+	// and cannot be read as describing the text just sent.
+	a.diags.noteSynced(path)
 	return true
 }
 

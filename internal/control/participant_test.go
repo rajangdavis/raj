@@ -323,10 +323,17 @@ func TestRebindReleasesTheProvisionalAndBoundAuthors(t *testing.T) {
 	if bound == provisional {
 		t.Fatalf("hello kept the provisional id %d", provisional)
 	}
-	// The provisional row is released as the connection moves off it, so it
+	// The provisional id was reserved, not a row: it is released as the
+	// connection moves off it, so no participant row exists under it and it
 	// is recyclable at once instead of leaking one id per reconnect.
-	if p, ok := ed.srv.Participants.Get(provisional); ok && p.Connected {
-		t.Errorf("provisional id %d stayed connected after the rebind", provisional)
+	if p, ok := ed.srv.Participants.Get(provisional); ok {
+		t.Errorf("provisional id %d left a participant row behind: %+v", provisional, p)
+	}
+	if again, err := ed.srv.Participants.Reserve(); err != nil || again != provisional {
+		t.Errorf("Reserve after rebind = %d, %v; want the released provisional id %d",
+			again, err, provisional)
+	} else {
+		ed.srv.Participants.Release(again)
 	}
 
 	first.Close()
@@ -341,5 +348,151 @@ func TestRebindReleasesTheProvisionalAndBoundAuthors(t *testing.T) {
 			t.Fatalf("bound id %d still connected after the connection closed: %+v", bound, p)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A reserved id is a connection's provisional byte, not a participant. It has
+// no row, so it is absent from List and Get, and Release hands the lowest one
+// back for the next connection.
+func TestReserveCarvesOutIdsWithoutRows(t *testing.T) {
+	r := NewRegistry()
+	a, err := r.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatalf("Reserve handed out %d twice", a)
+	}
+	if a < FirstAgent {
+		t.Errorf("reserved id %d is below FirstAgent", a)
+	}
+	for _, id := range []uint8{a, b} {
+		if p, ok := r.Get(id); ok {
+			t.Errorf("reserved id %d has a participant row: %+v", id, p)
+		}
+		for _, p := range r.List() {
+			if p.ID == id {
+				t.Errorf("reserved id %d appears in List", id)
+			}
+		}
+	}
+	r.Release(a)
+	again, err := r.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != a {
+		t.Errorf("Reserve after Release = %d, want the freed %d", again, a)
+	}
+}
+
+// A durable identity must never be handed a reserved id, even though a
+// reserved id has no row for Join's occupancy check to see. next is still just
+// past the local human here, so without the reserved check Join would land on
+// the lowest reserved byte.
+func TestJoinSkipsReservedIDs(t *testing.T) {
+	r := NewRegistry()
+	reserved := map[uint8]bool{}
+	for i := 0; i < 5; i++ {
+		id, err := r.Reserve()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserved[id] = true
+	}
+	id, err := r.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserved[id] {
+		t.Errorf("Join returned reserved id %d", id)
+	}
+}
+
+// At the cap Join recycles only a row whose participant disconnected. A
+// reserved id has no row, so it is never a recycling candidate: with only a
+// reservation free, Join refuses rather than putting a durable identity on a
+// live connection's byte.
+func TestRecyclingNeverTakesAReservedID(t *testing.T) {
+	r := NewRegistry()
+	held, err := r.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fill := make([]uint8, 0, MaxParticipants-2)
+	for i := 0; i < MaxParticipants-2; i++ {
+		id, err := r.Join(fmt.Sprintf("agent-%d", i), "", KindAgent)
+		if err != nil {
+			t.Fatalf("join %d: %v", i, err)
+		}
+		fill = append(fill, id)
+	}
+	// Every agent byte is a connected row except the reservation: nothing is
+	// gone, so there is no honest id left.
+	if id, err := r.Join("blocked", "", KindAgent); err == nil {
+		t.Fatalf("Join took id %d while the only free byte %d was reserved", id, held)
+	}
+	// One row disconnects: Join recycles that, never the reserved byte.
+	r.Leave(fill[38])
+	id, err := r.Join("newcomer", "", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != fill[38] {
+		t.Errorf("recycled %d, want the gone row %d", id, fill[38])
+	}
+	if id == held {
+		t.Errorf("recycled the reserved id %d", held)
+	}
+}
+
+// The leak this fixes: a one-off invocation used to Join an anon-N row per
+// connection, so who grew to the cap full of dead rows. A reservation releases
+// without a trace, so any number of connections leave the registry as it was.
+func TestReserveReleaseDoesNotGrowTheRegistry(t *testing.T) {
+	r := NewRegistry()
+	for i := 0; i < 1000; i++ {
+		id, err := r.Reserve()
+		if err != nil {
+			t.Fatalf("Reserve %d: %v", i, err)
+		}
+		r.Release(id)
+	}
+	if got := r.List(); len(got) != 1 || got[0].ID != LocalHuman {
+		t.Fatalf("after 1000 reserve/release cycles List = %+v, want just the local human", got)
+	}
+}
+
+// A durable identity survives a disconnect and a rejoin even while other
+// connections hold reservations, so the provisional bytes moving underneath do
+// not disturb attribution.
+func TestDurableIdentitySurvivesReservations(t *testing.T) {
+	r := NewRegistry()
+	id, err := r.Join("harness-abc", "claude-1", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Leave(id)
+	var held []uint8
+	for i := 0; i < 10; i++ {
+		got, err := r.Reserve()
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, got)
+	}
+	for _, got := range held {
+		r.Release(got)
+	}
+	again, err := r.Join("harness-abc", "claude-1", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != id {
+		t.Errorf("rejoined as %d, was %d", again, id)
 	}
 }

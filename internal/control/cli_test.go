@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"raj/internal/prog"
 )
 
 // A stand-in editor: a real Server on a real socket whose requests are executed
@@ -24,6 +26,10 @@ type fakeEditor struct {
 	docs    map[string]string
 	vers    map[string]uint64
 	authors []uint8
+	// active is the path the fake reports as the focused buffer, so a test can
+	// drive the CLI's pathless-target naming. Empty means no tab is focused,
+	// which keeps every existing test on the fallback wording.
+	active string
 	// policy is a real Guard over a memHost, so the exec decision under test is
 	// the shipped one rather than a second copy written for the test.
 	policy    *Guard
@@ -35,11 +41,29 @@ type fakeEditor struct {
 	bump func()
 	// lease is the change set the fake apply names when it refuses a hunk, so
 	// the CLI lease-refusal path can be exercised without a real Session. Zero
-	// makes the refusal an ordinary stale offset.
-	lease uint64
+	// makes the refusal an ordinary stale offset. leaseAuthor, leaseStart and
+	// leaseEnd are the owner and span that ride with it.
+	lease       uint64
+	leaseAuthor uint8
+	leaseStart  int
+	leaseEnd    int
+	// warnings is what the fake apply and patch answer on success, so the CLI
+	// warning path can be exercised without a real Session.
+	warnings []GroupOverlap
+	// patchConflict is the conflict list the fake patch returns, so the CLI's
+	// patch conflict reporting can be driven without a real Session. Empty
+	// means the patch succeeds.
+	patchConflict []Conflict
 	// searchPath records the -path the last search carried, so a CLI test can
 	// assert the flag reaches the wire without a real walker.
 	searchPath string
+	// searchHidden records the -hidden flag the last search carried, so a CLI
+	// test can assert it reaches the query without a real walker.
+	searchHidden bool
+	// entries is the canned ls answer, and lastLs records the request the CLI
+	// sent, so the verb and its -hidden switch can be asserted on the wire.
+	entries []Entry
+	lastLs  Request
 	// diffJSON is the canned diff answer; empty means no pending changes.
 	diffJSON string
 	// mode records the app mode a request switched to, so a test can assert
@@ -68,6 +92,9 @@ type fakeEditor struct {
 	// claimOverlaps are canned answers the CLI can be tested on.
 	claims    []string
 	lastClaim Request
+	// lastRevert records the revert request, so a CLI test can assert the verb
+	// reached the wire with the operand it was given.
+	lastRevert Request
 	// mkdirs records every mkdir request path, so a CLI test can assert the
 	// verb reaches the wire with its operand intact. The fake has no
 	// filesystem; the real MkdirAll semantics are covered in internal/app.
@@ -89,6 +116,9 @@ type fakeEditor struct {
 	// clearErr makes a named clear fail, standing in for a rejected set the
 	// journal has wedged behind a later edit.
 	clearErr map[uint64]string
+	// clearBlock makes a named clear fail with the live set that overlaps it,
+	// the structured refusal a real block reports.
+	clearBlock map[uint64]Conflict
 	// pending, when set, is the projection `diff` reports: the change sets with
 	// surviving text. A successful reject removes its entry and an entry named
 	// in wedge fails while its blocker is still pending, the two behaviours a
@@ -125,13 +155,21 @@ func controlSock(t *testing.T, id string) string {
 // drive the shipped server rather than a second one written for them.
 func newFakeEditorAt(t *testing.T, addr string, docs map[string]string) *fakeEditor {
 	t.Helper()
+	return newFakeEditorAddrs(t, []string{addr}, docs)
+}
+
+// newFakeEditorAddrs is the same fixture on several listeners at once, so a
+// test can drive one server over both a Unix socket and a TCP port and check
+// that they share one queue and one registry.
+func newFakeEditorAddrs(t *testing.T, addrs []string, docs map[string]string) *fakeEditor {
+	t.Helper()
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	f := &fakeEditor{docs: map[string]string{}, vers: map[string]uint64{}, stop: make(chan struct{})}
 	for k, v := range docs {
 		f.docs[k], f.vers[k] = v, 1
 	}
 	wake := make(chan struct{}, 64)
-	srv, err := Listen(addr, func() {
+	srv, err := ListenAll(addrs, func() {
 		select {
 		case wake <- struct{}{}:
 		default:
@@ -186,8 +224,11 @@ func (f *fakeEditor) run(req Request) Response {
 	case "buffers":
 		var bufs []Buffer
 		for p, text := range f.docs {
+			// run holds f.mu for the whole dispatch, so read the field
+			// directly; taking the lock again here deadlocks the fake.
 			bufs = append(bufs, Buffer{Path: p, Version: f.vers[p], Bytes: len(text),
-				Lines: strings.Count(text, "\n"), Headless: f.headless[p]})
+				Lines: strings.Count(text, "\n"), Active: p == f.active,
+				Headless: f.headless[p]})
 		}
 		return Response{OK: true, Root: "/w", Buffers: bufs}
 	case "text":
@@ -217,6 +258,38 @@ func (f *fakeEditor) run(req Request) Response {
 			res.StatesJSON = fmt.Sprintf(`[{"off":0,"len":%d,"group":0,"state":"accepted"}]`, end-start)
 		}
 		return res
+	case "find":
+		// The fake's find is a literal substring scan, enough for the CLI's
+		// run -prog end-to-end path. The real matching is the host's.
+		text, ok := f.docs[path]
+		if !ok {
+			return Response{Err: "no open buffer for " + path}
+		}
+		if req.Query == nil {
+			return Response{Err: "find needs a query"}
+		}
+		hay, needle := text, req.Query.Text
+		if !req.Query.Case {
+			hay, needle = strings.ToLower(hay), strings.ToLower(needle)
+		}
+		if needle == "" {
+			return Response{OK: true, Version: f.vers[path]}
+		}
+		i := strings.Index(hay, needle)
+		n := 0
+		for off := 0; off <= len(hay)-len(needle); {
+			j := strings.Index(hay[off:], needle)
+			if j < 0 {
+				break
+			}
+			n++
+			off += j + len(needle)
+		}
+		if i < 0 {
+			return Response{OK: true, FindCount: n, Version: f.vers[path]}
+		}
+		return Response{OK: true, Found: true, FindStart: i, FindEnd: i + len(needle),
+			FindCount: n, Version: f.vers[path]}
 	case "open":
 		created := false
 		if _, ok := f.docs[path]; !ok {
@@ -246,14 +319,21 @@ func (f *fakeEditor) run(req Request) Response {
 			return Response{Err: "apply needs a base version"}
 		}
 		if *req.Base != f.vers[path] {
-			return Response{Err: "stale", Conflicts: []Conflict{{Index: 0, Group: f.lease, Hunk: req.Hunks[0]}}}
+			return Response{Err: "stale", Conflicts: []Conflict{{Index: 0, Group: f.lease,
+				Author: f.leaseAuthor, Start: f.leaseStart, End: f.leaseEnd, Hunk: req.Hunks[0]}},
+				Warnings: f.warnings}
 		}
 		for i := len(req.Hunks) - 1; i >= 0; i-- { // back to front: offsets stay valid
 			h := req.Hunks[i]
 			text = text[:h.Start] + h.Text + text[h.End:]
 		}
 		f.docs[path], f.vers[path] = text, f.vers[path]+1
-		return Response{OK: true, Version: f.vers[path]}
+		return Response{OK: true, Version: f.vers[path], Warnings: f.warnings}
+	case "patch":
+		if len(f.patchConflict) > 0 {
+			return Response{Conflicts: f.patchConflict, Warnings: f.warnings}
+		}
+		return Response{OK: true, Version: f.vers[path], Warnings: f.warnings}
 	case "save":
 		return Response{OK: true, Version: f.vers[path]}
 	case "groups":
@@ -289,6 +369,10 @@ func (f *fakeEditor) run(req Request) Response {
 		f.decided = append(f.decided, req.Group)
 		return Response{OK: true}
 	case "clear":
+		if c, ok := f.clearBlock[req.Group]; ok {
+			return Response{Err: fmt.Sprintf("change set %d cannot be cleared: change set %d overlaps it",
+				req.Group, c.Group), Conflicts: []Conflict{c}}
+		}
 		if msg, ok := f.clearErr[req.Group]; ok {
 			return Response{Err: msg}
 		}
@@ -374,8 +458,14 @@ func (f *fakeEditor) run(req Request) Response {
 		return Response{OK: true}
 	case "rmdirs":
 		return Response{OK: true, DirRemovals: append([]DirRemoval(nil), f.dirRemovals...)}
+	case "ls":
+		f.lastLs = req
+		return Response{OK: true, Entries: append([]Entry(nil), f.entries...)}
 	case "proposals":
 		return Response{OK: true, Proposals: append([]Proposal(nil), f.proposals...)}
+	case "revert":
+		f.lastRevert = req
+		return Response{OK: true, Version: f.vers[path]}
 	}
 	return Response{Err: "unknown op " + req.Op}
 }
@@ -403,6 +493,35 @@ func TestCLIReads(t *testing.T) {
 	out, _, code = run(t, "read", "/w/a.go")
 	if code != 0 || out != "package a\n\nfunc f() {}\n" {
 		t.Errorf("read = %q, code %d", out, code)
+	}
+}
+
+// `raj ctl token` reads the running server's secret out of the process over the
+// local socket and prints it alone, so `TOKEN=$(raj ctl token)` is the whole
+// command. The socket is where the filesystem authorises, which is what lets a
+// local script fetch a token for the port without having seen startup stderr.
+func TestCLIToken(t *testing.T) {
+	sock := controlSock(t, "cli-tok.sock")
+	ed := newFakeEditorAddrs(t, []string{sock, "tcp://127.0.0.1:0"},
+		map[string]string{"/w/a.go": "x"})
+
+	out, errs, code := run(t, "token")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if strings.TrimSpace(out) != ed.srv.Token() {
+		t.Errorf("token = %q, want %q", strings.TrimSpace(out), ed.srv.Token())
+	}
+	if ed.srv.Token() == "" || strings.TrimSpace(out) == "" {
+		t.Fatal("the mixed server handed out no token")
+	}
+
+	out, errs, code = run(t, "token", "-json")
+	if code != 0 {
+		t.Fatalf("json code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, ed.srv.Token()) {
+		t.Errorf("token -json = %q, want it to carry %q", out, ed.srv.Token())
 	}
 }
 
@@ -451,13 +570,21 @@ func TestCLIReadSpan(t *testing.T) {
 }
 
 // -annotated reaches the server and its state runs reach the JSON output; the
-// plain form still prints just the text.
+// plain form prints the text and then one run line per run. A plain read
+// without the flag is still exactly the text, byte for byte.
 func TestCLIReadAnnotated(t *testing.T) {
 	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
+	const text = "package a\n\nfunc f() {}\n"
 
-	out, _, code := run(t, "read", "-annotated", "/w/a.go")
-	if code != 0 || out != "package a\n\nfunc f() {}\n" {
-		t.Errorf("annotated read = %q, code %d", out, code)
+	out, _, code := run(t, "read", "/w/a.go")
+	if code != 0 || out != text {
+		t.Errorf("plain read = %q, code %d; want the text alone", out, code)
+	}
+
+	out, _, code = run(t, "read", "-annotated", "/w/a.go")
+	want := text + "run off=0 len=23 group=0 state=accepted\n"
+	if code != 0 || out != want {
+		t.Errorf("annotated read = %q, code %d; want %q", out, code, want)
 	}
 
 	out, _, code = run(t, "read", "-annotated", "-json", "/w/a.go")
@@ -604,6 +731,27 @@ func TestCLIApplyVerbatimStdin(t *testing.T) {
 	}
 	if got := ed.docs["/w/a.go"]; got != "hi world\n" {
 		t.Errorf("buffer = %q, want the newline stripped", got)
+	}
+}
+
+// A recv that times out exits 3 in JSON mode too. The empty JSON list is still
+// written so `-json` always parses, but the code is what a polling loop reads
+// and it must not depend on the output shape. The cancelled frame is the real
+// server's, driven with -wait so the parked recv is cancelled. Modelled on
+// TestCLIRefusalsExitNonZero (exit-code assertions over the same fake server).
+func TestCLIRecvJSONTimeoutExitsThree(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	out, errs, code := run(t, "recv", "-wait", "20ms", "-json")
+	if code != 3 {
+		t.Fatalf("recv -json timeout code = %d, want 3 (stderr %q, stdout %q)", code, errs, out)
+	}
+	var msgs []Message
+	if err := json.Unmarshal([]byte(out), &msgs); err != nil {
+		t.Fatalf("recv -json timeout output = %q, want an empty JSON list: %v", out, err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("recv -json timeout = %+v, want no messages", msgs)
 	}
 }
 
@@ -862,7 +1010,7 @@ func TestCLIEditRefusesWhenTheBufferMoved(t *testing.T) {
 // carries the same group and reason.
 func TestCLIRefusalNamesTheLeaseOwner(t *testing.T) {
 	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
-	ed.lease = 7
+	ed.lease, ed.leaseAuthor, ed.leaseStart, ed.leaseEnd = 7, 4, 6, 11
 	ed.bump = func() { ed.vers["/w/a.go"]++ } // force the apply path to conflict
 
 	_, errs, code := run(t, "edit", "-old", "world", "-new", "socket")
@@ -871,6 +1019,9 @@ func TestCLIRefusalNamesTheLeaseOwner(t *testing.T) {
 	}
 	if !strings.Contains(errs, "change set 7 owns this text") {
 		t.Errorf("message %q does not name the lease owner", errs)
+	}
+	if !strings.Contains(errs, "bytes 6..11") {
+		t.Errorf("message %q does not name the leased span", errs)
 	}
 	if !strings.Contains(errs, "accept or reject it first") {
 		t.Errorf("message %q does not point at the decision", errs)
@@ -882,6 +1033,74 @@ func TestCLIRefusalNamesTheLeaseOwner(t *testing.T) {
 	}
 	if !strings.Contains(out, `"group": 7`) || !strings.Contains(out, "change set 7 owns this text") {
 		t.Errorf("json = %q, want the group and the lease message", out)
+	}
+	for _, want := range []string{`"author": 4`, `"start": 6`, `"end": 11`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json = %q, want the owner/%s", out, want)
+		}
+	}
+}
+
+// A successful apply over another writer Proposed span prints the superseded set
+// as a note, and the -json form carries the warnings beside ok:true: the apply
+// landed, and the set it moved past is data the driver can act on. Modelled on
+// TestCLIRefusalNamesTheLeaseOwner, which is the refusal half.
+func TestCLIApplyNotesOverlapWarning(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.warnings = []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}}
+
+	out, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "0", "--", "x")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "note: overlapped change set 7 (author 3, bytes 6..12)") {
+		t.Errorf("output = %q, want the overlap note", out)
+	}
+
+	ed.docs["/w/a.go"], ed.vers["/w/a.go"] = "hello world\n", 1
+	// -json is a flag, so it goes before -- ; after the terminator it would be
+	// read as a positional (the reason the CLI exits 2 on an unexpected arg).
+	jout, _, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "0", "-json", "--", "x")
+	if code != 0 {
+		t.Fatalf("json code %d", code)
+	}
+	if !strings.Contains(jout, `"warnings"`) || !strings.Contains(jout, `"group": 7`) ||
+		!strings.Contains(jout, `"author": 3`) {
+		t.Errorf("json = %q, want the warning carried", jout)
+	}
+}
+
+// A batch can refuse one hunk and still land another over a Proposed set. The
+// refusal is the exit status, but the landed overlap must not be lost to the
+// early return that reports the conflicts: the note prints on stderr and the
+// ok:false -json carries both conflicts and warnings. Modelled on
+// TestCLIRefusalNamesTheLeaseOwner (the refusal half) and on
+// TestCLIApplyNotesOverlapWarning (the warning half).
+func TestCLIApplyRefusalStillCarriesTheWarning(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.lease, ed.leaseAuthor, ed.leaseStart, ed.leaseEnd = 7, 4, 6, 11
+	ed.warnings = []GroupOverlap{{Group: 9, Author: 3, Start: 2, End: 4}}
+	ed.bump = func() { ed.vers["/w/a.go"]++ } // force the apply path to conflict
+
+	_, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "3", "--", "x")
+	if code == 0 {
+		t.Fatalf("a partly refused apply reported success")
+	}
+	if !strings.Contains(errs, "change set 7 owns this text") {
+		t.Errorf("stderr = %q, want the lease refusal", errs)
+	}
+	if !strings.Contains(errs, "note: overlapped change set 9 (author 3, bytes 2..4)") {
+		t.Errorf("stderr = %q, want the note for the hunk that landed", errs)
+	}
+
+	out, _, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "3", "-json", "--", "x")
+	if code == 0 {
+		t.Fatalf("a partly refused apply reported success in json")
+	}
+	for _, want := range []string{`"ok": false`, `"conflicts"`, `"warnings"`, `"group": 9`, `"author": 3`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json = %q, want %q", out, want)
+		}
 	}
 }
 
@@ -908,6 +1127,293 @@ func TestCLIRefusalWithoutALeaseKeepsTheStaleMessage(t *testing.T) {
 	}
 	if strings.Contains(out, `"group"`) {
 		t.Errorf("json = %q invented a lease group", out)
+	}
+}
+
+// patch routes a lease refusal through the same owner-and-span reporting apply
+// and edit use, in the text and in the -json block, rather than the old
+// "dump again" wording that a lease does not call for: the caller is being
+// asked to decide about another writer's text, not to redo its own edit.
+func TestCLIPatchReportsALeaseRefusal(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.patchConflict = []Conflict{{Index: 0, Group: 7, Author: 4, Start: 6, End: 11,
+		Hunk: Hunk{Start: 6, End: 11, Text: "socket"}}}
+
+	_, errs, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n")
+	if code == 0 {
+		t.Fatalf("a leased patch reported success")
+	}
+	for _, want := range []string{"change set 7 owns this text", "bytes 6..11", "accept or reject it first"} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("message %q does not name %q", errs, want)
+		}
+	}
+	if strings.Contains(strings.ToLower(errs), "dump again") {
+		t.Errorf("message %q still tells the caller to dump again", errs)
+	}
+
+	out, _, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n", "-json")
+	if code == 0 {
+		t.Fatalf("a leased patch reported success in json")
+	}
+	for _, want := range []string{`"ok": false`, `"group": 7`, `"author": 4`, `"start": 6`, `"end": 11`, "change set 7 owns this text"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json = %q, want %q", out, want)
+		}
+	}
+}
+
+// A patch conflict with no lease owner is the ordinary moved snapshot, and
+// keeps the re-read wording in the text and in the -json block.
+func TestCLIPatchReportsAStaleConflict(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.patchConflict = []Conflict{{Index: 0, Hunk: Hunk{Start: 6, End: 11, Text: "socket"}}}
+
+	_, errs, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n")
+	if code == 0 {
+		t.Fatalf("a stale patch reported success")
+	}
+	if !strings.Contains(errs, "could not be placed") {
+		t.Errorf("message %q lost the stale-offset wording", errs)
+	}
+	out, _, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n", "-json")
+	if code == 0 {
+		t.Fatalf("a stale patch reported success in json")
+	}
+	if !strings.Contains(out, "could not be placed") || !strings.Contains(out, `"ok": false`) {
+		t.Errorf("json = %q lost the stale-offset wording", out)
+	}
+}
+
+// A successful patch over another writer Proposed span prints the superseded
+// set as a note, and the -json form carries the warnings beside ok:true: the
+// patch landed, and the set it moved past is data the driver can act on.
+// Modelled on TestCLIApplyNotesOverlapWarning, the apply half.
+func TestCLIPatchNotesOverlapWarning(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.warnings = []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}}
+
+	out, errs, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "note: overlapped change set 7 (author 3, bytes 6..12)") {
+		t.Errorf("output = %q, want the overlap note", out)
+	}
+
+	jout, _, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n", "-json")
+	if code != 0 {
+		t.Fatalf("json code %d", code)
+	}
+	if !strings.Contains(jout, `"warnings"`) || !strings.Contains(jout, `"group": 7`) ||
+		!strings.Contains(jout, `"author": 3`) {
+		t.Errorf("json = %q, want the warning carried", jout)
+	}
+}
+
+// patch shares the diff path, so a batch with both a refusal and a landed
+// warning reports the warning too: the note prints on stderr and the ok:false
+// -json carries conflicts and warnings. Modelled on
+// TestCLIPatchReportsALeaseRefusal (the refusal half) and on
+// TestCLIPatchNotesOverlapWarning (the warning half).
+func TestCLIPatchRefusalStillCarriesTheWarning(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.patchConflict = []Conflict{{Index: 0, Group: 7, Author: 4, Start: 6, End: 11,
+		Hunk: Hunk{Start: 6, End: 11, Text: "socket"}}}
+	ed.warnings = []GroupOverlap{{Group: 9, Author: 3, Start: 2, End: 4}}
+
+	_, errs, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n")
+	if code == 0 {
+		t.Fatalf("a partly refused patch reported success")
+	}
+	if !strings.Contains(errs, "change set 7 owns this text") {
+		t.Errorf("stderr = %q, want the lease refusal", errs)
+	}
+	if !strings.Contains(errs, "note: overlapped change set 9 (author 3, bytes 2..4)") {
+		t.Errorf("stderr = %q, want the note for the hunk that landed", errs)
+	}
+
+	out, _, code := run(t, "patch", "/w/a.go", "-dump", "1", "-text", "hello socket\n", "-json")
+	if code == 0 {
+		t.Fatalf("a partly refused patch reported success in json")
+	}
+	for _, want := range []string{`"ok": false`, `"conflicts"`, `"warnings"`, `"group": 9`, `"author": 3`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json = %q, want %q", out, want)
+		}
+	}
+}
+
+// A zero-width apply with no text changes nothing, so it is refused before it
+// can become a change set; an empty -text-file at the same span is the same
+// no-op. A real deletion (a non-empty span, empty text) still goes through.
+func TestCLIApplyRefusesANoOp(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+
+	out, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-start", "0", "-end", "0", "-text", "")
+	if code != 2 || out != "" {
+		t.Errorf("no-op apply = code %d, stdout %q; want a usage refusal", code, out)
+	}
+	if !strings.Contains(errs, "nothing to apply") {
+		t.Errorf("stderr = %q, want the no-op refusal", errs)
+	}
+	if ed.docs["/w/a.go"] != "hello world\n" || ed.vers["/w/a.go"] != 1 {
+		t.Errorf("refused no-op wrote: %q v%d", ed.docs["/w/a.go"], ed.vers["/w/a.go"])
+	}
+
+	empty := filepath.Join(t.TempDir(), "empty.txt")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, errs, code = run(t, "apply", "/w/a.go", "-base", "1", "-start", "3", "-end", "3", "-text-file", empty)
+	if code != 2 || !strings.Contains(errs, "nothing to apply") {
+		t.Errorf("empty -text-file no-op = code %d, stderr %q", code, errs)
+	}
+
+	if _, errs, code = run(t, "apply", "/w/a.go", "-base", "1", "-start", "5", "-end", "6", "-text", ""); code != 0 {
+		t.Fatalf("a real deletion was refused: code %d, stderr %q", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "helloworld\n" {
+		t.Errorf("buffer = %q, want the deletion applied", got)
+	}
+}
+
+// A batch of only no-op hunks is refused; a batch mixing real and no-op hunks
+// sends only the real ones, so a no-op cannot ride in as a change set.
+func TestCLIApplyHunksDropsNoOps(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+
+	allNoop := filepath.Join(t.TempDir(), "noop.jsonl")
+	if err := os.WriteFile(allNoop, []byte("{\"start\":0,\"end\":0,\"text\":\"\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, errs, code := run(t, "apply", "/w/a.go", "-base", "1", "-hunks", allNoop)
+	if code != 1 || !strings.Contains(errs, "every hunk is a no-op") {
+		t.Errorf("all-no-op batch = code %d, stderr %q", code, errs)
+	}
+	if ed.vers["/w/a.go"] != 1 {
+		t.Errorf("all-no-op batch advanced the version to %d", ed.vers["/w/a.go"])
+	}
+
+	mixed := filepath.Join(t.TempDir(), "mixed.jsonl")
+	if err := os.WriteFile(mixed, []byte(
+		"{\"start\":0,\"end\":0,\"text\":\"\"}\n"+
+			"{\"start\":6,\"end\":11,\"text\":\"socket\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, errs, code = run(t, "apply", "/w/a.go", "-base", "1", "-hunks", mixed)
+	if code != 0 {
+		t.Fatalf("mixed batch refused: code %d, stderr %q", code, errs)
+	}
+	if got := ed.docs["/w/a.go"]; got != "hello socket\n" {
+		t.Errorf("buffer = %q, want only the real hunk applied", got)
+	}
+}
+
+// A wedged clear is refused with the live set that overlaps it — its author and
+// span, not only the group — so the caller can re-propose, in text and in the
+// -json block.
+func TestCLIClearReportsTheBlockingOverlap(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.clearBlock = map[uint64]Conflict{
+		3: {Group: 9, Author: 4, Start: 6, End: 11},
+	}
+
+	_, errs, code := run(t, "clear", "-group", "3")
+	if code == 0 {
+		t.Fatalf("a wedged clear reported success")
+	}
+	if !strings.Contains(errs, "cannot be cleared") || !strings.Contains(errs, "change set 9") {
+		t.Errorf("message %q does not name the blocking set", errs)
+	}
+
+	out, _, code := run(t, "clear", "-group", "3", "-json")
+	if code == 0 {
+		t.Fatalf("a wedged clear reported success in json")
+	}
+	for _, want := range []string{`"ok": false`, `"block"`, `"group": 9`, `"author": 4`, `"start": 6`, `"end": 11`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json = %q, want %s", out, want)
+		}
+	}
+}
+
+// revert is the inverse of attribution, and the CLI accepts it for the
+// connection's own pieces only: -mine, or -author naming the connection's own
+// id. Another writer is refused before the request is sent, because dropping a
+// peer's accepted pieces is the user's decision (reject then clear).
+func TestCLIRevertRefusesAnotherWriter(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+
+	// Author 1 is the human; the connection writes as an agent id, so naming it
+	// is the peer-drop this verb deliberately refuses.
+	_, errs, code := run(t, "revert", "-author", "1", "/w/a.go")
+	if code == 0 {
+		t.Fatalf("reverting the user's pieces reported success")
+	}
+	if !strings.Contains(errs, "not this connection") {
+		t.Errorf("refusal = %q, want the authorization message", errs)
+	}
+	if ed.lastRevert.Op != "" {
+		t.Errorf("a refused revert reached the wire: %+v", ed.lastRevert)
+	}
+}
+
+// revert reaches the wire as its own verb, carrying the path it was given.
+func TestCLIRevertSendsTheVerb(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+
+	out, errs, code := run(t, "revert", "-mine", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("revert -mine code %d: %s", code, errs)
+	}
+	if ed.lastRevert.Op != "revert" || ed.lastRevert.Path != "/w/a.go" {
+		t.Errorf("wire carried %+v, want a revert of /w/a.go", ed.lastRevert)
+	}
+	if !strings.Contains(out, "reverted") {
+		t.Errorf("revert printed %q, want the confirmation", out)
+	}
+}
+
+// `groups` shows an overlap on the set that carries it, in the -json listing a
+// script reads.
+func TestCLIGroupsShowsOverlaps(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.groups = []Group{
+		{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1},
+		{ID: 5, Path: "/w/a.go", Author: 3, State: "proposed", Ops: 1,
+			Overlaps: &GroupOverlaps{Sets: []GroupOverlap{{Group: 4, Author: 2, Start: 6, End: 11}}}},
+	}
+
+	out, _, code := run(t, "groups", "-json")
+	if code != 0 {
+		t.Fatalf("groups -json: exit %d", code)
+	}
+	for _, want := range []string{`"id": 5`, `"overlaps"`, `"group": 4`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("groups json = %q, want %s", out, want)
+		}
+	}
+}
+
+// `groups` marks a superseded proposal invalid and names the live set that
+// consumed it, over the wire and in the -json listing a script reads. Modelled
+// on TestCLIGroupsShowsOverlaps, which is the same fixture for overlaps.
+func TestCLIGroupsShowsInvalid(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.groups = []Group{
+		{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1,
+			Invalid: true, InvalidBy: &GroupOverlap{Group: 5, Author: 3, Start: 6, End: 11}},
+	}
+
+	out, _, code := run(t, "groups", "-json")
+	if code != 0 {
+		t.Fatalf("groups -json: exit %d", code)
+	}
+	for _, want := range []string{`"id": 4`, `"invalid": true`, `"invalid_by"`, `"group": 5`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("groups json = %q, want %s", out, want)
+		}
 	}
 }
 
@@ -1198,6 +1704,7 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 	gate := f.gate
 	truncated := append([]TruncatedFile(nil), f.truncated...)
 	f.searchPath = q.Path
+	f.searchHidden = q.Hidden
 	f.mu.Unlock()
 
 	var inc []string
@@ -1367,6 +1874,8 @@ func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 		DiffJSON: `[{"id":7,"path":"/Users/rajan/src/raj/a.go","author":2,` +
 			`"state":"proposed","ops":1,"bytes":1,"first":1,"last":1,` +
 			`"hunks":[{"start":0,"end":0,"old":"/Users/rajan/src/raj in text","new":""}],"moved":0}]`,
+		LSPJSON: `{"locations":[{"path":"/Users/rajan/src/raj/a.go","line":3,"col":4}],` +
+			`"text":"see /Users/rajan/src/raj/a.go"}`,
 		Err: "no open buffer for /Users/rajan/src/raj/a.go",
 	}
 	c.localise(&res)
@@ -1394,6 +1903,19 @@ func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 	// the thing a string replace inside the encoded JSON would have corrupted.
 	if got := diffs[0].Hunks[0].Old; got != "/Users/rajan/src/raj in text" {
 		t.Errorf("DiffHunk.Old = %q, want it left alone", got)
+	}
+	// An lsp answer nests its locations the same way the diff nests its group
+	// paths; the locations are rebased, while hover text is content and must
+	// not be — the same distinction the hunk text above asserts for a diff.
+	var lsp LSPResult
+	if err := json.Unmarshal([]byte(res.LSPJSON), &lsp); err != nil {
+		t.Fatalf("LSPJSON did not parse: %v", err)
+	}
+	if got := lsp.Locations[0].Path; got != "/workspace/a.go" {
+		t.Errorf("LSPLocation.Path = %q", got)
+	}
+	if got := lsp.Text; got != "see /Users/rajan/src/raj/a.go" {
+		t.Errorf("LSPResult.Text = %q, want it left alone", got)
 	}
 }
 
@@ -2714,5 +3236,120 @@ func TestCLIReviewListsWithoutEnteringMode(t *testing.T) {
 	}
 	if !strings.Contains(out, "review mode, 1 proposed") {
 		t.Errorf("review output = %q, want the mode and count", out)
+	}
+}
+
+// run -prog end to end for find: one frame locates text and gets back the byte
+// span and the match count, so a program can find a position, read against it,
+// and apply in the same batch.
+func TestCLIRunProgramFind(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "hello world\nhello again\n"})
+
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpQuery, Payload: []byte("hello")},
+		{Code: prog.OpFind},
+	})
+	out, errs, code := run(t, "run", "-prog", string(p), "-json")
+	if code != 0 {
+		t.Fatalf("code = %d: %s", code, errs)
+	}
+	var res Response
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if !res.Found || res.FindStart != 0 || res.FindEnd != len("hello") || res.FindCount != 2 {
+		t.Errorf("find answer = %+v", res)
+	}
+}
+
+// A verb given no path names the buffer it actually acted on rather than saying
+// "the buffer": the CLI asks the editor which tab is focused, so the refusal
+// names the file the user is looking at. The fake reports a focused tab only
+// when a test sets one, which is why the fallback stays the default.
+func TestPathlessVerbNamesTheActiveBuffer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "one\n"})
+	ed.mu.Lock()
+	ed.active = "/w/a.go"
+	ed.mu.Unlock()
+
+	_, errs, code := run(t, "edit", "-old", "not present", "-new", "x")
+	if code == 0 {
+		t.Fatal("a pathless edit replacing absent text succeeded")
+	}
+	if !strings.Contains(errs, "/w/a.go") {
+		t.Errorf("refusal = %q, want it to name the active buffer /w/a.go", errs)
+	}
+}
+
+// ls lists a directory's children, marks directories with a trailing slash, and
+// carries -hidden to the wire. The fake records the request and serves a canned
+// entry list, so both the output and the flag are asserted.
+func TestCLILs(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.entries = []Entry{
+		{Name: "main.go", Path: "/w/pkg/main.go", Size: i64p(9)},
+		{Name: "sub", Path: "/w/pkg/sub", Dir: true},
+	}
+
+	out, errs, code := run(t, "ls", "/w/pkg")
+	if code != 0 {
+		t.Fatalf("ls: code = %d: %s", code, errs)
+	}
+	if ed.lastLs.Op != "ls" || ed.lastLs.Path != "/w/pkg" || ed.lastLs.Hidden {
+		t.Errorf("the wire carried %+v, want an ls of /w/pkg without -hidden", ed.lastLs)
+	}
+	if !strings.Contains(out, "main.go") || !strings.Contains(out, "sub/") {
+		t.Errorf("ls output = %q, want the file and the marked directory", out)
+	}
+
+	// -hidden is the same flag the search carries; with no path it names the
+	// workspace root.
+	out, errs, code = run(t, "ls", "-hidden")
+	if code != 0 {
+		t.Fatalf("ls -hidden: code = %d: %s", code, errs)
+	}
+	if !ed.lastLs.Hidden || ed.lastLs.Path != "" {
+		t.Errorf("the wire carried %+v, want -hidden with the default root", ed.lastLs)
+	}
+
+	// -json is the machine form, with the directory and the size.
+	out, _, code = run(t, "ls", "-json")
+	if code != 0 || !strings.Contains(out, `"name": "sub"`) ||
+		!strings.Contains(out, `"dir": true`) || !strings.Contains(out, `"size": 9`) ||
+		!strings.Contains(out, `"path": "/w/pkg/main.go"`) {
+		t.Errorf("ls -json = %q (code %d)", out, code)
+	}
+
+	// An empty directory is an empty list, not an error.
+	ed.entries = nil
+	out, _, code = run(t, "ls", "-json")
+	if code != 0 || strings.TrimSpace(out) != "[]" {
+		t.Errorf("ls -json of an empty directory = %q (code %d), want []", out, code)
+	}
+}
+
+// -hidden reaches the wire as a query field; the walk's inclusion of hidden
+// paths is exercised in the app and search tests.
+func TestSearchHiddenReachesTheQuery(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+	if _, errs, code := run(t, "search", "-q", "needle", "-hidden"); code != 0 {
+		t.Fatalf("search -hidden: code %d: %s", code, errs)
+	}
+	ed.mu.Lock()
+	got := ed.searchHidden
+	ed.mu.Unlock()
+	if !got {
+		t.Error("search -hidden did not reach the query on the wire")
+	}
+
+	if _, _, code := run(t, "search", "-q", "needle"); code != 0 {
+		t.Fatalf("search: code %d", code)
+	}
+	ed.mu.Lock()
+	got = ed.searchHidden
+	ed.mu.Unlock()
+	if got {
+		t.Error("a plain search carried the include-hidden flag")
 	}
 }

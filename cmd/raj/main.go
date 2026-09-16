@@ -7,7 +7,7 @@
 //	raj --tabs file.go        indent with tabs where the file does not say
 //	raj --control             listen on a control socket for buffer edits
 //	raj --control-addr tcp://0.0.0.0:7391
-//	                          listen on TCP, for a driver in a container
+//	                          also listen on TCP, for a driver in a container
 //	raj --no-restore          start fresh instead of where you left off
 //	raj ctl <cmd>             read and edit a running raj's buffers
 //	raj --config ghostty      print Ghostty keybindings to install
@@ -49,8 +49,8 @@ func main() {
 		tab       = flag.Int("tab", 2, "indent width in spaces, and the display width of a tab")
 		useTabs   = flag.Bool("tabs", false, "indent with tabs in files that have no indentation to detect")
 		ctl       = flag.Bool("control", false, "listen on a Unix socket for buffer reads and edits")
-		ctlPath   = flag.String("control-socket", "", "path for --control; implies it")
-		ctlAddr   = flag.String("control-addr", "", "listen on tcp://host:port instead of a socket; implies --control")
+		ctlPath   = flag.String("control-socket", "", "path for the control socket; implies it")
+		ctlAddr   = flag.String("control-addr", "", "also listen on tcp://host:port, or set the socket path; implies --control")
 		ctlExec   = flag.Bool("control-exec", false, "with --control-addr: let a remote driver run commands on this machine")
 		noRestore = flag.Bool("no-restore", false, "do not reopen the previous session")
 		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
@@ -93,11 +93,27 @@ func main() {
 		}
 		return
 	}
-	addr := *ctlPath
-	if *ctlAddr != "" {
-		addr = *ctlAddr
+	// A control session always has a Unix socket: it is the local trust
+	// anchor, and the one place a script on this machine can read the token
+	// out of a running session. A `tcp://` address adds a listener for a
+	// driver that does not share the filesystem rather than replacing the
+	// socket, so the two can drive one session at once. `--control-socket`,
+	// or `--control-addr` naming a path, chooses where the socket lives.
+	sock := *ctlPath
+	if *ctlAddr != "" && !control.IsTCP(*ctlAddr) {
+		sock = *ctlAddr
 	}
-	if err := run(flag.Arg(0), *tab, *wrap, *useTabs, *ctl || addr != "", addr, *ctlExec, *noRestore); err != nil {
+	var ctlAddrs []string
+	if *ctl || sock != "" || *ctlAddr != "" {
+		if sock == "" {
+			sock = control.DefaultPath()
+		}
+		ctlAddrs = append(ctlAddrs, sock)
+	}
+	if control.IsTCP(*ctlAddr) {
+		ctlAddrs = append(ctlAddrs, *ctlAddr)
+	}
+	if err := run(flag.Arg(0), *tab, *wrap, *useTabs, ctlAddrs, *ctlExec, *noRestore); err != nil {
 		fail(err)
 	}
 }
@@ -134,7 +150,7 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlAddr string, ctlExec bool, noRestore bool) error {
+func run(path string, tab int, wrap bool, useTabs bool, ctlAddrs []string, ctlExec bool, noRestore bool) error {
 	root, path, err := resolve(path)
 	if err != nil {
 		return err
@@ -178,23 +194,35 @@ func run(path string, tab int, wrap bool, useTabs bool, ctl bool, ctlAddr string
 			fmt.Fprintln(os.Stderr, "raj: could not save session:", err)
 		}
 	}()
-	if ctl {
-		if err := a.StartControl(ctlAddr, ctlExec); err != nil {
+	if len(ctlAddrs) > 0 {
+		if err := a.StartControlAddrs(ctlAddrs, ctlExec); err != nil {
 			return err
 		}
 		// Printed before the alternate screen is entered, so a harness that
-		// started raj can read the address from its output rather than guessing.
-		fmt.Fprintln(os.Stderr, "raj: control", a.ControlPath())
+		// started raj can read the addresses from its output rather than
+		// guessing. Every address is printed, because a session can listen on
+		// a socket and a port at once.
+		paths := a.ControlPaths()
+		for _, p := range paths {
+			fmt.Fprintln(os.Stderr, "raj: control", p)
+		}
 		if tok := a.ControlToken(); tok != "" {
 			// The token has to leave the process somehow, and stderr is where
-			// the address already goes. Not a file: a file the driver could
+			// the addresses already go. Not a file: a file the driver could
 			// read is a file on a filesystem the driver does not share, which
-			// is the situation TCP exists for.
+			// is the situation TCP exists for. `raj ctl token` reads it back
+			// out of the running process over the local socket.
 			fmt.Fprintf(os.Stderr, "raj: %s=%s\n", control.TokenEnv, tok)
-			if _, address := control.ParseAddr(a.ControlPath()); !control.Loopback(address) {
-				fmt.Fprintln(os.Stderr, "raj: warning — this port is open to the network, "+
-					"not just to this machine. Anything holding the token can read and "+
-					"write your unsaved buffers.")
+			for _, p := range paths {
+				if !control.IsTCP(p) {
+					continue
+				}
+				if _, address := control.ParseAddr(p); !control.Loopback(address) {
+					fmt.Fprintln(os.Stderr, "raj: warning — this port is open to the network, "+
+						"not just to this machine. Anything holding the token can read and "+
+						"write your unsaved buffers.")
+					break
+				}
 			}
 		}
 	}

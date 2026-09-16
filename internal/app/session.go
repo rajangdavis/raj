@@ -79,6 +79,9 @@ func (a *App) SessionState() session.State {
 		}
 		hints := p.Hints
 		st.Tabs = append(st.Tabs, session.Tab{
+			// Top is a display row: Viewport.Top's own coordinate. Ratio is
+			// Top/DisplayLines, and restore prefers it because a fold that moved
+			// under the saved position cannot shift a proportion. See RestoreSession.
 			Path:   p.File.Path,
 			Cursor: p.Cursors.Primary().Head,
 			Top:    p.Viewport.Top,
@@ -96,12 +99,13 @@ func (a *App) SessionState() session.State {
 	return st
 }
 
-// scrollRatio is the scroll position as a proportion of the document, so a
+// scrollRatio is the scroll position as a proportion of the display, so a
 // restored session lands at the same place in a file that has grown. Zero for
 // an empty file: there is nothing to be proportional to, and the saved Top is
-// then exactly right.
+// then exactly right. It is coordinate-free, which is why restore prefers it
+// to Top: a fold that moved between sessions cannot shift a ratio.
 func scrollRatio(p *editor.Pane) float64 {
-	lines := p.File.Lines()
+	lines := p.DisplayLines()
 	if lines <= 1 {
 		return 0
 	}
@@ -172,18 +176,28 @@ func (a *App) RestoreSession() {
 			at = p.File.Len()
 		}
 		p.Cursors.Set(at, at)
-		p.Viewport.Top = t.Top
+		// Top is a display row. A session written by an older build stored a
+		// session line instead; while the projection is the identity here (the
+		// journal has not been restored yet) the two are the same number, and the
+		// clamp below keeps either in range. Ratio is coordinate-free and
+		// supersedes Top whenever it was written, so an old session cannot jump.
+		top := t.Top
 		if t.Ratio > 0 {
-			// Proportional restore: keep the same place in the document rather
-			// than the same line number, so a file that has grown opens where
-			// the work was. Clamped against the file as it is now, like the
-			// cursor above; the first resize would clamp it too, but the
-			// authority is the buffer that just opened.
-			p.Viewport.Top = int(math.Round(t.Ratio * float64(p.File.Lines())))
-			if max := p.File.Lines() - 1; p.Viewport.Top > max {
-				p.Viewport.Top = max
-			}
+			// Proportional restore: keep the same place in the display rather
+			// than the same row, so a file that has grown opens where the work
+			// was and a fold above the saved position cannot shift it.
+			top = int(math.Round(t.Ratio * float64(p.DisplayLines())))
 		}
+		// The projection may hide rows under a fold, so the bound is display
+		// rows, not session lines. Load validated the stored value against the
+		// file on disk; the authority is the buffer that just opened.
+		if max := p.DisplayLines() - 1; top > max {
+			top = max
+		}
+		if top < 0 {
+			top = 0
+		}
+		p.Viewport.Top = top
 		restored++
 	}
 	if restored == 0 {

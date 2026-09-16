@@ -136,7 +136,8 @@ crash in it is not a crash in the thing holding your unsaved work.
 Length-prefixed frames, a JSON header and a raw body — so document bytes cross
 unencoded and a frame is still readable in a dump. Ops: `ping`, `buffers`,
 `open`, `text`, `version`, `apply`, `save`, `search`, `exec`, `groups`,
-`accept`, `reject`, `hello`, `cancel`, `recv`. The path defaults to
+`accept`, `reject`, `claim`, `delete`, `rename`, `proposals`, `diff`,
+`review`, `lsp`, `hello`, `cancel`, `recv`. The path defaults to
 `$XDG_RUNTIME_DIR/raj/<pid>.sock` and is printed on stderr at startup;
 `--control-socket PATH` puts it somewhere you choose. `raj ctl` is the
 command-line client.
@@ -199,9 +200,14 @@ object, and bind-mounting one does not forward it.
 
 ```
 $ raj --control-addr tcp://0.0.0.0:7391
+raj: control /run/user/1000/raj/4821.sock
 raj: control tcp://0.0.0.0:7391
 raj: RAJ_CONTROL_TOKEN=3f9c...
 ```
+
+The address is now additive: the Unix socket keeps listening alongside the
+port, so a local script can read the token back with `raj ctl token` instead of
+you copying it from startup output.
 
 ```
 $ docker run -e RAJ_CONTROL_ADDR=tcp://host.docker.internal:7391 \

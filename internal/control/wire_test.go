@@ -451,6 +451,31 @@ func TestResponseCarriesMessages(t *testing.T) {
 	}
 }
 
+// Apply warnings ride in the header on a successful apply, so the one thing that
+// can go wrong is EncodeResponse or DecodeResponse forgetting the field -- which
+// compiles and silently turns a warned apply into a clean one.
+func TestResponseCarriesApplyWarnings(t *testing.T) {
+	want := []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Warnings: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Warnings) != len(want) || got.Warnings[0] != want[0] {
+		t.Errorf("warnings = %+v, want %+v", got.Warnings, want)
+	}
+
+	// Sparse: a clean apply sends none and decodes to nil.
+	h, body = EncodeResponse(Response{ID: 9, OK: true, Final: true, Version: 2})
+	clean, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Warnings != nil {
+		t.Errorf("clean warnings = %+v, want nil", clean.Warnings)
+	}
+}
+
 // Truncated rides in the header like buffers and messages; the failure mode is
 // EncodeResponse or DecodeResponse dropping it, which compiles and silently
 // loses the only sign that a per-file cap cut a file down.

@@ -562,6 +562,13 @@ func (a *App) restoreLog(logPath string) {
 	}
 	p.File = editor.NewRestoredFile(base.Path, sess, a.tabWidth, saved)
 	p.File.SetDark(a.host.Theme().Dark())
+	// The swap replaces the session the memoised projection was built from, so
+	// rebuild it now rather than leaving it to the first frame. The restored
+	// decisions are already in place, so SetDisplay derives exactly what the
+	// frame would; no reader can see the clean file's rows against the restored
+	// session. (invalidateDisplay is pane-internal, so the exported rebuild is
+	// what makes this independent of draw timing.)
+	p.SetDisplay(a.displayPolicy())
 	if at := p.Cursors.Primary().Head; at > p.File.Len() {
 		p.Cursors.Set(p.File.Len(), p.File.Len())
 	}

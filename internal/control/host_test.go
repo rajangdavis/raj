@@ -48,6 +48,14 @@ type memHost struct {
 	// dirRemovals is memHost's pending dir-removal set, the rmdir analogue of
 	// deletions, keyed by directory path.
 	dirRemovals map[string]DirRemoval
+	// entries is the canned ls answer, and lastLs records the request the Guard
+	// passed down, so Dispatch tests can assert the resolved path and the
+	// -hidden flag without a filesystem.
+	entries []Entry
+	lastLs  Request
+	// hiddenSearch is set when SearchHidden runs, so a Guard test can tell the
+	// include-hidden walk from the ordinary one. Nothing else observes it.
+	hiddenSearch bool
 	// proposals is a canned unified pending list, so a Dispatch test can prove
 	// the rollup without an editor behind it.
 	proposals []Proposal
@@ -56,6 +64,30 @@ type memHost struct {
 	// test can assert the plumbing without a language server.
 	hintsJSON string
 	hintLines [2]int
+	// lease, leaseAuthor, leaseStart and leaseEnd let a test make Apply answer
+	// a stale base with a lease refusal carrying the owner and span the real
+	// app reports, so Dispatch and the CLI can be checked without a journal
+	// behind them.
+	lease       uint64
+	leaseAuthor uint8
+	leaseStart  int
+	leaseEnd    int
+	// warnings is what Apply answers on success, so a Dispatch or CLI test can
+	// drive the advisory-lease warning without a journal behind it.
+	warnings []GroupOverlap
+	// reverts records every Revert the Guard passed down, so the guard and
+	// Dispatch tests can assert the canonical path and author arrived without
+	// an editor behind them. revertBlock, when non-zero, makes Revert answer a
+	// wedge with the live set that overlaps, the refusal the real host gives.
+	reverts     []revertCall
+	revertBlock Conflict
+}
+
+// revertCall is one memHost.Revert: the canonical path and the author the Guard
+// resolved, recorded so a test can assert the pair that crossed.
+type revertCall struct {
+	path   string
+	author uint8
 }
 
 // renameCall is one memHost.Rename: the canonical old and new the Guard
@@ -174,6 +206,50 @@ func (h *memHost) Read(path string, author uint8, start, end, lineStart, lineEnd
 	return spans, nil, h.vers[path], nil
 }
 
+// Find is the memory host's single-buffer search. It is a literal substring
+// scan on purpose: what these tests exercise is the Dispatch plumbing, not the
+// matching, and the real host uses the editor's engine. Case-insensitivity is
+// honoured by folding both sides; the regex and whole-word flags are accepted
+// but only the literal behaviour is modelled.
+func (h *memHost) Find(path string, author uint8, q SearchQuery) (SearchMatch, int, bool, error) {
+	text, ok := h.docs[path]
+	if !ok {
+		return SearchMatch{}, 0, false, ErrNoBuffer
+	}
+	out := SearchMatch{Path: path, Version: h.vers[path]}
+	if q.Text == "" {
+		return out, 0, false, nil
+	}
+	hay, needle := text, q.Text
+	if !q.Case {
+		hay, needle = strings.ToLower(hay), strings.ToLower(needle)
+	}
+	count := 0
+	for off := 0; off <= len(hay)-len(needle); {
+		i := strings.Index(hay[off:], needle)
+		if i < 0 {
+			break
+		}
+		start := off + i
+		if count == 0 {
+			out.ByteStart, out.ByteEnd, out.Len = start, start+len(q.Text), len(q.Text)
+			out.Line = 1 + strings.Count(text[:start], "\n")
+			lineStart := strings.LastIndexByte(text[:start], '\n') + 1
+			out.LineStart = lineStart
+			out.Col = start - lineStart
+			lineEnd := len(text)
+			if nl := strings.IndexByte(text[start:], '\n'); nl >= 0 {
+				lineEnd = start + nl
+			}
+			out.LineEnd = lineEnd
+			out.Text = strings.TrimRight(text[lineStart:lineEnd], " \t")
+		}
+		count++
+		off = start + len(needle)
+	}
+	return out, count, count > 0, nil
+}
+
 func (h *memHost) Version(path string, author uint8) (uint64, error) {
 	if _, ok := h.docs[path]; !ok {
 		return 0, ErrNoBuffer
@@ -181,23 +257,24 @@ func (h *memHost) Version(path string, author uint8) (uint64, error) {
 	return h.vers[path], nil
 }
 
-func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, error) {
+func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, []GroupOverlap, error) {
 	t, ok := h.docs[path]
 	if !ok {
-		return 0, nil, ErrNoBuffer
+		return 0, nil, nil, ErrNoBuffer
 	}
 	if base != h.vers[path] {
-		return h.vers[path], []Conflict{{Index: 0, At: h.vers[path], Hunk: hunks[0]}}, nil
+		return h.vers[path], []Conflict{{Index: 0, At: h.vers[path], Group: h.lease,
+			Author: h.leaseAuthor, Start: h.leaseStart, End: h.leaseEnd, Hunk: hunks[0]}}, nil, nil
 	}
 	for i := len(hunks) - 1; i >= 0; i-- {
 		x := hunks[i]
 		if x.End > len(t) {
-			return 0, nil, ErrNoBuffer
+			return 0, nil, nil, ErrNoBuffer
 		}
 		t = t[:x.Start] + x.Text + t[x.End:]
 	}
 	h.docs[path], h.vers[path] = t, h.vers[path]+1
-	return h.vers[path], nil, nil
+	return h.vers[path], nil, h.warnings, nil
 }
 
 func (h *memHost) Save(path string) (uint64, error) {
@@ -230,18 +307,18 @@ func (h *memHost) Dump(path string, start, end int, author uint8) (uint64, uint6
 	return h.seq, h.vers[path], t[start:end], "", nil
 }
 
-func (h *memHost) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, error) {
+func (h *memHost) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, []GroupOverlap, error) {
 	snap, ok := h.snaps[id]
 	if !ok || snap.author != author {
-		return 0, nil, fmt.Errorf("no snapshot %d for this writer", id)
+		return 0, nil, nil, fmt.Errorf("no snapshot %d for this writer", id)
 	}
 	t, ok := h.docs[path]
 	if !ok {
-		return 0, nil, ErrNoBuffer
+		return 0, nil, nil, ErrNoBuffer
 	}
 	diffs := DiffLines(snap.text, newText)
 	if len(diffs) == 0 {
-		return h.vers[path], nil, nil
+		return h.vers[path], nil, nil, nil
 	}
 	// The memHost has no journal, so it can only rebase what is still current;
 	// the real host replays the journal from the snapshot's version forward.
@@ -249,12 +326,12 @@ func (h *memHost) Patch(path string, author uint8, id uint64, newText string) (u
 		d := diffs[i]
 		s, e := snap.start+d.Start, snap.start+d.End
 		if e > len(t) {
-			return h.vers[path], []Conflict{{Index: i, At: h.vers[path], Hunk: d}}, nil
+			return h.vers[path], []Conflict{{Index: i, At: h.vers[path], Hunk: d}}, nil, nil
 		}
 		t = t[:s] + d.Text + t[e:]
 	}
 	h.docs[path], h.vers[path] = t, h.vers[path]+1
-	return h.vers[path], nil, nil
+	return h.vers[path], nil, h.warnings, nil
 }
 
 // Goto is a cursor move, and memHost has no cursor: the state it keeps is
@@ -366,6 +443,15 @@ func (h *memHost) DirRemovals() []DirRemoval {
 		out = append(out, d)
 	}
 	return out
+}
+
+// Ls is memHost's half of the ls verb: it records the request the Guard
+// resolved and returns the canned entries. memHost has no filesystem, so the
+// listing itself — the hidden policy, the sort and which files carry a size —
+// is covered in internal/app.
+func (h *memHost) Ls(path string, all bool) ([]Entry, error) {
+	h.lastLs = Request{Op: "ls", Path: path, Hidden: all}
+	return append([]Entry(nil), h.entries...), nil
 }
 
 // Proposals returns memHost's canned unified pending list. The real rollup
@@ -509,6 +595,50 @@ func TestDispatchOpenReportsCreated(t *testing.T) {
 	}
 }
 
+// find answers with the first match's byte span and the total count, and a
+// pattern that does not occur is a clean not-found rather than an error.
+func TestDispatchFindReturnsASpan(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.docs[path] = "alpha needle beta\nneedle again\n"
+
+	res := Dispatch(g, Request{Op: "find", Path: path, Author: FirstAgent,
+		Query: &SearchQuery{Text: "needle"}})
+	if !res.OK || !res.Found {
+		t.Fatalf("find = %+v, want ok and found", res)
+	}
+	if res.FindStart != 6 || res.FindEnd != 12 {
+		t.Errorf("span = [%d,%d), want [6,12)", res.FindStart, res.FindEnd)
+	}
+	if res.FindCount != 2 {
+		t.Errorf("count = %d, want 2", res.FindCount)
+	}
+	if res.Version != h.vers[path] {
+		t.Errorf("version = %d, want %d", res.Version, h.vers[path])
+	}
+
+	miss := Dispatch(g, Request{Op: "find", Path: path, Author: FirstAgent,
+		Query: &SearchQuery{Text: "absent"}})
+	if !miss.OK || miss.Found {
+		t.Errorf("missing pattern = %+v, want ok and not found", miss)
+	}
+	if miss.FindCount != 0 {
+		t.Errorf("missing count = %d, want 0", miss.FindCount)
+	}
+}
+
+// find needs a pattern, the same way search does, and validates the query
+// before touching the host.
+func TestDispatchFindNeedsAPattern(t *testing.T) {
+	g, _ := guarded(t)
+	if res := Dispatch(g, Request{Op: "find"}); res.OK {
+		t.Error("find with no query was accepted")
+	}
+	if res := Dispatch(g, Request{Op: "find", Query: &SearchQuery{Text: "   "}}); res.OK {
+		t.Error("find with a blank pattern was accepted")
+	}
+}
+
 // Escaping the workspace is a rejection, not a guess — including via "..",
 // which is why the check is on the cleaned path rather than on the string.
 func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
@@ -525,7 +655,7 @@ func TestGuardRejectsPathsOutsideRoot(t *testing.T) {
 		if _, _, _, err := g.Read(p, FirstAgent, -1, -1, 0, 0, false); err == nil {
 			t.Errorf("Read(%q) was allowed", p)
 		}
-		if _, _, err := g.Apply(p, FirstAgent, 1, []Hunk{{}}); err == nil {
+		if _, _, _, err := g.Apply(p, FirstAgent, 1, []Hunk{{}}); err == nil {
 			t.Errorf("Apply(%q) was allowed", p)
 		}
 	}
@@ -686,7 +816,7 @@ func TestGuardRequiresAReadBeforeAWrite(t *testing.T) {
 	// still exercises the read rule it is named for.
 	g.setClaims(FirstAgent, []string{path})
 
-	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err == nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err == nil {
 		t.Fatal("a blind write was allowed")
 	}
 	if h.docs[path] != "hello world\n" {
@@ -696,11 +826,44 @@ func TestGuardRequiresAReadBeforeAWrite(t *testing.T) {
 	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
 		t.Fatalf("write after read was refused: %v", err)
 	}
 	if h.docs[path] != "howdy world\n" {
 		t.Errorf("buffer = %q", h.docs[path])
+	}
+}
+
+// A live connection that has not declared an identity — a reserved, rowless
+// author id — is still allowed to write. The socket's permissions, or the TCP
+// token, already decided it may connect, and the write gate must not newly
+// refuse the anonymous case that the old per-connection row admitted.
+func TestApplyAllowsAReservedAuthor(t *testing.T) {
+	g, h := guarded(t)
+	reg := NewRegistry()
+	g.Participants = reg
+	id, err := reg.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(h.root, "a.go")
+	g.setClaims(id, []string{path})
+	if _, _, _, err := g.Read(path, id, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := g.Apply(path, id, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err != nil {
+		t.Fatalf("a reserved author's write was refused: %v", err)
+	}
+	if h.docs[path] != "x world\n" {
+		t.Errorf("buffer = %q, want the write applied", h.docs[path])
+	}
+	// A durable identity must not be handed the reserved id.
+	dur, err := reg.Join("someone", "", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dur == id {
+		t.Fatalf("Join reused the reserved id %d", id)
 	}
 }
 
@@ -717,13 +880,13 @@ func TestGuardReadBeforeWriteIsPerAuthor(t *testing.T) {
 	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
 		t.Fatalf("write after own read was refused: %v", err)
 	}
 
 	// A second writer has read nothing; the first writer's read must not
 	// satisfy its write gate.
-	if _, _, err := g.Apply(path, FirstAgent+1, 2, []Hunk{{Start: 0, End: 5, Text: "there"}}); err == nil {
+	if _, _, _, err := g.Apply(path, FirstAgent+1, 2, []Hunk{{Start: 0, End: 5, Text: "there"}}); err == nil {
 		t.Fatal("a write by an author that had not read was allowed")
 	} else if !strings.Contains(err.Error(), "read the buffer before writing") {
 		t.Errorf("blind write = %v, want the read-before-write refusal", err)
@@ -736,7 +899,7 @@ func TestGuardReadBeforeWriteIsPerAuthor(t *testing.T) {
 	if _, _, _, err := g.Read(path, FirstAgent+1, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent+1, 2, []Hunk{{Start: 0, End: 5, Text: "there"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent+1, 2, []Hunk{{Start: 0, End: 5, Text: "there"}}); err != nil {
 		t.Fatalf("write after own read was refused: %v", err)
 	}
 	if h.docs[path] != "there world\n" {
@@ -754,7 +917,7 @@ func TestVersionCountsAsARead(t *testing.T) {
 	if _, err := g.Version(path, FirstAgent); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 0, Text: "// "}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 0, Text: "// "}}); err != nil {
 		t.Errorf("write after version was refused: %v", err)
 	}
 }
@@ -765,7 +928,7 @@ func TestGuardRejectsMalformedSpans(t *testing.T) {
 	g.setClaims(FirstAgent, []string{path})
 	g.Read(path, FirstAgent, -1, -1, 0, 0, false)
 	for _, hk := range []Hunk{{Start: -1, End: 0}, {Start: 5, End: 2}} {
-		if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{hk}); err == nil {
+		if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{hk}); err == nil {
 			t.Errorf("%+v was allowed", hk)
 		}
 	}
@@ -924,14 +1087,14 @@ func TestGuardRefusesNonAgentAuthors(t *testing.T) {
 	// would not satisfy it.
 	g.Read(path, FirstAgent+3, -1, -1, 0, 0, false)
 	for _, a := range []uint8{0, 1} {
-		if _, _, err := g.Apply(path, a, 1, []Hunk{{Start: 0, End: 1, Text: "x"}}); err == nil {
+		if _, _, _, err := g.Apply(path, a, 1, []Hunk{{Start: 0, End: 1, Text: "x"}}); err == nil {
 			t.Errorf("author %d was accepted", a)
 		}
 	}
 	if h.docs[path] != "hello world\n" {
 		t.Errorf("buffer changed anyway: %q", h.docs[path])
 	}
-	if _, _, err := g.Apply(path, FirstAgent+3, 1, []Hunk{{Start: 0, End: 1, Text: "H"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent+3, 1, []Hunk{{Start: 0, End: 1, Text: "H"}}); err != nil {
 		t.Errorf("a later agent id was refused: %v", err)
 	}
 }
@@ -982,6 +1145,14 @@ func TestAnnotatedReadCarriesStates(t *testing.T) {
 }
 
 func (h *memHost) Snapshot() Searcher { return h }
+
+// SearchHidden records that the include-hidden walk was asked for, then
+// answers exactly as Search does. It exists so the Guard's dispatch on the
+// -hidden flag can be asserted without a real walker behind it.
+func (h *memHost) SearchHidden(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, int, bool, []TruncatedFile, error) {
+	h.hiddenSearch = true
+	return h.Search(ctx, q, emit)
+}
 
 // LSP has no language server to talk to in a memory host, so the caller is
 // nil and the error is the clean "no server" answer a driver would see. The
@@ -1062,6 +1233,22 @@ func (h *memHost) Clear(path string, group uint64) error {
 		return nil
 	}
 	return fmt.Errorf("no change set %d", group)
+}
+
+// Revert models the real RevertAuthor: it discards the writer's own pieces,
+// which a memory host with no journal stands in for by recording the call. A
+// non-zero revertBlock makes it answer the wedge the real host reports, so the
+// Dispatch and CLI block paths can be exercised without a journal behind them.
+func (h *memHost) Revert(path string, author uint8) error {
+	if h.revertBlock.Group != 0 {
+		return &BlockError{Conflict: h.revertBlock,
+			Message: fmt.Sprintf("author %d's pieces cannot be reverted", author)}
+	}
+	if _, ok := h.docs[path]; !ok {
+		return ErrNoBuffer
+	}
+	h.reverts = append(h.reverts, revertCall{path: path, author: author})
+	return nil
 }
 
 func (h *memHost) Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (int, int, bool, []TruncatedFile, error) {
@@ -1155,7 +1342,7 @@ func TestReadOfActiveBufferAuthorisesWriteByName(t *testing.T) {
 	if _, _, _, err := g.Read("", FirstAgent, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "howdy"}}); err != nil {
 		t.Errorf("write after reading the same buffer was refused: %v", err)
 	}
 }
@@ -1387,7 +1574,7 @@ func TestClaimAcceptsAnOpenUnsavedBuffer(t *testing.T) {
 	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent, h.vers[path], []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, h.vers[path], []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
 		t.Fatalf("apply after claim of an open buffer was refused: %v", err)
 	}
 }
@@ -1581,6 +1768,160 @@ func TestClaimOverlapsBetweenIdentities(t *testing.T) {
 	}
 }
 
+// A lease refusal over the socket carries the owning set's author and span,
+// not only its group, so a caller does not need a second groups call to learn
+// who holds the text and where it is.
+func TestDispatchLeaseRefusalCarriesTheOwner(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.lease, h.leaseAuthor, h.leaseStart, h.leaseEnd = 7, 3, 6, 11
+
+	if res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{path}}); !res.OK {
+		t.Fatalf("claim = %+v", res)
+	}
+	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	base := uint64(0)
+	res := Dispatch(g, Request{Op: "apply", Path: path, Author: FirstAgent, Base: &base,
+		Hunks: []Hunk{{Start: 0, End: 5, Text: "x"}}})
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("conflicts = %+v, want one", res.Conflicts)
+	}
+	c := res.Conflicts[0]
+	if c.Group != 7 || c.Author != 3 || c.Start != 6 || c.End != 11 {
+		t.Errorf("conflict = %+v, want group 7 author 3 span 6..11", c)
+	}
+	if c.At != h.vers[path] {
+		t.Errorf("At = %d, want the stale base %d", c.At, h.vers[path])
+	}
+}
+
+// A successful apply over another writer Proposed span carries the superseded
+// set in the reply warnings, so a Dispatch caller can tell a clean apply, an
+// apply with a warning, and a refusal apart. Modelled on
+// TestDispatchLeaseRefusalCarriesTheOwner, which is the refusal half.
+func TestDispatchApplyCarriesWarnings(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.warnings = []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}}
+
+	if res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{path}}); !res.OK {
+		t.Fatalf("claim = %+v", res)
+	}
+	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	base := uint64(1)
+	res := Dispatch(g, Request{Op: "apply", Path: path, Author: FirstAgent, Base: &base,
+		Hunks: []Hunk{{Start: 0, End: 0, Text: "x"}}})
+	if !res.OK || len(res.Conflicts) != 0 {
+		t.Fatalf("apply = %+v, want it to land cleanly", res)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want one", res.Warnings)
+	}
+	if w := res.Warnings[0]; w.Group != 7 || w.Author != 3 || w.Start != 6 || w.End != 12 {
+		t.Errorf("warning = %+v, want set 7 by author 3 at 6..12", w)
+	}
+
+	// A clean apply with no canned warnings reports none.
+	h.warnings = nil
+	next := res.Version
+	res = Dispatch(g, Request{Op: "apply", Path: path, Author: FirstAgent, Base: &next,
+		Hunks: []Hunk{{Start: 0, End: 0, Text: "y"}}})
+	if !res.OK || len(res.Warnings) != 0 {
+		t.Errorf("clean apply = %+v, want no warnings", res)
+	}
+}
+
+// A successful patch over another writer Proposed span carries the superseded
+// set in the reply warnings, exactly as apply does, so a Dispatch caller can
+// tell a clean patch, a patch with a warning, and a refusal apart. Modelled on
+// TestDispatchApplyCarriesWarnings, the apply half.
+func TestDispatchPatchCarriesWarnings(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	g.setClaims(FirstAgent, []string{path})
+	h.docs[path] = "hello world\n"
+	h.vers[path] = 1
+	h.warnings = []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}}
+
+	dumped := Dispatch(g, Request{Op: "dump", Path: path, Author: FirstAgent})
+	if !dumped.OK || dumped.DumpID == 0 {
+		t.Fatalf("dump = %+v", dumped)
+	}
+	res := Dispatch(g, Request{Op: "patch", Path: path, Author: FirstAgent,
+		DumpID: dumped.DumpID, PatchText: "hello there\n"})
+	if !res.OK || len(res.Conflicts) != 0 {
+		t.Fatalf("patch = %+v, want it to land cleanly", res)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want one", res.Warnings)
+	}
+	if w := res.Warnings[0]; w.Group != 7 || w.Author != 3 || w.Start != 6 || w.End != 12 {
+		t.Errorf("warning = %+v, want set 7 by author 3 at 6..12", w)
+	}
+
+	// A clean patch with no canned warnings reports none.
+	h.warnings = nil
+	res = Dispatch(g, Request{Op: "patch", Path: path, Author: FirstAgent,
+		DumpID: dumped.DumpID, PatchText: "hello again\n"})
+	if !res.OK || len(res.Warnings) != 0 {
+		t.Errorf("clean patch = %+v, want no warnings", res)
+	}
+}
+
+// `groups` reports an overlap on the set itself, so a reader sees it from the
+// listing without a second call, and it survives the wire on that set alone.
+func TestDispatchGroupsCarryOverlaps(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.groups = []Group{
+		{ID: 4, Path: path, Author: 2, State: "proposed", Ops: 1, Hunks: 1},
+		{ID: 5, Path: path, Author: 3, State: "proposed", Ops: 1, Hunks: 1,
+			Overlaps: &GroupOverlaps{Sets: []GroupOverlap{{Group: 4, Author: 2, Start: 6, End: 11}}}},
+	}
+	res := Dispatch(g, Request{Op: "groups", Path: path})
+	if len(res.Groups) != 2 || res.Groups[0].Overlaps != nil {
+		t.Fatalf("groups = %+v", res.Groups)
+	}
+	ov := res.Groups[1].Overlaps
+	if ov == nil || len(ov.Sets) != 1 || ov.Sets[0].Group != 4 || ov.Sets[0].Author != 2 ||
+		ov.Sets[0].Start != 6 || ov.Sets[0].End != 11 {
+		t.Errorf("overlaps = %+v, want set 4 by author 2 at 6..11", ov)
+	}
+
+	got, err := decodeHeader(encodeHeader(Header{Groups: res.Groups}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Groups) != 2 || got.Groups[0].Overlaps != nil ||
+		got.Groups[1].Overlaps == nil || got.Groups[1].Overlaps.Sets[0].Group != 4 {
+		t.Errorf("wire groups = %+v, want the overlap kept on set 5 only", got.Groups)
+	}
+}
+
+// `diff` carries the same overlap through its nested JSON, so the review
+// surface shows it too.
+func TestDispatchDiffCarriesOverlaps(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.diffs = []DiffGroup{{Group: Group{ID: 5, Path: path, Author: 3, State: "proposed",
+		Ops: 1, Overlaps: &GroupOverlaps{Sets: []GroupOverlap{{Group: 4, Author: 2, Start: 6, End: 11}}}}}}
+	res := Dispatch(g, Request{Op: "diff", Path: path})
+	if !res.OK {
+		t.Fatalf("diff = %+v", res)
+	}
+	var diffs []DiffGroup
+	if err := json.Unmarshal([]byte(res.DiffJSON), &diffs); err != nil {
+		t.Fatal(err)
+	}
+	if len(diffs) != 1 || diffs[0].Overlaps == nil || diffs[0].Overlaps.Sets[0].Group != 4 {
+		t.Errorf("diff = %+v, want the overlap carried", diffs)
+	}
+}
+
 // open -create is the declaration of intent the spec names: it makes the
 // buffer AND extends the caller's claim with it, so a write to the file it
 // just created needs no second command. From an empty set this is a set of
@@ -1608,7 +1949,7 @@ func TestOpenCreateAutoClaims(t *testing.T) {
 	if _, _, _, err := g.Read(path, FirstAgent, -1, -1, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := g.Apply(path, FirstAgent, h.vers[path], []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
+	if _, _, _, err := g.Apply(path, FirstAgent, h.vers[path], []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
 		t.Fatalf("apply after open -create was refused: %v", err)
 	}
 }
@@ -1708,14 +2049,14 @@ func TestClaimGateOnWrites(t *testing.T) {
 	// is allowed, and an explicit write for another file names the set.
 	g.setClaims(FirstAgent, []string{a})
 	g.markRead(FirstAgent, a)
-	if _, _, err := g.Apply("", FirstAgent, base, oneIn); err != nil {
+	if _, _, _, err := g.Apply("", FirstAgent, base, oneIn); err != nil {
 		t.Errorf("pathless write with one claim was refused: %v", err)
 	}
-	if _, _, err := g.Apply(a, FirstAgent, base, oneIn); err != nil {
+	if _, _, _, err := g.Apply(a, FirstAgent, base, oneIn); err != nil {
 		t.Errorf("explicit write for the claim was refused: %v", err)
 	}
 	wantNotIn := "not in your claim set (" + a + "); claim -add <path>"
-	if _, _, err := g.Apply(b, FirstAgent, base, oneIn); err == nil || err.Error() != wantNotIn {
+	if _, _, _, err := g.Apply(b, FirstAgent, base, oneIn); err == nil || err.Error() != wantNotIn {
 		t.Errorf("explicit write for another file = %v, want %q", err, wantNotIn)
 	}
 
@@ -1724,14 +2065,14 @@ func TestClaimGateOnWrites(t *testing.T) {
 	g.setClaims(FirstAgent, []string{b, a})
 	g.markRead(FirstAgent, a)
 	g.markRead(FirstAgent, b)
-	if _, _, err := g.Apply("", FirstAgent, base, oneIn); err == nil || err.Error() != "claim set has 2 files; name one" {
+	if _, _, _, err := g.Apply("", FirstAgent, base, oneIn); err == nil || err.Error() != "claim set has 2 files; name one" {
 		t.Errorf("pathless write with two claims = %v, want the set-size refusal", err)
 	}
-	if _, _, err := g.Apply(a, FirstAgent, base, oneIn); err != nil {
+	if _, _, _, err := g.Apply(a, FirstAgent, base, oneIn); err != nil {
 		t.Errorf("explicit in-set write was refused: %v", err)
 	}
 	wantNotIn = "not in your claim set (" + a + ", " + b + "); claim -add <path>"
-	if _, _, err := g.Apply(c, FirstAgent, base, oneIn); err == nil || err.Error() != wantNotIn {
+	if _, _, _, err := g.Apply(c, FirstAgent, base, oneIn); err == nil || err.Error() != wantNotIn {
 		t.Errorf("explicit out-of-set write = %v, want %q", err, wantNotIn)
 	}
 }
@@ -1766,12 +2107,12 @@ func TestPathlessClaimWriteStillNeedsARead(t *testing.T) {
 	other := filepath.Join(h.root, "b.go")
 	g.setClaims(FirstAgent, []string{path})
 	g.markRead(FirstAgent, other)
-	if _, _, err := g.Apply("", FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err == nil ||
+	if _, _, _, err := g.Apply("", FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err == nil ||
 		!strings.Contains(err.Error(), "read the buffer before writing") {
 		t.Fatalf("pathless write without reading the claim = %v, want the read gate", err)
 	}
 	g.markRead(FirstAgent, path)
-	if _, _, err := g.Apply("", FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err != nil {
+	if _, _, _, err := g.Apply("", FirstAgent, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err != nil {
 		t.Fatalf("pathless write after reading the claim was refused: %v", err)
 	}
 }
@@ -1791,6 +2132,69 @@ func TestClaimGateOnClear(t *testing.T) {
 	}
 	if err := g.Clear(a, FirstAgent, 7); err != nil {
 		t.Errorf("clear of a claimed file was refused: %v", err)
+	}
+}
+
+// revert reverses text out of the buffer, so it runs the claim gate too. It
+// reaches the host with the calling connection's own author, which is the only
+// writer it may drop.
+func TestClaimGateOnRevert(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go", "b.go")
+	a, b := p["a.go"], p["b.go"]
+	// claimGuard's memHost has no buffers loaded, and Revert — like Apply —
+	// refuses a path that is not open, so seed them. The gate under test is the
+	// claim, not whether the buffer exists.
+	h.docs[a] = "a.go"
+	h.docs[b] = "a.go"
+
+	if err := g.Revert(a, FirstAgent); err == nil || err.Error() != "claim a file first" {
+		t.Errorf("revert with no claim = %v, want the strict refusal", err)
+	}
+	g.setClaims(FirstAgent, []string{a})
+	if err := g.Revert(b, FirstAgent); err == nil || !strings.Contains(err.Error(), "not in your claim set") {
+		t.Errorf("revert of an unclaimed file = %v, want the set refusal", err)
+	}
+	if err := g.Revert(a, FirstAgent); err != nil {
+		t.Errorf("revert of a claimed file was refused: %v", err)
+	}
+	if len(h.reverts) != 1 || h.reverts[0].path != a || h.reverts[0].author != FirstAgent {
+		t.Errorf("reverts = %+v, want the canonical path and author to reach the host", h.reverts)
+	}
+}
+
+// A revert reaches the host through Dispatch with the request's author, so the
+// verb's plumbing and the author it drops are wired end to end.
+func TestDispatchRevertReachesTheHost(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	g.setClaims(FirstAgent, []string{path})
+
+	if res := Dispatch(g, Request{Op: "revert", Path: path, Author: FirstAgent}); !res.OK {
+		t.Fatalf("revert = %+v", res)
+	}
+	if len(h.reverts) != 1 || h.reverts[0].path != path || h.reverts[0].author != FirstAgent {
+		t.Errorf("reverts = %+v, want the call to reach the host", h.reverts)
+	}
+}
+
+// A wedged revert is refused with the live set that overlaps it, in the same
+// owner-and-span shape a lease refusal uses, so a driver learns what to clear
+// first instead of retrying blind.
+func TestDispatchRevertReportsTheBlockingSet(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	g.setClaims(FirstAgent, []string{path})
+	h.revertBlock = Conflict{Group: 9, Author: 3, Start: 6, End: 11}
+
+	res := Dispatch(g, Request{Op: "revert", Path: path, Author: FirstAgent})
+	if res.OK {
+		t.Fatal("a wedged revert reported success")
+	}
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("conflicts = %+v, want the blocking set", res.Conflicts)
+	}
+	if c := res.Conflicts[0]; c.Group != 9 || c.Author != 3 || c.Start != 6 || c.End != 11 {
+		t.Errorf("conflict = %+v, want the owner and span", c)
 	}
 }
 
@@ -2375,5 +2779,215 @@ func TestBraceTallyWithoutALexer(t *testing.T) {
 	unbalanced := braceTally("data.zzz", "{\n")
 	if unbalanced.Braces != 1 {
 		t.Errorf("plain counting of a lone { = %+v, want braces +1", unbalanced)
+	}
+}
+
+// ls resolves its directory against the workspace root and passes -hidden
+// through to the host. It is ungated, like deletions and rmdirs — seeing a
+// directory's children needs no claim — but a path outside the workspace is
+// still refused.
+func TestDispatchLs(t *testing.T) {
+	g, h := guarded(t)
+	h.entries = []Entry{
+		{Name: "a.go", Path: filepath.Join(h.root, "a.go"), Size: i64p(2)},
+		{Name: "pkg", Path: filepath.Join(h.root, "pkg"), Dir: true},
+	}
+
+	res := Dispatch(g, Request{Op: "ls", Path: "pkg"})
+	if !res.OK {
+		t.Fatalf("ls = %+v", res)
+	}
+	if h.lastLs.Path != filepath.Join(h.root, "pkg") {
+		t.Errorf("resolved path = %q, want it joined to the root", h.lastLs.Path)
+	}
+	if h.lastLs.Hidden {
+		t.Error("ls without -hidden carried the include-hidden flag")
+	}
+	if len(res.Entries) != 2 || res.Entries[0].Name != "a.go" || !res.Entries[1].Dir {
+		t.Errorf("entries = %+v, want the host's canned list", res.Entries)
+	}
+
+	// An empty path names the workspace root, and -hidden rides along.
+	if res := Dispatch(g, Request{Op: "ls", Hidden: true}); !res.OK || h.lastLs.Path != h.root || !h.lastLs.Hidden {
+		t.Errorf("ls -hidden = %+v, last = %+v; want the root and the flag", res, h.lastLs)
+	}
+
+	// A path outside the workspace is refused, the same as every other verb.
+	if res := Dispatch(g, Request{Op: "ls", Path: "../elsewhere"}); res.OK || res.Err == "" {
+		t.Errorf("ls outside the root = %+v, want a refusal", res)
+	}
+}
+
+// The -hidden switch on a search runs the inner searcher's include-hidden walk,
+// not the ordinary Search: if it were the latter the flag would silently do
+// nothing. memHost records which one ran.
+func TestGuardDispatchesHiddenSearch(t *testing.T) {
+	g, h := guarded(t)
+	searcher := g.Snapshot()
+
+	var got []SearchMatch
+	if _, _, _, _, err := searcher.Search(context.Background(), SearchQuery{Text: "hello", Hidden: true},
+		func(b []SearchMatch) { got = append(got, b...) }); err != nil {
+		t.Fatal(err)
+	}
+	if !h.hiddenSearch {
+		t.Error("a -hidden search did not reach the inner include-hidden walk")
+	}
+	if len(got) == 0 {
+		t.Error("the include-hidden walk returned no hits")
+	}
+
+	h.hiddenSearch = false
+	if _, _, _, _, err := searcher.Search(context.Background(), SearchQuery{Text: "hello"},
+		func(b []SearchMatch) { got = append(got, b...) }); err != nil {
+		t.Fatal(err)
+	}
+	if h.hiddenSearch {
+		t.Error("an ordinary search took the include-hidden walk")
+	}
+}
+
+// symlinkEscapeFixture builds a Guard over a temp root and two links inside it
+// that name targets outside: a file link and a directory link. It returns the
+// guard and the two spellings. The temp-root harness is claimGuard, the same
+// one the claim tests use, because the resolved check needs real symlinks.
+func symlinkEscapeFixture(t *testing.T) (*Guard, string, string) {
+	t.Helper()
+	g, _, _ := claimGuard(t, "a.go")
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fileLink := filepath.Join(g.Root(), "escape.txt")
+	if err := os.Symlink(secret, fileLink); err != nil {
+		t.Fatal(err)
+	}
+	dirLink := filepath.Join(g.Root(), "escapedir")
+	if err := os.Symlink(outside, dirLink); err != nil {
+		t.Fatal(err)
+	}
+	return g, fileLink, dirLink
+}
+
+// A symlink inside the workspace that resolves to a target outside it is
+// refused before any verb reads or writes the target: the resolved root check
+// is the gate the lexical one alone could not provide. Modelled on
+// TestGuardRenameRefusesEscape, the same property for a ".." destination.
+func TestGuardRefusesSymlinkEscape(t *testing.T) {
+	g, fileLink, dirLink := symlinkEscapeFixture(t)
+	// Seed a buffer under the spelled link and satisfy the read gate directly,
+	// so each assertion below fails only if the resolved symlink check is
+	// absent — not because the fake had no buffer or the read-before-write gate
+	// fired. Without the check, the read and the apply would both succeed.
+	h := g.Host.(*memHost)
+	h.docs[fileLink], h.vers[fileLink] = "hello\n", 1
+	g.markRead(FirstAgent, fileLink)
+
+	// Read: the canonical seam resolves and refuses before the host is asked.
+	if res := Dispatch(g, Request{Op: "text", Path: fileLink, Author: FirstAgent}); res.OK {
+		t.Errorf("read through an escaping symlink = %+v, want a refusal", res)
+	}
+	// Open names a buffer rather than a read of one, but it reaches the file.
+	if res := Dispatch(g, Request{Op: "open", Path: fileLink}); res.OK {
+		t.Errorf("open of an escaping symlink = %+v, want a refusal", res)
+	}
+	// Write: claim the spelled link so the claim gate is satisfied; the
+	// resolved-root check still stops the write.
+	g.setClaims(FirstAgent, []string{fileLink})
+	base := uint64(1)
+	if res := Dispatch(g, Request{Op: "apply", Path: fileLink, Author: FirstAgent,
+		Base: &base, Hunks: []Hunk{{Start: 0, End: 0, Text: "x"}}}); res.OK {
+		t.Errorf("write through an escaping symlink = %+v, want a refusal", res)
+	}
+	// ls reaches the filesystem through the same claimPath seam, so a
+	// symlinked directory that leaves the root is refused too.
+	if res := Dispatch(g, Request{Op: "ls", Path: dirLink}); res.OK {
+		t.Errorf("ls of an escaping symlink = %+v, want a refusal", res)
+	}
+}
+
+// A symlink that resolves to a file still inside the workspace is not an
+// escape: the target is in-root, so read and open keep working. Modelled on
+// TestClaimAcceptsANotYetOnDiskPath, the in-root acceptance sibling.
+func TestGuardAllowsSymlinkInsideRoot(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go")
+	link := filepath.Join(g.Root(), "alias.go")
+	if err := os.Symlink(p["a.go"], link); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture is a real file on disk; seed the memory host under the
+	// spelled link so the read has a buffer to return.
+	h.docs[link], h.vers[link] = "hello\n", 1
+
+	if res := Dispatch(g, Request{Op: "text", Path: link, Author: FirstAgent}); !res.OK {
+		t.Errorf("read through an in-root symlink = %+v, want it allowed", res)
+	}
+	if res := Dispatch(g, Request{Op: "open", Path: link}); !res.OK {
+		t.Errorf("open of an in-root symlink = %+v, want it allowed", res)
+	}
+}
+
+// RAJ_ALLOW_SYMLINK_ESCAPE is the opt-in: a true spelling skips the resolved
+// half of the check, while the empty and false spellings keep the default that
+// refuses the escape. Modelled on the RAJ_TRASH value tables in
+// internal/app/deletion_test.go (TestRemoveForeverTrashesWhenEnabled and
+// TestRemoveForeverUnlinksWithoutTrash).
+func TestGuardSymlinkEscapeOptIn(t *testing.T) {
+	for _, val := range []string{"1", "true", "yes"} {
+		t.Run("RAJ_ALLOW_SYMLINK_ESCAPE="+val, func(t *testing.T) {
+			t.Setenv(SymlinkEscapeEnv, val)
+			g, fileLink, _ := symlinkEscapeFixture(t)
+			if _, err := g.canonical(fileLink); err != nil {
+				t.Errorf("canonical with the opt-in set = %v, want the escape allowed", err)
+			}
+		})
+	}
+	for _, val := range []string{"", "0", "false"} {
+		t.Run("RAJ_ALLOW_SYMLINK_ESCAPE="+val, func(t *testing.T) {
+			t.Setenv(SymlinkEscapeEnv, val)
+			g, fileLink, _ := symlinkEscapeFixture(t)
+			if _, err := g.canonical(fileLink); err == nil {
+				t.Errorf("canonical with %q set = nil, want the escape refused", val)
+			}
+		})
+	}
+}
+
+// A path that does not exist yet has no target to resolve, so it is checked
+// lexically and stays allowed: open -create and a forward claim keep working.
+// Modelled on TestClaimAcceptsANotYetOnDiskPath, the original forwarding case.
+func TestGuardAllowsANotYetOnDiskPath(t *testing.T) {
+	g, _, _ := claimGuard(t, "a.go")
+	missing := filepath.Join(g.Root(), "new", "gone.go")
+
+	if err := g.inRootResolved(missing); err != nil {
+		t.Errorf("inRootResolved(%s) = %v, want nil for a create-forward path", missing, err)
+	}
+	if res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{missing}}); !res.OK {
+		t.Errorf("claim of a not-yet-on-disk path = %+v, want it accepted", res)
+	}
+	if res := Dispatch(g, Request{Op: "open", Path: missing, Author: FirstAgent, Create: true}); !res.OK {
+		t.Errorf("open -create of a not-yet-on-disk path = %+v, want it accepted", res)
+	}
+}
+
+// A new leaf under a symlinked parent that leaves the workspace is refused:
+// the deepest existing ancestor is resolved, so open -create and a forward
+// claim cannot write through the link. Modelled on TestGuardRefusesSymlinkEscape
+// (the escape property) with the not-yet-on-disk leaf of
+// TestGuardAllowsANotYetOnDiskPath.
+func TestGuardRefusesSymlinkParentEscape(t *testing.T) {
+	g, _, dirLink := symlinkEscapeFixture(t)
+	through := filepath.Join(dirLink, "newfile.txt")
+
+	if err := g.inRootResolved(through); err == nil {
+		t.Errorf("inRootResolved(%s) = nil, want the symlinked parent refused", through)
+	}
+	if res := Dispatch(g, Request{Op: "open", Path: through, Author: FirstAgent, Create: true}); res.OK {
+		t.Errorf("open -create through a symlinked parent = %+v, want a refusal", res)
+	}
+	if res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{through}}); res.OK {
+		t.Errorf("claim through a symlinked parent = %+v, want a refusal", res)
 	}
 }

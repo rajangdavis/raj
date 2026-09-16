@@ -77,12 +77,20 @@ type Header struct {
 	NewPath string
 
 	// Author identifies the writer. 0 means unset; the editor assigns one per
-	// connection and refuses a request that names a different one.
+	// connection. Only revert compares it to the connection's real author and
+	// refuses a mismatch — dropping a peer's pieces is the user's decision, not
+	// a driver's. A few verbs (patch, delete and rmdir -withdraw) compare it to
+	// a stored record's owner, but every one of them trusts the field for
+	// attribution, so naming a peer is still attributed as that peer; that is a
+	// known gap (TODO.md).
 	Author uint8
 
 	// Token is the shared secret a TCP client presents. It rides in the header
 	// on every request rather than in a handshake, so the server stays
-	// stateless about it and a reconnect needs no special case.
+	// stateless about it and a reconnect needs no special case. The same field
+	// carries a "token" reply's answer back — EncodeResponse stamps it from
+	// Response.Token and the codec writes it through hToken — so one field
+	// serves both directions.
 	//
 	// It is therefore in every frame, which is worth naming: anything dumping
 	// this wire dumps the token with it. The header being opcodes rather than
@@ -171,6 +179,10 @@ type Header struct {
 	// Create, so a peer that does not know it omits it and keeps the
 	// proposing default.
 	Withdraw bool
+	// Hidden is ls's include-hidden switch, the -hidden flag. It crosses as a
+	// presence flag like Withdraw, so a peer that does not know it omits it
+	// and keeps the filtered default.
+	Hidden bool
 
 	// LSPMode names the lsp sub-operation on a request; LSPJSON carries the
 	// JSON-encoded answer back on a response. Neither needs the body: they are
@@ -216,6 +228,10 @@ type Header struct {
 	// pending change sets, file deletions and dir-removals. Sparse like the
 	// lists above: an empty one is not sent.
 	Proposals []Proposal
+	// Entries is ls's answer: the immediate children of the directory the
+	// request named, sorted by name. Sparse like the lists above: an empty
+	// directory sends none.
+	Entries []Entry
 
 	// Messages is what a parked recv answers with. They stay in the header
 	// rather than moving to the body: a message is text a person typed into a
@@ -246,9 +262,16 @@ type Header struct {
 	Version uint64
 	Bytes   int
 	Lines   int
-	Buffers []Buffer
-	Files   int
-	Capped  bool
+	// Found, FindStart, FindEnd and FindCount are find's answer. Found is a
+	// sparse presence flag; the span and count follow from the omitted-zero
+	// defaults when it is set.
+	Found     bool
+	FindStart int
+	FindEnd   int
+	FindCount int
+	Buffers   []Buffer
+	Files     int
+	Capped    bool
 	// Considered is how many files a search walk opened and scanned; a
 	// search under an -include glob that matched no file reports zero,
 	// which is how the CLI tells "no matches" from "nothing was searched".
@@ -266,6 +289,12 @@ type Header struct {
 	// path is arbitrary bytes and a matched line is document content.
 	Matches   []MatchMeta
 	Conflicts []Conflict
+	// Warnings name the other writers' Proposed sets a successful apply landed
+	// over -- the advisory-lease half of the reply. It is sparse: a clean apply
+	// sends none, so a peer that does not know the field reads no warnings
+	// rather than an error, and it rides in its own field rather than widening
+	// the positional Conflict record.
+	Warnings []GroupOverlap
 
 	// Spans describe the body of a read: one entry per authored run, in
 	// document order. Their lengths sum to the body that follows them.
@@ -424,7 +453,7 @@ func EncodeRequest(req Request) (Header, []byte) {
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
 		Annotated: req.Annotated, Create: req.Create, Discard: req.Discard,
 		Paths: req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
-		Withdraw: req.Withdraw,
+		Withdraw: req.Withdraw, Hidden: req.Hidden,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
@@ -468,7 +497,7 @@ func DecodeRequest(f Frame) (Request, error) {
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
 		Annotated: f.Header.Annotated, Create: f.Header.Create, Discard: f.Header.Discard,
 		Paths: f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear,
-		Withdraw: f.Header.Withdraw}
+		Withdraw: f.Header.Withdraw, Hidden: f.Header.Hidden}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -506,7 +535,8 @@ func EncodeResponse(res Response) (Header, []byte) {
 	h := Header{ID: res.ID, OK: res.OK, Remains: res.Remains, Created: res.Created,
 		Err: res.Err, Root: res.Root, PID: res.PID,
 		Version: res.Version, Bytes: res.Bytes, Lines: res.Lines,
-		Buffers: res.Buffers, Conflicts: res.Conflicts,
+		Found: res.Found, FindStart: res.FindStart, FindEnd: res.FindEnd, FindCount: res.FindCount,
+		Buffers: res.Buffers, Conflicts: res.Conflicts, Warnings: res.Warnings,
 		Files: res.Files, Considered: res.Considered, Capped: res.Capped,
 		Truncated: res.Truncated, Final: res.Final, Author: res.Author,
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
@@ -517,8 +547,9 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Deletions:   res.Deletions,
 		DirRemovals: res.DirRemovals,
 		Proposals:   res.Proposals,
+		Entries:     res.Entries,
 
-		SrcVersion: res.SrcVersion, Identity: res.Identity}
+		Token: res.Token, SrcVersion: res.SrcVersion, Identity: res.Identity}
 	var body []byte
 	if res.Stream != 0 {
 		// Command output is bytes off a pipe: whatever the process wrote, not
@@ -546,7 +577,9 @@ func DecodeResponse(f Frame) (Response, error) {
 		Created: f.Header.Created, Err: f.Header.Err, Root: f.Header.Root,
 		PID: f.Header.PID, Version: f.Header.Version,
 		Bytes: f.Header.Bytes, Lines: f.Header.Lines,
-		Buffers: f.Header.Buffers, Conflicts: f.Header.Conflicts,
+		Found: f.Header.Found, FindStart: f.Header.FindStart,
+		FindEnd: f.Header.FindEnd, FindCount: f.Header.FindCount,
+		Buffers: f.Header.Buffers, Conflicts: f.Header.Conflicts, Warnings: f.Header.Warnings,
 		Files: f.Header.Files, Considered: f.Header.Considered, Capped: f.Header.Capped,
 		Truncated: f.Header.Truncated, Final: f.Header.Final,
 		Author: f.Header.Author, Exit: f.Header.Exit, Dirty: f.Header.Dirty,
@@ -560,8 +593,9 @@ func DecodeResponse(f Frame) (Response, error) {
 		Deletions:     f.Header.Deletions,
 		DirRemovals:   f.Header.DirRemovals,
 		Proposals:     f.Header.Proposals,
+		Entries:       f.Header.Entries,
 
-		SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
+		Token: f.Header.Token, SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

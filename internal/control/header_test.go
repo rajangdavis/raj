@@ -9,6 +9,9 @@ import (
 	"raj/internal/prog"
 )
 
+// i64p is an int64 pointer for a literal Entry whose Size is present.
+func i64p(n int64) *int64 { return &n }
+
 // fullHeader is a header with every field set, so a test can assert that all of
 // them cross the wire.
 func fullHeader() Header {
@@ -17,11 +20,12 @@ func fullHeader() Header {
 		ID: 7, Op: "apply", Path: "/w/main.go", NewPath: "/w/renamed.go", Author: 3, Token: "t0ken",
 		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent",
 		Argv: []string{"go", "test", "./..."}, Dir: "/w",
-		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true},
+		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true, Hidden: true},
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
 		Root: "/w", PID: 4242, Version: 70000, Bytes: 12345, Lines: 678, Files: 12, Capped: true,
-		Considered:   34,
+		Considered: 34,
+		Found:      true, FindStart: 1234, FindEnd: 1239, FindCount: 7,
 		Dirty:        []DirtyBuffer{{Path: "/w/a.go", AgentOnly: true}, {Path: "/w/b.go"}},
 		Stats:        ExecStats{Runs: 5, Stale: 1, AgentOnly: 2},
 		Participants: []Participant{{ID: 1, Identity: "i", Name: "n", Kind: KindAgent, Connected: true}},
@@ -31,6 +35,7 @@ func fullHeader() Header {
 		Truncated:    []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}},
 		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, LineEnd: 18, ByteStart: 10, ByteEnd: 14, Version: 6}},
 		Conflicts:    []Conflict{{Index: 1, At: 8, Group: 7, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
+		Warnings:     []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
 		DiffJSON:     `[{"id":4,"hunks":[{"start":1,"end":2,"old":"a","new":"b"}],"moved":0}]`,
 		StatesJSON:   `[{"off":0,"len":5,"group":0,"state":"accepted"}]`,
@@ -38,6 +43,7 @@ func fullHeader() Header {
 		Annotated:    true,
 		Discard:      true,
 		Withdraw:     true,
+		Hidden:       true,
 		Remains:      true,
 		Created:      true,
 
@@ -52,6 +58,10 @@ func fullHeader() Header {
 		Proposals: []Proposal{
 			{Kind: "set", Path: "/w/a.go", Author: 3, Group: 4, Start: -1, End: -1},
 			{Kind: "delete", Path: "/w/b.go", Author: 4, Start: 7, End: 9},
+		},
+		Entries: []Entry{
+			{Name: "pkg", Path: "/w/pkg", Dir: true},
+			{Name: "main.go", Path: "/w/main.go", Size: i64p(9)},
 		},
 	}
 }
@@ -110,8 +120,13 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"reviewlist", got.ReviewList, want.ReviewList},
 		{"annotated", got.Annotated, want.Annotated},
 		{"withdraw", got.Withdraw, want.Withdraw},
+		{"hidden", got.Hidden, want.Hidden},
 		{"remains", got.Remains, want.Remains},
 		{"created", got.Created, want.Created},
+		{"found", got.Found, want.Found},
+		{"findstart", got.FindStart, want.FindStart},
+		{"findend", got.FindEnd, want.FindEnd},
+		{"findcount", got.FindCount, want.FindCount},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
@@ -131,6 +146,40 @@ func TestHeaderRoundTrip(t *testing.T) {
 	}
 	if len(got.Proposals) != 2 || got.Proposals[0] != want.Proposals[0] || got.Proposals[1] != want.Proposals[1] {
 		t.Errorf("proposals = %+v, want %+v", got.Proposals, want.Proposals)
+	}
+}
+
+// An ls reply's entries cross as a flat record list: name, path, kind, and a
+// size that is absent for anything that is not a regular file. A zero-byte
+// regular file keeps its zero rather than reading as absent, which is why the
+// wire carries -1 rather than zero for "no size".
+func TestHeaderKeepsEntries(t *testing.T) {
+	zero, nine := int64(0), int64(9)
+	want := []Entry{
+		{Name: "pkg", Path: "/w/pkg", Dir: true},
+		{Name: "empty", Path: "/w/empty", Size: &zero},
+		{Name: "main.go", Path: "/w/main.go", Size: &nine},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Entries: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Entries) != len(want) {
+		t.Fatalf("decoded %d entries, want %d", len(got.Entries), len(want))
+	}
+	for i := range want {
+		g, w := got.Entries[i], want[i]
+		if g.Name != w.Name || g.Path != w.Path || g.Dir != w.Dir {
+			t.Errorf("entry %d = %+v, want %+v", i, g, w)
+		}
+		switch {
+		case w.Size == nil && g.Size != nil:
+			t.Errorf("entry %d size = %d, want absent", i, *g.Size)
+		case w.Size != nil && g.Size == nil:
+			t.Errorf("entry %d size absent, want %d", i, *w.Size)
+		case w.Size != nil && *g.Size != *w.Size:
+			t.Errorf("entry %d size = %d, want %d", i, *g.Size, *w.Size)
+		}
 	}
 }
 
@@ -316,8 +365,8 @@ func TestEveryVerbHasACode(t *testing.T) {
 		"groups", "accept", "reject", "clear", "exec", "execcheck", "stats", "hello",
 		"cancel", "recv", "snapshot", "prog", "diff", "review", "claim",
 		"mkdir", "delete", "deletions", "rename",
-		"proposals",
-		"rmdir", "rmdirs",
+		"proposals", "revert", "token",
+		"rmdir", "rmdirs", "ls",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)
@@ -462,6 +511,113 @@ func TestHeaderKeepsConflictGroup(t *testing.T) {
 		if got.Conflicts[i] != want[i] {
 			t.Errorf("conflict %d = %+v, want %+v", i, got.Conflicts[i], want[i])
 		}
+	}
+}
+
+// A lease refusal's author and span ride with the owner in their own sparse
+// field, so a zero span must survive next to a nonzero one and each triple must
+// stay with its own conflict rather than shift onto the next.
+func TestHeaderKeepsConflictLease(t *testing.T) {
+	want := []Conflict{
+		{Index: 0, At: 3, Hunk: Hunk{Start: 0, End: 5, Text: "x"}},
+		{Index: 1, Group: 12, Author: 3, Start: 6, End: 11, Hunk: Hunk{Start: 8, End: 8, Text: "y"}},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Conflicts: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Conflicts) != len(want) {
+		t.Fatalf("decoded %d conflicts, want %d", len(got.Conflicts), len(want))
+	}
+	for i := range want {
+		if got.Conflicts[i] != want[i] {
+			t.Errorf("conflict %d = %+v, want %+v", i, got.Conflicts[i], want[i])
+		}
+	}
+}
+
+// A successful apply warnings ride in their own sparse field, one
+// {group, author, start, end} record per warning, separate from the positional
+// conflict records. An absent field decodes to nil, and the warnings coexist
+// with conflicts without shifting them. Modelled on TestHeaderKeepsConflictLease.
+func TestHeaderKeepsApplyWarnings(t *testing.T) {
+	conflicts := []Conflict{{Index: 0, At: 3, Hunk: Hunk{Start: 0, End: 5, Text: "x"}}}
+	want := []GroupOverlap{{Group: 12, Author: 3, Start: 6, End: 12}}
+	got, err := decodeHeader(encodeHeader(Header{Conflicts: conflicts, Warnings: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Conflicts) != 1 || got.Conflicts[0] != conflicts[0] {
+		t.Errorf("conflicts = %+v, want %+v", got.Conflicts, conflicts)
+	}
+	if len(got.Warnings) != len(want) || got.Warnings[0] != want[0] {
+		t.Errorf("warnings = %+v, want %+v", got.Warnings, want)
+	}
+
+	// Absent means none: a header with no warnings decodes to a nil slice.
+	clean, err := decodeHeader(encodeHeader(Header{Version: 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Warnings != nil {
+		t.Errorf("clean warnings = %+v, want nil", clean.Warnings)
+	}
+}
+
+// A group's overlap list rides in its own sparse field, keyed to the groups by
+// position, so a group with no overlaps must decode to nil next to one that has
+// them rather than borrowing the other's list.
+func TestHeaderKeepsGroupOverlaps(t *testing.T) {
+	want := []Group{
+		{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1},
+		{ID: 5, Path: "/w/a.go", Author: 3, State: "proposed", Ops: 1,
+			Overlaps: &GroupOverlaps{Sets: []GroupOverlap{
+				{Group: 4, Author: 2, Start: 6, End: 11},
+			}}},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Groups: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Groups) != len(want) {
+		t.Fatalf("decoded %d groups, want %d", len(got.Groups), len(want))
+	}
+	if got.Groups[0].Overlaps != nil {
+		t.Errorf("group 0 borrowed an overlap list: %+v", got.Groups[0].Overlaps)
+	}
+	if got.Groups[1].Overlaps == nil || len(got.Groups[1].Overlaps.Sets) != 1 ||
+		got.Groups[1].Overlaps.Sets[0] != want[1].Overlaps.Sets[0] {
+		t.Errorf("group 1 overlaps = %+v, want %+v", got.Groups[1].Overlaps, want[1].Overlaps)
+	}
+}
+
+// A group's Invalid flag and collider ride in their own sparse field, keyed to
+// the groups by position, so a valid group next to an invalid one must decode
+// to invalid=false/nil and an invalid set with no namable collider must keep
+// its flag without borrowing one. Modelled on TestHeaderKeepsGroupOverlaps.
+func TestHeaderKeepsGroupInvalid(t *testing.T) {
+	want := []Group{
+		{ID: 4, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1},
+		{ID: 5, Path: "/w/a.go", Author: 3, State: "proposed", Ops: 1,
+			Invalid: true, InvalidBy: &GroupOverlap{Group: 4, Author: 2, Start: 6, End: 11}},
+		{ID: 6, Path: "/w/a.go", Author: 3, State: "proposed", Ops: 1, Invalid: true},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Groups: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Groups) != len(want) {
+		t.Fatalf("decoded %d groups, want %d", len(got.Groups), len(want))
+	}
+	if got.Groups[0].Invalid || got.Groups[0].InvalidBy != nil {
+		t.Errorf("group 0 borrowed invalid state: %+v", got.Groups[0])
+	}
+	if !got.Groups[1].Invalid || got.Groups[1].InvalidBy == nil ||
+		*got.Groups[1].InvalidBy != *want[1].InvalidBy {
+		t.Errorf("group 1 invalid = %+v, want %+v", got.Groups[1], want[1])
+	}
+	if !got.Groups[2].Invalid || got.Groups[2].InvalidBy != nil {
+		t.Errorf("group 2 invalid/no-collider = %+v, want invalid with a nil collider", got.Groups[2])
 	}
 }
 

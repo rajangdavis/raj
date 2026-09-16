@@ -49,8 +49,9 @@ const ctlUsage = `usage: raj ctl <command> [options]
 
   list                       running editors and their workspaces
   buffers                    files open in the editor; a headless buffer has no tab
-  read [path]                the buffer view, loaded on demand; -annotated adds per-run states, -start/-end/-lines for a span
+  read [path]                the buffer view, loaded on demand; -annotated prints a run line per change set after the text; -start/-end/-lines for a span
   open <path>                show a file: load it and focus a tab; -create makes a buffer for a path not on disk; prints opened or created
+  ls [path]                  list a directory's immediate children; a trailing / marks a directory, -hidden includes hidden entries
   mkdir <dir>                create a directory, and any missing parents, under the workspace root
   rename <old> <new>         move a file within the workspace, carrying an open clean buffer; alias: mv
   delete <path>              propose deleting a file for the user to review; claim-gated
@@ -66,15 +67,17 @@ const ctlUsage = `usage: raj ctl <command> [options]
   close [path]                close a buffer; refused while it has unsaved work, -discard drops it anyway and reports whether the file remains
   whoami                     the author id this connection writes as
   register [-as KEY]         mint an explicit identity key; -as binds a chosen one
+  token                      the running server's TCP token, read from a local socket
   who [-live]                everyone writing in this workspace; -live filters to connected
   recv                       wait for the user to say something, then print it
   groups [path]              change sets in a buffer, and their state
   accept [path] -group N     agree to a change set; -all for every pending one
   reject [path] -group N     mark a set rejected; -all for every pending one
   clear [path] -group N      hard-purge a rejected change set; -all for every rejected one
+  revert [path] [-author N]  discard your own pieces; the inverse of attribution
   diff [path]                pending change sets as old→new text, for review
   review [path]              enter review mode and list pending change sets; -json lists without entering
-  search -q PATTERN          search the workspace, unsaved edits included
+  search -q PATTERN          search the workspace, unsaved edits included; -hidden includes hidden paths
   search -q PATTERN -path DIR
                              search only DIR, under the workspace root
   version [path]             the version a later apply bases on
@@ -109,6 +112,12 @@ the set out so the same text can be applied again — so redo work that came bac
 rejected with reject, clear, then apply once more. open -create is how a path
 that is not on disk yet gets a buffer.
 
+Attribution has an inverse: revert discards the live pieces one writer wrote,
+reversing them out of the document and recording the reversal in the journal
+rather than a second forward edit. It acts on your own pieces only (-mine, or
+-author naming your own id); another writer's accepted text is dropped with
+reject then clear, which is the user's decision to make.
+
 The editor is found automatically, or named with -addr or RAJ_CONTROL_ADDR:
 a socket path, or tcp://host:port for a raj outside this container. A TCP
 editor also wants RAJ_CONTROL_TOKEN set to the token it printed on startup.
@@ -132,8 +141,13 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(out, " [options]")
 		if strings.Contains(verbOperand[cmd], "[path]") && cmd != "claim" {
-			fmt.Fprintln(out, "\nwith no path, targets the buffer the user is looking at.")
+			note := "\nwith no path, targets the buffer the user is looking at."
+			if cmd == "ls" {
+				note = "\nwith no path, lists the workspace root."
+			}
+			fmt.Fprintln(out, note)
 		}
+
 		fmt.Fprintln(out)
 		fs.PrintDefaults()
 	}
@@ -148,16 +162,17 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	query := fs.String("q", "", "search: the pattern")
 	include := fs.String("include", "", "search: comma-separated globs to search")
 	exclude := fs.String("exclude", "", "search: comma-separated globs to skip")
-	searchPath := fs.String("path", "", "search: limit the walk to a directory under the workspace root")
+	searchPath := fs.String("path", "", "search: limit the walk to a directory under the workspace root; the scope itself is searched even when hidden")
 	regex := fs.Bool("regex", false, "search: treat the pattern as a regular expression")
 	matchCase := fs.Bool("case", false, "search: match case")
 	word := fs.Bool("word", false, "search: whole words only")
+	hiddenFlag := fs.Bool("hidden", false, "ls/search: include hidden files and directories")
 	jsonl := fs.Bool("jsonl", false, "search: print each hit as one JSON object per line, as it arrives")
 	base := fs.Uint64("base", 0, "apply: the version the offsets were measured in")
 	start := fs.Int("start", -1, "apply/read: first byte of the span")
 	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
-	annotated := fs.Bool("annotated", false, "read: add the per-run change set and state of the view")
+	annotated := fs.Bool("annotated", false, "read: report the change set and state of each run; -json adds them as states, plain adds run lines after the text")
 	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
 	discard := fs.Bool("discard", false, "close: discard unsaved changes instead of refusing the close")
 	withdraw := fs.Bool("withdraw", false, "delete: retract your pending deletion instead of proposing one")
@@ -173,7 +188,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	oldFile := fs.String("old-file", "", "edit: read -old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read -new from a file, or - for stdin")
 	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject/clear: every change set")
-	mine := fs.Bool("mine", false, "groups, proposals: only the connection's own change sets")
+	mine := fs.Bool("mine", false, "groups, proposals, revert: only the connection's own work")
+	revertAuthor := fs.Uint("author", 0, "revert: the writer whose pieces to drop; must be your own author id")
 	state := fs.String("state", "", "groups: only sets in this state: proposed, accepted or rejected")
 	pendingOnly := fs.Bool("pending", false, "groups: only sets still awaiting a decision")
 	verbatim := fs.Bool("verbatim", false, "apply/edit: strip one trailing newline read from a file or stdin")
@@ -275,6 +291,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return simple(c, Request{Op: "mkdir", Path: path}, "created "+path, stdout, stderr, *asJSON)
+	case "ls":
+		return lsCmd(c, path, *hiddenFlag, stdout, stderr, *asJSON)
 	case "rename", "mv":
 		if path == "" || fs.Arg(1) == "" {
 			fmt.Fprintf(stderr, "raj ctl %s: needs an old and a new path\n", cmd)
@@ -358,7 +376,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			if *asJSON {
 				return emit(stdout, map[string]any{"ok": true, "line": line, "col": col})
 			}
-			where := firstOf(path, "active buffer")
+			where := targetName(c, path, "active buffer")
 			if line > 0 {
 				colText := ""
 				if col > 0 {
@@ -435,18 +453,42 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		for _, g := range res.Groups {
 			fmt.Fprintf(stdout, "%d\tauthor %d\t%s\t%d ops\t%+d bytes\t%d hunks\t%d moved\n",
 				g.ID, g.Author, g.State, g.Ops, g.Bytes, g.Hunks, g.Moved)
+			if g.Overlaps != nil {
+				// An overlap is reported, not resolved: two sets still awaiting
+				// a decision that claim the same bytes is a fact the person
+				// deciding them has to see.
+				for _, o := range g.Overlaps.Sets {
+					fmt.Fprintf(stdout, "  overlaps change set %d (author %d) at bytes %d..%d\n",
+						o.Group, o.Author, o.Start, o.End)
+				}
+			}
+			if g.Invalid {
+				// Superseded, not decided: the set is still proposed but every
+				// hunk is gone, so there is nothing to accept. Name the live
+				// edit that consumed it, so clearing that is an actionable next
+				// step rather than a bare state.
+				if g.InvalidBy != nil {
+					fmt.Fprintf(stdout, "  invalid: superseded by change set %d (author %d) at bytes %d..%d\n",
+						g.InvalidBy.Group, g.InvalidBy.Author, g.InvalidBy.Start, g.InvalidBy.End)
+				} else {
+					fmt.Fprintln(stdout, "  invalid: superseded; no colliding set can be named")
+				}
+			}
 		}
 		return 0
-	case "accept", "reject", "clear":
+	case "accept", "reject":
 		if *all {
 			return decideAll(c, cmd, path, *mine, *group, stdout, stderr, *asJSON)
 		}
-		msg := cmd + "ed"
-		if cmd == "clear" {
-			msg = fmt.Sprintf("cleared change set %d", *group)
-		}
-		return simple(c, Request{Op: cmd, Path: path, Group: *group}, msg,
+		return simple(c, Request{Op: cmd, Path: path, Group: *group}, cmd+"ed",
 			stdout, stderr, *asJSON)
+	case "clear":
+		if *all {
+			return decideAll(c, cmd, path, *mine, *group, stdout, stderr, *asJSON)
+		}
+		return clearCmd(c, path, *group, stdout, stderr, *asJSON)
+	case "revert":
+		return revertCmd(c, path, uint8(*revertAuthor), *mine, stdout, stderr, *asJSON)
 	case "diff":
 		return diffCmd(c, path, stdout, stderr, *asJSON)
 	case "review":
@@ -498,6 +540,20 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "%d\n", res.Author)
 		return 0
+	case "token":
+		// The secret is the server's, not this connection's, so there is
+		// nothing to resolve and no path involved. Printing it alone on the
+		// line is the point: `TOKEN=$(raj ctl token)` should not have to strip
+		// prose. A Unix-only server has no secret and prints an empty line.
+		res, err := c.Do(Request{Op: "token"})
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		if *asJSON {
+			return emit(stdout, map[string]any{"token": res.Token})
+		}
+		fmt.Fprintln(stdout, res.Token)
+		return 0
 	case "register":
 		return registerCmd(c, *identity, *name, stdout, stderr, *asJSON)
 	case "search":
@@ -509,7 +565,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		return doSearch(c, SearchQuery{Text: *query, Include: *include, Exclude: *exclude,
-			Path:  *searchPath,
+			Path: *searchPath, Hidden: *hiddenFlag,
 			Regex: *regex, Case: *matchCase, Word: *word}, *jsonl, *asJSON, stdout, stderr)
 	case "version":
 		res, err := c.Do(Request{Op: "version", Path: path})
@@ -684,6 +740,34 @@ func rmdirsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 	return 0
 }
 
+// lsCmd lists a directory's children, one per line, with a trailing slash on
+// each directory so the two kinds are told apart without a stat. The listing
+// applies the shared hidden policy unless -hidden drops it. The JSON form
+// carries the name, path, kind and a regular file's size; a directory, a
+// symlink and a special file omit the size rather than reporting a number that
+// is not their content.
+func lsCmd(c *Client, path string, all bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "ls", Path: path, Hidden: all})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	entries := res.Entries
+	if entries == nil {
+		entries = []Entry{}
+	}
+	if asJSON {
+		return emit(stdout, entries)
+	}
+	for _, e := range entries {
+		if e.Dir {
+			fmt.Fprintf(stdout, "%s/\n", e.Name)
+			continue
+		}
+		fmt.Fprintln(stdout, e.Name)
+	}
+	return 0
+}
+
 // renameCmd moves a file within the workspace, carrying an open clean buffer
 // with it. Two paths cross the wire: the old in Path and the new in NewPath.
 // The Guard gates the old on the caller's claim set and refuses a destination
@@ -722,6 +806,7 @@ var argLimit = map[string]struct {
 	"deletions": {0, "deletions takes no operands; it lists every pending deletion"},
 	"rmdir":     {1, "rmdir takes a directory path; pass -withdraw to retract a proposal"},
 	"rmdirs":    {0, "rmdirs takes no operands; it lists every pending dir-removal"},
+	"ls":        {1, "ls takes a directory path and nothing else"},
 	"proposals": {0, "proposals takes no operands; -mine limits the list to this identity's own"},
 	"rename":    {2, "rename takes <old> and <new> paths"},
 	"mv":        {2, "mv takes <old> and <new> paths"},
@@ -731,12 +816,14 @@ var argLimit = map[string]struct {
 	"accept":    {1, "accept takes a path; the change set id goes to -group"},
 	"reject":    {1, "reject takes a path; the change set id goes to -group"},
 	"clear":     {1, "clear takes a path; the change set id goes to -group"},
+	"revert":    {1, "revert takes a path; -mine or -author selects the writer"},
 	"diff":      {1, "diff takes a path and nothing else"},
 	"review":    {1, "review takes a path and nothing else"},
 	"patch":     {1, "patch takes a path; the snapshot id goes to -dump"},
 	"apply":     {1, "apply takes a path; offsets go to -base/-start/-end, and text to -text/-text-file or after --"},
 	"edit":      {1, "edit takes a path; the strings go to -old/-new, or both after --"},
 	"register":  {0, "register takes no path; the key goes to -as, or one is minted"},
+	"token":     {0, "token takes no operands; it reads the running server's TCP token"},
 }
 
 // verbOperand is each verb's positional operands, spelled as the top-level
@@ -752,6 +839,7 @@ var verbOperand = map[string]string{
 	"mv":       "<old> <new>",
 	"delete":   "<path>",
 	"rmdir":    "<dir>",
+	"ls":       "[path]",
 	"claim":    "[path]...",
 	"goto":     "[path] LINE[:COL]",
 	"close":    "[path]",
@@ -759,6 +847,7 @@ var verbOperand = map[string]string{
 	"accept":   "[path]",
 	"reject":   "[path]",
 	"clear":    "[path]",
+	"revert":   "[path]",
 	"diff":     "[path]",
 	"review":   "[path]",
 	"version":  "[path]",
@@ -1492,6 +1581,16 @@ func apply(c *Client, path string, base uint64, start, end int, textArg, textFil
 		}
 		text = data
 	}
+	if start == end && text == "" {
+		// A zero-width span with no text is a no-op. Refusing it here is
+		// clearer than sending it and reporting a change set that changed
+		// nothing; a deletion is a non-empty span with empty text and still
+		// goes through.
+		fmt.Fprintln(stderr, "raj ctl apply: nothing to apply: -start and -end are equal and\n"+
+			"no text was given, so the hunk would change nothing. A deletion needs a\n"+
+			"non-empty span (-end greater than -start); an insertion needs text.")
+		return 2
+	}
 	res, err := c.Do(Request{Op: "apply", Path: path, Base: &base,
 		Hunks: []Hunk{{Start: start, End: end, Text: text}}})
 	return reportApply(res, err, 1, []hunkEcho{{Start: start, End: end, Text: text}},
@@ -1535,10 +1634,14 @@ func applyHunks(c *Client, path string, base uint64, file string, fs *flag.FlagS
 // parseHunks decodes JSON Lines: one {start,end,text} object per line. A blank
 // line is skipped, so the trailing newline every text file ends with is not an
 // error; anything else is refused with its line number, because a hunk that
-// cannot be placed is worse than a hunk never sent.
+// cannot be placed is worse than a hunk never sent. A no-op hunk -- an empty
+// text at a zero-width span -- is dropped, so a batch mixing real and no-op
+// hunks sends only the real ones and a batch of only no-ops is refused rather
+// than recorded as a change set that changed nothing.
 func parseHunks(text string, stderr io.Writer) ([]Hunk, []hunkEcho, int) {
 	var hunks []Hunk
 	var echo []hunkEcho
+	noops := 0
 	for line := 1; len(text) > 0; line++ {
 		raw := text
 		if nl := strings.IndexByte(text, '\n'); nl >= 0 {
@@ -1564,11 +1667,20 @@ func parseHunks(text string, stderr io.Writer) ([]Hunk, []hunkEcho, int) {
 				line, h.Start, h.End)
 			return nil, nil, 1
 		}
+		if h.Start == h.End && h.Text == "" {
+			noops++
+			continue
+		}
 		hunks = append(hunks, Hunk{Start: h.Start, End: h.End, Text: h.Text})
 		echo = append(echo, hunkEcho{Start: h.Start, End: h.End, Text: h.Text})
 	}
 	if len(hunks) == 0 {
-		fmt.Fprintln(stderr, "raj ctl apply: -hunks file holds no hunks")
+		if noops > 0 {
+			fmt.Fprintln(stderr, "raj ctl apply: every hunk is a no-op: a zero-width\n"+
+				"span with empty text changes nothing")
+		} else {
+			fmt.Fprintln(stderr, "raj ctl apply: -hunks file holds no hunks")
+		}
 		return nil, nil, 1
 	}
 	return hunks, echo, 0
@@ -1640,19 +1752,25 @@ func patchCmd(c *Client, path string, dumpID uint64, textArg, textFile string, s
 		return 1
 	}
 	if len(res.Conflicts) > 0 {
-		fmt.Fprintf(stderr, "raj ctl patch: %d change(s) could not be placed on the current\n"+
-			"version — the buffer moved further than a rebase could carry them. Dump\n"+
-			"again and redo the edit.\n", len(res.Conflicts))
-		return 1
+		// The same lease-versus-stale split apply and edit use: a conflict that
+		// names an owner asks for a decision about another writer's text, while
+		// one with no group is the ordinary moved snapshot. The old wording
+		// told every caller to dump again, which is wrong for a lease.
+		return reportConflicts("patch", res.Conflicts, res.Warnings, len(res.Conflicts), stdout, stderr, asJSON)
 	}
 	if res.Err != "" {
 		fmt.Fprintln(stderr, "raj ctl patch:", res.Err)
 		return 1
 	}
 	if asJSON {
-		return emit(stdout, map[string]any{"ok": true, "version": res.Version})
+		out := map[string]any{"ok": true, "version": res.Version}
+		if len(res.Warnings) > 0 {
+			out["warnings"] = res.Warnings
+		}
+		return emit(stdout, out)
 	}
 	fmt.Fprintf(stdout, "patched snapshot %d at version %d; the buffer has unsaved changes\n", dumpID, res.Version)
+	noteOverlaps(stdout, res.Warnings)
 	return 0
 }
 
@@ -1669,11 +1787,11 @@ func reviewCmd(c *Client, path string, listOnly bool, stdout, stderr io.Writer) 
 		return emit(stdout, res.Groups)
 	}
 	if len(res.Groups) == 0 {
-		fmt.Fprintf(stdout, "%s: no proposed changes\n", firstOf(path, "active buffer"))
+		fmt.Fprintf(stdout, "%s: no proposed changes\n", targetName(c, path, "active buffer"))
 		return 0
 	}
 	fmt.Fprintf(stdout, "%s: review mode, %d proposed change set(s)\n",
-		firstOf(path, "active buffer"), len(res.Groups))
+		targetName(c, path, "active buffer"), len(res.Groups))
 	for _, g := range res.Groups {
 		fmt.Fprintf(stdout, "%d\tauthor %d\t%s\t%d ops\t%+d bytes\n",
 			g.ID, g.Author, g.State, g.Ops, g.Bytes)
@@ -1699,12 +1817,29 @@ func diffCmd(c *Client, path string, stdout, stderr io.Writer, asJSON bool) int 
 		return emit(stdout, diffs)
 	}
 	if len(diffs) == 0 {
-		fmt.Fprintf(stdout, "%s: no pending changes\n", firstOf(path, "active buffer"))
+		fmt.Fprintf(stdout, "%s: no pending changes\n", targetName(c, path, "active buffer"))
 		return 0
 	}
 	for _, g := range diffs {
 		fmt.Fprintf(stdout, "group %d\tauthor %d\t%s\t%d ops\t%+d bytes\n",
 			g.ID, g.Author, g.State, g.Ops, g.Bytes)
+		if g.Overlaps != nil {
+			for _, o := range g.Overlaps.Sets {
+				fmt.Fprintf(stdout, "  overlaps change set %d (author %d) at bytes %d..%d\n",
+					o.Group, o.Author, o.Start, o.End)
+			}
+		}
+		if g.Invalid {
+			// The set is still listed because it is still proposed; the flag
+			// says no hunk survives. Name the collider so the next step is
+			// clear rather than a bare "moved" note.
+			if g.InvalidBy != nil {
+				fmt.Fprintf(stdout, "  invalid: superseded by change set %d (author %d) at bytes %d..%d\n",
+					g.InvalidBy.Group, g.InvalidBy.Author, g.InvalidBy.Start, g.InvalidBy.End)
+			} else {
+				fmt.Fprintln(stdout, "  invalid: superseded; no colliding set can be named")
+			}
+		}
 		for _, h := range g.Hunks {
 			fmt.Fprintf(stdout, "@@ %s @@\n", diffHeader(h))
 			writeDiffLines(stdout, "-", h.Old)
@@ -1851,7 +1986,7 @@ func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, st
 		return 1
 	}
 	if len(res.Conflicts) > 0 {
-		return reportConflicts(res.Conflicts, hunks, stdout, stderr, asJSON)
+		return reportConflicts("apply", res.Conflicts, res.Warnings, hunks, stdout, stderr, asJSON)
 	}
 	if res.Err != "" {
 		fmt.Fprintln(stderr, "raj ctl apply:", res.Err)
@@ -1859,6 +1994,9 @@ func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, st
 	}
 	if asJSON {
 		out := map[string]any{"ok": true, "applied": hunks, "version": res.Version}
+		if len(res.Warnings) > 0 {
+			out["warnings"] = res.Warnings
+		}
 		if len(echo) > 0 {
 			spans := make([]map[string]any, 0, len(echo))
 			for _, h := range echo {
@@ -1877,56 +2015,107 @@ func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, st
 	}
 	fmt.Fprintf(stdout, "applied %d hunk(s) at version %d; the buffer has unsaved changes\n",
 		hunks, res.Version)
+	noteOverlaps(stdout, res.Warnings)
 	return 0
+}
+
+// noteOverlaps prints one note per superseded Proposed set. A warning is not a
+// refusal: the hunk landed, but over another writer's Proposed span, so naming
+// the set it moved past tells the caller rather than leaving them to find it in
+// groups/diff later. Shared by apply, edit and patch so the wording cannot
+// drift between the verbs.
+func noteOverlaps(w io.Writer, warnings []GroupOverlap) {
+	for _, wn := range warnings {
+		fmt.Fprintf(w, "note: overlapped change set %d (author %d, bytes %d..%d)\n",
+			wn.Group, wn.Author, wn.Start, wn.End)
+	}
 }
 
 // conflictView is one refused hunk in the -json reply: the wire Conflict plus
 // the reason worded for a driver, so a script and a person read the same thing.
+// Start and End are pointers so a lease span that begins at byte zero is
+// distinguishable from no span at all.
 type conflictView struct {
 	Index   int    `json:"index"`
 	At      uint64 `json:"at"`
 	Group   uint64 `json:"group,omitempty"`
+	Author  uint8  `json:"author,omitempty"`
+	Start   *int   `json:"start,omitempty"`
+	End     *int   `json:"end,omitempty"`
 	Message string `json:"message"`
 	Hunk    Hunk   `json:"hunk"`
 }
 
+// leaseView fills in the owner fields a lease refusal carries and words the
+// decision it asks for. A conflict with no group is the ordinary stale offset,
+// which is the caller's cue to re-read rather than to decide about someone
+// else's text.
+func leaseView(c Conflict) conflictView {
+	v := conflictView{Index: c.Index, At: c.At, Group: c.Group, Hunk: c.Hunk}
+	if c.Group == 0 {
+		return v
+	}
+	start, end := c.Start, c.End
+	v.Author = c.Author
+	v.Start, v.End = &start, &end
+	v.Message = fmt.Sprintf("change set %d owns this text (author %d, bytes %d..%d); "+
+		"accept or reject it first", c.Group, c.Author, c.Start, c.End)
+	return v
+}
+
 // reportConflicts describes hunks that could not be placed. A conflict that
 // carries a group is a lease refusal — a pending or rejected change set owns
-// the text and has to be decided before the hunk can land — and names the set;
-// one with no group is the ordinary stale offset and keeps the message that
-// tells the caller to re-read and resubmit. The two call for opposite actions,
-// which is why they no longer share a sentence.
-func reportConflicts(conflicts []Conflict, hunks int, stdout, stderr io.Writer, asJSON bool) int {
+// the text and has to be decided before the hunk can land — and names the set,
+// its author and the span it holds; one with no group is the ordinary stale
+// offset and keeps the message that tells the caller to re-read and resubmit.
+// The two call for opposite actions, which is why they no longer share a
+// sentence.
+//
+// Warnings ride along: a batch can refuse one hunk and still land another over
+// a Proposed set, so the landed overlap is reported on the failure reply too
+// rather than lost to the early return that reports the conflicts.
+func reportConflicts(verb string, conflicts []Conflict, warnings []GroupOverlap, hunks int, stdout, stderr io.Writer, asJSON bool) int {
+	// verb names the caller — apply or patch — so a refusal points at the
+	// command the driver actually ran rather than at whichever verb first grew
+	// this reporting.
 	const stale = "could not be placed on the current version — the buffer moved " +
 		"further than a rebase could carry them; read it again and redo the hunk " +
 		"against the version you get back"
 	views := make([]conflictView, 0, len(conflicts))
 	staleCount := 0
 	for _, c := range conflicts {
-		v := conflictView{Index: c.Index, At: c.At, Group: c.Group, Hunk: c.Hunk}
-		if c.Group != 0 {
-			v.Message = fmt.Sprintf("change set %d owns this text; accept or reject it first", c.Group)
-		} else {
+		v := leaseView(c)
+		if c.Group == 0 {
 			v.Message = stale
 			staleCount++
 		}
 		views = append(views, v)
 	}
 	if asJSON {
-		emit(stdout, map[string]any{"ok": false, "conflicts": views})
+		out := map[string]any{"ok": false, "conflicts": views}
+		// A warned hunk landed even though another was refused, so the warning
+		// rides the ok:false reply: dropping it would read as a clean refusal
+		// and lose the fact that the batch changed another writer's set.
+		if len(warnings) > 0 {
+			out["warnings"] = warnings
+		}
+		emit(stdout, out)
 		return 1
 	}
 	for _, v := range views {
 		if v.Group != 0 {
-			fmt.Fprintf(stderr, "raj ctl apply: change set %d owns this text; accept or reject it first\n", v.Group)
+			fmt.Fprintf(stderr, "raj ctl %s: %s\n", verb, v.Message)
 		}
 	}
 	if staleCount > 0 {
-		fmt.Fprintf(stderr, "raj ctl apply: %d of %d hunks could not be placed on the current\n"+
+		fmt.Fprintf(stderr, "raj ctl %s: %d of %d hunks could not be placed on the current\n"+
 			"version — the buffer moved further than a rebase could carry them. Read it\n"+
 			"again and redo those hunks against the version you get back.\n",
-			staleCount, hunks)
+			verb, staleCount, hunks)
 	}
+	// The warned hunks did land: say so on the same stream as the refusal, so
+	// a caller reading only the failure still learns what the batch changed.
+	noteOverlaps(stderr, warnings)
 	return 1
 }
 
@@ -2122,7 +2311,25 @@ func read(c *Client, path string, start, end int, lines string, annotated bool, 
 		}
 		return emit(stdout, out)
 	}
-	io.WriteString(stdout, res.Text())
+	text := res.Text()
+	io.WriteString(stdout, text)
+	if !annotated || res.StatesJSON == "" {
+		return 0
+	}
+	// Plain -annotated prints the text, then one line per run, so the change
+	// set and state of every byte is visible at a shell. The offsets are
+	// relative to the text just printed, exactly as the -json states are.
+	var runs []StateRun
+	if err := json.Unmarshal([]byte(res.StatesJSON), &runs); err != nil {
+		fmt.Fprintln(stderr, "raj ctl read: annotated states:", err)
+		return 1
+	}
+	if len(runs) > 0 && !strings.HasSuffix(text, "\n") {
+		io.WriteString(stdout, "\n")
+	}
+	for _, r := range runs {
+		fmt.Fprintf(stdout, "run off=%d len=%d group=%d state=%s\n", r.Off, r.Len, r.Group, r.State)
+	}
 	return 0
 }
 
@@ -2187,6 +2394,89 @@ func simple(c *Client, req Request, ok string, stdout, stderr io.Writer, asJSON 
 	return 0
 }
 
+// clearCmd hard-purges a rejected change set. Unlike accept and reject, clear
+// edits the document, so it can fail on state rather than on the address: a
+// later live set can overlap a member the reversal has to remove, and the
+// refusal then names that set, its author and the span as a block, so the
+// caller knows what to clear first instead of retrying blind.
+func clearCmd(c *Client, path string, group uint64, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "clear", Path: path, Group: group})
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl clear:", err)
+		return 1
+	}
+	if res.Err != "" {
+		if asJSON {
+			out := map[string]any{"ok": false, "error": res.Err}
+			if len(res.Conflicts) > 0 {
+				b := res.Conflicts[0]
+				out["block"] = map[string]any{
+					"group": b.Group, "author": b.Author,
+					"start": b.Start, "end": b.End,
+				}
+			}
+			emit(stdout, out)
+			return 1
+		}
+		fmt.Fprintln(stderr, "raj ctl clear:", res.Err)
+		return 1
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "version": res.Version})
+	}
+	fmt.Fprintf(stdout, "cleared change set %d\n", group)
+	return 0
+}
+
+// revertCmd discards a writer's own live pieces, the inverse of attribution.
+// The writer is the connection's own author — -mine, or -author naming that
+// same id; a different author is refused here and again at the socket, because
+// dropping a peer's accepted pieces is the user's decision, exercised through
+// reject and clear. Like clear, a revert really edits, so a later live set can
+// wedge a member; that refusal names the blocking set, its author and span.
+func revertCmd(c *Client, path string, wantAuthor uint8, mine bool, stdout, stderr io.Writer, asJSON bool) int {
+	me := c.Author()
+	if wantAuthor != 0 && mine && wantAuthor != me {
+		fmt.Fprintln(stderr, "raj ctl revert: -mine and -author name different writers")
+		return 2
+	}
+	target := wantAuthor
+	if target == 0 {
+		target = me
+	}
+	if me != 0 && target != me {
+		fmt.Fprintf(stderr, "raj ctl revert: author %d is not this connection (you write as %d); "+
+			"another writer's pieces are dropped with reject then clear\n", target, me)
+		return 1
+	}
+	res, err := c.Do(Request{Op: "revert", Path: path})
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl revert:", err)
+		return 1
+	}
+	if res.Err != "" {
+		if asJSON {
+			out := map[string]any{"ok": false, "error": res.Err}
+			if len(res.Conflicts) > 0 {
+				b := res.Conflicts[0]
+				out["block"] = map[string]any{
+					"group": b.Group, "author": b.Author,
+					"start": b.Start, "end": b.End,
+				}
+			}
+			emit(stdout, out)
+			return 1
+		}
+		fmt.Fprintln(stderr, "raj ctl revert:", res.Err)
+		return 1
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"ok": true, "version": res.Version})
+	}
+	fmt.Fprintf(stdout, "reverted author %d's pieces\n", me)
+	return 0
+}
+
 // openCmd shows a file and says which of the two things open can do happened:
 // created makes a new buffer, opened focuses one that was already loaded. A
 // driver writing a file for the first time needs to tell them apart — a typo
@@ -2216,6 +2506,14 @@ func openCmd(c *Client, path string, create bool, stdout, stderr io.Writer, asJS
 // otherwise leave a silent duplicate behind; the boolean is the machine answer
 // and the plain-text note is the person's.
 func closeCmd(c *Client, path string, discard bool, stdout, stderr io.Writer, asJSON bool) int {
+	// The name is resolved before the close: closing the buffer the user is
+	// looking at moves the active tab, so asking afterwards would name its
+	// successor. A pathful close, or one that leaves no file behind, never
+	// needs the extra round trip.
+	name := path
+	if discard && path == "" {
+		name = targetName(c, "", "the buffer")
+	}
 	res, err := c.Do(Request{Op: "close", Path: path, Discard: discard})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
@@ -2225,10 +2523,7 @@ func closeCmd(c *Client, path string, discard bool, stdout, stderr io.Writer, as
 			"remains": res.Remains})
 	}
 	if res.Remains {
-		if path == "" {
-			path = "the buffer"
-		}
-		fmt.Fprintln(stdout, "closed "+path+"; the file is still on disk")
+		fmt.Fprintln(stdout, "closed "+name+"; the file is still on disk")
 		return 0
 	}
 	fmt.Fprintln(stdout, "closed")
@@ -2247,11 +2542,11 @@ func edit(c *Client, path, old, newText string, all bool, stdout, stderr io.Writ
 	case len(offsets) == 0:
 		fmt.Fprintf(stderr, "raj ctl edit: that text does not appear in %s.\n"+
 			"Read it again and copy the text exactly, including indentation — this file\n"+
-			"may indent with tabs where you assumed spaces.", editTarget(path))
+			"may indent with tabs where you assumed spaces.", editTarget(c, path))
 		return 1
 	case len(offsets) > 1 && !all:
 		fmt.Fprintf(stderr, "raj ctl edit: that text appears %d times in %s. Include more surrounding\n"+
-			"context to make it unique, or pass -all to replace every occurrence.\n", len(offsets), editTarget(path))
+			"context to make it unique, or pass -all to replace every occurrence.\n", len(offsets), editTarget(c, path))
 		return 1
 	}
 
@@ -2267,13 +2562,40 @@ func edit(c *Client, path, old, newText string, all bool, stdout, stderr io.Writ
 }
 
 // editTarget names the buffer an edit ran against, for an error message. An
-// omitted path means the focused buffer; the client cannot learn the path the
-// server resolved it to without a wire field, so it names what it sent.
-func editTarget(path string) string {
-	if path == "" {
-		return "the buffer the user is looking at"
+// omitted path means the focused buffer; asking the editor which buffer that
+// is lets the message name the file rather than the convention.
+func editTarget(c *Client, path string) string {
+	return targetName(c, path, "the buffer the user is looking at")
+}
+
+// activePath names the buffer the user is looking at, for a message about a
+// verb that was given no path. Only the editor knows which buffer an empty
+// path resolves to, so this asks `buffers`: one round trip in the pathless
+// case, and the message can say the file rather than "the buffer". It is a
+// label for a message, never a target — the request still carries the empty
+// path, so the editor resolves the same buffer it would have anyway — and an
+// editor that cannot answer falls back to the convention.
+func activePath(c *Client) string {
+	res, err := c.Do(Request{Op: "buffers"})
+	if err != nil || res.Err != "" {
+		return ""
 	}
-	return path
+	for _, b := range res.Buffers {
+		if b.Active && b.Path != "" {
+			return b.Path
+		}
+	}
+	return ""
+}
+
+// targetName is the name to print for the buffer a verb acted on: the path the
+// caller gave, or the buffer an omitted path resolved to. fallback covers the
+// case where nothing is focused or the editor cannot be asked.
+func targetName(c *Client, path, fallback string) string {
+	if path != "" {
+		return path
+	}
+	return firstOf(activePath(c), fallback)
 }
 
 // fail turns a transport error or an editor refusal into an exit code. They are
@@ -2374,9 +2696,11 @@ func recv(c *Client, identity, name string, wait time.Duration,
 	if res.Err == "cancelled" {
 		// Nothing arrived in time. Distinguished from a refusal by the exit
 		// code: 3 means "no message", so a polling loop can tell "the user said
-		// nothing" from "the editor said no".
+		// nothing" from "the editor said no". The JSON form still writes the
+		// empty array so `-json` always parses, but it exits 3 too: a loop
+		// reads the code, and the code must not depend on the output shape.
 		if asJSON {
-			return emit(stdout, []Message{})
+			emit(stdout, []Message{})
 		}
 		return 3
 	}

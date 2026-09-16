@@ -65,6 +65,7 @@ const (
 	hDiscard    = 0x16 // close: drop unsaved changes instead of refusing the close
 	hWithdraw   = 0x17 // delete: retract this identity's proposal instead of making one
 	hNewPath    = 0x18 // rename: the destination path, alongside Path
+	hHidden     = 0x19 // ls: include hidden entries, the -hidden switch
 
 	// response fields
 	hExit           = 0x20
@@ -118,6 +119,15 @@ const (
 	hMatchVersion   = 0x50 // search: sparse buffer version per hit, in hit order
 	hRemains        = 0x51 // close -discard: a file is still on disk at the discarded buffer's path
 	hCreated        = 0x52 // open: a new buffer was made rather than an existing one focused
+	hConflictLease  = 0x53 // apply: sparse lease owner author and span per conflict, three numbers per conflict
+	hGroupOverlaps  = 0x54 // groups: sparse per-group overlap lists, one count then {group, author, start, end} records each
+	hFound          = 0x55 // find: the pattern occurred in the buffer
+	hFindStart      = 0x56 // find: byte offset of the first match
+	hFindEnd        = 0x57 // find: one past the last byte of the first match
+	hFindCount      = 0x58 // find: how many matches the buffer holds, including the first
+	hEntries        = 0x59 // ls: immediate children, one {name, path, dir, size} per record
+	hGroupInvalid   = 0x5a // groups: sparse per-group Invalid flag and collider, a flag then (when set) {group, author, start, end}
+	hApplyWarnings  = 0x5b // apply: sparse overlapped-set warnings, one {group, author, start, end} per warning
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -151,6 +161,9 @@ var verbCodes = map[string]byte{
 	"delete": 35, "deletions": 36,
 	"rename": 37,
 	"rmdir":  38, "rmdirs": 39, "proposals": 40,
+	"revert": 41,
+	"token":  42,
+	"ls":     43,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -236,6 +249,7 @@ func encodeHeader(h Header) []byte {
 	flag(hClaimAdd, h.ClaimAdd)
 	flag(hClaimClear, h.ClaimClear)
 	flag(hWithdraw, h.Withdraw)
+	flag(hHidden, h.Hidden)
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
 	// dump with -start 0 asks for the head of the file, an absent one asks for
@@ -270,6 +284,10 @@ func encodeHeader(h Header) []byte {
 	num(hVersion, int(h.Version))
 	num(hBytes, h.Bytes)
 	num(hLines, h.Lines)
+	flag(hFound, h.Found)
+	num(hFindStart, h.FindStart)
+	num(hFindEnd, h.FindEnd)
+	num(hFindCount, h.FindCount)
 	num(hFiles, h.Files)
 	num(hConsidered, h.Considered)
 	flag(hCapped, h.Capped)
@@ -303,7 +321,11 @@ func encodeHeader(h Header) []byte {
 		// trailing bytes, and a reader that knows it reads the seventh. No
 		// element count to disagree about, so the addition is invisible to the
 		// old end.
-		w.Str(q.Path)
+		//
+		// Hidden is appended after Path for the same reason: a reader that
+		// knows it reads one more field, and one that predates it reads what
+		// it knows and leaves the flag false, which is the default walk.
+		w.Str(q.Path).Bool(q.Hidden)
 		ops = append(ops, Op8{hQuery, w.Done()})
 	}
 	if len(h.Hunks) > 0 {
@@ -350,6 +372,57 @@ func encodeHeader(h Header) []byte {
 			}
 		}
 		ops = append(ops, Op8{hGroups, w.Done()})
+
+		// Overlap lists ride in their own sparse field, keyed to the groups by
+		// position: one count per group, then that many {group, author, start,
+		// end} records. A count is written for every group so the order matches
+		// hGroups, and the field is emitted only when some set overlaps, so a
+		// response with nothing to report is unchanged. A separate field rather
+		// than a wider hGroups record keeps an older reader from reading an
+		// overlap count as the next group's id.
+		var ovs prog.Writer
+		var anyOverlap bool
+		for _, g := range h.Groups {
+			var sets []GroupOverlap
+			if g.Overlaps != nil {
+				sets = g.Overlaps.Sets
+			}
+			ovs.Num(len(sets))
+			for _, o := range sets {
+				ovs.Num(int(o.Group)).Num(int(o.Author)).Num(o.Start).Num(o.End)
+			}
+			if len(sets) > 0 {
+				anyOverlap = true
+			}
+		}
+		if anyOverlap {
+			ops = append(ops, Op8{hGroupOverlaps, ovs.Done()})
+		}
+
+		// Invalid flags ride the same positional, sparse style: a flag per
+		// group, then -- only when the flag is set -- the collider's group,
+		// author and span. The field is emitted only when some group is
+		// invalid, so a response with none is unchanged, and a separate field
+		// rather than a wider hGroups record keeps an older reader from reading
+		// a flag as the next group's id.
+		var invs prog.Writer
+		var anyInvalid bool
+		for _, g := range h.Groups {
+			if !g.Invalid {
+				invs.Num(0)
+				continue
+			}
+			invs.Num(1)
+			var by GroupOverlap
+			if g.InvalidBy != nil {
+				by = *g.InvalidBy
+			}
+			invs.Num(int(by.Group)).Num(int(by.Author)).Num(by.Start).Num(by.End)
+			anyInvalid = true
+		}
+		if anyInvalid {
+			ops = append(ops, Op8{hGroupInvalid, invs.Done()})
+		}
 	}
 	if len(h.Messages) > 0 {
 		var w prog.Writer
@@ -399,6 +472,19 @@ func encodeHeader(h Header) []byte {
 			w.Str(p.Kind).Str(p.Path).Num(int(p.Author)).Num(int(p.Group)).Num(p.Start).Num(p.End)
 		}
 		ops = append(ops, Op8{hProposals, w.Done()})
+	}
+	if len(h.Entries) > 0 {
+		var w prog.Writer
+		for _, e := range h.Entries {
+			// Size is -1 when absent, so a zero-byte regular file keeps its
+			// zero and a directory stays distinguishable from an empty one.
+			size := -1
+			if e.Size != nil {
+				size = int(*e.Size)
+			}
+			w.Str(e.Name).Str(e.Path).Bool(e.Dir).Num(size)
+		}
+		ops = append(ops, Op8{hEntries, w.Done()})
 	}
 
 	if len(h.Buffers) > 0 {
@@ -536,6 +622,38 @@ func encodeHeader(h Header) []byte {
 		if any {
 			ops = append(ops, Op8{hConflictGroup, groups.Done()})
 		}
+
+		// The lease owner's author and span ride together in one sparse field,
+		// three numbers per conflict, in conflict order, so each pair stays with
+		// its own refusal. It is emitted whenever any conflict names a lease;
+		// the stale-offset conflicts write zeros and an old reader loses
+		// nothing it would have had. A separate field keeps the span out of the
+		// positional hConflicts record, which an older reader would otherwise
+		// read as the next conflict's index.
+		var lease prog.Writer
+		var anyLease bool
+		for _, c := range h.Conflicts {
+			if c.Group != 0 {
+				anyLease = true
+			}
+			lease.Num(int(c.Author)).Num(c.Start).Num(c.End)
+		}
+		if anyLease {
+			ops = append(ops, Op8{hConflictLease, lease.Done()})
+		}
+	}
+	// Warnings ride in their own sparse field: one {group, author, start, end}
+	// record per warning, emitted only when some hunk landed over another
+	// writer's Proposed span. A separate argument field rather than another
+	// field on the positional hConflicts record, so an older reader that does
+	// not know it skips it whole and loses the warnings rather than misreading
+	// the next conflict's index.
+	if len(h.Warnings) > 0 {
+		var w prog.Writer
+		for _, x := range h.Warnings {
+			w.Num(int(x.Group)).Num(int(x.Author)).Num(x.Start).Num(x.End)
+		}
+		ops = append(ops, Op8{hApplyWarnings, w.Done()})
 	}
 	if len(h.Spans) > 0 {
 		var w prog.Writer
@@ -561,9 +679,11 @@ type Op8 struct {
 
 // decodeHeader reads what encodeHeader wrote.
 //
-// Unknown fields are skipped: nil is passed as the known set, and every header
-// code is in the argument range, so prog.Decode drops what it does not
-// recognise rather than refusing the frame.
+// Unknown fields are dropped by the switch below, not by prog.Decode: nil is
+// passed as the known set, and prog.Decode reads nil as "every opcode is
+// known", so it returns an op for a code this function has no case for and the
+// switch's lack of a default ignores it. Header codes are allocated in the
+// argument range below 0x80, so the frame is kept rather than refused.
 func decodeHeader(b []byte) (Header, error) {
 	ops, err := prog.Decode(b, nil)
 	if err != nil {
@@ -587,6 +707,15 @@ func decodeHeader(b []byte) (Header, error) {
 	// Conflict lease owners arrive the same way, one number per conflict, so
 	// their position relative to hConflicts does not matter either.
 	var conflictGroups []int
+	// The lease owner's author and span arrive the same sparse way, three
+	// numbers per conflict, merged after every op like the owners.
+	var conflictLeases []conflictLease
+	// Group overlap lists arrive the same way, a count then that many records
+	// per group, merged after every op so their position does not matter.
+	var groupOverlaps [][]GroupOverlap
+	// Invalid flags and their colliders arrive the same way, a flag then (when
+	// set) four numbers per group, merged after every op.
+	var groupInvalid []invalidCollider
 	// Headless buffer paths arrive the same sparse way: one path per buffer
 	// with no tab, marked on the matching buffers after every op is read.
 	var headless []string
@@ -641,6 +770,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.ClaimClear = true
 		case hWithdraw:
 			h.Withdraw = true
+		case hHidden:
+			h.Hidden = true
 
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
@@ -676,6 +807,14 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Bytes = prog.ReadNumber(op.Payload)
 		case hLines:
 			h.Lines = prog.ReadNumber(op.Payload)
+		case hFound:
+			h.Found = true
+		case hFindStart:
+			h.FindStart = prog.ReadNumber(op.Payload)
+		case hFindEnd:
+			h.FindEnd = prog.ReadNumber(op.Payload)
+		case hFindCount:
+			h.FindCount = prog.ReadNumber(op.Payload)
 		case hFiles:
 			h.Files = prog.ReadNumber(op.Payload)
 		case hConsidered:
@@ -721,6 +860,10 @@ func decodeHeader(b []byte) (Header, error) {
 			// leaves q.Path empty rather than an error: the value is absent,
 			// which is the same thing as no scope.
 			q.Path = r.Str()
+			// Hidden is the newest field; a payload from before it existed
+			// leaves it false rather than a frame error, which is the default
+			// walk rather than an include-hidden one.
+			q.Hidden = r.Bool()
 			h.Query = &q
 		case hHunks:
 			r := prog.NewReader(op.Payload)
@@ -773,6 +916,49 @@ func decodeHeader(b []byte) (Header, error) {
 				h.Groups = append(h.Groups, g)
 			}
 			if err := recordsOK(r, "groups"); err != nil {
+				return Header{}, err
+			}
+		case hGroupOverlaps:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				n := r.Num()
+				sets := make([]GroupOverlap, 0, n)
+				for k := 0; k < n; k++ {
+					sets = append(sets, GroupOverlap{
+						Group: uint64(r.Num()), Author: uint8(r.Num()),
+						Start: r.Num(), End: r.Num()})
+				}
+				groupOverlaps = append(groupOverlaps, sets)
+			}
+			if err := recordsOK(r, "group overlaps"); err != nil {
+				return Header{}, err
+			}
+		case hGroupInvalid:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				ic := invalidCollider{invalid: r.Num() != 0}
+				if ic.invalid {
+					by := GroupOverlap{Group: uint64(r.Num()), Author: uint8(r.Num()),
+						Start: r.Num(), End: r.Num()}
+					// A zero group means the set is invalid but no single
+					// collider can be named, not a collider with id zero.
+					if by.Group != 0 {
+						ic.by = &by
+					}
+				}
+				groupInvalid = append(groupInvalid, ic)
+			}
+			if err := recordsOK(r, "group invalid"); err != nil {
+				return Header{}, err
+			}
+		case hApplyWarnings:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Warnings = append(h.Warnings, GroupOverlap{
+					Group: uint64(r.Num()), Author: uint8(r.Num()),
+					Start: r.Num(), End: r.Num()})
+			}
+			if err := recordsOK(r, "apply warnings"); err != nil {
 				return Header{}, err
 			}
 		case hMessages:
@@ -834,6 +1020,19 @@ func decodeHeader(b []byte) (Header, error) {
 					Group: uint64(r.Num()), Start: r.Num(), End: r.Num()})
 			}
 			if err := recordsOK(r, "proposals"); err != nil {
+				return Header{}, err
+			}
+		case hEntries:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				e := Entry{Name: r.Str(), Path: r.Str(), Dir: r.Bool()}
+				if size := r.Num(); size >= 0 {
+					s := int64(size)
+					e.Size = &s
+				}
+				h.Entries = append(h.Entries, e)
+			}
+			if err := recordsOK(r, "entries"); err != nil {
 				return Header{}, err
 			}
 		case hBuffers:
@@ -924,6 +1123,15 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "conflict groups"); err != nil {
 				return Header{}, err
 			}
+		case hConflictLease:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				conflictLeases = append(conflictLeases, conflictLease{
+					author: r.Num(), start: r.Num(), end: r.Num()})
+			}
+			if err := recordsOK(r, "conflict lease"); err != nil {
+				return Header{}, err
+			}
 		case hSpans:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -970,7 +1178,39 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Conflicts[i].Group = uint64(g)
 		}
 	}
+	for i, l := range conflictLeases {
+		if i < len(h.Conflicts) {
+			h.Conflicts[i].Author = uint8(l.author)
+			h.Conflicts[i].Start = l.start
+			h.Conflicts[i].End = l.end
+		}
+	}
+	for i, sets := range groupOverlaps {
+		if i < len(h.Groups) && len(sets) > 0 {
+			h.Groups[i].Overlaps = &GroupOverlaps{Sets: sets}
+		}
+	}
+	for i, ic := range groupInvalid {
+		if i < len(h.Groups) && ic.invalid {
+			h.Groups[i].Invalid = true
+			h.Groups[i].InvalidBy = ic.by
+		}
+	}
 	return h, nil
+}
+
+// conflictLease is one lease refusal's owner and span as it crosses the wire:
+// three numbers per conflict, carried in the sparse hConflictLease field.
+type conflictLease struct {
+	author, start, end int
+}
+
+// invalidCollider is one group's Invalid flag and, when set, the live set that
+// consumed it, carried in the sparse hGroupInvalid field: a flag then four
+// numbers, the collider's group zero when no single collider can be named.
+type invalidCollider struct {
+	invalid bool
+	by      *GroupOverlap
 }
 
 // bufferState is one buffer's pending and moved counts as they cross the wire,

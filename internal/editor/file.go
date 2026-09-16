@@ -553,9 +553,11 @@ func (f *File) Delete(author piecetable.Author, pos, length int) bool {
 }
 
 // ApplyDiff routes an agent's diff through the session and catches the index
-// up on every hunk that landed.
-func (f *File) ApplyDiff(author piecetable.Author, base piecetable.Version, hunks []piecetable.Hunk) []piecetable.Conflict {
-	_, conflicts := f.sess.ApplyDiff(author, base, hunks)
+// up on every hunk that landed. It returns the refused hunks and, for a hunk
+// that landed over another writer's Proposed span, the advisory warnings
+// naming the set it moved past.
+func (f *File) ApplyDiff(author piecetable.Author, base piecetable.Version, hunks []piecetable.Hunk) ([]piecetable.Conflict, []piecetable.Block) {
+	_, conflicts, warnings := f.sess.ApplyDiff(author, base, hunks)
 	// Anchor the catch-up at `applied`, not at the version on entry. An op that
 	// reached the journal without going through File — a reject made straight on
 	// the session — is otherwise left unmirrored while `applied` jumps past it,
@@ -564,7 +566,7 @@ func (f *File) ApplyDiff(author piecetable.Author, base piecetable.Version, hunk
 		f.applyToIndex(op)
 	}
 	f.applied = f.sess.Version()
-	return conflicts
+	return conflicts, warnings
 }
 
 // Undo and Redo reverse edits by one author, leaving other authors' work alone.
@@ -613,12 +615,50 @@ func (f *File) RejectGroup(group uint64) bool {
 // composition. It reports false when the set was not rejected or a reversal
 // genuinely wedged, exactly as the session does.
 func (f *File) ClearRejected(group uint64) bool {
-	if !f.sess.ClearRejected(group) {
-		return false
+	ok, _ := f.ClearRejectedBlock(group)
+	return ok
+}
+
+// ClearRejectedBlock is ClearRejected plus, when the reversal wedges, the live
+// set whose span overlaps a member that could not be placed. The line index is
+// only mirrored on success; the block is passed through untouched, because a
+// refusal leaves the document exactly as it was.
+func (f *File) ClearRejectedBlock(group uint64) (bool, piecetable.Block) {
+	ok, block := f.sess.ClearRejectedBlock(group)
+	if !ok {
+		return false, block
 	}
 	f.noteDecision()
 	f.sync()
-	return true
+	return true, block
+}
+
+// RevertAuthor discards every piece author wrote. Unlike ClearRejected this is
+// not gated on a decision: it is the inverse of attribution, reversing a whole
+// writer's live contribution out of the document and recording the reversal in
+// the journal. It really edits, so the line index has to mirror the reversal,
+// and noteDecision moves the decision generation — a set the revert emptied has
+// its own decision dropped. It reports false when the author holds no live
+// pieces or a later edit has wedged a member, passing the block through
+// untouched.
+func (f *File) RevertAuthor(author piecetable.Author) (bool, piecetable.Block) {
+	before := f.sess.Version()
+	ok, block := f.sess.RevertAuthor(author)
+	if !ok && block.Group == 0 && f.sess.Version() == before {
+		// Nothing live to reverse: the document did not move. The version
+		// check catches the other false return — a wedge with an unnamed
+		// blocker after earlier sets were already reversed, where the journal
+		// (and so the index) did move even though Group is zero.
+		return false, block
+	}
+	// Either the whole reversal landed or a wedge stopped the walk after
+	// earlier sets were already dropped. Both moved the document, so the line
+	// index has to mirror it and noteDecision advances the generation — a set
+	// the revert emptied has its decision dropped. The block still passes
+	// through so the caller can name what wedged.
+	f.noteDecision()
+	f.sync()
+	return ok, block
 }
 
 // ProposeGroup marks a change set as awaiting a decision. A proposal is not in
@@ -655,6 +695,13 @@ func (f *File) noteDecision() {
 	f.decisionGen++
 	f.cleanKnow = false
 }
+
+// DecisionGeneration reports the file's decision generation: it advances
+// every time a decision — propose, accept, reject, clear or revert — changes
+// the composition without moving the session version. Session.Version paired
+// with this value is the key a display projection can be memoised under, since
+// a decision moves the view without moving the version.
+func (f *File) DecisionGeneration() uint64 { return f.decisionGen }
 
 // noteDecisions marks a session that already carries decisions — one restored
 // from its journal — as layered, so Dirty compares the agreed composition

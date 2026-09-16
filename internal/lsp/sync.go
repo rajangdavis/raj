@@ -274,6 +274,17 @@ func (s *Sync) Version(path string) (int, bool) {
 	return t.version, ok
 }
 
+// Pinned is the version and the full text the server was last told about for a
+// document, and whether it knows the document at all. The text is the copy the
+// server holds; a caller about to change it can compare and know whether a
+// notification is needed, which the diagnostics sync marker depends on.
+func (s *Sync) Pinned(path string) (version int, text string, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.open[URI(path)]
+	return t.version, t.text, ok
+}
+
 // Count is how many documents the server is tracking.
 func (s *Sync) Count() int {
 	s.mu.Lock()

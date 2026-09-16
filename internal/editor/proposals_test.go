@@ -137,54 +137,66 @@ func TestAcceptedTextFallsBackToAuthorTint(t *testing.T) {
 	}
 }
 
-// A proposed span is a lease: a user edit inside it is refused as a conflict
-// naming the set, so the member cannot fragment under the review surface. The
-// whole run still projects as one mark.
-func TestPendingMarksRefuseAnEditInsideTheLease(t *testing.T) {
+// A merely Proposed span is advisory: an edit inside it lands in the editor's
+// own group, and the proposal's member fragments into one mark per surviving
+// run. The runs share the group id, so the review surface still reads them as
+// the one change set they are.
+func TestPendingMarksFragmentAroundAnEditInsideAnAdvisoryProposal(t *testing.T) {
 	p := newTestPane("hello world\n")
 	id := propose(t, p, piecetable.Hunk{Start: 6, End: 11, Text: "socket"})
 
-	// The user tries to type inside the proposed text, at offset 8.
-	conflicts := p.File.ApplyDiff(piecetable.User, p.File.Session().Version(),
+	// A second writer applies inside the proposed text, at offset 8 — the
+	// advisory ApplyDiff path, not the human typing path (which still refuses).
+	conflicts, _ := p.File.ApplyDiff(piecetable.User, p.File.Session().Version(),
 		[]piecetable.Hunk{{Start: 8, End: 8, Text: "XYZ"}})
-
-	if len(conflicts) != 1 || conflicts[0].Group != id {
-		t.Fatalf("conflicts = %+v, want one naming set %d", conflicts, id)
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want the advisory proposal to allow the edit", conflicts)
 	}
-	if got := p.File.Text(); got != "hello socket\n" {
-		t.Fatalf("text = %q, want the leased text unchanged", got)
+	if got := p.File.Text(); got != "hello soXYZcket\n" {
+		t.Fatalf("text = %q, want the edit applied between the proposal's halves", got)
 	}
 	marks := p.PendingMarks()
-	if len(marks) != 1 {
-		t.Fatalf("marks = %+v, want the one unbroken run", marks)
+	if len(marks) != 2 {
+		t.Fatalf("marks = %+v, want the fragmented run as two marks", marks)
 	}
-	if m := marks[0]; m.Group != id || m.Start != 6 || m.End != 12 {
-		t.Errorf("mark = %+v, want group %d at 6..12", m, id)
-	}
-	if !marks[0].CoversLine(p.File, 0) {
-		t.Error("the run must still cover its line for accept-at-caret")
+	want := [][2]int{{6, 8}, {11, 15}}
+	for i, m := range marks {
+		if m.Group != id {
+			t.Errorf("mark %d group = %d, want %d", i, m.Group, id)
+		}
+		if m.Start != want[i][0] || m.End != want[i][1] {
+			t.Errorf("mark %d span = %d..%d, want %d..%d", i, m.Start, m.End, want[i][0], want[i][1])
+		}
+		if !m.CoversLine(p.File, 0) {
+			t.Errorf("mark %d must still cover its line for accept-at-caret", i)
+		}
 	}
 }
 
-// The lease stops a set being overwritten, so it cannot silently drop out of
-// the pending list: the edit is refused and the set stays there to be decided.
-func TestPendingMarksKeepALeasedSetPending(t *testing.T) {
+// Overwriting every run of an advisory proposal lands the edit and moves the
+// set: it drops out of Pending (there is nothing left to decide or to block a
+// save on) while DiffPending still reports it as moved, so a reviewer can see
+// what the buffer moved past.
+func TestPendingDropsAWhollyOverwrittenProposal(t *testing.T) {
 	p := newTestPane("hello world\n")
 	id := propose(t, p, piecetable.Hunk{Start: 6, End: 11, Text: "socket"})
 
-	conflicts := p.File.ApplyDiff(piecetable.User, p.File.Session().Version(),
+	conflicts, _ := p.File.ApplyDiff(piecetable.User, p.File.Session().Version(),
 		[]piecetable.Hunk{{Start: 6, End: 12, Text: "port"}})
-
-	if len(conflicts) != 1 || conflicts[0].Group != id {
-		t.Fatalf("conflicts = %+v, want one naming set %d", conflicts, id)
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want the advisory proposal to allow the overwrite", conflicts)
 	}
-	if got := p.File.Text(); got != "hello socket\n" {
-		t.Fatalf("text = %q, want the leased text unchanged", got)
+	if got := p.File.Text(); got != "hello port\n" {
+		t.Fatalf("text = %q, want the overwrite applied", got)
 	}
-	if marks := p.PendingMarks(); len(marks) != 1 {
-		t.Errorf("marks = %+v, want the set still pending", marks)
+	if marks := p.PendingMarks(); len(marks) != 0 {
+		t.Errorf("marks = %+v, want no surviving run", marks)
 	}
-	if got := p.File.Session().Pending(); len(got) != 1 {
-		t.Errorf("pending = %+v, want the set still awaiting a decision", got)
+	if got := p.File.Session().Pending(); len(got) != 0 {
+		t.Errorf("pending = %+v, want the overwritten set out of the pending list", got)
+	}
+	diffs := p.File.Session().DiffPending()
+	if len(diffs) != 1 || diffs[0].Group.ID != id || diffs[0].Moved != 1 {
+		t.Errorf("diffs = %+v, want set %d reported as moved", diffs, id)
 	}
 }

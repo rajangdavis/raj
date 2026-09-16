@@ -43,10 +43,10 @@ import (
 // Message is one thing the user said, and who it is for is implied by the
 // mailbox it sits in.
 type Message struct {
-	// From is the author id of the sender. Always the local human today —
-	// nothing else can reach Post — but recorded rather than assumed, because
-	// a second human is an ordinary participant and this should not be the
-	// place that has to change when one arrives.
+	// From is the author id of the sender: AuthorUser when the human typed it,
+	// AuthorOriginal for an automatic notice the editor enqueued. Recorded
+	// rather than assumed, so a driver can tell a person's message from the
+	// editor's, and a second human is still an ordinary participant.
 	From uint8  `json:"from"`
 	Text string `json:"text"`
 }

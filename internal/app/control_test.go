@@ -42,7 +42,8 @@ func (h *harness) dial(t *testing.T) *client {
 // is the point: a reply that needed no event thread would mean the request was
 // executed somewhere it should not have been.
 func (c *client) do(h *harness, req control.Request) control.Response {
-	if req.Op == "apply" || req.Op == "patch" || req.Op == "clear" || req.Op == "rename" {
+	if req.Op == "apply" || req.Op == "patch" || req.Op == "clear" ||
+		req.Op == "rename" || req.Op == "revert" {
 		path := req.Path
 		if path == "" {
 			path = h.Tabs.Active().File.Path
@@ -237,6 +238,45 @@ func TestControlAppliesAnEdit(t *testing.T) {
 	}
 }
 
+// revert is the inverse of attribution: it discards the connection's own pieces
+// — here a change set still proposed — reversing them out of the buffer and
+// leaving the text as it was before the apply.
+func TestControlRevertsItsOwnPieces(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+
+	base := c.do(h, control.Request{Op: "text"}).Version
+	if r := c.do(h, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	if got := h.text(); got != "hello socket\n" {
+		t.Fatalf("buffer after apply = %q", got)
+	}
+
+	if r := c.do(h, control.Request{Op: "revert"}); !r.OK {
+		t.Fatalf("revert = %+v", r)
+	}
+	if got := h.text(); got != "hello world\n" {
+		t.Errorf("buffer after revert = %q, want the applied pieces gone", got)
+	}
+}
+
+// A writer with no live pieces has nothing to drop, so revert refuses rather
+// than reporting a success that changed nothing.
+func TestControlRevertWithNothingToDropIsRefused(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	c := h.dial(t)
+
+	r := c.do(h, control.Request{Op: "revert"})
+	if r.OK {
+		t.Fatalf("revert with no pieces = %+v, want a refusal", r)
+	}
+	if got := h.text(); got != "hello\n" {
+		t.Errorf("buffer = %q, want it unchanged", got)
+	}
+}
+
 // A span past the end of the buffer is refused, not clamped to an empty read:
 // for one driver that is a typo, for several writing concurrently it is silent
 // corruption. The read verbs and the write surface share the one check.
@@ -416,6 +456,50 @@ func TestControlRefusesAnApplyWithNoBase(t *testing.T) {
 	}
 	if h.text() != "hello world\n" {
 		t.Errorf("buffer changed anyway: %q", h.text())
+	}
+}
+
+// A no-op hunk — empty text at a zero-width span — is not a change. A batch of
+// only no-ops advances nothing and opens no change set; a batch mixing real and
+// no-op hunks applies only the real one and opens exactly one.
+func TestControlNoOpHunksCreateNoChangeSet(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	base := c.do(h, control.Request{Op: "text"}).Version
+
+	r := c.do(h, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: ""}}})
+	if !r.OK {
+		t.Fatalf("no-op apply = %+v", r)
+	}
+	if r.Version != base {
+		t.Errorf("no-op apply advanced version %d -> %d", base, r.Version)
+	}
+	if got := h.text(); got != "hello world\n" {
+		t.Errorf("buffer = %q, want unchanged", got)
+	}
+	if groups := c.do(h, control.Request{Op: "groups"}); len(groups.Groups) != 0 {
+		t.Errorf("no-op apply opened change sets: %+v", groups.Groups)
+	}
+
+	// A mixed batch applies the real hunk and opens exactly one change set.
+	base = c.do(h, control.Request{Op: "text"}).Version
+	r = c.do(h, control.Request{Op: "apply", Base: &base, Hunks: []control.Hunk{
+		{Start: 0, End: 0, Text: ""},
+		{Start: 6, End: 11, Text: "socket"},
+	}})
+	if !r.OK {
+		t.Fatalf("mixed apply = %+v", r)
+	}
+	if got := h.text(); got != "hello socket\n" {
+		t.Errorf("buffer = %q, want only the real hunk applied", got)
+	}
+	groups := c.do(h, control.Request{Op: "groups"})
+	if len(groups.Groups) != 1 {
+		t.Fatalf("mixed apply opened %d change sets, want 1: %+v", len(groups.Groups), groups.Groups)
+	}
+	if groups.Groups[0].State != "proposed" {
+		t.Errorf("change set state = %q, want proposed", groups.Groups[0].State)
 	}
 }
 
@@ -1361,10 +1445,14 @@ func TestControlLeaseRefusalCarriesTheGroup(t *testing.T) {
 		t.Fatalf("no proposal listed: %+v", gs.Groups)
 	}
 
-	// A second hunk from a different writer, overlapping that span, is refused,
-	// not rebased through it: the lease stops another hand overwriting the
-	// proposal before it is decided. (The proposer's own amendment folds into
-	// the set instead; that is covered in the piece table's tests.)
+	// Reject it first: a rejection is the human's decision and stays locked, so
+	// a second writer's hunk over it is refused. (A still-proposed set is only
+	// advisory now — another writer may land over it and own the result, with
+	// the superseded set reported as moved; that is covered in the piece table's
+	// tests.)
+	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: owner}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
 	c2 := h.dial(t)
 	read = c2.do(h, control.Request{Op: "text"})
 	base = read.Version
@@ -1375,6 +1463,396 @@ func TestControlLeaseRefusalCarriesTheGroup(t *testing.T) {
 	}
 	if got := res.Conflicts[0].Group; got != owner {
 		t.Errorf("conflict group = %d, want the leasing set %d", got, owner)
+	}
+	// The refusal names the owning author and the owner's current span, so the
+	// caller does not need a second groups call to act on it.
+	if got := res.Conflicts[0].Author; got != c.c.Author() {
+		t.Errorf("conflict author = %d, want the leasing writer %d", got, c.c.Author())
+	}
+	if got, want := res.Conflicts[0].Start, 6; got != want {
+		t.Errorf("conflict start = %d, want %d", got, want)
+	}
+	if got, want := res.Conflicts[0].End, 12; got != want {
+		t.Errorf("conflict end = %d, want %d", got, want)
+	}
+
+	// The one live set has nothing to overlap, so it carries no overlap marker;
+	// the lease's refusal behaviour is otherwise unchanged.
+	gs = c.do(h, control.Request{Op: "groups", Path: path})
+	var ownerGroup control.Group
+	for _, g := range gs.Groups {
+		if g.ID == owner {
+			ownerGroup = g
+		}
+	}
+	if ownerGroup.Overlaps != nil {
+		t.Errorf("a single live set reported an overlap: %+v", ownerGroup.Overlaps)
+	}
+}
+
+// proposeOver pushes one proposal into path as a fresh identity and returns the
+// connection, the author id it bound, and the proposed set's id. The two-
+// identity tests share it so the setup is not repeated and cannot drift.
+func proposeOver(t *testing.T, h *harness, path, identity, name string, start, end int, text string) (*client, uint8, uint64) {
+	t.Helper()
+	c := h.dial(t)
+	hi := c.do(h, control.Request{Op: "hello", Identity: identity, Name: name})
+	if !hi.OK {
+		t.Fatalf("hello %s = %+v", identity, hi)
+	}
+	read := c.do(h, control.Request{Op: "text", Path: path})
+	base := read.Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: start, End: end, Text: text}}}); !r.OK {
+		t.Fatalf("proposal apply = %+v", r)
+	}
+	var id uint64
+	for _, g := range c.do(h, control.Request{Op: "groups", Path: path}).Groups {
+		if g.State == "proposed" {
+			id = g.ID
+		}
+	}
+	if id == 0 {
+		t.Fatalf("no proposed set after the proposal apply")
+	}
+	return c, hi.Author, id
+}
+
+// A second identity's apply over a first identity's Proposed span is the real
+// advisory-lease path through host.Apply: it lands, and the warning names the
+// run's actual set, its author and the span it held. The Dispatch tests use a
+// canned memHost, so this pins the semantics rather than the plumbing. Modelled
+// on TestControlLeaseRefusalCarriesTheGroup (two identities over the real host).
+func TestControlApplyOverAProposalWarnsTheRealSet(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	path := h.Tabs.Active().File.Path
+
+	_, owner, id := proposeOver(t, h, path, "occupant", "claude-a", 6, 11, "socket")
+
+	editor := h.dial(t)
+	if hi := editor.do(h, control.Request{Op: "hello", Identity: "editor", Name: "claude-b"}); !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	read := editor.do(h, control.Request{Op: "text", Path: path})
+	base := read.Version
+	res := editor.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 12, Text: "port"}}})
+	if len(res.Conflicts) != 0 {
+		t.Fatalf("apply = %+v, want the advisory proposal to allow it", res)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want the one superseded set", res.Warnings)
+	}
+	w := res.Warnings[0]
+	if w.Group != id {
+		t.Errorf("warning group = %d, want %d", w.Group, id)
+	}
+	if w.Author != owner {
+		t.Errorf("warning author = %d, want the occupant %d", w.Author, owner)
+	}
+	if w.Start != 6 || w.End != 12 {
+		t.Errorf("warning span = %d..%d, want the superseded run 6..12", w.Start, w.End)
+	}
+}
+
+// patch is the other writer's path into the same diff, so the real host.Patch
+// mapping reports the same warning shape with the same owner and span. Modelled
+// on TestControlApplyOverAProposalWarnsTheRealSet and on
+// TestControlLeaseRefusalCarriesTheGroup.
+func TestControlPatchOverAProposalWarnsTheRealSet(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	path := h.Tabs.Active().File.Path
+
+	_, owner, id := proposeOver(t, h, path, "occupant", "claude-a", 6, 11, "socket")
+
+	editor := h.dial(t)
+	if hi := editor.do(h, control.Request{Op: "hello", Identity: "editor", Name: "claude-b"}); !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	d := editor.do(h, control.Request{Op: "dump", Path: path})
+	if !d.OK {
+		t.Fatalf("dump = %+v", d)
+	}
+	res := editor.do(h, control.Request{Op: "patch", Path: path, DumpID: d.DumpID,
+		PatchText: "hello port\n"})
+	if len(res.Conflicts) != 0 {
+		t.Fatalf("patch = %+v, want the advisory proposal to allow it", res)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want the one superseded set", res.Warnings)
+	}
+	w := res.Warnings[0]
+	if w.Group != id || w.Author != owner {
+		t.Errorf("warning = %+v, want set %d by the occupant %d", w, id, owner)
+	}
+	if w.Start != 6 || w.End != 12 {
+		t.Errorf("warning span = %d..%d, want 6..12", w.Start, w.End)
+	}
+}
+
+// A patch whose every hunk is refused commits nothing, so the host must not
+// mark a change set it did not open. host.Patch guards that with
+// Version() > before because LastGroup names the group Begin reserved, which no
+// hunk joined; without the guard ProposeGroup would leave that empty set
+// proposed and could flip the state named after an all-conflict patch. Modelled
+// on TestControlLeaseRefusalCarriesTheGroup (two identities over the real host)
+// and TestControlPatchOverAProposalWarnsTheRealSet (the real-host patch path).
+func TestControlPatchAllRefusedDoesNotReproposePriorSet(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	path := h.Tabs.Active().File.Path
+	sess := h.Pane().File.Session()
+
+	// The occupant proposes over "world", and the human rejects it. Rejected is
+	// a locked lease, so every hunk of a later patch over those bytes is refused.
+	occupant, _, prior := proposeOver(t, h, path, "occupant", "claude-a", 6, 11, "socket")
+	if r := occupant.do(h, control.Request{Op: "reject", Path: path, Group: prior}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
+
+	// A second identity patches the whole file, so its one diff lands on the
+	// rejected run and conflicts.
+	editor := h.dial(t)
+	if hi := editor.do(h, control.Request{Op: "hello", Identity: "editor", Name: "claude-b"}); !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	d := editor.do(h, control.Request{Op: "dump", Path: path})
+	if !d.OK {
+		t.Fatalf("dump = %+v", d)
+	}
+	res := editor.do(h, control.Request{Op: "patch", Path: path, DumpID: d.DumpID,
+		PatchText: "hello port\n"})
+	if res.OK || len(res.Conflicts) != 1 {
+		t.Fatalf("patch = %+v, want every hunk refused", res)
+	}
+	if got := res.Conflicts[0].Group; got != prior {
+		t.Errorf("conflict group = %d, want the rejected set %d", got, prior)
+	}
+	if res.Version != d.Version {
+		t.Errorf("version = %d on an all-refused patch, want %d", res.Version, d.Version)
+	}
+
+	// The guard: the reserved group was never joined, so it is not left
+	// Proposed, and the prior set keeps its decision.
+	if got := sess.GroupState(prior); got != piecetable.Rejected {
+		t.Errorf("prior set state = %v after an all-refused patch, want Rejected", got)
+	}
+	if got := sess.GroupState(sess.LastGroup()); got == piecetable.Proposed {
+		t.Errorf("all-refused patch left reserved set %d proposed", sess.LastGroup())
+	}
+}
+
+// Landing over a writer's Proposed span notifies that writer through the
+// mailbox -- spec 7b's "notified (mailbox), never summoned" -- naming the
+// editing author and the superseded set. Modelled on
+// TestRecvDeliversWhatWasSaidWhileAway (the box keeps for a durable identity)
+// and TestControlApplyOverAProposalWarnsTheRealSet (the real host apply path).
+func TestControlSupersededAuthorIsNotified(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	path := h.Tabs.Active().File.Path
+
+	occupant, _, id := proposeOver(t, h, path, "occupant", "claude-a", 6, 11, "socket")
+
+	editor := h.dial(t)
+	hi := editor.do(h, control.Request{Op: "hello", Identity: "editor", Name: "claude-b"})
+	if !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	read := editor.do(h, control.Request{Op: "text", Path: path})
+	base := read.Version
+	res := editor.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 12, Text: "port"}}})
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want the superseded set", res.Warnings)
+	}
+
+	got := occupant.do(h, control.Request{Op: "recv"})
+	if !got.OK || len(got.Messages) != 1 {
+		t.Fatalf("recv = %+v, want the supersession notice", got)
+	}
+	msg := got.Messages[0]
+	if msg.From != control.AuthorOriginal {
+		t.Errorf("notice from = %d, want the editor (AuthorOriginal)", msg.From)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("change set %d", id),
+		fmt.Sprintf("by author %d", hi.Author),
+		"landed over",
+	} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("notice = %q, want it to contain %q", msg.Text, want)
+		}
+	}
+}
+
+// The supersession notice ships no path: the server only knows req.Path in the
+// editor's spelling, and the recipient is another writer whose view of the tree
+// is not known there, so an absolute editor path would be one the recipient
+// cannot resolve. The set, span and author still ride. Modelled on
+// TestControlSupersededAuthorIsNotified (the same mailbox delivery over the real
+// host).
+func TestControlSupersededNoticeShipsNoPath(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	path := h.Tabs.Active().File.Path
+
+	occupant, _, id := proposeOver(t, h, path, "occupant", "claude-a", 6, 11, "socket")
+
+	editor := h.dial(t)
+	hi := editor.do(h, control.Request{Op: "hello", Identity: "editor", Name: "claude-b"})
+	if !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	read := editor.do(h, control.Request{Op: "text", Path: path})
+	base := read.Version
+	res := editor.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 12, Text: "port"}}})
+	if len(res.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want the superseded set", res.Warnings)
+	}
+
+	got := occupant.do(h, control.Request{Op: "recv"})
+	if !got.OK || len(got.Messages) != 1 {
+		t.Fatalf("recv = %+v, want the supersession notice", got)
+	}
+	msg := got.Messages[0]
+	if strings.Contains(msg.Text, path) {
+		t.Errorf("notice = %q, want it to name no editor-spelled path", msg.Text)
+	}
+	if strings.Contains(msg.Text, "/") {
+		t.Errorf("notice = %q, want it to ship no path at all", msg.Text)
+	}
+	// The message otherwise keeps its shape: the set, its span and the editing
+	// author.
+	for _, want := range []string{
+		fmt.Sprintf("change set %d", id),
+		"(bytes 6..12)",
+		fmt.Sprintf("by author %d", hi.Author),
+	} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("notice = %q, want it to contain %q", msg.Text, want)
+		}
+	}
+}
+
+// findGroup returns the group with id from a listing, failing if it is absent.
+func findGroup(t *testing.T, groups []control.Group, id uint64) control.Group {
+	t.Helper()
+	for _, g := range groups {
+		if g.ID == id {
+			return g
+		}
+	}
+	t.Fatalf("no change set %d in %+v", id, groups)
+	return control.Group{}
+}
+
+// Two live change sets whose rebased ranges intersect are reported on both, in
+// groups and in diff, with the other's author and span. The editor does not
+// arbitrate: nothing is clamped, merged or refused here.
+func TestControlGroupsReportLiveOverlaps(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	p := h.Pane()
+	sess := p.File.Session()
+
+	// First proposal inserts "AA" at 0.
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, sess.Version(), []piecetable.Hunk{{Start: 0, End: 0, Text: "AA"}})
+	p.File.End()
+	a := sess.LastGroup()
+	sess.MarkGroup(a, piecetable.Proposed)
+
+	// A second writer's proposal overlaps it. The op is inserted straight on
+	// the session, which builds the overlap without routing it through
+	// ApplyDiff; what is under test is the report, not how the overlap arose.
+	// (An ApplyDiff over A's Proposed run would land now too — a Proposed lease
+	// is advisory — and report the same overlap.)
+	sess.Begin()
+	sess.Insert(piecetable.Agent+1, 1, "BB")
+	sess.End()
+	b := sess.LastGroup()
+	sess.MarkGroup(b, piecetable.Proposed)
+	// Bring the file's line index up to the op inserted straight on the
+	// session, so diff's line mapping is honest.
+	p.File.ApplyDiff(piecetable.Agent, sess.Version(), nil)
+
+	gs := c.do(h, control.Request{Op: "groups", Path: path})
+	aGroup, bGroup := findGroup(t, gs.Groups, a), findGroup(t, gs.Groups, b)
+	if aGroup.Overlaps == nil || len(aGroup.Overlaps.Sets) != 1 {
+		t.Fatalf("group %d overlaps = %+v, want one", a, aGroup.Overlaps)
+	}
+	if o := aGroup.Overlaps.Sets[0]; o.Group != b || o.Author != uint8(piecetable.Agent+1) {
+		t.Errorf("group %d overlaps %+v, want set %d by agent %d", a, o, b, piecetable.Agent+1)
+	}
+	if bGroup.Overlaps == nil || len(bGroup.Overlaps.Sets) != 1 || bGroup.Overlaps.Sets[0].Group != a {
+		t.Errorf("group %d overlaps = %+v, want set %d", b, bGroup.Overlaps, a)
+	}
+
+	d := c.do(h, control.Request{Op: "diff", Path: path})
+	var diffs []control.DiffGroup
+	if err := json.Unmarshal([]byte(d.DiffJSON), &diffs); err != nil {
+		t.Fatalf("diff json: %v", err)
+	}
+	carried := false
+	for _, dg := range diffs {
+		if dg.ID != b || dg.Overlaps == nil || len(dg.Overlaps.Sets) != 1 {
+			continue
+		}
+		carried = true
+		if dg.Overlaps.Sets[0].Group != a {
+			t.Errorf("diff overlap = %+v, want set %d", dg.Overlaps, a)
+		}
+	}
+	if !carried {
+		t.Errorf("diff = %+v, want set %d to carry the overlap", diffs, b)
+	}
+}
+
+// A rejected set a later edit has wedged is refused with the live set whose
+// span overlaps it -- group, author and span -- so the caller can clear that
+// one first instead of guessing.
+func TestControlClearReportsTheBlockingOverlap(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	p := h.Pane()
+	sess := p.File.Session()
+
+	// A rejected set deletes "world" (6..11). A pure deletion owns no inserted
+	// run, so it is not leased and a later edit may overwrite the bytes its
+	// reversal would have to put back.
+	p.File.Begin()
+	if !p.File.Delete(piecetable.Agent, 6, 5) {
+		t.Fatal("the rejected set's delete was refused")
+	}
+	p.File.End()
+	id := sess.LastGroup()
+	sess.MarkGroup(id, piecetable.Rejected)
+
+	// A later user edit removes the whole line, so the reversal can no longer
+	// place "world".
+	p.File.Begin()
+	if !p.File.Delete(piecetable.User, 0, 11) {
+		t.Fatal("the later delete was refused")
+	}
+	p.File.End()
+
+	res := c.do(h, control.Request{Op: "clear", Path: path, Group: id})
+	if res.OK || len(res.Conflicts) != 1 {
+		t.Fatalf("clear = %+v, want a structured refusal", res)
+	}
+	b := res.Conflicts[0]
+	if b.Group == 0 {
+		t.Errorf("block = %+v, want the blocking set named", b)
+	}
+	if b.Author != uint8(piecetable.User) {
+		t.Errorf("block author = %d, want the user's %d", b.Author, piecetable.User)
+	}
+	if res.Err == "" || !strings.Contains(res.Err, "overlaps") {
+		t.Errorf("error = %q, want it to name the overlap", res.Err)
+	}
+	if got := sess.GroupState(id); got != piecetable.Rejected {
+		t.Errorf("state after a wedged clear = %v, want it kept Rejected", got)
 	}
 }
 
@@ -1935,5 +2413,40 @@ func TestControlRenameCaseOnly(t *testing.T) {
 	}
 	if p.File.Path != newPath {
 		t.Errorf("pane path = %q, want %q", p.File.Path, newPath)
+	}
+}
+
+// Goto names a session position, and a rejected fold above it must not
+// renumber the request: the caret lands file-true on the named session line,
+// while the viewport centres on the display row that draws it.
+func TestControlGotoIsFileTrueUnderAFold(t *testing.T) {
+	h := newHarness(t, strings.Repeat("xxxxxxxxxx\n", 40))
+	p := h.Pane()
+	hidden := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "X\nY\n"})
+	if !p.File.RejectGroup(hidden) {
+		t.Fatal("rejecting the fold's set failed")
+	}
+	h.Draw()
+
+	// Session line 31 (1-based 32) is original line 29; the fold draws it one
+	// row up, at display row 30.
+	if err := hostOf(h.App).Goto(p.File.Path, 32, 1); err != nil {
+		t.Fatalf("goto = %v", err)
+	}
+	caret := p.Cursors.Primary().Head
+	if line := p.File.LineOf(caret); line != 31 {
+		t.Fatalf("caret line = %d, want the named session line 31", line)
+	}
+	row, _ := p.DispPos(caret)
+	if row != 30 {
+		t.Fatalf("caret display row = %d, want 30", row)
+	}
+	want := row - p.Viewport.Rows/2
+	if want < 0 {
+		want = 0
+	}
+	if got := p.Viewport.Top; got != want {
+		t.Errorf("viewport top = %d, want %d: centred on the display row, not session line 31",
+			got, want)
 	}
 }

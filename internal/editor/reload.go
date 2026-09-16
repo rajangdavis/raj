@@ -88,6 +88,10 @@ func (p *Pane) Reload() error {
 	if err := p.File.Reload(); err != nil {
 		return err
 	}
+	// The session was replaced, so the projection built from the old document
+	// no longer describes this one. Drop it before FollowCursor reads the map,
+	// or the caret is scrolled through the file that was.
+	p.invalidateDisplay()
 	if last := p.File.Lines() - 1; line > last {
 		line = last
 	}

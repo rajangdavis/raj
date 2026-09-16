@@ -429,3 +429,132 @@ func TestDiagnosticsRunReturnsThePublishedReading(t *testing.T) {
 		t.Errorf("diags = %v, want the published item", out.Diags)
 	}
 }
+
+// A versionless publish is not automatically a reading of the current text.
+// gopls omits the document version from a publish for a file at version 0,
+// which is exactly what its analysis of the on-disk copy looks like, and the
+// editor's own unedited buffer is also at version 0. Reading that on-disk set
+// as clean is the false ok this pins: the buffer holds a deliberate type error
+// the on-disk file does not.
+//
+// Modelled on TestDiagnosticsRunReturnsThePublishedReading — same caller, same
+// bounded wait — with the on-disk publish inserted before the sync.
+func TestDiagnosticsRejectsAPreSyncVersionlessPublish(t *testing.T) {
+	d := newDiagnostics()
+	const path = "/w/broken.go"
+
+	// The server analysed the on-disk file, which is clean, and published with
+	// no version: it omits the version at file version 0.
+	d.setVersion(path, nil, nil)
+
+	// The buffer now holds a type error at version 2, and the request has told
+	// the server about that text.
+	d.noteSynced(path)
+
+	if status, detail := d.status(path, 2, 2); status == control.LSPStatusOK {
+		t.Fatalf("status = %q (%s); an on-disk publish answered for the buffer", status, detail)
+	}
+
+	c := lspCaller{
+		mode: "diagnostics", status: control.LSPStatusStale,
+		store: d, path: path, buf: 2,
+	}
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		v := 2
+		d.setVersion(path, []lsp.Diagnostic{
+			diag(1, sevError, "multiple-value s.RevertAuthor(Agent) in single-value context"),
+		}, &v)
+	}()
+
+	raw, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var out control.LSPResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if out.Status != control.LSPStatusOK {
+		t.Fatalf("status = %q, want %q", out.Status, control.LSPStatusOK)
+	}
+	if len(out.Diags) != 1 || !strings.Contains(out.Diags[0].Message, "single-value context") {
+		t.Fatalf("diags = %v, want the published type error", out.Diags)
+	}
+}
+
+// The other half of the rule: a versionless publish that arrives after the sync
+// is the server's reading of the text just sent, and a clean one reads clean.
+// gopls publishes with no version for a file at version 0, which is exactly the
+// unedited buffer.
+func TestDiagnosticsReadsAPostSyncVersionlessPublishAsClean(t *testing.T) {
+	d := newDiagnostics()
+	const path = "/w/clean.go"
+	d.noteSynced(path)
+	d.setVersion(path, nil, nil) // a publish for the text the sync just sent
+
+	if status, detail := d.status(path, 0, 0); status != control.LSPStatusOK {
+		t.Fatalf("status = %q (%s), want %q", status, detail, control.LSPStatusOK)
+	}
+}
+
+// With no publish after the sync, the answer is honest rather than clean: the
+// caller's bounded wait gives up and reports the non-ok status, not an empty ok.
+func TestDiagnosticsWithoutAPostSyncPublishStaysStale(t *testing.T) {
+	d := newDiagnostics()
+	const path = "/w/quiet.go"
+	d.setVersion(path, nil, nil) // the on-disk clean set, before the sync
+	d.noteSynced(path)
+
+	c := lspCaller{
+		mode: "diagnostics", status: control.LSPStatusStale,
+		store: d, path: path, buf: 1,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	raw, err := c.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var out control.LSPResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if out.Status == control.LSPStatusOK {
+		t.Fatalf("status = ok with no publish for the current text")
+	}
+	if len(out.Diags) != 0 {
+		t.Errorf("diags = %v, want none from a stale reading", out.Diags)
+	}
+}
+
+// Even a versionless publish that arrives after the sync is not a reading of an
+// edited buffer: gopls omits the version only at file version 0, so a
+// versionless set for a buffer with edits cannot be the text just sent. This
+// is the post-sync half of the on-disk race, where the sequence rule alone
+// would accept the publish because it landed after the sync.
+func TestDiagnosticsRejectsAPostSyncVersionlessPublishForAnEditedBuffer(t *testing.T) {
+	d := newDiagnostics()
+	const path = "/w/edited.go"
+	d.noteSynced(path)
+	// The on-disk clean set arrives after the sync, with no version.
+	d.setVersion(path, nil, nil)
+
+	if status, detail := d.status(path, 2, 2); status == control.LSPStatusOK {
+		t.Fatalf("status = %q (%s); a versionless on-disk publish answered for the edited buffer", status, detail)
+	}
+}
+
+// The sequence rule on its own, with the buffer unedited so the version rule
+// cannot be what rejects the publish: an on-disk set that predates the sync is
+// stale even at version 0.
+func TestDiagnosticsRejectsAVersionlessPublishThatPredatesTheSync(t *testing.T) {
+	d := newDiagnostics()
+	const path = "/w/unchanged.go"
+	d.setVersion(path, nil, nil) // the on-disk clean set, before the sync
+	d.noteSynced(path)
+
+	if status, detail := d.status(path, 0, 0); status == control.LSPStatusOK {
+		t.Fatalf("status = %q (%s); a pre-sync on-disk publish answered as current", status, detail)
+	}
+}

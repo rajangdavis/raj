@@ -31,7 +31,7 @@ func (p *Pane) OffsetAt(x, y int) int {
 		y = 0
 	}
 	line := p.Viewport.Top + y
-	if last := p.displayLines() - 1; line > last {
+	if last := p.DisplayLines() - 1; line > last {
 		line = last
 	}
 	if line < 0 {
@@ -41,7 +41,7 @@ func (p *Pane) OffsetAt(x, y int) int {
 	if col < 0 {
 		col = 0
 	}
-	return p.docAt(line, col)
+	return p.DocAt(line, col)
 }
 
 // offsetAtWrapped walks visual rows the way placeCaretWrapped does, counting
@@ -56,7 +56,7 @@ func (p *Pane) offsetAtWrapped(x, y int) int {
 	// Start above the viewport's first line by however many of its rows are
 	// scrolled off, which is what TopRow records.
 	row := -p.Viewport.TopRow
-	lines := p.displayLines()
+	lines := p.DisplayLines()
 	for line := p.Viewport.Top; line < lines; line++ {
 		n := p.RowsInLine(line)
 		if y < row+n {
@@ -73,13 +73,13 @@ func (p *Pane) offsetAtWrapped(x, y int) int {
 
 // offsetInRow resolves a column within one visual row of a wrapped display
 // line, the inverse of placeCaretWrapped. A fold or composition-only row has
-// no session bytes to measure a column against, so it defers to docAt, which
+// no session bytes to measure a column against, so it defers to DocAt, which
 // yields the row session cursor rather than a byte inside text it does not
 // draw.
 func (p *Pane) offsetInRow(line, within, x int) int {
 	sl, dlo, _, _ := p.line(line)
 	if sl < 0 {
-		return p.docAt(line, x)
+		return p.DocAt(line, x)
 	}
 	breaks, text := p.lineBreaks(nil, line)
 	start := 0

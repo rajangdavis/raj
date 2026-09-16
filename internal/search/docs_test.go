@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"raj/internal/hidden"
 )
 
 func docsTree(t *testing.T, files map[string]string) string {
@@ -312,5 +314,29 @@ func TestRunStreamBatchRespectsThePerFileCap(t *testing.T) {
 	}
 	if got, want := res.Total(), MaxPerFile*3; got != want {
 		t.Errorf("Total() = %d, want the true %d", got, want)
+	}
+}
+
+// The -hidden switch is the "include everything" policy: the same walk that
+// refuses .git, node_modules and vendor when Hidden is nil opens all of them
+// when it is hidden.Everything(). It is what lets search answer for a directory
+// holding only binaries or only hidden entries, which content search otherwise
+// cannot see.
+func TestEverythingIncludesHiddenPaths(t *testing.T) {
+	// Isolate the user-level hidden configuration so the default case measures
+	// the built-in defaults.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	root := docsTree(t, map[string]string{
+		".git/x.go":         "needle\n",
+		"vendor/dep/y.go":   "needle\n",
+		"node_modules/z.go": "needle\n",
+		"src/main.go":       "needle\n",
+	})
+	// The default policy sees only the ordinary file.
+	if got := run(root, Query{Text: "needle"}, nil).Total(); got != 1 {
+		t.Errorf("default policy found %d, want 1", got)
+	}
+	if got := run(root, Query{Text: "needle", Hidden: hidden.Everything()}, nil).Total(); got != 4 {
+		t.Errorf("Everything() found %d, want 4", got)
 	}
 }

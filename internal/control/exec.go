@@ -46,6 +46,17 @@ func Run(ctx context.Context, argv []string, dir string,
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
+	// The command leads its own process group, and Cancel is overridden to
+	// signal the whole group rather than just the process exec returned. A
+	// `sh -c "go test"` is two processes: killing the shell leaves the test
+	// binary running and holding the pipes, which is what made a cancel look
+	// like it did nothing. killProcessGroup is the platform half; see
+	// exec_unix.go.
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return nil
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, err
@@ -85,12 +96,11 @@ func Run(ctx context.Context, argv []string, dir string,
 
 	// Waiting is done off to the side so a cancellation can return without it.
 	//
-	// CommandContext kills the process it started, but that process may have
-	// children — `sh -c "go test"` is two processes, and killing the shell
-	// leaves the test binary holding the pipes open. The pumps then never see
-	// EOF and a plain wg.Wait() blocks for as long as the orphan runs, which
-	// makes cancel silently do nothing. Returning on ctx instead means a
-	// cancel is prompt; the leftover goroutines exit when the pipes finally
+	// Cancel signals the command's whole process group (see setProcessGroup
+	// above), so `sh -c "go test"` loses the shell and the test binary both and
+	// the pipes close. That is asynchronous, though: a plain wg.Wait() would
+	// still block until the group is actually reaped, so returning on ctx makes
+	// the cancel prompt either way. The leftover goroutines exit once the pipes
 	// close, and they write to nothing but a closed channel guard.
 	waited := make(chan struct{})
 	var waitErr error

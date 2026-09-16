@@ -86,7 +86,7 @@ Define one API in `piecetable`:
     func (s *Session) Project(p Policy) Composed
 
 - `AcceptedOnly` — the agreed composition. Include `KindEdit` members whose
-  group is `Accepted` (and, by decision, `Proposed` — see open questions).
+  group is `Accepted` only; `Proposed` and `Rejected` groups are excluded.
   A `Rejected` group is treated as absent: its `Ins` pieces are not in the
   composition and its `Del` pieces are.
 - `Annotated` — the view: every op as applied, plus the per-run state needed to
@@ -122,13 +122,14 @@ Resolved 2026-09-11:
 
 ## 6. Consumers
 
-- **`read`** — default to `AcceptedOnly`, so a driver proposes against the
-  agreed base rather than another agent's unaccepted guesses. A flag returns
-  the annotated view. (TODO already asks "which composition does read return?")
+- **`read`** — returns the session view, with `-annotated` adding the state
+  runs. It reports the session version, so a driver's offsets must be session
+  coordinates for a later `apply`/`diff` to base on (decision 3). (TODO's
+  "which composition does read return?" is settled.)
 - **`save`** — writes `AcceptedOnly`, never proposed text. For phase 1 it keeps
   refusing while anything is proposed, so cmd+s still means what it means today;
-  the composition split is visible as `read` (accepted) versus the screen
-  (accepted + proposed), and accept/save stay separable gestures.
+  the composition split is visible as `save`/`exec` (`AcceptedOnly`) versus the
+  screen (accepted + proposed), and accept/save stay separable gestures.
 - **`exec`** — materialise `AcceptedOnly` and run against that; the stale-run
   counter finally has a composition to check against.
 - **LSP** — sync `AcceptedOnly` under a policy, or the compiler sees rejected
@@ -301,7 +302,13 @@ Resolved 2026-09-11:
 1. The first increment is **phase 0 (persistence)** — behaviour-neutral.
 2. A rejected span is visible **only in Review mode**; outside it, rejected
    text is absent from the view.
-3. `read` defaults to **`AcceptedOnly`**, with an explicit annotated flag.
+3. `read` returns the **session view** — the whole document, proposed and
+   rejected text included, in the session's coordinates — with `-annotated`
+   adding the state runs. (Corrected 2026-09-16: the original "defaults to
+   `AcceptedOnly`" predated the lease/version model and cannot hold — `read`
+   reports the **session** version, so a driver's offsets must be session
+   coordinates for a later `apply`/`diff` to base on. `AcceptedOnly` is what
+   `save` and `exec` use.)
 4. Decisions are **not undoable**; accept/reject toggle the set, and
    `cmd+ctl+k` clears rejected.
 5. `save` writes **`AcceptedOnly`** and never proposed text.
@@ -317,18 +324,38 @@ Resolved 2026-09-11:
 
 Resolved 2026-09-12 (supersedes 2, 4 and 6; retires the promote rule):
 
-1. **Leases make spans disjoint.** A pending, rejected or invalidated span is an
-   atomic read-only run. An edit or an agent `apply` whose range intersects one
-   is refused (a status note in the editor, a conflict over the socket), with
-   one exception added 2026-09-13: a writer amending its **own** `Proposed` set
-   is allowed, and the new ops join that set rather than opening a second one
-   (`Session.ApplyDiff` -> `commitInto`). Another writer's set, and a `Rejected`
-   set, still refuse; a hunk that also catches another writer's lease still
-   refuses (`leasedElsewhere`). Overlap is therefore prevented, not resolved,
-   and the projection never chooses an anchor.
+1. **Leases warn, not wall: Proposed is advisory, Rejected is locked.** A
+   rejected or invalidated span is an atomic read-only run, and an edit or an
+   agent `apply` whose range intersects one is refused (a status note in the
+   editor, a conflict over the socket). A span that is merely `Proposed` is a
+   draft, so an agent `apply` whose range intersects *another* writer's Proposed
+   run is allowed: the editing author's ops land in their own new group (never
+   the original set), and the original set's overlapping members are left moved
+   past what a rebase can carry; the successful apply -- and the agent `patch`
+   that shares its diff path -- also **warns**, naming
+   that set by group, author and the span it held when the hunk landed, so the
+   caller is told rather than left to find the overlap in `groups`/`diff` later.
+   Its `Moved` count remains the record for the review surface. A `Rejected` set
+   still refuses and wins over any Proposed run the same
+   hunk also catches, because a rejection is the human's decision rather than a
+   draft. A writer amending its **own** `Proposed` set still joins that set
+   instead of opening a second one (`Session.ApplyDiff` -> `commitInto`), but
+   only when every `Proposed` run the hunk catches is the writer's own. A hunk
+   that also catches another writer's `Proposed` run -- or any `Rejected` run --
+   is not a clean amendment and refuses, naming the writer's own set, and it
+   does so whichever run the projection meets first. The advisory path is
+   therefore taken only when every caught `Proposed` run belongs to another
+   author, so run order never changes the outcome (`Session.proposedSpans`
+   supplies the evidence).
+   The human typing path (`EditLeased`) is unchanged and
+   still treats a Proposed run as read-only. Overlap through the agent path is
+   therefore advisory rather than prevented; where an accepted edit consumes a
+   proposal's inserted run, the agreed composition is the undefined overlap
+   §12.3's `Invalid` flag resolves, and the projection does not yet.
 2. **Rejected and invalidated spans are hidden from the edit view and annotated
    in Review mode.** Edit mode shows accepted + proposed; Review mode shows every
-   state with its annotation; `save`/`read`/`exec` still see `AcceptedOnly`.
+   state with its annotation; `save`/`exec` still see `AcceptedOnly`, while
+   `read` returns the session view (decision 3).
 3. **Invalidation is orthogonal and recomputed.** A still-`Proposed` set can be
    proposed and stale at once: its recorded edit no longer fits the current
    composition (a later accepted edit consumed its `Del`, two proposals touched
@@ -357,6 +384,59 @@ Still open:
   this sacrifices.
 - **Git as the store (commit every change).** Durable but no per-op provenance,
   no review state, and history noise; the journal is the right granularity.
+
+## 14. The `proposals` rollup (2026-09-15)
+
+Built in buffers 2026-09-15; host verification pending. One verb to list
+everything an agent has proposed and is awaiting the human on, instead of one
+verb per kind. Implemented as a read-only rollup (`App.Proposals`) behind the
+CLI `raj ctl proposals [-mine]`; `-json` is one flat tagged list. This section
+folds in the former standalone proposals-listing note.
+
+### Purpose
+
+The pending surface is three disjoint listings today: `groups` (change sets,
+with `-mine`), `deletions` (pending file deletions), and — after the `rmdir`
+wave — `rmdirs` (pending dir-removals). A driver asking "what have I proposed,
+and what is left for the human to decide" must call all three and merge by
+hand. `proposals` is that merge.
+
+### Scope
+
+Lists only the true proposals — work that waits on a human decision:
+
+- **change sets** — `groups` where state is `proposed` (path, author, group id,
+  span or lines).
+- **pending deletions** — `deletions` (path, author).
+- **pending dir-removals** — `rmdirs` (dir, author).
+
+`mkdir`, `create` (`open -create`) and `rename` are immediate and do NOT
+appear. If "every mutation is a proposal" later becomes the direction (option
+B from the design review), those verbs surface here; until then they stay out.
+
+### Verb
+
+- `raj ctl proposals` — list every pending proposal, all authors.
+- `raj ctl proposals -mine` — this identity only.
+- `-json` — machine shape: a single flat tagged list, `{kind, path, author,
+  ...}`, so a driver sorts by whichever axis it cares about. Human output
+  groups per kind under a short header.
+
+### Entry shape
+
+Each entry carries `kind` (`set` | `delete` | `rmdir`), the `path` (for
+`rmdir`, the directory), the proposing `author`, and the kind-specific field: a
+`group` id plus span or lines for a change set. This is a read-only rollup over
+existing state — no new store; it reads `Session.Groups`, `pendingDeletions`
+and the pending dir-removals the way their own verbs do.
+
+### Open questions
+
+- ~~`-json` single payload vs `-jsonl`~~ — decided 2026-09-15: one flat `-json`
+  payload, no `-jsonl`; the rollup is bounded by the pending set.
+- Whether a single tab or picker should drive accept/reject across all three
+  kinds (the human side), instead of the per-kind prompts that exist today.
+  Still open: `proposals` is read-only, so approval stays per kind for now.
 
 ## References
 

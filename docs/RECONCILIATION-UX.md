@@ -4,6 +4,21 @@ How overlapping agent edits and the human's become visible and resolvable.
 Companion to the "Direction" section in INVESTIGATIONS.md (2026-09-13); not
 scheduled, and it inherits the working agreement at the top of RECURSIVE_RAJ.md.
 
+## Decision (2026-09-15)
+
+The editor-side part of this direction is **decided against**, for editor
+simplicity: no layer toggles and no conflict navigator in the TUI. Reconciling
+a wave's agent changes is the job of the between-wave **review pass**
+(`docs/REVIEW-AGENT.md`, `docs/RECURSIVE_RAJ.md` §7b), the arbiter of "this set
+of changes is the correct changes."
+
+The long-term navigation direction stands: conflict navigation **keyed to git
+diffs** — reviewing history and the working tree — rather than the
+composition's overlap reports. What does not change is that *resolution* stays
+native: the piecetable composition, the lease and the review pass, not work
+trees or git-branch manipulation. Git is history and navigation; it is not the
+merge mechanism.
+
 ## The pivot
 
 Today the composition is a fixed policy over one document: the edit view shows

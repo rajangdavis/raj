@@ -55,6 +55,17 @@ const (
 // last and Save first, so the default selection is the non-destructive one.
 func SaveOptions() []string { return []string{Save, Discard, Cancel} }
 
+// Candidate is one entry a Suggest hook offers under an Ask field. Text is what
+// replaces the field when the entry is chosen; Display is what the listing
+// draws, so a directory's full path can be inserted while its bare name is
+// shown; and Dir records that choosing the entry opens a listing of its own
+// rather than answering the question.
+type Candidate struct {
+	Text    string
+	Display string
+	Dir     bool
+}
+
 type kind int
 
 const (
@@ -72,6 +83,12 @@ type Prompt struct {
 	// Complete is the tab hook; see SetComplete.
 	Complete func(string) string
 
+	// Suggest, when set, returns the entries under an Ask field's current text.
+	// The prompt draws them under the field and lets the arrow keys step
+	// through them. A hook for the same reason Complete is one: the prompt has
+	// no business knowing what a directory is.
+	Suggest func(string) []Candidate
+
 	kind    kind
 	title   string
 	message string
@@ -85,6 +102,13 @@ type Prompt struct {
 	rows  []string
 	row   int
 	moved func(row int)
+
+	// cands is the current listing under an Ask field and cand the highlighted
+	// entry, -1 for none. -1 rather than 0 so a typed path that happens to match
+	// an entry is still answered by enter: nothing is chosen until an arrow says
+	// so.
+	cands []Candidate
+	cand  int
 }
 
 // New returns a closed prompt.
@@ -106,9 +130,21 @@ func (p *Prompt) Ask(title, initial string, done func(answer string, ok bool)) {
 // the failure looked like tab not being delivered at all.
 func (p *Prompt) AskComplete(title, initial string, complete func(string) string,
 	done func(answer string, ok bool)) {
-	*p = Prompt{Open: true, kind: ask, title: title, done: done, Complete: complete}
+	p.AskList(title, initial, complete, nil, done)
+}
+
+// AskList is AskComplete with a listing hook: suggest returns the entries under
+// the text so far, which the prompt shows beneath the field and the arrow keys
+// step through. Tab still fills the common prefix; the listing is what shows the
+// choices a common prefix alone cannot — the contents of the directory being
+// typed into.
+func (p *Prompt) AskList(title, initial string, complete func(string) string,
+	suggest func(string) []Candidate, done func(answer string, ok bool)) {
+	*p = Prompt{Open: true, kind: ask, title: title, done: done,
+		Complete: complete, Suggest: suggest}
 	p.input.Focused = true
 	p.input.SetText(initial)
+	p.refreshCandidates()
 }
 
 // AskSuggestion opens the same question with the seed selected, so the first
@@ -187,17 +223,46 @@ func (p *Prompt) Handle(a keys.Action, text string) {
 		p.finish("", false)
 		return
 	case keys.Confirm:
+		// Enter takes the highlighted listing entry when there is one, so the
+		// arrows are a way to pick a file rather than only to look at it. With
+		// no highlight it answers with the field, which is what a typed path
+		// does.
+		if p.kind == ask && p.cand >= 0 && p.cand < len(p.cands) {
+			p.chooseCandidate()
+			return
+		}
 		p.finish(p.answer(), true)
 		return
 	}
-	if p.kind == ask && a == keys.Indent {
-		// Tab completes rather than indenting. There is nothing to indent in a
-		// one-line field, and a path field that does not complete is the thing
-		// that made save-as feel like a text box rather than a file dialog.
-		if p.Complete != nil {
-			if done := p.Complete(p.input.Text); done != "" && done != p.input.Text {
-				p.input.SetText(done)
+	if p.kind == ask {
+		switch a {
+		case keys.Indent:
+			// Tab completes rather than indenting. There is nothing to indent in
+			// a one-line field, and a path field that does not complete is the
+			// thing that made save-as feel like a text box rather than a file
+			// dialog. The listing is recomputed because completing changed which
+			// entries match.
+			if p.Complete != nil {
+				if done := p.Complete(p.input.Text); done != "" && done != p.input.Text {
+					p.input.SetText(done)
+				}
 			}
+			p.refreshCandidates()
+			return
+		case keys.LineUp:
+			p.moveCandidate(-1)
+			return
+		case keys.LineDown:
+			p.moveCandidate(+1)
+			return
+		}
+		// Any other key edits or moves in the field. The listing is refreshed
+		// only when the text changed, so a caret move does not re-read a
+		// directory.
+		before := p.input.Text
+		p.input.Handle(a, text)
+		if p.input.Text != before {
+			p.refreshCandidates()
 		}
 		return
 	}
@@ -228,7 +293,6 @@ func (p *Prompt) Handle(a keys.Action, text string) {
 		}
 		return
 	}
-	p.input.Handle(a, text)
 }
 
 func (p *Prompt) move(d int) {
@@ -248,6 +312,84 @@ func (p *Prompt) moveRow(d int) {
 	if p.moved != nil {
 		p.moved(p.row)
 	}
+}
+
+// refreshCandidates recomputes the listing for the field's current text and
+// clears the highlight. Clearing it matters: the listing is filtered by what was
+// typed, so the entry under the old highlight is not the entry under the new
+// one, and keeping the index would silently choose text the user never pointed
+// at.
+func (p *Prompt) refreshCandidates() {
+	p.cand = -1
+	if p.Suggest == nil || p.kind != ask {
+		p.cands = nil
+		return
+	}
+	p.cands = p.Suggest(p.input.Text)
+}
+
+// candMaxRows caps the listing drawn under the field. A directory can hold more
+// entries than a dialog can show; the window follows the highlight, so the
+// arrows reach every entry without the box growing past the screen.
+const candMaxRows = 6
+
+// candWindow is the slice of candidates the dialog draws, with the highlighted
+// one always inside it, and how many it can afford. The screen caps it as well
+// as candMaxRows so a small terminal still gets the field rather than no box at
+// all.
+func (p *Prompt) candWindow(rows int) (first, shown int) {
+	shown = len(p.cands)
+	if shown > candMaxRows {
+		shown = candMaxRows
+	}
+	if max := rows - 2 - (1 + widget.Height + 2); shown > max {
+		shown = max
+	}
+	if shown <= 0 {
+		return 0, 0
+	}
+	if p.cand >= shown {
+		first = p.cand - shown + 1
+	}
+	if max := len(p.cands) - shown; first > max {
+		first = max
+	}
+	if first < 0 {
+		first = 0
+	}
+	return first, shown
+}
+
+// moveCandidate steps the listing's highlight. From no highlight a forward step
+// takes the first entry and a backward step the last, so the arrows enter the
+// listing from either end.
+func (p *Prompt) moveCandidate(d int) {
+	n := len(p.cands)
+	if n == 0 {
+		return
+	}
+	if p.cand < 0 {
+		if d > 0 {
+			p.cand = 0
+		} else {
+			p.cand = n - 1
+		}
+		return
+	}
+	p.cand = (p.cand + d + n) % n
+}
+
+// chooseCandidate applies the highlighted entry. A directory fills the field and
+// keeps the question open so the listing becomes its contents; anything else
+// answers with the entry's full text, which is what enter on a typed path does.
+func (p *Prompt) chooseCandidate() {
+	c := p.cands[p.cand]
+	p.input.SetText(c.Text)
+	if c.Dir {
+		p.refreshCandidates()
+		return
+	}
+	p.finish(p.answer(), true)
 }
 
 // reviewMaxRows is the most of a review listing the dialog will draw before it
@@ -411,7 +553,10 @@ func (p *Prompt) box(cols, rows int) (x, y, w, h int, ok bool) {
 	h = 5
 	switch p.kind {
 	case ask:
-		h = 1 + widget.Height + 2 // the field draws its own three-row border
+		// The field draws its own three-row border; the listing, when there is
+		// one, sits under it and above the hint.
+		_, shown := p.candWindow(rows)
+		h = 1 + widget.Height + 2 + shown
 	case confirm:
 		// The message wraps, so the box is as tall as it needs -- clamped to
 		// the screen, because a box taller than the screen draws nothing.
@@ -526,7 +671,24 @@ func (p *Prompt) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 		// Inset by one so the field's border sits inside the dialog's rather
 		// than doubling up on it.
 		p.input.Render(s, x+2, y+1, w-4, th)
-		s.SetString(x+2, y+1+widget.Height, "enter  save      esc  cancel", th.Dim, w-4)
+		// The listing sits between the field and the hint: it is what the field
+		// would otherwise make you guess, and the hint is a fixed footer.
+		first, shown := p.candWindow(rows)
+		line := y + 1 + widget.Height
+		for i := 0; i < shown; i++ {
+			c := p.cands[first+i]
+			text := c.Display
+			if text == "" {
+				text = c.Text
+			}
+			style := th.Text
+			if first+i == p.cand {
+				style = th.Selected
+			}
+			s.SetString(x+2, line, widget.TruncateLeft(text, w-4), style, w-4)
+			line++
+		}
+		s.SetString(x+2, line, "enter  save      esc  cancel", th.Dim, w-4)
 		return
 	}
 	// The message wraps across rows and the box was sized from the same clamped

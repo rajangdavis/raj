@@ -303,6 +303,11 @@ func (c *Client) localise(res *Response) {
 	for i := range res.DirRemovals {
 		res.DirRemovals[i].Path = c.paths.FromEditor(res.DirRemovals[i].Path)
 	}
+	// An ls entry's path is an editor path; the caller sees its own spelling
+	// of the same file, so it is rebased like every other path a reply names.
+	for i := range res.Entries {
+		res.Entries[i].Path = c.paths.FromEditor(res.Entries[i].Path)
+	}
 	for i := range res.Proposals {
 		res.Proposals[i].Path = c.paths.FromEditor(res.Proposals[i].Path)
 	}
@@ -317,6 +322,20 @@ func (c *Client) localise(res *Response) {
 			}
 			if b, err := json.Marshal(diffs); err == nil {
 				res.DiffJSON = string(b)
+			}
+		}
+	}
+	// LSPJSON nests the same way: a definition or reference answer carries
+	// caller-visible locations. Unmarshal, rebase the Locations, marshal back.
+	// Hover text is content, not a path, so only Locations is rewritten.
+	if res.LSPJSON != "" {
+		var lsp LSPResult
+		if err := json.Unmarshal([]byte(res.LSPJSON), &lsp); err == nil {
+			for i := range lsp.Locations {
+				lsp.Locations[i].Path = c.paths.FromEditor(lsp.Locations[i].Path)
+			}
+			if b, err := json.Marshal(lsp); err == nil {
+				res.LSPJSON = string(b)
 			}
 		}
 	}

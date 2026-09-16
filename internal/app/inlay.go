@@ -148,37 +148,75 @@ func (a *App) maybeRequestHints(p *editor.Pane) {
 	})
 }
 
-// hintLines is the visible line range a pane asks about: the lines on screen
-// plus half a screen of margin on each side, clamped to the file.
+// hintLines is the visible range a pane asks about: the rows on screen plus
+// half a screen of margin on each side, clamped to the display, then converted
+// to the session line range the protocol speaks.
 //
-// The margin is what stops a one-line scroll from having to re-ask before the
-// hint it scrolled to has arrived; the clamp keeps a document shorter than the
-// pane from asking past its end. It returns lines rather than positions so the
-// per-tick guard costs no document walk.
+// The window is measured in display rows because that is what the viewport
+// holds; a fold above shifts every session line, so the two ends are resolved
+// to session lines through the pane map. The margin is what stops a one-line
+// scroll from having to re-ask before the hint it scrolled to has arrived; the
+// clamp keeps a document shorter than the pane from asking past its end. It
+// returns lines rather than positions so the per-tick guard costs no document
+// walk.
 func (a *App) hintLines(p *editor.Pane) (top, bottom int) {
-	lines := p.File.Lines()
-	top = p.Viewport.Top - p.Viewport.Rows/2
-	bottom = p.Viewport.Bottom() + p.Viewport.Rows/2
-	if top < 0 {
-		top = 0
+	rows := p.DisplayLines()
+	dtop := p.Viewport.Top - p.Viewport.Rows/2
+	dbottom := p.Viewport.Bottom() + p.Viewport.Rows/2
+	if dtop < 0 {
+		dtop = 0
 	}
-	if bottom > lines {
-		bottom = lines
+	if dbottom > rows {
+		dbottom = rows
 	}
-	if bottom < top {
-		bottom = top
+	if dbottom < dtop {
+		dbottom = dtop
 	}
-	return top, bottom
+	// A display row resolves to its session line through the byte it starts
+	// at, which is the only way back across a fold. With no fold DocAt(row,0)
+	// is LineStart(row), so top and bottom come back as the old bounds exactly.
+	// bottom stays exclusive: once the window reaches past the last display
+	// row the request runs to the end of the file, not to the start of the
+	// last line.
+	top = sessionLineAtRow(p, dtop)
+	if dbottom >= rows {
+		return top, p.File.Lines()
+	}
+	return top, sessionLineAtRow(p, dbottom)
+}
+
+// sessionLineAtRow is the session line a display row starts on. A fold row has
+// no session line of its own, so DocAt answers the hidden run session cursor
+// and its line stands in for the row — a bound a shade wider than the row
+// itself, which is the safe side for a request window.
+func sessionLineAtRow(p *editor.Pane, row int) int {
+	if row < 0 {
+		row = 0
+	}
+	if last := p.DisplayLines() - 1; row > last && last >= 0 {
+		row = last
+	}
+	return p.File.LineOf(p.DocAt(row, 0))
 }
 
 // hintRange converts the line bounds hintLines chose into the byte positions
 // the protocol wants. It is called only once a request is going to be made, so
 // the document walk is paid per request rather than per idle tick.
 func (a *App) hintRange(p *editor.Pane, top, bottom int) lsp.Range {
+	lines := p.File.Lines()
+	if top < 0 {
+		top = 0
+	}
+	if top >= lines {
+		top = lines - 1
+	}
+	if top < 0 {
+		top = 0
+	}
 	doc := lsp.NewDocument(p.File.Text())
 	startOff := p.File.LineStart(top)
 	endOff := p.File.Len()
-	if bottom < p.File.Lines() {
+	if bottom < lines {
 		endOff = p.File.LineStart(bottom)
 	}
 	return lsp.Range{Start: doc.Position(startOff), End: doc.Position(endOff)}

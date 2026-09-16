@@ -3,6 +3,7 @@ package hidden
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +27,13 @@ func TestDefaults(t *testing.T) {
 		// never asks, having skipped .git whole; a caller holding a path asks
 		// per component, and the ".git" component above answers.
 		{".git/config", false, false},
+		// .raj's scratch is the same kind of thing, but the directory itself
+		// is walked: only its scratch entries are hidden, so .raj/hidden (the
+		// user's configuration) stays reachable.
+		{".raj", true, false},
+		{".raj/logs", true, true},
+		{".raj/trash", true, true},
+		{".raj/hidden", false, false},
 		{"node_modules", true, true},
 		{"vendor", true, true},
 		{".DS_Store", false, true},
@@ -45,6 +53,56 @@ func TestDefaults(t *testing.T) {
 		if got := r.Hidden(c.path, c.dir); got != c.want {
 			t.Errorf("Hidden(%q, dir=%v) = %v, want %v", c.path, c.dir, got, c.want)
 		}
+	}
+}
+
+// The editor's own state — the journal, trash and session under .raj — is
+// scratch, not repository content, so the defaults hide those entries. The .raj
+// directory itself is walked, because .raj/hidden is the user's own
+// configuration file and must stay reachable from the editor it configures.
+func TestRajesOwnStateIsHidden(t *testing.T) {
+	isolate(t)
+	r := Default()
+	if r.Hidden(".raj", true) {
+		t.Fatal(".raj itself is hidden, cutting off .raj/hidden")
+	}
+	if !r.Hidden(".raj/logs", true) || !r.Hidden(".raj/trash", true) || !r.Hidden(".raj/session", false) {
+		t.Error("a .raj scratch entry is not hidden")
+	}
+	if r.Hidden(".raj/hidden", false) {
+		t.Error(".raj/hidden is hidden, so the config file is unreachable")
+	}
+	// Hidden judges one entry at a time, so a path into the directory is
+	// reached only by asking about each component in turn — which is what
+	// search's eligible does for a buffer the walk never visited. One of them
+	// has to answer, or the path is not hidden at all.
+	under := []string{".raj", "trash", "dead.go"}
+	hidden := false
+	for i := range under {
+		if r.Hidden(strings.Join(under[:i+1], "/"), i < len(under)-1) {
+			hidden = true
+			break
+		}
+	}
+	if !hidden {
+		t.Error("a file under .raj never met a hidden component")
+	}
+	// Adding a rule extends the defaults; it does not replace them.
+	if !r.Hidden(".git", true) || !r.Hidden("node_modules", true) ||
+		r.Hidden(".github", true) || r.Hidden(".gitlab-ci.yml", false) {
+		t.Error("the other defaults changed")
+	}
+	// The user's hide-file lives inside the directory that is now hidden, and
+	// Load reads it by path rather than through a walk, so it still applies.
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".raj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".raj", "hidden"), []byte("dist/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if loaded := Load(dir); !loaded.Hidden("dist", true) {
+		t.Error("the workspace hide-file was not read once .raj was hidden")
 	}
 }
 
@@ -159,6 +217,34 @@ func TestNilRulesHideNothing(t *testing.T) {
 	var r *Rules
 	if r.Hidden(".git", true) || r.HiddenPath("/root", "/root/.git", true) || r.Patterns() != nil {
 		t.Error("nil Rules did not behave as empty")
+	}
+}
+
+// Everything is the -hidden switch's policy: it hides nothing, so a walk that
+// applies it reaches .git, node_modules and vendor just as it reaches ordinary
+// files. It is the explicit counterpart to nil, which means the built-in
+// defaults.
+func TestEverythingHidesNothing(t *testing.T) {
+	r := Everything()
+	if r == nil {
+		t.Fatal("Everything returned nil, which means the built-in defaults")
+	}
+	for _, c := range []struct {
+		path string
+		dir  bool
+	}{
+		{".git", true},
+		{"node_modules", true},
+		{"vendor", true},
+		{".raj/trash", true},
+		{"a.log", false},
+	} {
+		if r.Hidden(c.path, c.dir) {
+			t.Errorf("Hidden(%q, dir=%v) = true under Everything; it must hide nothing", c.path, c.dir)
+		}
+	}
+	if len(r.Patterns()) != 0 {
+		t.Errorf("Patterns() = %v, want none", r.Patterns())
 	}
 }
 

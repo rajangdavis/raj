@@ -27,7 +27,7 @@ var knownOps = map[byte]bool{
 	prog.OpAuthor: true, prog.OpToken: true, prog.OpGroup: true,
 	prog.OpQuery: true, prog.OpFlags: true, prog.OpID: true,
 	prog.OpInclude: true, prog.OpExclude: true,
-	prog.OpLine: true, prog.OpCol: true,
+	prog.OpLine: true, prog.OpCol: true, prog.OpArg: true,
 
 	prog.OpPing: true, prog.OpBuffers: true, prog.OpRead: true, prog.OpOpen: true,
 	prog.OpApply: true, prog.OpSave: true, prog.OpVersion: true,
@@ -39,7 +39,8 @@ var knownOps = map[byte]bool{
 	prog.OpLSP:    true, prog.OpLSPMode: true,
 	prog.OpReviewList: true,
 	prog.OpDiff:       true, prog.OpReview: true,
-	prog.OpClear: true,
+	prog.OpClear: true, prog.OpExec: true,
+	prog.OpFind: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -55,10 +56,10 @@ var verbNames = map[byte]string{
 	prog.OpGoto: "goto", prog.OpClose: "close",
 	prog.OpDump: "dump", prog.OpPatch: "patch",
 	prog.OpLSP: "lsp", prog.OpDiff: "diff", prog.OpReview: "review",
-	prog.OpClear: "clear",
+	prog.OpClear: "clear", prog.OpExec: "exec", prog.OpFind: "find",
 }
 
-// Four verbs stay out of programs, and the reasons are different enough to be
+// Three verbs stay out of programs, and the reasons are different enough to be
 // worth separating.
 //
 //   - recv parks until the user says something, which could be hours. A batch
@@ -71,12 +72,13 @@ var verbNames = map[byte]string{
 //     a cancel can arrive during the search it cancels. Putting either in a
 //     batch would mean a request queued behind the very thing it is meant to
 //     interrupt.
-//   - exec runs a command, and its argv is a list, which the opcode table has
-//     no repeated-argument shape for yet. It is also the one verb with a
-//     remote-execution gate on it, and widening its surface deserves its own
-//     change rather than arriving as part of a batching feature.
 //
-// raj ctl still reaches all four.
+// exec is reachable now that an argument op can accumulate its argv, but the
+// remote-execution gate still applies. The serve loop only sees the outer
+// "prog" request, so connection.one re-checks the gate for every exec and a
+// batch is not a way around the flag path's refusal.
+//
+// raj ctl still reaches all of them.
 
 var errNoVerb = errors.New("program ended with arguments and no verb")
 
@@ -100,6 +102,7 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 	sticky.Author = connAuthor
 	pending := sticky
 	var hunk *Hunk
+	var argv []string // OpArg accumulates; the next verb consumes it
 
 	for _, op := range ops {
 		if prog.IsVerb(op.Code) {
@@ -112,6 +115,10 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			req := pending
 			req.Op = name
 			switch name {
+			case "exec":
+				// The arg ops accumulated into an argv; exec is the one verb
+				// that consumes a list rather than a scalar.
+				req.Argv = argv
 			case "dump":
 				// A span selects the chunk to snapshot; no text rides the
 				// request, the chunk comes back in the reply.
@@ -134,6 +141,7 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			// Reset everything the verb consumed; keep what describes the
 			// caller.
 			hunk = nil
+			argv = nil
 			pending = sticky
 			continue
 		}
@@ -168,6 +176,9 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			pending.Line = prog.ReadNumber(op.Payload)
 		case prog.OpCol:
 			pending.Col = prog.ReadNumber(op.Payload)
+		case prog.OpArg:
+			// One argv element; repeated, they append in order.
+			argv = append(argv, string(op.Payload))
 
 		case prog.OpQuery:
 			pending.query().Text = string(op.Payload)

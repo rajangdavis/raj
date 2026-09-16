@@ -19,7 +19,7 @@ func (p *Pane) MoveTo(fn func(Cursor, *File) int, extend bool) {
 		if !extend {
 			c.Anchor = c.Head
 		}
-		_, col := p.dispPos(c.Head)
+		_, col := p.DispPos(c.Head)
 		c.Goal = col
 		return c
 	})
@@ -34,16 +34,16 @@ func (p *Pane) MoveVertical(delta int, extend bool) {
 		return
 	}
 	p.Cursors.Apply(func(c Cursor) Cursor {
-		line, col := p.dispPos(c.Head)
+		line, col := p.DispPos(c.Head)
 		if c.Goal > col {
 			col = c.Goal // remember the column we wanted, not the one we got
 		}
-		max := p.displayLines() - 1
+		max := p.DisplayLines() - 1
 		if max < 0 {
 			max = 0
 		}
 		target := clamp(line+delta, 0, max)
-		c.Head = p.docAt(target, col)
+		c.Head = p.DocAt(target, col)
 		if !extend {
 			c.Anchor = c.Head
 		}
@@ -125,7 +125,7 @@ func (p *Pane) ScrollPage(dir int) {
 	if rows < 2 {
 		rows = 2
 	}
-	p.Viewport.ScrollBy((rows-1)*dir, p.displayLines())
+	p.Viewport.ScrollBy((rows-1)*dir, p.DisplayLines())
 }
 
 // ScrollRows moves the view by rows without moving the cursor, for the wheel.
@@ -134,7 +134,7 @@ func (p *Pane) ScrollPage(dir int) {
 // navigating: dragging the cursor along would change what the next keystroke
 // edits, and the cursor would arrive somewhere the user never chose.
 func (p *Pane) ScrollRows(rows int) {
-	p.Viewport.ScrollBy(rows, p.displayLines())
+	p.Viewport.ScrollBy(rows, p.DisplayLines())
 }
 
 func (p *Pane) MovePage(dir int, extend bool) {
@@ -143,7 +143,7 @@ func (p *Pane) MovePage(dir int, extend bool) {
 		rows = 2
 	}
 	step := (rows - 1) * dir
-	p.Viewport.ScrollBy(step, p.displayLines())
+	p.Viewport.ScrollBy(step, p.DisplayLines())
 	p.MoveVertical(step, extend)
 }
 
@@ -215,12 +215,12 @@ func (p *Pane) SplitIntoLines() {
 // which is the cmd+alt+up/down gesture.
 func (p *Pane) AddCursorVertical(delta int) {
 	for _, c := range p.Cursors.All() {
-		line, col := p.dispPos(c.Head)
+		line, col := p.DispPos(c.Head)
 		target := line + delta
-		if target < 0 || target >= p.displayLines() {
+		if target < 0 || target >= p.DisplayLines() {
 			continue
 		}
-		off := p.docAt(target, col)
+		off := p.DocAt(target, col)
 		p.Cursors.Add(off, off)
 	}
 }

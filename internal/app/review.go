@@ -208,7 +208,14 @@ func (a *App) proposalsVisible(p *editor.Pane) []editor.PendingMark {
 	seen := map[uint64]bool{}
 	var out []editor.PendingMark
 	for _, m := range p.PendingMarks() {
-		if seen[m.Group] || !p.Viewport.Visible(m.Line) {
+		if seen[m.Group] {
+			continue
+		}
+		// The viewport is a window of display rows; a fold above the set shifts
+		// its row away from its session line, so the visibility test projects
+		// first. A mark a fold hides entirely has no row to be on screen.
+		row := m.DispLine(p)
+		if row < 0 || !p.Viewport.Visible(row) {
 			continue
 		}
 		seen[m.Group] = true
@@ -218,14 +225,21 @@ func (a *App) proposalsVisible(p *editor.Pane) []editor.PendingMark {
 }
 
 // proposalGroups lists the distinct pending change sets in document order, one
-// mark each — the first hunk of the set. PendingMarks comes out oldest first,
-// which is not document order once a set is written after something below it,
-// so the sort is what makes next/prev walk the file rather than the journal.
+// mark each — the first hunk of the set that the display draws. PendingMarks
+// comes out oldest first, which is not document order once a set is written
+// after something below it, so the sort is what makes next/prev walk the file
+// rather than the journal.
 func proposalGroups(p *editor.Pane) []editor.PendingMark {
 	seen := map[uint64]bool{}
 	var out []editor.PendingMark
 	for _, m := range p.PendingMarks() {
 		if seen[m.Group] {
+			continue
+		}
+		// A mark a fold hides has no row to jump to, so the set is represented
+		// by the first mark that is drawn; a set with no drawn mark drops out
+		// of the walk rather than landing the caret on a fold row.
+		if m.DispLine(p) < 0 {
 			continue
 		}
 		seen[m.Group] = true
@@ -254,8 +268,24 @@ func (a *App) cycleProposed(forward bool) {
 	on, hasOn := a.proposalAtCaret(p)
 	caretLine := p.File.LineOf(p.Cursors.Primary().Head)
 	next := cycleTarget(groups, caretLine, on.Group, hasOn, forward)
-	a.jumpTo(groups[next].Line + 1)
+	reviewJump(p, groups[next].Line+1)
 	a.status = fmt.Sprintf("proposal %d of %d", next+1, len(groups))
+}
+
+// reviewJump moves the caret to a 1-based session line and centres the
+// viewport on the display row that draws it. The line stays file-true — the
+// caret lands at that session line start — and only the viewport arithmetic
+// moves onto the display map, because a rejected fold above the target shifts
+// its row away from its session line. With no decisions the projection is the
+// identity, so this is exactly the old jump.
+func reviewJump(p *editor.Pane, line int) {
+	if p == nil || line <= 0 {
+		return
+	}
+	off := p.File.LineStart(line - 1)
+	p.Cursors.Set(off, off)
+	row, _ := p.DispPos(off)
+	p.Viewport.Center(row, p.DisplayLines())
 }
 
 // cycleTarget is the index cycleProposed lands on. A caret inside a set steps
@@ -302,6 +332,12 @@ func (a *App) reviewPicker() {
 	seen := map[uint64]bool{}
 	for _, m := range p.PendingMarks() {
 		if seen[m.Group] {
+			continue
+		}
+		// A fold-hidden mark has no row to land on, so the set is listed at the
+		// first mark that is drawn. The Line stays a session line: it is the
+		// document address the picker jumps through.
+		if m.DispLine(p) < 0 {
 			continue
 		}
 		seen[m.Group] = true
@@ -359,7 +395,7 @@ func (a *App) reviewSave(p *editor.Pane, pending []piecetable.Group, then func(s
 		[]string{prompt.Save, prompt.Cancel},
 		func(row int) {
 			if row < len(lines) && lines[row] > 0 {
-				a.jumpTo(lines[row])
+				reviewJump(p, lines[row])
 			}
 		},
 		func(answer string, ok bool) {
@@ -377,15 +413,21 @@ func (a *App) reviewSave(p *editor.Pane, pending []piecetable.Group, then func(s
 }
 
 // reviewRows describes one pending set per row for the save review, and the
-// 1-based line its first pending mark sits on, so the dialog can name a set
-// and the caret can visit it. A set whose marks have all been moved out from
-// under it has no line; the caret stays put for it.
+// 1-based line its first drawn pending mark sits on, so the dialog can name a
+// set and the caret can visit it. A set whose marks have all been moved out
+// from under it, or hidden behind a fold, has no line; the caret stays put.
 func (a *App) reviewRows(p *editor.Pane, pending []piecetable.Group) (rows []string, lines []int) {
 	firstLine := map[uint64]int{}
 	for _, m := range p.PendingMarks() {
-		if _, seen := firstLine[m.Group]; !seen {
-			firstLine[m.Group] = m.Line + 1 // jumpTo counts from 1
+		if _, seen := firstLine[m.Group]; seen {
+			continue
 		}
+		// A fold-hidden mark has no row to jump to; the set is represented by
+		// the first mark that is drawn, and one with none keeps the caret put.
+		if m.DispLine(p) < 0 {
+			continue
+		}
+		firstLine[m.Group] = m.Line + 1 // reviewJump counts from 1
 	}
 	for _, g := range pending {
 		rows = append(rows, fmt.Sprintf("group %d · %s · %+d bytes · %d op(s)",

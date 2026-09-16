@@ -730,3 +730,54 @@ func TestJournalRestoredLogIsReusedNotArchived(t *testing.T) {
 			len(after.Records), len(before.Records))
 	}
 }
+
+// The startup journal swap replaces the File behind a pane. The display
+// projection memo must be rebuilt for the restored session rather than left
+// describing the clean file the tab opened with, and it must not depend on a
+// frame having drawn first.
+func TestJournalRestoreRebuildsTheDisplayProjection(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	// A rejected set is excluded from the agreed composition, and so is a
+	// pending one: a buffer holding only those still reads clean, appendJournal
+	// writes no log at all, and there is nothing to restore. Make the work
+	// agreed -- an accepted edit at the end, clear of the rejected run's lease
+	// -- so the log exists and carries the rejected fold with it.
+	at := p.File.Len()
+	live := propose(t, h, piecetable.Hunk{Start: at, End: at, Text: "LIVE\n"})
+	p.File.AcceptGroup(live)
+	h.flushJournal(p)
+	// A real restart has the tab in the session, so record it: without that the
+	// log reads as a clean leftover and is dropped before it can attach.
+	h.sessionTick(time.Now())
+	want := p.File.Text()
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	q := a.Pane()
+	if q == nil {
+		t.Fatal("the log with a rejected fold did not reopen")
+	}
+	if q.File.Text() != want {
+		t.Fatalf("restored text = %q, want %q", q.File.Text(), want)
+	}
+	// The projection must already describe the restored session: session line
+	// 0 is hidden by the fold, so it has no row.
+	if row := q.DispOfDocLine(0); row != -1 {
+		t.Errorf("DispOfDocLine(0) = %d after restore, want -1: the projection was not rebuilt", row)
+	}
+	if q.DisplayLines() >= q.File.Lines() {
+		t.Errorf("DisplayLines = %d after restore, want fewer than the %d session lines", q.DisplayLines(), q.File.Lines())
+	}
+}

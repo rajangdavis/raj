@@ -3,7 +3,7 @@ name: raj-recursive
 description: Standing workflow for a Raj agent improving the raj editor itself. Read docs/TODO.md, make a plan, the user reviews, then implement approved items with focused raj subagents. Use when the user mentions recursive raj, improving raj, the raj TODO, plan-review-implement, or spawning raj subagents.
 ---
 
-# RECURSIVE_RAJ.md — bootstrap for a Raj agent improving raj
+# RECURSIVE-RAJ.md — bootstrap for a Raj agent improving raj
 
 You are improving the editor you are driving. Read this first, every session.
 
@@ -227,35 +227,114 @@ in docs/TODO.md, do not route around it. Workarounds drift; verbs do not.
 
 ## 7. Swarm workflow
 
-- Spawn subagents via the task tool as `subagent_type: "raj"` ONLY (the plugin
-  gates this).
+- Spawn implementation subagents via the task tool as `subagent_type: "raj"`,
+  and close each wave with one `subagent_type: "review"` pass (the plugin gates
+  spawning to those two).
 - Each subagent mints its own identity: brief it to run `raj ctl register`
   first, then pass `-as <key>` on every call. Never brief a token you minted.
 - Briefs must be self-contained: a subagent starts with NO skill context.
   State the tooling rules (raj ctl for content, `jq` allowed for shaping
   `raj ctl -json` output, no /tmp copies of source) and the identity rule
   (`register` once, `-as <key>` on every call) in every brief.
+- Every implementation brief must say the agent **owns the fallout** of its
+  change: update the call sites, interfaces and tests its edit breaks, and
+  report what it touched. A wave whose agents leave dangling call sites exports
+  its failures to the host's `make check`.
 - `raj ctl who` tells participants apart. `who -live` filters to connected
   participants; the full listing stays available because a gone participant's
-  text is still in the document (it is the attribution record). The registry
-  recycles `gone` ids at the 255 cap (lowest first, never the local human),
-  but every connection still takes a provisional dead `anon-N` before hello,
-  so the full `who` floods with dead rows — `-live` is the read path for a
-  swarm.
+  text is still in the document (it is the attribution record). Identity is
+  durable: `register`/`-as` bind an author id that survives reconnects, and a
+  connection that has not declared itself holds a *reserved* id with no row, so
+  it never appears in `who` and never leaks a row per `raj ctl` invocation. A
+  `gone` id is still recycled at the 255 cap (lowest first, never the local
+  human), so keep a swarm's identities few and named.
+
+## 7b. Reconciliation
+
+The word covers two things. **Operational reconciliation** is the rule above: a
+change owns its fallout. **Proposal reconciliation** is what happens when two
+writers touch the same bytes:
+
+- The lease is **advisory for `Proposed`** and **locked for `Rejected`**. A hunk
+  that intersects another writer's proposed text lands: the new ops are
+  attributed to the *editing* author in their own set, and the superseded set's
+  members are left `moved past what a rebase can carry`, which `groups`/`diff`
+  report. The successful apply **warns** too — its reply names the superseded
+  set by group, author and the span it held when the hunk landed, so a driver is
+  told rather than left to discover the overlap on a later read. A same-author
+  edit instead joins its own set, but only when every proposed run the hunk
+  catches is its own: a hunk that also catches another writer's proposed run --
+  or a `Rejected` run -- refuses against the writer's own set, whichever run the
+  projection meets first, so run order never changes the outcome.
+  A `Rejected` span is the
+  human's decision and is refused, with a conflict naming the owning group,
+  author and span. The editor **reports, never merges** — which of two
+  overlapping edits is right is semantic and not the editor's to decide.
+- Overlap is therefore *possible*, not prevented: an agent that lands over a
+  peer's proposal owns the result, and the review pass reconciles between waves.
+  A wholly overwritten proposal is the undefined case the `Invalid` flag (phase
+  1c) is to name; until it exists, the superseded set's moved members are the
+  signal.
+- Resolution is a decision: `accept`, `reject` (the text stays), `clear` (purges
+  it, and can be wedged, with the blocker named). The writer whose apply was
+  refused is the actor — it has the conflict and can route around; the
+  occupying author is the only one who can amend its own set, and is
+  **notified** (mailbox), never *summoned*, because a gone agent cannot be
+  woken; the human is the backstop.
+
+### The between-wave review pass
+
+A wave of implementation agents can leave integration damage, and each agent
+sees only its own change. End each wave with one **review** agent
+(`subagent_type: "review"`), after the implementation agents report and the user
+has accepted and saved, before the next wave begins. Its contract is
+`docs/REVIEW-AGENT.md`; in short:
+
+- it is the arbiter of "this set of changes is the correct changes", reconciling
+  the wave for technical debt, correctness and refactoring — the individual
+  agents only apply the change each was assigned;
+- enumerate the wave's changes (`proposals`, `groups`, `diff`), and keep them
+  clean — dispose of superseded or duplicated sets rather than leaving a pile
+  for the user to accept;
+- run `raj ctl lsp diagnostics` on **every** file in the change, not the one in
+  front of you: a cross-file reference is undefined to the server until the
+  other file's buffer is registered, so one file can read `ok` while the package
+  does not compile. It is the only compile check the container has;
+- **verify as a reader, not a believer**: for each new or changed test, say why
+  it would fail without the change and confirm the fixture builds the state it
+  asserts — a fold that folds, a log that is written, a hidden directory that is
+  seeded — modelled on a named passing sibling. A pass that can only read says
+  so; it does not report "verified";
+- **authority:** dispose of sets it can prove superseded, stale or wedged
+  (`reject`/`clear`/re-derive), and fix integration in free regions — call
+  sites, renamed symbols, tests, formatting; escalate a genuine content or
+  design choice to the user instead of deciding it;
+- **pay debt down between rounds**, not just file it: raw findings in
+  `docs/AGENT-FEEDBACK.md` (dated), actionable and intended work promoted into
+  `docs/TODO.md` as active statuses, finished work as one line in
+  `docs/COMPLETED.md`, so TODO stays open work;
+- treat the host `make check` as the final gate: it cannot compile. If the check
+  fails, resume the same review pass with the failure rather than starting cold.
+
+One review agent per wave for now; scale to a small review swarm as waves grow,
+keeping the contract — oracle, mechanical disposal, escalation, paydown — fixed.
 
 ## 8. The self-improvement loop
 
-Observe friction while driving -> record it as a concrete, cheap-to-fix item
-in docs/TODO.md (root causes in docs/INVESTIGATIONS.md, numbers in
-docs/BENCHMARKS.md) -> propose the fix in buffers -> user verifies on host ->
-the editor improves. Keep items small and structural. A friction you hit and
+Observe friction while driving -> record it raw and dated in
+docs/AGENT-FEEDBACK.md (root causes in docs/INVESTIGATIONS.md, numbers in
+docs/BENCHMARKS.md) -> promote only the actionable, intended items into
+docs/TODO.md as active statuses -> propose the fix in buffers -> user verifies
+on host -> move the finished item to a one-line entry in docs/COMPLETED.md, so
+TODO stays open work. Keep items small and structural. A friction you hit and
 do not record is a bug the next agent hits again.
 
 The loop extends to the swarm: when a wave of subagents lands, REVIEW THEIR
 TOOL-USAGE REPORTS before the phase is marked done. Every brief already asks
 for verb-surface gaps and friction; the orchestrator's job is to read those
-sections out, dedupe against the notes already in docs/TODO.md, and file what
-is new — as a dated notes block, with `[ ]` bullets for the actionable ones.
+sections out, dedupe against the notes already in docs/AGENT-FEEDBACK.md and
+docs/TODO.md, and file what is new — a dated block in docs/AGENT-FEEDBACK.md,
+promoting only the actionable ones to docs/TODO.md.
 A report that says "none" is data too: it means the surface held for that
 task shape. The subagents drive the verb surface harder and wider than one
 session does — several subagents hit `/tmp/opencode` being unwritable before

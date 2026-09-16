@@ -9,6 +9,8 @@ import (
 
 	"raj/internal/control"
 	"raj/internal/keys"
+	"raj/internal/piecetable"
+	"raj/internal/prompt"
 	"raj/internal/ui"
 	"raj/internal/widget"
 )
@@ -407,4 +409,161 @@ func TestSyncFileTreePicksUpANewFile(t *testing.T) {
 		}
 	}
 	t.Errorf("a file created outside raj is not in the tree")
+}
+
+// Save-as lists what is already in the directory being typed into, so a name is
+// visible before enough of it has been typed to complete.
+func TestSaveAsListsDirectoryEntries(t *testing.T) {
+	h := newWorkspace(t, 120, 30)
+	saveAsPrompt(t, h)
+
+	screen := h.host.Text()
+	for _, name := range []string{"README.md", "main.go", "pkg/"} {
+		if !strings.Contains(screen, name) {
+			t.Errorf("save-as does not list %q:\n%s", name, screen)
+		}
+	}
+}
+
+// An arrow steps into the listing and enter takes the highlighted entry, so a
+// listed file resolves to its full path rather than the typed prefix.
+func TestSaveAsChoosingAListedFileUsesItsPath(t *testing.T) {
+	h := newWorkspace(t, 120, 30)
+	saveAsPrompt(t, h)
+	h.typeText("README")
+	h.press("down", "enter")
+
+	if !h.Prompt.Open || h.Prompt.Title() != "File exists" {
+		t.Fatalf("choosing a listed file did not resolve to it; status = %q", h.Status())
+	}
+	answer(h, prompt.Cancel)
+	if h.Status() != "save cancelled" {
+		t.Errorf("status = %q after cancelling", h.Status())
+	}
+}
+
+// A fold above the caret hides session lines, so the completion popup must
+// anchor on the display row rather than the session line, or the list sits a
+// row away from the word it completes.
+func TestCompletionAnchorsBelowAFold(t *testing.T) {
+	// The candidate "foobar" is what "foo" completes to: the word being typed
+	// is not offered as its own completion, so a buffer of "foo" alone would
+	// show an empty list and the anchor could not be observed.
+	h := newHarness(t, "foobar alpha\nbravo\ncharlie\ndelta foo\n")
+	p := h.Pane()
+	// A rejected two-line insertion stays in the session but the edit
+	// composition hides it, so it becomes one fold row over two session lines.
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	head := len(p.File.Text()) - 1 // end of the last line, after "foo"
+	p.Cursors.Set(head, head)
+	h.drain()
+
+	if p.DisplayLines() >= p.File.Lines() {
+		t.Fatalf("no fold: DisplayLines = %d, session lines = %d", p.DisplayLines(), p.File.Lines())
+	}
+	wantRow, _ := p.DispPos(head)
+	if wantRow == p.File.LineOf(head) {
+		t.Fatalf("fixture does not exercise the shift: row %d == session line %d", wantRow, p.File.LineOf(head))
+	}
+	if !h.showCompletion(p, 0) {
+		t.Fatal("no completion was offered at the word")
+	}
+	if line, _ := h.Complete.Anchor(); line != wantRow {
+		t.Errorf("completion anchored on row %d, want display row %d (session line %d)",
+			line, wantRow, p.File.LineOf(head))
+	}
+}
+
+// A fold above the target shifts a jump too: the viewport must centre on the
+// display row, not the session line the target came in as.
+func TestJumpCentresOnTheDisplayRowBelowAFold(t *testing.T) {
+	h := newHarness(t, strings.Repeat("xxxxxxxx\n", 20))
+	p := h.Pane()
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	p.Cursors.Set(0, 0)
+	h.drain()
+
+	// Session line 15 is visible at display row 14: two hidden lines become one
+	// fold row above it.
+	if got := p.DispOfDocLine(15); got != 14 {
+		t.Fatalf("DispOfDocLine(15) = %d, want 14 below the fold", got)
+	}
+	h.jumpTo(16) // 1-based line 16 is session line 15
+	if got := p.File.LineOf(p.Cursors.Primary().Head); got != 15 {
+		t.Fatalf("caret on session line %d after jumpTo(16), want 15", got)
+	}
+	wantTop := 14 - p.Viewport.Rows/2
+	if wantTop < 0 {
+		wantTop = 0
+	}
+	if max := p.DisplayLines() - 1; wantTop > max {
+		wantTop = max
+	}
+	if p.Viewport.Top != wantTop {
+		t.Errorf("viewport top = %d after the jump, want %d (centred on display row 14)",
+			p.Viewport.Top, wantTop)
+	}
+}
+
+// A line a fold hides has no row to land on: the jump is skipped rather than
+// clamped onto the fold marker.
+func TestJumpSkipsALineInsideAFold(t *testing.T) {
+	h := newHarness(t, "alpha\nbravo\ncharlie\n")
+	p := h.Pane()
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	p.Cursors.Set(p.File.Len(), p.File.Len())
+	h.drain()
+
+	if row := p.DispOfDocLine(0); row != -1 {
+		t.Fatalf("session line 0 shows at row %d, want -1 inside the fold", row)
+	}
+	before := p.Cursors.Primary().Head
+	top := p.Viewport.Top
+	h.jumpTo(1) // 1-based line 1, the hidden "HIDDEN-1"
+	if got := p.Cursors.Primary().Head; got != before {
+		t.Errorf("caret moved to %d for a hidden line, want it left at %d", got, before)
+	}
+	if p.Viewport.Top != top {
+		t.Errorf("viewport scrolled to %d for a hidden line, want %d", p.Viewport.Top, top)
+	}
+}
+
+// With no decisions the projection is the identity, so a jump and a completion
+// anchor land exactly where they did before the display map existed.
+func TestJumpAndCompletionAreIdentityWithoutDecisions(t *testing.T) {
+	// "foobar" gives the typed "foo" a completion; the word itself is not
+	// offered as its own candidate.
+	h := newHarness(t, "foobar alpha\nbravo\ncharlie\ndelta foo\n")
+	p := h.Pane()
+	if p.DisplayLines() != p.File.Lines() {
+		t.Fatalf("no-decision projection is not the identity: %d rows vs %d lines", p.DisplayLines(), p.File.Lines())
+	}
+	for ln := 0; ln < p.File.Lines(); ln++ {
+		if got := p.DispOfDocLine(ln); got != ln {
+			t.Fatalf("DispOfDocLine(%d) = %d with no decisions, want the identity", ln, got)
+		}
+	}
+	h.jumpTo(3) // 1-based line 3 is session line 2, "charlie"
+	if got := p.File.LineOf(p.Cursors.Primary().Head); got != 2 {
+		t.Errorf("caret on session line %d after jumpTo(3), want 2", got)
+	}
+	head := len(p.File.Text()) - 1
+	p.Cursors.Set(head, head)
+	h.drain()
+	if !h.showCompletion(p, 0) {
+		t.Fatal("no completion was offered")
+	}
+	if line, _ := h.Complete.Anchor(); line != p.File.LineOf(head) {
+		t.Errorf("completion anchored on row %d, want session line %d with no decisions",
+			line, p.File.LineOf(head))
+	}
 }

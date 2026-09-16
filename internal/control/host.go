@@ -115,6 +115,13 @@ type BufferHost interface {
 
 	// DirRemovals lists the pending dir-removals.
 	DirRemovals() []DirRemoval
+
+	// Ls lists the immediate children of a directory, sorted by name.
+	// Directories are entries too, marked as such; Size is set only for a
+	// regular file. all drops the internal/hidden policy and includes hidden
+	// entries. It is a read, so it is ungated; the Guard resolves the path
+	// before it reaches here.
+	Ls(path string, all bool) ([]Entry, error)
 	// Proposals is a read-only rollup over every open buffer's pending change
 	// sets plus the pending file deletions and dir-removals. It is ungated,
 	// like Deletions: a driver may see what is waiting without a claim.
@@ -145,14 +152,27 @@ type BufferHost interface {
 	// spans. The agreed composition as the default is a future change.
 	Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) (spans []Span, states []StateRun, version uint64, err error)
 
+	// Find searches one buffer for a pattern and answers with the first
+	// match's span, the total number of matches it holds, and the version the
+	// search ran against. It is the single-document half of the search verb:
+	// the matching is the editor's own engine, the same one the search pane
+	// and the workspace walk use, so a find cannot disagree with a search over
+	// the same text. The returned match always carries Path and Version; the
+	// position fields are set only when found, and a pattern that does not
+	// occur is a clean found=false rather than an error.
+	Find(path string, author uint8, q SearchQuery) (match SearchMatch, count int, found bool, err error)
+
 	// Version is what a later Apply bases on, without moving the bytes. It
 	// records the read under author, so asking for a version counts as that
 	// writer having seen the buffer.
 	Version(path string, author uint8) (uint64, error)
 
 	// Apply rebases hunks written against base onto the current document.
-	// Hunks are rejected independently; the conflicts say which.
-	Apply(path string, author uint8, base uint64, hunks []Hunk) (version uint64, conflicts []Conflict, err error)
+	// Hunks are rejected independently; the conflicts say which. A hunk that
+	// lands over another writer's Proposed run is allowed -- the advisory
+	// lease -- and that set is named in warnings, so a clean apply, an apply
+	// that moved a draft, and a refusal stay distinguishable.
+	Apply(path string, author uint8, base uint64, hunks []Hunk) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
 
 	// Save writes a buffer to disk.
 	Save(path string) (uint64, error)
@@ -171,6 +191,15 @@ type BufferHost interface {
 	// leave the view. Unlike Decide this really edits, so it can fail; the
 	// error names the group.
 	Clear(path string, group uint64) error
+
+	// Revert discards a writer's own live pieces: every op the author wrote is
+	// reversed out of the document and the reversal recorded in the journal,
+	// the inverse of attribution. It is not gated on a decision, because it
+	// removes the caller's own work rather than agreeing to someone else's; a
+	// set it empties has its decision dropped. Unlike a decision this really
+	// edits, so it can fail, and a member a later edit has wedged is reported
+	// as a block rather than clamped.
+	Revert(path string, author uint8) error
 
 	// Diff renders the buffer's pending change sets as old→new hunks in
 	// current coordinates: the review surface for what Groups only lists.
@@ -193,8 +222,10 @@ type BufferHost interface {
 	// Patch replaces a snapshot's text, diffing old against new on the editor
 	// side and rebasing the result onto the current document. The id must have
 	// been minted by this writer; one that has been evicted, belongs to another
-	// author, or whose buffer has moved is refused rather than guessed at.
-	Patch(path string, author uint8, id uint64, newText string) (version uint64, conflicts []Conflict, err error)
+	// author, or whose buffer has moved is refused rather than guessed at. A
+	// hunk that lands over another writer's Proposed run is allowed -- the
+	// advisory lease -- and that set is named in warnings, exactly as Apply.
+	Patch(path string, author uint8, id uint64, newText string) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
 
 	// LSP prepares a language-server request for a 1-based line and column.
 	// Mode is hover, definition, completion or diagnostics. The returned
@@ -244,10 +275,34 @@ type Searcher interface {
 	Search(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (files, considered int, capped bool, truncated []TruncatedFile, err error)
 }
 
+// hiddenSearcher is the optional half of Searcher: a searcher that can run the
+// same walk with the hidden policy dropped, which is what the -hidden switch
+// asks for. It is separate from Searcher so an implementation with no snapshot
+// to walk need not pretend to have one, and guardedSearcher falls back to the
+// ordinary Search when the inner one does not implement it.
+type hiddenSearcher interface {
+	SearchHidden(ctx context.Context, q SearchQuery, emit func([]SearchMatch)) (files, considered int, capped bool, truncated []TruncatedFile, err error)
+}
+
 var (
 	ErrNoBuffer   = errors.New("no open buffer for that path")
 	ErrOutsideoot = errors.New("path is outside the workspace")
 )
+
+// SymlinkEscapeEnv is the opt-out from the resolved-root check: any non-empty
+// value other than "0" or "false" restores the behaviour before the check,
+// where a symlink inside the workspace may name a target outside it. Unset or
+// empty keeps the default, which resolves the path and refuses the escape. It
+// is named with the other RAJ_* gates (TokenEnv, AddrEnv, RootMapEnv).
+const SymlinkEscapeEnv = "RAJ_ALLOW_SYMLINK_ESCAPE"
+
+// symlinkEscapeAllowed reports whether RAJ_ALLOW_SYMLINK_ESCAPE has turned the
+// resolved-root refusal off. Every non-empty value but the two false spellings
+// enables it; unset and empty keep the default.
+func symlinkEscapeAllowed() bool {
+	v := os.Getenv(SymlinkEscapeEnv)
+	return v != "" && v != "0" && v != "false"
+}
 
 // Guard is the validation layer. Every check is a rejection, never a guess.
 //
@@ -318,6 +373,68 @@ func (g *Guard) inRoot(path string) error {
 	return nil
 }
 
+// inRootResolved is inRoot with symlinks resolved. The lexical check runs
+// first and always, so a ".." escape is refused exactly as it was. The path is
+// then resolved with EvalSymlinks and its target checked against the resolved
+// root, so a symlink inside the workspace that points outside it is refused
+// before any verb reads or writes the target. The root is resolved too, so a
+// workspace that is itself reached through a symlink (a temp directory under
+// /var on macOS, say) is not mistaken for an escape.
+//
+// A path that does not exist yet has no target of its own, but its deepest
+// existing ancestor is resolved as well, so creating a file through a
+// symlinked parent that leaves the workspace is refused too. Only a path none
+// of whose ancestors exist passes on the lexical check alone, which is what
+// keeps open -create and a forward claim working. RAJ_ALLOW_SYMLINK_ESCAPE
+// skips only the resolved half; the lexical refusal still applies.
+func (g *Guard) inRootResolved(path string) error {
+	if err := g.inRoot(path); err != nil {
+		return err
+	}
+	if symlinkEscapeAllowed() {
+		return nil
+	}
+	resolved, ok := resolveExistingPrefix(path)
+	if !ok {
+		// Nothing along the path exists, so there is no target to resolve
+		// and the lexical check above is the whole gate.
+		return nil
+	}
+	root := filepath.Clean(g.Host.Root())
+	if r, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		root = r
+	}
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: %s resolves to %s, outside %s", ErrOutsideoot, path, resolved, root)
+	}
+	return nil
+}
+
+// resolveExistingPrefix resolves path's symlinks as far as it exists and
+// re-appends the not-yet-existing remainder, so a path whose leaf is new but
+// whose parent is a symlink out of the tree is checked against the directory it
+// would be created in. ok is false when no prefix of the path exists, which
+// leaves the lexical check as the whole gate.
+func resolveExistingPrefix(path string) (string, bool) {
+	clean := filepath.Clean(path)
+	var missing []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, true
+		}
+		parent := filepath.Dir(clean)
+		if parent == clean {
+			return "", false
+		}
+		missing = append(missing, filepath.Base(clean))
+		clean = parent
+	}
+}
+
 // inRootDir is inRoot for a directory a caller names relative to the workspace
 // root, which is how search -path and exec -dir are spelled. A relative name
 // is resolved against the root first; the check that follows is the same one,
@@ -329,19 +446,33 @@ func (g *Guard) inRootDir(dir string) error {
 	if !filepath.IsAbs(dir) {
 		dir = filepath.Join(g.Host.Root(), dir)
 	}
-	return g.inRoot(dir)
+	return g.inRootResolved(dir)
 }
 
 // canonical resolves and validates in one step, so no method can accidentally
 // check one name and act on another.
 func (g *Guard) canonical(path string) (string, error) {
-	// Open is the exception: its path names a file that is not a buffer yet, so
-	// there is nothing to resolve against.
+	// Resolve and check the root BEFORE Host.Resolve loads the file, so a
+	// symlink that points outside is refused before its target is read. Open
+	// is the exception: its path names a file that is not a buffer yet, so it
+	// has its own gate and never comes through here.
+	if path != "" {
+		check := path
+		if !filepath.IsAbs(check) {
+			check = filepath.Join(g.Host.Root(), check)
+		}
+		if err := g.inRootResolved(check); err != nil {
+			return "", err
+		}
+	}
 	resolved, err := g.Host.Resolve(path)
 	if err != nil {
 		return "", err
 	}
-	if err := g.inRoot(resolved); err != nil {
+	// A second look at what Resolve named, this time resolved: it catches a
+	// host that answered with a name outside the root, including the pathless
+	// case where the resolved name is the buffer the user is looking at.
+	if err := g.inRootResolved(resolved); err != nil {
 		return "", err
 	}
 	return resolved, nil
@@ -412,7 +543,7 @@ func (g *Guard) Open(path string, create bool) (uint64, bool, error) {
 	if path != "" && !filepath.IsAbs(path) {
 		path = filepath.Join(g.Host.Root(), path)
 	}
-	if err := g.inRoot(path); err != nil {
+	if err := g.inRootResolved(path); err != nil {
 		return 0, false, err
 	}
 	return g.Host.Open(path, create)
@@ -433,7 +564,7 @@ func (g *Guard) Mkdir(path string) error {
 		path = filepath.Join(g.Host.Root(), path)
 	}
 	path = filepath.Clean(path)
-	if err := g.inRoot(path); err != nil {
+	if err := g.inRootResolved(path); err != nil {
 		return err
 	}
 	return g.Host.Mkdir(path)
@@ -560,6 +691,23 @@ func (g *Guard) Rmdirs() []DirRemoval {
 	out := g.Host.DirRemovals()
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+// Ls lists a directory's immediate children. It is a read, ungated like
+// Deletions, but the path still has to resolve inside the workspace: ls is not
+// a way to read the filesystem outside the tree. An empty path names the
+// workspace root, which is the verb's default. claimPath is the canonicaliser
+// rather than canonical, because the latter goes through Host.Resolve and a
+// directory is not a buffer to load; the same split Rmdir uses.
+func (g *Guard) Ls(path string, all bool) ([]Entry, error) {
+	if path == "" {
+		path = g.Host.Root()
+	}
+	name, err := g.claimPath(path)
+	if err != nil {
+		return nil, err
+	}
+	return g.Host.Ls(name, all)
 }
 
 // checkOperandKind stats a file-operation operand and refuses the wrong kind:
@@ -730,25 +878,25 @@ func (g *Guard) Review(path string, listOnly bool) ([]Group, error) {
 // indistinguishable from typed text. The offsets are implicit — the snapshot's
 // span told the editor where the chunk lives — so there is no hunk span to
 // validate here; the host refuses a snapshot this writer does not own.
-func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, error) {
+func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, []GroupOverlap, error) {
 	if author == AuthorOriginal {
-		return 0, nil, fmt.Errorf("author %d is the file as loaded, not a writer", author)
+		return 0, nil, nil, fmt.Errorf("author %d is the file as loaded, not a writer", author)
 	}
 	if g.Participants != nil {
-		if !g.Participants.IsAgent(author) {
-			return 0, nil, fmt.Errorf("author %d is not an agent", author)
+		if !g.Participants.IsAgent(author) && !g.Participants.IsProvisional(author) {
+			return 0, nil, nil, fmt.Errorf("author %d is not an agent", author)
 		}
 	} else if author < FirstAgent {
-		return 0, nil, fmt.Errorf("author %d is not an agent id", author)
+		return 0, nil, nil, fmt.Errorf("author %d is not an agent id", author)
 	}
 	name, err := g.claimTarget(author, path)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	return g.Host.Patch(name, author, id, newText)
 }
 
-func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, error) {
+func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, []GroupOverlap, error) {
 	// A socket may not write as the file-as-loaded, and may not write as a
 	// human — attribution is what the tint, the per-author undo stacks and the
 	// exec staleness split all read, so a connection able to claim a person
@@ -759,29 +907,29 @@ func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uin
 	// belongs to. Without a registry the old rule stands, so a Guard built by
 	// hand still refuses 0 and 1.
 	if author == AuthorOriginal {
-		return 0, nil, fmt.Errorf("author %d is the file as loaded, not a writer", author)
+		return 0, nil, nil, fmt.Errorf("author %d is the file as loaded, not a writer", author)
 	}
 	if g.Participants != nil {
-		if !g.Participants.IsAgent(author) {
-			return 0, nil, fmt.Errorf("author %d is not an agent", author)
+		if !g.Participants.IsAgent(author) && !g.Participants.IsProvisional(author) {
+			return 0, nil, nil, fmt.Errorf("author %d is not an agent", author)
 		}
 	} else if author < FirstAgent {
-		return 0, nil, fmt.Errorf("author %d is not an agent id", author)
+		return 0, nil, nil, fmt.Errorf("author %d is not an agent id", author)
 	}
 	name, err := g.claimTarget(author, path)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	g.mu.Lock()
 	seen := g.read[author][name]
 	g.mu.Unlock()
 	if !seen {
-		return 0, nil, errors.New("read the buffer before writing it: offsets only mean " +
+		return 0, nil, nil, errors.New("read the buffer before writing it: offsets only mean " +
 			"something in the coordinates of a version you have seen")
 	}
 	for i, h := range hunks {
 		if h.Start < 0 || h.End < h.Start {
-			return 0, nil, fmt.Errorf("hunk %d: start %d, end %d", i, h.Start, h.End)
+			return 0, nil, nil, fmt.Errorf("hunk %d: start %d, end %d", i, h.Start, h.End)
 		}
 	}
 	return g.Host.Apply(name, author, base, hunks)
@@ -843,6 +991,15 @@ func (s guardedSearcher) Search(ctx context.Context, q SearchQuery, emit func([]
 	if err := s.g.CheckQuery(q); err != nil {
 		return 0, 0, false, nil, err
 	}
+	// The include-hidden switch is a walk with the policy dropped, and only
+	// the inner searcher can run it: it holds the open-buffer snapshot the
+	// walk overlays. One that cannot — a test fake, a future adapter — falls
+	// back to the ordinary walk rather than failing the query.
+	if q.Hidden {
+		if hs, ok := s.inner.(hiddenSearcher); ok {
+			return hs.SearchHidden(ctx, q, emit)
+		}
+	}
 	return s.inner.Search(ctx, q, emit)
 }
 
@@ -865,6 +1022,20 @@ func (g *Guard) Clear(path string, author uint8, group uint64) error {
 		return err
 	}
 	return g.Host.Clear(name, group)
+}
+
+// Revert discards the calling writer's own live pieces. It is a write, so it
+// runs the claim gate like Apply and Clear: only a claimed file can have text
+// reversed out over the socket. The author is the connection's own id and
+// nothing else: dropping another writer's accepted pieces is the user's
+// decision, taken through reject and clear, so no verb here names a peer. The
+// host owns the journal and reports a reversal a later edit has wedged.
+func (g *Guard) Revert(path string, author uint8) error {
+	name, err := g.claimTarget(author, path)
+	if err != nil {
+		return err
+	}
+	return g.Host.Revert(name, author)
 }
 
 // Exec policy: run, and say what is stale.
@@ -899,7 +1070,10 @@ func (g *Guard) CheckExec(argv []string, dir string) ([]DirtyBuffer, error) {
 		return nil, errors.New("exec needs a command")
 	}
 	if dir != "" {
-		if err := g.inRoot(dir); err != nil {
+		// inRootDir, not the absolute-only resolved check: exec -dir is
+		// documented to take a relative name, and inRootDir resolves against
+		// the root before running the same symlink-aware check.
+		if err := g.inRootDir(dir); err != nil {
 			return nil, err
 		}
 	}
@@ -1020,7 +1194,7 @@ func (g *Guard) claimPath(path string) (string, error) {
 		path = filepath.Join(g.Host.Root(), path)
 	}
 	path = filepath.Clean(path)
-	if err := g.inRoot(path); err != nil {
+	if err := g.inRootResolved(path); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -1212,6 +1386,30 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}
+	case "find":
+		// Find is a read: it locates a pattern in one buffer and reports its
+		// byte span, so a program can find a position, read the version and
+		// apply against it without a separate search round trip. The query is
+		// validated like a search's, and the matching is the editor's own.
+		if req.Query == nil {
+			return Response{Err: "find needs a query"}
+		}
+		if err := g.CheckQuery(*req.Query); err != nil {
+			return Response{Err: err.Error()}
+		}
+		name, err := g.canonical(req.Path)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		m, count, found, err := g.Host.Find(name, req.Author, *req.Query)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		// Found is sparse and the span reads from the omitted-zero defaults,
+		// so a match at offset 0 costs no field. Version is always carried: a
+		// caller that found nothing still learns the revision it looked at.
+		return Response{OK: true, Found: found, FindStart: m.ByteStart,
+			FindEnd: m.ByteEnd, FindCount: count, Version: m.Version}
 
 	case "text":
 
@@ -1290,6 +1488,25 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: "clear needs a group id; list them with `groups`"}
 		}
 		if err := g.Clear(req.Path, req.Author, req.Group); err != nil {
+			// A wedged clear names the live set that blocked it, in the same
+			// shape a lease refusal uses, so the caller can re-propose instead
+			// of only learning that it failed.
+			var be *BlockError
+			if errors.As(err, &be) {
+				return Response{Err: err.Error(), Conflicts: []Conflict{be.Conflict}}
+			}
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "revert":
+		if err := g.Revert(req.Path, req.Author); err != nil {
+			// A wedged revert names the live set that blocked it, in the same
+			// shape a lease refusal uses, so the caller learns what to clear
+			// first instead of retrying blind.
+			var be *BlockError
+			if errors.As(err, &be) {
+				return Response{Err: err.Error(), Conflicts: []Conflict{be.Conflict}}
+			}
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}
@@ -1307,6 +1524,12 @@ func Dispatch(g *Guard, req Request) Response {
 		return Response{OK: true}
 	case "rmdirs":
 		return Response{OK: true, DirRemovals: g.Rmdirs()}
+	case "ls":
+		entries, err := g.Ls(req.Path, req.Hidden)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true, Entries: entries}
 	case "proposals":
 		return Response{OK: true, Proposals: g.Proposals()}
 	case "claim":
@@ -1336,6 +1559,14 @@ func Dispatch(g *Guard, req Request) Response {
 		// Internal: the lsp path asks the event thread to sync the document and
 		// locate the server, then runs the request off it. No wire
 		// representation, like snapshot.
+		// The guard gates the path before the host loads it for the server:
+		// without this, lsp was the one verb that reached the filesystem
+		// without the resolved-root check, and a diagnostics request could
+		// read through a symlink escape.
+		name, cerr := g.canonical(req.Path)
+		if cerr != nil {
+			return Response{Err: cerr.Error()}
+		}
 		var caller LSPCaller
 		var err error
 		if req.LSPMode == "inlay-hints" {
@@ -1349,9 +1580,9 @@ func Dispatch(g *Guard, req Request) Response {
 			if req.LineEnd != nil {
 				lineEnd = *req.LineEnd
 			}
-			caller, err = g.Host.LSPInlayHints(req.Path, lineStart, lineEnd)
+			caller, err = g.Host.LSPInlayHints(name, lineStart, lineEnd)
 		} else {
-			caller, err = g.Host.LSP(req.Path, req.Line, req.Col, req.LSPMode)
+			caller, err = g.Host.LSP(name, req.Line, req.Col, req.LSPMode)
 		}
 		if err != nil {
 			return Response{Err: err.Error()}
@@ -1388,11 +1619,12 @@ func Dispatch(g *Guard, req Request) Response {
 			v, err := g.Version(req.Path, req.Author)
 			return done(v, err)
 		}
-		v, conflicts, err := g.Apply(req.Path, req.Author, *req.Base, req.Hunks)
+		v, conflicts, warnings, err := g.Apply(req.Path, req.Author, *req.Base, req.Hunks)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
-		res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts}
+		res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts,
+			Warnings: warnings}
 		if len(conflicts) > 0 {
 			res.Err = fmt.Sprintf("%d of %d hunks could not be placed on the current version",
 				len(conflicts), len(req.Hunks))
@@ -1413,11 +1645,12 @@ func Dispatch(g *Guard, req Request) Response {
 		return Response{OK: true, DumpID: id, Version: v, Hash: hash,
 			Spans: []Span{{Text: text, Author: req.Author}}}
 	case "patch":
-		v, conflicts, err := g.Patch(req.Path, req.Author, req.DumpID, req.PatchText)
+		v, conflicts, warnings, err := g.Patch(req.Path, req.Author, req.DumpID, req.PatchText)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
-		res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts}
+		res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts,
+			Warnings: warnings}
 		if len(conflicts) > 0 {
 			res.Err = fmt.Sprintf("%d of the snapshot's changes could not be placed on the current version",
 				len(conflicts))

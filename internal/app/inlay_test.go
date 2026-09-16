@@ -502,3 +502,81 @@ func TestFindAfterAHintLandsOnTheByte(t *testing.T) {
 		t.Errorf("find selection = %d..%d, want match bytes 4..5 after the hint", c.Anchor, c.Head)
 	}
 }
+
+// The inlay request window is measured in display rows — the viewport holds
+// those — and converted to the session line range the protocol speaks. With a
+// fold above the window the two spaces differ, so the bounds must come through
+// the pane map; the old code compared the display top to File.Lines directly.
+func TestHintLinesMapDisplayWindowToSession(t *testing.T) {
+	h, _ := foldedMarkHarness(t)
+	p := h.Pane()
+	// Display rows: 0 aaa, 1 fold, 2 bbb, 3 ccc, 4 ddd, 5 the trailing empty
+	// line. Session lines: 0 aaa, 1-2 the hidden insertion, 3 bbb, 4 ccc,
+	// 5 ddd, 6 the trailing empty line. The fold drops one row, so six rows
+	// stand for seven session lines.
+	if got := p.DisplayLines(); got != 6 {
+		t.Fatalf("DisplayLines = %d, want 6", got)
+	}
+	p.Viewport.Top, p.Viewport.Rows = 3, 1
+	top, bottom := h.hintLines(p)
+	if top != 4 || bottom != 5 {
+		t.Errorf("hintLines = (%d,%d), want (4,5): display row 3 is session line 4", top, bottom)
+	}
+}
+
+// Without the fold the window is the identity: the same top and rows return the
+// same session lines the old code did, and hintRange covers the line at the
+// top through the one past the bottom.
+func TestHintLinesIdentityWithoutFolds(t *testing.T) {
+	h := newHarness(t, foldedFixture)
+	p := h.Pane()
+	p.Viewport.Top, p.Viewport.Rows = 3, 1
+	if got := p.DisplayLines(); got != p.File.Lines() {
+		t.Fatalf("DisplayLines = %d, want File.Lines = %d", got, p.File.Lines())
+	}
+	top, bottom := h.hintLines(p)
+	if top != 3 || bottom != 4 {
+		t.Errorf("hintLines = (%d,%d), want (3,4) with no decisions", top, bottom)
+	}
+}
+
+// hintRange turns the session bounds into byte positions: top maps to that
+// line's start, bottom to its start as the exclusive end.
+func TestHintRangeUsesSessionBounds(t *testing.T) {
+	h, _ := foldedMarkHarness(t)
+	p := h.Pane()
+	// Session lines 4 (ccc) and 5 (ddd) after the folded insertion.
+	rng := h.hintRange(p, 4, 5)
+	if rng.Start.Line != 4 || rng.End.Line != 5 {
+		t.Errorf("range = %d..%d, want 4..5", rng.Start.Line, rng.End.Line)
+	}
+	if rng.Start.Character != 0 || rng.End.Character != 0 {
+		t.Errorf("range columns = %d..%d, want line starts", rng.Start.Character, rng.End.Character)
+	}
+	// The start is the top line's byte start, converted to an LSP position:
+	// the request sends the document's own coordinates, not a row number.
+	doc := lsp.NewDocument(p.File.Text())
+	if want := doc.Position(p.File.LineStart(4)); rng.Start != want {
+		t.Errorf("range start = %+v, want %+v", rng.Start, want)
+	}
+}
+
+// A window that runs off the end of the display asks to the end of the file,
+// not to the start of the last line: bottom stays exclusive and the hidden
+// lines between do not make it overshoot.
+func TestHintLinesReachesFileEnd(t *testing.T) {
+	h, _ := foldedMarkHarness(t)
+	p := h.Pane()
+	p.Viewport.Top, p.Viewport.Rows = 0, 50
+	top, bottom := h.hintLines(p)
+	if top != 0 {
+		t.Errorf("top = %d, want 0", top)
+	}
+	if bottom != p.File.Lines() {
+		t.Errorf("bottom = %d, want File.Lines = %d", bottom, p.File.Lines())
+	}
+	// bottom == File.Lines is exclusive, so hintRange runs to the file end.
+	if end := lsp.NewDocument(p.File.Text()).Position(p.File.Len()); h.hintRange(p, top, bottom).End != end {
+		t.Errorf("range end = %+v, want the file end %+v", h.hintRange(p, top, bottom).End, end)
+	}
+}

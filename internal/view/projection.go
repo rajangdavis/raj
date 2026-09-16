@@ -150,9 +150,18 @@ func Build(comp string, segs []Seg) *Projection {
 		}
 	}
 
-	// emitContent lays [a,b) of comp into rows, splitting at piece boundaries so
-	// a kept run and a restored run never share a row.
+	// emitContent lays [a,b) of comp into rows. Adjacent kept pieces merge into
+	// one row: a composition line restored from several change sets is still one
+	// line. A restore piece starts its own row, drawing bytes the session does
+	// not hold, and a fold splits the call in two. [a,b) never spans a
+	// composition line or a fold: the caller emits each line's fold-free ranges.
 	emitContent := func(a, b int) {
+		// foldAt reports a fold marker at off. A kept run must not merge across
+		// one: the fold owns a display row of its own there.
+		foldAt := func(off int) bool {
+			i := sort.Search(len(folds), func(k int) bool { return folds[k].disp >= off })
+			return i < len(folds) && folds[i].disp == off
+		}
 		for a < b {
 			pc, ok := segAt(a)
 			if !ok {
@@ -165,16 +174,39 @@ func Build(comp string, segs []Seg) *Projection {
 			if end <= a {
 				return
 			}
-			if pc.length > 0 {
-				docA := pc.doc + (a - pc.disp)
-				docB := pc.doc + (end - pc.disp)
-				sl := projLineOf(starts, docA)
-				ls := projLineStart(starts, sl)
-				emit(sl, docA-ls, docB-ls, 0, docA, docB, a, end)
-			} else {
+			if pc.length <= 0 {
+				// A restore run is composition-only: its own row, so it never
+				// shares a session-backed row with kept bytes.
 				emit(-1, a-pc.disp, end-pc.disp, 0, pc.doc, pc.doc, a, end)
+				a = end
+				continue
 			}
-			a = end
+			docA := pc.doc + (a - pc.disp)
+			docB := pc.doc + (end - pc.disp)
+			merged := end
+			// Absorb every following kept piece that continues this run: same
+			// composition line (the caller's range is one line), contiguous in
+			// both composition and session, and not behind a fold. Different
+			// change sets may own the pieces; the row is still one line.
+			for merged < b && !foldAt(merged) {
+				np, ok := segAt(merged)
+				if !ok || np.length <= 0 || np.disp != merged || np.doc != docB {
+					break
+				}
+				nend := b
+				if np.disp+np.dlen < nend {
+					nend = np.disp + np.dlen
+				}
+				if nend <= merged {
+					break
+				}
+				docB = np.doc + (nend - np.disp)
+				merged = nend
+			}
+			sl := projLineOf(starts, docA)
+			ls := projLineStart(starts, sl)
+			emit(sl, docA-ls, docB-ls, 0, docA, docB, a, merged)
+			a = merged
 		}
 	}
 

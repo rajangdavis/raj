@@ -81,7 +81,7 @@ func (p *Pane) GutterWidth() int {
 	// document even when folds make the display shorter than it; a split line
 	// can also make the display longer, so take the larger of the two.
 	n := p.File.Lines()
-	if d := p.displayLines(); d > n {
+	if d := p.DisplayLines(); d > n {
 		n = d
 	}
 	return len(strconv.Itoa(n)) + 2
@@ -135,7 +135,7 @@ func (p *Pane) RenderFocused(s *ui.Screen, x, y, w, h int, th Theme, focused boo
 	// bytes the view hides; a composition-only row draws composition text the
 	// session no longer holds, plainly and with a blank gutter.
 	row := -p.Viewport.TopRow
-	for line := p.Viewport.Top; line < p.displayLines() && row < h; line++ {
+	for line := p.Viewport.Top; line < p.DisplayLines() && row < h; line++ {
 		sessionLine, dlo, _, fold := p.line(line)
 		if sessionLine < 0 {
 			if row >= 0 {
@@ -179,7 +179,7 @@ func (p *Pane) placeCaret(s *ui.Screen, x, y, w, h int) {
 		p.placeCaretWrapped(s, x, y, w, h)
 		return
 	}
-	line, col := p.dispPos(p.Cursors.Primary().Head)
+	line, col := p.DispPos(p.Cursors.Primary().Head)
 	row := line - p.Viewport.Top
 	sx := x + col - p.Viewport.Left
 	if row < 0 || row >= h || sx < x || sx >= x+w {

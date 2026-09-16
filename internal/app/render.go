@@ -158,20 +158,23 @@ func (a *App) drawDiagnosticMarks(l Layout) {
 	}
 	first := p.Viewport.Top
 
-	// One mark per line, the most severe. A line with a warning and an error
-	// is an error line.
+	// One mark per display row, the most severe. A line with a warning and an
+	// error is an error line.
+	//
+	// The mark is keyed in session coordinates and placed in display ones: a
+	// fold above the line shifts it down, and a line inside a fold has no row
+	// to draw on and is dropped rather than clamped onto the fold row.
 	worst := map[int]int{}
 	for _, it := range items {
-		ln := it.Range.Start.Line
-		if ln < first || ln >= first+rows {
+		row := p.DispOfDocLine(it.Range.Start.Line)
+		if row < first || row >= first+rows {
 			continue
 		}
-		if sev, seen := worst[ln]; !seen || severityRank(it.Severity) < severityRank(sev) {
-			worst[ln] = it.Severity
+		if sev, seen := worst[row]; !seen || severityRank(it.Severity) < severityRank(sev) {
+			worst[row] = it.Severity
 		}
 	}
-	for ln, sev := range worst {
-		row := top + (ln - first)
+	for row, sev := range worst {
 		st := a.theme.Gutter
 		switch severityRank(sev) {
 		case 0:
@@ -179,7 +182,7 @@ func (a *App) drawDiagnosticMarks(l Layout) {
 		case 1:
 			st = st.With(ui.Ansi(3)) // yellow
 		}
-		a.screen.SetString(l.EditorX, row, severityMark(sev), st, 1)
+		a.screen.SetString(l.EditorX, top+(row-first), severityMark(sev), st, 1)
 	}
 }
 
@@ -205,6 +208,10 @@ func (a *App) drawProposalMarks(l Layout) {
 	first := p.Viewport.Top
 	// Two passes so a removal wins a shared line: red is the mark that cannot
 	// be seen anywhere else, since a deletion leaves no text to tint.
+	//
+	// The hunk stays in session coordinates and each touched line is placed on
+	// the display: a fold above the mark shifts it down, and a line the fold
+	// hides draws nothing rather than a mark on the fold row.
 	for _, removed := range []bool{false, true} {
 		for _, m := range marks {
 			if m.Removed != removed {
@@ -215,14 +222,15 @@ func (a *App) drawProposalMarks(l Layout) {
 				last = p.File.LineOf(m.End - 1)
 			}
 			for line := m.Line; line <= last; line++ {
-				if line < first || line >= first+rows {
+				row := p.DispOfDocLine(line)
+				if row < first || row >= first+rows {
 					continue
 				}
 				color := a.theme.ProposedAdd
 				if removed {
 					color = a.theme.ProposedDel
 				}
-				a.screen.SetString(l.EditorX, top+(line-first),
+				a.screen.SetString(l.EditorX, top+(row-first),
 					a.participantInitial(m.Author), a.theme.Gutter.With(color), 1)
 			}
 		}
@@ -235,13 +243,43 @@ func (a *App) drawCompletion(l Layout) {
 		return
 	}
 	x, top, w, rows := a.textArea(l, p)
+	// The completion popup anchors on the display row and column of the word
+	// (showCompletion calls DispPos), so its top is the viewport top unchanged.
+	//
+	// The hover panel still pins its anchor in session coordinates — hover()
+	// captures it from File.LineCol — and places itself at (anchorLine -
+	// topLine) rows below the editor origin. A fold between the viewport top
+	// and the anchor shifts the anchor display row without moving its session
+	// line by the same amount, so sessionTopFor hands back the top in that
+	// same session coordinate; with no fold it is Viewport.Top exactly. When
+	// hover() is moved onto DispPos like showCompletion, this becomes a plain
+	// p.Viewport.Top and the helper goes.
+	hoverLine, hoverCol := a.Hover.Anchor()
 	// The hover panel first, so a completion popup that overlaps it is drawn
 	// on top. Completion is what you are doing; hover is what you were
 	// reading, and the one being typed into should not be buried.
-	a.Hover.Render(a.screen, x, top, w, rows, p.Viewport.Top, a.wth)
+	a.Hover.Render(a.screen, x, top, w, rows, sessionTopFor(p, hoverLine, hoverCol), a.wth)
 	if a.Complete.Open {
 		a.Complete.Render(a.screen, x, top, w, rows, p.Viewport.Top, a.wth)
 	}
+}
+
+// sessionTopFor maps the pane viewport top into the session coordinate a
+// session-anchored floating overlay expects, so (anchorLine - sessionTopFor)
+// is the anchor display row minus the viewport display top.
+//
+// The anchor byte is resolved through DispPos — which handles a mid-line fold,
+// not just a whole-line one — and the offset between the anchor session line
+// and its display row is added back to the viewport top. It is an exact
+// inverse only while the anchor is a session coordinate; see the caller for
+// why hover is the only such overlay left.
+func sessionTopFor(p *editor.Pane, anchorLine, anchorCol int) int {
+	if anchorLine < 0 {
+		return p.Viewport.Top
+	}
+	off := p.File.LineStart(anchorLine) + anchorCol
+	anchorRow, _ := p.DispPos(off)
+	return anchorLine - anchorRow + p.Viewport.Top
 }
 
 // textArea is the editor's text region, excluding the gutter and the find bar.
@@ -262,6 +300,12 @@ func (a *App) drawEditor(l Layout) {
 		a.drawEmpty(l)
 		return
 	}
+	// Bring the display projection up to date with the mode before anything
+	// measures the pane: fitHints and RenderFocused both call GutterWidth and
+	// Resize, which read DisplayLines, and the render itself reads the map.
+	// UpdateDisplay memoises, so the common path is a key comparison rather
+	// than a journal walk every frame.
+	p.UpdateDisplay(a.displayPolicy())
 	// The pane hints were filtered for the width they had when they were
 	// installed. A resize, a sidebar or a split changes that width, and this is
 	// the first point in the frame where the new width is known, so the set is

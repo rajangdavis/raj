@@ -510,10 +510,11 @@ func (d DerivedProject) States() []StateRun { return d.states }
 func (d DerivedProject) Segments() []ProjSeg { return d.segments }
 
 // Leased reports which change set, if any, owns the bytes in [pos, pos+length)
-// as a read-only run — a lease. A pending or rejected span is atomic: an edit
-// or an agent diff that intersects it is refused, which is what keeps the
-// composition overlap-free by construction rather than by resolving overlaps
-// after the fact.
+// as a read-only run for the human typing path: File.Insert and File.Delete
+// call this and refuse an edit that intersects a pending or rejected span. The
+// agent diff path does not come through here — ApplyDiff treats a Proposed span
+// as advisory and only a Rejected one as locked (rejectedLease/proposedSpans) — so
+// this is the caret-side lease, not the whole rule.
 //
 // Coordinates are the live document's, because the runs come from the
 // Annotated projection and its composition is the view frame. Only inserted
@@ -545,25 +546,25 @@ func (s *Session) Leased(pos, length int) (group uint64, ok bool) {
 	return 0, false
 }
 
-// leasedElsewhere reports whether [pos,pos+length) intersects a non-accepted
-// run whose group is not except: a second lease sharing the range. Leased
-// returns only the first intersecting run, so an own-proposal amendment has to
-// confirm no other writer's run is caught up in the same hunk before it is
-// allowed to fold in.
-func (s *Session) leasedElsewhere(pos, length int, except uint64) bool {
+// rejectedLease reports whether [pos,pos+length) intersects a Rejected run,
+// naming the first one and its current bounds. Rejected is the human's
+// decision, so unlike a Proposed draft it still refuses an edit; a hunk that
+// also catches an advisory Proposed run has to report the rejection, which is
+// why this asks about the state rather than taking Leased's first run.
+func (s *Session) rejectedLease(pos, length int) (group uint64, start, end int, ok bool) {
 	if !s.HasDecisions() {
-		return false
+		return 0, 0, 0, false
 	}
 	if length < 0 {
 		length = 0
 	}
 	for _, r := range s.Project(Annotated).States() {
-		if r.State == Accepted || r.Len <= 0 || r.Group == except {
+		if r.State != Rejected || r.Len <= 0 {
 			continue
 		}
 		if pos < r.Off+r.Len && r.Off < pos+length {
-			return true
+			return r.Group, r.Off, r.Off + r.Len, true
 		}
 	}
-	return false
+	return 0, 0, 0, false
 }

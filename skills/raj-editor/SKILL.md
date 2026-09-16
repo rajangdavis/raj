@@ -34,8 +34,11 @@ Inspection does not need `open`. `read`, `version` and `lsp diagnostics` load a
 closed file on demand — no tab, nothing on the user's screen — so read freely.
 `raj ctl open <path>` is the verb that shows a file: it loads the file and
 focuses a tab, so use it when you mean to put the file in front of the user, not
-to make a path readable. A pending proposal also opens a tab on its own, because
-the file now has something for the user to decide.
+to make a path readable. `open -create` is the one way to name a path that is
+not on disk yet: without it a path that is neither an open buffer nor a file is
+refused as a typo rather than made into an empty buffer for a misspelled name to
+become later. A pending proposal also opens a tab on its own, because the file
+now has something for the user to decide.
 
 Every command takes an optional path; omit it for the buffer the user is
 currently looking at. Add `-json` to any command for machine-readable output.
@@ -92,9 +95,12 @@ longer loopback-only. The warning is worth repeating to the user rather than
 talking them past: the frames carry their unsaved work in plaintext, which is a
 fine trade for a container bridge on a laptop and a bad one on a shared network.
 
-The token is printed to stderr once when raj starts and stored nowhere, so a
-user who has scrolled past it has to restart. Setting `RAJ_CONTROL_TOKEN`
-before starting raj, as above, is what makes it reproducible.
+The token is printed to stderr once when raj starts. You no longer have to
+scroll back or restart to get it: `raj ctl token` reads it out of the running
+session over the local Unix socket — which is why `--control-addr tcp://…` is
+now additive, the socket keeps listening alongside the port. Setting
+`RAJ_CONTROL_TOKEN` before starting raj, as above, is what makes the token
+reproducible without reading it back.
 
 **Use the paths you can see.** `raj ctl` translates between your filesystem and
 the editor's, so if the repository is `/workspace` to you and
@@ -329,11 +335,17 @@ and only the batch's last verb ends the conversation — so a program of
 `query, search, path, read` gives you match frames, then the read, then the
 frame marked final. Put the search last if you would rather not read past it.
 
-**exec, recv, hello and cancel are not available in a program.** recv parks
-until the user speaks, which would hold every verb behind it; hello and cancel
-act on the connection rather than a document, and a cancel queued behind the
-search it means to interrupt would never arrive in time. Use the flags for
-those.
+**`find` locates text in one buffer and answers with a byte span**, so a batch
+can find → read → apply in a single frame.
+
+**`exec` is available in a program** through the `arg` argument op: each `arg`
+appends one argv element and the following `exec` verb consumes them. The
+remote-execution gate is unchanged — over TCP the verb is refused unless raj
+started with `--control-exec`. **recv, hello and cancel are still not available
+in a program**: recv parks until the user speaks, which would hold every verb
+behind it; hello and cancel act on the connection rather than a document, and a
+cancel queued behind the search it means to interrupt would never arrive in
+time. Use the flags for those.
 
 **A program is all-or-nothing at compile time and sequential at run time.** If
 any opcode fails to compile, nothing runs. Once it is running the verbs execute

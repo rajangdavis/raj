@@ -39,10 +39,29 @@ func pid() int            { return os.Getpid() }
 // to run commands here — off by default, because a driver in a container
 // asking for that is asking to run outside its container.
 func (a *App) StartControl(addr string, remoteExec bool) error {
-	if addr == "" {
-		addr = control.DefaultPath()
+	return a.StartControlAddrs([]string{addr}, remoteExec)
+}
+
+// StartControlAddrs begins listening on each address at once, over one queue
+// and one registry. The CLI uses it to keep the Unix socket — where a local
+// script reads the token and where the filesystem authorises — listening
+// alongside a TCP port for a driver that does not share the filesystem. A
+// single address is the common case and behaves exactly as StartControl did.
+//
+// An empty entry means the default socket, so a caller that has a flag can
+// pass "" rather than resolve the convention itself.
+func (a *App) StartControlAddrs(addrs []string, remoteExec bool) error {
+	if len(addrs) == 0 {
+		addrs = []string{""}
 	}
-	srv, err := control.Listen(addr, func() { a.host.Post(wakeEvent()) })
+	clean := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr == "" {
+			addr = control.DefaultPath()
+		}
+		clean = append(clean, addr)
+	}
+	srv, err := control.ListenAll(clean, func() { a.host.Post(wakeEvent()) })
 	if err != nil {
 		return err
 	}
@@ -68,6 +87,16 @@ func (a *App) ControlPath() string {
 		return ""
 	}
 	return a.control.Path()
+}
+
+// ControlPaths is every address the listener is bound to, primary first, for a
+// session listening on both a socket and a port at once. Nil when there is no
+// listener.
+func (a *App) ControlPaths() []string {
+	if a.control == nil {
+		return nil
+	}
+	return a.control.Paths()
 }
 
 // Tell sends the user's message to a connected driver.
@@ -140,7 +169,40 @@ func (a *App) drainControl() {
 		a.guard.Participants = a.control.Participants
 	}
 	for _, p := range a.control.Take() {
-		p.Reply(control.Dispatch(a.guard, p.Req))
+		res := control.Dispatch(a.guard, p.Req)
+		a.notifySuperseded(p.Req, res)
+		p.Reply(res)
+	}
+}
+
+// notifySuperseded tells the author of each Proposed set that a landed apply or
+// patch moved over it. The editing caller already carries the warning in its
+// reply; this is the other half of the spec's reconciliation: the occupying
+// author is notified through the mailbox, never summoned, because a gone driver
+// cannot be woken and its box keeps until it returns.
+//
+// Best-effort by construction. The write has already landed, so a full mailbox
+// or a connection that went away must not turn the notice into a failed write,
+// and the path runs on the event thread where Post never blocks.
+func (a *App) notifySuperseded(req control.Request, res control.Response) {
+	if a.control == nil || len(res.Warnings) == 0 {
+		return
+	}
+	if req.Op != "apply" && req.Op != "patch" {
+		return
+	}
+	for _, w := range res.Warnings {
+		if w.Author == req.Author {
+			continue
+		}
+		// The notice carries no path. The server only has req.Path in the
+		// editor's spelling, and the recipient is another writer whose view of
+		// the tree is not known here, so an absolute path would be one it
+		// cannot resolve; a pathless request has none to name anyway. The set,
+		// span and author are what the recipient acts on.
+		_ = a.control.PostNotice(w.Author, fmt.Sprintf(
+			"change set %d (bytes %d..%d) was landed over by author %d",
+			w.Group, w.Start, w.End, req.Author))
 	}
 }
 
@@ -343,7 +405,10 @@ func sameFile(a, b string) bool {
 // goto-line prompt does: line 9999 in a 300-line file is the end, not an
 // error. The line and column are 1-based, or zero when the caller left them
 // out — ":40" from a compiler means a column on the line already showing, and
-// a missing column means the margin.
+// a missing column means the margin. The line is a session (file) line, not a
+// display row: a caller names a place in the document, and a fold must not
+// renumber it. The map is used only to place the viewport, so a fold above the
+// target still scrolls to the row that draws the position.
 func (h host) Goto(path string, line, col int) error {
 	p, err := h.find(path)
 	if err != nil {
@@ -361,7 +426,11 @@ func (h host) Goto(path string, line, col int) error {
 	}
 	off := p.File.OffsetAt(line-1, col-1)
 	p.Cursors.Set(off, off)
-	p.Viewport.Center(line-1, p.File.Lines())
+	// The caret is placed file-true; the viewport centres on the row that draws
+	// the offset, which a fold above it shifts away from the session line. A
+	// line a fold hides maps to its fold row, so the caret is still shown.
+	row, _ := p.DispPos(off)
+	p.Viewport.Center(row, p.DisplayLines())
 	// A cursor and viewport move is view state the session records, so persist
 	// it the same way the editor's own goto does.
 	h.a.TouchSession()
@@ -812,6 +881,45 @@ func (h host) Read(path string, author uint8, start, end, lineStart, lineEnd int
 	return out, states, uint64(p.File.Session().Version()), nil
 }
 
+// Find searches one buffer and returns the first match's byte span together
+// with the total match count. The matching is the editor's own: the same search
+// engine the search pane and the workspace walk use, reached by rooting the
+// walk at the one document, so a find cannot disagree with a search over the
+// same text and there is no second matcher to drift. It is a read, so an
+// unopened file is loaded headlessly and a buffer's unsaved text is what is
+// searched, not the file on disk.
+func (h host) Find(path string, author uint8, q control.SearchQuery) (control.SearchMatch, int, bool, error) {
+	p, err := h.findOrLoad(path)
+	if err != nil {
+		return control.SearchMatch{}, 0, false, err
+	}
+	name := p.File.Path
+	version := uint64(p.File.Session().Version())
+	out := control.SearchMatch{Path: name, Version: version}
+	// The search engine walks a root and overlays open documents. Handing it
+	// the file itself as the root, with the buffer's text as the one open
+	// document, bounds the walk to exactly this file: a path that exists on
+	// disk is visited once, and a buffer that has never been written has no
+	// walk to do and is served from the snapshot. Either way the engine does
+	// the matching and this host never re-implements it.
+	res := search.RunDocs(context.Background(), name, search.Query{
+		Text: q.Text, Regex: q.Regex, Case: q.Case, Word: q.Word,
+	}, search.Docs{name: p.File.Text()})
+	if res.Err != nil {
+		return out, 0, false, res.Err
+	}
+	count := res.Total()
+	if len(res.Matches) == 0 {
+		return out, count, false, nil
+	}
+	m := res.Matches[0]
+	out.Line, out.Col, out.Len = m.Line, m.Col, m.Len
+	out.LineStart, out.LineEnd = m.LineStart, m.LineEnd
+	out.ByteStart, out.ByteEnd = m.ByteStart, m.ByteEnd
+	out.Text = m.Text
+	return out, count, true, nil
+}
+
 // clipStates trims the Annotated projection's runs to [start, end) and makes
 // their offsets relative to the text a read returns, so a caller can align them
 // with the spans it was handed. A run that straddles a boundary is cut, never
@@ -847,11 +955,13 @@ func (h host) Version(path string, author uint8) (uint64, error) {
 // Apply is the write surface, and the reason offsets rather than text matching:
 // ApplyDiff rebases hunks written against base onto whatever the document is
 // now, and rejects the ones it cannot place. Staleness is handled by replaying
-// the journal, so there is no old_str to get wrong.
-func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk) (uint64, []control.Conflict, error) {
+// the journal, so there is no old_str to get wrong. A hunk that lands over
+// another writer's Proposed span is allowed -- the advisory lease -- and the
+// warning names the set it moved past; a Rejected span is still a conflict.
+func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk) (uint64, []control.Conflict, []control.GroupOverlap, error) {
 	p, err := h.find(path)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	// A proposal the user has to decide about must be visible: a headless
 	// buffer is announced before the change set lands, never left hidden.
@@ -868,7 +978,7 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	pt := make([]piecetable.Hunk, 0, len(hunks))
 	for i, x := range hunks {
 		if _, _, serr := resolveSpan(x.Start, x.End, size); serr != nil {
-			return 0, nil, fmt.Errorf("hunk %d: %w", i, serr)
+			return 0, nil, nil, fmt.Errorf("hunk %d: %w", i, serr)
 		}
 		pt = append(pt, piecetable.Hunk{Start: x.Start, End: x.End, Text: x.Text})
 	}
@@ -876,14 +986,20 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	// undo stacks are per-author, so two connected agents stay distinguishable
 	// from each other as well as from the user, and cmd+z swallows neither.
 	// Begin/End makes one diff one undo entry.
+	before := p.File.Session().Version()
 	p.File.Begin()
-	conflicts := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(base), pt)
+	conflicts, blocks := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(base), pt)
 	p.File.End()
 	// An agent's change set is a proposal, not an edit: it is in the document
 	// and visible, but marked as awaiting a decision. Marked here rather than
 	// in the piece table because only this layer knows which authors are
 	// agents — and a second human's edits must not be marked.
-	if h.isAgent(author) {
+	//
+	// No-op hunks are skipped by ApplyDiff, so a batch of only no-ops commits
+	// nothing and LastGroup would name whatever set came before. Only mark a
+	// set this call actually opened: the version advances exactly when at
+	// least one real hunk committed.
+	if h.isAgent(author) && p.File.Session().Version() > before {
 		p.File.ProposeGroup(p.File.Session().LastGroup())
 	}
 	p.Cursors.Normalize()
@@ -899,10 +1015,20 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 			// lets the CLI tell "read again and resubmit" from "decide about
 			// this text first" instead of printing one message for both.
 			Group: c.Group,
-			Hunk:  control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
+			// Author and the span ride with the lease so a driver learns who
+			// holds the text and where without a second groups call.
+			Author: uint8(c.Author),
+			Start:  c.Start,
+			End:    c.End,
+			Hunk:   control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
 		})
 	}
-	return uint64(p.File.Session().Version()), out, nil
+	var warnings []control.GroupOverlap
+	for _, b := range blocks {
+		warnings = append(warnings, control.GroupOverlap{
+			Group: b.Group, Author: uint8(b.Author), Start: b.Start, End: b.End})
+	}
+	return uint64(p.File.Session().Version()), out, warnings, nil
 }
 
 // snapshot is a dump's editor-side copy: the text captured, and the version and
@@ -957,35 +1083,39 @@ func (h host) Dump(path string, start, end int, author uint8) (uint64, uint64, s
 // the current document, so concurrent edits elsewhere in the file are preserved
 // and only the chunk's own change is applied. It refuses a snapshot this writer
 // does not own, or one whose buffer has moved on to a different name.
-func (h host) Patch(path string, author uint8, id uint64, newText string) (uint64, []control.Conflict, error) {
+func (h host) Patch(path string, author uint8, id uint64, newText string) (uint64, []control.Conflict, []control.GroupOverlap, error) {
 	snap, ok := h.a.snapshots[id]
 	if !ok || snap.author != author {
-		return 0, nil, fmt.Errorf("no snapshot %d for this writer (snapshots are per-writer and evicted on restart)", id)
+		return 0, nil, nil, fmt.Errorf("no snapshot %d for this writer (snapshots are per-writer and evicted on restart)", id)
 	}
 	p, err := h.find(path)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	// A patch creates a proposal too, so it is announced by the same rule as
 	// apply: work the user has to decide about is never hidden.
 	h.a.announceIfHeadless(p)
 	if snap.path != p.File.Path {
-		return 0, nil, fmt.Errorf("snapshot %d is of %s, not %s", id, snap.path, p.File.Path)
+		return 0, nil, nil, fmt.Errorf("snapshot %d is of %s, not %s", id, snap.path, p.File.Path)
 	}
 	diffs := control.DiffLines(snap.text, newText)
 	if len(diffs) == 0 {
 		// The caller returned the text unchanged; there is no change set to
 		// record, and no group to mark.
-		return uint64(p.File.Session().Version()), nil, nil
+		return uint64(p.File.Session().Version()), nil, nil, nil
 	}
 	pt := make([]piecetable.Hunk, 0, len(diffs))
 	for _, d := range diffs {
 		pt = append(pt, piecetable.Hunk{Start: snap.start + d.Start, End: snap.start + d.End, Text: d.Text})
 	}
+	before := p.File.Session().Version()
 	p.File.Begin()
-	conflicts := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(snap.version), pt)
+	conflicts, blocks := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(snap.version), pt)
 	p.File.End()
-	if h.isAgent(author) {
+	// Like apply: a patch whose every hunk was refused commits nothing, so
+	// LastGroup would name whatever set came before and ProposeGroup would
+	// flip its state. Only mark a set this call actually opened.
+	if h.isAgent(author) && p.File.Session().Version() > before {
 		p.File.ProposeGroup(p.File.Session().LastGroup())
 	}
 	p.Cursors.Normalize()
@@ -1001,10 +1131,20 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 			// lets the CLI tell "read again and resubmit" from "decide about
 			// this text first" instead of printing one message for both.
 			Group: c.Group,
-			Hunk:  control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
+			// Author and the span ride with the lease so a driver learns who
+			// holds the text and where without a second groups call.
+			Author: uint8(c.Author),
+			Start:  c.Start,
+			End:    c.End,
+			Hunk:   control.Hunk{Start: c.Hunk.Start, End: c.Hunk.End, Text: c.Hunk.Text},
 		})
 	}
-	return uint64(p.File.Session().Version()), out, nil
+	var warnings []control.GroupOverlap
+	for _, b := range blocks {
+		warnings = append(warnings, control.GroupOverlap{
+			Group: b.Group, Author: uint8(b.Author), Start: b.Start, End: b.End})
+	}
+	return uint64(p.File.Session().Version()), out, warnings, nil
 }
 
 // Dirty reports unsaved buffers, and whether the human wrote any of the unsaved
@@ -1068,28 +1208,9 @@ type snapshotSearcher struct {
 
 func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 	emit func([]control.SearchMatch)) (int, int, bool, []control.TruncatedFile, error) {
-	root, err := s.walkRoot(q.Path)
-	if err != nil {
-		return 0, 0, false, nil, err
-	}
-	res := search.RunStreamVersioned(ctx, root, search.Query{
-		Text: q.Text, Include: q.Include, Exclude: q.Exclude,
-		Regex: q.Regex, Case: q.Case, Word: q.Word,
-	}, s.docs, s.versions, func(batch []search.Match) {
-		out := make([]control.SearchMatch, 0, len(batch))
-		for _, m := range batch {
-			out = append(out, control.SearchMatch{
-				Path: m.Path, Line: m.Line, Col: m.Col, Len: m.Len,
-				LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
-				Version: m.Version, Text: m.Text})
-		}
-		emit(out)
-	})
-	var truncated []control.TruncatedFile
-	for _, f := range res.Truncated() {
-		truncated = append(truncated, control.TruncatedFile{Path: f.Path, Shown: f.Shown, Total: f.Total})
-	}
-	return res.Files, res.Considered, res.Capped, truncated, res.Err
+	// The walk lives in ls.go so Search and SearchHidden share one body; nil
+	// rules keep the configured hidden policy search substitutes by default.
+	return s.runSearch(ctx, q, nil, emit)
 }
 
 // walkRoot resolves a query's -path against the workspace root. A relative
@@ -1126,26 +1247,33 @@ func (h host) Groups(path string) ([]control.Group, error) {
 	// counts. A set already decided is not in DiffPending, so project its own
 	// members the same way; its counts would otherwise read zero and say the
 	// set contributed nothing when it did.
+	sess := p.File.Session()
 	counts := map[uint64][2]int{}
-	for _, d := range p.File.Session().DiffPending() {
+	for _, d := range sess.DiffPending() {
 		counts[d.Group.ID] = [2]int{len(d.Hunks), d.Moved}
 	}
+	overlaps := sess.PendingOverlaps()
 	var out []control.Group
-	for _, g := range p.File.Session().Groups() {
+	for _, g := range sess.Groups() {
 		c, ok := counts[g.ID]
 		if !ok {
 			// Accepted or rejected: not pending, but its members are still in
 			// the journal, so the same projection applies.
-			if d, found := p.File.Session().GroupDiff(g.ID); found {
+			if d, found := sess.GroupDiff(g.ID); found {
 				c = [2]int{len(d.Hunks), d.Moved}
 			}
 		}
-		out = append(out, control.Group{
+		cg := control.Group{
 			ID: g.ID, Path: p.File.Path, Author: uint8(g.Author),
 			State: g.State.String(), Ops: g.Ops, Bytes: g.Bytes,
 			First: uint64(g.First), Last: uint64(g.Last),
 			Hunks: c[0], Moved: c[1],
-		})
+			Invalid: g.Invalid, InvalidBy: groupCollider(g.InvalidBy),
+		}
+		if ov, ok := overlaps[g.ID]; ok {
+			cg.Overlaps = groupOverlaps(ov)
+		}
+		out = append(out, cg)
 	}
 	return out, nil
 }
@@ -1159,15 +1287,21 @@ func (h host) Diff(path string, author uint8) ([]control.DiffGroup, error) {
 	if err != nil {
 		return nil, err
 	}
+	sess := p.File.Session()
+	overlaps := sess.PendingOverlaps()
 	var out []control.DiffGroup
-	for _, g := range p.File.Session().DiffPending() {
+	for _, g := range sess.DiffPending() {
 		dg := control.DiffGroup{
 			Group: control.Group{
 				ID: g.Group.ID, Path: p.File.Path, Author: uint8(g.Group.Author),
 				State: g.Group.State.String(), Ops: g.Group.Ops, Bytes: g.Group.Bytes,
 				First: uint64(g.Group.First), Last: uint64(g.Group.Last),
+				Invalid: g.Group.Invalid, InvalidBy: groupCollider(g.Group.InvalidBy),
 			},
 			Moved: g.Moved,
+		}
+		if ov, ok := overlaps[g.Group.ID]; ok {
+			dg.Overlaps = groupOverlaps(ov)
 		}
 		for _, hk := range g.Hunks {
 			line, endLine := diffLines(p.File, hk.Start, hk.End)
@@ -1182,6 +1316,33 @@ func (h host) Diff(path string, author uint8) ([]control.DiffGroup, error) {
 		out = append(out, dg)
 	}
 	return out, nil
+}
+
+// groupOverlaps converts the session's overlap report into the wire shape. It
+// returns nil for no overlaps, so `groups -json` omits the field entirely
+// rather than carrying an empty list.
+func groupOverlaps(ov []piecetable.Overlap) *control.GroupOverlaps {
+	if len(ov) == 0 {
+		return nil
+	}
+	sets := make([]control.GroupOverlap, 0, len(ov))
+	for _, o := range ov {
+		sets = append(sets, control.GroupOverlap{
+			Group: o.Group, Author: uint8(o.Author), Start: o.Start, End: o.End,
+		})
+	}
+	return &control.GroupOverlaps{Sets: sets}
+}
+
+// groupCollider converts one invalid set's collider report into the wire shape,
+// or nil when the set has none. It is the single-set sibling of groupOverlaps.
+func groupCollider(ov *piecetable.Overlap) *control.GroupOverlap {
+	if ov == nil {
+		return nil
+	}
+	return &control.GroupOverlap{
+		Group: ov.Group, Author: uint8(ov.Author), Start: ov.Start, End: ov.End,
+	}
 }
 
 // diffLines converts a hunk's byte span into 1-based line coordinates using
@@ -1275,9 +1436,72 @@ func (h host) Clear(path string, group uint64) error {
 		return err
 	}
 	defer h.a.flushJournal(p)
-	if !p.File.ClearRejected(group) {
+	ok, block := p.File.ClearRejectedBlock(group)
+	if !ok {
+		if block.Group != 0 {
+			// The reversal wedged behind a live set. Name it in the same
+			// owner-and-span shape a lease refusal uses, so the caller sees
+			// what to reject or clear first instead of retrying blind.
+			return &control.BlockError{
+				Conflict: control.Conflict{
+					Group:  block.Group,
+					Author: uint8(block.Author),
+					Start:  block.Start,
+					End:    block.End,
+				},
+				Message: fmt.Sprintf("change set %d cannot be cleared: change set %d "+
+					"(author %d, bytes %d..%d) overlaps it; reject or clear that set first",
+					group, block.Group, block.Author, block.Start, block.End),
+			}
+		}
 		return fmt.Errorf("change set %d is not a rejected set that can be cleared "+
 			"(it may be proposed, already gone, or wedged behind a later edit)", group)
+	}
+	p.Cursors.Normalize()
+	h.a.Explorer.Tree.MarkChanged(p.File.Path)
+	return nil
+}
+
+// Revert discards the calling writer's own pieces: RevertAuthor reverses every
+// op they wrote out of the document and records the reversal in the journal,
+// so the record stays consistent rather than holding a second forward edit
+// beside the work it undoes. It is claim-gated like Clear and, like Clear, can
+// wedge behind a later live set, which it names in the same block shape.
+//
+// The authorization is the caller's own author and nothing else: no field on
+// the wire names a peer, so a driver cannot reverse another writer's accepted
+// text. Dropping a peer's work is the user's decision, taken through reject and
+// clear.
+func (h host) Revert(path string, author uint8) error {
+	p, err := h.find(path)
+	if err != nil {
+		return err
+	}
+	defer h.a.flushJournal(p)
+	ok, block := p.File.RevertAuthor(piecetable.Author(author))
+	if !ok {
+		if block.Group != 0 {
+			// The reversal wedged behind a live set, but sets earlier in the
+			// walk were already dropped, so the document moved. Mirror that
+			// before naming the blocker in the same owner-and-span shape a
+			// lease refusal uses, so the caller sees what to clear first
+			// instead of retrying blind.
+			p.Cursors.Normalize()
+			h.a.Explorer.Tree.MarkChanged(p.File.Path)
+			return &control.BlockError{
+				Conflict: control.Conflict{
+					Group:  block.Group,
+					Author: uint8(block.Author),
+					Start:  block.Start,
+					End:    block.End,
+				},
+				Message: fmt.Sprintf("author %d's pieces cannot be reverted: change set %d "+
+					"(author %d, bytes %d..%d) overlaps them; reject or clear that set first",
+					author, block.Group, block.Author, block.Start, block.End),
+			}
+		}
+		return fmt.Errorf("author %d has no live pieces in %s to revert "+
+			"(they may be gone, or a later edit has wedged them)", author, path)
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
@@ -1357,16 +1581,13 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 		if ls == nil {
 			return lspCaller{mode: "diagnostics", status: lspStatus(st), detail: st.message(lpath)}, nil
 		}
-		// The published latch is not a freshness proof. An edit after the
-		// publish leaves the previous set in place until the server speaks
-		// again, so compare the version the publish applied to, and the version
-		// the server was last told about, against the buffer's own. A mismatch
-		// reports stale rather than a clean file: a per-hunk compile gate that
-		// read "not yet republished" as "no problems" would pass broken code.
-		var pubVersion *int
-		if v, ok := h.a.diags.publishedVersion(lpath); ok {
-			pubVersion = &v
-		}
+		// The published latch is not a freshness proof, and a versionless
+		// publish cannot be dated by version at all: gopls omits the version
+		// for a file at version 0, which is both the on-disk copy and an
+		// unedited buffer. syncDoc notes the sync in the store, so status can
+		// reject a versionless publish that predates the current text rather
+		// than read it as clean.
+
 		// for_ returns a server only alongside a live sync, so this branch is
 		// unreachable today; guarding it keeps a nil dereference off the event
 		// thread if that invariant ever changes.
@@ -1386,10 +1607,7 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 		}
 		bufVersion := int(p.File.Session().Version())
 		synced, _ := ls.sync.Version(lpath)
-		status, detail := diagnosticsStatus(
-			h.a.diags.published(lpath), pubVersion,
-			synced, bufVersion,
-		)
+		status, detail := h.a.diags.status(lpath, synced, bufVersion)
 		return lspCaller{
 			mode:   "diagnostics",
 			status: status,
@@ -1683,7 +1901,9 @@ func lspStatus(st serverState) string {
 // told about, and bufVersion the buffer's current version. A set is a real
 // reading only when it was published for the text the buffer holds now: a
 // publish that predates it, or a server that has not even been told about it,
-// is stale rather than clean.
+// is stale rather than clean. A publish that carried no version cannot be
+// dated here; freshnessLocked refines this verdict for it with the store
+// publish/sync sequence.
 func diagnosticsStatus(published bool, pubVersion *int, syncedVersion, bufVersion int) (status, detail string) {
 	switch {
 	case !published:

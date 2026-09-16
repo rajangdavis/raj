@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"raj/internal/editor"
 	"raj/internal/piecetable"
 )
 
@@ -276,4 +277,45 @@ func TestReviewBadgeIsDrawn(t *testing.T) {
 	if !strings.Contains(frame, "Review") {
 		t.Errorf("status line does not carry the Review badge:\n%s", frame)
 	}
+}
+
+// TestDrawProjectsByMode is the wiring test this slice adds: a rejected run is
+// folded in Edit mode and annotated in Review, which holds only if the draw
+// path feeds the pane's display from the mode. Before this slice disp was
+// always nil, so the fold marker could never appear.
+func TestDrawProjectsByMode(t *testing.T) {
+	h := newHarness(t, reviewFixture)
+	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	if !h.Pane().File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+
+	h.Draw()
+	if !rendersFold(h.Pane()) {
+		t.Fatalf("edit mode did not fold the rejected run:\n%s", h.host.Text())
+	}
+	if !strings.Contains(h.host.Text(), "rejected") {
+		t.Errorf("the fold marker does not name the state:\n%s", h.host.Text())
+	}
+
+	h.EnterReview()
+	h.Draw()
+	if rendersFold(h.Pane()) {
+		t.Errorf("review mode still folds the rejected run:\n%s", h.host.Text())
+	}
+	if !strings.Contains(h.host.Text(), reviewNew) {
+		t.Errorf("review mode does not annotate the rejected text:\n%s", h.host.Text())
+	}
+}
+
+// rendersFold reports whether the pane currently draws any fold row, through
+// the exported Fold accessor so the test checks the rendered model, not the
+// projection internals.
+func rendersFold(p *editor.Pane) bool {
+	for i := 0; i < p.DisplayLines(); i++ {
+		if _, _, ok := p.Fold(i); ok {
+			return true
+		}
+	}
+	return false
 }

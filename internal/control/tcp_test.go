@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"raj/internal/prog"
 )
 
 // The behavioural spec for talking to an editor that is not on this filesystem.
@@ -63,6 +66,142 @@ func TestTCPListenerReportsADialableAddress(t *testing.T) {
 	}
 	if ed.srv.Token() == "" {
 		t.Fatal("a TCP listener must mint a token")
+	}
+	if paths := ed.srv.Paths(); len(paths) != 1 || paths[0] != addr {
+		t.Errorf("Paths() = %v, want just %q", paths, addr)
+	}
+}
+
+// A server can listen on a Unix socket and a TCP port at once, and both
+// listeners drain the same queue and answer from the same document. The write
+// that lands over the port is read back over the socket.
+func TestBothListenersShareOneQueue(t *testing.T) {
+	sock := controlSock(t, "both.sock")
+	ed := newFakeEditorAddrs(t, []string{sock, "tcp://127.0.0.1:0"},
+		map[string]string{"/w/a.go": "package main\n"})
+
+	paths := ed.srv.Paths()
+	if len(paths) != 2 {
+		t.Fatalf("Paths() = %v, want two addresses", paths)
+	}
+	if ed.srv.Path() != paths[0] || paths[0] != sock {
+		t.Errorf("primary = %q, Paths()[0] = %q, want the socket %q", ed.srv.Path(), paths[0], sock)
+	}
+	if !IsTCP(paths[1]) {
+		t.Errorf("second address %q is not TCP", paths[1])
+	}
+	if ed.srv.Token() == "" {
+		t.Fatal("a server with a TCP listener must have a token")
+	}
+
+	// Local: no token, over the socket.
+	local, err := Dial(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+
+	// Remote: the token, over the port.
+	t.Setenv(TokenEnv, ed.srv.Token())
+	remote, err := Dial(paths[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+
+	// Apply over the port, read back over the socket: one queue, one document,
+	// two transports.
+	base := uint64(1)
+	res, err := remote.Do(Request{Op: "apply", Path: "/w/a.go", Base: &base,
+		Hunks: []Hunk{{Start: 0, End: 7, Text: "PACKAGE"}}})
+	if err != nil || res.Err != "" {
+		t.Fatalf("apply over TCP: %v %q", err, res.Err)
+	}
+	res, err = local.Do(Request{Op: "text", Path: "/w/a.go"})
+	if err != nil || res.Err != "" {
+		t.Fatalf("read over the socket: %v %q", err, res.Err)
+	}
+	if res.Text() != "PACKAGE main\n" {
+		t.Errorf("read back %q, want the write made over TCP", res.Text())
+	}
+}
+
+// The token op hands back the server's TCP secret to a caller on the local
+// socket, which is how a script passes it to a container without scraping
+// startup stderr.
+func TestTokenOpReadsTheSecretOverTheSocket(t *testing.T) {
+	sock := controlSock(t, "tok.sock")
+	ed := newFakeEditorAddrs(t, []string{sock, "tcp://127.0.0.1:0"},
+		map[string]string{"/w/a.go": "x"})
+
+	c, err := Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "token"})
+	if err != nil || res.Err != "" {
+		t.Fatalf("token over the socket: %v %q", err, res.Err)
+	}
+	if res.Token == "" || res.Token != ed.srv.Token() {
+		t.Errorf("token = %q, want %q", res.Token, ed.srv.Token())
+	}
+}
+
+// Over TCP the op is answered too: the request already passed the token check,
+// so the caller is holding the secret it would be handed back.
+func TestTokenOpOverTCP(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "token"})
+	if err != nil || res.Err != "" {
+		t.Fatalf("token over TCP: %v %q", err, res.Err)
+	}
+	if res.Token != ed.srv.Token() {
+		t.Errorf("token = %q, want %q", res.Token, ed.srv.Token())
+	}
+}
+
+// A TCP caller without the token cannot reach the token op either: the refusal
+// happens before any handler runs.
+func TestTokenOpRefusesWithoutTheToken(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x"})
+	t.Setenv(TokenEnv, "wrong")
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "token"})
+	if err == nil && res.Err == "" {
+		t.Fatal("the token op answered a caller with the wrong token")
+	}
+}
+
+// A Unix-only server has no secret to hand out, so the op answers with nothing
+// rather than inventing one.
+func TestTokenOpOnAUnixOnlyServerIsEmpty(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "token"})
+	if err != nil || res.Err != "" {
+		t.Fatalf("token: %v %q", err, res.Err)
+	}
+	if res.Token != "" {
+		t.Errorf("a Unix-only server handed out %q", res.Token)
 	}
 }
 
@@ -206,6 +345,69 @@ func TestUnixAllowsExec(t *testing.T) {
 	res, err := c.DoExec(Request{Op: "exec", Argv: []string{"true"}}, nil)
 	if err != nil || res.Err != "" {
 		t.Fatalf("exec over the socket: %v %q", err, res.Err)
+	}
+}
+
+// The remote-exec gate is not bypassed by a batch. A program arrives as one
+// "prog" frame, so the serve loop's direct-exec check never sees the exec
+// inside it; connection.one re-checks the gate for every exec it runs. Without
+// the re-check, a container driver could run a command on the host by wrapping
+// it in a program — the sandbox escape the flag exists to prevent.
+func TestTCPRefusesExecInsideAProgram(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpArg, Payload: []byte("true")},
+		{Code: prog.OpExec},
+	})
+	res, err := c.Do(Request{Op: "prog", Program: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Err == "" {
+		t.Fatal("exec inside a program was allowed over TCP by default")
+	}
+	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "--control-exec") {
+		t.Errorf("refusal %q does not say why, or how to allow it", res.Err)
+	}
+
+	ed.srv.AllowRemoteExec = true
+	if res, err = c.Do(Request{Op: "prog", Program: p}); err != nil {
+		t.Fatal(err)
+	}
+	if res.Err != "" {
+		t.Errorf("exec inside a program still refused once allowed: %q", res.Err)
+	}
+}
+
+// exec is program-reachable on the socket, the same as a direct exec: arg ops
+// accumulate an argv and the batch runs it through the ordinary path. Over a
+// Unix socket the caller could run the command itself, so it is allowed.
+func TestUnixAllowsExecInsideAProgram(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpArg, Payload: []byte("true")},
+		{Code: prog.OpExec},
+	})
+	res, err := c.Do(Request{Op: "prog", Program: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Err != "" || !res.OK {
+		t.Fatalf("exec inside a program over the socket: %+v", res)
 	}
 }
 
@@ -412,5 +614,78 @@ func TestTokenSurvivesTheWire(t *testing.T) {
 	}
 	if got.Token != "s3cret" {
 		t.Errorf("token %q", got.Token)
+	}
+}
+
+// Every `raj ctl` call is a fresh connection. A provisional id must not leave a
+// registry row behind, or a long-lived editor's who list fills with dead anon-N
+// rows and, at the cap, durable identities start sharing recycled ids. N
+// connections that bind one identity and leave must leave exactly one durable
+// row — not one per connection — and that identity must bind the same author id
+// on every connection.
+func TestConnectionsDoNotLeakParticipants(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+
+	const n = 50
+	var id uint8
+	for i := 0; i < n; i++ {
+		c, err := Dial(ed.srv.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := c.Do(Request{Op: "hello", Identity: "harness-abc", Name: "claude-1"})
+		if err != nil || !res.OK {
+			c.Close()
+			t.Fatalf("hello %d: res=%+v err=%v", i, res, err)
+		}
+		if i == 0 {
+			id = c.Author()
+		} else if c.Author() != id {
+			t.Errorf("connection %d bound to %d, want the stable %d", i, c.Author(), id)
+		}
+		c.Close()
+	}
+
+	// Every serve goroutine must have released or left its id by now. The
+	// registry should hold the local human and the one durable identity — no
+	// provisional row per connection, connected or not.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := ed.srv.Participants.List()
+		if len(got) == 2 && got[0].ID == LocalHuman && !got[1].Connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after %d connections the registry holds %+v, want the human and one durable row", n, got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A revert names the writer whose pieces to drop, but it can only ever be the
+// connection's own author. The refusal lives on the reading goroutine, where
+// the connection's real id is known rather than the claimed field, so a frame
+// cannot impersonate a peer and discard their accepted text.
+func TestRevertRefusesAForeignAuthor(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "package main\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "text", Path: "/w/a.go"})
+	if err != nil || res.Err != "" {
+		t.Fatalf("read: %v %q", err, res.Err)
+	}
+	own := res.Author
+	res, err = c.Do(Request{Op: "revert", Path: "/w/a.go", Author: own + 1})
+	if err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if !strings.Contains(res.Err, "revert discards only your own pieces") {
+		t.Fatalf("a foreign-author revert was not refused: err=%q", res.Err)
 	}
 }

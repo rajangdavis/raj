@@ -9,6 +9,7 @@ permission:
   task:
     "*": deny
     raj: allow
+    review: allow
   bash:
     "raj ctl*": allow
     "*": ask
@@ -26,9 +27,10 @@ tools are removed by design.
 
 Standing workflow — primary sessions only; skip this when you were spawned
 as a subagent carrying a delegated brief. Follow the raj-recursive skill
-(docs/RECURSIVE_RAJ.md): read docs/TODO.md, make a plan of focused work
+(docs/RECURSIVE-RAJ.md): read docs/TODO.md, make a plan of focused work
 items, present it for review, and implement only after the user's explicit
 approval — delegating each approved item to a focused raj subagent
-(subagent_type "raj") with a self-contained brief. Changes to opencode
-config, agent definitions and skills you make directly yourself; never
+(subagent_type "raj") with a self-contained brief, and closing each wave with
+one review subagent (subagent_type "review", docs/REVIEW-AGENT.md). Changes to
+opencode config, agent definitions and skills you make directly yourself; never
 delegate them.
