@@ -83,6 +83,57 @@ func TestPresentWritesMatchingFrame(t *testing.T) {
 	}
 }
 
+// Repaint drops the previous frame and forces a full write, but must not erase
+// the terminal first: the frame that follows covers every cell, so the clear is
+// only a flash. This is the layout-change path — a sidebar toggle.
+func TestRepaintWritesFullFrameWithoutErasing(t *testing.T) {
+	h, r := host(t, 40, 10)
+	first := NewScreen(40, 10)
+	first.SetString(0, 0, "first", DefaultStyle, 40)
+	if err := h.Present(first); err != nil {
+		t.Fatal(err)
+	}
+	_ = read(t, r, 4096) // drain the first frame
+
+	next := NewScreen(40, 10)
+	next.SetString(0, 0, "second", DefaultStyle, 40)
+	h.Repaint()
+	go h.Present(next)
+
+	out := read(t, r, 4096)
+	if strings.Contains(out, "\x1b[2J") {
+		t.Errorf("Repaint erased the screen: %q", out)
+	}
+	if !strings.Contains(out, "second") {
+		t.Errorf("Repaint did not write the full frame: %q", out)
+	}
+}
+
+// Invalidate still clears before the full write: the screen may hold content
+// the new frame never addresses.
+func TestInvalidateWritesFullFrameWithErase(t *testing.T) {
+	h, r := host(t, 40, 10)
+	first := NewScreen(40, 10)
+	first.SetString(0, 0, "first", DefaultStyle, 40)
+	if err := h.Present(first); err != nil {
+		t.Fatal(err)
+	}
+	_ = read(t, r, 4096) // drain the first frame
+
+	next := NewScreen(40, 10)
+	next.SetString(0, 0, "second", DefaultStyle, 40)
+	h.Invalidate()
+	go h.Present(next)
+
+	out := read(t, r, 4096)
+	if !strings.Contains(out, "\x1b[2J") {
+		t.Errorf("Invalidate did not erase the screen: %q", out)
+	}
+	if !strings.Contains(out, "second") {
+		t.Errorf("Invalidate did not write the full frame: %q", out)
+	}
+}
+
 // shortWriter accepts at most n bytes per call, the way a tty in raw mode does
 // when its buffer is full.
 type shortWriter struct {

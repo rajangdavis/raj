@@ -135,8 +135,11 @@ and sends you off to edit against it.
 
 Hits print as they are found, so a slow search over a large tree is still
 usable, and ctrl+C stops the walk inside the editor rather than just detaching
-from it. `-regex`, `-case` and `-word` are available. `-include` and `-exclude`
-take comma-separated globs and must stay inside the workspace.
+from it. `-regex`, `-case` and `-word` are available. `-context N` adds N lines
+either side of each hit and prints the block under a `path:line:col version V`
+header, so a hit and its neighbours arrive in one call rather than a search
+followed by a read. `-include` and `-exclude` take comma-separated globs and
+must stay inside the workspace.
 
 Exit is non-zero when there are no matches, as with grep.
 
@@ -153,6 +156,7 @@ rather than returning an authoritative empty result.
 raj ctl read /abs/path/to/file.go                  # the text
 raj ctl read -start 120 -end 148 /abs/path/to/file.go  # a byte span
 raj ctl read -json /abs/path/to/file.go            # text, version, and authorship
+raj ctl read A.go B.go C.go                        # several files, one call
 ```
 
 Do this even if you read the same file a moment ago: the user is typing in it.
@@ -162,7 +166,15 @@ actually seen.
 
 `-start` and `-end` are byte offsets, half-open like `apply`: `-start 120
 -end 148` returns the 28 bytes starting at offset 120. Use them to verify a
-splice without reading the whole file.
+splice without reading the whole file. A shared `-start`/`-end`/`-lines` applies
+to every target of a multi-path read.
+
+`read` takes several paths in one call — `raj ctl read A.go B.go C.go` returns
+each file's text and version and satisfies the read-before-write gate for every
+one of them, so a sweep of the files you are about to touch is one round trip
+rather than three. A path that fails fails the whole call and marks none of them
+read. `-annotated` still takes a single path, because the state runs are
+relative to one buffer's text.
 
 If you only need coordinates and not the whole document — appending, say —
 `raj ctl version` is enough and satisfies that check too.

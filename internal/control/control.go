@@ -99,8 +99,16 @@ type Request struct {
 	LineEnd   *int
 
 	// LSPMode is the sub-operation of an lsp request: hover, definition,
-	// references, completion or diagnostics. Line and Col name the position to ask about
-	// (1-based), which the host maps to the server's UTF-16 coordinates.
+	// references, completion, diagnostics, inlay-hints, symbols or
+	// document-symbols. Line and Col name the position to ask about (1-based),
+	// which the host maps to the server's UTF-16 coordinates; document-symbols
+	// and diagnostics are asked about a file, so they send no position.
+	//
+	// For symbols, Query carries the workspace/symbol text. It is the generic
+	// run of text the wire already knows how to send, which is why this mode
+	// rides it rather than a field of its own; the position is still required
+	// by the CLI's grammar and is what selects the document's server, but
+	// workspace/symbol itself takes only the query.
 	LSPMode string
 	// ReviewList is set on a review request to return the pending change sets
 	// without entering Review mode. Its absence enters the mode, which is what
@@ -126,6 +134,12 @@ type Request struct {
 	// default and extended when ClaimAdd is set; ClaimClear releases it. A
 	// claim that carries none of the three reports the current set. The state
 	// is per identity, keyed by Author.
+	//
+	// Paths is also a read's operand list: a text request with paths reads each
+	// one in a single call, and the Start/End and LineStart/LineEnd span fields
+	// select the same span in every one. It is the list shape claim already
+	// crosses with, so a peer that does not know the read form reads no targets
+	// and falls back to Path.
 	Paths      []string
 	ClaimAdd   bool
 	ClaimClear bool
@@ -283,6 +297,13 @@ type SearchQuery struct {
 	// caller's to send. Sparse by absence, so a peer that does not know it
 	// keeps the filtered default.
 	Hidden bool
+	// Context is how many full lines before and after each hit the engine
+	// returns with it, so a caller sees a hit in place without a follow-up
+	// read. Zero is the hit line alone, which is the behaviour before the
+	// option existed; a negative value is clamped to zero rather than refused.
+	// Sparse by absence, so a peer that does not know it searches without
+	// context.
+	Context int
 }
 
 // SearchMatch is one hit. LineStart..LineEnd bound the whole line the hit was
@@ -304,6 +325,12 @@ type SearchMatch struct {
 	ByteEnd   int    `json:"byte_end"`   // one past the last byte of the match within the file
 	Version   uint64 `json:"version"`    // buffer version the hit was found in, or 0 for disk
 	Text      string `json:"text"`
+	// Context is the hit's line plus the requested number of lines either
+	// side, when search -context asked for them, and empty otherwise. It is
+	// the neighbouring text itself rather than a range, because the caller
+	// that asked for context wants it without a second call. Sparse by
+	// absence, so a peer that does not know the field reads no context.
+	Context string `json:"context,omitempty"`
 }
 
 // TruncatedFile is one file the per-file cap cut down: Shown is how many rows
@@ -359,9 +386,11 @@ type Buffer struct {
 	Path    string `json:"path"`
 	Version uint64 `json:"version"`
 	Dirty   bool   `json:"dirty"`
-	Bytes   int    `json:"bytes"`
-	Lines   int    `json:"lines"`
-	Active  bool   `json:"active"`
+	// Bytes is the buffer's length in a `buffers` reply; in a multi-target
+	// `read` it is the bytes that target contributed to the concatenation.
+	Bytes  int  `json:"bytes"`
+	Lines  int  `json:"lines"`
+	Active bool `json:"active"`
 	// Headless is true when the buffer is loaded and addressable over the
 	// socket but has no tab: `read`, `version` and `lsp diagnostics` load on
 	// demand, so an inspection leaves nothing in front of the user. A
@@ -377,6 +406,14 @@ type Buffer struct {
 	// pending count as the next buffer's path.
 	Pending int `json:"pending"`
 	Moved   int `json:"moved"`
+	// Superseded is how many of this buffer's proposed sets a save would drop
+	// even though the edit view still shows their text: an invalid set whose
+	// run a rejected collider restores. It is a field of its own rather than
+	// folded into Pending because such a file reports no pending set and yet
+	// cannot be saved, and "dirty and cannot be saved" has to be legible. It
+	// travels in its own sparse header field, for the same positional-record
+	// reason Pending and Moved do.
+	Superseded int `json:"superseded,omitempty"`
 	// Tally is the buffer's brace balance, string- and comment-aware, or nil
 	// when the buffer is unnamed or unreadable. It is computed CLI-side from
 	// the live text (unsaved edits included), not carried on the wire header:
@@ -443,6 +480,28 @@ type LSPResult struct {
 	Items     []LSPItem     `json:"items,omitempty"`     // completion
 	Diags     []LSPDiag     `json:"diagnostics,omitempty"`
 	Hints     []LSPHint     `json:"hints,omitempty"`
+	// Symbols is a workspace/symbol answer: the project-wide declarations the
+	// server's index matched against the query. Line and Col are the editor's
+	// 1-based position, or zero when the server named only the file.
+	Symbols []LSPSymbol `json:"symbols,omitempty"`
+	// DocumentSymbols is a textDocument/documentSymbol answer: the declarations
+	// of one file, kept as a tree so a hierarchical reply retains its nesting.
+	// It is a sibling of Symbols, not a replacement: Symbols is the
+	// project-wide index answer, this is the one file's outline.
+	DocumentSymbols []LSPDocumentSymbol `json:"documentSymbols,omitempty"`
+	// Edits is a formatting answer: the server's text edits in the editor's
+	// 1-based line and column coordinates. The ctl mode reports them rather
+	// than applying them — the control surface asks, it does not edit — and
+	// the human chord is what applies a format through the editor's one-undo
+	// application path.
+	Edits []LSPEdit `json:"edits,omitempty"`
+	// Signatures is a signature-help answer: the candidate signatures and the
+	// index the server says is active. ActiveSignature is that top-level index
+	// and ActiveParameter its parameter index; a signature's own
+	// activeParameter override travels on the signature itself.
+	Signatures      []LSPSignature `json:"signatures,omitempty"`
+	ActiveSignature int            `json:"activeSignature,omitempty"`
+	ActiveParameter int            `json:"activeParameter,omitempty"`
 	// Status says whether a diagnostics answer is a real reading of the
 	// server's state. It is set only for diagnostics, and never left empty
 	// there: "ok" means the list is current, so an empty list means no
@@ -476,11 +535,65 @@ type LSPLocation struct {
 	Col  int    `json:"col"`
 }
 
+// LSPSymbol is one workspace/symbol answer: a project-wide declaration the
+// server's index matched to a query. Container names the enclosing type or
+// package when the server sends one. Path is the file it was declared in; Line
+// and Col are the editor's 1-based position, or zero when the server named only
+// the file and no place in it.
+type LSPSymbol struct {
+	Name      string `json:"name"`
+	Kind      string `json:"kind,omitempty"`
+	Container string `json:"container,omitempty"`
+	Path      string `json:"path"`
+	Line      int    `json:"line,omitempty"`
+	Col       int    `json:"col,omitempty"`
+}
+
+// LSPDocumentSymbol is one declaration from a textDocument/documentSymbol
+// answer, with the editor's 1-based line and column of its identifier. Children
+// is the nested list a hierarchical server sent; a flat SymbolInformation reply
+// has no nesting and leaves it empty, so a driver must not assume a depth.
+type LSPDocumentSymbol struct {
+	Name   string `json:"name"`
+	Detail string `json:"detail,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	// Container is the SymbolInformation containerName. A hierarchical reply
+	// names the parent by position in Children instead, so this is usually
+	// empty for one.
+	Container string              `json:"container,omitempty"`
+	Path      string              `json:"path"`
+	Line      int                 `json:"line,omitempty"`
+	Col       int                 `json:"col,omitempty"`
+	Children  []LSPDocumentSymbol `json:"children,omitempty"`
+}
+
 // LSPItem is one completion suggestion.
 type LSPItem struct {
 	Label  string `json:"label"`
 	Detail string `json:"detail,omitempty"`
 	Kind   string `json:"kind,omitempty"`
+}
+
+// LSPSignature is one candidate call signature from a signature-help answer,
+// with its documentation already flattened to plain text. ActiveParameter is
+// the server's per-signature override, or nil when it sent none and the
+// top-level index applies.
+type LSPSignature struct {
+	Label           string         `json:"label"`
+	Documentation   string         `json:"documentation,omitempty"`
+	Parameters      []LSPParameter `json:"parameters,omitempty"`
+	ActiveParameter *int           `json:"activeParameter,omitempty"`
+}
+
+// LSPParameter is one parameter of a signature. Start and End are the server's
+// UTF-16 offsets into the signature label, present only when Offsets is true;
+// otherwise the label is a plain string the server chose and the parameter
+// cannot be located in the signature text.
+type LSPParameter struct {
+	Label   string `json:"label,omitempty"`
+	Start   int    `json:"start,omitempty"`
+	End     int    `json:"end,omitempty"`
+	Offsets bool   `json:"offsets,omitempty"`
 }
 
 // LSPHint is one inlay hint, flattened to the fields a driver needs: a 1-based
@@ -505,6 +618,19 @@ type LSPHintEdit struct {
 	Start int    `json:"start"`
 	End   int    `json:"end"`
 	Text  string `json:"text"`
+}
+
+// LSPEdit is one server text edit: a 1-based start line and column, a 1-based
+// end line and column (end-exclusive, as the protocol's ranges are), and the
+// text that replaces the span. It is the formatting answer's shape, kept in the
+// editor's own coordinates so a driver does not re-implement the UTF-16
+// conversion the host already did.
+type LSPEdit struct {
+	Line    int    `json:"line"`
+	Col     int    `json:"col"`
+	EndLine int    `json:"endLine"`
+	EndCol  int    `json:"endCol"`
+	Text    string `json:"text"`
 }
 
 // LSPDiag is one problem in a file.
@@ -1430,7 +1556,7 @@ func (c *connection) exec(req Request, emit func(Response)) {
 func (c *connection) lsp(req Request, emit func(Response)) {
 	prep := c.srv.submit(Request{ID: req.ID, Op: "lspprep", Path: req.Path,
 		Line: req.Line, Col: req.Col, LSPMode: req.LSPMode,
-		LineStart: req.LineStart, LineEnd: req.LineEnd})
+		LineStart: req.LineStart, LineEnd: req.LineEnd, Query: req.Query})
 	if prep.Err != "" {
 		emit(Response{ID: req.ID, Err: prep.Err, Final: true})
 		return

@@ -1,9 +1,6 @@
 package editor
 
-import (
-	"errors"
-	"unicode/utf8"
-)
+import "errors"
 
 // ErrBinary is returned when a file is not text. raj declines rather than
 // opening it: a binary buffer is unreadable, unsaveable without corrupting the
@@ -24,42 +21,23 @@ var ErrIsDir = errors.New("is a directory")
 // return on a disk image should not be how you find that out.
 const MaxFileSize = 256 << 20
 
-// sniffLen is how much of a file is examined to classify it. A binary file
-// almost always reveals itself immediately, and reading more costs time on
-// every open.
+// sniffLen is how much of a file the single-byte heuristic examines. A binary
+// file almost always reveals itself immediately, and looking deeper costs time
+// on every open.
 const sniffLen = 8192
 
 // IsBinary reports whether content should be treated as binary.
 //
-// Two signals, in the order they are cheap: a NUL byte, which text effectively
-// never contains and every binary format does; and invalid UTF-8, which catches
-// formats that avoid NUL. Neither alone is sufficient — UTF-16 text is full of
-// NULs and would be misclassified either way, which is acceptable, since raj
-// could not edit it correctly anyway.
+// It shares charset with decode, so the verdict here and the decode that
+// follows cannot disagree. A BOM-marked UTF-16 file is text (false); a file
+// with a NUL, or with the control bytes binary formats are made of, is binary
+// (true). A text encoding raj recognises but cannot reproduce is neither:
+// IsBinary is false for it, and decode refuses it by name.
+//
+// Once this sniffed only for a NUL and invalid UTF-8, which made every
+// single-byte encoding binary as a side effect. The decision now lives in
+// charset, which also recognises the encodings raj can round-trip.
 func IsBinary(content string) bool {
-	head := content
-	if len(head) > sniffLen {
-		head = head[:sniffLen]
-	}
-	for i := 0; i < len(head); i++ {
-		if head[i] == 0 {
-			return true
-		}
-	}
-	if utf8.ValidString(head) {
-		return false
-	}
-	// Truncating the sniff window can split a multi-byte rune, so a single
-	// invalid sequence at the very end is not evidence of anything.
-	if len(content) > sniffLen {
-		trimmed := head
-		for len(trimmed) > 0 && !utf8.ValidString(trimmed) {
-			trimmed = trimmed[:len(trimmed)-1]
-			if len(head)-len(trimmed) > utf8.UTFMax {
-				return true
-			}
-		}
-		return false
-	}
-	return true
+	_, _, err := charset([]byte(content))
+	return errors.Is(err, ErrBinary)
 }

@@ -195,6 +195,76 @@ func (p *Pane) CollapseAll() {
 	p.list.Reset()
 }
 
+// ToggleExpandAll expands every visible file group, or folds them all when none
+// is already folded. Visible means the current result set: a path the query or
+// the include/exclude fields filtered out is not in Result.Matches, and its
+// fold state is left alone, so a refine does not silently reopen files the
+// filter is hiding. The rule is read off the visible groups rather than kept in
+// a flag, so a half-read result set still answers "show me everything" on the
+// first press.
+func (p *Pane) ToggleExpandAll() {
+	paths := make([]string, 0, len(p.Result.Matches))
+	seen := make(map[string]bool, len(p.Result.Matches))
+	folded := false
+	for _, m := range p.Result.Matches {
+		if seen[m.Path] {
+			continue
+		}
+		seen[m.Path] = true
+		paths = append(paths, m.Path)
+		if p.collapsed[m.Path] {
+			folded = true
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+	// Remember what the cursor is on: the fold must not move the selection to
+	// another file. A header stays itself; a match row stays itself when it
+	// survives and otherwise lands on its file's header.
+	selPath, selHdr := "", false
+	var selMatch Match
+	if p.list.Sel < len(p.rows) {
+		r := p.rows[p.list.Sel]
+		selPath, selHdr, selMatch = r.Path, r.IsHdr, r.Match
+	}
+	for _, path := range paths {
+		p.collapsed[path] = !folded
+	}
+	p.group()
+	p.reselect(selPath, selHdr, selMatch)
+	p.list.Follow(len(p.rows))
+}
+
+// reselect puts the cursor back on the row it was on before rows was rebuilt.
+// A match is identified by the match itself, so one the fold hid falls back to
+// its file header rather than keeping a stale index that now names another
+// file.
+func (p *Pane) reselect(path string, header bool, m Match) {
+	if len(p.rows) == 0 {
+		p.list.Reset()
+		return
+	}
+	for i, r := range p.rows {
+		if r.Path == path && r.IsHdr == header && (header || r.Match == m) {
+			p.list.Sel = i
+			return
+		}
+	}
+	for i, r := range p.rows {
+		if r.IsHdr && r.Path == path {
+			p.list.Sel = i
+			return
+		}
+	}
+	if p.list.Sel >= len(p.rows) {
+		p.list.Sel = len(p.rows) - 1
+	}
+	if p.list.Sel < 0 {
+		p.list.Sel = 0
+	}
+}
+
 // toggle folds or unfolds the file under the cursor, keeping that header
 // selected so repeated presses open and close the same group.
 func (p *Pane) toggle() {
@@ -309,6 +379,8 @@ func (p *Pane) Handle(a keys.Action, text string) (path string, line int, exit b
 		p.list.Move(-1, len(p.rows))
 	case keys.LineDown:
 		p.list.Move(+1, len(p.rows))
+	case keys.ToggleExpandAll:
+		p.ToggleExpandAll()
 	case keys.Confirm:
 		if p.toggleAt(p.spot) {
 			return "", 0, false

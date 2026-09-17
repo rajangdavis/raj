@@ -33,6 +33,13 @@ type Session struct {
 	// reverses it a second time and the buffer comes back scrambled.
 	reversers map[Version][]Version
 
+	// compacted records store ranges compaction created: a merged or copied
+	// span whose bytes no longer sit inside one journal op's inserted range.
+	// The projection reads them beside the journal's own origins so a
+	// compacted piece is still attributed to the change set that wrote it.
+	// They carry no ops: compaction moves bytes, never history.
+	compacted []insOrigin
+
 	group uint64
 	depth int
 }

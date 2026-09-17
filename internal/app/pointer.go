@@ -63,7 +63,9 @@ func (a *App) pointer(ev ui.Mouse) {
 	// nobody is holding.
 	if !ev.Press {
 		a.drag, a.autoscroll = false, 0
-		return
+		if !ev.Motion {
+			return
+		}
 	}
 	cols, rows := a.screen.Size()
 	l := computeLayout(cols, rows, a.sidebar, a.focus)
@@ -82,10 +84,27 @@ func (a *App) pointer(ev ui.Mouse) {
 				a.dragCol, a.dragRow = ev.Col, ev.Row
 				a.autoscroll = a.beyondEdge(l, p, ev.Row)
 			}
+			return
 		}
+		a.pointerHint(l, ev.Col, ev.Row)
 		return
 	}
 
+	// The menu is drawn over everything but a dialog, so it takes the press
+	// first, before the button split: any click off it dismisses it. A
+	// left-click on a row chooses it; any other press closes it and is
+	// swallowed, so a click that misses the menu cannot focus or open what is
+	// under it.
+	if a.Menu.Open() && !a.Prompt.Open {
+		if ev.Button == keys.MouseLeft {
+			if key, ok := a.Menu.RowAt(ev.Col, ev.Row, a.menuCol, a.menuRow); ok {
+				a.chooseMenu(key)
+				return
+			}
+		}
+		a.closeMenu()
+		return
+	}
 	// Middle-click closes a tab. There is no × drawn on a tab to aim at, and
 	// adding one would spend a column of every label on a target that is
 	// missed as often as it is hit at sidebar widths; middle-click is what
@@ -96,8 +115,22 @@ func (a *App) pointer(ev ui.Mouse) {
 		}
 		return
 	}
+	// A right-click is the context-menu gesture. It resolves against the
+	// geometry the last frame drew, and the overlay order is the draw order
+	// reversed: the dialog, then the menu, then the picker.
+	//
+	// A terminal does not always deliver a right button. iTerm2 on a Mac
+	// trackpad reports ctrl+left-click as MouseLeft with ctrl held, not as
+	// MouseRight, so ctrl+left is the same context-menu gesture here. It is
+	// scoped to the cells a menu has a target in — the tab bar and the
+	// explorer rows — so a ctrl+left anywhere else keeps its ordinary meaning.
+	if ev.Button == keys.MouseRight ||
+		(ev.Button == keys.MouseLeft && ev.Mods&keys.ModCtrl != 0 && a.menuTargetAt(l, ev)) {
+		a.rightClick(l, ev)
+		return
+	}
 	if ev.Button != keys.MouseLeft {
-		return // right-click does nothing yet
+		return // middle-click was handled above; other buttons do nothing
 	}
 
 	switch {
@@ -141,10 +174,148 @@ func (a *App) pointer(ev ui.Mouse) {
 	}
 }
 
+// menuTargetAt reports whether a context menu has a target under the press: a
+// tab on the tab bar, or a row in the explorer. It is the scope of the
+// ctrl+left-click substitute for a right button, so a ctrl+left that misses
+// these keeps its ordinary left-click meaning instead of being swallowed by a
+// menu path with nothing to open. A dialog or picker owns the press wherever
+// it is, exactly as it does for a left click, so neither counts as a target.
+func (a *App) menuTargetAt(l Layout, ev ui.Mouse) bool {
+	if a.Prompt.Open || a.Picker.Open {
+		return false
+	}
+	if ev.Row == l.TabY {
+		cols, _ := a.screen.Size()
+		_, ok := a.Tabs.HitTest(0, cols, ev.Col)
+		return ok
+	}
+	_, _, ok := a.explorerRowAt(l, ev.Col, ev.Row)
+	return ok
+}
+
+// Hint tooltips. A hint occupies cells no caret may enter, so the caret-driven
+// document hover can never anchor one; the pointer can. The motion event is the
+// trigger, the hint-aware column map is the hit test, and the shared hover
+// panel is the box, so a tooltip is a hit test plus a panel show.
+
+// hintDwell is how long the pointer must rest on a hint cell before its
+// tooltip appears. Long enough not to flash as the pointer crosses a hint,
+// short enough that stopping on one feels answered rather than ignored.
+const hintDwell = 300 * time.Millisecond
+
+// hintHover is the pointer-tooltip state. The box is the shared hover.Panel,
+// which the caret-driven document hover also writes, so the state remembers
+// exactly what it showed: a leave closes the panel only while it still holds
+// that text at that anchor, and never a document hover that replaced it.
+type hintHover struct {
+	path    string
+	version int
+	line    int
+	col     int
+	text    string
+	at      time.Time
+	shown   bool
+}
+
+// pointerHint arms the tooltip for the hint under the pointer. It shows nothing
+// yet: the dwell is what stops a pass over a hint from flashing a box, and
+// dwellHint opens it from the idle tick once the pointer rests.
+func (a *App) pointerHint(l Layout, col, row int) {
+	p := a.Tabs.Active()
+	if p == nil {
+		a.hideHint()
+		return
+	}
+	x, y, ok := a.editorCell(l, p, col, row)
+	if !ok {
+		a.hideHint()
+		return
+	}
+	h, line, ok := a.hintAtCell(p, x, y)
+	if !ok {
+		a.hideHint()
+		return
+	}
+	if st := a.hintHover; st.text == h.Tooltip && st.path == a.docPath(p) &&
+		st.version == int(p.File.Session().Version()) {
+		return // the same hint still under a pointer that has not left it
+	}
+	a.hideHint()
+	// Anchor at the hint's own line and starting column, where the box
+	// belongs: the caret is not on the hint and never can be.
+	_, hcol := p.File.LineCol(p.File.LineStart(line) + h.Off)
+	a.hintHover = hintHover{
+		path:    a.docPath(p),
+		version: int(p.File.Session().Version()),
+		line:    line,
+		col:     hcol,
+		text:    h.Tooltip,
+		at:      time.Now(),
+	}
+}
+
+// hintAtCell is the hint drawn in the text-area cell (x, y) of a pane, and the
+// document line it is on. The display column comes from the pane's column map,
+// so the hit test can only find a hint the frame actually painted; the cell is
+// matched against the hint's own span, unlike File.OffsetAt, which resolves the
+// document cell after a hint back to the hint's anchor.
+func (a *App) hintAtCell(p *editor.Pane, x, y int) (editor.Hint, int, bool) {
+	if p.File.Hints == nil {
+		return editor.Hint{}, 0, false // no inlay hints, so no tooltip to show
+	}
+	line := p.File.LineOf(p.OffsetAt(x, y))
+	if line < 0 || line >= p.File.Lines() {
+		return editor.Hint{}, 0, false
+	}
+	h, ok := editor.HintAtCol(p.File.HintsAt(line), p.File.Line(line), p.File.Cols, x+p.Viewport.Left)
+	if !ok || h.Lens || h.Tooltip == "" {
+		return editor.Hint{}, 0, false
+	}
+	return h, line, true
+}
+
+// dwellHint opens a tooltip whose pointer has rested a full dwell. It runs from
+// the idle tick because a pointer that has stopped sends no more motion events,
+// so motion alone could never complete the wait. The version and path pin
+// discard a pending tooltip when the hint it described has been cleared.
+func (a *App) dwellHint() {
+	st := a.hintHover
+	if st.text == "" || st.shown || st.at.IsZero() {
+		return
+	}
+	p := a.Tabs.Active()
+	if p == nil || a.docPath(p) != st.path || int(p.File.Session().Version()) != st.version {
+		a.hintHover = hintHover{}
+		return
+	}
+	if time.Since(st.at) < hintDwell {
+		return
+	}
+	a.Hover.Show(st.text, st.line, st.col)
+	a.hintHover.shown = true
+}
+
+// hideHint closes the panel if it still holds the pointer's tooltip, and forgets
+// the pending one. The content and anchor check is the arbitration with the
+// caret-driven document hover: a panel replaced since the tooltip was shown is
+// left exactly as the replacement left it.
+func (a *App) hideHint() {
+	st := a.hintHover
+	a.hintHover = hintHover{}
+	if !st.shown || st.text == "" || !a.Hover.Open {
+		return
+	}
+	line, col := a.Hover.Anchor()
+	if a.Hover.Text() == st.text && line == st.line && col == st.col {
+		a.Hover.Hide()
+	}
+}
+
 // clickSidebar routes a press into whichever sidebar is open. The divider
 // column belongs to the sidebar's width but is drawn over, so the panes are hit
 // tested against the width they were rendered with rather than the one they
-// were allotted.
+// were allotted. dy is measured from SidebarTop, the row the pane's content
+// starts on, so the padding under the tab bar is not a clickable row.
 func (a *App) clickSidebar(l Layout, ev ui.Mouse) {
 	a.focus = FocusSidebar
 	a.status = ""
@@ -152,19 +323,19 @@ func (a *App) clickSidebar(l Layout, ev ui.Mouse) {
 	if l.ShowEditor {
 		w--
 	}
-	dx, dy := ev.Col-l.SidebarX, ev.Row-l.TopY
+	dx, dy := ev.Col-l.SidebarX, ev.Row-l.SidebarTop
 	switch a.sidebar {
 	case SidebarExplorer:
-		if path, _ := a.Explorer.ClickAt(dy, l.Rows); path != "" {
+		if path, _ := a.Explorer.ClickAt(dy, l.SidebarRows); path != "" {
 			a.OpenFile(path)
 		}
 	case SidebarSearch:
-		if path, line, _ := a.Search.ClickAt(dx, dy, w, l.Rows); path != "" {
+		if path, line, _ := a.Search.ClickAt(dx, dy, w, l.SidebarRows); path != "" {
 			a.OpenFile(path)
 			a.jumpTo(line)
 		}
 	case SidebarProblems:
-		if path, line, _ := a.Problems.ClickAt(dx, dy, w, l.Rows); path != "" {
+		if path, line, _ := a.Problems.ClickAt(dx, dy, w, l.SidebarRows); path != "" {
 			a.OpenFile(path)
 			a.jumpTo(line)
 		}
@@ -178,10 +349,13 @@ func (a *App) clickEditor(l Layout, ev ui.Mouse) {
 	if p == nil {
 		return
 	}
-	if p.Find.Open && ev.Row == l.TopY {
-		a.focus = FocusEditor
-		p.Find.ClickAt(ev.Col - l.EditorX)
-		return
+	if p.Find.Open {
+		ny := ev.Row - l.TopY
+		if ny >= 0 && ny < p.Find.Rows() {
+			a.focus = FocusEditor
+			p.Find.ClickAt(ev.Col-l.EditorX, ny)
+			return
+		}
 	}
 	x, y, ok := a.editorCell(l, p, ev.Col, ev.Row)
 	if !ok {
@@ -190,6 +364,7 @@ func (a *App) clickEditor(l Layout, ev ui.Mouse) {
 
 	a.focus = FocusEditor
 	a.Complete.Hide()
+	a.hideHint()
 	switch a.click.press(ev.Col, ev.Row, time.Now()) {
 	case 2:
 		p.SelectWordAt(x, y)
@@ -222,8 +397,11 @@ func (a *App) clickEditor(l Layout, ev ui.Mouse) {
 // wanders out of the pane still has somewhere sensible to extend to.
 func (a *App) editorCell(l Layout, p *editor.Pane, col, row int) (x, y int, ok bool) {
 	top, rows := l.TopY, l.Rows
-	if p.Find.Open {
-		top, rows = top+1, rows-1
+	if n := p.Find.Rows(); n > 0 {
+		top, rows = top+n, rows-n
+		if rows < 1 {
+			rows = 1
+		}
 	}
 	g := p.GutterWidth()
 	textX := l.EditorX + g
@@ -264,8 +442,8 @@ const maxAutoscrollRows = 8
 // zero when it is inside.
 func (a *App) beyondEdge(l Layout, p *editor.Pane, row int) int {
 	top, rows := l.TopY, l.Rows
-	if p.Find.Open {
-		top, rows = top+1, rows-1
+	if n := p.Find.Rows(); n > 0 {
+		top, rows = top+n, rows-n
 	}
 	if rows < 1 {
 		return 0

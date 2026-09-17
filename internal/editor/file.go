@@ -34,11 +34,37 @@ type File struct {
 	// nil means no hints, which draws nothing rather than an empty overlay.
 	Hints *HintSet
 
+	// Lenses are language-server code lenses, drawn inline at the start of the
+	// line they annotate. They share the inline column map and the renderer
+	// with Hints, so HintsAt merges the two, but they are a separate set
+	// because the two features install, clear and filter independently. Like
+	// Hints, installed and cleared on the event thread; nil means none.
+	Lenses *HintSet
+
+	// Semantic is the language server's semantic-token colour overlay,
+	// grouped by line and holding line-relative byte spans. It is consulted
+	// before Syntax and falls back to it wherever it has no span, so chroma
+	// keeps the base colour. Installed and cleared on the event thread like
+	// Hints and Lenses; nil means none.
+	Semantic *SemanticSet
+
+	// Highlight is the language server's document-highlight overlay:
+	// occurrences of the symbol under the caret, marked read or write, drawn
+	// as a background over whatever colour the token already has. It is
+	// caret-dependent, so the set carries the caret and version it was
+	// measured at and the renderer drops it when either has moved. Installed
+	// and cleared on the event thread like Semantic; nil means none.
+	Highlight *HighlightSet
+
 	// hintWidth is the text width the installed Hints were filtered for.
 	// LineCol and OffsetAt read Hints without knowing the pane, so the
 	// application refilters from the full answer when the pane width changes;
 	// this is how it tells that the installed set is stale.
 	hintWidth int
+
+	// lensWidth is the text width the installed Lenses were filtered for, for
+	// the same reason as hintWidth.
+	lensWidth int
 
 	// Indent is what one press of Tab inserts, resolved at open from the
 	// format, the content and the language in that order. indentFrom records
@@ -49,6 +75,12 @@ type File struct {
 	Syntax *syntax.Highlighter
 	sess   *piecetable.Session
 	idx    *view.Index
+
+	// docGen names the document generation: it advances when Reload replaces
+	// the session and its store in place. A Clip's spans are offsets into one
+	// generation's store, so a clip captured before the replacement must not be
+	// spliced after it even though the File pointer is unchanged.
+	docGen uint64
 
 	// saved is the version at the last write, and savedLen/savedSum describe
 	// what was written. The version alone cannot answer "is this file
@@ -126,12 +158,14 @@ func Open(path string, tab int) (*File, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	if IsBinary(string(data)) {
-		return nil, ErrBinary
-	}
 	// Decode before the file is built: indent detection, the line index and
-	// the highlighter should all see the text, not the encoding.
-	text, enc := decode(string(data))
+	// the highlighter should all see the text, not the encoding. A binary
+	// file, or one in an encoding raj cannot reproduce, is refused here,
+	// before any of that is built.
+	text, enc, err := decode(data)
+	if err != nil {
+		return nil, err
+	}
 	f := NewFile(path, text, tab)
 	f.Enc = enc
 	f.savedDisk = sha256.Sum256(data) // the bytes actually on disk, encoding included
@@ -179,9 +213,9 @@ type RestoredWrite struct {
 // whose disk matches that write reads clean rather than dirty. Otherwise the
 // baseline is the log's base, not what the session currently holds: the origin
 // store is the file as it was when logging began, so a buffer whose log contains
-// no ops reads as clean and one whose ops changed the text reads as dirty. A
-// restored buffer has never been saved by this process, so its encoding is the
-// default until a save writes one.
+// no ops reads as clean and one whose ops changed the text reads as dirty. The
+// encoding too comes from the log, installed by SetEncoding after the build, so
+// the file re-encodes as it was saved; a log with none leaves the default.
 func NewRestoredFile(path string, sess *piecetable.Session, tab int, wrote RestoredWrite) *File {
 	content := sess.Buffer().Slice(0, sess.Buffer().Len())
 	style, from := IndentFor(path, content, Indent{Width: tab})
@@ -217,6 +251,13 @@ func NewRestoredFile(path string, sess *piecetable.Session, tab int, wrote Resto
 	}
 	return f
 }
+
+// SetEncoding records the shape of the bytes a restored buffer's log was
+// written in, so the next save re-encodes the same way. NewRestoredFile builds
+// a buffer from an op log and leaves this at the default; the app maps the
+// log's persisted encoding here. An unset encoding is UTF-8, LF, no BOM, which is
+// exactly what a log that recorded none means.
+func (f *File) SetEncoding(enc Encoding) { f.Enc = enc }
 
 // SetIndentDefault applies a preference to files that had nothing to detect —
 // a new buffer, or one with no indentation yet. A file that answered for itself
@@ -390,10 +431,13 @@ func (f *File) acceptedDirty() bool {
 }
 
 // markSaved records what is now on disk, so a later edit that puts the buffer
-// back to it reads as clean. The encoding is applied so the digest names the
-// bytes a save would write.
+// back to it reads as clean.
 func (f *File) markSaved(content string) {
-	f.markSavedBytes(content, encode(content, f.Enc))
+	// A buffer built in memory carries the default encoding — UTF-8, LF, no
+	// mark — so the bytes a save would write are the text itself. Only Open
+	// sets another kind, and it records the bytes it read with
+	// markSavedBytes.
+	f.markSavedBytes(content, []byte(content))
 }
 
 // markSavedBytes is markSaved with the encoded bytes already in hand, for a
@@ -464,10 +508,40 @@ func (f *File) OffsetAt(line, col int) int {
 	return f.idx.LineStart(line) + f.Cols.OffsetOfHints(text, col, f.HintCols(line))
 }
 
-// HintsAt is the hints anchored on a line, nil when the file has none. This is
-// the renderer read path and the nil check is the fast one: most files, and
-// most lines, have no hints.
+// HintsAt is every inline run anchored on a line — code lenses first, then
+// inlay hints — or nil when the file has neither. This is the renderer read
+// path and the nil check is the fast one: most files, and most lines, have
+// nothing here. The two sets are merged rather than drawn separately because
+// they share one column map and one line's display row; a caller that wants
+// only one of them asks LensAt or inlayAt.
 func (f *File) HintsAt(line int) []Hint {
+	lenses := f.LensAt(line)
+	hints := f.inlayAt(line)
+	switch {
+	case len(lenses) == 0:
+		return hints
+	case len(hints) == 0:
+		return lenses
+	}
+	out := make([]Hint, 0, len(lenses)+len(hints))
+	out = append(out, lenses...)
+	out = append(out, hints...)
+	return out
+}
+
+// LensAt is the code lenses anchored on a line, nil when there are none. It is
+// the half of HintsAt the fit path and the run path read on their own.
+func (f *File) LensAt(line int) []Hint {
+	if f.Lenses == nil {
+		return nil
+	}
+	return f.Lenses.At(line)
+}
+
+// inlayAt is the inlay hints anchored on a line, nil when there are none. It
+// is unexported because only the lens fit path needs the half-set; everything
+// outside this package reads the merged HintsAt.
+func (f *File) inlayAt(line int) []Hint {
 	if f.Hints == nil {
 		return nil
 	}
@@ -477,10 +551,17 @@ func (f *File) HintsAt(line int) []Hint {
 // SetHints installs a hint set for the file, replacing whatever was there.
 func (f *File) SetHints(h *HintSet) { f.Hints = h }
 
+// SetLenses installs a code-lens set for the file, replacing whatever was there.
+func (f *File) SetLenses(h *HintSet) { f.Lenses = h }
+
 // HintWidth is the text width the installed Hints were filtered for, or zero
 // when nothing has been filtered yet. The application compares it against the
 // pane width to decide whether the installed set is still current.
 func (f *File) HintWidth() int { return f.hintWidth }
+
+// LensWidth is the text width the installed Lenses were filtered for, for the
+// same reason as HintWidth.
+func (f *File) LensWidth() int { return f.lensWidth }
 
 // SetHintsFiltered installs the hints from an answer that fit width, dropping
 // every hint on a line whose whole line, hints included, is wider than the
@@ -492,13 +573,25 @@ func (f *File) SetHintsFiltered(lineHints []LineHint, width int) {
 	f.hintWidth = width
 }
 
+// SetLensesFiltered is SetHintsFiltered for code lenses. The two record their
+// widths separately so a width change can refilter each from its own answer.
+func (f *File) SetLensesFiltered(lineHints []LineHint, width int) {
+	f.Lenses = LensesThatFit(f, lineHints, width)
+	f.lensWidth = width
+}
+
 // ClearHints drops every hint for the file, for an edit that has moved the
 // offsets they were anchored to. The next answer reinstalls them.
 func (f *File) ClearHints() { f.Hints = nil }
 
-// HintCols is the line's hints in the view-only column form the layout code
-// reads. A file with no hints answers nil, so the hint-aware conversions fall
-// back to the un-hinted ones exactly.
+// ClearLenses drops every code lens for the file, for an edit that has moved
+// the lines they were anchored to, and for a server that stopped advertising
+// them. The next answer reinstalls them.
+func (f *File) ClearLenses() { f.Lenses = nil }
+
+// HintCols is the line's inline runs in the view-only column form the layout
+// code reads, lenses and inlay hints together. A file with neither answers
+// nil, so the hint-aware conversions fall back to the un-hinted ones exactly.
 func (f *File) HintCols(line int) []view.HintCol {
 	return HintCols(f.HintsAt(line))
 }
@@ -606,6 +699,22 @@ func (f *File) RejectGroup(group uint64) bool {
 	}
 	f.sync()
 	return ok
+}
+
+// ClearGroup is the clear gesture's disposal, extended to a superseded
+// proposal: a Rejected set is reversed out as before, and an Invalid
+// (superseded) Proposed set is dropped by marking it rejected, because its text
+// is already gone from the session. Either move changes the composition without
+// necessarily moving the version, so the decision generation advances; a real
+// reversal also moves the document, which sync mirrors into the line index.
+func (f *File) ClearGroup(group uint64) (bool, piecetable.Block) {
+	ok, block := f.sess.ClearGroup(group)
+	if !ok {
+		return false, block
+	}
+	f.noteDecision()
+	f.sync()
+	return true, block
 }
 
 // ClearRejected hard-purges a rejected change set: it reverses the set out of
@@ -773,15 +882,40 @@ func (f *File) applyToIndex(op piecetable.Op) {
 	f.Syntax.Edit(op.Pos, op.DelLen(), n, f.nlBuf, uint64(op.Seq)+1)
 }
 
+// UnsavedProposedError reports a save the editor refused because it would have
+// written the agreed composition while the edit view still shows text from a
+// superseded change set. The sets it names are still Proposed but Invalid --
+// every member a later edit moved past -- so the save's AcceptPending does not
+// agree to them and Project(AcceptedOnly) omits them, while a rejected collider
+// can restore their run to the edit view. Refusing is the safe default for
+// text: the save wrote nothing and changed no decision, and the error names the
+// two gestures that resolve it.
+type UnsavedProposedError struct {
+	// Groups are the still-Proposed sets the save would have dropped, oldest
+	// first.
+	Groups []piecetable.Group
+}
+
+func (e *UnsavedProposedError) Error() string {
+	ids := make([]uint64, len(e.Groups))
+	for i, g := range e.Groups {
+		ids[i] = g.ID
+	}
+	return fmt.Sprintf("save refused: superseded change set(s) %v hold text the buffer shows "+
+		"but the save would drop; accept them to keep the text, or clear them to discard it", ids)
+}
+
 // Save writes the agreed composition to disk and marks the current version
 // clean.
 //
 // It writes Project(AcceptedOnly), never the raw view: proposed and rejected
 // sets are in the buffer but not on disk, which is what makes deciding a
 // proposal a separate gesture from saving one. The save gesture is itself the
-// approval, so every pending set is accepted first — the review popup a human
-// answers is that gesture, and the control verb refuses while anything is
-// proposed before it reaches here.
+// approval, and it accepts the pending sets — the review popup a human answers
+// is that gesture, and the control verb refuses while anything is proposed
+// before it reaches here. But the acceptance only stands if the text can be
+// written: a save whose encoding refuses the text rolls that acceptance back,
+// so a write that never happens approves nothing.
 //
 // The write is atomic — see writeAtomic — so an interrupted save leaves the
 // previous file rather than a truncated one.
@@ -802,11 +936,64 @@ func (f *File) SaveOver() error {
 	if f.Path == "" {
 		return os.ErrInvalid
 	}
-	f.AcceptPending()
+	// The save gesture is the approval, but only a save that can be written
+	// may approve. Encoding can refuse a character the file's encoding has no
+	// byte for, so accept the pending sets into a snapshot first, and if
+	// encode refuses, put the snapshot back: a write that never happened must
+	// not approve the work. Accepting is a pure state flip that cannot fail
+	// and cannot wedge, and the rollback re-proposes exactly the sets the
+	// snapshot held, so a refused save cannot be left half-decided.
+	pending := f.sess.Pending()
+	for _, g := range pending {
+		f.sess.AcceptGroup(g.ID)
+	}
+	// AcceptPending has agreed to every set with a surviving hunk, but a
+	// Proposed set with none -- an Invalid, superseded set -- is left out of
+	// the agreed composition, and a rejected collider can still restore its run
+	// to the edit view. Writing now would drop text the user can see with
+	// nothing on screen to say so, so refuse and roll the acceptance back:
+	// UnsavedProposedError names the sets and the two gestures that resolve
+	// them.
+	if dropped := f.sess.UnsavedProposed(); len(dropped) > 0 {
+		for _, g := range pending {
+			f.sess.MarkGroup(g.ID, piecetable.Proposed)
+		}
+		return &UnsavedProposedError{Groups: dropped}
+	}
 	content := f.sess.Project(piecetable.AcceptedOnly).Text()
-	data := encode(content, f.Enc)
+	data, err := encode(content, f.Enc)
+	if err != nil {
+		for _, g := range pending {
+			f.sess.MarkGroup(g.ID, piecetable.Proposed)
+		}
+		return err
+	}
+	// The bytes are known writable now, so the acceptance is real and the
+	// decision generation moves with it. Waiting until here is what keeps a
+	// refused save from moving the generation while its sets roll back.
+	if len(pending) > 0 {
+		f.noteDecision()
+	}
 	if err := writeAtomic(f.Path, data); err != nil {
 		return err
+	}
+	// The write landed, so retire the Invalid sets it accepted past: sets every
+	// member of which a later edit moved past, holding no text and blocking
+	// nothing. Left Proposed they keep a buffer that matches disk reporting a
+	// decision forever, and its groups listing never settles.
+	// InvalidWithoutMembers is empty while a rejected collider still restores a
+	// run to the view -- the refusal case above -- so this can only mark
+	// memberless sets, and the bytes written are identical with or without it.
+	// Rejecting is the same state-only disposal ClearGroup gives a memberless
+	// invalid Proposal, and it keeps a later un-reject of the collider from
+	// resurrecting the run as agreed text.
+	retired := 0
+	for _, g := range f.sess.InvalidWithoutMembers() {
+		f.sess.MarkGroup(g.ID, piecetable.Rejected)
+		retired++
+	}
+	if retired > 0 {
+		f.noteDecision()
 	}
 	f.markSavedBytes(content, data)
 	f.stampDisk() // raj is now the last writer

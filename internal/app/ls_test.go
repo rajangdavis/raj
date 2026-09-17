@@ -169,3 +169,38 @@ func TestLsMarksSymlinkWithoutFollowing(t *testing.T) {
 		t.Errorf("linkdir size = %d, want none for a symlink", *e.Size)
 	}
 }
+
+// search -context reaches the engine through the shared walk: runSearch
+// forwards the query's Context, and the hit carries its neighbouring lines.
+// The CLI's own test speaks to the fake editor, so this is the app-layer pin
+// that ls.go's Context field is not dropped between the control query and
+// internal/search.
+func TestSearchContextReachesTheEngine(t *testing.T) {
+	h := newHarness(t, "line one\nneedle here\nline three\n")
+	searcher := control.NewGuard(host{h.App}).Snapshot()
+
+	var got []control.SearchMatch
+	if _, _, _, _, err := searcher.Search(context.Background(),
+		control.SearchQuery{Text: "needle", Context: 1},
+		func(b []control.SearchMatch) { got = append(got, b...) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("hits = %+v, want one", got)
+	}
+	if want := "line one\nneedle here\nline three"; got[0].Context != want {
+		t.Errorf("context = %q, want %q", got[0].Context, want)
+	}
+
+	// Without the field the hit is the line alone, the behaviour before the
+	// option existed.
+	got = nil
+	if _, _, _, _, err := searcher.Search(context.Background(),
+		control.SearchQuery{Text: "needle"},
+		func(b []control.SearchMatch) { got = append(got, b...) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Context != "" {
+		t.Errorf("plain hit = %+v, want no context", got)
+	}
+}

@@ -19,15 +19,26 @@ const (
 
 	sidebarMin = 24
 	sidebarMax = 40
+
+	// sidebarPad is how many rows of breathing room the sidebar content keeps
+	// below the tab bar. Only the sidebar is pushed down; the editor keeps the
+	// full height, so TopY and Rows are unchanged.
+	sidebarPad = 1
+
+	// minSidebarRows is the fewest rows the sidebar may be squeezed to: the
+	// explorer's heading, changed-only toggle and footer, plus one tree row.
+	// The pad yields before the pane becomes unusable.
+	minSidebarRows = 4
 )
 
 // Layout is the computed geometry for one frame.
 type Layout struct {
-	SidebarX, SidebarW int
-	EditorX, EditorW   int
-	TabY, TopY, Rows   int
-	ShowSidebar        bool
-	ShowEditor         bool
+	SidebarX, SidebarW      int
+	EditorX, EditorW        int
+	TabY, TopY, Rows        int
+	SidebarTop, SidebarRows int
+	ShowSidebar             bool
+	ShowEditor              bool
 }
 
 // computeLayout decides the geometry from the terminal size, which sidebar is
@@ -41,6 +52,23 @@ func computeLayout(cols, rows int, side Sidebar, focus Focus) Layout {
 	l := Layout{TabY: 0, TopY: 1, Rows: rows - 2} // tab bar above, status below
 	if l.Rows < 1 {
 		l.Rows = 1
+	}
+	// The sidebar is pushed below the tab bar and gives those rows back from
+	// its own height, so its content still ends level with the editor's. The
+	// inset yields to a floor so a short terminal cannot leave the pane with
+	// no room to draw its header and a tree row; when there is no room at all
+	// the pre-inset geometry is preserved.
+	pad := sidebarPad
+	if l.Rows-pad < minSidebarRows {
+		pad = l.Rows - minSidebarRows
+	}
+	if pad < 0 {
+		pad = 0
+	}
+	l.SidebarTop = l.TopY + pad
+	l.SidebarRows = l.Rows - pad
+	if l.SidebarRows < 1 {
+		l.SidebarRows = 1
 	}
 
 	sidebarOpen := side != SidebarNone

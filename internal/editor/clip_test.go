@@ -89,6 +89,75 @@ func TestPasteKeepsAttribution(t *testing.T) {
 	}
 }
 
+// A whole-line copy pasted with the caret next to the text goes in as a line
+// below, rather than at the raw caret: the original line is untouched and the
+// duplicate keeps its own indent. The reported case was a caret after the
+// indentation; a caret anywhere on the line behaves the same.
+func TestWholeLinePasteGoesBelowNotAtCaret(t *testing.T) {
+	const body = "\tfoo\nbar\n"
+	for _, caret := range []int{0, 1, 4} { // column 0, after indent, end of line
+		p := NewPane(NewFile("t.go", body, 2))
+		p.Resize(80, 40)
+		p.Cursors.Set(caret, caret)
+		clip := p.Copy()
+		p.PasteClip(clip)
+		if got, want := p.File.Text(), "\tfoo\n\tfoo\nbar\n"; got != want {
+			t.Errorf("caret %d: got %q, want %q", caret, got, want)
+		}
+	}
+}
+
+// An empty line is filled rather than duplicated, so no stray blank line is
+// left behind; the empty line's own newline terminates the pasted line.
+func TestWholeLinePasteFillsEmptyLine(t *testing.T) {
+	p := NewPane(NewFile("t.go", "one\n\nthree\n", 2))
+	p.Resize(80, 40)
+	p.Cursors.Set(0, 0)
+	clip := p.Copy()
+	p.Cursors.Set(4, 4) // the empty second line
+	p.PasteClip(clip)
+	if got, want := p.File.Text(), "one\none\nthree\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// The final empty line has no newline of its own to inherit, so the pasted
+// line brings one; the file still ends in a newline rather than gaining a
+// blank final line.
+func TestWholeLinePasteFillsFinalEmptyLine(t *testing.T) {
+	p := NewPane(NewFile("t.go", "one\n", 2))
+	p.Resize(80, 40)
+	p.Cursors.Set(0, 0)
+	clip := p.Copy()
+	p.Cursors.Set(p.File.Len(), p.File.Len())
+	p.PasteClip(clip)
+	if got, want := p.File.Text(), "one\none\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// After a linewise paste the cursor sits on the pasted line's first non-blank
+// byte, matching Vim's p, for both the pasted-below and the filled case.
+func TestLinewisePasteCursorAtFirstNonBlank(t *testing.T) {
+	below := NewPane(NewFile("t.go", "\tfoo\nbar\n", 2))
+	below.Resize(80, 40)
+	below.Cursors.Set(0, 0)
+	below.PasteClip(below.Copy())
+	if got, want := below.Cursors.Primary().Head, 6; got != want {
+		t.Errorf("below: cursor at %d, want %d", got, want)
+	}
+
+	filled := NewPane(NewFile("t.go", "one\n\nthree\n", 2))
+	filled.Resize(80, 40)
+	filled.Cursors.Set(0, 0)
+	clip := filled.Copy()
+	filled.Cursors.Set(4, 4)
+	filled.PasteClip(clip)
+	if got, want := filled.Cursors.Primary().Head, 4; got != want {
+		t.Errorf("filled: cursor at %d, want %d", got, want)
+	}
+}
+
 // TestClipCost reports what each strategy costs, for the record.
 func TestClipCost(t *testing.T) {
 	for _, n := range []int{1, 4, 16, 64} {

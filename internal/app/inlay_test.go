@@ -2,9 +2,12 @@ package app
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"raj/internal/editor"
+	"raj/internal/keys"
 	"raj/internal/lsp"
 	"raj/internal/ui"
 )
@@ -578,5 +581,294 @@ func TestHintLinesReachesFileEnd(t *testing.T) {
 	// bottom == File.Lines is exclusive, so hintRange runs to the file end.
 	if end := lsp.NewDocument(p.File.Text()).Position(p.File.Len()); h.hintRange(p, top, bottom).End != end {
 		t.Errorf("range end = %+v, want the file end %+v", h.hintRange(p, top, bottom).End, end)
+	}
+}
+
+// ---------- applying a hint's edits ----------
+
+// Applying a hint's edits lands them through the shared server-edit path, so
+// one undo reverses the whole batch. The offsets are the absolute bytes the
+// install resolved, and no LSP conversion happens at apply time.
+func TestApplyInlayEditLandsAsOneUndoStep(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	h.installInlay(lsp.InlayHint{
+		Pos:  lsp.Position{Line: 1, Character: 0},
+		Text: "int",
+		Edits: []lsp.TextEdit{{
+			Range:   lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 1, Character: 1}},
+			NewText: "xyz",
+		}},
+	})
+	p := h.Pane()
+	p.Cursors.Set(p.File.LineStart(1), p.File.LineStart(1))
+
+	h.applyInlayEdit()
+	if got := h.text(); got != "abc\nxyzef\n" {
+		t.Fatalf("after apply = %q, want the edit landed", got)
+	}
+	if got := h.Status(); !strings.Contains(got, "applied") {
+		t.Errorf("status = %q, want a confirmation", got)
+	}
+	h.press("super+z")
+	if got := h.text(); got != "abc\ndef\n" {
+		t.Errorf("one undo = %q, want the whole batch reversed", got)
+	}
+}
+
+// A hint's edits are pinned to the version they were installed for. An edit
+// that moved the text since makes every offset wrong, so the apply is refused
+// rather than landed at shifted positions. Without the version pin the old
+// [2,3) span would replace whatever byte now sits there.
+func TestApplyInlayEditRefusesStaleOffsets(t *testing.T) {
+	h := newHarness(t, "abcdef\n")
+	h.installInlay(lsp.InlayHint{
+		Pos:  lsp.Position{Line: 0, Character: 2},
+		Text: "x",
+		Edits: []lsp.TextEdit{{
+			Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 2}, End: lsp.Position{Line: 0, Character: 3}},
+			NewText: "ZZ",
+		}},
+	})
+	p := h.Pane()
+	// Shift the text under the installed hint without a draw, which is the
+	// window between an edit and the frame that clears the stale hints.
+	p.ReplaceRange(0, 0, "q")
+	p.Cursors.Set(p.File.LineStart(0)+3, p.File.LineStart(0)+3)
+
+	h.applyInlayEdit()
+	if got := h.text(); got != "qabcdef\n" {
+		t.Errorf("text = %q, want it untouched by a stale edit", got)
+	}
+	if got := h.Status(); !strings.Contains(got, "out of date") {
+		t.Errorf("status = %q, want the stale refusal", got)
+	}
+}
+
+// A hint with no edits says so rather than doing nothing silently, and a line
+// with no hint says that instead. Both are the "the chord did something" half
+// of gating the apply on the hint actually carrying edits.
+func TestApplyInlayEditRefusalsSpeak(t *testing.T) {
+	t.Run("no edits", func(t *testing.T) {
+		h := newHarness(t, "abc\ndef\n")
+		h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 1}, Text: "int"})
+		p := h.Pane()
+		p.Cursors.Set(p.File.LineStart(1)+1, p.File.LineStart(1)+1)
+
+		h.applyInlayEdit()
+		if got := h.text(); got != "abc\ndef\n" {
+			t.Errorf("text = %q, want it untouched", got)
+		}
+		if got := h.Status(); !strings.Contains(got, "no edit") {
+			t.Errorf("status = %q, want it to name the missing edits", got)
+		}
+	})
+	t.Run("no hint", func(t *testing.T) {
+		h := newHarness(t, "abc\ndef\n")
+		h.installInlay(lsp.InlayHint{
+			Pos:   lsp.Position{Line: 0, Character: 0},
+			Text:  "int",
+			Edits: []lsp.TextEdit{{Range: lsp.Range{Start: lsp.Position{}, End: lsp.Position{Line: 0, Character: 1}}, NewText: "x"}},
+		})
+		p := h.Pane()
+		p.Cursors.Set(p.File.LineStart(1), p.File.LineStart(1))
+
+		h.applyInlayEdit()
+		if got := h.text(); got != "abc\ndef\n" {
+			t.Errorf("text = %q, want it untouched", got)
+		}
+		if got := h.Status(); !strings.Contains(got, "no inlay hint") {
+			t.Errorf("status = %q, want it to say there is no hint here", got)
+		}
+	})
+}
+
+// Review mode is read-only for the document, and a hint's edits are an edit.
+func TestApplyInlayEditRefusedInReviewMode(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	h.installInlay(lsp.InlayHint{
+		Pos:  lsp.Position{Line: 1, Character: 0},
+		Text: "int",
+		Edits: []lsp.TextEdit{{
+			Range:   lsp.Range{Start: lsp.Position{Line: 1, Character: 0}, End: lsp.Position{Line: 1, Character: 1}},
+			NewText: "xyz",
+		}},
+	})
+	p := h.Pane()
+	p.Cursors.Set(p.File.LineStart(1), p.File.LineStart(1))
+	h.EnterReview()
+
+	h.applyInlayEdit()
+	if got := h.text(); got != "abc\ndef\n" {
+		t.Errorf("text = %q, want Review mode to refuse the edit", got)
+	}
+	if got := h.Status(); !strings.Contains(got, "read-only") {
+		t.Errorf("status = %q, want the review refusal", got)
+	}
+}
+
+// ---------- mouse-hover tooltips ----------
+
+// hintScreenCell is the screen cell of a hint's first painted column on a
+// document line, for a test that drives the pointer. It reads the same
+// HintCols/HintsAt maths the renderer paints with.
+func hintScreenCell(h *harness, line, off int) (col, row int) {
+	ox, oy := editorOrigin(h)
+	p := h.Pane()
+	text := p.File.Line(line)
+	dc := p.File.Cols.ColOfHints(text, off, editor.HintCols(p.File.HintsAt(line)))
+	return ox + dc - p.Viewport.Left, oy + line - p.Viewport.Top
+}
+
+// move sends a bare pointer move: motion with no button, which is the tooltip's
+// only trigger.
+func move(h *harness, col, row int) {
+	h.Handle(ui.Mouse{Mouse: keys.Mouse{Motion: true, Button: keys.MouseNone, Press: true, Col: col, Row: row}})
+}
+
+// notesPane points the harness at a file type with no language server, so an
+// idle tick in a tooltip test cannot start a real one.
+func notesPane(h *harness) {
+	h.Pane().File.Path = h.root + "/notes.txt"
+	h.Draw()
+}
+
+// rest completes the dwell for a pointer that has stopped, which in the app
+// comes from the idle tick.
+func rest(h *harness) {
+	h.hintHover.at = time.Now().Add(-2 * hintDwell)
+	h.Handle(ui.Tick{})
+	h.Draw()
+}
+
+// A pointer resting on a hint shows its tooltip in the shared hover panel.
+// Before the motion path the bare move was decoded and discarded, so a hint's
+// tooltip was unreachable: no caret can enter a hint's cells.
+func TestHintTooltipShowsAfterDwell(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h)
+	h.installInlay(lsp.InlayHint{
+		Pos:     lsp.Position{Line: 1, Character: 0},
+		Text:    "int",
+		Tooltip: "the inferred type",
+	})
+	col, row := hintScreenCell(h, 1, 0)
+	move(h, col, row)
+	if h.Hover.Open {
+		t.Fatal("the tooltip opened before the pointer rested")
+	}
+	rest(h)
+	if !h.Hover.Open {
+		t.Fatal("resting on a hint did not open its tooltip")
+	}
+	if got := h.Hover.Text(); !strings.Contains(got, "the inferred type") {
+		t.Errorf("tooltip = %q, want the hint's own tooltip", got)
+	}
+}
+
+// Only the hint's own cells show it: the cell after the hint, which the mouse
+// clamp resolves back to the hint's anchor, is outside the span. The positive
+// half makes the test fail without the motion path rather than passing on
+// absence; the negative half would catch a hit test built on the anchor clamp
+// instead of the column-map span.
+func TestHintTooltipOnlyOnTheHintCells(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h)
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
+	col, row := hintScreenCell(h, 1, 0)
+
+	move(h, col, row) // the hint's first cell
+	rest(h)
+	if !h.Hover.Open {
+		t.Fatal("setup: the hint's own span did not show the tooltip")
+	}
+
+	move(h, col+3, row) // the 'd', drawn after the three hint cells
+	h.Draw()
+	if h.Hover.Open {
+		t.Errorf("a cell outside the hint's span kept its tooltip open")
+	}
+}
+
+// Leaving the hint closes its tooltip; the pointer that has stopped being on
+// the hint is the only thing that dismisses it.
+func TestHintTooltipHidesWhenThePointerLeaves(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h)
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
+	col, row := hintScreenCell(h, 1, 0)
+	move(h, col, row)
+	rest(h)
+	if !h.Hover.Open {
+		t.Fatal("setup: the tooltip did not open")
+	}
+
+	lcol, lrow := hintScreenCell(h, 0, 0) // the first line, off the hint
+	move(h, lcol, lrow)
+	h.Draw()
+	if h.Hover.Open {
+		t.Error("leaving the hint left its tooltip open")
+	}
+}
+
+// A hint with no tooltip shows no box: the label is already inline, and an
+// empty box is worse than none.
+func TestHintWithoutATooltipShowsNoBox(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h)
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int"})
+	col, row := hintScreenCell(h, 1, 0)
+
+	move(h, col, row)
+	rest(h)
+	if h.Hover.Open {
+		t.Error("a hint with no tooltip opened a box")
+	}
+}
+
+// The panel is shared with the caret-driven document hover, and the pointer
+// must not dismiss a box it did not open. Crossing a hint without resting — the
+// common gesture — leaves the document hover exactly as it was.
+func TestHintLeaveDoesNotHideADocumentHover(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h)
+	h.lspGen++
+	h.park(lspAnswer{gen: h.lspGen, kind: answerHover, text: "func F()", line: 0, col: 0})
+	h.applyAnswer()
+	if !h.Hover.Open {
+		t.Fatal("setup: the document hover did not open")
+	}
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
+	col, row := hintScreenCell(h, 1, 0)
+
+	move(h, col, row)   // arms the tooltip but does not show it
+	move(h, col+3, row) // leaves the hint before the dwell
+	h.Handle(ui.Tick{})
+	h.Draw()
+	if !h.Hover.Open || !strings.Contains(h.Hover.Text(), "func F()") {
+		t.Errorf("crossing a hint hid the document hover: open=%v text=%q", h.Hover.Open, h.Hover.Text())
+	}
+}
+
+// Once the tooltip is open, a later caret hover replaces the panel and owns it:
+// the pointer leaving the hint must not close the replacement. The state's
+// text-and-anchor match is what tells the two boxes apart.
+func TestHintLeaveLeavesAReplacedPanelAlone(t *testing.T) {
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h)
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
+	col, row := hintScreenCell(h, 1, 0)
+	move(h, col, row)
+	rest(h)
+	if !h.Hover.Open {
+		t.Fatal("setup: the tooltip did not open")
+	}
+
+	h.lspGen++
+	h.park(lspAnswer{gen: h.lspGen, kind: answerHover, text: "func F()", line: 0, col: 0})
+	h.applyAnswer()
+	move(h, col+3, row)
+	h.Draw()
+	if !h.Hover.Open || !strings.Contains(h.Hover.Text(), "func F()") {
+		t.Errorf("leaving the hint hid the document hover that replaced it: open=%v text=%q", h.Hover.Open, h.Hover.Text())
 	}
 }

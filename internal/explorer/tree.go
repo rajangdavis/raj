@@ -30,6 +30,11 @@ type Tree struct {
 	Root     string
 	expanded map[string]bool
 	entries  []Entry
+	// expandAll names the directories whose whole subtree the current
+	// Refresh is opening. ExpandAll sets it; the walk consumes it, opening
+	// each directory it meets and writing the result into expanded, then
+	// Refresh clears it. See ExpandAll.
+	expandAll map[string]bool
 
 	// sig digests the names and kinds of the children of every expanded
 	// directory -- the listing the tree was last built from. ChangedOnDisk
@@ -58,10 +63,11 @@ func NewTree(root string) *Tree {
 		abs = root
 	}
 	t := &Tree{
-		Root:     abs,
-		expanded: map[string]bool{abs: true},
-		session:  map[string]bool{},
-		Hidden:   hidden.Load(abs),
+		Root:      abs,
+		expanded:  map[string]bool{abs: true},
+		expandAll: map[string]bool{},
+		session:   map[string]bool{},
+		Hidden:    hidden.Load(abs),
 	}
 	t.Refresh()
 	return t
@@ -100,6 +106,77 @@ func (t *Tree) Toggle(path string) {
 // Expanded reports a directory's state.
 func (t *Tree) Expanded(path string) bool { return t.expanded[path] }
 
+// ExpandAll opens path and every directory under it. The subtree is loaded by
+// the same walk that draws the rows: path is marked in expandAll, and walk
+// opens the directories it meets from there down, materialising each into
+// expanded as it goes. A recursive expand therefore costs one walk of the
+// subtree -- the walk Refresh already does for expanded directories -- rather
+// than one walk to find the directories and a second to draw them. The mark is
+// consumed and cleared by that Refresh, so a later manual Toggle sees ordinary
+// state and can close a single directory again.
+//
+// The work is bounded by the subtree: one ReadDir per directory the expansion
+// actually brings into view. It is synchronous, like every other Refresh; a
+// subtree too large to load is too large to display, and the alternative -- a
+// background walk feeding rows in later -- would be a second loader.
+func (t *Tree) ExpandAll(path string) {
+	path = filepath.Clean(path)
+	t.Expand(path) // parents too, or a collapsed parent hides the subtree
+	t.expanded[path] = true
+	if t.expandAll == nil {
+		t.expandAll = map[string]bool{}
+	}
+	t.expandAll[path] = true
+	t.Refresh()
+}
+
+// CollapseAll closes every directory under path, leaving path itself open so
+// the children it directly holds stay visible. That is what makes the gesture
+// a toggle: the selected directory stays put and the subtree folds beneath it.
+func (t *Tree) CollapseAll(path string) {
+	path = filepath.Clean(path)
+	prefix := path + string(filepath.Separator)
+	for p := range t.expanded {
+		if strings.HasPrefix(p, prefix) {
+			delete(t.expanded, p)
+		}
+	}
+	delete(t.expandAll, path)
+	t.Refresh()
+}
+
+// ToggleExpandAll is one gesture with two states: if the whole subtree under
+// path is already open it collapses, otherwise it expands. Deciding from the
+// state of the subtree rather than the selected directory's own flag is what
+// makes a partially collapsed subtree expand on the first press instead of
+// folding the rest of it away.
+func (t *Tree) ToggleExpandAll(path string) {
+	if t.allExpanded(path) {
+		t.CollapseAll(path)
+		return
+	}
+	t.ExpandAll(path)
+}
+
+// allExpanded reports whether path and every directory the tree has loaded
+// under it are open. Because walk loads children only of an open directory, a
+// closed descendant that exists is loaded the moment its parent opens; so an
+// expanded path with no closed loaded descendant has its whole subtree open.
+// No filesystem walk is needed to answer it -- the question is about the state
+// the tree already holds.
+func (t *Tree) allExpanded(path string) bool {
+	if !t.expanded[path] {
+		return false
+	}
+	prefix := path + string(filepath.Separator)
+	for _, e := range t.entries {
+		if e.Dir && !e.Open && strings.HasPrefix(e.Path, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
 // ExpandedDirs lists the open directories, for a session to remember. Sorted so
 // a session file does not churn between saves that changed nothing.
 func (t *Tree) ExpandedDirs() []string {
@@ -131,7 +208,8 @@ func (t *Tree) Refresh() {
 		t.changed = gitChanged(t.Root)
 	}
 	t.entries = t.entries[:0]
-	t.walk(t.Root, 0)
+	t.walk(t.Root, 0, t.expandAll[t.Root])
+	t.expandAll = map[string]bool{}
 	t.sig = t.signature()
 }
 
@@ -160,7 +238,11 @@ func (t *Tree) children(dir string) []os.DirEntry {
 	return kept
 }
 
-func (t *Tree) walk(dir string, depth int) {
+// walk lists dir's children. all carries an in-progress ExpandAll: when an
+// ancestor of dir was the target, every directory from there down opens, and
+// each is written into expanded as it is met, so the state is ordinary once
+// the walk finishes.
+func (t *Tree) walk(dir string, depth int, all bool) {
 	for _, it := range t.children(dir) {
 		name := it.Name()
 		path := filepath.Join(dir, name)
@@ -168,10 +250,13 @@ func (t *Tree) walk(dir string, depth int) {
 			if t.ChangedOnly && !t.hasChanged(path) {
 				continue
 			}
-			open := t.expanded[path]
+			open := all || t.expanded[path] || t.expandAll[path]
+			if open {
+				t.expanded[path] = true
+			}
 			t.entries = append(t.entries, Entry{path, name, depth, true, open})
 			if open {
-				t.walk(path, depth+1)
+				t.walk(path, depth+1, all || t.expandAll[path])
 			}
 			continue
 		}

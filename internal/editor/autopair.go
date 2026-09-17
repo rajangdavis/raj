@@ -242,7 +242,8 @@ func (p *Pane) deletePair() bool {
 			return false
 		}
 		before, after := p.byteBefore(c.Head), p.byteAt(c.Head)
-		if pairs[before] != after && !(quotes[before] && before == after) {
+		expect, isOpener := pairs[before]
+		if (!isOpener || expect != after) && !(quotes[before] && before == after) {
 			return false
 		}
 	}

@@ -1613,3 +1613,262 @@ func TestRevertAuthorKeepsASharedGroupsDecision(t *testing.T) {
 		t.Errorf("pending = %+v, want the shared set %d still pending", got, id)
 	}
 }
+
+// A superseded proposal whose text a rejected collider restores to the edit
+// view is what a save would silently drop: Pending has already let it go, and
+// AcceptedOnly never held it. UnsavedProposed names it. Without the comparison
+// against AcceptedAndProposed the function would either name every invalid set
+// -- including the wholly-consumed one that is honestly absent from both views
+// -- or none. Modelled on TestInvalidWhollyOverwrittenProposal for the setup
+// and on TestProjectPoliciesDifferOnRejected and friends for the policy split.
+func TestUnsavedProposedNamesTheSetASaveWouldDrop(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+
+	// The user deletes the whole line; the set's insertion is consumed. The
+	// deletion is rejected, so its bytes come back to the session and the
+	// projection restores them, which is what separates the two compositions.
+	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 12, Text: ""}})
+	collider := s.LastGroup()
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+
+	if len(s.Pending()) != 0 {
+		t.Fatalf("Pending = %+v, want none; the refusal is for a set Pending drops", s.Pending())
+	}
+	if g, _ := findGroup(s, superseded); !g.Invalid {
+		t.Fatalf("set %d = %+v, want invalid", superseded, g)
+	}
+	got := s.UnsavedProposed()
+	if len(got) != 1 || got[0].ID != superseded {
+		t.Fatalf("UnsavedProposed = %+v, want just set %d", got, superseded)
+	}
+	if got[0].State != Proposed {
+		t.Errorf("named set state = %v, want Proposed", got[0].State)
+	}
+}
+
+// UnsavedProposed is silent when the invalid set is absent from the edit view
+// too: a wholly consumed insertion is already gone from AcceptedAndProposed, so
+// nothing on screen is lost and a save must not be refused. Modelled on
+// TestInvalidWhollyOverwrittenProposal, where the collider is accepted and stays.
+func TestUnsavedProposedIsSilentWhenNothingIsShown(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	// An accepted edit overwrites the insertion; nothing restores it.
+	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 6, End: 12, Text: "port"}})
+
+	if g, _ := findGroup(s, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+	if got := s.UnsavedProposed(); len(got) != 0 {
+		t.Errorf("UnsavedProposed = %+v, want none when the text is in neither view", got)
+	}
+}
+
+// A set that still has a surviving hunk is Pending, so it is not what
+// UnsavedProposed names: AcceptPending agrees to it and the text is written. It
+// guards against the function reporting the ordinary proposed set a save
+// handles. Sibling: TestPendingListsOnlyUndecidedGroups.
+func TestUnsavedProposedIgnoresAPendingSet(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	s.MarkGroup(s.LastGroup(), Proposed)
+
+	if len(s.Pending()) != 1 {
+		t.Fatalf("Pending = %+v, want the set", s.Pending())
+	}
+	if got := s.UnsavedProposed(); len(got) != 0 {
+		t.Errorf("UnsavedProposed = %+v, want none for a set a save accepts", got)
+	}
+}
+
+// InvalidWithoutMembers names the memberless invalid sets a save retires: a
+// Proposed set every live member of which is a pure insertion a later edit
+// removed, with no rejected collider restoring a run and no removal of its own
+// to put back. The set is in neither composition, so retiring it is pure
+// bookkeeping. Without the predicate the save has nothing to select and the set
+// lingers Proposed forever.
+func TestInvalidWithoutMembersNamesTheDeadSets(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 0, End: 0, Text: "AB"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	// An accepted edit removes the insertion; nothing restores it, and the
+	// member removed nothing itself, so the set is in neither composition.
+	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 2, Text: ""}})
+
+	if got := s.UnsavedProposed(); len(got) != 0 {
+		t.Fatalf("setup: UnsavedProposed = %+v, want none; the two must not overlap", got)
+	}
+	if len(s.Pending()) != 0 {
+		t.Fatalf("setup: Pending = %+v, want none", s.Pending())
+	}
+	got := s.InvalidWithoutMembers()
+	if len(got) != 1 || got[0].ID != superseded {
+		t.Fatalf("InvalidWithoutMembers = %+v, want just set %d", got, superseded)
+	}
+	if !got[0].Invalid {
+		t.Errorf("set %+v is not marked invalid", got[0])
+	}
+}
+
+// InvalidWithoutMembers is silent when a rejected collider restores the
+// superseded run to the edit view: that set is UnsavedProposed's, and a save
+// must refuse over it rather than retire it. It pins the distinction the two
+// predicates share; without the projection guard the function would hand a set
+// holding visible text to the retirement path. Sibling:
+// TestUnsavedProposedNamesTheSetASaveWouldDrop.
+func TestInvalidWithoutMembersIsSilentWhenTextIsShown(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	// The user deletes the whole line and the deletion is rejected, so its
+	// bytes come back to the session and the projection restores them.
+	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 12, Text: ""}})
+	collider := s.LastGroup()
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if got := s.UnsavedProposed(); len(got) != 1 || got[0].ID != superseded {
+		t.Fatalf("setup: UnsavedProposed = %+v, want just set %d", got, superseded)
+	}
+	if got := s.InvalidWithoutMembers(); len(got) != 0 {
+		t.Errorf("InvalidWithoutMembers = %+v, want none while the run is restored", got)
+	}
+}
+
+// Retiring a memberless invalid set is bookkeeping: it changes no composition,
+// so the session text, the edit view and the agreed composition all stay
+// byte-for-byte what they were. Without that property the save's retirement
+// would silently rewrite the file. Modelled on
+// TestClearGroupDisposesASupersededSet for the fixture.
+func TestRetiringInvalidWithoutMembersChangesNoText(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 0, End: 0, Text: "AB"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 2, Text: ""}})
+
+	if len(s.InvalidWithoutMembers()) != 1 {
+		t.Fatalf("setup: InvalidWithoutMembers = %+v, want the dead set", s.InvalidWithoutMembers())
+	}
+	sessionBefore, editBefore, agreedBefore := text(s),
+		s.Project(AcceptedAndProposed).Text(), s.Project(AcceptedOnly).Text()
+
+	for _, g := range s.InvalidWithoutMembers() {
+		s.MarkGroup(g.ID, Rejected)
+	}
+
+	if got := text(s); got != sessionBefore {
+		t.Errorf("session text = %q after retirement, want %q", got, sessionBefore)
+	}
+	if got := s.Project(AcceptedAndProposed).Text(); got != editBefore {
+		t.Errorf("edit composition = %q after retirement, want %q", got, editBefore)
+	}
+	if got := s.Project(AcceptedOnly).Text(); got != agreedBefore {
+		t.Errorf("agreed composition = %q after retirement, want %q", got, agreedBefore)
+	}
+	if got := s.InvalidWithoutMembers(); len(got) != 0 {
+		t.Errorf("InvalidWithoutMembers = %+v, want none after retirement", got)
+	}
+}
+
+// ClearGroup disposes of a superseded proposal in one gesture. The set is
+// Proposed and Pending drops it, so no accept or reject step can reach it, and
+// no live member can be reversed; marking it Rejected is the whole disposal and
+// takes its restored run out of the edit view. Without the Proposed case the
+// set can be neither decided nor dropped -- the clear verb refuses it as "not a
+// rejected set" -- which is the wedge this closes. Modelled on
+// TestInvalidClearsWhenColliderClears for the setup and on
+// TestClearRejectedBacksOutTheWholeGroup for the rejected path.
+func TestClearGroupDisposesASupersededSet(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 12, Text: ""}})
+	collider := s.LastGroup()
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if g, _ := findGroup(s, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+	before := text(s)
+
+	ok, block := s.ClearGroup(superseded)
+	if !ok {
+		t.Fatalf("ClearGroup of a superseded set = false (block %+v), want one-gesture disposal", block)
+	}
+	if got := s.GroupState(superseded); got != Rejected {
+		t.Errorf("state after clear = %v, want Rejected", got)
+	}
+	if got := text(s); got != before {
+		t.Errorf("session text = %q after a state-only clear, want %q", got, before)
+	}
+	if edit := s.Project(AcceptedAndProposed).Text(); strings.Contains(edit, "socket") {
+		t.Errorf("edit composition = %q, want the restored superseded run gone", edit)
+	}
+	if g, _ := findGroup(s, superseded); g.Invalid {
+		t.Errorf("set %d is still reported invalid after disposal", superseded)
+	}
+}
+
+// ClearGroup still disposes a genuinely rejected set by reversing it, so the
+// new Proposed case did not close the old path. Modelled on
+// TestClearRejectedBacksOutTheWholeGroup.
+func TestClearGroupStillReversesARejectedSet(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	id := s.LastGroup()
+	s.MarkGroup(id, Rejected)
+
+	ok, _ := s.ClearGroup(id)
+	if !ok {
+		t.Fatal("ClearGroup of a rejected set failed")
+	}
+	if got := text(s); got != "hello world\n" {
+		t.Errorf("text after clearing the rejected set = %q, want the reversal", got)
+	}
+	if got := s.GroupState(id); got != Accepted {
+		t.Errorf("state after clear = %v, want the decision dropped", got)
+	}
+}
+
+// ClearGroup refuses a Proposed set that is not invalid, and an Accepted one:
+// neither is a clear, and silently marking an ordinary proposal rejected would
+// drop a decision the user has not made. Without the Invalid guard the Proposed
+// case would swallow every proposal. Sibling: TestClearRejectedRefusesAProposedSet
+// and the address check in TestClearRejectedRefusesUnknownGroup.
+func TestClearGroupRefusesWhatItCannotDispose(t *testing.T) {
+	s := groupSession(t, "hello world\n")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
+	proposed := s.LastGroup()
+	s.MarkGroup(proposed, Proposed)
+
+	if ok, _ := s.ClearGroup(proposed); ok {
+		t.Error("ClearGroup disposed a proposed set that is not invalid")
+	}
+	if got := s.GroupState(proposed); got != Proposed {
+		t.Errorf("state after the refused clear = %v, want Proposed", got)
+	}
+	if ok, _ := s.ClearGroup(9999); ok {
+		t.Error("ClearGroup disposed an id the journal does not hold")
+	}
+}

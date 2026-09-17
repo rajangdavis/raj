@@ -197,6 +197,7 @@ func TestReferencesShapes(t *testing.T) {
 		want int
 	}{
 		{"array", `[{"uri":"file:///w/b.go","range":{"start":{"line":3,"character":5},"end":{"line":3,"character":9}}},{"uri":"file:///w/c.go","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":4}}}]`, 2},
+		{"location link", `[{"targetUri":"file:///w/b.go","targetRange":{"start":{"line":3,"character":5},"end":{"line":3,"character":9}},"targetSelectionRange":{"start":{"line":3,"character":7},"end":{"line":3,"character":8}}}]`, 1},
 		{"empty array", `[]`, 0},
 		{"null", `null`, 0},
 	}
@@ -248,6 +249,134 @@ func TestReferencesSendsContext(t *testing.T) {
 	}
 }
 
+// workspace/symbol is an array of SymbolInformation or the newer
+// WorkspaceSymbol; both carry a name, a kind and a location. A location with a
+// document URI and no range is legal, and the symbol must be kept rather than
+// dropped: a list quietly missing symbols is wrong in a way the caller cannot
+// see.
+func TestWorkspaceSymbolShapes(t *testing.T) {
+	cases := []struct {
+		name  string
+		raw   string
+		want  int
+		first WorkspaceSymbol
+	}{
+		{
+			name: "symbol information",
+			raw:  `[{"name":"F","kind":12,"containerName":"pkg","location":{"uri":"file:///w/b.go","range":{"start":{"line":3,"character":5},"end":{"line":3,"character":9}}}}]`,
+			want: 1,
+			first: WorkspaceSymbol{Name: "F", Kind: 12, Container: "pkg",
+				Location: Location{Path: "/w/b.go", Range: Range{
+					Start: Position{Line: 3, Character: 5}, End: Position{Line: 3, Character: 9},
+				}}, HasRange: true},
+		},
+		{
+			name:  "no range",
+			raw:   `[{"name":"G","kind":13,"location":{"uri":"file:///w/c.go"}}]`,
+			want:  1,
+			first: WorkspaceSymbol{Name: "G", Kind: 13, Location: Location{Path: "/w/c.go"}},
+		},
+		{
+			name: "null",
+			raw:  `null`,
+			want: 0,
+		},
+		{
+			name: "empty array",
+			raw:  `[]`,
+			want: 0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t)
+			f.on("workspace/symbol", func(*Message) (any, *ResponseError) {
+				return json.RawMessage(c.raw), nil
+			})
+			ctx, cancel := ctx1s(t)
+			defer cancel()
+			syms, err := RequestWorkspaceSymbols(ctx, f.conn, "F")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(syms) != c.want {
+				t.Fatalf("got %d symbols, want %d: %+v", len(syms), c.want, syms)
+			}
+			if c.want == 0 {
+				return
+			}
+			if syms[0] != c.first {
+				t.Errorf("first symbol = %+v, want %+v", syms[0], c.first)
+			}
+		})
+	}
+}
+
+// The query is the request: a server is asked which symbols match it, and a
+// client that dropped it would get everything or the wrong set, neither of
+// which reads as an error.
+func TestWorkspaceSymbolSendsQuery(t *testing.T) {
+	f := newFake(t)
+	var got map[string]any
+	f.on("workspace/symbol", func(m *Message) (any, *ResponseError) {
+		json.Unmarshal(m.Params, &got)
+		return json.RawMessage(`[]`), nil
+	})
+	ctx, cancel := ctx1s(t)
+	defer cancel()
+	if _, err := RequestWorkspaceSymbols(ctx, f.conn, "Reader"); err != nil {
+		t.Fatal(err)
+	}
+	if got["query"] != "Reader" {
+		t.Errorf("query sent as %v, want Reader", got["query"])
+	}
+}
+
+// Declaration, type definition and implementation are definition's siblings:
+// one position in, a location list out, differing only in the method name. Each
+// must send its own method and decode through the shared location decode — a
+// method typo is invisible until a server answers method-not-found at runtime,
+// and a decode that returned nothing would make the feature silently jump
+// nowhere.
+func TestSiblingLocationRequests(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		call   func(context.Context, *Conn, string, Position) ([]Location, error)
+	}{
+		{"declaration", "textDocument/declaration", RequestDeclaration},
+		{"type definition", "textDocument/typeDefinition", RequestTypeDefinition},
+		{"implementation", "textDocument/implementation", RequestImplementation},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t)
+			var got map[string]any
+			f.on(c.method, func(m *Message) (any, *ResponseError) {
+				json.Unmarshal(m.Params, &got)
+				return json.RawMessage(`{"uri":"file:///w/b.go","range":{"start":{"line":3,"character":5},"end":{"line":3,"character":9}}}`), nil
+			})
+			ctx, cancel := ctx1s(t)
+			defer cancel()
+			locs, err := c.call(ctx, f.conn, "/w/a.go", Position{Line: 12, Character: 34})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(locs) != 1 || locs[0].Path != "/w/b.go" || locs[0].Range.Start.Line != 3 {
+				t.Fatalf("got %+v, want the one location at /w/b.go:3", locs)
+			}
+			pos, _ := got["position"].(map[string]any)
+			if pos == nil || pos["line"] != float64(12) || pos["character"] != float64(34) {
+				t.Errorf("position sent as %v, want 12:34", pos)
+			}
+			doc, _ := got["textDocument"].(map[string]any)
+			if doc == nil || doc["uri"] != "file:///w/a.go" {
+				t.Errorf("uri sent as %v", doc)
+			}
+		})
+	}
+}
+
 // Nonsense from a server produces nothing rather than a panic. Servers send
 // shapes no version of the specification describes.
 func TestMalformedResponsesAreSurvived(t *testing.T) {
@@ -263,9 +392,13 @@ func TestMalformedResponsesAreSurvived(t *testing.T) {
 		f.on("textDocument/hover", func(*Message) (any, *ResponseError) {
 			return json.RawMessage(raw), nil
 		})
+		f.on("workspace/symbol", func(*Message) (any, *ResponseError) {
+			return json.RawMessage(raw), nil
+		})
 		ctx, cancel := ctx1s(t)
 		RequestDefinition(ctx, f.conn, "/w/a.go", Position{})
 		RequestHover(ctx, f.conn, "/w/a.go", Position{})
+		RequestWorkspaceSymbols(ctx, f.conn, "")
 		cancel()
 	}
 }
@@ -281,6 +414,18 @@ func TestRequestsOnADeadConnection(t *testing.T) {
 	}
 	if _, err := RequestReferences(context.Background(), nil, "/w/a.go", Position{}, true); err != ErrClosed {
 		t.Errorf("references err = %v, want ErrClosed", err)
+	}
+	if _, err := RequestDeclaration(context.Background(), nil, "/w/a.go", Position{}); err != ErrClosed {
+		t.Errorf("declaration err = %v, want ErrClosed", err)
+	}
+	if _, err := RequestTypeDefinition(context.Background(), nil, "/w/a.go", Position{}); err != ErrClosed {
+		t.Errorf("type definition err = %v, want ErrClosed", err)
+	}
+	if _, err := RequestImplementation(context.Background(), nil, "/w/a.go", Position{}); err != ErrClosed {
+		t.Errorf("implementation err = %v, want ErrClosed", err)
+	}
+	if _, err := RequestWorkspaceSymbols(context.Background(), nil, "x"); err != ErrClosed {
+		t.Errorf("workspace symbols err = %v, want ErrClosed", err)
 	}
 
 	f := newFake(t)

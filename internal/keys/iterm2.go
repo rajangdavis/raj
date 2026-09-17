@@ -30,6 +30,12 @@ var itermKeys = map[string]rune{
 	"up": 0xF700, "down": 0xF701, "left": 0xF702, "right": 0xF703,
 	"home": 0xF729, "end": 0xF72B, "pgup": 0xF72C, "pgdown": 0xF72D,
 	"enter": 0x0D, "tab": 0x09, "esc": 0x1B, "backspace": 0x7F, "space": 0x20,
+	// Function keys: AppKit reports an F-key as its own private-use codepoint,
+	// unchanged by shift (a shifted F-key has no alternate character), so a
+	// shifted F-key maps to the plain key with the shift mask.
+	"f1": 0xF704, "f2": 0xF705, "f3": 0xF706, "f4": 0xF707,
+	"f5": 0xF708, "f6": 0xF709, "f7": 0xF70A, "f8": 0xF70B,
+	"f9": 0xF70C, "f10": 0xF70D, "f11": 0xF70E, "f12": 0xF70F,
 }
 
 // ITerm2Profile renders a dynamic profile that forwards raj's chords.

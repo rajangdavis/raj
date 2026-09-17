@@ -57,17 +57,58 @@ type Projection struct {
 	foldRows []int // fold rows, ordered by docLo
 }
 
-// Build lays comp — the text of a piecetable projection — into display rows,
-// inserting one fold row wherever a Fold seg sits and drawing a Restore seg as
-// an ordinary composition row. It returns nil iff there are no segments: with
-// no decisions the composition is the identity and the caller renders the
-// session directly.
-//
-// A kept run's text is its session text, so it pins down the session line starts
-// for the bytes it carries. A fold's bytes are not in comp, so its newlines come
-// from Seg.HiddenLines instead; that is what keeps SessionLine correct for every
-// row after a multi-line fold.
+// FoldRange is one reader-placed hidden run: the session bytes [Lo, Hi) the
+// display collapses to one fold row. It is a display-only range and adds
+// nothing to the document — the same atomic-fold representation a rejected run
+// uses, distinguished only by the sentinel group on its row.
+type FoldRange struct{ Lo, Hi int }
+
+// UserFold is the DispLine.Fold value on a row a reader folded rather than a
+// change set. Change-set ids start at 1, so the top of the id space is free to
+// mark the other kind; Pane.Fold and drawFold read it to tell them apart
+// without a second field on every row.
+const UserFold uint64 = ^uint64(0)
+
+// Build lays comp into display rows from the composition segments alone. It is
+// BuildFolds with no reader-placed folds, kept because every existing caller
+// and test wants exactly that.
 func Build(comp string, segs []Seg) *Projection {
+	return BuildFolds(comp, segs, nil)
+}
+
+// BuildFolds lays comp — the text of a piecetable projection — into display
+// rows, inserting one fold row wherever a Fold seg sits and one more wherever a
+// caller-placed FoldRange hides a run the composition still carries. It returns
+// nil iff there are no segments and no reader folds: with neither, the
+// composition is the identity and the caller renders the session directly.
+//
+// A reader fold (a language server's folding range, toggled by the user) hides
+// bytes the composition keeps, so its whole display rows are dropped and
+// replaced by one fold row. The map stays the single bidirectional projection:
+// DispOfDoc maps any hidden offset to that row, DocAt returns the run's start,
+// and DispOfDocLine answers -1 for the hidden lines, so the caret, scroll,
+// mouse and gutter invariants are the rejected-run ones unchanged.
+func BuildFolds(comp string, segs []Seg, user []FoldRange) *Projection {
+	if len(segs) == 0 {
+		if len(user) == 0 {
+			return nil
+		}
+		// A clean document has no decisions, so the composition is the session
+		// text itself; synthesise the identity run so a fold still has rows to
+		// hide. Every field is the one session byte mapping to itself.
+		segs = []Seg{{Doc: 0, Disp: 0, Len: len(comp), DLen: len(comp)}}
+	}
+	p := buildProjection(comp, segs)
+	if len(user) > 0 {
+		p.hideUserFolds(user)
+	}
+	p.reindex()
+	return p
+}
+
+// buildProjection is the composition-only half of Build. It does not index the
+// rows; BuildFolds hides reader folds first and reindexes once.
+func buildProjection(comp string, segs []Seg) *Projection {
 	if len(segs) == 0 {
 		return nil
 	}
@@ -275,15 +316,101 @@ func Build(comp string, segs []Seg) *Projection {
 		}
 	}
 
+	return p
+}
+
+// reindex rebuilds the derived row tables from p.lines: which rows are folds,
+// which are session-backed, and the first row of each session line. BuildFolds
+// calls it after hiding reader folds, so the map's search tables describe the
+// rows that actually exist.
+func (p *Projection) reindex() {
+	p.first = make([]int, len(p.starts))
+	for i := range p.first {
+		p.first[i] = -1
+	}
+	p.foldRows = p.foldRows[:0]
+	p.sessRows = p.sessRows[:0]
 	for i, d := range p.lines {
 		switch {
 		case d.Fold != 0:
 			p.foldRows = append(p.foldRows, i)
 		case d.SessionLine >= 0:
 			p.sessRows = append(p.sessRows, i)
+			if d.SessionLine < len(p.first) && p.first[d.SessionLine] < 0 {
+				p.first[d.SessionLine] = i
+			}
 		}
 	}
-	return p
+}
+
+// hideUserFolds drops the rows a set of reader folds hides and inserts one fold
+// row for each. Ranges are sorted and overlapping ones merged, so the result is
+// one row per hidden region and the row tables stay ordered by session offset.
+//
+// A row is hidden when its session start falls inside a range. With line-based
+// ranges from a server that is always whole rows, because a range begins at a
+// line start; a proposal fold row that straddles a range boundary is left
+// visible rather than half-hidden, which is the one overlap this deliberately
+// does not try to resolve.
+func (p *Projection) hideUserFolds(folds []FoldRange) {
+	fs := make([]FoldRange, 0, len(folds))
+	for _, f := range folds {
+		if f.Hi > f.Lo {
+			fs = append(fs, f)
+		}
+	}
+	if len(fs) == 0 {
+		return
+	}
+	sort.Slice(fs, func(i, j int) bool { return fs[i].Lo < fs[j].Lo })
+	merged := fs[:1]
+	for _, f := range fs[1:] {
+		last := &merged[len(merged)-1]
+		if f.Lo <= last.Hi {
+			if f.Hi > last.Hi {
+				last.Hi = f.Hi
+			}
+			continue
+		}
+		merged = append(merged, f)
+	}
+
+	n := len(p.lines)
+	lines := make([]DispLine, 0, n)
+	docLo := make([]int, 0, n)
+	docHi := make([]int, 0, n)
+	compLo := make([]int, 0, n)
+	compHi := make([]int, 0, n)
+
+	fi := 0
+	for i := 0; i < n; {
+		for fi < len(merged) && merged[fi].Hi <= p.docLo[i] {
+			fi++
+		}
+		if fi < len(merged) && p.docLo[i] >= merged[fi].Lo && p.docLo[i] < merged[fi].Hi {
+			fr := merged[fi]
+			lines = append(lines, DispLine{SessionLine: -1, Fold: UserFold})
+			docLo = append(docLo, fr.Lo)
+			docHi = append(docHi, fr.Hi)
+			compLo = append(compLo, 0)
+			compHi = append(compHi, 0)
+			for i < n && p.docLo[i] >= fr.Lo && p.docLo[i] < fr.Hi {
+				i++
+			}
+			continue
+		}
+		lines = append(lines, p.lines[i])
+		docLo = append(docLo, p.docLo[i])
+		docHi = append(docHi, p.docHi[i])
+		compLo = append(compLo, p.compLo[i])
+		compHi = append(compHi, p.compHi[i])
+		i++
+	}
+	p.lines = lines
+	p.docLo = docLo
+	p.docHi = docHi
+	p.compLo = compLo
+	p.compHi = compHi
 }
 
 // projLineOf reports which known session line an offset falls on, matching

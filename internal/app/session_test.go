@@ -321,6 +321,92 @@ func TestSessionTickRespectsNoRestore(t *testing.T) {
 	}
 }
 
+// The idle tick is where fragmentation is folded back: two adjacent pieces by
+// one author in one change set merge, the composed text is byte-identical, and
+// a second tick has nothing left to fold. Modelled on
+// TestCompactMergesAdjacentSameAuthorPieces and the sessionTick tests above.
+func TestCompactTickMergesAdjacentSameAuthorPieces(t *testing.T) {
+	h := newHarness(t, "")
+	p := h.Pane()
+	p.File.Begin()
+	p.File.Insert(p.Author, 0, "hello ")
+	p.File.Insert(p.Author, 6, "world")
+	p.File.End()
+	if got := p.File.Pieces(); got != 2 {
+		t.Fatalf("precondition pieces = %d, want 2", got)
+	}
+	before := p.File.Text()
+	now := time.Now()
+	h.compactTick(now)
+	if got := p.File.Pieces(); got != 1 {
+		t.Fatalf("after the tick pieces = %d, want 1", got)
+	}
+	if got := p.File.Text(); got != before {
+		t.Fatalf("text changed to %q, want %q", got, before)
+	}
+	// Compact is idempotent: a later tick folds nothing further.
+	h.compactTick(now.Add(CompactInterval))
+	if got := p.File.Pieces(); got != 1 {
+		t.Fatalf("a second tick changed pieces to %d, want 1", got)
+	}
+}
+
+// An empty buffer has nothing to fold, so the tick touches neither its pieces
+// nor its version. Modelled on TestSessionTickIsInertWhenNothingChanged.
+func TestCompactTickLeavesAQuietBufferAlone(t *testing.T) {
+	h := newHarness(t, "")
+	p := h.Pane()
+	beforePieces, beforeVersion := p.File.Pieces(), p.File.Session().Version()
+	now := time.Now()
+	h.compactTick(now)
+	h.compactTick(now.Add(CompactInterval))
+	if got := p.File.Pieces(); got != beforePieces {
+		t.Fatalf("pieces = %d, want %d", got, beforePieces)
+	}
+	if got := p.File.Session().Version(); got != beforeVersion {
+		t.Fatalf("version = %d, want %d", got, beforeVersion)
+	}
+	// The piece-count guard is what keeps a buffer with nothing to fold off the
+	// origin-index walk, so it must not even be marked as attempted.
+	if len(h.compacted) != 0 {
+		t.Fatalf("quiet buffer was marked compacted: %v", h.compacted)
+	}
+}
+
+// The compaction memo is keyed on the pane, so a closed pane entry outlives
+// its buffer and Go can hand that pointer to a new buffer whose (version,
+// generation) matches, skipping the compaction it needs. A tick must drop the
+// entries that are not in Tabs.All before it reads any of them. Modelled on
+// TestCompactTickMergesAdjacentSameAuthorPieces, which builds the recorded
+// state this one then closes.
+func TestCompactTickPrunesClosedPaneEntries(t *testing.T) {
+	h := newHarness(t, "")
+	p := h.Pane()
+	p.File.Begin()
+	p.File.Insert(p.Author, 0, "hello ")
+	p.File.Insert(p.Author, 6, "world")
+	p.File.End()
+	if got := p.File.Pieces(); got != 2 {
+		t.Fatalf("precondition pieces = %d, want 2", got)
+	}
+	now := time.Now()
+	h.compactTick(now)
+	if _, ok := h.compacted[p]; !ok {
+		t.Fatal("precondition: the pane state was not recorded")
+	}
+	// Close the tab. A saved buffer closes without the unsaved prompt, and the
+	// pane pointer is stale in the map afterwards.
+	h.press("super+s")
+	h.closeTabAt(0)
+	if got := len(h.Tabs.All()); got != 0 {
+		t.Fatalf("tabs after close = %d, want 0", got)
+	}
+	h.compactTick(now.Add(CompactInterval))
+	if _, ok := h.compacted[p]; ok {
+		t.Error("a closed pane compaction state outlived the tab")
+	}
+}
+
 // writeLines writes n lines so a test can grow and shrink the file between
 // sessions.
 func writeLines(t *testing.T, path string, n int) {

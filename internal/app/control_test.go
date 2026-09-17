@@ -1592,7 +1592,7 @@ func TestControlPatchOverAProposalWarnsTheRealSet(t *testing.T) {
 
 // A patch whose every hunk is refused commits nothing, so the host must not
 // mark a change set it did not open. host.Patch guards that with
-// Version() > before because LastGroup names the group Begin reserved, which no
+// Version() > before because LastGroup names the phantom group Begin reserved, which no
 // hunk joined; without the guard ProposeGroup would leave that empty set
 // proposed and could flip the state named after an all-conflict patch. Modelled
 // on TestControlLeaseRefusalCarriesTheGroup (two identities over the real host)
@@ -2448,5 +2448,140 @@ func TestControlGotoIsFileTrueUnderAFold(t *testing.T) {
 	if got := p.Viewport.Top; got != want {
 		t.Errorf("viewport top = %d, want %d: centred on the display row, not session line 31",
 			got, want)
+	}
+}
+
+// sessionGroup returns the piecetable listing of the change set with id, or
+// false when the journal holds none. It is the session-layer sibling of
+// findGroup, which addresses the control.Group the socket returns.
+func sessionGroup(t *testing.T, s *piecetable.Session, id uint64) (piecetable.Group, bool) {
+	t.Helper()
+	for _, g := range s.Groups() {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return piecetable.Group{}, false
+}
+
+// A save the editor would refuse because it drops a superseded set is surfaced
+// by the socket save too, in the one wording: the buffer keeps the text, the
+// file stays as it was, and the message names the set and both exits. Without
+// the refusal this save succeeds and writes a file the buffer does not
+// describe; without saveRefusal it reaches the caller as a bare err.Error()
+// with no gestures in it. Sibling: the ordinary pending refusal in
+// TestControlSaveRefusedWhileProposed.
+func TestControlSaveRefusesSupersededText(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	p := h.Pane()
+	sess := p.File.Session()
+
+	// A set whose insertion a later deletion consumes is invalid. The deletion
+	// is rejected, so the session no longer holds its bytes and the projection
+	// restores the proposed run to the edit view while AcceptedOnly drops it.
+	// The invalid set is the only thing holding the difference, and Pending has
+	// already dropped it.
+	base := sess.Version()
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, base, []piecetable.Hunk{{Start: 6, End: 11, Text: "socket"}})
+	p.File.End()
+	superseded := sess.LastGroup()
+	sess.MarkGroup(superseded, piecetable.Proposed)
+
+	p.File.Begin()
+	// The caret Delete path refuses an edit that intersects a Proposed run, so
+	// the collider has to land the way a real overwrite does: through the diff
+	// path, which treats a Proposed run as advisory.
+	p.File.ApplyDiff(piecetable.User, sess.Version(),
+		[]piecetable.Hunk{{Start: 0, End: 12, Text: ""}})
+	p.File.End()
+	collider := sess.LastGroup()
+	if !sess.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+
+	g, ok := sessionGroup(t, sess, superseded)
+	if !ok || !g.Invalid {
+		t.Fatalf("set %d = %+v, want invalid", superseded, g)
+	}
+	if len(sess.Pending()) != 0 {
+		t.Fatalf("Pending = %+v, want none; the refusal is for a set Pending drops", sess.Pending())
+	}
+	if edit, agreed := sess.Project(piecetable.AcceptedAndProposed).Text(),
+		sess.Project(piecetable.AcceptedOnly).Text(); edit == agreed {
+		t.Fatalf("setup did not separate the compositions: %q", edit)
+	}
+
+	res := c.do(h, control.Request{Op: "save", Path: path})
+	if res.OK {
+		t.Fatal("save succeeded while the agreed composition would drop visible text")
+	}
+	if !strings.Contains(res.Err, fmt.Sprintf("change set(s) [%d]", superseded)) {
+		t.Errorf("refusal = %q, want it to name set %d", res.Err, superseded)
+	}
+	if !strings.Contains(res.Err, "accept them to keep the text") ||
+		!strings.Contains(res.Err, "clear them to discard it") {
+		t.Errorf("refusal = %q, want both exits named", res.Err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "hello world\n" {
+		t.Errorf("file = %q err %v, want the refused save to have written nothing", data, err)
+	}
+	if got := len(sess.Pending()); got != 0 {
+		t.Errorf("Pending after a refused save = %d, want none; the refusal changed no decision", got)
+	}
+}
+
+// clear disposes of a superseded proposal in one gesture: the set is still
+// Proposed and Pending drops it, so no accept or reject step could reach it,
+// and the text is already out of the session. Marking it rejected is enough,
+// and the set leaves the edit view with it. Without ClearGroup's Proposed case
+// the set can be neither decided nor dropped -- clear refuses it as "not a
+// rejected set" -- which is the wedge. Sibling: TestControlClearReportsTheBlockingOverlap
+// for the rejected path.
+func TestControlClearDisposesASupersededSet(t *testing.T) {
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	p := h.Pane()
+	sess := p.File.Session()
+
+	base := sess.Version()
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, base, []piecetable.Hunk{{Start: 6, End: 11, Text: "socket"}})
+	p.File.End()
+	superseded := sess.LastGroup()
+	sess.MarkGroup(superseded, piecetable.Proposed)
+
+	p.File.Begin()
+	// The caret Delete path refuses an edit that intersects a Proposed run, so
+	// land the collider through the diff path, which treats it as advisory.
+	p.File.ApplyDiff(piecetable.User, sess.Version(),
+		[]piecetable.Hunk{{Start: 0, End: 12, Text: ""}})
+	p.File.End()
+	collider := sess.LastGroup()
+	if !sess.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if g, _ := sessionGroup(t, sess, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+
+	res := c.do(h, control.Request{Op: "clear", Path: path, Group: superseded})
+	if !res.OK {
+		t.Fatalf("clear of a superseded set = %+v, want one-gesture disposal", res)
+	}
+	if got := sess.GroupState(superseded); got != piecetable.Rejected {
+		t.Errorf("state after clear = %v, want Rejected", got)
+	}
+	if edit := sess.Project(piecetable.AcceptedAndProposed).Text(); strings.Contains(edit, "socket") {
+		t.Errorf("edit composition after clear = %q, want the superseded text gone", edit)
+	}
+	if got := sess.Project(piecetable.AcceptedOnly).Text(); got != "hello world\n" {
+		t.Errorf("agreed composition after clear = %q", got)
+	}
+	if g, _ := sessionGroup(t, sess, superseded); g.Invalid {
+		t.Errorf("set %d is still reported invalid after disposal", superseded)
 	}
 }

@@ -310,6 +310,95 @@ func (s *Session) Pending() []Group {
 	return out
 }
 
+// UnsavedProposed reports the change sets a save would leave out even though
+// the edit composition still shows their text. It is meant to be consulted
+// after AcceptPending, when every Proposed set with a surviving hunk has been
+// agreed to: what remains Proposed then is an Invalid set, whose members a
+// later edit has moved past.
+//
+// Invalid alone is not enough to refuse a save, and the classification is per
+// set. A wholly consumed insertion is absent from the edit view as well, so
+// there is nothing on screen to lose; but a collider that is itself excluded --
+// a rejected edit that deleted the run -- restores the superseded bytes to
+// AcceptedAndProposed while AcceptedOnly still omits them. Asking each set
+// whether any of its inserted bytes is present in AcceptedAndProposed tells the
+// two apart: the restored run points back into the inserted store range of the
+// superseded member, so visible names exactly the sets a save would drop. A
+// whole-document comparison cannot, because a memberless set can still differ
+// between the two compositions by its *deletion* coming back in AcceptedOnly,
+// which adds text rather than dropping it.
+func (s *Session) UnsavedProposed() []Group {
+	d := s.Project(AcceptedAndProposed)
+	var out []Group
+	for _, g := range s.Groups() {
+		if g.State == Proposed && g.Invalid && s.visible(d, g) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// InvalidWithoutMembers lists the still-Proposed Invalid sets a save can retire
+// without changing a byte of either composition: every live member is a pure
+// insertion whose bytes are already gone. It is the bookkeeping half of the
+// Invalid sets, the complement of UnsavedProposed: a set whose inserted bytes
+// are still in AcceptedAndProposed would be dropped by a save and is refused;
+// a set with no such byte and nothing removed contributes nothing to either
+// view, and retiring it (a state-only reject) changes no text.
+//
+// visible answers the inserted-bytes question from the AcceptedAndProposed
+// composition with the same store-range ownership projectMember uses, so a
+// rejected collider restored run counts and the two listings cannot overlap.
+// deletes excludes a member that removed text: an Invalid set has no surviving
+// inserted run, so un-applying such a member to retire the record would restore
+// the bytes it removed and change the view -- an edit, not bookkeeping.
+func (s *Session) InvalidWithoutMembers() []Group {
+	d := s.Project(AcceptedAndProposed)
+	var out []Group
+	for _, g := range s.Groups() {
+		if g.State == Proposed && g.Invalid && !s.visible(d, g) && !s.deletes(g) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// deletes reports whether any live member of the set removed text. It is the
+// deletion-side companion of visible: an Invalid set has no surviving inserted
+// run, so the removals of its members are the only thing excluding it would put
+// back, and putting them back is a real edit rather than the state-only
+// disposal retirement is.
+func (s *Session) deletes(g Group) bool {
+	for _, o := range s.journal {
+		if o.Group == g.ID && o.Kind == KindEdit && s.live(o.Seq) && o.DelLen() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// visible reports whether any inserted byte of the set is present in the
+// composition d. It is the composition-side form of the ownership test that
+// projectMember makes against the buffer the session holds: a piece that points
+// into a store range the set inserted -- or a compacted origin of one --
+// belongs to the set, wherever the projection placed it. Reading the
+// composition rather than the session buffer is what lets a restored run from a
+// rejected collider count: its bytes are gone from the view and only excluding
+// the collider puts them back.
+func (s *Session) visible(d DerivedProject, g Group) bool {
+	for _, o := range s.journal {
+		if o.Group != g.ID || o.Kind != KindEdit || !s.live(o.Seq) {
+			continue
+		}
+		for _, p := range d.comp.pieces {
+			if insOwns(o.Ins, p) || s.compactedOwns(g.ID, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // AcceptPending agrees to every change set awaiting a decision and reports how
 // many there were.
 //
@@ -351,6 +440,47 @@ func (s *Session) RejectGroup(id uint64) bool {
 // the same forgetting, because Accepted is the default.
 func (s *Session) AcceptGroup(id uint64) {
 	s.MarkGroup(id, Accepted)
+}
+
+// ClearGroup is the one-gesture disposal the clear verb exposes. A Rejected set
+// takes the existing ClearRejectedBlock path: reverse its live members and
+// forget the decision. A Proposed set is ordinarily not clear's business --
+// accept or reject decides it -- with one exception: an Invalid set. No live
+// member of an invalid set has a surviving projection, so there is no text left
+// in the session to reverse; marking it Rejected is the whole disposal, and it
+// is safe because Rejected is excluded from the edit and agreed compositions
+// alike. Forgetting the decision instead, as ClearRejectedBlock does for a set a
+// reversal already emptied, would make the restored run reappear as Accepted --
+// the opposite of a purge.
+//
+// It returns false for an id the journal does not hold, for a Proposed set that
+// is not invalid, and for an Accepted set: none of those is a clear.
+func (s *Session) ClearGroup(id uint64) (bool, Block) {
+	switch s.GroupState(id) {
+	case Rejected:
+		return s.ClearRejectedBlock(id)
+	case Proposed:
+		g, ok := s.groupByID(id)
+		if !ok || !g.Invalid {
+			return false, Block{}
+		}
+		s.MarkGroup(id, Rejected)
+		return true, Block{}
+	default:
+		return false, Block{}
+	}
+}
+
+// groupByID returns the listed change set with id, or false when the journal
+// holds none. It narrows Groups' listing to one set, so the Invalid flag a
+// caller reads here is the same one `groups` reports.
+func (s *Session) groupByID(id uint64) (Group, bool) {
+	for _, g := range s.Groups() {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return Group{}, false
 }
 
 // ClearRejected is the hard purge behind the clear gesture: it reverses a
@@ -550,7 +680,7 @@ func (s *Session) projectMember(o Op) []DiffHunk {
 		run = nil
 	}
 	for _, p := range s.buf.pieceRange(lo, hi-lo) {
-		if insOwns(o.Ins, p) {
+		if insOwns(o.Ins, p) || s.compactedOwns(o.Group, p) {
 			if len(run) == 0 {
 				runStart = pos
 			}

@@ -29,6 +29,15 @@ type Server struct {
 	// case today. nil omits the field.
 	Options any
 
+	// Handler answers requests the server originates — workspace/configuration,
+	// window/showMessageRequest, workspace/applyEdit, client/registerCapability.
+	// Without one every such request is refused with method-not-found, which
+	// leaves a server that asked a question or wanted to register a capability
+	// waiting for a reply that never comes. It runs on the connection's reader
+	// goroutine, so it must only touch state it owns and must never touch
+	// buffers or the screen. nil leaves the default refusal in place.
+	Handler func(*Message) (any, *ResponseError)
+
 	mu       sync.Mutex
 	conn     *Conn
 	cmd      *exec.Cmd
@@ -86,6 +95,11 @@ func (s *Server) Start(ctx context.Context, rootURI string, caps any) (*Initiali
 		}
 		_ = cmd.Wait()
 	}, s.Notify)
+	// Wired before the handshake so a registration cannot arrive before the
+	// handler that records it is in place.
+	if s.Handler != nil {
+		conn.Handle(s.Handler)
+	}
 
 	s.mu.Lock()
 	s.conn, s.cmd = conn, cmd

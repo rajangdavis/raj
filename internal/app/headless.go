@@ -140,6 +140,12 @@ func (a *App) announce(p *editor.Pane) {
 	if !a.Prompt.Open {
 		a.focus = FocusEditor
 	}
+	// A revealed buffer owes the same warning a freshly opened one does: mixed
+	// line endings a save will normalise, or indentation the file's format
+	// rejects. It lands here, before the caller does the work that revealed the
+	// buffer (a proposal, a goto), so a note the caller sets afterwards still
+	// wins the status line.
+	a.status = fileWarning(p.File)
 	// A tab appeared, and the session is the set of tabs; losing one to a crash
 	// is a file to find again.
 	a.TouchSession()

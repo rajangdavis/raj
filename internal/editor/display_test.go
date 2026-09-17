@@ -345,6 +345,48 @@ func TestExportedLineMapOnMultiLineFold(t *testing.T) {
 	}
 }
 
+// RowText is the composition text a display row draws, which is what a
+// consumer needs to read the screen rather than the session. With no decisions
+// the projection is the identity, so every row reads back its session line
+// exactly and D2 can call the accessor unconditionally.
+func TestRowTextIsTheSessionLineWithoutDecisions(t *testing.T) {
+	p := savedPane(t, "alpha\nbeta\ngamma\n")
+	p.SetDisplay(piecetable.AcceptedOnly)
+	if p.disp != nil {
+		t.Fatal("no decisions must leave the projection nil")
+	}
+	for i := 0; i < p.DisplayLines(); i++ {
+		if got, want := p.RowText(i), p.File.Line(i); got != want {
+			t.Errorf("RowText(%d) = %q, want the session line %q", i, got, want)
+		}
+	}
+	if got := p.RowText(-1); got != "" {
+		t.Errorf("RowText(-1) = %q, want empty", got)
+	}
+	if got := p.RowText(p.DisplayLines()); got != "" {
+		t.Errorf("RowText(past the end) = %q, want empty", got)
+	}
+}
+
+// A fold row draws a marker rather than text, so it reads back empty; the rows
+// either side of a rejected mid-line run read back only the slice they draw.
+func TestRowTextIsTheVisibleSliceAroundAFold(t *testing.T) {
+	p, _ := foldedPane(t, "hello world\n")
+	fold := firstFoldRow(p)
+	if fold < 1 || fold+1 >= p.DisplayLines() {
+		t.Fatalf("fixture built no usable fold: row %d of %d", fold, p.DisplayLines())
+	}
+	if got := p.RowText(fold); got != "" {
+		t.Errorf("RowText(fold row %d) = %q, want empty", fold, got)
+	}
+	if got := p.RowText(fold - 1); got != "hello " {
+		t.Errorf("RowText(before the fold) = %q, want %q", got, "hello ")
+	}
+	if got := p.RowText(fold + 1); got != "world" {
+		t.Errorf("RowText(after the fold) = %q, want world", got)
+	}
+}
+
 // firstFoldRow finds the first fold row in the pane's current projection, or
 // -1 when nothing is folded. It reads the exported Fold accessor, so a test
 // observes the projection's effect rather than reaching into view.
@@ -500,5 +542,58 @@ func TestPaneReloadInvalidatesTheDisplayProjection(t *testing.T) {
 	p.UpdateDisplay(piecetable.AcceptedAndProposed)
 	if p.displayBuilds != builds+1 {
 		t.Errorf("displayBuilds = %d, want %d after a reload", p.displayBuilds, builds+1)
+	}
+}
+
+// A display projection is a snapshot of the version it was built for, and the
+// cursor can be read through it on the same event that shortened the text:
+// undo appends its reversing ops and then Pane.history runs FollowCursor,
+// before the next UpdateDisplay rebuilds the map. The stale row then reports
+// the pre-undo line length, and reading the freshly shortened line through it
+// used to slice out of range and take the process down.
+func TestUndoOfAShorteningEditClampsTheStaleProjection(t *testing.T) {
+	p := savedPane(t, "abc\ndef\n")
+	p.Wrap = true // the wrapped cursor path is the one that slices the row
+	// Any decision makes the edit-mode projection non-nil.
+	proposeAt(t, p.File, 4, 7, "DDD")
+	// The user insertion, which the undo will delete. The projection is
+	// built with it in, so its row for line 0 ends past the line the undo
+	// leaves behind.
+	p.Cursors.Set(3, 3)
+	if !p.File.Insert(p.Author, 3, "XY") {
+		t.Fatal("the user insertion was refused")
+	}
+	p.SetDisplay(piecetable.AcceptedAndProposed)
+	if p.disp == nil {
+		t.Fatal("setup: a decision must build a projection")
+	}
+	if _, _, hi, _ := p.line(0); hi <= len("abc") {
+		t.Fatalf("setup: the stale row ends at %d, want past the shortened line", hi)
+	}
+	// Undo runs FollowCursor through the stale map before the frame rebuilds
+	// it; the fix clamps rather than slicing out of range.
+	p.history(p.File.Undo(p.Author))
+	if got := p.File.Text(); got != "abc\nDDD\n" {
+		t.Fatalf("after undo = %q", got)
+	}
+	assertRowsInsideTheirLines(t, p)
+	p.SetDisplay(piecetable.AcceptedAndProposed)
+	assertRowsInsideTheirLines(t, p)
+}
+
+// assertRowsInsideTheirLines is the invariant Pane.line must hold whatever the
+// projection vintage: a session-backed row [lo,hi) lies inside the session
+// line it names.
+func assertRowsInsideTheirLines(t *testing.T, p *Pane) {
+	t.Helper()
+	for i := 0; i < p.DisplayLines(); i++ {
+		sl, lo, hi, _ := p.line(i)
+		if sl < 0 {
+			continue
+		}
+		full := p.File.Line(sl)
+		if lo < 0 || hi < lo || hi > len(full) {
+			t.Fatalf("row %d slice [%d,%d) outside line %q", i, lo, hi, full)
+		}
 	}
 }

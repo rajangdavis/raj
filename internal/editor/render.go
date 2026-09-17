@@ -53,6 +53,21 @@ type Theme struct {
 	// characters. Dim italic marks it as an annotation rather than document
 	// text, so it does not read as something that can be typed or selected.
 	InlayHint ui.Style
+
+	// CodeLens styles a language-server code lens, the actionable annotation
+	// drawn inline at the start of a line. Dim cyan keeps it distinct from the
+	// dim italic inlay hint: a lens reads as a link or button rather than as a
+	// type annotation, so the two do not blur when a line carries both.
+	CodeLens ui.Style
+
+	// HighlightRead and HighlightWrite are the document-highlight backgrounds:
+	// occurrences of the symbol under the caret that the language server
+	// reported. They are background colours rather than full styles so the
+	// token keeps its syntax or semantic foreground and the mark reads as an
+	// emphasis over it, not a replacement. Write is the stronger colour of the
+	// two, so a write can be told from a read at a glance.
+	HighlightRead  ui.Color
+	HighlightWrite ui.Color
 }
 
 // DefaultTheme names as little as possible: the terminal's foreground and
@@ -72,6 +87,12 @@ func DefaultTheme() Theme {
 		Caret:       ui.Ansi(12),
 		CaretText:   ui.Ansi(0),
 		InlayHint:   ui.DefaultStyle.Plus(ui.Dim).Plus(ui.Italic),
+		CodeLens:    ui.DefaultStyle.With(ui.Ansi(6)).Plus(ui.Dim),
+		// A dim grey for a read and a dark magenta for a write: both are
+		// visible on a dark terminal and distinguishable from the selection
+		// grey and the two find colours already in the palette.
+		HighlightRead:  ui.Ansi(236),
+		HighlightWrite: ui.Ansi(54),
 	}
 }
 
@@ -215,13 +236,18 @@ func (p *Pane) placeCaretWrapped(s *ui.Screen, x, y, w, h int) {
 // drawFold renders a hidden run as one dim row. The marker is deliberately
 // quieter than text: it stands for bytes the edit view does not show, and the
 // label names the state and the size so a reader knows a decision put it
-// there. Edit mode only ever folds rejected runs, so rejected is the fallback.
+// there. A rejected run names its change-set state; a reader fold, which has
+// no change set behind it, names itself "folded". Rejected stays the fallback
+// for a row that carries a group the state table cannot name.
 func (p *Pane) drawFold(s *ui.Screen, x, y, w, line int, th Theme) {
 	state := "rejected"
 	n := 0
 	if group, hidden, ok := p.Fold(line); ok {
 		n = hidden
-		if group != 0 {
+		switch {
+		case group == view.UserFold:
+			state = "folded"
+		case group != 0:
 			state = p.File.Session().GroupState(group).String()
 		}
 	}
@@ -280,6 +306,15 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 
 	tints := p.authorTints(start, len(text), th)
 	tokens := p.File.Syntax.Line(line)
+	semantic := p.File.Semantic.At(line)
+	// The document-highlight overlay is caret-dependent, so it is consulted
+	// only while it still describes the caret and version in front of it. A
+	// moved caret or an edit between the answer and this frame drops it here
+	// rather than painting an emphasis on the wrong word.
+	var highlights []HighlightRun
+	if hs := p.File.Highlight; hs.Live(int(p.File.Session().Version()), p.Cursors.Primary().Head) {
+		highlights = hs.At(line)
+	}
 	// Syntax offsets are line-relative, so a continuation row has to shift by
 	// where it starts or the colours slide left by the preceding rows' bytes.
 	shift := lo
@@ -315,14 +350,33 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 		}
 		off := start + offs[i]
 		style := th.Text
-		// Syntax first, then the author tint as a background, then selection,
-		// then the cursor. Each layer only overrides what it needs to: the
-		// tint keeps the token's foreground, so agent-written code is still
-		// syntax-coloured.
-		if st, ok := syntax.StyleAt(tokens, shift+offs[i]); ok {
+		// The semantic overlay refines the syntax colour where the server has
+		// an opinion, and chroma keeps the base everywhere else: it is
+		// consulted first, and only a byte it claims replaces the syntax
+		// style. Then the author tint and the document highlight as
+		// backgrounds, then find or selection, then the cursor. Each layer
+		// only overrides what it needs to: the tint and the highlight keep
+		// the token's foreground, so agent-written code is still
+		// syntax-coloured and a highlighted occurrence still says what it is.
+		if st, ok := syntax.StyleAt(semantic, shift+offs[i]); ok {
+			style = st
+		} else if st, ok := syntax.StyleAt(tokens, shift+offs[i]); ok {
 			style = st
 		}
 		if bg, ok := tints[offs[i]]; ok {
+			style = style.On(bg)
+		}
+		if write, ok := highlightAt(highlights, shift+offs[i]); ok {
+			// The emphasis layers over the token: a background keeps the
+			// syntax or semantic foreground, so the occurrence is marked
+			// without hiding what the token is. It lands after the author
+			// tint because the highlight is the transient mark; find and
+			// selection below still override it, because where the user is
+			// looking matters more than where the server can jump.
+			bg := th.HighlightRead
+			if write {
+				bg = th.HighlightWrite
+			}
 			style = style.On(bg)
 		}
 		if m, cur := p.Find.Highlight(off); m {
@@ -373,12 +427,19 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 	}
 }
 
-// drawHint paints one inlay hint at display column col, padding and text, and
-// returns the column after it. A hint whose run does not fit wholly inside the
-// row is suppressed rather than clipped, but its columns are still counted:
-// the column map counts them whether or not the viewport has room, so skipping
-// the advance would shift every character after it.
+// drawHint paints one inline run — an inlay hint or a code lens — at display
+// column col, padding and text, and returns the column after it. The two differ
+// only in style. A run that does not fit wholly inside the row is suppressed
+// rather than clipped, but its columns are still counted: the column map counts
+// them whether or not the viewport has room, so skipping the advance would
+// shift every character after it.
 func (p *Pane) drawHint(s *ui.Screen, x, y, w, col int, h Hint, th Theme) int {
+	// A lens and an inlay hint share this placement path; the style is the one
+	// thing that tells them apart on a line that carries both.
+	style := th.InlayHint
+	if h.Lens {
+		style = th.CodeLens
+	}
 	width := h.Width()
 	screenX := x + col - p.Viewport.Left
 	if screenX >= x && screenX+width <= x+w {
@@ -391,12 +452,12 @@ func (p *Pane) drawHint(s *ui.Screen, x, y, w, col int, h Hint, th Theme) int {
 		}
 		cx := screenX
 		if h.Left {
-			s.Set(cx, y, ' ', th.InlayHint)
+			s.Set(cx, y, ' ', style)
 			cx++
 		}
-		cx += s.SetString(cx, y, h.Text, th.InlayHint, textW)
+		cx += s.SetString(cx, y, h.Text, style, textW)
 		if h.Right {
-			s.Set(cx, y, ' ', th.InlayHint)
+			s.Set(cx, y, ' ', style)
 		}
 	}
 	return col + width
@@ -469,4 +530,17 @@ func inAny(ranges [][2]int, off int) bool {
 		}
 	}
 	return false
+}
+
+// highlightAt reports whether a line-relative offset falls inside a
+// document-highlight run, and whether that run is a write. The run list holds
+// the handful of occurrences on one line, so a linear scan in the same shape as
+// StyleAt is cheaper than a binary search and keeps the composition readable.
+func highlightAt(runs []HighlightRun, off int) (write, ok bool) {
+	for _, r := range runs {
+		if off >= r.Start && off < r.End {
+			return r.Write, true
+		}
+	}
+	return false, false
 }

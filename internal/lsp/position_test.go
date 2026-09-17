@@ -169,6 +169,38 @@ func TestSpanIsOrdered(t *testing.T) {
 	}
 }
 
+// A start and a UTF-16 length become the byte range the token covers. The
+// conversion counts code units, not bytes: a token after a two-byte rune starts
+// at the right byte, and a length that spans a newline keeps walking rather
+// than clamping at the line end. Without this the semantic overlay would paint
+// shifted bytes on every non-ASCII file.
+func TestSpanFrom(t *testing.T) {
+	cases := []struct {
+		text   string
+		start  Position
+		length int
+		lo, hi int
+	}{
+		{"hello world", Position{0, 6}, 5, 6, 11},
+		// é is two bytes and one unit, so UTF-16 char 6 is byte 7.
+		{"héllo wörld", Position{0, 6}, 5, 7, 13},
+		// A length of zero is an empty span at the start, not the whole line.
+		{"abc", Position{0, 1}, 0, 1, 1},
+		// A token that spans the newline keeps counting units onto line 1.
+		{"ab\ncd", Position{0, 1}, 4, 1, 5},
+		// Past the end clamps rather than panicking.
+		{"abc", Position{0, 99}, 5, 3, 3},
+		{"abc", Position{9, 0}, 5, 3, 3},
+	}
+	for _, c := range cases {
+		lo, hi := NewDocument(c.text).SpanFrom(c.start, c.length)
+		if lo != c.lo || hi != c.hi {
+			t.Errorf("SpanFrom(%q, %+v, %d) = (%d,%d), want (%d,%d)",
+				c.text, c.start, c.length, lo, hi, c.lo, c.hi)
+		}
+	}
+}
+
 // The invariants anything built on this depends on, against arbitrary text and
 // arbitrary offsets: a position is always inside the document, converting back
 // lands on a rune boundary at or before where it started, and nothing panics.

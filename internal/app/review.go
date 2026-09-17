@@ -268,24 +268,8 @@ func (a *App) cycleProposed(forward bool) {
 	on, hasOn := a.proposalAtCaret(p)
 	caretLine := p.File.LineOf(p.Cursors.Primary().Head)
 	next := cycleTarget(groups, caretLine, on.Group, hasOn, forward)
-	reviewJump(p, groups[next].Line+1)
+	jumpToSessionLine(p, groups[next].Line+1)
 	a.status = fmt.Sprintf("proposal %d of %d", next+1, len(groups))
-}
-
-// reviewJump moves the caret to a 1-based session line and centres the
-// viewport on the display row that draws it. The line stays file-true — the
-// caret lands at that session line start — and only the viewport arithmetic
-// moves onto the display map, because a rejected fold above the target shifts
-// its row away from its session line. With no decisions the projection is the
-// identity, so this is exactly the old jump.
-func reviewJump(p *editor.Pane, line int) {
-	if p == nil || line <= 0 {
-		return
-	}
-	off := p.File.LineStart(line - 1)
-	p.Cursors.Set(off, off)
-	row, _ := p.DispPos(off)
-	p.Viewport.Center(row, p.DisplayLines())
 }
 
 // cycleTarget is the index cycleProposed lands on. A caret inside a set steps
@@ -395,7 +379,7 @@ func (a *App) reviewSave(p *editor.Pane, pending []piecetable.Group, then func(s
 		[]string{prompt.Save, prompt.Cancel},
 		func(row int) {
 			if row < len(lines) && lines[row] > 0 {
-				reviewJump(p, lines[row])
+				jumpToSessionLine(p, lines[row])
 			}
 		},
 		func(answer string, ok bool) {
@@ -427,7 +411,7 @@ func (a *App) reviewRows(p *editor.Pane, pending []piecetable.Group) (rows []str
 		if m.DispLine(p) < 0 {
 			continue
 		}
-		firstLine[m.Group] = m.Line + 1 // reviewJump counts from 1
+		firstLine[m.Group] = m.Line + 1 // jumpToSessionLine counts from 1
 	}
 	for _, g := range pending {
 		rows = append(rows, fmt.Sprintf("group %d · %s · %+d bytes · %d op(s)",

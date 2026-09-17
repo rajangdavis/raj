@@ -24,6 +24,7 @@ type FakeHost struct {
 	theme         Theme
 	closed        bool
 	invalidations int
+	repaints      int
 	clipboard     string
 }
 
@@ -42,20 +43,45 @@ func (f *FakeHost) Size() (int, int)     { return f.cols, f.rows }
 func (f *FakeHost) Theme() Theme         { return f.theme }
 func (f *FakeHost) Suspend() error       { f.Send(Suspended{}); return nil }
 
-// Invalidate records a forced repaint. The headless host has no wire to write
-// to, so it only counts them, which is enough to assert that the application
-// invalidates when it should.
+// SetSize changes the size the host reports, the way a real terminal does on a
+// resize. The application adopts it on the next frame, so a test can drive the
+// size-driven layout change that must clear before it repaints. The size
+// accessors are single-goroutine like the rest of the fake, so Size does not
+// take the mutex; the counter methods do, and this follows them.
+func (f *FakeHost) SetSize(cols, rows int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cols, f.rows = cols, rows
+}
+
+// Invalidate records a forced repaint from a cleared surface. The headless host
+// has no wire to write to, so it only counts them, which is enough to assert
+// that the application invalidates when it should.
 func (f *FakeHost) Invalidate() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.invalidations++
 }
 
-// Invalidations is how many full repaints have been forced.
+// Invalidations is how many screen-clearing full repaints have been forced.
 func (f *FakeHost) Invalidations() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.invalidations
+}
+
+// Repaint records a full repaint that does not clear the screen first.
+func (f *FakeHost) Repaint() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repaints++
+}
+
+// Repaints is how many non-clearing full repaints have been forced.
+func (f *FakeHost) Repaints() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.repaints
 }
 
 func (f *FakeHost) Present(s *Screen) error {

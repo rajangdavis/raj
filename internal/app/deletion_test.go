@@ -160,8 +160,9 @@ func TestRemoveForeverRefusedWhenDirty(t *testing.T) {
 	if !strings.Contains(screen, "Unsaved changes") {
 		t.Errorf("the prompt does not say why Remove forever is missing:\n%s", screen)
 	}
-	// Right is a no-op with one button; enter answers Ignore.
-	h.press("right", "enter")
+	// Ignore is the default; enter answers it. Withdraw is the other answer
+	// a refused removal still offers, but this test only needs the file kept.
+	h.press("enter")
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("the file was removed despite unsaved changes: %v", err)
 	}

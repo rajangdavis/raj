@@ -72,7 +72,14 @@ host's `make check` is the gate. That makes reading easy to overstate, so:
   creates the condition it claims — a rejected set that folds, a journal that is
   written, a hidden directory that is seeded. Model it on a named passing
   sibling test.
-- **Reading is not verifying.** A pass that could not run anything labels its
+- **Check arity, not just identifiers.** Confirming that every symbol in a
+  change exists is not the same as checking each call's result count: a
+  two-value call in a single-value context is a `go vet` failure that exports
+  the wave's breakage to `make check` rather than catching it here. Treat
+  multi-return functions as an explicit checkpoint — read each changed call's
+  assignment against the callee's signature.
+- **Reading is not verifying.**
+ A pass that could not run anything labels its
   conclusions as read-only. Never report `verified` for something only
   inspected.
 - **Clean sets.** Leave the review list tidy: dispose of sets you can prove

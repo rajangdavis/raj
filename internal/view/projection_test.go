@@ -671,3 +671,141 @@ func TestBuildMidLineReplacementMergesKeptRuns(t *testing.T) {
 		checkProjectionInvariants(t, "AC", "ABC", p)
 	})
 }
+
+// A reader fold hides the whole display rows of the session lines it covers and
+// stands in for them with one fold row, the same atomic-fold row a rejected run
+// produces. Without BuildFolds the ranges never reach the projection and the
+// file renders every line, so this is the test that the feature is wired.
+func TestBuildFoldsHidesWholeLines(t *testing.T) {
+	// "a\nb\nc\nd\ne\n": a fold of session lines 1..3 hides "b\nc\nd\n".
+	session := "a\nb\nc\nd\ne\n"
+	p := BuildFolds(session, nil, []FoldRange{{Lo: 2, Hi: 8}})
+	if p == nil {
+		t.Fatal("BuildFolds with only reader folds = nil; a clean document still needs a projection")
+	}
+	if got := p.Lines(); got != 4 {
+		t.Fatalf("Lines = %d, want 4 (a, the fold, e, the empty line after the newline)", got)
+	}
+	if got := p.RowText(0); got != "a" {
+		t.Errorf("RowText(0) = %q, want a", got)
+	}
+	if got := p.RowText(2); got != "e" {
+		t.Errorf("RowText(2) = %q, want e", got)
+	}
+	for _, ln := range []int{1, 2, 3} {
+		if got := p.DispOfDocLine(ln); got != -1 {
+			t.Errorf("DispOfDocLine(%d) = %d, want -1 for a folded line", ln, got)
+		}
+	}
+	if got := p.DispOfDocLine(0); got != 0 {
+		t.Errorf("DispOfDocLine(0) = %d, want 0", got)
+	}
+	if got := p.DispOfDocLine(4); got != 2 {
+		t.Errorf("DispOfDocLine(4) = %d, want 2 after the fold", got)
+	}
+	group, hidden, ok := p.Fold(1)
+	if !ok || group != UserFold || hidden != 6 {
+		t.Fatalf("Fold(1) = (%d,%d,%v), want (UserFold,6,true)", group, hidden, ok)
+	}
+	// A click or caret on the fold row lands at the hidden run's start, and
+	// every hidden byte maps back to the fold row at column zero.
+	if got := p.DocAt(1, 0); got != 2 {
+		t.Errorf("DocAt(fold row) = %d, want the hidden start 2", got)
+	}
+	for _, off := range []int{2, 3, 4, 5, 6, 7} {
+		line, col := p.DispOfDoc(off)
+		if line != 1 || col != 0 {
+			t.Errorf("DispOfDoc(%d) = (%d,%d), want the fold row (1,0)", off, line, col)
+		}
+	}
+	if line, _ := p.DispOfDoc(8); line != 2 {
+		t.Errorf("DispOfDoc(8) row = %d, want 2", line)
+	}
+	checkSessionRows(t, p)
+}
+
+// A reader fold is dropped when it has no bytes to hide and overlapping folds
+// merge, so one hidden region is one row and the row tables stay ordered.
+func TestBuildFoldsMergesOverlaps(t *testing.T) {
+	session := "a\nb\nc\nd\n"
+	// Two ranges that overlap: lines 1..2 and lines 2..3 together hide b, c, d.
+	p := BuildFolds(session, nil, []FoldRange{{Lo: 2, Hi: 5}, {Lo: 4, Hi: 8}, {Lo: 4, Hi: 4}})
+	if p == nil {
+		t.Fatal("BuildFolds = nil")
+	}
+	if got := p.Lines(); got != 3 {
+		t.Fatalf("Lines = %d, want 3 (a, one merged fold, the empty line)", got)
+	}
+	if _, hidden, ok := p.Fold(1); !ok || hidden != 6 {
+		t.Fatalf("Fold(1) hidden = %d ok %v, want 6", hidden, ok)
+	}
+	if got := p.DispOfDocLine(3); got != -1 {
+		t.Errorf("DispOfDocLine(3) = %d, want -1", got)
+	}
+	checkSessionRows(t, p)
+}
+
+// A reader fold composes with the rejected-run folds the composition already
+// produces, and the proposal fold is left standing where it is rather than
+// hidden by a range that does not cover it. Without the composition the two
+// kinds would each believe they were the only fold.
+func TestBuildFoldsComposeWithRejectedRun(t *testing.T) {
+	// session "a\nb\nc\nd\ne\nf\n"; the composition hides "c\n" as a rejected
+	// run, producing comp "a\nb\nd\ne\nf\n". The reader then folds "d\ne\n".
+	segs := []Seg{
+		{Doc: 0, Disp: 0, Len: 4, DLen: 4},                                       // "a\nb\n"
+		{Doc: 4, Disp: 4, Len: 2, DLen: 0, Fold: true, Group: 7, HiddenLines: 1}, // "c\n"
+		{Doc: 6, Disp: 4, Len: 4, DLen: 4},                                       // "d\ne\n"
+		{Doc: 10, Disp: 8, Len: 2, DLen: 2},                                      // "f\n"
+	}
+	p := BuildFolds("a\nb\nd\ne\nf\n", segs, []FoldRange{{Lo: 6, Hi: 10}})
+	if p == nil {
+		t.Fatal("BuildFolds = nil")
+	}
+	if got := p.Lines(); got != 6 {
+		t.Fatalf("Lines = %d, want 6 (a, b, rejected fold, reader fold, f, empty line)", got)
+	}
+	if group, _, ok := p.Fold(2); !ok || group != 7 {
+		t.Fatalf("Fold(2) = (%d,_,%v), want the rejected run's group 7", group, ok)
+	}
+	group, hidden, ok := p.Fold(3)
+	if !ok || group != UserFold || hidden != 4 {
+		t.Fatalf("Fold(3) = (%d,%d,%v), want (UserFold,4,true)", group, hidden, ok)
+	}
+	if got := p.DispOfDocLine(2); got != -1 {
+		t.Errorf("DispOfDocLine(2) = %d, want -1: the rejected line is folded", got)
+	}
+	for _, ln := range []int{3, 4} {
+		if got := p.DispOfDocLine(ln); got != -1 {
+			t.Errorf("DispOfDocLine(%d) = %d, want -1: the reader folded it", ln, got)
+		}
+	}
+	if got := p.DispOfDocLine(5); got != 4 {
+		t.Errorf("DispOfDocLine(5) = %d, want 4", got)
+	}
+	if got := p.DocAt(3, 0); got != 6 {
+		t.Errorf("DocAt(reader fold) = %d, want 6", got)
+	}
+	checkSessionRows(t, p)
+}
+
+// A reader fold on a document with no composition segments still needs a
+// projection: Build returns nil for the identity because the caller renders the
+// session directly, but a fold has rows to hide, so BuildFolds synthesises the
+// identity run instead of returning nil.
+func TestBuildFoldsCleanDocumentRebuildsIdentity(t *testing.T) {
+	if p := Build("a\nb\n", nil); p != nil {
+		t.Fatalf("Build with no segs = %v, want nil", p)
+	}
+	p := BuildFolds("a\nb\n", nil, []FoldRange{{Lo: 2, Hi: 4}})
+	if p == nil {
+		t.Fatal("BuildFolds ignored the reader fold on a clean document")
+	}
+	if got := p.Lines(); got != 3 {
+		t.Fatalf("Lines = %d, want 3 (a, the fold, the empty line)", got)
+	}
+	if got := p.DispOfDocLine(1); got != -1 {
+		t.Errorf("DispOfDocLine(1) = %d, want -1", got)
+	}
+	checkSessionRows(t, p)
+}

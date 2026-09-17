@@ -26,6 +26,15 @@ func (a *App) Draw() {
 	// the installed answer catches typed keys, paste, undo, redo and a control
 	// write in one place, before a stale overlay can be painted.
 	a.invalidateHints()
+	// Lenses are dropped by the same rule and for the same reason: their
+	// anchors move with the text, so the frame that would draw them checks the
+	// version first.
+	a.invalidateLenses()
+	// The semantic overlay is keyed to the document version the same way: an
+	// edit moves the bytes it was measured on, so the frame that would paint
+	// it checks the version first and re-installs a still-current answer when
+	// the active tab has changed underneath it.
+	a.invalidateSemantic()
 	cols, rows := a.syncSize()
 	a.screen.Clear()
 	if rows < 2 || cols < 4 {
@@ -37,12 +46,22 @@ func (a *App) Draw() {
 
 	l := computeLayout(cols, rows, a.sidebar, a.focus)
 	// A layout change moves every pane boundary, so the previous frame is a
-	// poor basis for a diff even though it is technically accurate. Repainting
-	// once is cheaper than a subtle residue bug at a pane edge.
+	// poor basis for a diff even though it is technically accurate. When only
+	// the panes moved, raj is the only writer and the frame covers every cell,
+	// so Repaint rather than Invalidate — erasing first would flash the whole
+	// screen on every sidebar toggle. A size change is not raj's own: the
+	// terminal changed what is on screen (a resize leaves the cells outside the
+	// old geometry undefined, and a resume may find a shell has been drawing),
+	// so the first frame and every later size change clear before the write.
 	if l != a.lastLayout {
-		a.host.Invalidate()
+		if cols != a.lastCols || rows != a.lastRows {
+			a.host.Invalidate()
+		} else {
+			a.host.Repaint()
+		}
 		a.lastLayout = l
 	}
+	a.lastCols, a.lastRows = cols, rows
 	a.Tabs.Render(a.screen, 0, l.TabY, cols, a.wth)
 
 	if l.ShowSidebar {
@@ -65,6 +84,12 @@ func (a *App) Draw() {
 	a.Debug.Render(a.screen, a, 0, l.TopY, cols, l.Rows, a.wth)
 	// The picker floats above everything, so it is drawn last.
 	a.Picker.Render(a.screen, cols, rows, a.wth)
+	// The context menu floats above the picker and below a dialog, matching
+	// the order the pointer resolves a press in: a dialog first, then the
+	// menu, then the picker.
+	if a.Menu.Open() {
+		a.drawMenu(cols, rows)
+	}
 	// A dialog is modal, so it floats above even the picker.
 	a.Prompt.Render(a.screen, cols, rows, a.wth)
 	if err := a.host.Present(a.screen); err != nil {
@@ -115,17 +140,19 @@ func (a *App) drawSidebar(l Layout) {
 	if l.ShowEditor {
 		w--
 	}
-	restore := a.screen.Clip(l.SidebarX, l.TopY, w, l.Rows)
+	restore := a.screen.Clip(l.SidebarX, l.SidebarTop, w, l.SidebarRows)
 	switch a.sidebar {
 	case SidebarExplorer:
-		a.Explorer.Render(a.screen, l.SidebarX, l.TopY, w, l.Rows, a.wth, focused)
+		a.Explorer.Render(a.screen, l.SidebarX, l.SidebarTop, w, l.SidebarRows, a.wth, focused)
 	case SidebarSearch:
-		a.Search.Render(a.screen, l.SidebarX, l.TopY, w, l.Rows, a.wth, focused)
+		a.Search.Render(a.screen, l.SidebarX, l.SidebarTop, w, l.SidebarRows, a.wth, focused)
 	case SidebarProblems:
-		a.Problems.Render(a.screen, l.SidebarX, l.TopY, w, l.Rows, a.wth, focused)
+		a.Problems.Render(a.screen, l.SidebarX, l.SidebarTop, w, l.SidebarRows, a.wth, focused)
 	}
 	restore()
 	if l.ShowEditor {
+		// The divider spans the full editor height, not just the content: the
+		// pane boundary reads as continuous even where the sidebar is padded.
 		for y := l.TopY; y < l.TopY+l.Rows; y++ {
 			a.screen.Set(l.SidebarX+l.SidebarW-1, y, '│', a.wth.Border)
 		}
@@ -153,8 +180,11 @@ func (a *App) drawDiagnosticMarks(l Layout) {
 		return
 	}
 	top, rows := l.TopY, l.Rows
-	if p.Find.Open {
-		top, rows = top+1, rows-1
+	if n := p.Find.Rows(); n > 0 {
+		top, rows = top+n, rows-n
+		if rows < 1 {
+			rows = 1
+		}
 	}
 	first := p.Viewport.Top
 
@@ -202,8 +232,11 @@ func (a *App) drawProposalMarks(l Layout) {
 		return
 	}
 	top, rows := l.TopY, l.Rows
-	if p.Find.Open {
-		top, rows = top+1, rows-1
+	if n := p.Find.Rows(); n > 0 {
+		top, rows = top+n, rows-n
+		if rows < 1 {
+			rows = 1
+		}
 	}
 	first := p.Viewport.Top
 	// Two passes so a removal wins a shared line: red is the mark that cannot
@@ -287,8 +320,11 @@ func sessionTopFor(p *editor.Pane, anchorLine, anchorCol int) int {
 // where column zero of the document is.
 func (a *App) textArea(l Layout, p *editor.Pane) (x, y, w, h int) {
 	top, rows := l.TopY, l.Rows
-	if p.Find.Open {
-		top, rows = top+1, rows-1
+	if n := p.Find.Rows(); n > 0 {
+		top, rows = top+n, rows-n
+		if rows < 1 {
+			rows = 1
+		}
 	}
 	g := p.GutterWidth()
 	return l.EditorX + g, top, l.EditorW - g, rows
@@ -311,14 +347,18 @@ func (a *App) drawEditor(l Layout) {
 	// the first point in the frame where the new width is known, so the set is
 	// refreshed here — before RenderFocused resizes the pane itself.
 	a.fitHints(p, l.EditorW-p.GutterWidth())
+	a.fitLenses(p, l.EditorW-p.GutterWidth())
 	restore := a.screen.Clip(l.EditorX, l.TopY, l.EditorW, l.Rows)
 	defer restore()
 	a.screen.Fill(l.EditorX, l.TopY, l.EditorW, l.Rows, ui.DefaultStyle)
 
 	top, rows := l.TopY, l.Rows
-	if p.Find.Open {
+	if n := p.Find.Rows(); n > 0 {
 		p.Find.Render(a.screen, l.EditorX, top, l.EditorW, a.wth)
-		top, rows = top+1, rows-1
+		top, rows = top+n, rows-n
+		if rows < 1 {
+			rows = 1
+		}
 	}
 	p.RenderFocused(a.screen, l.EditorX, top, l.EditorW, rows, a.theme,
 		a.focus == FocusEditor)
@@ -380,6 +420,9 @@ func (a *App) drawStatus(cols, y int) {
 				left += "  " + sum
 			}
 		}
+	}
+	if note := a.pendingRemovalNote(); note != "" {
+		left += "  " + note
 	}
 	// A transient message outranks the diagnostic on the cursor's line: the
 	// status is something raj just did and the diagnostic is always there, so

@@ -20,7 +20,7 @@ func fullHeader() Header {
 		ID: 7, Op: "apply", Path: "/w/main.go", NewPath: "/w/renamed.go", Author: 3, Token: "t0ken",
 		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent",
 		Argv: []string{"go", "test", "./..."}, Dir: "/w",
-		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true, Hidden: true},
+		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true, Hidden: true, Context: 2},
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
 		Root: "/w", PID: 4242, Version: 70000, Bytes: 12345, Lines: 678, Files: 12, Capped: true,
@@ -33,7 +33,7 @@ func fullHeader() Header {
 		Messages:     []Message{{From: 1, Text: "hello"}},
 		Buffers:      []Buffer{{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Pending: 2, Moved: 1, Lines: 5}},
 		Truncated:    []TruncatedFile{{Path: "/w/big.md", Shown: 20, Total: 214}},
-		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, LineEnd: 18, ByteStart: 10, ByteEnd: 14, Version: 6}},
+		Matches:      []MatchMeta{{Line: 2, Col: 3, Len: 4, PathLen: 7, TextLen: 8, LineStart: 9, LineEnd: 18, ByteStart: 10, ByteEnd: 14, Version: 6, Context: "hit"}},
 		Conflicts:    []Conflict{{Index: 1, At: 8, Group: 7, Hunk: Hunk{Start: 1, End: 2, Text: "x"}}},
 		Warnings:     []GroupOverlap{{Group: 7, Author: 3, Start: 6, End: 12}},
 		Spans:        []SpanMeta{{Len: 5, Author: 1}, {Len: 6, Author: 2}},
@@ -647,8 +647,8 @@ func TestOldShapedConflictRecordStillDecodes(t *testing.T) {
 	}
 }
 
-// -path is the newest field on the query record; a payload from before it
-// existed must decode with an empty path rather than a frame error.
+// A payload from before -path existed carries only the six original fields; it
+// must decode with an empty path rather than a frame error.
 func TestOldShapedQueryStillDecodes(t *testing.T) {
 	var w prog.Writer
 	w.Str("needle").Str("*.go").Str("vendor").Bool(false).Bool(false).Bool(false)
@@ -668,6 +668,31 @@ func TestOldShapedQueryStillDecodes(t *testing.T) {
 func TestBufferPendingAndMovedRoundTrip(t *testing.T) {
 	want := []Buffer{
 		{Path: "/w/a.go", Version: 3, Dirty: true, Bytes: 90, Lines: 5, Pending: 2, Moved: 1},
+		{Path: "/w/b.go", Version: 9, Bytes: 4, Lines: 1},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Buffers: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Buffers) != len(want) {
+		t.Fatalf("buffers = %+v, want %d", got.Buffers, len(want))
+	}
+	for i := range want {
+		if got.Buffers[i] != want[i] {
+			t.Errorf("buffer %d = %+v, want %+v", i, got.Buffers[i], want[i])
+		}
+	}
+}
+
+// Headless is per-buffer state
+
+// Superseded is a per-buffer count that must survive the wire: it is how
+// `buffers` says a file holds text a save would refuse even though it reports
+// no pending set. It rides in a sparse field of its own, so a buffer without it
+// decodes as zero.
+func TestBufferSupersededRoundTrip(t *testing.T) {
+	want := []Buffer{
+		{Path: "/w/a.go", Version: 3, Bytes: 90, Lines: 5, Superseded: 1},
 		{Path: "/w/b.go", Version: 9, Bytes: 4, Lines: 1},
 	}
 	got, err := decodeHeader(encodeHeader(Header{Buffers: want}))
@@ -727,6 +752,9 @@ func TestOldShapedBufferRecordStillDecodes(t *testing.T) {
 		if b.Pending != 0 || b.Moved != 0 {
 			t.Errorf("buffer %d carries counts %d/%d; neither was on the wire", i, b.Pending, b.Moved)
 		}
+		if b.Superseded != 0 {
+			t.Errorf("buffer %d carries superseded=%d; the field was not on the wire", i, b.Superseded)
+		}
 		if b.Headless {
 			t.Errorf("buffer %d reads as headless; the field was not on the wire", i)
 		}
@@ -753,5 +781,53 @@ func TestTruncatedRecordListIsRefused(t *testing.T) {
 	}
 	if !errors.Is(err, errBadFrame) {
 		t.Errorf("err = %v, want it to wrap errBadFrame", err)
+	}
+}
+
+// A match's context block rides in its own sparse field, so a hit without
+// context must survive next to one with it, and each block must stay with its
+// own hit rather than shift onto the next. Modelled on
+// TestHeaderKeepsMatchVersion.
+func TestHeaderKeepsMatchContext(t *testing.T) {
+	want := []MatchMeta{
+		{Line: 1, Col: 0, Len: 6, PathLen: 4, ByteStart: 0, ByteEnd: 6},
+		{Line: 2, Col: 1, Len: 6, PathLen: 4, LineStart: 9, ByteStart: 10, ByteEnd: 16,
+			Context: "head\nneedle\ntail"},
+		{Line: 3, Col: 1, Len: 6, PathLen: 4, LineStart: 20, ByteStart: 21, ByteEnd: 27,
+			Context: "a\nb\nc"},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Matches: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != len(want) {
+		t.Fatalf("decoded %d matches, want %d", len(got.Matches), len(want))
+	}
+	for i := range want {
+		if got.Matches[i] != want[i] {
+			t.Errorf("match %d = %+v, want %+v", i, got.Matches[i], want[i])
+		}
+	}
+}
+
+// Context is newer than Path and Hidden, and a payload carrying those two but
+// not Context is exactly the shape the immediately preceding build sent. It
+// must decode with a zero context rather than a frame error, the same
+// forward-compatibility rule the six-field case above pins for Path.
+func TestQueryWithoutContextStillDecodes(t *testing.T) {
+	var w prog.Writer
+	w.Str("needle").Str("*.go").Str("vendor").Bool(false).Bool(false).Bool(false)
+	w.Str("internal").Bool(true)
+	old := prog.Encode([]prog.Op{{Code: hQuery, Payload: w.Done()}})
+
+	got, err := decodeHeader(old)
+	if err != nil {
+		t.Fatalf("a context-less query was refused: %v", err)
+	}
+	if got.Query == nil || got.Query.Path != "internal" || !got.Query.Hidden {
+		t.Fatalf("query = %+v, want Path and Hidden set", got.Query)
+	}
+	if got.Query.Context != 0 {
+		t.Errorf("context = %d, none was on the wire", got.Query.Context)
 	}
 }

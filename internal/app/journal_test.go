@@ -781,3 +781,279 @@ func TestJournalRestoreRebuildsTheDisplayProjection(t *testing.T) {
 		t.Errorf("DisplayLines = %d after restore, want fewer than the %d session lines", q.DisplayLines(), q.File.Lines())
 	}
 }
+
+// A restored buffer must re-encode the way its bytes were shaped on disk. The
+// journal carries the encoding on Base (crash before a save) and Written
+// (crash after one); without installing it on the restored File the next save
+// rewrites a UTF-16 file as UTF-8. Sibling: TestJournalRestoreAfterSaveUsesWrittenHash,
+// the same crash-restore walk, extended to the bytes the save leaves behind.
+func TestJournalRestoreReencodesSavedEncoding(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	for _, tc := range []struct {
+		name      string
+		saveFirst bool
+	}{
+		{"base only", false},
+		{"after save", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			utf16 := "\xff\xfe" + "a\x00b\x00\n\x00" // BOM + "ab\n"
+			h := newHarness(t, utf16)
+			defer h.closeJournals()
+
+			p := h.Pane()
+			if p.File.Enc.Kind != editor.UTF16LE || !p.File.Enc.BOM {
+				t.Fatalf("setup: opened as %+v, want UTF-16LE with a BOM", p.File.Enc)
+			}
+			h.typeText("X") // dirty it so there is a log to restore
+			if tc.saveFirst {
+				h.press("super+s") // the Written record now carries the encoding
+			} else {
+				h.flushJournal(p)
+			}
+			want := p.File.Text()
+
+			// A real restart has the tab in the session, so record it.
+			h.sessionTick(time.Now())
+
+			host := ui.NewFakeHost(120, 12)
+			t.Cleanup(func() { host.Close() })
+			a := New(host, h.root, 2)
+			defer a.closeJournals()
+			a.RestoreSession()
+
+			q := a.Pane()
+			if q == nil {
+				t.Fatal("the UTF-16 log did not restore")
+			}
+			if got := q.File.Text(); got != want {
+				t.Fatalf("restored text = %q, want %q", got, want)
+			}
+			if q.File.Enc.Kind != editor.UTF16LE || !q.File.Enc.BOM {
+				t.Fatalf("restored encoding = %+v, want UTF-16LE with a BOM", q.File.Enc)
+			}
+			if err := q.File.SaveOver(); err != nil {
+				t.Fatalf("save after restore: %v", err)
+			}
+			got, err := os.ReadFile(q.File.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(string(got), "\xff\xfe") {
+				t.Fatalf("saved bytes = % x, want a UTF-16LE BOM", got)
+			}
+			// The bytes are genuinely UTF-16, not a UTF-8 BOM passed off as
+			// one: reopen and ask the decoder.
+			reopened, err := editor.Open(q.File.Path, 2)
+			if err != nil {
+				t.Fatalf("reopening the saved file: %v", err)
+			}
+			if reopened.Enc.Kind != editor.UTF16LE {
+				t.Fatalf("saved file reopened as %v, want UTF-16LE (it was rewritten as UTF-8)", reopened.Enc.Kind)
+			}
+			if reopened.Text() != want {
+				t.Errorf("saved text = %q, want %q", reopened.Text(), want)
+			}
+		})
+	}
+}
+
+// After a save, a further edit is unsaved work the log must replay. The Written
+// marker hashes the encoded bytes, so a restore that compared it to the decoded
+// text read a matching disk as an external edit: the log was archived and the
+// edit was lost. A UTF-16 file is where the text hash and the byte hash always
+// differ. Sibling: TestJournalRestoreReencodesSavedEncoding, the same
+// crash-restore walk without the second edit.
+func TestJournalRestoreReplaysUnsavedEditAfterSave(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	utf16 := "\xff\xfe" + "a\x00b\x00\n\x00" // BOM + "ab\n"
+	h := newHarness(t, utf16)
+	defer h.closeJournals()
+
+	p := h.Pane()
+	if p.File.Enc.Kind != editor.UTF16LE || !p.File.Enc.BOM {
+		t.Fatalf("setup: opened as %+v, want UTF-16LE with a BOM", p.File.Enc)
+	}
+	h.typeText("X")
+	h.press("super+s") // the Written marker now carries the saved UTF-16 bytes
+	h.typeText("Y")    // an unsaved edit past the Written baseline
+	h.flushJournal(p)
+	want := p.File.Text()
+
+	// A real restart has the tab in the session, so record it.
+	h.sessionTick(time.Now())
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	q := a.Pane()
+	if q == nil {
+		t.Fatal("the UTF-16 log did not restore")
+	}
+	if got := q.File.Text(); got != want {
+		t.Fatalf("restored text = %q, want %q (the unsaved edit was lost)", got, want)
+	}
+	if q.File.Enc.Kind != editor.UTF16LE || !q.File.Enc.BOM {
+		t.Fatalf("restored encoding = %+v, want UTF-16LE with a BOM", q.File.Enc)
+	}
+	if got := archivedLogs(t, a); len(got) != 0 {
+		t.Errorf("archived logs = %d, want none: the disk matches the last write", len(got))
+	}
+}
+
+// A log with no encoding tail — an older log, or a default UTF-8/LF file —
+// must restore to the default and save exactly the text back. Sibling:
+// TestJournalSaveThenRestoreIsClean; this pins the default arm of the mapping
+// and the encoder omitting a default so old bytes reproduce.
+func TestJournalRestoreWithoutEncodingKeepsDefault(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "base\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	h.typeText("X")
+	h.flushJournal(p)
+
+	l := readLog(t, h, p.File.Path)
+	if got := l.Encoding(); got != (journal.Encoding{}) {
+		t.Fatalf("setup: log carries %+v, want no encoding tail", got)
+	}
+	h.sessionTick(time.Now())
+	want := p.File.Text()
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	q := a.Pane()
+	if q == nil {
+		t.Fatal("the default log did not restore")
+	}
+	if q.File.Enc != (editor.Encoding{}) {
+		t.Fatalf("restored encoding = %+v, want the default", q.File.Enc)
+	}
+	if err := q.File.SaveOver(); err != nil {
+		t.Fatalf("save after restore: %v", err)
+	}
+	got, err := os.ReadFile(q.File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("saved bytes = %q, want the text %q (a default save is the text itself)", got, want)
+	}
+}
+
+// A log written before Base and Written carried an encoding records no shape,
+// so a non-default file would come back as UTF-8/LF and the next save would
+// rewrite it. Restore must recover only the shape from the file still on disk:
+// the replay is the text, the disk supplies the encoding. Sibling:
+// TestJournalRestoreReplaysUnsavedEditAfterSave, the same crash-restore walk
+// pinned to the tail records rather than to a recovered one.
+func TestJournalRestoreRecoversPreTailEncoding(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	utf16 := "\xff\xfe" + "a\x00b\x00\n\x00" // BOM + "ab\n"
+	h := newHarness(t, utf16)
+	defer h.closeJournals()
+
+	p := h.Pane()
+	if p.File.Enc.Kind != editor.UTF16LE || !p.File.Enc.BOM {
+		t.Fatalf("setup: opened as %+v, want UTF-16LE with a BOM", p.File.Enc)
+	}
+	h.typeText("X") // unsaved work, so the log must replay rather than be dropped
+	// Model a log from before the encoding tail. The field is version-compatible
+	// -- it did not bump FormatVersion -- so a pre-tail log is a v2 log whose
+	// records omit the tail; leaving the buffer at the default shape before the
+	// first base is laid is exactly what that build wrote.
+	p.File.SetEncoding(editor.Encoding{})
+	h.flushJournal(p)
+	want := p.File.Text()
+
+	l := readLog(t, h, p.File.Path)
+	if got := l.Encoding(); got != (journal.Encoding{}) {
+		t.Fatalf("fixture: log carries %+v, want no encoding tail", got)
+	}
+	base, ok := baseOf(l)
+	if !ok {
+		t.Fatal("fixture: log has no base record")
+	}
+	if base.Encoding != (journal.Encoding{}) {
+		t.Fatalf("fixture: base encoding = %+v, want the omitted default", base.Encoding)
+	}
+
+	// A real restart has the tab in the session, so record it.
+	h.sessionTick(time.Now())
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	q := a.Pane()
+	if q == nil {
+		t.Fatal("the pre-tail log did not restore")
+	}
+	if got := q.File.Text(); got != want {
+		t.Fatalf("restored text = %q, want %q (the replay was lost)", got, want)
+	}
+	if got := archivedLogs(t, a); len(got) != 0 {
+		t.Errorf("archived logs = %d, want none: the log should have replayed", len(got))
+	}
+	if q.File.Enc.Kind != editor.UTF16LE || !q.File.Enc.BOM {
+		t.Fatalf("restored encoding = %+v, want the UTF-16LE the disk has", q.File.Enc)
+	}
+	// The point of recovering the shape: the next save writes it back.
+	if err := q.File.SaveOver(); err != nil {
+		t.Fatalf("save after restore: %v", err)
+	}
+	got, err := os.ReadFile(q.File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(got), "\xff\xfe") {
+		t.Fatalf("saved bytes = % x, want a UTF-16LE BOM", got)
+	}
+}
+
+// A fresh Base and a save's Written must both record the buffer's encoding, so
+// the next restore reads back what this one wrote. Sibling:
+// TestJournalCaptureWritesBaseStoreAndOps, the same log walk. Without the
+// mapping both records carry the zero encoding and a UTF-16 buffer's shape is
+// lost on the round trip.
+func TestJournalRecordsBufferEncoding(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	utf16 := "\xff\xfe" + "a\x00\r\x00\n\x00" // BOM + "a\r\n"
+	h := newHarness(t, utf16)
+	defer h.closeJournals()
+
+	p := h.Pane()
+	if p.File.Enc.Kind != editor.UTF16LE || !p.File.Enc.CRLF || !p.File.Enc.BOM {
+		t.Fatalf("setup: opened as %+v, want UTF-16LE, CRLF, BOM", p.File.Enc)
+	}
+	h.typeText("X")
+	h.press("super+s") // a save appends a Written marker
+	h.flushJournal(p)
+
+	want := journal.Encoding{Kind: journal.EncodingUTF16LE, CRLF: true, BOM: true}
+	l := readLog(t, h, p.File.Path)
+	base, ok := baseOf(l)
+	if !ok {
+		t.Fatal("the log has no base record")
+	}
+	if base.Encoding != want {
+		t.Errorf("base encoding = %+v, want %+v", base.Encoding, want)
+	}
+	mark, ok := lastWritten(l)
+	if !ok {
+		t.Fatal("the save left no Written marker")
+	}
+	if mark.Encoding != want {
+		t.Errorf("written encoding = %+v, want %+v", mark.Encoding, want)
+	}
+}

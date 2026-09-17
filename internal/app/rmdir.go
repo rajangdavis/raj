@@ -110,17 +110,21 @@ func (a *App) promptDirRemoval(d control.DirRemoval) {
 	rows := dirRemovalPaths(d.Path)
 	msg := fmt.Sprintf("%s proposed removing %s.",
 		a.deletionProposer(d.Author), filepath.Base(d.Path))
-	options := []string{ignoreForNow}
+	options := []string{ignoreForNow, withdrawRemoval}
 	if safe, why := a.dirRemovalSafe(d.Path); safe {
-		options = []string{ignoreForNow, removeForever}
+		options = []string{ignoreForNow, removeForever, withdrawRemoval}
 	} else {
 		msg += " " + why
 	}
 	done := func(answer string, ok bool) {
-		if !ok || answer != removeForever {
+		switch {
+		case !ok, answer == ignoreForNow:
 			return
+		case answer == removeForever:
+			a.removeDirDeleted(d)
+		case answer == withdrawRemoval:
+			a.withdrawDirRemoval(d)
 		}
-		a.removeDirDeleted(d)
 	}
 	a.beforePrompt()
 	a.Prompt.Review("Remove directory", msg, rows, options, nil, done)
@@ -142,6 +146,7 @@ func (a *App) removeDirDeleted(d control.DirRemoval) {
 		a.closeDeletedPane(p)
 	}
 	delete(a.pendingDirRemovals, d.Path)
+	a.clearPendingRemoval(d.Path, true)
 	a.Explorer.Tree.Refresh()
 	a.status = "removed " + filepath.Base(d.Path)
 	a.TouchSession()

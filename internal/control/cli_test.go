@@ -47,6 +47,10 @@ type fakeEditor struct {
 	leaseAuthor uint8
 	leaseStart  int
 	leaseEnd    int
+	// ownLease makes a refused hunk name the caller's own author (the request
+	// author) instead of leaseAuthor: the own+other case, whose refusal the CLI
+	// must word as the caller's own draft rather than a peer's set.
+	ownLease bool
 	// warnings is what the fake apply and patch answer on success, so the CLI
 	// warning path can be exercised without a real Session.
 	warnings []GroupOverlap
@@ -232,6 +236,30 @@ func (f *fakeEditor) run(req Request) Response {
 		}
 		return Response{OK: true, Root: "/w", Buffers: bufs}
 	case "text":
+		if len(req.Paths) > 0 {
+			// The multi-target form, mirroring the real Dispatch: one span per
+			// target, Buffers naming each path and version and the bytes it
+			// contributed.
+			res := Response{OK: true}
+			var states []string
+			off := 0
+			for _, p := range req.Paths {
+				text, ok := f.docs[p]
+				if !ok {
+					return Response{Err: "no open buffer for " + p}
+				}
+				res.Spans = append(res.Spans, Span{Text: text, Author: FirstAgent})
+				res.Buffers = append(res.Buffers, Buffer{Path: p, Version: f.vers[p], Bytes: len(text)})
+				if req.Annotated {
+					states = append(states, fmt.Sprintf(`{"off":%d,"len":%d,"group":0,"state":"accepted"}`, off, len(text)))
+				}
+				off += len(text)
+			}
+			if len(states) > 0 {
+				res.StatesJSON = "[" + strings.Join(states, ",") + "]"
+			}
+			return res
+		}
 		text, ok := f.docs[path]
 		if !ok {
 			return Response{Err: "no open buffer for " + path}
@@ -319,8 +347,14 @@ func (f *fakeEditor) run(req Request) Response {
 			return Response{Err: "apply needs a base version"}
 		}
 		if *req.Base != f.vers[path] {
+			author := f.leaseAuthor
+			if f.ownLease {
+				// req.Author is the caller's real id, stamped by the connection,
+				// so the refusal names the caller's own set: the own+other case.
+				author = req.Author
+			}
 			return Response{Err: "stale", Conflicts: []Conflict{{Index: 0, Group: f.lease,
-				Author: f.leaseAuthor, Start: f.leaseStart, End: f.leaseEnd, Hunk: req.Hunks[0]}},
+				Author: author, Start: f.leaseStart, End: f.leaseEnd, Hunk: req.Hunks[0]}},
 				Warnings: f.warnings}
 		}
 		for i := len(req.Hunks) - 1; i >= 0; i-- { // back to front: offsets stay valid
@@ -596,21 +630,17 @@ func TestCLIReadAnnotated(t *testing.T) {
 	}
 }
 
-// A span written as positional operands used to read the whole file and look
-// like it worked, with two numbers that look like offsets read does take. The
-// refusal names the flags that carry them.
+// A byte span written as positional operands used to read the whole file and
+// look like it worked, with two numbers that look like offsets the verb
+// accepts. read now takes several paths, so the span mistake shows up as a
+// missing file rather than a silently ignored offset; dump still refuses the
+// extra operand outright and names the flags that carry a span.
 func TestCLIRefusesPositionalSpan(t *testing.T) {
 	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
 
 	out, errs, code := run(t, "read", "/w/a.go", "940", "1000")
-	if code != 2 {
-		t.Errorf("read with positional offsets: code = %d, want 2 (usage); stdout %q", code, out)
-	}
-	if out != "" {
-		t.Errorf("a refused read still wrote to stdout: %q", out)
-	}
-	if !strings.Contains(errs, `unexpected argument "940"`) || !strings.Contains(errs, "-start/-end") {
-		t.Errorf("stderr = %q, want the stray operand and the flags that take it", errs)
+	if code == 0 || out != "" || !strings.Contains(errs, "940") {
+		t.Errorf("read with positional offsets: code = %d, stdout %q, stderr %q; want the missing-file refusal", code, out, errs)
 	}
 
 	out, errs, code = run(t, "dump", "/w/a.go", "0", "10")
@@ -900,6 +930,146 @@ func TestCLILSPInlayHintsBadLines(t *testing.T) {
 	}
 }
 
+// `lsp format` is a whole-file request: no position and no range, and the
+// server's edit list round-trips as the structured `edits` field. Without the
+// mode in the switch the call is refused as a usage error before the editor is
+// asked.
+func TestCLILSPFormatReachesTheWire(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"edits":[{"line":1,"col":1,"endLine":1,"endCol":3,"text":"  "}]}`
+	out, errs, code := run(t, "lsp", "format", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.LSPMode != "format" {
+		t.Errorf("mode = %q, want format", ed.lastLSP.LSPMode)
+	}
+	if ed.lastLSP.LineStart != nil || ed.lastLSP.LineEnd != nil {
+		t.Errorf("whole-document format carried a range: %v..%v", ed.lastLSP.LineStart, ed.lastLSP.LineEnd)
+	}
+	if !strings.Contains(out, `"edits"`) || !strings.Contains(out, `"text": "  "`) {
+		t.Errorf("output = %q, want the edit list", out)
+	}
+}
+
+// `lsp range-format` needs its range: a collapsed range would ask the server to
+// format nothing, so the CLI refuses before the host is reached, and the named
+// lines then ride the wire as the 1-based inclusive range the range verbs use.
+func TestCLILSPRangeFormatNeedsLinesAndSendsThem(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"edits":[]}`
+	_, errs, code := run(t, "lsp", "range-format", "/w/a.go")
+	if code != 2 {
+		t.Errorf("code = %d, want 2 (usage) without -lines; stderr %q", code, errs)
+	}
+	if !strings.Contains(errs, "-lines") {
+		t.Errorf("stderr = %q, want the -lines hint", errs)
+	}
+
+	if _, errs, code := run(t, "lsp", "range-format", "/w/a.go", "-lines", "3,9"); code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.LSPMode != "range-format" {
+		t.Errorf("mode = %q, want range-format", ed.lastLSP.LSPMode)
+	}
+	if ed.lastLSP.LineStart == nil || *ed.lastLSP.LineStart != 3 {
+		t.Errorf("LineStart = %v, want 3", ed.lastLSP.LineStart)
+	}
+	if ed.lastLSP.LineEnd == nil || *ed.lastLSP.LineEnd != 9 {
+		t.Errorf("LineEnd = %v, want 9", ed.lastLSP.LineEnd)
+	}
+}
+
+// The signature mode is a structured position request like the others: it
+// carries the 1-based line and column and reaches the wire as its own
+// sub-operation. Without the mode in the switch it is refused as a usage error
+// before the editor is ever asked — the failure is in raj, not in the answer.
+func TestCLILSPSignatureReachesTheWire(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"signatures":[{"label":"F(x int)","parameters":[{"label":"x"}]}],"activeSignature":0,"activeParameter":0}`
+	out, errs, code := run(t, "lsp", "signature", "/w/a.go", "1:2")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.LSPMode != "signature" {
+		t.Errorf("mode = %q, want signature", ed.lastLSP.LSPMode)
+	}
+	if ed.lastLSP.Line != 1 || ed.lastLSP.Col != 2 {
+		t.Errorf("position = %d:%d, want 1:2", ed.lastLSP.Line, ed.lastLSP.Col)
+	}
+	if !strings.Contains(out, `"signatures"`) || !strings.Contains(out, `"label": "F(x int)"`) {
+		t.Errorf("output = %q, want the signature list", out)
+	}
+}
+
+// `lsp symbols` takes the query as a positional: it rides the request's Query
+// field when present and stays absent when the caller names none, so the server
+// can tell "match this" from "match nothing in particular".
+func TestCLILSPWorkspaceSymbolsSendsQuery(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"symbols":[{"name":"Reader","kind":"interface","path":"/w/a.go","line":1,"col":6}]}`
+	if _, errs, code := run(t, "lsp", "symbols", "/w/a.go", "1:2"); code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.LSPMode != "symbols" {
+		t.Errorf("mode = %q, want symbols", ed.lastLSP.LSPMode)
+	}
+	if ed.lastLSP.Query != nil {
+		t.Errorf("query = %+v, want absent for an empty query", ed.lastLSP.Query)
+	}
+	if _, errs, code := run(t, "lsp", "symbols", "/w/a.go", "1:2", "Reader"); code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.Query == nil || ed.lastLSP.Query.Text != "Reader" {
+		t.Errorf("query = %+v, want Reader", ed.lastLSP.Query)
+	}
+}
+
+// `lsp document-symbols` asks about a file, not a place, and its mode reaches
+// the wire so the editor runs textDocument/documentSymbol. A mode the CLI did
+// not accept would be refused before the editor was ever asked, and a position
+// requirement would make the verb unusable for a whole-file request.
+func TestCLILSPDocumentSymbolsReachesTheWire(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"documentSymbols":[{"name":"Reader","kind":"interface","path":"/w/a.go","line":1,"col":6,"children":[{"name":"Read","kind":"method","path":"/w/a.go","line":3,"col":10}]}]}`
+	out, errs, code := run(t, "lsp", "document-symbols", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if ed.lastLSP.LSPMode != "document-symbols" {
+		t.Errorf("mode = %q, want document-symbols", ed.lastLSP.LSPMode)
+	}
+	if ed.lastLSP.Line != 0 || ed.lastLSP.Col != 0 {
+		t.Errorf("position = %d:%d, want no position", ed.lastLSP.Line, ed.lastLSP.Col)
+	}
+	if !strings.Contains(out, `"name": "Reader"`) {
+		t.Errorf("output = %q, want the symbol", out)
+	}
+	if !strings.Contains(out, `"name": "Read"`) {
+		t.Errorf("output = %q, want the nested child kept in the tree", out)
+	}
+}
+
+// The sibling jump modes are accepted by the CLI and reach the wire as their
+// own sub-operation with the 1-based position. Without them in the mode switch,
+// each is refused as a usage error before the editor is ever asked — the
+// failure is in raj, not in the answer.
+func TestCLILSPSiblingJumpModesReachTheWire(t *testing.T) {
+	for _, mode := range []string{"declaration", "type-definition", "implementation"} {
+		ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+		ed.lspJSON = `{"locations":[]}`
+		if _, errs, code := run(t, "lsp", mode, "/w/a.go", "1:2"); code != 0 {
+			t.Fatalf("%s: code = %d, stderr %q", mode, code, errs)
+		}
+		if ed.lastLSP.LSPMode != mode {
+			t.Errorf("mode = %q, want %q", ed.lastLSP.LSPMode, mode)
+		}
+		if ed.lastLSP.Line != 1 || ed.lastLSP.Col != 2 {
+			t.Errorf("%s: position = %d:%d, want 1:2", mode, ed.lastLSP.Line, ed.lastLSP.Col)
+		}
+	}
+}
+
 // A bare positional is the pattern typed in the wrong place: search takes
 // no path, so accepting it silently would run a different search than was
 // meant — the refusal names both flags the caller might have wanted.
@@ -1038,6 +1208,71 @@ func TestCLIRefusalNamesTheLeaseOwner(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("json = %q, want the owner/%s", out, want)
 		}
+	}
+}
+
+// A conflict whose author is the caller is necessarily own+other: a hunk over
+// only the caller's own Proposed set joins it instead of refusing
+// (Session.ApplyDiff -> commitInto), so a refusal that names the caller means
+// a peer's run is in the way too. The caller cannot accept or reject its own
+// draft, so the message names the draft and the remedy it has — narrow the
+// hunk. Modelled on TestCLIRefusalNamesTheLeaseOwner, the peer half.
+func TestCLIRefusalNamesTheCallersOwnDraft(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.lease, ed.leaseStart, ed.leaseEnd, ed.ownLease = 7, 6, 11, true
+	ed.bump = func() { ed.vers["/w/a.go"]++ } // force the apply path to conflict
+
+	_, errs, code := run(t, "edit", "-old", "world", "-new", "socket")
+	if code == 0 {
+		t.Fatalf("an own+other edit reported success")
+	}
+	for _, want := range []string{
+		"change set 7 is your own draft", "bytes 6..11", "narrow it to avoid their span",
+	} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("message %q does not say %q", errs, want)
+		}
+	}
+	if strings.Contains(errs, "accept or reject it first") {
+		t.Errorf("own+other message %q tells the caller to decide its own draft", errs)
+	}
+
+	out, _, code := run(t, "edit", "-old", "world", "-new", "socket", "-json")
+	if code == 0 {
+		t.Fatalf("an own+other edit reported success in json")
+	}
+	for _, want := range []string{`"group": 7`, `"start": 6`, `"end": 11`, "is your own draft"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json = %q, want %q", out, want)
+		}
+	}
+	if strings.Contains(out, "accept or reject it first") {
+		t.Errorf("own+other json = %q still tells the caller to decide its own draft", out)
+	}
+}
+
+// A conflict whose author is another writer keeps the peer wording exactly: the
+// caller decides a peer's set with accept or reject, and this change must not
+// soften or reword that. Modelled on TestCLIRefusalNamesTheLeaseOwner.
+//
+// This is a guard, not a pin: the peer branch is untouched, so it passes before
+// the change too; it fails only if the own-draft rewording leaks into the peer
+// path.
+func TestCLIRefusalKeepsThePeerWording(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.lease, ed.leaseAuthor, ed.leaseStart, ed.leaseEnd = 7, 4, 6, 11
+	ed.bump = func() { ed.vers["/w/a.go"]++ }
+
+	_, errs, code := run(t, "edit", "-old", "world", "-new", "socket")
+	if code == 0 {
+		t.Fatalf("a peer refusal reported success")
+	}
+	want := "change set 7 owns this text (author 4, bytes 6..11); accept or reject it first"
+	if !strings.Contains(errs, want) {
+		t.Errorf("message %q does not carry the peer sentence %q", errs, want)
+	}
+	if strings.Contains(errs, "your own draft") {
+		t.Errorf("peer message %q was reworded as the caller's own draft", errs)
 	}
 }
 
@@ -1745,10 +1980,23 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 			case <-gate:
 			}
 		}
-		for i, line := range strings.Split(t, "\n") {
+		lines := strings.Split(t, "\n")
+		for i, line := range lines {
 			if c := strings.Index(line, q.Text); c >= 0 {
-				emit([]SearchMatch{{Path: p, Line: i + 1, Col: c, Len: len(q.Text),
-					Version: vers[p], Text: line}})
+				m := SearchMatch{Path: p, Line: i + 1, Col: c, Len: len(q.Text),
+					Version: vers[p], Text: line}
+				if q.Context > 0 {
+					lo := i - q.Context
+					if lo < 0 {
+						lo = 0
+					}
+					hi := i + q.Context
+					if hi >= len(lines) {
+						hi = len(lines) - 1
+					}
+					m.Context = strings.Join(lines[lo:hi+1], "\n")
+				}
+				emit([]SearchMatch{m})
 			}
 		}
 		files++
@@ -1875,6 +2123,7 @@ func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 			`"state":"proposed","ops":1,"bytes":1,"first":1,"last":1,` +
 			`"hunks":[{"start":0,"end":0,"old":"/Users/rajan/src/raj in text","new":""}],"moved":0}]`,
 		LSPJSON: `{"locations":[{"path":"/Users/rajan/src/raj/a.go","line":3,"col":4}],` +
+			`"symbols":[{"name":"Reader","kind":"interface","path":"/Users/rajan/src/raj/a.go","line":1,"col":6}],` +
 			`"text":"see /Users/rajan/src/raj/a.go"}`,
 		Err: "no open buffer for /Users/rajan/src/raj/a.go",
 	}
@@ -1904,7 +2153,7 @@ func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 	if got := diffs[0].Hunks[0].Old; got != "/Users/rajan/src/raj in text" {
 		t.Errorf("DiffHunk.Old = %q, want it left alone", got)
 	}
-	// An lsp answer nests its locations the same way the diff nests its group
+	// An lsp answer nests its locations and symbols the same way the diff nests
 	// paths; the locations are rebased, while hover text is content and must
 	// not be — the same distinction the hunk text above asserts for a diff.
 	var lsp LSPResult
@@ -1913,6 +2162,9 @@ func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 	}
 	if got := lsp.Locations[0].Path; got != "/workspace/a.go" {
 		t.Errorf("LSPLocation.Path = %q", got)
+	}
+	if len(lsp.Symbols) != 1 || lsp.Symbols[0].Path != "/workspace/a.go" {
+		t.Errorf("LSPSymbol.Path = %+v, want the rebased path", lsp.Symbols)
 	}
 	if got := lsp.Text; got != "see /Users/rajan/src/raj/a.go" {
 		t.Errorf("LSPResult.Text = %q, want it left alone", got)
@@ -3351,5 +3603,99 @@ func TestSearchHiddenReachesTheQuery(t *testing.T) {
 	ed.mu.Unlock()
 	if got {
 		t.Error("a plain search carried the include-hidden flag")
+	}
+}
+
+// A read can name several targets in one call, so a read-read-read chain is one
+// round trip. The single-target form is unchanged, and -json gives one object
+// per file. Modelled on TestCLIReads.
+func TestCLIReadMultipleTargets(t *testing.T) {
+	newFakeEditor(t, map[string]string{
+		"/w/a.go": "package a\n",
+		"/w/b.go": "package b\n",
+	})
+
+	out, _, code := run(t, "read", "/w/a.go")
+	if code != 0 || out != "package a\n" {
+		t.Errorf("single read = %q, code %d", out, code)
+	}
+
+	out, _, code = run(t, "read", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("multi read: code %d", code)
+	}
+	want := "==> /w/a.go <==\npackage a\n\n==> /w/b.go <==\npackage b\n"
+	if out != want {
+		t.Errorf("multi read = %q, want %q", out, want)
+	}
+
+	out, _, code = run(t, "read", "-json", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("multi json: code %d", code)
+	}
+	var got struct {
+		Files []struct {
+			Path    string `json:"path"`
+			Text    string `json:"text"`
+			Version uint64 `json:"version"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("multi json = %q: %v", out, err)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("multi json files = %+v, want two", got.Files)
+	}
+	if got.Files[0].Path != "/w/a.go" || got.Files[0].Text != "package a\n" || got.Files[0].Version == 0 {
+		t.Errorf("file 0 = %+v", got.Files[0])
+	}
+	if got.Files[1].Path != "/w/b.go" || got.Files[1].Text != "package b\n" || got.Files[1].Version == 0 {
+		t.Errorf("file 1 = %+v", got.Files[1])
+	}
+}
+
+// search -context returns each hit's neighbouring lines and the version it was
+// found at, so a hit is actionable without a follow-up read; without the flag
+// the grep-style line is unchanged. Modelled on TestCLIReads.
+func TestCLISearchContext(t *testing.T) {
+	newFakeEditor(t, map[string]string{
+		"/w/a.go": "line one\nline two\nneedle here\nline four\n",
+	})
+
+	out, _, code := run(t, "search", "-q", "needle")
+	if code != 0 || out != "/w/a.go:3:0:needle here\n" {
+		t.Errorf("plain search = %q, code %d", out, code)
+	}
+
+	out, _, code = run(t, "search", "-q", "needle", "-context", "1")
+	if code != 0 {
+		t.Fatalf("context search: code %d", code)
+	}
+	want := "/w/a.go:3:0 version 1\nline two\nneedle here\nline four\n"
+	if out != want {
+		t.Errorf("context search = %q, want %q", out, want)
+	}
+
+	out, _, code = run(t, "search", "-q", "needle", "-context", "1", "-json")
+	if code != 0 {
+		t.Fatalf("context json: code %d", code)
+	}
+	var got struct {
+		Matches []struct {
+			Context string `json:"context"`
+			Version uint64 `json:"version"`
+		} `json:"matches"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("context json = %q: %v", out, err)
+	}
+	if len(got.Matches) != 1 {
+		t.Fatalf("context json matches = %+v, want one", got.Matches)
+	}
+	if want := "line two\nneedle here\nline four"; got.Matches[0].Context != want {
+		t.Errorf("json context = %q, want %q", got.Matches[0].Context, want)
+	}
+	if got.Matches[0].Version != 1 {
+		t.Errorf("json version = %d, want 1", got.Matches[0].Version)
 	}
 }

@@ -115,23 +115,87 @@ var Bindings = []Binding{
 	// their terminal is a worse trade than picking a duller letter.
 	{"nav", Hover, "super+i", "105;9u", "cmd+i", "ctrl+i", ""},
 	{"nav", GotoDef, "super+j", "106;9u", "cmd+j", "ctrl+alt+j", ""},
+	// references shares go-to-definition's j: the shifted form asks where the
+	// thing is used, where the plain form asks where it is defined.
+	{"nav", References, "shift+super+j", "106;10u", "cmd+shift+j", "ctrl+shift+j", "shifted sibling of go-to-definition's super+j"},
+	// declaration, type definition and implementation are go-to-definition's
+	// other siblings. references already owns shift+super+j, and the plain j
+	// forms left for them collide with go-to-definition's own Linux trigger
+	// (ctrl+alt+j), so each gets a free ctrl+super letter: cmd+ctrl on macOS,
+	// ctrl+alt on Linux. None is claimed by macOS or by a terminal default.
+	{"nav", GotoDecl, "ctrl+super+b", "98;13u", "cmd+ctrl+b", "ctrl+alt+b", "IntelliJ's Ctrl+B is go-to-declaration; where the name is declared, not the body"},
+	{"nav", GotoTypeDef, "ctrl+super+t", "116;13u", "cmd+ctrl+t", "ctrl+alt+t", "t for type: the definition of the thing's type"},
+	{"nav", GotoImpl, "ctrl+super+i", "105;13u", "cmd+ctrl+i", "ctrl+alt+i", "i for implementation; the picker opens when the server returns several"},
+	// workspace_symbols shares GotoSymbol's "o" one modifier over: shift+super+o
+	// is the file's own declarations from the keyword scanner, and ctrl+super+o
+	// is the server's project-wide answer. Neither chord is claimed by macOS nor
+	// by a terminal default; on Linux it is ctrl+alt+o.
+	{"nav", WorkspaceSymbols, "ctrl+super+o", "111;13u", "cmd+ctrl+o", "ctrl+alt+o", "project-wide symbols from the language server; the sibling of shift+super+o"},
 
 	// ToggleInlayHints turns the inline language-server annotations on and off
 	// for the active pane. shift+super+i is the shifted sibling of Hover's
 	// super+i and no terminal claims it; the choice is per-pane and the app
 	// default is untouched.
 	{"nav", ToggleInlayHints, "shift+super+i", "105;10u", "cmd+shift+i", "ctrl+shift+i", "toggle inline hints for the active pane"},
+	{"nav", ApplyInlayEdit, "super+.", "46;9u", "cmd+period", "ctrl+period", "apply the inlay hint's edits on the caret's line"},
 
-	// Reviewing proposals from the keyboard. These are ctrl+super chords the
-	// way all_occurrences is: no terminal claims them, but they live in
-	// Bindings rather than Natives so the CSI-u encoding is pinned for both
-	// platforms instead of inferred from report_all.
+	// Signature help is the parameter list of the call the cursor is inside.
+	// shift+ctrl+space is VS Code's parameter-info chord and the shifted
+	// sibling of ctrl+space, which summons completion; it is pinned here rather
+	// than left implicit so the CSI-u encoding is explicit on both platforms.
+	{"nav", SignatureHelp, "shift+ctrl+space", "32;6u", "ctrl+shift+space", "ctrl+shift+space", "the conventional parameter-info chord; shifted sibling of ctrl+space, which summons completion"},
+	{"nav", CodeAction, "ctrl+super+a", "97;13u", "cmd+ctrl+a", "ctrl+alt+a", "a for action; list the server's fixes and refactors for the caret"},
+
+	// OpenMenu is the keyboard half of the right-click gesture: the same
+	// context menu, for whatever has focus — the focused explorer entry when
+	// the sidebar has it, otherwise the active tab. shift+f10 is the
+	// conventional context-menu key on the desktops; no macOS system shortcut
+	// and no terminal default claims it, and the f-keys decode through the KKP
+	// tilde table (f10 is code 21).
+	{"nav", OpenMenu, "shift+f10", "21;2~", "shift+f10", "shift+f10", "the conventional context-menu key; right-click parity for the focused explorer entry, else the active tab"},
+
+	// Code lenses are the server's line-attached actions, drawn inline at the
+	// start of the line they annotate. Running the one on the caret's line
+	// follows the same ctrl+super letter family (cmd+ctrl on macOS, ctrl+alt on
+	// Linux); l for lens is free there, and neither terminal nor macOS claims
+	// cmd+ctrl+l or ctrl+alt+l.
+	{"nav", RunCodeLens, "ctrl+super+l", "108;13u", "cmd+ctrl+l", "ctrl+alt+l", "run the code lens on the caret's line"},
+
+	// Folding is the language server's collapsible ranges, toggled at the
+	// caret. c for collapse follows the ctrl+super letter family (cmd+ctrl on
+	// macOS, ctrl+alt on Linux); no terminal or macOS default claims it.
+	{"nav", ToggleFold, "ctrl+super+c", "99;13u", "cmd+ctrl+c", "ctrl+alt+c", "fold or unfold the language server's range at the caret"},
+
+	// Rename moves the symbol under the caret through every file the server
+	// names. It follows the ctrl+super letter family (cmd+ctrl on macOS,
+	// ctrl+alt on Linux); r is free there, no terminal claims it, and it is not
+	// in the macOS reserved set. The edits are ordinary editor changes, so a
+	// save writes them.
+	{"nav", Rename, "ctrl+super+r", "114;13u", "cmd+ctrl+r", "ctrl+alt+r", "rename the symbol under the cursor; server edits land in every file they touch"},
+
+	// Formatting is the server's own whitespace writer, in two scopes. The
+	// document form is shift+alt+f, VS Code's format chord and one no macOS or
+	// terminal default claims; the selection form is its ctrl+alt+f sibling,
+	// which formats the selected range and refuses with a word when nothing is
+	// selected rather than silently reformatting the whole file.
+	{"nav", Format, "shift+alt+f", "102;4u", "shift+alt+f", "shift+alt+f", "format the whole document through the language server"},
+	{"nav", FormatRange, "ctrl+alt+f", "102;7u", "ctrl+alt+f", "ctrl+alt+f", "format the selected range; needs a selection"},
+	// Following a document link is the server's documentLink answer applied to
+	// the caret. ctrl+super+y is free in the family the other server features
+	// use (cmd+ctrl on macOS, ctrl+alt on Linux); y for hyperlink, and no
+	// terminal or macOS default claims it.
+	{"nav", FollowLink, "ctrl+super+y", "121;13u", "cmd+ctrl+y", "ctrl+alt+y", "follow the document link under the caret"},
+
+	// Reviewing proposals from the keyboard. These are review and proposal
+	// chords pinned in Bindings rather than Natives, so the CSI-u encoding is
+	// explicit for both platforms instead of inferred from report_all.
 	{"proposals", ToggleReview, "super+r", "114;9u", "cmd+r", "ctrl+r", "toggle review mode: the document is read-only while on; reload moved to cmd+shift+r"},
 	{"proposals", AcceptProposed, "ctrl+super+m", "109;13u", "cmd+ctrl+m", "ctrl+alt+m", "accept the proposed change set at the caret"},
 	{"proposals", RejectProposed, "ctrl+super+/", "47;13u", "cmd+ctrl+slash", "ctrl+alt+slash", "reject the proposed change set at the caret"},
 	{"proposals", ClearRejected, "ctrl+super+k", "107;13u", "cmd+ctrl+k", "ctrl+alt+k", "hard-purge the rejected change set at the caret"},
 	{"proposals", PrevProposed, "ctrl+super+,", "44;13u", "cmd+ctrl+comma", "ctrl+alt+comma", "previous pending change set"},
 	{"proposals", NextProposed, "ctrl+super+.", "46;13u", "cmd+ctrl+period", "ctrl+alt+period", "next pending change set"},
+	{"proposals", PendingRemovals, "ctrl+alt+d", "100;7u", "ctrl+alt+d", "ctrl+alt+d", "re-raise the oldest pending deletion or dir-removal; macOS claims cmd+ctrl+d for Look Up in Dictionary"},
 }
 
 // Reclaim holds chords a terminal keeps for itself, which raj therefore has to

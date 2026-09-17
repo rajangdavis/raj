@@ -1,6 +1,7 @@
 package complete
 
 import (
+	"strings"
 	"testing"
 
 	"raj/internal/keys"
@@ -167,5 +168,41 @@ func TestPopupDegenerateInputs(t *testing.T) {
 	p.Hide()
 	if _, ok := p.Selected(); ok {
 		t.Error("a hidden popup reports a selection")
+	}
+}
+
+// The documentation for the highlighted candidate is shown through the hover
+// panel, so the markdown subset and its scrolling are not reimplemented. It
+// follows the selection, and an item with none closes it rather than leaving
+// the previous item's text up.
+func TestPopupShowsDocumentationForTheSelection(t *testing.T) {
+	p := open(t)
+	p.Show("hand", []Candidate{
+		{Word: "handoff", Documentation: "Keeps going."},
+		{Word: "handleRequest"},
+	}, 10, 4)
+	if got := p.DocText(); !strings.Contains(got, "Keeps going.") {
+		t.Errorf("documentation = %q, want the first item's", got)
+	}
+	p.Handle(keys.LineDown)
+	if got := p.DocText(); got != "" {
+		t.Errorf("documentation = %q, want none for an item without", got)
+	}
+}
+
+// SetResolved is how a completionItem/resolve answer reaches the popup: it
+// updates every candidate carrying the key and the panel if one is selected.
+func TestSetResolvedUpdatesByKey(t *testing.T) {
+	p := open(t)
+	p.Show("hand", []Candidate{{Word: "handoff", ResolveKey: "k"}}, 10, 4)
+	if got := p.DocText(); got != "" {
+		t.Fatalf("setup: unexpected documentation %q", got)
+	}
+	p.SetResolved("k", "Resolved docs.", "")
+	if got := p.DocText(); !strings.Contains(got, "Resolved docs.") {
+		t.Errorf("documentation = %q, want the resolved text", got)
+	}
+	if c, _ := p.Selected(); c.Documentation != "Resolved docs." {
+		t.Errorf("candidate documentation = %q", c.Documentation)
 	}
 }

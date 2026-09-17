@@ -63,6 +63,13 @@ func NewKeymap() *Keymap {
 	// resolved to nothing at all and the keystroke was simply lost.
 	k.Bind(Prompt, "tab", Indent)
 	k.Bind(Prompt, "shift+tab", None)
+
+	// cmd+return expands every folder under the explorer selection, and every
+	// file group in the search results. A scope override shadows the global
+	// LineBelow only while one of those panes has focus, so the editor keeps
+	// its line-below.
+	k.Bind(Explorer, "super+enter", ToggleExpandAll)
+	k.Bind(Search, "super+enter", ToggleExpandAll)
 	return k
 }
 

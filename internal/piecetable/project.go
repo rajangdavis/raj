@@ -121,20 +121,11 @@ func (s *Session) Project(p Policy) DerivedProject {
 	// reach into.
 	comp := &Naive{store: s.Store()}
 	comp.pieces = s.buf.pieceRange(0, s.buf.Len())
-	// origins records which change set inserted which store range. Every policy
-	// needs them now: a kept run reports its owning set and state in the
-	// segments, not only in the annotated view.
-	var origins []insOrigin
-	for _, o := range s.journal {
-		if o.Kind != KindEdit || !s.live(o.Seq) {
-			continue
-		}
-		for _, r := range o.Ins {
-			origins = append(origins, insOrigin{
-				buf: r.Buf, start: r.Start, end: r.Start + r.Length, group: o.Group,
-			})
-		}
-	}
+	// origins records which change set inserted which store range, including
+	// any an earlier compaction folded. Every policy needs them now: a kept run
+	// reports its owning set and state in the segments, not only in the
+	// annotated view.
+	origins := s.allOrigins()
 	index := newOriginIndex(origins)
 	// prov runs parallel to comp.pieces and says where each piece came from: the
 	// session byte it starts at, or -1 once a restored deletion puts bytes back
@@ -158,7 +149,7 @@ func (s *Session) Project(p Policy) DerivedProject {
 		if o.Kind != KindEdit || !s.live(o.Seq) || s.included(o, p) {
 			continue
 		}
-		at, removed, kept, dropped := unapplyRemoveIns(comp, prov, o.Ins)
+		at, removed, kept, dropped := s.unapplyRemoveIns(comp, prov, o.Ins, o.Group)
 		prov = kept
 		hidden = append(hidden, dropped...)
 		if removed {
@@ -194,13 +185,14 @@ func (s *Session) Project(p Policy) DerivedProject {
 }
 
 // unapplyRemoveIns drops every piece of comp that sits inside a store range the
-// excluded edit inserted, and reports the document offset of the first piece it
-// dropped, or -1 when none of the edit's inserted bytes survive. Filtering in
-// place is safe because the range reads each element before the write cursor
-// can reach it. kept mirrors the surviving comp.pieces and dropped records the
-// session bytes the removal hides, one entry per piece removed, including the
-// number of newlines among them.
-func unapplyRemoveIns(comp *Naive, prov []projOrigin, ins []PieceRec) (at int, removed bool, kept []projOrigin, dropped []hiddenRun) {
+// excluded edit inserted -- or inside a compacted origin of its group, for a
+// span an earlier compaction folded -- and reports the document offset of the
+// first piece it dropped, or -1 when none of the edit's inserted bytes survive.
+// Filtering in place is safe because the range reads each element before the
+// write cursor can reach it. kept mirrors the surviving comp.pieces and dropped
+// records the session bytes the removal hides, one entry per piece removed,
+// including the number of newlines among them.
+func (s *Session) unapplyRemoveIns(comp *Naive, prov []projOrigin, ins []PieceRec, group uint64) (at int, removed bool, kept []projOrigin, dropped []hiddenRun) {
 	if len(ins) == 0 {
 		return -1, false, prov, nil
 	}
@@ -209,7 +201,7 @@ func unapplyRemoveIns(comp *Naive, prov []projOrigin, ins []PieceRec) (at int, r
 	kept = prov[:0]
 	off := 0
 	for k, piece := range comp.pieces {
-		if insOwns(ins, piece) {
+		if insOwns(ins, piece) || s.compactedOwns(group, piece) {
 			if at < 0 {
 				at = off
 			}
@@ -371,18 +363,9 @@ func (s *Session) projectNoDecisions(p Policy) DerivedProject {
 		return d
 	}
 	// With no decisions, Annotated includes every live edit, which is exactly
-	// KindEdit && live — the same filter included applies for the policy.
-	var origins []insOrigin
-	for _, o := range s.journal {
-		if o.Kind != KindEdit || !s.live(o.Seq) {
-			continue
-		}
-		for _, r := range o.Ins {
-			origins = append(origins, insOrigin{
-				buf: r.Buf, start: r.Start, end: r.Start + r.Length, group: o.Group,
-			})
-		}
-	}
+	// KindEdit && live — the same filter included applies for the policy — and
+	// the compacted origins an earlier compaction left.
+	origins := s.allOrigins()
 	d.states = s.stateRuns(comp.pieces, origins)
 	return d
 }

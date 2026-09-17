@@ -2,6 +2,7 @@ package editor
 
 import (
 	"raj/internal/keys"
+	"raj/internal/piecetable"
 	"strings"
 	"testing"
 )
@@ -201,6 +202,101 @@ func TestFindHighlightMarksCurrent(t *testing.T) {
 	}
 	if m, _ := p.Find.Highlight(3); m {
 		t.Error("a space was highlighted")
+	}
+}
+
+// Rows reports the bar's height across the closed, query-only and revealed
+// states. It is what the application uses to shift the text area down.
+func TestFindRows(t *testing.T) {
+	p := newTestPane("one two one")
+	if got := p.Find.Rows(); got != 0 {
+		t.Fatalf("closed rows = %d, want 0", got)
+	}
+	p.Find.Show(p)
+	if got := p.Find.Rows(); got != 1 {
+		t.Fatalf("open rows = %d, want 1", got)
+	}
+	p.Find.Handle(p, keys.Indent, "")
+	if got := p.Find.Rows(); got != 2 {
+		t.Fatalf("revealed rows = %d, want 2", got)
+	}
+	p.Find.Handle(p, keys.Outdent, "")
+	if got := p.Find.Rows(); got != 2 {
+		t.Errorf("rows = %d after shift+tab, want the row to stay", got)
+	}
+	p.Find.Hide()
+	if got := p.Find.Rows(); got != 0 {
+		t.Errorf("rows = %d after close, want 0", got)
+	}
+}
+
+// Enter in the replace row replaces the current match and advances to the next.
+func TestFindReplaceCurrent(t *testing.T) {
+	p := newTestPane("one two one")
+	p.Find.Show(p)
+	p.Find.Handle(p, keys.None, "one")
+	if n := len(p.Find.Matches()); n != 2 {
+		t.Fatalf("matches = %d, want 2", n)
+	}
+	p.Find.Handle(p, keys.Indent, "") // reveal and focus the replace row
+	p.Find.Handle(p, keys.None, "1")
+	p.Find.Handle(p, keys.Confirm, "")
+	if got := p.File.Text(); got != "1 two one" {
+		t.Fatalf("text = %q, want only the current match replaced", got)
+	}
+	if n := len(p.Find.Matches()); n != 1 {
+		t.Errorf("matches after replace = %d, want 1", n)
+	}
+	if lo, _ := p.Cursors.Primary().Range(); lo != 6 {
+		t.Errorf("cursor at %d, want the next match at 6", lo)
+	}
+}
+
+// Replace all rewrites every match as one change set, so a single undo puts the
+// buffer back.
+func TestFindReplaceAll(t *testing.T) {
+	p := newTestPane("one two one")
+	p.Find.Show(p)
+	p.Find.Handle(p, keys.None, "one")
+	p.Find.Handle(p, keys.Indent, "")
+	p.Find.Handle(p, keys.None, "1")
+	p.Find.Handle(p, keys.LineBelow, "")
+	if got := p.File.Text(); got != "1 two 1" {
+		t.Fatalf("text = %q, want every match replaced", got)
+	}
+	if n := len(p.Find.Matches()); n != 0 {
+		t.Errorf("matches = %d after replace all, want 0", n)
+	}
+	if _, ok := p.File.Undo(p.Author); !ok {
+		t.Fatal("undo reported nothing to reverse")
+	}
+	if got := p.File.Text(); got != "one two one" {
+		t.Errorf("after one undo = %q, want the original", got)
+	}
+}
+
+// A replace that touches a leased run is refused whole: nothing changes and the
+// refusing set is recorded for the application's status note.
+func TestFindReplaceRefusedByLease(t *testing.T) {
+	p := newTestPane(proposalFixture)
+	id := propose(t, p, piecetable.Hunk{
+		Start: proposalAt,
+		End:   proposalAt + len(proposalOld),
+		Text:  proposalNew,
+	})
+	p.Find.Show(p)
+	p.Find.Handle(p, keys.None, proposalNew)
+	if n := len(p.Find.Matches()); n != 1 {
+		t.Fatalf("setup: matches = %d, want 1", n)
+	}
+	p.Find.Handle(p, keys.Indent, "")
+	p.Find.Handle(p, keys.None, "ZZZZ")
+	p.Find.Handle(p, keys.Confirm, "")
+	if got := p.File.Text(); got != "user AGNT here" {
+		t.Errorf("text = %q, want the leased run untouched", got)
+	}
+	if g, ok := p.TakeLeaseRefusal(); !ok || g != id {
+		t.Errorf("lease refusal = (%d, %v), want (%d, true)", g, ok, id)
 	}
 }
 

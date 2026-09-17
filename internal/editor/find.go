@@ -17,16 +17,33 @@ import (
 type Find struct {
 	Open    bool
 	input   widget.Input
+	replace widget.Input
 	matches []int // byte offsets of each match
 	at      int   // index into matches
 	term    string
+
+	// spot is which row holds focus, spotQuery or spotReplace, and replaceShown
+	// whether the replace row has been revealed. The row stays hidden until tab
+	// asks for it, so a plain find looks exactly as it always has.
+	spot         int
+	replaceShown bool
 }
+
+// The two focus spots in the find bar: the query row and the replace row. The
+// replace field is revealed and focused by spotReplace.
+const (
+	spotQuery   = 0
+	spotReplace = 1
+)
 
 // Show opens the bar, seeding it with the current selection when there is one —
 // select a word, press cmd+f, and it is already the query.
 func (f *Find) Show(p *Pane) {
 	f.Open = true
 	f.input.Focused = true
+	f.replace.Focused = false
+	f.spot = spotQuery
+	f.replaceShown = false
 	// Always start from the selection, or from empty. Retaining the previous
 	// query would mean the next thing typed silently appends to it, which is
 	// the kind of surprise that makes a search box feel broken.
@@ -39,32 +56,71 @@ func (f *Find) Show(p *Pane) {
 	// now, and leaving it pointing into the old contents indexes past the end
 	// of the new ones.
 	f.input.SetText(seed)
+	// The replacement is cleared rather than kept, like the query: reopening
+	// the bar should not silently re-use the previous replacement.
+	f.replace.SetText("")
 	f.run(p)
 }
 
-// Hide closes the bar, leaving the cursor where the last match put it.
+// Hide closes the bar, leaving the cursor where the last match put it. The
+// entered text is kept, like the query, so reopening finds the same thing; the
+// replace row is hidden again so the bar comes back one row tall.
 func (f *Find) Hide() {
 	f.Open = false
 	f.matches = nil
+	f.spot = spotQuery
+	f.replaceShown = false
 }
 
 // Matches returns the match offsets, for highlighting and for tests.
-// ActiveInput is the find field while the bar is open. The bar sits inside the
-// editor pane, so without this cmd+c while typing a query would copy from the
-// document being searched.
+func (f *Find) Matches() []int { return f.matches }
+
+// Rows is how many rows the bar draws: none when it is closed, one for a plain
+// find, and two once the replace row has been revealed.
+func (f *Find) Rows() int {
+	if !f.Open {
+		return 0
+	}
+	if f.replaceShown {
+		return 2
+	}
+	return 1
+}
+
+// ActiveInput is the focused field while the bar is open. The bar sits inside
+// the editor pane, so without this cmd+c while typing a query would copy from
+// the document being searched, and cmd+x in the replace row would cut the
+// document instead of the replacement.
 func (f *Find) ActiveInput() *widget.Input {
 	if !f.Open {
 		return nil
 	}
+	if f.spot == spotReplace {
+		return &f.replace
+	}
 	return &f.input
 }
 
-func (f *Find) Matches() []int { return f.matches }
+// WouldEdit reports whether an action, handled by the bar, would change the
+// document. The application asks this before letting a bar key through in
+// Review mode, because handleEditor delegates to the bar before the ordinary
+// read-only check and a replace would otherwise bypass it.
+func (f *Find) WouldEdit(a keys.Action) bool {
+	switch a {
+	case keys.LineBelow:
+		return true // replace all
+	case keys.Confirm:
+		return f.spot == spotReplace
+	}
+	return false
+}
 
 // Query is the current search text.
 func (f *Find) Query() string { return f.input.Text }
 
-// Handle applies an action while the bar is open.
+// Handle applies an action while the bar is open. The focused row receives
+// typing: the query re-runs the match set on every keystroke, the replacement
+// does not, or the matches would jump around as a replacement is typed.
 func (f *Find) Handle(p *Pane, a keys.Action, text string) {
 	switch a {
 	case keys.Cancel:
@@ -76,19 +132,97 @@ func (f *Find) Handle(p *Pane, a keys.Action, text string) {
 	case keys.FindPrev:
 		f.step(p, -1)
 		return
-	case keys.Confirm, keys.FindInFile, keys.LineDown, keys.Indent:
-		// Tab arrives as Indent in the editor's scope. Stepping matches with it
-		// is what the hand expects from a search bar, and indentation is not
-		// reachable while the bar has the keys anyway.
+	case keys.Confirm:
+		if f.spot == spotReplace {
+			f.replaceCurrent(p)
+			return
+		}
 		f.step(p, +1)
 		return
-	case keys.LineUp, keys.Outdent:
+	case keys.LineBelow:
+		// cmd+enter arrives as LineBelow; while the replace row is shown it
+		// means replace all. With the row hidden it is ignored, so an
+		// unrevealed bar cannot delete every match.
+		if f.replaceShown {
+			f.replaceAll(p)
+		}
+		return
+	case keys.FindInFile, keys.LineDown:
+		f.step(p, +1)
+		return
+	case keys.LineUp:
 		f.step(p, -1)
+		return
+	case keys.Indent:
+		// Tab reveals the replace row from the query, then toggles focus
+		// between the two rows once it is shown.
+		if f.spot == spotQuery {
+			f.replaceShown = true
+			f.spot = spotReplace
+		} else {
+			f.spot = spotQuery
+		}
+		return
+	case keys.Outdent:
+		// Shift+tab walks back to the query. It never hides the row, so the
+		// bar's height depends on whether replacement was asked for rather
+		// than on where focus happens to be.
+		if f.spot == spotReplace {
+			f.spot = spotQuery
+		}
+		return
+	}
+	if f.spot == spotReplace {
+		// Editing the replacement must not recompute matches: the field is not
+		// the query, and a half-typed replacement is not a search.
+		f.replace.Handle(a, text)
 		return
 	}
 	if f.input.Handle(a, text) {
 		f.run(p)
 	}
+}
+
+// replaceCurrent replaces the current match and advances to the next one. It
+// runs through the pane's own edit path, so it is one undo step and a leased
+// run refuses it exactly as a typed edit would. The match set is recomputed
+// afterwards because the text under it moved.
+func (f *Find) replaceCurrent(p *Pane) {
+	if len(f.matches) == 0 {
+		return
+	}
+	off := f.matches[f.at]
+	p.File.Begin()
+	p.applyEdit(off, len(f.term), f.replace.Text)
+	p.File.End()
+	f.run(p)
+	p.FollowCursor()
+}
+
+// replaceAll replaces every match in one change set, so a single undo puts the
+// buffer back. The leases are checked together before anything moves, so a set
+// that owns any match refuses the whole action rather than mutating the rest —
+// the same rule every multi-cursor action follows.
+func (f *Find) replaceAll(p *Pane) {
+	if len(f.matches) == 0 {
+		return
+	}
+	edits := make([]cursorEdit, 0, len(f.matches))
+	for _, off := range f.matches {
+		edits = append(edits, cursorEdit{pos: off, remove: len(f.term), insert: f.replace.Text})
+	}
+	if p.leaseBlocks(edits) {
+		return
+	}
+	p.File.Begin()
+	// Highest offset first: earlier matches stay valid while later ones are
+	// edited away.
+	for i := len(edits) - 1; i >= 0; i-- {
+		e := edits[i]
+		p.applyEdit(e.pos, e.remove, e.insert)
+	}
+	p.File.End()
+	f.run(p)
 }
 
 // run recomputes the matches and jumps to the first at or after the cursor, so
@@ -172,20 +306,37 @@ func (f *Find) Highlight(off int) (match, current bool) {
 	return false, false
 }
 
-// Render draws the bar as a single line across the top of the editor pane.
-// findPrefix is what the bar writes before the query. The renderer and the
-// pointer share it so the caret cannot land a column away from the character it
-// was aimed at.
-const findPrefix = " find: "
+// Render draws the bar across the top of the editor pane. findPrefix and
+// replacePrefix are what each row writes before its text. The renderer and the
+// pointer share them so the caret cannot land a column away from the character
+// it was aimed at.
+const (
+	findPrefix    = " find: "
+	replacePrefix = " replace: "
+)
 
-// ClickAt places the caret from a press dx columns into the bar, reporting
-// whether the bar took it. A press on the prefix or the match count is still
-// the bar's — it is one row and there is nothing else it could mean.
-func (f *Find) ClickAt(dx int) bool {
+// ClickAt places the caret from a press at (dx, dy) in the bar, reporting
+// whether the bar took it. dy 0 is the query row; the replace row is on dy 1
+// and only takes a press once it has been revealed. A press on the prefix or
+// the match count is still the row's — there is nothing else it could mean.
+func (f *Find) ClickAt(dx, dy int) bool {
 	if !f.Open {
 		return false
 	}
-	f.input.PlaceCaret(dx - len(findPrefix))
+	in, prefix := &f.input, findPrefix
+	switch dy {
+	case 0:
+		f.spot = spotQuery
+	case 1:
+		if !f.replaceShown {
+			return false
+		}
+		f.spot = spotReplace
+		in, prefix = &f.replace, replacePrefix
+	default:
+		return false
+	}
+	in.PlaceCaret(dx - len(prefix))
 	return true
 }
 
@@ -193,6 +344,10 @@ func (f *Find) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 	if !f.Open || w < 12 {
 		return
 	}
+	// Keep the fields' own focus flags in step with the spot, so the focused
+	// row is the one a caller reading the field sees as active.
+	f.input.Focused = f.spot == spotQuery
+	f.replace.Focused = f.spot == spotReplace
 	s.Fill(x, y, w, 1, th.Selected)
 	count := "no results"
 	if n := len(f.matches); n > 0 {
@@ -204,6 +359,11 @@ func (f *Find) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 	s.SetString(x, y, widget.Truncate(label, w-len(count)-2), th.Selected, w)
 	if count != "" {
 		s.SetString(x+w-len(count)-1, y, count, th.Selected, len(count)+1)
+	}
+	if f.replaceShown {
+		s.Fill(x, y+1, w, 1, th.Selected)
+		label := replacePrefix + f.replace.Text
+		s.SetString(x, y+1, widget.Truncate(label, w-2), th.Selected, w)
 	}
 }
 

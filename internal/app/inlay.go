@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/lsp"
 	"raj/internal/safe"
@@ -362,4 +363,100 @@ func (a *App) toggleInlayHints() {
 		a.inlayGen++
 	}
 	a.inlayReq = inlayRequest{}
+}
+
+// nearestHint is the hint on a line whose anchor is closest to the caret's
+// line-relative byte offset, and whether there is one. Lenses are skipped:
+// their inline text is a server action rather than a correction to the
+// document, so they have no edits to apply.
+func nearestHint(hints []editor.Hint, rel int) (editor.Hint, bool) {
+	best := -1
+	bestDist := 0
+	for i, h := range hints {
+		if h.Lens {
+			continue
+		}
+		d := h.Off - rel
+		if d < 0 {
+			d = -d
+		}
+		if best < 0 || d < bestDist {
+			best, bestDist = i, d
+		}
+	}
+	if best < 0 {
+		return editor.Hint{}, false
+	}
+	return hints[best], true
+}
+
+// applyInlayEdit applies the edits attached to the inlay hint nearest the caret
+// on the caret's line, as one undo step.
+//
+// A hint's edits are the server's own corrections to the document — an
+// argument name to remove or a type to add — and this is the keyboard way to
+// take one, VS Code's quick fix. The offsets were resolved to absolute byte
+// edits when the hint was installed, so no protocol conversion happens here;
+// they go through applyServerEdits like every other server edit, which is what
+// makes the whole answer one undo step and refuses a batch that overlaps a
+// change set.
+//
+// The installed hints describe one document version. If the text has moved
+// since — the draw that clears stale hints may not have run yet — every edit
+// offset is wrong, so the apply is refused rather than landed at a shifted
+// position. A hint with no edits is refused in words, not silently.
+func (a *App) applyInlayEdit() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	// The apply is a key gesture, so the pointer tooltip (if one is up) is
+	// stale the moment the edits land; the caret hover is not ours to close.
+	a.hideHint()
+	if a.mode == ModeReview {
+		a.status = reviewReadOnlyNote()
+		return
+	}
+	path := a.docPath(p)
+	if _, version, ok := a.inlays.forPath(path); !ok || int(p.File.Session().Version()) != version {
+		p.File.ClearHints()
+		a.inlayGen++
+		a.status = "inlay hints are out of date"
+		return
+	}
+	head := p.Cursors.Primary().Head
+	line := p.File.LineOf(head)
+	h, ok := nearestHint(p.File.HintsAt(line), head-p.File.LineStart(line))
+	if !ok {
+		a.status = "no inlay hint on this line"
+		return
+	}
+	if len(h.Edits) == 0 {
+		a.status = "this inlay hint has no edit to apply"
+		return
+	}
+	edits := make([]complete.Edit, 0, len(h.Edits))
+	for _, he := range h.Edits {
+		edits = append(edits, complete.Edit{Start: he.Start, End: he.End, Text: he.Text})
+	}
+	group, ok := applyServerEdits(p, edits)
+	if !ok {
+		a.status = leaseNote(group)
+		return
+	}
+	// Carry the caret through the batch the way every other server edit does,
+	// then drop the hints: their offsets described the pre-edit text.
+	at := shiftThroughEdits(head, edits)
+	if n := p.File.Len(); at > n {
+		at = n
+	}
+	if at < 0 {
+		at = 0
+	}
+	p.Cursors.Set(at, at)
+	p.FollowCursor()
+	p.File.ClearHints()
+	a.inlayGen++
+	a.Explorer.Tree.MarkChanged(p.File.Path)
+	a.status = "applied inlay hint"
 }

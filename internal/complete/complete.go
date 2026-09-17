@@ -37,11 +37,27 @@ type Edit struct {
 type Candidate struct {
 	Word   string
 	Detail string
+	// Documentation is the server's markdown documentation for this candidate,
+	// shown beside the list. It is empty for buffer words and for an item whose
+	// documentation the server defers to completionItem/resolve.
+	Documentation string
+	// ResolveKey, when non-empty, is an opaque handle for a deferred
+	// completionItem/resolve. The completion package never interprets it: the
+	// caller carries it and hands it back to the server. It is empty for buffer
+	// words and for items the server already finished.
+	ResolveKey string
 	// Edit, when set, is a server replacement for this candidate; Additional
 	// are further edits, such as an import line, that must land with it. The
 	// buffer-word source leaves both nil.
 	Edit       *Edit
 	Additional []Edit
+	// Snippet, when non-empty, is an LSP snippet template for this candidate:
+	// the text to insert with `$1`/`${1:default}` stops, not the plain word in
+	// Word. It is a plain string rather than an LSP type, so this package stays
+	// independent of the protocol; ParseSnippet expands it and the caller runs
+	// the session. Word stays the label the popup shows and the fallback when
+	// no engine consumes the template.
+	Snippet string
 	// score is how strongly this candidate is preferred. Higher is better.
 	score int
 }

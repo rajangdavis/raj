@@ -46,6 +46,7 @@ type NativeHost struct {
 	theme  Theme
 	closed bool
 	dirty  bool
+	erase  bool
 	stop   func()
 }
 
@@ -99,14 +100,28 @@ func (h *NativeHost) Invalidate() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.dirty = true
+	h.erase = true
+}
+
+// Repaint forces the next Present to write every cell, without erasing the
+// terminal first. The change is raj's own and the new frame covers the whole
+// screen, so an erase would only flash; prev is dropped so the frame is full
+// rather than a diff.
+func (h *NativeHost) Repaint() {
+	h.mu.Lock()
+	h.dirty = true
+	h.erase = false
+	h.mu.Unlock()
 }
 
 // Present writes only what changed since the previous frame, or everything
-// after an Invalidate.
+// after an Invalidate or a Repaint.
 func (h *NativeHost) Present(s *Screen) error {
 	h.mu.Lock()
 	dirty := h.dirty
+	erase := h.erase
 	h.dirty = false
+	h.erase = false
 	h.mu.Unlock()
 
 	cols, rows := h.trueSize()
@@ -133,6 +148,7 @@ func (h *NativeHost) Present(s *Screen) error {
 	if sc, sr := s.Size(); sc != cols || sr != rows {
 		h.mu.Lock()
 		h.dirty = true
+		h.erase = true
 		h.mu.Unlock()
 		h.prev = nil
 		return nil
@@ -140,10 +156,14 @@ func (h *NativeHost) Present(s *Screen) error {
 
 	out := ""
 	if dirty {
-		// Erase before the full repaint. Writing every cell is not enough on
-		// its own: a terminal that has been resized or written to by another
-		// program may hold content the new frame never addresses.
-		out = "\x1b[2J"
+		// Erase before the full repaint only when the screen may hold content
+		// this frame never addresses — a resize, a resume, or another writer.
+		// A Repaint drops prev but leaves erase false: writing every cell is
+		// enough when raj is the only writer, and skipping the clear is what
+		// keeps a layout change from flashing.
+		if erase {
+			out = "\x1b[2J"
+		}
 		h.prev = nil
 	}
 	out += s.Diff(h.prev)
@@ -172,9 +192,11 @@ func (h *NativeHost) Present(s *Screen) error {
 	// write; it returns io.ErrShortWrite and leaves the rest unsent.
 	if err := writeAll(h.w, out); err != nil {
 		// The screen is now in an unknown state, so the next frame has to be a
-		// full repaint rather than a diff against something never drawn.
+		// full repaint rather than a diff against something never drawn — and
+		// it must erase, because a partial frame may be sitting on the screen.
 		h.mu.Lock()
 		h.dirty = true
+		h.erase = true
 		h.mu.Unlock()
 		h.prev = nil
 		return err

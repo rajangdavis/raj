@@ -1,7 +1,9 @@
 package editor
 
 import (
+	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"raj/internal/piecetable"
@@ -162,4 +164,177 @@ func TestApplyDiffRefusedOverALease(t *testing.T) {
 	if got := f.Text(); got != "hello >socket\n" {
 		t.Errorf("text = %q, want the boundary insert to land", got)
 	}
+}
+
+// A save whose agreed composition would drop a superseded set that the edit
+// view still shows is refused, and the refusal is a no-op: no bytes written, no
+// pending set accepted. The historical case is a declaration that exists only
+// in a superseded run -- a rejected collider restores it to the edit view while
+// AcceptedOnly omits it -- which a plain save would have written out, leaving a
+// file that does not compile while the buffer still showed the declaration.
+// Without the check the save succeeds and the file is truncated; without the
+// rollback the successful AcceptGroup is left behind on a write that never
+// happened. Sibling: TestSaveFailedEncodeLeavesPendingProposed, which pins the
+// same rollback for the encoding refusal.
+func TestSaveRefusesSupersededText(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	f := p.File
+	superseded := proposeAt(t, f, 6, 11, "socket")
+
+	// A later user deletion consumes the set's insertion; rejecting the
+	// deletion restores its bytes to the session, so the projection puts them
+	// back into the edit view while AcceptedOnly stays without them.
+	f.Begin()
+	// The caret Delete path refuses an edit that intersects a Proposed run, so
+	// the collider has to land the way a real overwrite does: through the diff
+	// path, which treats a Proposed run as advisory.
+	f.ApplyDiff(piecetable.User, f.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 12, Text: ""}})
+	f.End()
+	collider := f.Session().LastGroup()
+	if !f.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if g, _ := sessionGroupOf(f, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+	if len(f.Session().Pending()) != 0 {
+		t.Fatalf("Pending = %+v, want none; the refusal is for a set Pending drops", f.Session().Pending())
+	}
+	if edit, agreed := f.Session().Project(piecetable.AcceptedAndProposed).Text(),
+		f.Session().Project(piecetable.AcceptedOnly).Text(); edit == agreed {
+		t.Fatalf("setup did not separate the compositions: %q", edit)
+	}
+
+	err := f.SaveOver()
+	var refused *UnsavedProposedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("SaveOver() = %v, want *UnsavedProposedError", err)
+	}
+	if len(refused.Groups) != 1 || refused.Groups[0].ID != superseded {
+		t.Errorf("refused groups = %+v, want just set %d", refused.Groups, superseded)
+	}
+	if !strings.Contains(refused.Error(), "accept them to keep the text") ||
+		!strings.Contains(refused.Error(), "clear them to discard it") {
+		t.Errorf("refusal = %q, want both exits named", refused.Error())
+	}
+	if data, rerr := os.ReadFile(f.Path); rerr != nil || string(data) != "hello world\n" {
+		t.Errorf("file = %q err %v, want the refused save to have written nothing", data, rerr)
+	}
+	if got := f.Session().GroupState(superseded); got != piecetable.Proposed {
+		t.Errorf("state after the refused save = %v, want the proposal still pending", got)
+	}
+	if f.Dirty() && !f.ViewDirty() {
+		t.Error("a refused save must not report the buffer clean")
+	}
+}
+
+// A superseded set can be disposed in one gesture through File.ClearGroup, and
+// the decision generation moves with it so Dirty and ViewDirty see the change.
+// Without the method the clear verb has no path to an invalid Proposed set --
+// ClearRejectedBlock refuses it as not rejected -- which is the wedge. Sibling:
+// TestSaveWritesTheAgreedComposition for the rejected path through Save.
+func TestClearGroupDisposesASupersededSet(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	f := p.File
+	superseded := proposeAt(t, f, 6, 11, "socket")
+	f.Begin()
+	// The caret Delete path refuses an edit that intersects a Proposed run, so
+	// land the collider through the diff path, which treats it as advisory.
+	f.ApplyDiff(piecetable.User, f.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 12, Text: ""}})
+	f.End()
+	collider := f.Session().LastGroup()
+	if !f.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if g, _ := sessionGroupOf(f, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+	gen := f.DecisionGeneration()
+
+	ok, block := f.ClearGroup(superseded)
+	if !ok {
+		t.Fatalf("ClearGroup = false (block %+v), want one-gesture disposal", block)
+	}
+	if got := f.Session().GroupState(superseded); got != piecetable.Rejected {
+		t.Errorf("state after clear = %v, want Rejected", got)
+	}
+	if f.DecisionGeneration() == gen {
+		t.Error("clear did not advance the decision generation")
+	}
+	if edit := f.Session().Project(piecetable.AcceptedAndProposed).Text(); strings.Contains(edit, "socket") {
+		t.Errorf("edit composition = %q, want the restored superseded run gone", edit)
+	}
+}
+
+// A save retires the Invalid sets it accepted past: a set whose every member a
+// later accepted edit moved past holds no text, is in neither projection, and
+// Pending and UnsavedProposed both drop it. Left Proposed it keeps a buffer
+// that matches disk reporting a decision forever and its groups listing never
+// settles; the save retires it as Rejected and the bytes it writes are
+// unchanged. Without the retirement the state assertion fails -- the set stays
+// Proposed after the save. Sibling: TestSaveAcceptsPendingProposals for the
+// hunk-carrying case and TestSaveRefusesSupersededText for the refusal.
+func TestSaveRetiresMemberlessInvalidSets(t *testing.T) {
+	p := savedPane(t, "hello world\n")
+	f := p.File
+	superseded := proposeAt(t, f, 0, 0, "AB")
+	// An accepted edit removes the insertion, so the proposed set is invalid
+	// with no surviving hunk, nothing restored to the edit view, and no removal
+	// of its own for retirement to put back.
+	f.Begin()
+	f.ApplyDiff(piecetable.User, f.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 2, Text: ""}})
+	f.End()
+
+	if g, _ := sessionGroupOf(f, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d = %+v, want invalid", superseded, g)
+	}
+	if got := f.Session().InvalidWithoutMembers(); len(got) != 1 {
+		t.Fatalf("setup: InvalidWithoutMembers = %+v, want the dead set", got)
+	}
+	agreed := f.Session().Project(piecetable.AcceptedOnly).Text()
+
+	if err := f.SaveOver(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Session().GroupState(superseded); got != piecetable.Rejected {
+		t.Errorf("state after save = %v, want the dead set retired as Rejected", got)
+	}
+	for _, g := range f.Session().Groups() {
+		if g.State == piecetable.Proposed {
+			t.Errorf("set %+v is still proposed after the save", g)
+		}
+	}
+	if got := len(f.Session().Pending()); got != 0 {
+		t.Errorf("pending after save = %d, want none", got)
+	}
+	if got := f.Session().UnsavedProposed(); len(got) != 0 {
+		t.Errorf("UnsavedProposed after save = %+v, want none", got)
+	}
+	data, err := os.ReadFile(f.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != agreed {
+		t.Errorf("on disk = %q, want the agreed composition %q unchanged by retirement", data, agreed)
+	}
+	if f.Dirty() {
+		t.Error("the buffer matched disk, so Dirty is false after a save that retired the dead sets")
+	}
+	if f.ViewDirty() {
+		t.Error("retirement writes nothing new to the view, so ViewDirty is false")
+	}
+}
+
+// sessionGroupOf finds a piecetable listing by id for a File, the editor-side
+// sibling of the control test's findGroup.
+func sessionGroupOf(f *File, id uint64) (piecetable.Group, bool) {
+	for _, g := range f.Session().Groups() {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return piecetable.Group{}, false
 }

@@ -26,8 +26,9 @@ import (
 // when the buffer is clean of both unsaved text and undecided change sets;
 // there is deliberately no force path.
 const (
-	ignoreForNow  = "Ignore for now"
-	removeForever = "Remove forever"
+	ignoreForNow    = "Ignore for now"
+	removeForever   = "Remove forever"
+	withdrawRemoval = "Withdraw"
 )
 
 // deletionSafe reports whether p can be removed without discarding work the
@@ -141,20 +142,25 @@ func (a *App) pendingDeletionFor(path string) (control.Deletion, bool) {
 // are listed so the reason is concrete rather than a count.
 func (a *App) promptDeletion(p *editor.Pane, d control.Deletion) {
 	msg := fmt.Sprintf("%s proposed deleting %s.", a.deletionProposer(d.Author), p.File.Name())
-	options := []string{ignoreForNow}
+	options := []string{ignoreForNow, withdrawRemoval}
 	if safe, why := deletionSafe(p); safe {
-		options = []string{ignoreForNow, removeForever}
+		options = []string{ignoreForNow, removeForever, withdrawRemoval}
 	} else {
 		msg += " " + why
 	}
 	done := func(answer string, ok bool) {
 		// Ignore for now -- and a dismissed dialog, which means the same
 		// thing -- leaves the proposal pending. The file works normally and
-		// the question returns on the next focus.
-		if !ok || answer != removeForever {
+		// the question returns on the next focus. Withdraw retracts the
+		// proposal; Remove forever is the only answer that touches the file.
+		switch {
+		case !ok, answer == ignoreForNow:
 			return
+		case answer == removeForever:
+			a.removeDeleted(p, d.Path)
+		case answer == withdrawRemoval:
+			a.withdrawDeletion(d)
 		}
-		a.removeDeleted(p, d.Path)
 	}
 	if pending := p.File.Session().Pending(); len(pending) > 0 {
 		rows, lines := a.reviewRows(p, pending)
@@ -223,6 +229,7 @@ func (a *App) removeDeleted(p *editor.Pane, path string) {
 	}
 	a.closeDeletedPane(p)
 	delete(a.pendingDeletions, path)
+	a.clearPendingRemoval(path, false)
 	a.deletionPromptPane = nil
 	a.Explorer.Tree.Refresh()
 	a.status = "removed " + filepath.Base(path)

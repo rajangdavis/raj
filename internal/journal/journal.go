@@ -28,6 +28,11 @@
 //
 // Nil and empty byte blobs are the same on the wire: both encode as a zero
 // length and decode as a non-nil empty slice.
+//
+// Base and Written may end with an optional encoding. A record that ends
+// before it — every record an older log holds — reads as the default (UTF-8,
+// LF, no BOM), which is what the field missing means. The encoder omits the
+// default, so a decode followed by an encode reproduces the bytes.
 package journal
 
 import (
@@ -46,7 +51,10 @@ const Magic = "RAJLOG01"
 // FormatVersion is the version stamped in the header. A reader refuses a file
 // from a different version rather than guessing at its layout.
 //
-// Version 2 adds the session version to the Written marker.
+// Version 2 adds the session version to the Written marker. The encoding is a
+// field-additive extension to Base and Written and does not change the
+// version: it is self-describing through the record's own length, and a log
+// written before it decodes with the default encoding.
 const FormatVersion uint16 = 2
 
 // Framing. headerPrefixLen is the fixed part before the variable body: magic,
@@ -156,6 +164,40 @@ const (
 	Agent
 )
 
+// EncodingKind names the character encoding of a file's bytes. UTF8 is the
+// zero value, so a record built before this field existed, or with no encoding
+// recorded, means UTF-8.
+type EncodingKind uint8
+
+const (
+	EncodingUTF8        EncodingKind = iota // UTF-8, with or without a BOM
+	EncodingUTF16LE                         // UTF-16, little endian, with its BOM
+	EncodingUTF16BE                         // UTF-16, big endian, with its BOM
+	EncodingWindows1252                     // Windows code page 1252
+	EncodingLatin1                          // ISO-8859-1
+)
+
+// Encoding is the shape of the bytes a save put on disk, so a restored buffer
+// can re-encode the same way. It mirrors internal/editor's Encoding by value,
+// not by import: this package defines its own types and a later task maps at
+// the seam. The zero value is UTF-8 with LF lines and no mark, which is what a
+// record that carries no encoding means.
+type Encoding struct {
+	Kind EncodingKind
+	CRLF bool // line endings are \r\n
+	BOM  bool // the file starts with its encoding's byte order mark
+}
+
+// encodingBytes is the encoded width of the optional encoding tail: a kind byte
+// and a flags byte. encodingFlags is every bit the flags byte may carry.
+const encodingBytes = 2
+
+const (
+	encodingFlagCRLF uint8 = 1 << iota
+	encodingFlagBOM
+	encodingFlags = encodingFlagCRLF | encodingFlagBOM
+)
+
 // Record is one entry in the log. The unexported method seals the set: the
 // codec only ever writes the kinds below.
 type Record interface{ recordKind() RecordKind }
@@ -167,6 +209,9 @@ type Base struct {
 	Path  string
 	Hash  string
 	Bytes []byte
+	// Encoding is the shape of the bytes as first read. It is optional on the
+	// wire: a log written before the field decodes with the zero Encoding.
+	Encoding Encoding
 }
 
 func (Base) recordKind() RecordKind { return KindBase }
@@ -246,6 +291,10 @@ type Written struct {
 	Path    string
 	Hash    string
 	Version uint64
+	// Encoding is the shape of the bytes this save wrote, so a restore after a
+	// crash re-encodes with what the save used. Optional on the wire, like
+	// Base's.
+	Encoding Encoding
 }
 
 func (Written) recordKind() RecordKind { return KindWritten }
@@ -468,6 +517,25 @@ func Truncate(path string, at int64) error {
 // Truncate cuts the file to the end of its valid prefix.
 func (l *Log) Truncate() error { return Truncate(l.Path, l.Tail) }
 
+// Encoding reports the encoding a restored buffer must re-encode with: the
+// most recent Written marker's when the log saved, otherwise the base's, and
+// the zero Encoding (UTF-8, LF, no BOM) when neither carries one — an older
+// log, or a file whose bytes are already the default. It is the one accessor a
+// restore path needs; the records stay exported, this just states which one
+// wins.
+func (l *Log) Encoding() Encoding {
+	var enc Encoding
+	for _, r := range l.Records {
+		switch v := r.(type) {
+		case Base:
+			enc = v.Encoding
+		case Written:
+			enc = v.Encoding
+		}
+	}
+	return enc
+}
+
 // encodeHeader lays out the header body: root then identity.
 func encodeHeader(h Header) ([]byte, error) {
 	e := &encoder{}
@@ -537,6 +605,7 @@ func encodeRecord(r Record) (RecordKind, []byte, error) {
 		e.str(v.Path)
 		e.str(v.Hash)
 		e.blob(v.Bytes)
+		e.encoding(v.Encoding)
 	case StoreAppend:
 		e.u8(v.Author)
 		e.u64(v.Start)
@@ -555,6 +624,7 @@ func encodeRecord(r Record) (RecordKind, []byte, error) {
 		e.str(v.Path)
 		e.str(v.Hash)
 		e.u64(v.Version)
+		e.encoding(v.Encoding)
 	case Session:
 		e.blob(v.Blob)
 	default:
@@ -594,7 +664,9 @@ func decodeRecord(kind RecordKind, b []byte) (Record, error) {
 	var r Record
 	switch kind {
 	case KindBase:
-		r = Base{Path: d.str(), Hash: d.str(), Bytes: d.blob()}
+		base := Base{Path: d.str(), Hash: d.str(), Bytes: d.blob()}
+		base.Encoding = d.encoding()
+		r = base
 	case KindStore:
 		r = StoreAppend{Author: d.u8(), Start: d.u64(), Blob: d.blob()}
 	case KindOp:
@@ -610,7 +682,9 @@ func decodeRecord(kind RecordKind, b []byte) (Record, error) {
 	case KindAuthor:
 		r = Author{ID: d.u8(), Identity: d.str(), Name: d.str(), Kind: ParticipantKind(d.u8())}
 	case KindWritten:
-		r = Written{Path: d.str(), Hash: d.str(), Version: d.u64()}
+		w := Written{Path: d.str(), Hash: d.str(), Version: d.u64()}
+		w.Encoding = d.encoding()
+		r = w
 	case KindSession:
 		r = Session{Blob: d.blob()}
 	default:
@@ -643,6 +717,14 @@ func validate(r Record) error {
 	case Author:
 		if v.Kind > Agent {
 			return fmt.Errorf("journal: unknown participant kind %d", v.Kind)
+		}
+	case Base:
+		if v.Encoding.Kind > EncodingLatin1 {
+			return fmt.Errorf("journal: unknown encoding kind %d", v.Encoding.Kind)
+		}
+	case Written:
+		if v.Encoding.Kind > EncodingLatin1 {
+			return fmt.Errorf("journal: unknown encoding kind %d", v.Encoding.Kind)
 		}
 	}
 	return nil
@@ -699,6 +781,24 @@ func (e *encoder) blob(b []byte) {
 	}
 	e.u64(uint64(len(b)))
 	e.b = append(e.b, b...)
+}
+
+// encoding appends a non-default Encoding. The default is omitted so a record
+// that never carried one still re-encodes to the same bytes, and an older log
+// record is the canonical form of the default.
+func (e *encoder) encoding(enc Encoding) {
+	if e.err != nil || enc == (Encoding{}) {
+		return
+	}
+	e.u8(uint8(enc.Kind))
+	var flags uint8
+	if enc.CRLF {
+		flags |= encodingFlagCRLF
+	}
+	if enc.BOM {
+		flags |= encodingFlagBOM
+	}
+	e.u8(flags)
 }
 
 // decoder reads fields back in the order they were written. It records the
@@ -823,4 +923,34 @@ func (d *decoder) blob() []byte {
 	b := d.b[d.off : d.off+int(n)]
 	d.off += int(n)
 	return b
+}
+
+// encoding reads an optional trailing Encoding. A record whose payload ends
+// before it — every Base and Written an older log holds — has none, and the
+// default (UTF-8, LF, no BOM) is what that means. A record that spells out the
+// default is refused: the canonical form omits it, so decode followed by
+// encode reproduces the bytes.
+func (d *decoder) encoding() Encoding {
+	if d.err != nil || d.off == len(d.b) {
+		return Encoding{}
+	}
+	if d.off+encodingBytes != len(d.b) {
+		d.fail(fmt.Sprintf("%d trailing record bytes", len(d.b)-d.off))
+		return Encoding{}
+	}
+	kind := d.u8()
+	flags := d.u8()
+	if d.err != nil {
+		return Encoding{}
+	}
+	if flags&^encodingFlags != 0 {
+		d.fail(fmt.Sprintf("unknown encoding flags %#02x", flags))
+		return Encoding{}
+	}
+	enc := Encoding{Kind: EncodingKind(kind), CRLF: flags&encodingFlagCRLF != 0, BOM: flags&encodingFlagBOM != 0}
+	if enc == (Encoding{}) {
+		d.fail("non-canonical default encoding")
+		return Encoding{}
+	}
+	return enc
 }

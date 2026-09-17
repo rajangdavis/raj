@@ -40,7 +40,9 @@ type inlayHint struct {
 	PaddingLeft  bool            `json:"paddingLeft"`
 	PaddingRight bool            `json:"paddingRight"`
 	Tooltip      json.RawMessage `json:"tooltip"`
-	TextEdits    []TextEdit      `json:"textEdits"`
+	// TextEdits is kept raw so one malformed edit cannot cost the hint its
+	// label and tooltip; the edits are decoded permissively afterwards.
+	TextEdits json.RawMessage `json:"textEdits"`
 }
 
 // labelText flattens an inlay hint label. It is either a plain string or an
@@ -90,6 +92,32 @@ func tooltipText(raw json.RawMessage) string {
 	return ""
 }
 
+// textEdits decodes a hint's attached edits permissively. resolveSupport is
+// unadvertised, so a server sends the edits with the hint or not at all; a
+// malformed list or a malformed element must not cost the hint its label and
+// tooltip, so a bad element is dropped and the good ones are kept.
+func textEdits(raw json.RawMessage) []TextEdit {
+	if isNull(raw) {
+		return nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	out := make([]TextEdit, 0, len(parts))
+	for _, p := range parts {
+		var e TextEdit
+		if json.Unmarshal(p, &e) != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // RequestInlayHints asks for the hints in a range of a document.
 //
 // The range is mandatory in the protocol and is how a client asks only about
@@ -111,12 +139,19 @@ func RequestInlayHints(ctx context.Context, c *Conn, path string, r Range) ([]In
 	if isNull(raw) {
 		return nil, nil
 	}
-	var wire []inlayHint
+	// Decoded element by element: one malformed hint must not cost the whole
+	// answer, and the edits are decoded separately so a malformed edit is
+	// dropped rather than failing the hint it hung off.
+	var wire []json.RawMessage
 	if json.Unmarshal(raw, &wire) != nil {
 		return nil, nil
 	}
 	out := make([]InlayHint, 0, len(wire))
-	for _, w := range wire {
+	for _, el := range wire {
+		var w inlayHint
+		if json.Unmarshal(el, &w) != nil {
+			continue
+		}
 		out = append(out, InlayHint{
 			Pos:          w.Position,
 			Text:         labelText(w.Label),
@@ -124,7 +159,7 @@ func RequestInlayHints(ctx context.Context, c *Conn, path string, r Range) ([]In
 			PaddingLeft:  w.PaddingLeft,
 			PaddingRight: w.PaddingRight,
 			Tooltip:      tooltipText(w.Tooltip),
-			Edits:        w.TextEdits,
+			Edits:        textEdits(w.TextEdits),
 		})
 	}
 	return out, nil

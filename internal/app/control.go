@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -255,6 +256,8 @@ func (h host) Buffers() []control.Buffer {
 	}
 	return out
 }
+
+// canonicalPat}
 
 // canonicalPath maps a request's path to the name a tab is keyed on: a
 // relative path resolves against the workspace root, and .. and symlink
@@ -633,6 +636,7 @@ func (a *App) ProposeDeletion(path string, author uint8) error {
 		return nil
 	}
 	a.pendingDeletions[path] = control.Deletion{Path: path, Author: author}
+	a.notePendingRemoval(path, false)
 	// A proposal for the file already on screen is raised now rather than at
 	// the next focus: the gate must not wait for a focus change that may never
 	// come. A path open only in the background waits for its turn, so the
@@ -656,6 +660,7 @@ func (a *App) WithdrawDeletion(path string, author uint8) error {
 		return fmt.Errorf("pending deletion of %s was proposed by author %d, not this writer", path, d.Author)
 	}
 	delete(a.pendingDeletions, path)
+	a.clearPendingRemoval(path, false)
 	return nil
 }
 
@@ -699,6 +704,7 @@ func (a *App) ProposeDirRemoval(path string, author uint8) error {
 		return nil
 	}
 	a.pendingDirRemovals[path] = control.DirRemoval{Path: path, Author: author}
+	a.notePendingRemoval(path, true)
 	// A directory has no pane to focus, so the gate raises immediately rather
 	// than waiting for a focus change that will never come. A question already
 	// on screen is never interrupted; the check runs again on the next
@@ -721,6 +727,7 @@ func (a *App) WithdrawDirRemoval(path string, author uint8) error {
 		return fmt.Errorf("pending dir-removal of %s was proposed by author %d, not this writer", path, d.Author)
 	}
 	delete(a.pendingDirRemovals, path)
+	a.clearPendingRemoval(path, true)
 	return nil
 }
 
@@ -1425,18 +1432,21 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 	return nil
 }
 
-// Clear hard-purges a rejected change set. Unlike Decide this really edits:
-// ClearRejected reverses the set's ops out of the document and drops the
-// decision, so both the text and the mark leave the view. It returns false for
-// a set that is not currently rejected or one a later edit has wedged, and the
-// refusal names the group because that is how the caller addressed it.
+// Clear disposes of a change set in one gesture: a Rejected set is reversed
+// out as before, and an Invalid (superseded) Proposed set is dropped by
+// marking it rejected, because no live member of it can be reversed. It is the
+// only disposal that reaches an invalid set -- Pending drops it, so accept and
+// reject address nothing, and the old rejected-only path refused it outright --
+// which is the wedge this closes. It returns false for a set that is neither a
+// rejected set nor an invalid one, and the refusal names the group because that
+// is how the caller addressed it.
 func (h host) Clear(path string, group uint64) error {
 	p, err := h.find(path)
 	if err != nil {
 		return err
 	}
 	defer h.a.flushJournal(p)
-	ok, block := p.File.ClearRejectedBlock(group)
+	ok, block := p.File.ClearGroup(group)
 	if !ok {
 		if block.Group != 0 {
 			// The reversal wedged behind a live set. Name it in the same
@@ -1454,8 +1464,9 @@ func (h host) Clear(path string, group uint64) error {
 					group, block.Group, block.Author, block.Start, block.End),
 			}
 		}
-		return fmt.Errorf("change set %d is not a rejected set that can be cleared "+
-			"(it may be proposed, already gone, or wedged behind a later edit)", group)
+		return fmt.Errorf("change set %d cannot be cleared "+
+			"(proposed sets with surviving text are decided with accept or reject; "+
+			"an accepted set, or one already reversed, has nothing to clear)", group)
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
@@ -1527,6 +1538,25 @@ func (h host) Revert(path string, author uint8) error {
 // App.lspSaved. It still does not share the rest of App.write's bookkeeping —
 // the journal and AcceptPending have no meaning for a buffer whose proposed
 // changes were refused above.
+// saveRefusal converts an editor save refusal into the one wording both save
+// paths use. A save the editor refused because the agreed composition would
+// have dropped a superseded set gets an actionable message naming the set and
+// the two gestures that resolve it, and the set ids ride along so a caller can
+// route the decision. Any other error -- disk changed, an unencodable
+// character -- is the editor's own, returned unchanged.
+func saveRefusal(err error) (string, []uint64) {
+	var refused *editor.UnsavedProposedError
+	if !errors.As(err, &refused) {
+		return "save failed: " + err.Error(), nil
+	}
+	msg := refused.Error() + "; save with proposed changes to accept them, or `clear` them to discard"
+	ids := make([]uint64, len(refused.Groups))
+	for i, g := range refused.Groups {
+		ids[i] = g.ID
+	}
+	return msg, ids
+}
+
 func (h host) Save(path string) (uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
@@ -1537,6 +1567,12 @@ func (h host) Save(path string) (uint64, error) {
 			"the edit is in the buffer and will reach disk when they save", len(pending))
 	}
 	if err := p.File.Save(); err != nil {
+		// The only save that can refuse for a reason beyond disk or encoding is
+		// one whose agreed composition would drop a superseded set; give the
+		// caller the same actionable wording the user's own save shows.
+		if msg, _ := saveRefusal(err); msg != "save failed: "+err.Error() {
+			return 0, errors.New(msg)
+		}
 		return 0, err
 	}
 	// The bytes reached disk; both announcements are best-effort, like App.write's.
@@ -1554,9 +1590,10 @@ func (h host) Save(path string) (uint64, error) {
 // ready" answer the driver can retry.
 func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, error) {
 	switch mode {
-	case "hover", "definition", "references", "completion", "diagnostics":
+	case "hover", "definition", "declaration", "type-definition", "implementation",
+		"references", "completion", "signature", "diagnostics", "document-symbols":
 	default:
-		return nil, fmt.Errorf("unknown lsp mode %q (want hover, definition, references, completion or diagnostics)", mode)
+		return nil, fmt.Errorf("unknown lsp mode %q (want hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics or document-symbols)", mode)
 	}
 	p, err := h.findOrLoad(path)
 	if err != nil {
@@ -1618,7 +1655,9 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 			buf:    bufVersion,
 		}, nil
 	}
-	if line < 1 || col < 1 {
+	// document-symbols is asked about the document, not a position, like
+	// diagnostics; the server's whole-file outline has no caret.
+	if mode != "document-symbols" && (line < 1 || col < 1) {
 		return nil, fmt.Errorf("lsp %s needs a 1-based line and column", mode)
 	}
 
@@ -1637,8 +1676,75 @@ func (h host) LSP(path string, line, col int, mode string) (control.LSPCaller, e
 		return nil, fmt.Errorf("language server not ready")
 	}
 	off := p.File.OffsetAt(line-1, col-1)
+	switch mode {
+	case "references":
+		if msg := capabilityGap(ls.caps.Capabilities.ReferencesProvider, "references"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	case "declaration":
+		if msg := capabilityGap(ls.caps.Capabilities.DeclarationProvider, "declaration"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	case "type-definition":
+		if msg := capabilityGap(ls.caps.Capabilities.TypeDefinitionProvider, "type definition"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	case "implementation":
+		if msg := capabilityGap(ls.caps.Capabilities.ImplementationProvider, "implementation"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	case "signature":
+		if msg := capabilityGap(ls.caps.Capabilities.SignatureHelpProvider, "signature help"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	case "document-symbols":
+		if msg := capabilityGap(ls.caps.Capabilities.DocumentSymbolProvider, "document symbols"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	}
+	// A document-symbol request carries no position; the caller's path is the
+	// whole subject, like a formatting request's.
+	if mode == "document-symbols" {
+		return lspCaller{mode: mode, conn: conn, path: lpath}, nil
+	}
 	pos := lsp.NewDocument(p.File.Text()).Position(off)
 	return lspCaller{mode: mode, conn: conn, path: lpath, pos: pos}, nil
+}
+
+// LSPWorkspaceSymbols prepares a project-wide symbol query. It is the variant
+// of host.LSP that takes a query instead of a position: the server's index is
+// what matches names, so there is nothing to ask about a place. The path still
+// names the document whose server should answer, and the capability gate is
+// the human action's, in the same voice, so a server that never advertised
+// workspaceSymbolProvider is told apart from one with nothing to say rather
+// than asked a method it would answer method-not-found.
+func (h host) LSPWorkspaceSymbols(path, query string) (control.LSPCaller, error) {
+	p, err := h.findOrLoad(path)
+	if err != nil {
+		return nil, err
+	}
+	lpath := h.a.docPath(p)
+	if lpath == "" {
+		return nil, fmt.Errorf("no path for this buffer")
+	}
+	ls, st := h.a.servers.for_(lpath, func() { h.a.host.Post(ui.Wake{}) })
+	if ls == nil {
+		if msg := st.message(lpath); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, fmt.Errorf("language server not available")
+	}
+	if msg := ls.capabilityGapMethod(ls.caps.Capabilities.WorkspaceSymbolProvider, "workspace/symbol", "workspace symbols"); msg != "" {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	if !h.a.syncDoc(ls, p) {
+		return nil, fmt.Errorf("could not synchronise the document with the server")
+	}
+	conn := ls.srv.Conn()
+	if conn == nil {
+		return nil, fmt.Errorf("language server not ready")
+	}
+	return lspCaller{mode: "symbols", conn: conn, query: query}, nil
 }
 
 // LSPInlayHints prepares a range-scoped inlay-hint request, the range variant
@@ -1735,6 +1841,81 @@ func (h host) LSPInlayHints(path string, lineStart, lineEnd int) (control.LSPCal
 	return lspCaller{mode: "inlay-hints", conn: conn, path: lpath, rng: rng, toHint: toHint}, nil
 }
 
+// LSPFormat prepares a whole-document or range formatting request. It is the
+// formatting variant of host.LSP: the same find-or-load, capability gate and
+// sync, with the buffer's own indent style built into the FormattingOptions on
+// the event thread so the request goroutine never reads the live buffer.
+//
+// lineStart and lineEnd are 1-based inclusive lines, zero meaning the start or
+// the end of the file; both zero asks about the whole document. The capability
+// gate is per feature — the whole-document form reads documentFormattingProvider
+// and the range form reads documentRangeFormattingProvider — so a server that
+// advertises one and not the other is refused for the one it lacks rather than
+// asked a method it would answer method-not-found.
+func (h host) LSPFormat(path string, lineStart, lineEnd int) (control.LSPCaller, error) {
+	p, err := h.findOrLoad(path)
+	if err != nil {
+		return nil, err
+	}
+	lpath := h.a.docPath(p)
+	if lpath == "" {
+		return nil, fmt.Errorf("no path for this buffer")
+	}
+	ls, st := h.a.servers.for_(lpath, func() { h.a.host.Post(ui.Wake{}) })
+	if ls == nil {
+		if msg := st.message(lpath); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, fmt.Errorf("language server not available")
+	}
+	whole := lineStart <= 0 && lineEnd <= 0
+	if whole {
+		if msg := capabilityGap(ls.caps.Capabilities.DocumentFormattingProvider, "formatting"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	} else {
+		if msg := capabilityGap(ls.caps.Capabilities.DocumentRangeFormattingProvider, "range formatting"); msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+	}
+	if !h.a.syncDoc(ls, p) {
+		return nil, fmt.Errorf("could not synchronise the document with the server")
+	}
+	conn := ls.srv.Conn()
+	if conn == nil {
+		return nil, fmt.Errorf("language server not ready")
+	}
+	opts := formatOptions(p.File.Indent)
+	if whole {
+		return lspCaller{mode: "format", conn: conn, path: lpath, opts: opts}, nil
+	}
+	lines := p.File.Lines()
+	top, bottom := 0, lines
+	if lineStart > 0 {
+		top = lineStart - 1
+	}
+	if lineEnd > 0 {
+		bottom = lineEnd
+	}
+	if top < 0 {
+		top = 0
+	}
+	if top > lines {
+		top = lines
+	}
+	if bottom > lines {
+		bottom = lines
+	}
+	if bottom < top {
+		bottom = top
+	}
+	// The same line-bounds-to-range conversion the inlay-hints request uses:
+	// the range starts at the first selected line and ends at the start of the
+	// line after the last, so a whole-line selection asks for whole lines.
+	rng := h.a.hintRange(p, top, bottom)
+	return lspCaller{mode: "range-format", conn: conn, path: lpath, opts: opts, rng: rng}, nil
+}
+
 // diagnosticsWait bounds how long the diagnostics caller waits for the publish
 // that answers it. A server that has not spoken within this window gets the
 // honest stale or unpublished status instead of holding the caller open; a
@@ -1764,6 +1945,14 @@ type lspCaller struct {
 	// closes over a text snapshot, so Run never touches the live buffer.
 	rng    lsp.Range
 	toHint func(lsp.InlayHint) control.LSPHint
+	// query is the workspace/symbol text for the symbols mode. It is the whole
+	// request: the server matches it against its index, and an empty query asks
+	// for everything the server has.
+	query string
+	// opts carries a formatting request's FormattingOptions, built on the event
+	// thread from the buffer's indent style so the request goroutine never
+	// reads the live buffer.
+	opts lsp.FormattingOptions
 }
 
 func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
@@ -1815,33 +2004,14 @@ func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 			out.Text = h.Text
 		}
 		return json.Marshal(out)
-	case "definition":
+	case "definition", "declaration", "type-definition", "implementation", "references":
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
-		locs, err := lsp.RequestDefinition(ctx, c.conn, c.path, c.pos)
+		locs, err := runLocationRequest(ctx, c.mode, c)
 		if err != nil {
 			return nil, err
 		}
-		out.Locations = make([]control.LSPLocation, 0, len(locs))
-		for _, l := range locs {
-			out.Locations = append(out.Locations, control.LSPLocation{
-				Path: l.Path, Line: l.Range.Start.Line + 1, Col: l.Range.Start.Character + 1,
-			})
-		}
-		return json.Marshal(out)
-	case "references":
-		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		locs, err := lsp.RequestReferences(ctx, c.conn, c.path, c.pos, true)
-		if err != nil {
-			return nil, err
-		}
-		out.Locations = make([]control.LSPLocation, 0, len(locs))
-		for _, l := range locs {
-			out.Locations = append(out.Locations, control.LSPLocation{
-				Path: l.Path, Line: l.Range.Start.Line + 1, Col: l.Range.Start.Character + 1,
-			})
-		}
+		out.Locations = lspLocations(locs)
 		return json.Marshal(out)
 	case "completion":
 		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1857,6 +2027,51 @@ func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 			})
 		}
 		return json.Marshal(out)
+	case "signature":
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		help, err := lsp.RequestSignatureHelp(ctx, c.conn, c.path, c.pos)
+		if err != nil {
+			return nil, err
+		}
+		if help != nil {
+			out.ActiveSignature = help.ActiveSignature
+			out.ActiveParameter = help.ActiveParameter
+			out.Signatures = make([]control.LSPSignature, 0, len(help.Signatures))
+			for _, sig := range help.Signatures {
+				cs := control.LSPSignature{
+					Label:           sig.Label,
+					Documentation:   sig.Documentation,
+					ActiveParameter: sig.ActiveParameter,
+				}
+				for _, prm := range sig.Parameters {
+					cs.Parameters = append(cs.Parameters, control.LSPParameter{
+						Label: prm.Label, Start: prm.Start, End: prm.End, Offsets: prm.HasOffsets,
+					})
+				}
+				out.Signatures = append(out.Signatures, cs)
+			}
+		}
+		return json.Marshal(out)
+	case "format", "range-format":
+		// Formatting is a cold-server request like document symbols, so the
+		// bound is the longer one. The FormattingOptions were built on the
+		// event thread; the range form also carries the lines the driver named,
+		// and the whole-document form leaves rng zero.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		var edits []lsp.TextEdit
+		var err error
+		if c.mode == "range-format" {
+			edits, err = lsp.RequestRangeFormatting(ctx, c.conn, c.path, c.rng, c.opts)
+		} else {
+			edits, err = lsp.RequestFormatting(ctx, c.conn, c.path, c.opts)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out.Edits = lspEdits(edits)
+		return json.Marshal(out)
 	case "inlay-hints":
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
@@ -1869,8 +2084,121 @@ func (c lspCaller) Run(ctx context.Context) ([]byte, error) {
 			out.Hints = append(out.Hints, c.toHint(hint))
 		}
 		return json.Marshal(out)
+	case "document-symbols":
+		// A file's whole outline can be large and a cold server may still be
+		// parsing it, so the bound matches the workspace-symbol 5s rather than
+		// the point-query 3s.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		syms, err := lsp.RequestDocumentSymbols(ctx, c.conn, c.path)
+		if err != nil {
+			return nil, err
+		}
+		out.DocumentSymbols = lspDocumentSymbols(syms)
+		return json.Marshal(out)
+	case "symbols":
+		// A project-wide symbol query can outlast a hover: a cold gopls index
+		// is the slow case, so the bound is the longer one.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		syms, err := lsp.RequestWorkspaceSymbols(ctx, c.conn, c.query)
+		if err != nil {
+			return nil, err
+		}
+		out.Symbols = lspWorkspaceSymbols(syms)
+		return json.Marshal(out)
 	}
 	return nil, fmt.Errorf("unknown lsp mode %q", c.mode)
+}
+
+// lspDocumentSymbols converts a document-symbol tree to the wire shape, with the
+// server's 0-based positions made 1-based. The tree is preserved rather than
+// flattened: a flat SymbolInformation reply is childless, and a driver that
+// assumed a depth would misread one shape or the other. A symbol with no range
+// keeps line 0, the same "no place" distinction LSPSymbol makes.
+func lspDocumentSymbols(syms []lsp.DocumentSymbol) []control.LSPDocumentSymbol {
+	out := make([]control.LSPDocumentSymbol, 0, len(syms))
+	for _, s := range syms {
+		cs := control.LSPDocumentSymbol{
+			Name: s.Name, Detail: s.Detail, Kind: s.Kind.String(),
+			Container: s.Container, Path: s.Path,
+		}
+		if s.HasRange {
+			cs.Line = s.SelectionRange.Start.Line + 1
+			cs.Col = s.SelectionRange.Start.Character + 1
+		}
+		cs.Children = lspDocumentSymbols(s.Children)
+		out = append(out, cs)
+	}
+	return out
+}
+
+// runLocationRequest performs the blocking request for one of the location
+// modes. Definition, declaration, type definition, implementation and
+// references differ only in the method, so a new one is a case here rather
+// than a fourth copy of the timeout-and-decode sequence.
+func runLocationRequest(ctx context.Context, mode string, c lspCaller) ([]lsp.Location, error) {
+	switch mode {
+	case "definition":
+		return lsp.RequestDefinition(ctx, c.conn, c.path, c.pos)
+	case "declaration":
+		return lsp.RequestDeclaration(ctx, c.conn, c.path, c.pos)
+	case "type-definition":
+		return lsp.RequestTypeDefinition(ctx, c.conn, c.path, c.pos)
+	case "implementation":
+		return lsp.RequestImplementation(ctx, c.conn, c.path, c.pos)
+	case "references":
+		return lsp.RequestReferences(ctx, c.conn, c.path, c.pos, true)
+	}
+	return nil, fmt.Errorf("unknown lsp mode %q", mode)
+}
+
+// lspEdits converts the lsp package's formatting edits to the wire shape, with
+// the server's 0-based line and character made 1-based for the driver. End is
+// exclusive, as the protocol's ranges are.
+func lspEdits(edits []lsp.TextEdit) []control.LSPEdit {
+	out := make([]control.LSPEdit, 0, len(edits))
+	for _, e := range edits {
+		out = append(out, control.LSPEdit{
+			Line:    e.Range.Start.Line + 1,
+			Col:     e.Range.Start.Character + 1,
+			EndLine: e.Range.End.Line + 1,
+			EndCol:  e.Range.End.Character + 1,
+			Text:    e.NewText,
+		})
+	}
+	return out
+}
+
+// lspLocations converts the lsp package's locations to the wire shape, with the
+// server's 0-based line and character made 1-based for the driver.
+func lspLocations(locs []lsp.Location) []control.LSPLocation {
+	out := make([]control.LSPLocation, 0, len(locs))
+	for _, l := range locs {
+		out = append(out, control.LSPLocation{
+			Path: l.Path, Line: l.Range.Start.Line + 1, Col: l.Range.Start.Character + 1,
+		})
+	}
+	return out
+}
+
+// lspWorkspaceSymbols converts a workspace/symbol answer to the wire shape,
+// with the server's 0-based positions made 1-based. A symbol the server named
+// by file alone keeps line 0, the same "no place" distinction LSPSymbol makes.
+func lspWorkspaceSymbols(syms []lsp.WorkspaceSymbol) []control.LSPSymbol {
+	out := make([]control.LSPSymbol, 0, len(syms))
+	for _, s := range syms {
+		cs := control.LSPSymbol{
+			Name: s.Name, Kind: s.Kind.String(),
+			Container: s.Container, Path: s.Location.Path,
+		}
+		if s.HasRange {
+			cs.Line = s.Location.Range.Start.Line + 1
+			cs.Col = s.Location.Range.Start.Character + 1
+		}
+		out = append(out, cs)
+	}
+	return out
 }
 
 // lspStatus names the state a diagnostics answer reports, so a caller never has

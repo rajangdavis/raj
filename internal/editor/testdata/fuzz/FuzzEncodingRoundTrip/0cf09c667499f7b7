@@ -1,2 +1,2 @@
 go test fuzz v1
-string("\r\r\n")
+[]byte("\r\r\n")

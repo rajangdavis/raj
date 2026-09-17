@@ -580,7 +580,7 @@ func TestReviewMapsAreIdentityWithoutDecisions(t *testing.T) {
 	if got := h.proposalsVisible(p); len(got) != 1 {
 		t.Errorf("proposalsVisible = %+v, want the one proposal", got)
 	}
-	reviewJump(p, 1)
+	jumpToSessionLine(p, 1)
 	if line := p.File.LineOf(p.Cursors.Primary().Head); line != 0 {
 		t.Errorf("caret line = %d after a jump to line 1, want 0", line)
 	}

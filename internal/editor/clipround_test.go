@@ -1,6 +1,8 @@
 package editor
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -38,11 +40,13 @@ func TestClipRoundTripAllShapes(t *testing.T) {
 				}
 				return p
 			}
-			clip := build().Copy()
+			src := build()
+			clip := src.Copy()
 
-			dst := build()
-			dst.PasteClip(clip)
-			spliced := dst.File.Slice(0, dst.File.Len())
+			// Paste internally into the pane that copied, so the spans splice;
+			// a separate pane's store differs and would exercise Text only.
+			src.PasteClip(clip)
+			spliced := src.File.Slice(0, src.File.Len())
 
 			ext := build()
 			ext.PasteClip(Clip{Text: clip.Text})
@@ -70,6 +74,57 @@ func TestWholeLineCopyKeepsItsNewline(t *testing.T) {
 	}
 }
 
+// The linewise paste must yield the same document whether it goes through the
+// piece path (internal) or appends the text (external), and land the cursor in
+// the same place. TestClipRoundTripAllShapes narrowed to the new path,
+// covering the captured-newline and NewlinePiece cases.
+func TestLinewisePasteInternalMatchesExternal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		from int // caret when copying the whole line
+		to   int // caret when pasting
+	}{
+		{"after indent", "\tfoo\nbar\n", 1, 1},
+		{"end of line", "\tfoo\nbar\n", 4, 4},
+		{"column zero", "\tfoo\nbar\n", 0, 0},
+		{"filled empty line", "one\n\nthree\n", 0, 4},
+		{"final empty line", "one\n", 0, 4},
+		{"final line without newline", "one\nlast", 0, 8},
+		{"final source into empty line", "x\n\nlast", 6, 2},
+		{"final source pasted below", "one\nlast", 4, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			build := func() *Pane {
+				p := NewPane(NewFile("t.go", tc.body, 2))
+				p.Resize(80, 40)
+				p.Cursors.Set(tc.from, tc.from)
+				return p
+			}
+			src := build()
+			clip := src.Copy()
+			src.Cursors.Set(tc.to, tc.to)
+			src.PasteClip(clip)
+			spliced := src.File.Text()
+
+			ext := build()
+			ext.Cursors.Set(tc.to, tc.to)
+			ext.PasteClip(Clip{Text: clip.Text})
+			external := ext.File.Text()
+
+			if spliced != external {
+				t.Errorf("internal %q\nexternal %q", spliced, external)
+			}
+			if spliced == tc.body {
+				t.Errorf("paste changed nothing: %q", spliced)
+			}
+			if a, b := src.Cursors.Primary().Head, ext.Cursors.Primary().Head; a != b {
+				t.Errorf("cursor internal %d, external %d", a, b)
+			}
+		})
+	}
+}
+
 // Splicing an internal clip appends nothing to the store, at any size. Widening
 // the captured span to cover the newline must not cost that.
 func TestWholeLineCopyStillStoresNothing(t *testing.T) {
@@ -81,8 +136,70 @@ func TestWholeLineCopyStillStoresNothing(t *testing.T) {
 		before := p.File.Session().Store().Bytes()
 		p.Cursors.Set(p.File.Len(), p.File.Len())
 		p.PasteClip(clip)
+		// Paste again below line 0: both the filled and the pasted-below
+		// branch must reuse the captured newline, appending nothing.
+		p.Cursors.Set(0, 0)
+		p.PasteClip(clip)
 		if got := p.File.Session().Store().Bytes() - before; got != 0 {
 			t.Errorf("size %d: stored %d bytes, want 0", size, got)
 		}
+	}
+}
+
+// A clip's spans are offsets into the store of the file that copied it. Pasted
+// into a different file they name unrelated bytes, or none at all, so PasteClip
+// must fall back to the text. This is the cross-buffer path: copy in one file,
+// switch tabs, paste in another.
+func TestClipDoesNotCrossFiles(t *testing.T) {
+	src := NewPane(NewFile("a.go", "alpha beta", 2))
+	src.Resize(80, 40)
+	src.Cursors.Set(0, 5) // select "alpha"
+	clip := src.Copy()
+	if clip.Text != "alpha" {
+		t.Fatalf("copy = %q, want alpha", clip.Text)
+	}
+
+	dst := NewPane(NewFile("b.go", "XY", 2))
+	dst.Resize(80, 40)
+	dst.PasteClip(clip)
+
+	ext := NewPane(NewFile("b.go", "XY", 2))
+	ext.Resize(80, 40)
+	ext.PasteClip(Clip{Text: clip.Text})
+
+	if got, want := dst.File.Text(), ext.File.Text(); got != want {
+		t.Errorf("cross-file paste = %q, want %q (the text paste)", got, want)
+	}
+	if got := dst.File.Text(); got != "alphaXY" {
+		t.Errorf("cross-file paste = %q, want alphaXY", got)
+	}
+}
+
+// A reload replaces the file's session and store in place, so a clip captured
+// before it names bytes that no longer exist even though the File is the same.
+// It too must go through Text.
+func TestClipDoesNotCrossReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.go")
+	if err := os.WriteFile(path, []byte("alpha beta"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Open(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewPane(f)
+	p.Resize(80, 40)
+	p.Cursors.Set(0, 5) // select "alpha"
+	clip := p.Copy()
+
+	if err := os.WriteFile(path, []byte("replaced entirely"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	p.PasteClip(clip)
+	if got := p.File.Text(); !strings.Contains(got, "alpha") {
+		t.Errorf("paste after reload = %q, want the copied text inserted", got)
 	}
 }

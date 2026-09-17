@@ -22,13 +22,14 @@ type fakeServer struct {
 	out     *io.PipeWriter // what the server writes
 	stopped chan struct{}
 
-	mu       sync.Mutex
-	handlers map[string]func(*Message) (any, *ResponseError)
-	hang     map[string]bool
-	seen     []string
-	params   map[string][]json.RawMessage // params of each notification, by method
-	replies  []string                     // IDs of client responses to server requests
-	stops    int
+	mu        sync.Mutex
+	handlers  map[string]func(*Message) (any, *ResponseError)
+	hang      map[string]bool
+	seen      []string
+	params    map[string][]json.RawMessage // params of each notification, by method
+	replies   []string                     // IDs of client responses to server requests
+	responses map[string]*Message          // client replies, by the ID they answer
+	stops     int
 }
 
 func newFake(t *testing.T) *fakeServer {
@@ -39,13 +40,14 @@ func newFake(t *testing.T) *fakeServer {
 	clientIn, serverOut := io.Pipe()
 
 	f := &fakeServer{
-		t:        t,
-		in:       serverIn,
-		out:      serverOut,
-		stopped:  make(chan struct{}),
-		handlers: map[string]func(*Message) (any, *ResponseError){},
-		hang:     map[string]bool{},
-		params:   map[string][]json.RawMessage{},
+		t:         t,
+		in:        serverIn,
+		out:       serverOut,
+		stopped:   make(chan struct{}),
+		handlers:  map[string]func(*Message) (any, *ResponseError){},
+		hang:      map[string]bool{},
+		params:    map[string][]json.RawMessage{},
+		responses: map[string]*Message{},
 	}
 	f.conn = NewConn(clientOut, clientIn, func() {
 		f.mu.Lock()
@@ -90,6 +92,15 @@ func (f *fakeServer) replyIDs() []string {
 	return append([]string(nil), f.replies...)
 }
 
+// response returns the client's reply to a server request, by ID. A reply
+// carries exactly one of Result or Error; the shape is checked here because
+// marshal is where a nil handler result becomes the protocol's null.
+func (f *fakeServer) response(id string) *Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.responses[id]
+}
+
 func (f *fakeServer) stopCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -113,7 +124,9 @@ func (f *fakeServer) serve() {
 			f.params[m.Method] = append(f.params[m.Method], m.Params)
 		}
 		if m.IsResponse() && m.ID != nil {
-			f.replies = append(f.replies, strings.TrimSpace(string(*m.ID)))
+			id := strings.TrimSpace(string(*m.ID))
+			f.replies = append(f.replies, id)
+			f.responses[id] = m
 		}
 		fn, hasFn := f.handlers[m.Method]
 		hang := f.hang[m.Method]
@@ -145,9 +158,23 @@ func TestInitialize(t *testing.T) {
 	f.on("initialize", func(*Message) (any, *ResponseError) {
 		return map[string]any{
 			"capabilities": map[string]any{
-				"hoverProvider":      true,
-				"definitionProvider": map[string]any{"workDoneProgress": true},
-				"completionProvider": map[string]any{"triggerCharacters": []string{"."}},
+				"hoverProvider":              true,
+				"definitionProvider":         map[string]any{"workDoneProgress": true},
+				"completionProvider":         map[string]any{"triggerCharacters": []string{"."}},
+				"referencesProvider":         map[string]any{"workDoneProgress": true},
+				"declarationProvider":        true,
+				"inlayHintProvider":          map[string]any{},
+				"signatureHelpProvider":      map[string]any{"triggerCharacters": []string{"(", ","}},
+				"renameProvider":             map[string]any{"prepareProvider": true},
+				"workspaceSymbolProvider":    map[string]any{"resolveProvider": true},
+				"selectionRangeProvider":     true,
+				"callHierarchyProvider":      map[string]any{},
+				"typeHierarchyProvider":      true,
+				"linkedEditingRangeProvider": map[string]any{},
+				"monikerProvider":            true,
+				"inlineValueProvider":        map[string]any{},
+				"diagnosticProvider":         map[string]any{"identifier": "fake"},
+				"inlineCompletionProvider":   true,
 			},
 			"serverInfo": map[string]any{"name": "fake", "version": "1"},
 		}, nil
@@ -168,8 +195,101 @@ func TestInitialize(t *testing.T) {
 	if !Supports(res.Capabilities.DefinitionProvider) {
 		t.Error("an options object counts as support")
 	}
+	if !Supports(res.Capabilities.ReferencesProvider) {
+		t.Error("references advertised as an options object was not detected")
+	}
+	if !Supports(res.Capabilities.DeclarationProvider) {
+		t.Error("declaration advertised as a boolean was not detected")
+	}
+	if !Supports(res.Capabilities.InlayHintProvider) {
+		t.Error("inlayHint was advertised but not detected")
+	}
+	if !Supports(res.Capabilities.WorkspaceSymbolProvider) {
+		t.Error("workspaceSymbol was advertised but not detected")
+	}
+	if got := res.Capabilities.SignatureHelpTriggers(); len(got) != 2 || got[0] != "(" || got[1] != "," {
+		t.Errorf("signature trigger characters = %q, want ( and ,", got)
+	}
+	if !res.Capabilities.RenamePrepare() {
+		t.Error("rename advertised prepareProvider but it was not detected")
+	}
+	if !Supports(res.Capabilities.SelectionRangeProvider) {
+		t.Error("selectionRange was advertised but not detected")
+	}
+	if !Supports(res.Capabilities.CallHierarchyProvider) {
+		t.Error("callHierarchy advertised as an options object was not detected")
+	}
+	if !Supports(res.Capabilities.TypeHierarchyProvider) {
+		t.Error("typeHierarchy was advertised but not detected")
+	}
+	if !Supports(res.Capabilities.LinkedEditingRangeProvider) {
+		t.Error("linkedEditingRange advertised as an options object was not detected")
+	}
+	if !Supports(res.Capabilities.MonikerProvider) {
+		t.Error("moniker was advertised but not detected")
+	}
+	if !Supports(res.Capabilities.InlineValueProvider) {
+		t.Error("inlineValue advertised as an options object was not detected")
+	}
+	if !Supports(res.Capabilities.DiagnosticProvider) {
+		t.Error("diagnostic advertised as an options object was not detected")
+	}
+	if !Supports(res.Capabilities.InlineCompletionProvider) {
+		t.Error("inlineCompletion advertised as a boolean was not detected")
+	}
+	if !res.Capabilities.WorkspaceSymbolResolve() {
+		t.Error("workspaceSymbol advertised resolveProvider but it was not detected")
+	}
+
 	// initialized must follow, or servers that wait for it never start.
 	waitFor(t, func() bool { return has(f.methods(), "initialized") })
+}
+
+// A provider sent as the boolean false is present in the reply and means no.
+// The fields are kept raw for exactly this: a typed options struct would fail
+// to unmarshal false and take the whole handshake down with it.
+func TestCapabilitiesFalseIsNotSupported(t *testing.T) {
+	f := newFake(t)
+	f.on("initialize", func(*Message) (any, *ResponseError) {
+		return map[string]any{
+			"capabilities": map[string]any{
+				"referencesProvider":      false,
+				"renameProvider":          false,
+				"signatureHelpProvider":   false,
+				"declarationProvider":     map[string]any{},
+				"selectionRangeProvider":  false,
+				"inlineValueProvider":     map[string]any{},
+				"workspaceSymbolProvider": map[string]any{"resolveProvider": false},
+			},
+		}, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	res, err := f.conn.Initialize(ctx, "file:///w", nil, nil)
+	if err != nil {
+		t.Fatalf("a false provider failed the handshake: %v", err)
+	}
+	if Supports(res.Capabilities.ReferencesProvider) {
+		t.Error("referencesProvider: false read as supported")
+	}
+	if res.Capabilities.RenamePrepare() {
+		t.Error("renameProvider: false read as prepare-capable")
+	}
+	if got := res.Capabilities.SignatureHelpTriggers(); got != nil {
+		t.Errorf("signatureHelpProvider: false yielded triggers %q", got)
+	}
+	if !Supports(res.Capabilities.DeclarationProvider) {
+		t.Error("an empty options object is presence, not absence")
+	}
+	if Supports(res.Capabilities.SelectionRangeProvider) {
+		t.Error("selectionRangeProvider: false read as supported")
+	}
+	if !Supports(res.Capabilities.InlineValueProvider) {
+		t.Error("inlineValueProvider: an options object is presence, not absence")
+	}
+	if res.Capabilities.WorkspaceSymbolResolve() {
+		t.Error("workspaceSymbolProvider.resolveProvider: false read as resolve-capable")
+	}
 }
 
 // initializationOptions goes out when the caller sets it and is omitted when
@@ -592,4 +712,136 @@ func has(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// A request the server originates reaches the connection's handler, and the
+// handler's result goes back as the response. Before the handler existed the
+// same request was refused with method-not-found, so a server that asked
+// workspace/configuration for settings never got them and could stall.
+func TestServerRequestIsAnsweredByTheHandler(t *testing.T) {
+	f := newFake(t)
+	seen := make(chan string, 1)
+	f.conn.Handle(func(m *Message) (any, *ResponseError) {
+		seen <- m.Method
+		return []any{nil, nil}, nil
+	})
+	id := json.RawMessage(`5`)
+	f.push(&Message{JSONRPC: "2.0", ID: &id, Method: "workspace/configuration"})
+
+	select {
+	case got := <-seen:
+		if got != "workspace/configuration" {
+			t.Errorf("handler saw %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler was never called")
+	}
+	waitFor(t, func() bool { return f.response("5") != nil })
+	if got := string(f.response("5").Result); got != "[null,null]" {
+		t.Errorf("result = %s, want [null,null]", got)
+	}
+}
+
+// A handler that returns no result still answers with an explicit null. JSON-RPC
+// requires exactly one of result or error, and window/showMessageRequest's
+// dismiss answer is null: dropping the field would leave the server parsing a
+// malformed reply.
+func TestNilHandlerResultMarshalsToNull(t *testing.T) {
+	f := newFake(t)
+	f.conn.Handle(func(m *Message) (any, *ResponseError) { return nil, nil })
+	id := json.RawMessage(`6`)
+	f.push(&Message{JSONRPC: "2.0", ID: &id, Method: "window/showMessageRequest"})
+	waitFor(t, func() bool { return f.response("6") != nil })
+	if got := string(f.response("6").Result); got != "null" {
+		t.Errorf("result = %q, want null", got)
+	}
+}
+
+// With no handler installed the connection refuses every server request with
+// method-not-found. Silence would leave the server waiting; the code is what
+// says the method is the problem rather than the reply being lost.
+func TestUnhandledServerRequestIsMethodNotFound(t *testing.T) {
+	f := newFake(t)
+	id := json.RawMessage(`8`)
+	f.push(&Message{JSONRPC: "2.0", ID: &id, Method: "some/unknown"})
+	waitFor(t, func() bool { return f.response("8") != nil })
+	if got := f.response("8").Error; got == nil || got.Code != -32601 {
+		t.Errorf("error = %+v, want -32601", got)
+	}
+}
+
+// window/showMessage and window/logMessage reach the event loop on the message
+// channel. Before the dispatch they were dropped, so a server's warning or
+// error never appeared anywhere a human could see it.
+func TestWindowMessagesReachTheChannel(t *testing.T) {
+	cases := []struct {
+		method string
+		typ    int
+		want   string
+	}{
+		{"window/showMessage", MessageError, "boom"},
+		{"window/logMessage", MessageWarning, "careful"},
+	}
+	for _, c := range cases {
+		t.Run(c.method, func(t *testing.T) {
+			f := newFake(t)
+			params, _ := json.Marshal(map[string]any{"type": c.typ, "message": c.want})
+			f.push(&Message{JSONRPC: "2.0", Method: c.method, Params: params})
+			select {
+			case m := <-f.conn.ServerMessages:
+				if m.Method != c.method || m.Type != c.typ || m.Message != c.want {
+					t.Errorf("message = %+v", m)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("no message arrived")
+			}
+		})
+	}
+}
+
+// $/cancelRequest from a server is a no-op: the reserved method carries no
+// reply and there is no local work to stop, so it must not surface as a user
+// message or break the connection.
+func TestServerCancelRequestIsIgnored(t *testing.T) {
+	f := newFake(t)
+	params, _ := json.Marshal(map[string]any{"id": 42})
+	f.push(&Message{JSONRPC: "2.0", Method: "$/cancelRequest", Params: params})
+
+	// The reader dispatches in order, so a successful round trip after the
+	// cancel proves the no-op ran and the connection survived it.
+	f.on("ping", func(*Message) (any, *ResponseError) { return "pong", nil })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var got string
+	if err := f.conn.Call(ctx, "ping", nil, &got); err != nil || got != "pong" {
+		t.Fatalf("connection after $/cancelRequest: %v, %q", err, got)
+	}
+	select {
+	case m := <-f.conn.ServerMessages:
+		t.Errorf("$/cancelRequest surfaced as %+v", m)
+	default:
+	}
+}
+
+// An unknown `$/` notification is dropped quietly: the reserved namespace is
+// for methods a newer protocol may add, and a client that errored on one would
+// break against a server that is merely newer.
+func TestUnknownDollarNotificationIsIgnored(t *testing.T) {
+	f := newFake(t)
+	f.push(&Message{JSONRPC: "2.0", Method: "$/progress", Params: json.RawMessage(`{"token":"x"}`)})
+
+	// The round trip orders the reader past the notification, so the check
+	// below is deterministic rather than a race with dispatch.
+	f.on("ping", func(*Message) (any, *ResponseError) { return "pong", nil })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var got string
+	if err := f.conn.Call(ctx, "ping", nil, &got); err != nil || got != "pong" {
+		t.Fatalf("connection after $/progress: %v, %q", err, got)
+	}
+	select {
+	case m := <-f.conn.ServerMessages:
+		t.Errorf("$/progress surfaced as %+v", m)
+	default:
+	}
 }

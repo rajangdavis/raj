@@ -480,3 +480,42 @@ func TestRunIncludeNoMatch(t *testing.T) {
 		}
 	}
 }
+
+// Context carries the hit's line plus the requested number of lines either
+// side, so a hit is actionable without a follow-up read. The hit line stays in
+// Text and the block in Context. Modelled on TestRunReportsLineStart.
+func TestRunContextIncludesNeighbouringLines(t *testing.T) {
+	dir := t.TempDir()
+	body := "line one\nline two\nneedle here\nline four\nline five\n"
+	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := Run(dir, Query{Text: "needle", Context: 1})
+	if len(res.Matches) != 1 {
+		t.Fatalf("got %d matches", len(res.Matches))
+	}
+	m := res.Matches[0]
+	if m.Text != "needle here" {
+		t.Errorf("text = %q, want the hit line alone", m.Text)
+	}
+	if want := "line two\nneedle here\nline four"; m.Context != want {
+		t.Errorf("context = %q, want %q", m.Context, want)
+	}
+	// A hit near the top of the file clips the block rather than padding it.
+	res = Run(dir, Query{Text: "line one", Context: 2})
+	if len(res.Matches) != 1 {
+		t.Fatalf("top hit: got %d matches", len(res.Matches))
+	}
+	if want := "line one\nline two\nneedle here"; res.Matches[0].Context != want {
+		t.Errorf("top context = %q, want %q", res.Matches[0].Context, want)
+	}
+	// Without the flag the block is absent, which is the behaviour before the
+	// option existed.
+	plain := Run(dir, Query{Text: "needle"})
+	if len(plain.Matches) != 1 {
+		t.Fatalf("plain: got %d matches", len(plain.Matches))
+	}
+	if plain.Matches[0].Context != "" {
+		t.Errorf("plain context = %q, want none", plain.Matches[0].Context)
+	}
+}

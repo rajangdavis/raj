@@ -72,6 +72,12 @@ func (a *App) sessionFingerprint() string {
 func (a *App) SessionState() session.State {
 	st := session.State{Active: a.Tabs.Index(), Focus: focusName(a.focus)}
 	for _, p := range a.Tabs.All() {
+		// A preview is transient view state, not a committed tab. Leaving it
+		// out keeps arrowing through files from rewriting the session, and
+		// keeps a restart from reopening a file nobody opened.
+		if p == a.Tabs.Preview() {
+			continue
+		}
 		// An unnamed buffer is keyed on nothing, so there is nowhere to put it.
 		// It needs the dirty-buffer journal, not a path.
 		if p.File.Path == "" {

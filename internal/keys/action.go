@@ -49,6 +49,11 @@ const (
 	Save    Action = "save"
 	Reload  Action = "reload"
 
+	// CopyRelPath copies the active buffer's path relative to the workspace
+	// root to the clipboard. It has no chord by design: it is an occasional
+	// command, and the palette is where it lives. See keys.Unbound.
+	CopyRelPath Action = "copy_relative_path"
+
 	// edit
 	Undo            Action = "undo"
 	Redo            Action = "redo"
@@ -109,16 +114,79 @@ const (
 	GotoSymbol   Action = "goto_symbol"
 	Hover        Action = "hover"
 	GotoDef      Action = "goto_definition"
+	// GotoDeclaration, GotoTypeDef and GotoImpl are go-to-definition's
+	// siblings: where the name is declared, the definition of the thing's
+	// type, and the concrete implementations of an interface method. They
+	// share its request pipeline and differ only in the LSP method.
+	GotoDecl    Action = "goto_declaration"
+	GotoTypeDef Action = "goto_type_definition"
+	GotoImpl    Action = "goto_implementation"
+	// References lists the uses of the symbol under the cursor, in the picker,
+	// so "who calls this" is answered without leaving the editor.
+	References Action = "references"
+	// WorkspaceSymbols lists the project-wide symbols the language server has
+	// indexed, in the picker; the sibling of GotoSymbol's file-scope scan.
+	WorkspaceSymbols Action = "workspace_symbols"
+	// Rename renames the symbol under the cursor through every file the
+	// language server names, collecting the new name through the shared prompt.
+	Rename Action = "rename"
 	// Complete summons the completion popup deliberately. Without it the popup
 	// only ever appears on its own after MinPrefix characters, so there is no
 	// way to ask for it after a cursor move or with a one-character prefix.
 	Complete Action = "complete"
+
+	// SignatureHelp shows the parameter list of the call the caret is inside,
+	// marking the active parameter; the sibling of Complete.
+	SignatureHelp Action = "signature_help"
+
+	// CodeAction lists the language server's fixes and refactors for the
+	// caret, in the picker, and applies the one chosen.
+	CodeAction Action = "code_action"
+
+	// OpenMenu opens the same context menu a right-click opens, for whatever
+	// has focus: the focused explorer entry when the sidebar has it, otherwise
+	// the active tab. It is the keyboard half of the pointer gesture, so a menu
+	// reachable by mouse is reachable without leaving the home row.
+	OpenMenu Action = "open_menu"
+
+	// RunCodeLens runs the code lens drawn at the start of the caret's line.
+	// Lenses are the server's line-attached actions — "3 references", "Run
+	// test" — and this is the keyboard half of the human path; the inline text
+	// is the other half.
+	RunCodeLens Action = "run_code_lens"
+
+	// Format formats the whole document through the language server, and
+	Format      Action = "format"
+	FormatRange Action = "format_range"
+
+	// FollowLink follows the document link at the caret: the server names the
+	// spans of the document that point at a file or a URL, and this opens a
+	// file: target through the same path every other jump uses. A non-file
+	// target is refused out loud, because a terminal editor has no browser to
+	// hand it to.
+	FollowLink Action = "follow_link"
 
 	// ToggleInlayHints flips language-server inlay hints for the active pane.
 	// Per-pane rather than app-wide: the application default still applies to
 	// files opened later, so silencing hints on one file does not have to
 	// silence every file opened next.
 	ToggleInlayHints Action = "toggle_inlay_hints"
+
+	// ApplyInlayEdit applies the edits the language server attached to the
+	// inlay hint nearest the caret on its line, through the shared
+	// one-undo-step server-edit path. A hint with no edits says so.
+	ApplyInlayEdit Action = "apply_inlay_edit"
+
+	// ToggleFold closes the folding range at the caret, or opens it when it is
+	// already closed. The range is the language server's; the pane holds
+	// the closed state, so the buffer is untouched.
+	ToggleFold Action = "toggle_fold"
+
+	// ToggleExpandAll expands every folder under the explorer selection, or
+	// every file group in the search results, and collapses them again on a
+	// second press; scope-bound to cmd+return so it does not disturb the
+	// editor's line-below.
+	ToggleExpandAll Action = "toggle_expand_all"
 
 	// proposals — an agent change set lands as a proposal: in the document,
 	// tinted, save-blocked, and decided one gesture at a time. Accept marks it
@@ -135,4 +203,8 @@ const (
 	ReviewProposed Action = "review_proposed"
 	NextProposed   Action = "next_proposed"
 	PrevProposed   Action = "prev_proposed"
+	// PendingRemovals re-raises the oldest pending deletion or dir-removal
+	// after the gate prompt was missed or dismissed. It is the persistent
+	// surface for a proposal that is not a change set.
+	PendingRemovals Action = "pending_removals"
 )

@@ -40,6 +40,11 @@ func TestCodecRoundTripEveryKind(t *testing.T) {
 		Written{Path: "a.go", Hash: "sha256:abc", Version: 7},
 		Written{Path: "b.go", Hash: "sha256:def", Version: max},
 		Written{},
+		Base{Path: "u16.go", Hash: "sha256:enc", Bytes: []byte("a\x00b"),
+			Encoding: Encoding{Kind: EncodingUTF16LE, BOM: true}},
+		Base{Path: "cp.go", Hash: "sha256:enc", Encoding: Encoding{Kind: EncodingWindows1252, CRLF: true}},
+		Written{Path: "latin.go", Hash: "sha256:enc", Version: 12, Encoding: Encoding{Kind: EncodingLatin1, CRLF: true}},
+		Written{Path: "bom.go", Hash: "sha256:enc", Version: 13, Encoding: Encoding{BOM: true}},
 	}
 	for i, want := range cases {
 		kind, payload, err := encodeRecord(want)
@@ -57,6 +62,201 @@ func TestCodecRoundTripEveryKind(t *testing.T) {
 			t.Fatalf("case %d: round trip = %#v, want %#v", i, got, want)
 		}
 	}
+}
+
+// The encoding a save recorded survives the codec on both records that carry
+// it, so a restore can re-encode UTF-16, a BOM or CRLF exactly as the file was
+// written. The zero value is not a special case: it is the default, and a
+// record that carries it omits it on the wire.
+func TestEncodingRoundTripsThroughBaseAndWritten(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  Record
+		want Encoding
+	}{
+		{"base utf16le", Base{Path: "u16.go", Hash: "h", Bytes: []byte("a\x00b"),
+			Encoding: Encoding{Kind: EncodingUTF16LE, BOM: true}},
+			Encoding{Kind: EncodingUTF16LE, BOM: true}},
+		{"base windows1252 crlf", Base{Path: "cp.go", Hash: "h",
+			Encoding: Encoding{Kind: EncodingWindows1252, CRLF: true}},
+			Encoding{Kind: EncodingWindows1252, CRLF: true}},
+		{"written utf8 bom", Written{Path: "b.go", Hash: "h", Version: 3,
+			Encoding: Encoding{BOM: true}},
+			Encoding{BOM: true}},
+		{"written latin1", Written{Path: "l.go", Hash: "h", Version: 9,
+			Encoding: Encoding{Kind: EncodingLatin1}},
+			Encoding{Kind: EncodingLatin1}},
+		{"written default omitted", Written{Path: "d.go", Hash: "h", Version: 1}, Encoding{}},
+	}
+	for _, tc := range cases {
+		kind, payload, err := encodeRecord(tc.rec)
+		if err != nil {
+			t.Fatalf("%s: encode: %v", tc.name, err)
+		}
+		got, err := decodeRecord(kind, payload)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", tc.name, err)
+		}
+		if !equalRecord(got, tc.rec) {
+			t.Fatalf("%s: round trip = %#v, want %#v", tc.name, got, tc.rec)
+		}
+		if enc := encodingOf(got); enc != tc.want {
+			t.Fatalf("%s: encoding = %+v, want %+v", tc.name, enc, tc.want)
+		}
+	}
+}
+
+// A record written before the encoding field existed still decodes, and the
+// missing tail reads as the default — UTF-8, LF, no BOM. The old layout is a
+// prefix of the new one, so an older log's Base and Written decode without a
+// version branch or a hand-rolled upgrade, and nothing is invented for a file
+// whose shape was never recorded.
+func TestOlderRecordsWithoutEncodingDecodeAsDefault(t *testing.T) {
+	e := &encoder{}
+	e.str("old.go")
+	e.str("h")
+	e.blob([]byte("old body"))
+	if e.err != nil {
+		t.Fatalf("build old base: %v", e.err)
+	}
+	got, err := decodeRecord(KindBase, e.b)
+	if err != nil {
+		t.Fatalf("decode old base: %v", err)
+	}
+	if base, ok := got.(Base); !ok || base.Encoding != (Encoding{}) {
+		t.Fatalf("old base encoding = %+v, want the zero default", got)
+	}
+
+	e = &encoder{}
+	e.str("old.go")
+	e.str("h")
+	e.u64(7)
+	if e.err != nil {
+		t.Fatalf("build old written: %v", e.err)
+	}
+	got, err = decodeRecord(KindWritten, e.b)
+	if err != nil {
+		t.Fatalf("decode old written: %v", err)
+	}
+	if mark, ok := got.(Written); !ok || mark.Encoding != (Encoding{}) {
+		t.Fatalf("old written encoding = %+v, want the zero default", got)
+	}
+}
+
+// The whole-file path agrees with the codec: a log whose records predate the
+// encoding field opens, and Log.Encoding reports the default rather than
+// refusing the file or inventing a value.
+func TestOpenReadsAnOlderLogAsDefaultEncoding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raj.log")
+	w, err := Create(path, Header{Root: "/work"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := w.Append(Base{Path: "old.go", Hash: "h", Bytes: []byte("old")}); err != nil {
+		t.Fatalf("Append base: %v", err)
+	}
+	if err := w.Append(Written{Path: "old.go", Hash: "h", Version: 4}); err != nil {
+		t.Fatalf("Append written: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if l.Damaged {
+		t.Fatalf("log damaged at %d of %d", l.Tail, l.Size)
+	}
+	if enc := l.Encoding(); enc != (Encoding{}) {
+		t.Fatalf("Log.Encoding = %+v, want the zero default", enc)
+	}
+}
+
+// Log.Encoding reports the shape of the bytes the buffer must re-encode with:
+// the last Written marker's encoding when the log saved, otherwise the base's.
+// A restore path needs exactly this one call.
+func TestLogEncodingFollowsTheLastWrite(t *testing.T) {
+	write := func(t *testing.T, recs ...Record) *Log {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "raj.log")
+		w, err := Create(path, Header{Root: "/work"})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		for _, r := range recs {
+			if err := w.Append(r); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		l, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if l.Damaged {
+			t.Fatalf("log damaged at %d of %d", l.Tail, l.Size)
+		}
+		return l
+	}
+	u16 := Encoding{Kind: EncodingUTF16LE, BOM: true}
+	latin := Encoding{Kind: EncodingLatin1, CRLF: true}
+	if got := write(t, Base{Path: "f.go", Encoding: u16}).Encoding(); got != u16 {
+		t.Fatalf("base-only encoding = %+v, want %+v", got, u16)
+	}
+	if got := write(t,
+		Base{Path: "f.go", Encoding: u16},
+		Written{Path: "f.go", Version: 3, Encoding: latin},
+	).Encoding(); got != latin {
+		t.Fatalf("last-write encoding = %+v, want %+v", got, latin)
+	}
+}
+
+// A corrupt encoding is refused the way the format's other enums are: validate
+// rejects an unknown kind, so decodeRecord returns an error and Open refuses
+// the log rather than restoring a shape this build cannot reproduce. The flags
+// byte's unknown bits and an explicit default are refused for the same reason:
+// neither is a canonical record.
+func TestCodecRejectsAnUnknownEncoding(t *testing.T) {
+	build := func(t *testing.T, kind EncodingKind, flags uint8) []byte {
+		t.Helper()
+		e := &encoder{}
+		e.str("f.go")
+		e.str("h")
+		e.blob([]byte("body"))
+		e.u8(uint8(kind))
+		e.u8(flags)
+		if e.err != nil {
+			t.Fatalf("build: %v", e.err)
+		}
+		return e.b
+	}
+	cases := []struct {
+		name  string
+		kind  EncodingKind
+		flags uint8
+	}{
+		{"unknown kind", EncodingKind(200), 0},
+		{"unknown flags", EncodingUTF16LE, 0x80},
+		{"explicit default", EncodingUTF8, 0},
+	}
+	for _, tc := range cases {
+		if _, err := decodeRecord(KindBase, build(t, tc.kind, tc.flags)); err == nil {
+			t.Fatalf("%s: decode accepted a non-canonical encoding", tc.name)
+		}
+	}
+}
+
+func encodingOf(r Record) Encoding {
+	switch v := r.(type) {
+	case Base:
+		return v.Encoding
+	case Written:
+		return v.Encoding
+	}
+	return Encoding{}
 }
 
 // Append a run of records, reopen, and read every one back in order with the
@@ -337,7 +537,10 @@ func TestCodecRandomized(t *testing.T) {
 // that decodes must re-encode to the exact bytes it came from.
 func FuzzDecodeRecord(f *testing.F) {
 	seeds := []Record{
-		Base{Path: "p", Hash: "h", Bytes: []byte("b")},
+		Base{Path: "p", Hash: "h", Bytes: []byte("b"),
+			Encoding: Encoding{Kind: EncodingUTF16LE, BOM: true}},
+		Written{Path: "w", Hash: "h", Version: 2,
+			Encoding: Encoding{Kind: EncodingWindows1252, CRLF: true}},
 		StoreAppend{Author: 1, Start: 2, Blob: []byte("x")},
 		Op{Seq: 1, Author: 2, Pos: 3,
 			Del:    []Piece{{Buf: 1, Start: 4, Length: 5}},
@@ -399,7 +602,8 @@ func randomRecord(rnd *rand.Rand) Record {
 	author := uint8(rnd.Intn(256))
 	switch rnd.Intn(7) {
 	case 0:
-		return Base{Path: randomString(rnd), Hash: randomString(rnd), Bytes: randomBytes(rnd)}
+		return Base{Path: randomString(rnd), Hash: randomString(rnd), Bytes: randomBytes(rnd),
+			Encoding: randomEncoding(rnd)}
 	case 1:
 		return StoreAppend{Author: author, Start: rnd.Uint64(), Blob: randomBytes(rnd)}
 	case 2:
@@ -414,7 +618,16 @@ func randomRecord(rnd *rand.Rand) Record {
 	case 5:
 		return Session{Blob: randomBytes(rnd)}
 	default:
-		return Written{Path: randomString(rnd), Hash: randomString(rnd), Version: rnd.Uint64()}
+		return Written{Path: randomString(rnd), Hash: randomString(rnd), Version: rnd.Uint64(),
+			Encoding: randomEncoding(rnd)}
+	}
+}
+
+func randomEncoding(rnd *rand.Rand) Encoding {
+	return Encoding{
+		Kind: EncodingKind(rnd.Intn(int(EncodingLatin1) + 1)),
+		CRLF: rnd.Intn(2) == 0,
+		BOM:  rnd.Intn(2) == 0,
 	}
 }
 

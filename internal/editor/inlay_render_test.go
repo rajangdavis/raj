@@ -143,6 +143,56 @@ func TestClickInsideHintClampsToAnchor(t *testing.T) {
 	}
 }
 
+// A cell inside a hint's painted span is over that hint and one outside is
+// not. The columns are the same ColOfHints maths drawHint paints with, so the
+// hit test and the frame cannot disagree about where a hint is — and the cell
+// after a hint is outside even though the mouse clamp resolves it to the same
+// anchor.
+func TestHintAtColHitTest(t *testing.T) {
+	p := newTestPane("abcdef\n")
+	// Width 4 at byte 2: the hint occupies display columns 2..5 and 'c' is
+	// drawn at column 6, after it.
+	withHints(p, 0, Hint{Off: 2, Text: "XY", Left: true, Right: true})
+	hints := p.File.HintsAt(0)
+	text := p.File.Line(0)
+
+	for _, c := range []int{2, 3, 4, 5} {
+		if got, ok := HintAtCol(hints, text, p.File.Cols, c); !ok || got.Text != "XY" {
+			t.Errorf("column %d = (%+v, %v), want the hint", c, got, ok)
+		}
+	}
+	for _, c := range []int{0, 1, 6, 7, 100} {
+		if got, ok := HintAtCol(hints, text, p.File.Cols, c); ok {
+			t.Errorf("column %d = %+v, want no hint (outside every span)", c, got)
+		}
+	}
+}
+
+// With two hints on a line the second's span starts after the first, so a cell
+// between them belongs to neither and the widths accumulate the way the
+// renderer advances the column.
+func TestHintAtColWithTwoHints(t *testing.T) {
+	p := newTestPane("abcdef\n")
+	// First width 4 at byte 1 occupies columns 1..4; the second at byte 3
+	// starts at column 7 and its span is 7..8.
+	withHints(p, 0, Hint{Off: 1, Text: "XXXX"}, Hint{Off: 3, Text: "YY"})
+	hints := p.File.HintsAt(0)
+	text := p.File.Line(0)
+
+	if got, ok := HintAtCol(hints, text, p.File.Cols, 2); !ok || got.Text != "XXXX" {
+		t.Errorf("column 2 = (%+v, %v), want the first hint", got, ok)
+	}
+	if got, ok := HintAtCol(hints, text, p.File.Cols, 6); ok {
+		t.Errorf("column 6 = %+v, want no hint between the spans", got)
+	}
+	if got, ok := HintAtCol(hints, text, p.File.Cols, 7); !ok || got.Text != "YY" {
+		t.Errorf("column 7 = (%+v, %v), want the second hint", got, ok)
+	}
+	if got, ok := HintAtCol(hints, text, p.File.Cols, 9); ok {
+		t.Errorf("column 9 = %+v, want no hint past the second", got)
+	}
+}
+
 // An end-of-line hint is drawn past the last character, and a hint's cells are
 // styled as hints whatever byte a selection covers at its anchor.
 func TestHintAtEndOfLineAndSelectionStyling(t *testing.T) {

@@ -49,7 +49,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
 
   list                       running editors and their workspaces
   buffers                    files open in the editor; a headless buffer has no tab
-  read [path]                the buffer view, loaded on demand; -annotated prints a run line per change set after the text; -start/-end/-lines for a span
+  read [path]...             one or more buffer views, loaded on demand; -annotated prints a run line per change set after the text; -start/-end/-lines for a span, shared by every target, and an out-of-range byte span refuses the call rather than clamping
   open <path>                show a file: load it and focus a tab; -create makes a buffer for a path not on disk; prints opened or created
   ls [path]                  list a directory's immediate children; a trailing / marks a directory, -hidden includes hidden entries
   mkdir <dir>                create a directory, and any missing parents, under the workspace root
@@ -77,13 +77,17 @@ const ctlUsage = `usage: raj ctl <command> [options]
   revert [path] [-author N]  discard your own pieces; the inverse of attribution
   diff [path]                pending change sets as old→new text, for review
   review [path]              enter review mode and list pending change sets; -json lists without entering
-  search -q PATTERN          search the workspace, unsaved edits included; -hidden includes hidden paths
+  search -q PATTERN          search the workspace, unsaved edits included; -hidden includes hidden paths; -context N adds N lines either side of each hit
   search -q PATTERN -path DIR
                              search only DIR, under the workspace root
   version [path]             the version a later apply bases on
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] -dump N       replace a snapshot's text; the editor diffs and applies
-  lsp MODE [path] LINE:COL   hover, definition, references, completion, or diagnostics [path]
+  lsp MODE [path] LINE:COL   hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics, inlay-hints, symbols, format, range-format or document-symbols
+  lsp symbols [path] LINE:COL [query]
+                             project-wide symbols matching query, from the language server
+  lsp document-symbols [path]
+                             one file's declarations from the language server, as a tree
   lsp inlay-hints [path] [-lines A,B]
                              inlay hints for a file or a 1-based inclusive line range
   apply [path] -base N [-start N -end N [-text S | -text-file F | -- TEXT]]
@@ -172,6 +176,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	start := fs.Int("start", -1, "apply/read: first byte of the span")
 	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over -start/-end")
+	context := fs.Int("context", 0, "search: lines of context before and after each hit; 0 is the hit line alone")
 	annotated := fs.Bool("annotated", false, "read: report the change set and state of each run; -json adds them as states, plain adds run lines after the text")
 	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
 	discard := fs.Bool("discard", false, "close: discard unsaved changes instead of refusing the close")
@@ -278,7 +283,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "buffers":
 		return buffers(c, stdout, stderr, *asJSON)
 	case "read":
-		return read(c, path, *start, *end, *lines, *annotated, stdout, stderr, *asJSON)
+		return read(c, fs.Args(), *start, *end, *lines, *annotated, stdout, stderr, *asJSON)
 	case "open":
 		if path == "" {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
@@ -564,8 +569,12 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "search: unexpected argument %q — the pattern goes to -q; to limit paths use -include or -path\n", arg)
 			return 2
 		}
+		if *context < 0 {
+			fmt.Fprintln(stderr, "raj ctl search: -context cannot be negative")
+			return 2
+		}
 		return doSearch(c, SearchQuery{Text: *query, Include: *include, Exclude: *exclude,
-			Path: *searchPath, Hidden: *hiddenFlag,
+			Path: *searchPath, Hidden: *hiddenFlag, Context: *context,
 			Regex: *regex, Case: *matchCase, Word: *word}, *jsonl, *asJSON, stdout, stderr)
 	case "version":
 		res, err := c.Do(Request{Op: "version", Path: path})
@@ -585,7 +594,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "patch":
 		return patchCmd(c, path, *dumpID, *textArg, *textFile, stdout, stderr, *asJSON)
 	case "lsp":
-		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, stdout, stderr, *asJSON)
+		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, fs.Arg(3), stdout, stderr, *asJSON)
 	case "apply":
 		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile,
 			textOperands, *verbatim, fs, stdout, stderr, *asJSON)
@@ -785,19 +794,19 @@ func renameCmd(c *Client, old, newPath string, stdout, stderr io.Writer, asJSON 
 }
 
 // argLimit is how many positional operands a verb takes, and what to say about
-// one it does not. A verb absent from the map takes none; goto and lsp are
-// absent too, because their extra operands are positions rather than a stray
-// span.
+// one it does not. A verb absent from the map takes any number; goto and lsp
+// are absent too, because their extra operands are positions rather than a
+// stray span, and read is absent because extra operands are extra targets
+// rather than a stray span.
 //
-// The case that matters is a byte span written as operands. `raj ctl read path
+// The case that matters is a byte span written as operands. `raj ctl dump path
 // 940 1000` used to read the whole file and look like it worked, with two
-// numbers that look like offsets read accepts; refusing the second operand and
+// numbers that look like offsets dump accepts; refusing the second operand and
 // naming the flags turns a silently wrong read into a usage error.
 var argLimit = map[string]struct {
 	n    int
 	hint string
 }{
-	"read":      {1, "read takes a path; a byte span goes to -start/-end, a line range to -lines"},
 	"dump":      {1, "dump takes a path; the span goes to -start/-end"},
 	"version":   {1, "version takes a path and nothing else"},
 	"open":      {1, "open takes a path and nothing else"},
@@ -832,7 +841,7 @@ var argLimit = map[string]struct {
 // path, nor that omitting one targets the buffer on screen. A verb absent from
 // the map takes no positional.
 var verbOperand = map[string]string{
-	"read":     "[path]",
+	"read":     "[path]...",
 	"open":     "<path>",
 	"mkdir":    "<dir>",
 	"rename":   "<old> <new>",
@@ -856,7 +865,7 @@ var verbOperand = map[string]string{
 	"apply":    "[path] [TEXT]",
 	"edit":     "[path] [OLD NEW]",
 	"save":     "[path]",
-	"lsp":      "MODE [path] LINE:COL",
+	"lsp":      "MODE [path] LINE:COL [query]",
 	"register": "[-as KEY]",
 }
 
@@ -1471,11 +1480,18 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 			// NDJSON: one object per line, as each hit arrives.
 			enc := json.NewEncoder(stdout)
 			for _, m := range batch {
-				enc.Encode(map[string]any{
+				obj := map[string]any{
 					"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
 					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "line_start": m.LineStart, "line_end": m.LineEnd,
 					"version": m.Version, "text": m.Text,
-				})
+				}
+				// Context is absent, not empty, when the flag was not given:
+				// the key must not appear for a plain -jsonl, whose bytes are
+				// unchanged from before the option existed.
+				if m.Context != "" {
+					obj["context"] = m.Context
+				}
+				enc.Encode(obj)
 				n++
 			}
 			return
@@ -1484,7 +1500,14 @@ func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Wr
 			return // JSON is emitted whole, so it stays parseable
 		}
 		for _, m := range batch {
-			fmt.Fprintf(stdout, "%s:%d:%d:%s\n", m.Path, m.Line, m.Col, m.Text)
+			if m.Context != "" {
+				// The context block already contains the hit line, so the
+				// header names where the hit is and the block shows it in
+				// place, with the version the hit was found at.
+				fmt.Fprintf(stdout, "%s:%d:%d version %d\n%s\n", m.Path, m.Line, m.Col, m.Version, m.Context)
+			} else {
+				fmt.Fprintf(stdout, "%s:%d:%d:%s\n", m.Path, m.Line, m.Col, m.Text)
+			}
 			n++
 		}
 	}
@@ -1593,7 +1616,7 @@ func apply(c *Client, path string, base uint64, start, end int, textArg, textFil
 	}
 	res, err := c.Do(Request{Op: "apply", Path: path, Base: &base,
 		Hunks: []Hunk{{Start: start, End: end, Text: text}}})
-	return reportApply(res, err, 1, []hunkEcho{{Start: start, End: end, Text: text}},
+	return reportApply(res, err, 1, []hunkEcho{{Start: start, End: end, Text: text}}, c.Author(),
 		stdout, stderr, asJSON)
 }
 
@@ -1628,7 +1651,7 @@ func applyHunks(c *Client, path string, base uint64, file string, fs *flag.FlagS
 		return code
 	}
 	res, derr := c.Do(Request{Op: "apply", Path: path, Base: &base, Hunks: hunks})
-	return reportApply(res, derr, len(hunks), echo, stdout, stderr, asJSON)
+	return reportApply(res, derr, len(hunks), echo, c.Author(), stdout, stderr, asJSON)
 }
 
 // parseHunks decodes JSON Lines: one {start,end,text} object per line. A blank
@@ -1756,7 +1779,7 @@ func patchCmd(c *Client, path string, dumpID uint64, textArg, textFile string, s
 		// names an owner asks for a decision about another writer's text, while
 		// one with no group is the ordinary moved snapshot. The old wording
 		// told every caller to dump again, which is wrong for a lease.
-		return reportConflicts("patch", res.Conflicts, res.Warnings, len(res.Conflicts), stdout, stderr, asJSON)
+		return reportConflicts("patch", res.Conflicts, res.Warnings, len(res.Conflicts), c.Author(), stdout, stderr, asJSON)
 	}
 	if res.Err != "" {
 		fmt.Fprintln(stderr, "raj ctl patch:", res.Err)
@@ -1884,24 +1907,60 @@ func writeDiffLines(w io.Writer, prefix, text string) {
 	}
 }
 
-// doLSP asks the language server for hover text, a definition, references,
-// completions, the cached diagnostics for a path, or the inlay hints over a
-// whole file or a line range. The answer is JSON already; -json prints it whole
-// and the plain path pretty-prints it, so a script and a person read the same
-// result. inlay-hints is the one mode whose plain form is line-oriented: a hint
-// is one line of text, and a JSON object per line reads worse.
-func doLSP(c *Client, mode, path, pos, lines string, stdout, stderr io.Writer, asJSON bool) int {
+// doLSP asks the language server for hover text, a definition, a declaration,
+// a type definition, an implementation, references, completions, the signature
+// of the call at a position, the cached diagnostics for a path, the inlay hints
+// over a whole file or a line range, the project-wide symbols matching a query,
+// or the formatting edits for a file or a line range. The answer is JSON
+// already; -json prints it whole and the plain path pretty-prints it, so a
+// script and a person read the same result. inlay-hints is the one mode whose
+// plain form is line-oriented: a hint is one line of text, and a JSON object
+// per line reads worse.
+//
+// format and range-format are the formatting pair: `lsp format PATH` asks for
+// the whole buffer to be formatted and `lsp range-format PATH -lines A,B` for
+// the named lines. They report the server's TextEdit list as `edits`, in 1-based
+// editor coordinates, rather than applying it — the control surface asks and
+// does not edit — and the human chords are what apply a format, through the
+// editor's one-undo application path.
+//
+// symbols is the one mode that takes a query: `lsp symbols PATH LINE:COL [query]`
+// asks the server's project index for declarations matching the query, and the
+// answer's `symbols` field carries them. document-symbols asks about the file
+// itself and returns its outline as `documentSymbols`, nested.
+func doLSP(c *Client, mode, path, pos, lines, query string, stdout, stderr io.Writer, asJSON bool) int {
 	switch mode {
-	case "hover", "definition", "references", "completion", "diagnostics", "inlay-hints":
+	case "hover", "definition", "declaration", "type-definition", "implementation",
+		"references", "completion", "signature", "diagnostics", "inlay-hints", "symbols",
+		"format", "range-format", "document-symbols":
 	default:
-		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, references, completion, diagnostics or inlay-hints")
+		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics, inlay-hints, symbols, format, range-format or document-symbols")
 		return 2
 	}
 	line, col := 0, 0
 	var lineStart, lineEnd *int
 	switch mode {
-	case "diagnostics":
-		// No position and no range: diagnostics is asked about the whole file.
+	case "diagnostics", "format", "document-symbols":
+		// No position: diagnostics, formatting and a file outline are asked
+		// about a file, not a place.
+	case "range-format":
+		// The range form: like inlay-hints, a bare A reads from A to the end
+		// and A,B is the 1-based inclusive range. Unlike inlay-hints it has no
+		// useful whole-file default, because a collapsed range would ask the
+		// server to format nothing, so the lines are required.
+		if lines == "" {
+			fmt.Fprintln(stderr, "raj ctl lsp range-format: needs -lines A or A,B")
+			return 2
+		}
+		a, b, hasEnd, ok := ctlLines(lines)
+		if !ok {
+			fmt.Fprintln(stderr, "raj ctl lsp: -lines wants A or A,B, 1-based inclusive")
+			return 2
+		}
+		lineStart = &a
+		if hasEnd {
+			lineEnd = &b
+		}
 	case "inlay-hints":
 		// A range request. A bare A reads from A to the end; A,B is the
 		// 1-based inclusive range, mirroring read -lines.
@@ -1929,7 +1988,7 @@ func doLSP(c *Client, mode, path, pos, lines string, stdout, stderr io.Writer, a
 		line, col = l, cl
 	}
 	res, err := c.Do(Request{Op: "lsp", Path: path, Line: line, Col: col, LSPMode: mode,
-		LineStart: lineStart, LineEnd: lineEnd})
+		Query: lspQuery(query), LineStart: lineStart, LineEnd: lineEnd})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -1969,6 +2028,17 @@ func doLSP(c *Client, mode, path, pos, lines string, stdout, stderr io.Writer, a
 	return emit(stdout, out)
 }
 
+// lspQuery carries a workspace/symbol query on the request's generic Query
+// field. An empty query is nil rather than an empty SearchQuery, so the field
+// is absent on the wire exactly when there is nothing to say; the server's
+// symbols branch reads "" either way.
+func lspQuery(q string) *SearchQuery {
+	if q == "" {
+		return nil
+	}
+	return &SearchQuery{Text: q}
+}
+
 // reportApply is shared by apply and edit so the two cannot describe the same
 // outcome differently.
 // hunkEcho is what an apply or edit reports it wrote, so the -json reply is
@@ -1980,13 +2050,13 @@ type hunkEcho struct {
 	Text       string // the replacement that was written
 }
 
-func reportApply(res Response, err error, hunks int, echo []hunkEcho, stdout, stderr io.Writer, asJSON bool) int {
+func reportApply(res Response, err error, hunks int, echo []hunkEcho, self uint8, stdout, stderr io.Writer, asJSON bool) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "raj ctl apply:", err)
 		return 1
 	}
 	if len(res.Conflicts) > 0 {
-		return reportConflicts("apply", res.Conflicts, res.Warnings, hunks, stdout, stderr, asJSON)
+		return reportConflicts("apply", res.Conflicts, res.Warnings, hunks, self, stdout, stderr, asJSON)
 	}
 	if res.Err != "" {
 		fmt.Fprintln(stderr, "raj ctl apply:", res.Err)
@@ -2050,7 +2120,7 @@ type conflictView struct {
 // decision it asks for. A conflict with no group is the ordinary stale offset,
 // which is the caller's cue to re-read rather than to decide about someone
 // else's text.
-func leaseView(c Conflict) conflictView {
+func leaseView(c Conflict, self uint8) conflictView {
 	v := conflictView{Index: c.Index, At: c.At, Group: c.Group, Hunk: c.Hunk}
 	if c.Group == 0 {
 		return v
@@ -2058,6 +2128,18 @@ func leaseView(c Conflict) conflictView {
 	start, end := c.Start, c.End
 	v.Author = c.Author
 	v.Start, v.End = &start, &end
+	if c.Author == self {
+		// A conflict the caller owns is necessarily own+other: a hunk whose
+		// only caught Proposed run is the caller's own joins that set instead
+		// of refusing (Session.ApplyDiff -> commitInto), so the refusal means a
+		// peer's run is in the way as well. The caller cannot accept or
+		// reject its own draft, so name the draft and the remedy that is
+		// actually available: narrow the hunk off the peer's text.
+		v.Message = fmt.Sprintf("change set %d is your own draft (bytes %d..%d); "+
+			"this hunk also crosses another writer's text — narrow it to avoid their span",
+			c.Group, c.Start, c.End)
+		return v
+	}
 	v.Message = fmt.Sprintf("change set %d owns this text (author %d, bytes %d..%d); "+
 		"accept or reject it first", c.Group, c.Author, c.Start, c.End)
 	return v
@@ -2066,15 +2148,17 @@ func leaseView(c Conflict) conflictView {
 // reportConflicts describes hunks that could not be placed. A conflict that
 // carries a group is a lease refusal — a pending or rejected change set owns
 // the text and has to be decided before the hunk can land — and names the set,
-// its author and the span it holds; one with no group is the ordinary stale
-// offset and keeps the message that tells the caller to re-read and resubmit.
-// The two call for opposite actions, which is why they no longer share a
-// sentence.
+// its author and the span it holds; when that set is the caller's own draft
+// the wording says so and names the remedy the caller actually has (narrow the
+// hunk off the peer text), because a writer cannot decide its own proposal. One
+// with no group is the ordinary stale offset and keeps the message that tells
+// the caller to re-read and resubmit. The two call for opposite actions, which
+// is why they no longer share a sentence.
 //
 // Warnings ride along: a batch can refuse one hunk and still land another over
 // a Proposed set, so the landed overlap is reported on the failure reply too
 // rather than lost to the early return that reports the conflicts.
-func reportConflicts(verb string, conflicts []Conflict, warnings []GroupOverlap, hunks int, stdout, stderr io.Writer, asJSON bool) int {
+func reportConflicts(verb string, conflicts []Conflict, warnings []GroupOverlap, hunks int, self uint8, stdout, stderr io.Writer, asJSON bool) int {
 	// verb names the caller — apply or patch — so a refusal points at the
 	// command the driver actually ran rather than at whichever verb first grew
 	// this reporting.
@@ -2084,7 +2168,7 @@ func reportConflicts(verb string, conflicts []Conflict, warnings []GroupOverlap,
 	views := make([]conflictView, 0, len(conflicts))
 	staleCount := 0
 	for _, c := range conflicts {
-		v := leaseView(c)
+		v := leaseView(c, self)
 		if c.Group == 0 {
 			v.Message = stale
 			staleCount++
@@ -2268,7 +2352,7 @@ func braceTally(path, text string) BraceTally {
 	return t
 }
 
-func read(c *Client, path string, start, end int, lines string, annotated bool, stdout, stderr io.Writer, asJSON bool) int {
+func read(c *Client, paths []string, start, end int, lines string, annotated bool, stdout, stderr io.Writer, asJSON bool) int {
 	var sp, ep *int
 	if start >= 0 {
 		sp = &start
@@ -2282,6 +2366,20 @@ func read(c *Client, path string, start, end int, lines string, annotated bool, 
 		if hasEnd {
 			lep = &b
 		}
+	}
+	if len(paths) > 1 {
+		if annotated {
+			// The state runs are relative to one buffer's text, and the plain
+			// form prints them after that text; there is no per-file shape for
+			// them yet, so a single target is still the annotated read.
+			fmt.Fprintln(stderr, "raj ctl read: -annotated takes one path")
+			return 2
+		}
+		return readMany(c, paths, sp, ep, lsp, lep, annotated, stdout, stderr, asJSON)
+	}
+	path := ""
+	if len(paths) == 1 {
+		path = paths[0]
 	}
 	res, err := c.Do(Request{Op: "text", Path: path, Start: sp, End: ep,
 		LineStart: lsp, LineEnd: lep, Annotated: annotated})
@@ -2329,6 +2427,54 @@ func read(c *Client, path string, start, end int, lines string, annotated bool, 
 	}
 	for _, r := range runs {
 		fmt.Fprintf(stdout, "run off=%d len=%d group=%d state=%s\n", r.Off, r.Len, r.Group, r.State)
+	}
+	return 0
+}
+
+// readMany prints the answer to a read that named several targets. The wire
+// reuses the buffers and spans shapes, so the per-file split is the running
+// sum of each buffer's byte length; a file is printed as its text under an
+// `==> path <==` header, the convention head and tail use, which keeps two
+// files' bytes from running together. -json emits one object per file.
+func readMany(c *Client, paths []string, sp, ep, lsp, lep *int, annotated bool,
+	stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "text", Paths: paths, Start: sp, End: ep,
+		LineStart: lsp, LineEnd: lep, Annotated: annotated})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	all := res.Text()
+	files := make([]map[string]any, 0, len(res.Buffers))
+	off := 0
+	for _, b := range res.Buffers {
+		end := off + b.Bytes
+		if end > len(all) {
+			end = len(all)
+		}
+		files = append(files, map[string]any{
+			"path": b.Path, "text": all[off:end], "version": b.Version,
+		})
+		off = end
+	}
+	if len(files) == 0 {
+		// A server that does not know the multi-target form answered with a
+		// single target's text. Print it rather than nothing, and let the
+		// version-skew warning name the mismatch.
+		if asJSON {
+			return emit(stdout, map[string]any{"text": all, "version": res.Version})
+		}
+		io.WriteString(stdout, all)
+		return 0
+	}
+	if asJSON {
+		return emit(stdout, map[string]any{"files": files})
+	}
+	for i, f := range files {
+		if i > 0 {
+			fmt.Fprintln(stdout)
+		}
+		fmt.Fprintf(stdout, "==> %s <==\n", f["path"])
+		io.WriteString(stdout, f["text"].(string))
 	}
 	return 0
 }
@@ -2558,7 +2704,7 @@ func edit(c *Client, path, old, newText string, all bool, stdout, stderr io.Writ
 	}
 	base := res.Version
 	ap, err := c.Do(Request{Op: "apply", Path: path, Base: &base, Hunks: hunks})
-	return reportApply(ap, err, len(hunks), echo, stdout, stderr, asJSON)
+	return reportApply(ap, err, len(hunks), echo, c.Author(), stdout, stderr, asJSON)
 }
 
 // editTarget names the buffer an edit ran against, for an error message. An

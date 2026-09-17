@@ -36,6 +36,15 @@ const (
 	// Proposals lists the pending change sets in one file, and choosing one
 	// jumps to where it sits.
 	Proposals
+	// Commands lists the actions the keymap binds, and choosing one runs it.
+	Commands
+	// References lists a symbol's uses across files; choosing a row opens the
+	// file at the use and leaves the place where PositionFor will find it.
+	References
+	// CodeActions lists the actions a language server offers for the caret;
+	// choosing one names its index back to the caller, which applies the edit
+	// or runs the command the action carries.
+	CodeActions
 )
 
 // Proposal is one row in Proposals mode: a pending change set, labelled for a
@@ -43,6 +52,31 @@ const (
 type Proposal struct {
 	Label string
 	Line  int
+}
+
+type Command struct {
+	Label  string
+	Action keys.Action
+}
+
+// Reference is one row in References mode: a labelled use and where it is. Path
+// is absolute, because the uses of a symbol can lie outside the workspace root
+// the file rows are relative to, and a list of them is not scoped to one file
+// the way symbols and proposals are.
+type Reference struct {
+	Label string
+	Path  string
+	Line  int
+	Col   int
+}
+
+// CodeAction is one row in CodeActions mode: the action's title and the index
+// choosing it names back to the caller. The action itself stays with the caller
+// because it is a language-server value, not a picker one, and the picker's job
+// is only to show the labels and report which was chosen.
+type CodeAction struct {
+	Label string
+	Index int
 }
 
 // Picker is the floating quick-open overlay.
@@ -71,6 +105,18 @@ type Picker struct {
 	// file is the document Symbols mode is listing, held so a chosen symbol
 	// can name it.
 	file string
+
+	// command is the action the last choice named in Commands mode, or None.
+	// It is how the palette hands its choice back: the picker names a command,
+	// the caller dispatches it.
+	command keys.Action
+
+	// codeAction is the index the last choice named in CodeActions mode, and
+	// codeChosen says whether a choice was actually made: index zero is a real
+	// row, so a sentinel cannot stand in for "none". It is how the code-action
+	// list hands its choice back, the same way command does for the palette.
+	codeAction int
+	codeChosen bool
 }
 
 // Position is a place in a file, 1-based, as a compiler or grep prints it. A
@@ -78,10 +124,20 @@ type Picker struct {
 type Position struct{ Line, Col int }
 
 // entry is one row. label is what is shown and what the query is matched
-// against; line is where choosing it goes, and is zero for a file.
+// against; line is where choosing it goes and is zero for a file, and action
+// is the command a Commands row runs.
 type entry struct {
-	label string
-	line  int
+	label  string
+	line   int
+	col    int
+	action keys.Action
+	// path is the file a References row names. The other path modes hold one
+	// file for every row; a reference list spans files, so the row carries its
+	// own.
+	path string
+	// codeAction is the index a CodeActions row names. The list itself lives
+	// with the caller; the row only carries its position in it.
+	codeAction int
 }
 
 type scored struct {
@@ -136,10 +192,56 @@ func (p *Picker) ShowProposals(path string, rows []Proposal) {
 	p.filter()
 }
 
+func (p *Picker) ShowCommands(rows []Command) {
+	p.reset(Commands, "Run command")
+	p.items = p.items[:0]
+	for _, r := range rows {
+		p.items = append(p.items, entry{label: r.Label, action: r.Action})
+	}
+	p.filter()
+}
+
+// ShowReferences opens the same overlay over a symbol's uses. Unlike symbols and
+// proposals, which hold one file for every row, each row carries its own path
+// and position: a reference list crosses files. Choosing a row hands back that
+// path with the place in it, which is what openFromPicker already consumes.
+func (p *Picker) ShowReferences(rows []Reference) {
+	p.ShowLocations(rows, "References")
+}
+
+// ShowLocations opens the same overlay under a caller-chosen heading. It is
+// ShowReferences generalised: an implementation list has the same shape — a
+// label, a path and a place per row, crossing files — and differs only in what
+// the list is called. The reference path keeps its name so the common case
+// still reads the way it did.
+func (p *Picker) ShowLocations(rows []Reference, title string) {
+	p.reset(References, title)
+	p.items = p.items[:0]
+	for _, r := range rows {
+		p.items = append(p.items, entry{label: r.Label, line: r.Line, col: r.Col, path: r.Path})
+	}
+	p.filter()
+}
+
+// ShowCodeActions opens the same overlay over the actions a language server
+// offers for the caret. A row is a label plus an index, so choosing one names
+// the index back to the caller rather than opening a file; the action itself
+// stays with the caller, which owns the server connection and the edit path.
+func (p *Picker) ShowCodeActions(rows []CodeAction, title string) {
+	p.reset(CodeActions, title)
+	p.items = p.items[:0]
+	for _, r := range rows {
+		p.items = append(p.items, entry{label: r.Label, codeAction: r.Index})
+	}
+	p.filter()
+}
+
 func (p *Picker) reset(m Mode, label string) {
 	p.Open = true
 	p.mode = m
 	p.file = ""
+	p.command = keys.None
+	p.codeAction, p.codeChosen = 0, false
 	p.pos, p.path = Position{}, ""
 	p.input.Label = label
 	p.input.SetText("")
@@ -147,7 +249,16 @@ func (p *Picker) reset(m Mode, label string) {
 }
 
 // Mode is what the overlay is currently listing.
-func (p *Picker) Mode() Mode { return p.mode }
+func (p *Picker) Mode() Mode          { return p.mode }
+func (p *Picker) Action() keys.Action { return p.command }
+
+// ChosenCodeAction is the index the last choice named in CodeActions mode, and
+// whether a choice was made. The boolean is the "none" signal because index
+// zero is a real row. It is how the code-action list hands its choice back,
+// the same way Action does for the palette.
+func (p *Picker) ChosenCodeAction() (int, bool) {
+	return p.codeAction, p.codeChosen
+}
 
 // ActiveInput is the query field while the overlay is open.
 func (p *Picker) ActiveInput() *widget.Input {
@@ -354,12 +465,32 @@ func allDigits(s string) bool {
 	return true
 }
 
-// choose closes the overlay and returns the path the choice names. A symbol
-// answers with the file it lives in and leaves its line where PositionFor will
-// find it, so both modes come out of Handle as "a path, possibly with a place
-// in it" and the caller needs one path rather than two.
+// choose closes the overlay and returns the path the choice names, or "" for a
+// command. A symbol answers with the file it lives in and leaves its line where
+// PositionFor will find it, so the path modes come out of Handle as "a path,
+// possibly with a place in it" and the caller needs one path rather than two. A
+// Commands row instead names its action in p.command.
 func (p *Picker) choose(s scored) string {
 	p.Hide()
+	if p.mode == Commands {
+		// A command names an action rather than a place: the caller runs it
+		// through the dispatch a chord takes.
+		p.command = s.action
+		return ""
+	}
+	if p.mode == CodeActions {
+		// A code action is the caller's to carry out: it names an index, not a
+		// place and not a keymap action.
+		p.codeAction, p.codeChosen = s.codeAction, true
+		return ""
+	}
+	if p.mode == References {
+		if s.path == "" {
+			return ""
+		}
+		p.pos, p.path = Position{Line: s.line, Col: s.col}, s.path
+		return s.path
+	}
 	if p.mode == Symbols || p.mode == Proposals {
 		if p.file == "" {
 			return ""
@@ -477,7 +608,7 @@ func (p *Picker) score(query string) {
 	}
 }
 
-// fuzzy scores a subsequence match.
+// fuzzy scores a query against a path and reports which bytes matched.
 //
 // Scattered subsequence matches are the trap: "test" is a subsequence of
 // in-t-ernal/ui/styl-e.go -> s -> t, so a naive per-character score ranks it
@@ -485,7 +616,6 @@ func (p *Picker) score(query string) {
 // dominate — a run of n adjacent characters scores quadratically, gaps cost,
 // and an exact substring of the base name outweighs anything spread across
 // directories.
-// fuzzy scores a query against a path and reports which bytes matched.
 //
 // The match is anchored to the file name whenever the query fits inside it,
 // and falls back to the whole path otherwise. Without that anchor the scan is
@@ -706,6 +836,15 @@ func (p *Picker) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 	}
 	if p.mode == Proposals {
 		noun = " changes "
+	}
+	if p.mode == Commands {
+		noun = " commands "
+	}
+	if p.mode == References {
+		noun = " references "
+	}
+	if p.mode == CodeActions {
+		noun = " actions "
 	}
 	s.SetString(x+2, y+h-1, " "+itoa(len(p.shown))+noun, th.Dim, w-4)
 }

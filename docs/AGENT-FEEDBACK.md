@@ -170,41 +170,14 @@ items and COMPLETED.md. One friction item is not tracked anywhere:
 
 ## File lifecycle verbs — create, delete, rename (agent feedback, 2026-09-13)
 
-An agent adding modules (`create-store.js`, `hex.js`, `register.js`) or removing
-dead files had to hand the work back to the host: `raj ctl` has no create,
-delete or rename verb. Creation is partly covered — `open <path> -create` makes
-a buffer for a path that is not on disk, and a save writes the file — but the
-verb is not discoverable as "create", the container client was built before the
-flag existed, and nothing creates a missing parent directory, so a module in a
-new directory still fails at save. Delete and rename do not exist at all.
-
-Desired verbs, with the open decisions:
-
-- **`create [path]`** (or keep `open -create` as the one spelling). Empty buffer
-  → apply → save writes the file. Decision: parent directories — `MkdirAll` on
-  save for an explicitly created buffer, or a separate `mkdir`?
-- **`delete [path]`.** Tear the buffer down (`closeDoc`, drop the tab/headless
-  entry, remove the journal log, `TouchSession`), then remove the file. Refuse a
-  dirty buffer or one holding proposals (decide the work first), a directory,
-  and anything outside the workspace. Decision: unlink outright, or move to
-  `.raj/trash/` so it is recoverable without a VCS?
-- **`rename [path] NEW`** (or `move`). Both paths in the workspace; refuse an
-  existing destination and a dirty buffer. Rename on disk, then update
-  `File.Path`, close the old journal log (the log name is a hash of the path)
-  and the old language-server doc, and update the session. Import edits are
-  separate text proposals, not part of the rename.
-
-One design question behind all three: are these immediate verbs like `open` and
-`close`, or should a file operation surface as a decision in the review flow the
-way text does? The dirty/proposal refusal keeps immediate verbs
-review-consistent, and a file operation is not a text span; but a deletion is
-irreversible in a way a rejected hunk is not.
-
-Context confirmed while investigating: `open <path> -create` is implemented
-server-side (`Request.Create`, `hCreate = 0x12`, `Guard.Open`,
-`host.Open(path, create)`); the agent that saw "no create verb" was driving a
-container client built before that flag, so rebuilding the container image is
-part of any fix.
+Superseded 2026-09-13/14: the requested verbs landed — `mkdir`,
+`delete`/`delete -withdraw`/`deletions` (a review primitive with a prompt gate
+and `RAJ_TRASH`), `rename`/`mv` for files, and `rmdir`/`rmdirs` — and the open
+decisions resolved (parent directories via `mkdir`; recoverable delete via
+`.raj/trash/`; immediate, claim-gated verbs that refuse a dirty buffer or one
+holding proposals). Directory rename remains open in `docs/TODO.md`
+("File lifecycle — remaining"). Design: `docs/FILE-LIFECYCLE-SPEC.md`,
+`docs/CLAIM-SPEC.md`.
 
 ## Reconciler notes, 2026-09-15 (revert + control transport)
 
@@ -420,36 +393,13 @@ Bullet 5, deferred rather than done:
 
 ## Documents-consolidation review pass (2026-09-15, between-wave review)
 
-A documentation wave renamed `RECURSIVE-RAJ.md` and `AGENT-FEEDBACK.md`, folded
-`PROPOSALS-SPEC.md` into `LAYERED-PROPOSALS-SPEC.md` §14, `AGENT-VERB-AUDIT.md`
-into the dated verb-surface audit above, and `RECONCILIATION-UX.md` into
-INVESTIGATIONS' "Reconciliation UX" direction, and added the `docs/README.md`
-index with its placement rule. The review pass reread every folded section
-against its source: the ranked simplification table, the `Leave alone` and
-`Already fixed` lists, the pivot, visual models A–D and the open questions all
-survived intact, with only heading levels and the old feedback filename's
-citation updated to `AGENT-FEEDBACK.md`.
-
-Findings — the wave did its folds but not its deletions:
-
-- **The three folded source docs survived the move.** `docs/PROPOSALS-SPEC.md`,
-  `docs/AGENT-VERB-AUDIT.md` and `docs/RECONCILIATION-UX.md` were still on disk
-  after the wave was accepted and saved, so searches for the pre-rename
-  filenames still resolved (three and two hits), none had a
-  `docs/README.md` row, and the placement rule was violated by their continued
-  existence. The content is fully folded, so their retention was pure
-  duplication; the review pass proposed their deletion.
-- **Root `/work/KEYBINDINGS.md` was not deleted either.** The wave's brief said
-  it was, and a note in the 2026-09-10/11 wave reports above already called it
-  stale. It is 109 lines against the tested doc's 121 and the two have drifted
-  (the reload chord, the inlay-hints row, the review chords). Deletion proposed.
-- **The dangling-citation cleanup left short lines.** Dropping the
-  `EDIT-BUFFER-STRATEGY.md` references from `internal/piecetable/doc.go` and
-  `naive.go` (comment-only, correct) orphaned a few words at the end of a
-  comment line; the review pass reflowed them without changing the meaning.
-
-With the deletions accepted, `docs/README.md` matches the set exactly (15 docs,
-every row a real file) and the placement rule holds for the remaining docs.
+Superseded 2026-09-16: the review proposed deleting the three folded source docs
+(`docs/AGENT-VERB-AUDIT.md`, `docs/PROPOSALS-SPEC.md`,
+`docs/RECONCILIATION-UX.md`) and the stale root `/work/KEYBINDINGS.md`; all four
+were deleted, their `docs/README.md` rows removed, and
+`internal/docsindex/docsindex_test.go` now fails a `docs/*.md` with no row or a
+row naming a missing file. See `docs/COMPLETED.md` "Docs retirement and the
+index guard (2026-09-16)".
 
 ## F3b-ii D2a review pass (2026-09-15, between-wave)
 
@@ -544,7 +494,8 @@ placement already fixed in the buffer.
   mid-line folds the same way and its oracle only promises comp is reproduced,
   not one row per line. The review test now uses a whole-line hunk (boundaries
   on the line's start and end) so it exercises the identity it names; the split
-  is filed in TODO.md and left alone under the D2b `internal/view` freeze.
+  was later fixed: `view.Build` absorbs the continuation run, so it draws one
+  row (COMPLETED, 2026-09-16).
 - **The journal restore fixture was never written to disk.** `File.Dirty()` is
   content-based and a rejected set is excluded from the agreed composition, so
   a rejected-only buffer reads clean; `flushJournal` then writes no log at all
@@ -1015,3 +966,1010 @@ wording item.
   contains no `/`.
 
 
+## Ledger, own+other conflict message and D2b-seam review pass (2026-09-16, between-wave)
+
+Read-only over the socket except the ledger corrections below; the container has
+no Go toolchain, so the host `make check` stays the gate. `lsp diagnostics`
+returned `ok` on `internal/control/cli.go`, `internal/app/app.go`,
+`internal/app/review.go`, `internal/editor/pane.go`, `internal/view/projection.go`,
+`internal/piecetable/groups.go` and the four touched test files, so the only
+compile check available in the container is clean.
+
+- **The docs index matches the directory, both ways.** `ls /work/docs` returns 18
+  files and `docs/README.md` has exactly 18 rows naming them; the three folded
+  sources (`AGENT-VERB-AUDIT.md`, `PROPOSALS-SPEC.md`, `RECONCILIATION-UX.md`)
+  are still on disk, so their retired rows and "delete pending" notes are
+  correct and go only when the files do.
+- **`TODO.md` carries no `[x]` and no `[~]` checkbox** (`read -json | jq`, since
+  `search` caps at 20): 0 and 0, with 107 `[ ]`. The only `[~]` left was the
+  legend sentence in the agent-feedback section, which described a marker no
+  entry now uses; removed in this pass.
+- **The wave left its own seams and wording stale in the ledger.** `TODO.md`
+  still described `App.jumpTo`/`reviewJump` as "two copies" and `Pane.RowText` as
+  absent, and still carried the own+other message as an open decision, though all
+  three landed in this wave. The `Pane.RowText` and own+other entries were moved
+  to `COMPLETED.md`; the jump entry was narrowed to the remaining `host.Goto`.
+- **The own+other conflict is live and correctly worded.** Two identities
+  (caller author 3, peer author 4) on an `open -create` scratch buffer: the
+  caller proposed `AAA` at 0..3, the peer `BBB` at 3..6, then the caller's hunk
+  over [0,6) refused with `change set 1 is your own draft (bytes 0..3); this hunk
+  also crosses another writer's text — narrow it to avoid their span`; the
+  `-json` reply carried the same message and no `accept or reject`. A peer-owned
+  `Rejected` set at 6..9 refused the caller's hunk with `change set 5 owns this
+  text (author 4, bytes 6..9); accept or reject it first`, byte-for-byte the old
+  peer sentence. Scratch closed with `close -discard`, never written to disk.
+- **Test honesty.** `TestCLIRefusalNamesTheCallersOwnDraft` builds the own+other
+  state through the fake's `ownLease`, which stamps `Author: req.Author` (the
+  real connection author, learned from `res.Author` in `control.go`), and fails
+  without the `leaseView` branch. `TestCLIRefusalKeepsThePeerWording` passes on
+  pre-change code by construction — it is a guard against the new wording leaking
+  into the peer path, now labelled as one in `cli_test.go`.
+  `TestCompletionPrefixIsTheRowTextBelowAMidLineFold` builds a rejected mid-line
+  insertion, asserts the fold exists and the row differs from the session line,
+  and would fail on the old session-byte prefix (`fooREJbar`, not `bar`).
+  `TestOneJumpPathSkipsHiddenAndCentresVisible` and the two `RowText` tests
+  exercise the collapsed jump and the new accessor; the `RowText` tests build a
+  real fold through `foldedPane`.
+- **The five `[~]`->`[ ]` conversions read as open work, not host-confirmed done
+  work.** Without a git checkout in the container the exact five cannot be
+  reconstructed; the entries carrying an "in-tree part done / remainder open"
+  split are the dangling-symlink decision, the save-review lag diagnosis, the
+  app-layer `Invalid` mapping test, run-`prog` path reachability, the
+  superseded-warning span choice, the docs-index drift test and the
+  request-header count. Each remainder is unstarted or a decision (not merely
+  host verification), so `[ ]` is the right taxonomy; the in-tree halves are
+  already one-line COMPLETED entries. The one stale premise was the two seam
+  entries, fixed in this pass.
+- **The ledger's three unsettled flags are filed.** The docs drift check is
+  `TODO.md` "Guard the docs index against drift"; the missing app-layer `Invalid`
+  mapping test is `TODO.md` "The invalidation mapping has no app-layer test"; the
+  request-header count reads three (`recv`, `hello`, `cancel`), matching
+  `internal/control/prog.go` and the serve loop's pre-dispatch handlers, and the
+  item is its own record.
+- **A saved wave still has no enumerable diff.** Already a TODO, but this pass
+  felt it: with `proposals`/`groups` empty after the save and no git in the
+  container, the wave was reconciled from the brief's file list plus a tree
+  search. A `history`/`changes` verb over a saved wave would make the next pass
+  cheaper and the ledger harder to leave stale.
+
+## Cut-exploration wave review pass — multi-target read, `search -context` (2026-09-16, between-wave)
+
+Live over the socket against the rebuilt editor and container client, two
+identities (`review-explore-01` author 3, `review-explore-02` author 4). The
+wave's two additions are live and correct; this pass fixed one read-gate hole,
+closed four test gaps, documented the surface in the skill, and re-ran the call
+census.
+
+- **Multi-target read is live.** `raj ctl read docs/TODO.md docs/COMPLETED.md
+  -lines 1,2 -json` returns one object per file with each text and version; the
+  human form prints `==> path <==` headers; a shared `-lines`/`-start` span
+  applies to each. The single-target form is unchanged: `read docs/TODO.md
+  -lines 1,3 -json` is still `{author,spans,text,version}`, and a one-path read
+  no longer goes through `readPaths`. `-annotated` with two paths is refused
+  `raj ctl read: -annotated takes one path`, exit 2, with or without `-json`.
+- **Read-before-write is satisfied for every target.** After one
+  `read review-w2-a.txt review-w2-b.txt`, an `apply -base 0` to B and then to A
+  both landed; a fresh scratch buffer with no read refused with `read the buffer
+  before writing it: offsets only mean something in the coordinates of a version
+  you have seen`. The gate is real, so the both-landed result is the pin. Two
+  identities confirm the keying: author 4 claimed the file, author 3 multi-read
+  it, and author 4's apply was still refused until author 4 read it itself, so a
+  multi-read marks the targets under the request author and no one else.
+- **`search -context N` is live and the no-flag output is unchanged.**
+  `search -q "Agent call census" -include docs/BENCHMARKS.md -context 1` printed
+  the hit under `path:line:col version 0` with its neighbour; `-json` carried
+  `"context"` and `"version": 0`; `-jsonl` carried `"context"` only with the
+  flag. Without it the human line is exactly `path:line:col:text` and the JSON
+  has no `context` key. `-context 0` is byte-identical to an absent flag; a
+  negative is refused exit 2. Clipping at the first and last line is correct,
+  and unsaved open buffers report their nonzero version.
+- **Wire form.** `hMatchContext = 0x5c` is its own sparse argument op, emitted
+  only when some hit carries context and one string per hit in hit order; an old
+  reader's switch has no case for it and drops it whole (`decodeHeader` has no
+  `default`). `Query.Context` is the last field in the `hQuery` record
+  (`w.Str(q.Path).Bool(q.Hidden).Num(q.Context)`), so an old reader that stops
+  after Hidden ignores the trailing varint (`prog.Reader` reads past the end as
+  zero, and the `hQuery` case does not treat `Bad` as a frame error). The brief
+  called `hQuery` "JSON"; it is a `prog.Writer` record, so the argument is
+  "trailing bytes are ignored", not "unknown JSON keys are ignored" — worth
+  correcting on the next brief.
+- **`internal/app/ls.go` was the only mapping that mattered.** `runSearch` is
+  the one place a `control.SearchQuery` becomes a `search.Query`, and the only
+  change there was `Context: q.Context`. `Search` and `SearchHidden` both
+  delegate to it (the one-body share landed in the 2026-09-16 ls review pass);
+  without the field `-context` is dead end to end. Nothing else in ls.go moved.
+- **Test honesty.** `TestDispatchReadMultipleTargets` and
+  `TestDispatchReadMultipleAllowsLaterWrites` are real: the fixture seeds the
+  second doc and version, the pre-wave Dispatch cannot answer a `Paths` read at
+  all, and a fresh buffer is refused by the gate, so the later-writes test is
+  discriminating. `TestCLISearchContext` drives the real header codec through
+  the fake server, so it pins the query's Context and the response's
+  hMatchContext end to end; `TestHeaderKeepsMatchContext` puts a no-context hit
+  between two context hits so a positional shift fails; the real-engine
+  `TestRunContextIncludesNeighbouringLines` writes its file and asserts exact
+  top clipping. No vacuous new test found.
+
+### The read gate was satisfied by a read that failed (fixed in this pass)
+
+`readPaths` read each target through `Guard.Read`, which marks the path read on
+success, then returned on the first error. `read a missing` therefore returned
+an error but had already marked `a` seen, so a later `apply` to `a` was allowed
+without the caller ever receiving its text — the one thing the gate exists to
+stop. Fixed: `readPaths` now reads through `g.Host.Read` and calls `g.markRead`
+for every target only after the whole loop succeeds, so a mid-list failure marks
+none. `TestDispatchReadMultipleFailureDoesNotMarkEarlierTargets` pins it.
+
+### Gaps this pass closed
+
+- `fullHeader` is the every-field round-trip fixture but set neither
+  `SearchQuery.Context` nor `MatchMeta.Context`; both are set now, so a dropped
+  encode line fails `TestHeaderRoundTrip`.
+- `TestOldShapedQueryStillDecodes` was the only old-shape query test and its
+  comment claimed Path was newest; a `Path`+`Hidden`-without-`Context` payload
+  (the immediately preceding build's shape) had no pin. Added
+  `TestQueryWithoutContextStillDecodes` and corrected the comment.
+- `TestCLISearchContext`'s JSON half asserted a substring like `"version": 1`,
+  a spacing assertion of the class that cost a host cycle earlier; it now
+  unmarshals and asserts the context value and version.
+- The app-layer `runSearch` forwarding had no test — the CLI test speaks to the
+  fake editor — so it is pinned by `TestSearchContextReachesTheEngine` in
+  `internal/app/ls_test.go`.
+
+### Escalations (content/design choices, not decided here)
+
+- **The multi-read `-json` shape is inconsistent with the single read.**
+  Single: `{author,spans:[...],text,version}`. Multi:
+  `{files:[{path,text,version}]}`, no author and no per-file spans. Whether the
+  multi form carries authorship (it is available) or stays a path/text/version
+  list is the user's choice.
+- **A shared byte span that overruns one target refuses the whole call, while a
+  shared line range clamps per file.** Live: `read docs/TODO.md review-w2-a.txt
+  -start 0 -end 5` returned `offset out of range: [0, 5) is not within [0, 3)`,
+  while `-lines 5,9` returned the one-line file's whole line. The byte form
+  inherits single-read bounds-checking (right alone, surprising across files);
+  clamping per target and refusing are both defensible.
+- **`Buffer.Bytes` now means two things.** In a `buffers` reply it is the
+  document length; in a multi-read reply it is the bytes this read contributed.
+  Reusing the shape is the no-new-field decision; the field's doc does not say
+  so.
+
+### Census re-run (2026-09-16, during this review pass, so it includes the review's own calls)
+
+`node scripts/call-census.mjs` over the current store: 26,859 tool calls —
+26,320 bash, 250 task, 197 skill, 78 todowrite. Verbs: read 13,085 (32.5%),
+search 12,569 (31.2%), edit 3,170, lsp 2,062, open 1,765, version 1,181, apply
+1,084, buffers 1,071, groups 847, goto 501, diff 438. Transitions: read→read
+4,475, search→search 3,540, search→read 2,761, read→search 2,534. The baseline
+in BENCHMARKS.md (26,059 bash; read 12,944; search 12,410; read→read 4,416) is
+accurate for the snapshot it names; the store has since grown by the sessions
+after it, and the shares are unmoved, which is the expected pre-use reading. The
+doc's two read→read figures (4,416 and 4,459) are two runs of the same script,
+not two methods, and should be collapsed to one.
+
+### What the next census must show for this wave to count
+
+The tools only pay off if the self-looping explore cluster shrinks. Falsifiable
+targets, per session against the baseline's shares: the `read` share falls from
+32.5% (one call reads several files), the `search→read` transition falls from
+2,761 (a hit's neighbours no longer need a follow-up read), and the combined
+`read`+`search` share falls from 64%. The `search` count itself should not fall
+— `-context` is still one search — so success is read-count and total
+verb-count, not search-count. The census cannot see the win directly: it counts
+command strings, so a multi-path read counts once and its benefit shows as fewer
+reads, not as a new verb. Compare per-session medians, not aggregates, and gate
+on the explore phase (consecutive reads/searches before the first write) getting
+shorter.
+
+## Encoding + compaction + hover wave review pass (2026-09-16, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `make check` is the gate. `raj ctl lsp diagnostics` on every touched file
+(`internal/editor/{encoding,binary,file,reload}.go`,
+`internal/piecetable/{compact,project,groups,session}.go`,
+`internal/hover/hover.go`, and the test files) returned `status: ok`; one cold
+start answered `starting` and was retried. The wave was accepted and saved, so
+there were no pending sets to reconcile.
+
+### Verified by reading
+
+- **The encoding decision is one classifier.** `charset` owns the BOM switch
+  (`encoding.go:156`), the NUL / unmarked-UTF-16 / single-byte heuristics, and
+  is called by both `decode` (`:133`) and `IsBinary` (`binary.go:40`), which
+  only forwards and tests `errors.Is(err, ErrBinary)`. The sniffer and decoder
+  cannot disagree.
+- **decode/encode is the inverse it claims.** UTF-8 (±BOM), UTF-16LE/BE (±
+  surrogate pairs, ±CRLF), Windows-1252 and Latin-1 are bijective; the CP1252
+  table maps the five undefined bytes to themselves so the round trip holds.
+  `stripCR`/`encode` reproduce `\r\r\n` (the fuzz corpus entry).
+  `FuzzEncodingRoundTrip` skips Mixed, the documented lossy case.
+- **Refusals are honest.** UTF-32 is checked before the UTF-16 BOM it prefixes
+  (`:158`); odd byte counts and unpaired surrogates refuse in `decodeUTF16`;
+  `encode` refuses an unrepresentable character before any write; `Open`
+  (`file.go:133`) and `Reload` (`reload.go:50`) return the decode error before
+  mutating the file, and `SaveOver` (`file.go:806`) returns the encode error
+  before `writeAtomic`. A refused reload/re-save leaves the buffer and the
+  on-disk bytes alone (`TestReloadRefusesABinaryReplacement`,
+  `TestSaveRefusesUnencodableText`).
+- **Compaction moves bytes, not history.** `Compact` (`compact.go:47`) only
+  rewrites `s.buf`; `Version()` is `len(journal)`, so it is unchanged. The merge
+  branch requires the same store buffer (author), the same `originIndex` owner
+  and exact store contiguity (`cur.Start+cur.Length == next.Start`), so the
+  composed text is character-identical and no group absorbs another's bytes;
+  `TestCompactKeepsProjectionOracle` pins text and Annotated states for all
+  three policies. Flatten requires `Accepted` and every live claimant's
+  `Seq < saved` (`pieceStable`), so Proposed/Rejected and unsaved spans keep
+  their pieces (`TestCompactDoesNotFlattenPendingOrRejected`,
+  `TestCompactDoesNotFlattenUnsavedSpan`). `Store.Append` is a pure append, so
+  the flatten copy's `off - cur.Start` arithmetic is sound.
+- **Compaction is inert.** The only callers are `compact_test.go`; nothing in
+  `internal/app` or elsewhere calls `Compact`. `allOrigins` now walks
+  `s.compacted`, which is empty until a call, so even the projection paths are
+  byte-identical until wiring lands.
+- **Hover claims keys narrowly.** `Handle` always claims escape, claims the four
+  scroll keys only when `Scrollable()` (`shown > 0 && len(body) > shown`), and
+  returns false otherwise, so a fitting panel falls through to the old "any
+  action dismisses" path in `app.go:1086` and `TestHoverPanelClosesOnAnyAction`
+  still holds. `scrollBy` and `Render` both clamp, and `Render` zeroes `shown`
+  when there is not room for a box. The app-layer test draws first, so it builds
+  the geometry it asserts.
+- **Fuzz corpus sweep is clean.** Only two corpus entries exist repo-wide
+  (`FuzzEncodingRoundTrip/0cf09c667499f7b7` and
+  `FuzzProjectAgainstOracle/ebfe21d7ff53dc71`); both are `[]byte(...)` and match
+  their `f.Fuzz` parameter types. No other fuzz target changed signature this
+  wave.
+
+### Findings (raw, with severity)
+
+- **High — crash-restore loses the encoding, and the wave widened what that
+  costs.** `NewRestoredFile` (`internal/editor/file.go:187`) documents it: a
+  restored buffer has never been saved by this process, so its encoding is the
+  default until a save writes one. `internal/journal` has no encoding field
+  (`Written` carries Path/Hash/Version), so a dirty log replayed after a crash
+  comes back as zero `Encoding` (UTF-8/LF/no BOM) and the next save rewrites a
+  UTF-16/CRLF/CP1252 file as UTF-8/LF. Pre-existing — CRLF was already exposed —
+  but before this wave CP1252/Latin-1/UTF-16 were refused at `Open`, so they
+  could not be opened and then corrupted. A widened gap, not a regression in
+  the encoding code.
+- **Medium — a refused encode is not a no-op.** `SaveOver` calls
+  `f.AcceptPending()` before `encode`, so `ErrUnencodableText` leaves every
+  proposed set accepted although nothing was written (the brief called it a
+  no-op). `App.write` (`app.go:1656`) only reports "save failed".
+- **Medium — `EncodingWarning` is dead.** Nothing in `internal/app` calls
+  `File.EncodingWarning`, so a mixed-ending file is normalised to the dominant
+  ending on save with the warning never shown, contradicting the method's own
+  comment. Wire it beside `IndentWarning` (`app.go:364`, `:1357`).
+- **Medium — asterisk emphasis mangles plain text.** `inline`
+  (`internal/hover/hover.go`) has the `_`-identifier guard but no flanking guard
+  for `*`, so `2 * 3 * 4` renders as `2  3  4` (markers dropped). The blanket
+  "cannot mangle plain text" claim holds only for underscores; a glob like
+  `a/*/b` still italicises the `/`.
+- **Low — the UTF-32LE mark shadows a UTF-16LE file whose first unit is
+  U+0000.** `ff fe 00 00` is checked as UTF-32 before the UTF-16 BOM, so such a
+  file is refused by name rather than decoded. Refusal, not corruption.
+- **Low — unmarked UTF-16 with no NUL is decoded as Latin-1.** `looksUTF16`
+  only fires when NULs are present, so a BOM-less CJK/emoji UTF-16 file falls
+  through to the single-byte branch and displays as mojibake. It still
+  round-trips byte-for-byte, and an edit needing a byte the mapping lacks
+  refuses at save, so the failure is visible rather than corrupting.
+- **Low — `IsBinary` is exported but has no production caller** (`Open`/`Reload`
+  call `decode` directly).
+- **Low — `OpenFile` sends `ErrUnsupportedEncoding` to the status line**, not the
+  refusal dialog its own comment reserves for statements about the file.
+- **Low — fence matching is prefix-only.** A four-backtick fence is read as
+  three and an interior line starting with three closes it early; acceptable for
+  a hover subset but an escalation, not a decision made here.
+
+### Test honesty
+
+- Fault-finders (would fail without the change):
+  `TestEncodingRoundTripPreservesBytes`, `TestOpenDecodesUTF16`,
+  `TestEditedUTF16FileStaysUTF16`, `TestOpenDecodesWindows1252`,
+  `TestOpenDecodesLatin1`, `TestOpenRefusesUnsupportedEncoding`,
+  `TestOpenRefusesUnmarkedUTF16`, `TestSaveRefusesUnencodableText`,
+  `FuzzEncodingRoundTrip`; `TestCompactMergesAdjacentSameAuthorPieces`,
+  `TestCompactFlattensSavedCommittedSpan`,
+  `TestCompactDoesNotFlattenPendingOrRejected`,
+  `TestCompactDoesNotFlattenUnsavedSpan`, `TestCompactIsIdempotent`,
+  `TestCompactKeepsProjectionOracle`; `TestOverlongContentIsScrollable`,
+  `TestScrollKeysMoveTheOverflowingView`, `TestScrollIsClamped`,
+  `TestFencedCodeKeepsItsFence`, `TestIndentationInsideFencesSurvives`,
+  `TestBlankRunsCollapse`, `TestInlineCodeBoldAndItalic`,
+  `TestListItemsGetBullets`, `TestHoverPanelScrollsWithoutMovingTheCaret`.
+- Guards (pin behaviour that should not change):
+  `TestIsBinary`'s Latin-1/CP1252 cases assert the new shared verdict but
+  `IsBinary` itself is uncalled; `TestClaimsNothingElse`,
+  `TestClosedPanelClaimsNothing`, `TestUnderscoresInIdentifiersAreNotEmphasis`,
+  `TestHoverPanelClosesOnAnyAction` (the fitting fall-through).
+- Gaps: no app-layer test opens a legacy-encoded file (only the binary refusal
+  is covered); no test that a refused `Reload` leaves `Enc` unchanged (the
+  ordering guarantees it but does not pin it); `EncodingWarning` is tested only
+  at the editor layer.
+
+### Escalations (content/design, not decided here)
+
+- **Whether to wire `Compact` now.** It is safe but inert; the wave left it
+  uncalled on purpose. Wiring it is a behavioural change (idle-tick cost,
+  interaction with review state) and is the next wave's call.
+- **Whether to persist the encoding in the journal now, or accept the restore
+  gap** with the new encodings. Persisting is a Version-3 additive record and
+  touches `internal/journal` plus `internal/app/journal.go`.
+- **The markdown subset's flanking rules and fence matching**: tighten to
+  CommonMark-ish rules, or document the subset as deliberately loose.
+- **`SaveOver`'s accept-before-encode ordering:** make it atomic, or accept that
+  a failed save still approves the pending sets.
+
+## Encoding-through-restore + app-wiring wave review pass (2026-09-16, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `make check` is the gate. `raj ctl lsp diagnostics` on
+`internal/app/{journal,app,journal_test,app_test}.go` returned `status: ok`. The
+wave was accepted and saved, so there were no pending sets to reconcile.
+
+### Verified by reading
+
+- **The two mappers are total inverses.** `journalEncoding` and
+  `editorEncoding` (`internal/app/journal.go`) cover all five `editor.Kind`
+  values plus the default, copy `CRLF`/`BOM`, and drop `Mixed` (not persisted,
+  by design). `editor.UTF8`/`journal.EncodingUTF8` are both zero, so the
+  identity round-trips; `validate` bounds the kind and the decoder refuses a
+  non-canonical explicit default.
+- **The default path is byte-identical.** The two append sites (`startTap`'s
+  fresh `Base`, `recordWritten`'s `Written`) both pass
+  `journalEncoding(p.File.Enc)`; a default buffer maps to the zero `Encoding`,
+  which `encoder.encoding` omits, so an old log re-encodes to its own bytes.
+- **Only two append sites exist** for `journal.Base`/`journal.Written` (plus
+  tests), both in `internal/app/journal.go`.
+- **A fresh Base records a non-default open.** `editor.Open` sets `File.Enc`
+  from `decode`, so `startTap` records it for a path with no prior log — the
+  follow-up item is closed, not open.
+- **The restore seam is ordered.** `restoreLog` calls `SetEncoding` before
+  `startTap`, so the reused or fresh base records the restored shape.
+- **CompactTick is off the keystroke path.** Only `ui.Tick` calls it; the 2 s
+  `compactAt` debounce and the `Pieces() < 2` skip run before `Compact`, and the
+  `(Version, DecisionGeneration)` memo is checked before `Compact` builds its
+  origin index. `Compact` does not move `Session.Version`, so the memo hit
+  lasts. `SavedVersion()` is passed and `Compact` refuses Proposed/Rejected.
+- **Compacting before `journalTick` is safe.** It is not the load-bearing
+  guarantee: `appendTap` already writes store growth before ops, so a copy a
+  later op addresses is always in the log first. First is the conservative
+  ordering, not an accident.
+- **Status-clobber audit.** The other `a.status = ""` sites (`gotoSymbol`,
+  `applyHover`, `applyDefinition`, `clickSidebar`, `clickEditor`, `reviewList`)
+  are success-path clears after a failure branch returned, not set-then-clobber.
+
+### Findings (raw, with severity)
+
+- **High — the restore's Written-hash comparison mixed text and bytes, losing
+  post-save edits for every non-default encoding.** `restoreLog` built `disk`
+  from the decoded text (`hashBytes(orig)`) and compared it to `mark.Hash`,
+  which `recordWritten` fills from `File.SavedDigest()` — the digest of the
+  *encoded* bytes. For CRLF/BOM/UTF-16/CP1252 they never match, so a saved file
+  with a later unsaved edit was archived as "changed on disk" and the edit was
+  lost; the clean baseline (`RestoredWrite`) was never built either.
+  `logIsCleanOnDisk` had the same conflation. **Fixed this pass:** compare
+  `digestOf(p.File.SavedDigest())`/`digestOf(f.SavedDigest())` to `mark.Hash`
+  and the text hash to `base.Hash`; pinned by
+  `TestJournalRestoreReplaysUnsavedEditAfterSave`.
+- **Medium — compactTick bounds frequency, not cost.** `Compact` runs
+  `allOrigins` plus a whole-journal `pieceStable` whenever a pane's version or
+  decision generation moved; under sustained typing that is once per 2 s,
+  because the memo only spares an unchanged pair. Filed in TODO.
+- **Low — `App.compacted` is never pruned.** Filed in TODO.
+- **Low — a pre-tail log restores the default encoding.** Filed in TODO.
+- **Low — announcing a headless buffer skips `fileWarning`.** Filed in TODO.
+- **Low — the `fileWarning` call-site comment is stale.** It says "Clear any
+  stale note first", but the assignment is the clear; there is no preceding
+  clear. Left as-is; a one-line reword.
+
+### Test honesty
+
+- Fault-finders (would fail without the change):
+  `TestJournalRestoreReencodesSavedEncoding` (the base-only subtest),
+  `TestJournalRestoreWithoutEncodingKeepsDefault`,
+  `TestJournalRecordsBufferEncoding`,
+  `TestCompactTickMergesAdjacentSameAuthorPieces`,
+  `TestOpenSurfacesMixedEndingWarning`.
+- **A test that was not one.** `TestJournalRestoreReencodesSavedEncoding`'s
+  `after save` subtest passed for the wrong reason: the log was archived by the
+  bug above, so the pane came from disk (already UTF-16) and the encoding
+  assertion held with `SetEncoding` doing nothing. The new
+  `TestJournalRestoreReplaysUnsavedEditAfterSave` makes the post-save edit
+  unmissable and fails on the old code.
+- Guard labelling verified: `TestCompactTickLeavesAQuietBufferAlone` names the
+  `Pieces() < 2` guard and does fail without it (the empty pane would enter
+  `App.compacted`). The normal-ending half of
+  `TestOpenSurfacesMixedEndingWarning` is the silence guard and holds.
+- Added this pass: `TestOpenSurfacesIndentAndEncodingWarnings` — there was no
+  app-layer test that `IndentWarning` reaches the status line, and the
+  mixed-endings comment wrongly credited the editor-layer `TestIndentWarning`.
+- Remaining gaps: no app-level test that `compactTick` passes `SavedVersion`;
+  no test that the 2 s debounce skips a call inside the interval.
+
+### Escalations (content/design, not decided here)
+
+- **Whether to benchmark the 2 s compaction scan before raising the interval or
+  adding a fragmentation trigger.** The memo does not help a buffer being typed,
+  so a large journal pays a whole-journal `pieceStable` every 2 s. The threshold
+  is a measurement, not a guess.
+- **The pre-tail-log migration.** Recover the shape by decoding the disk when
+  the log is silent, or accept the one-time CRLF→LF conversion.
+- **`Base.Hash` is a text hash while `Written.Hash` is a byte hash.** The fix
+  makes each comparison its own kind, but an external edit that changes only
+  line endings still cannot be told from the base by text alone; making Base a
+  byte hash would unify them at the cost of re-reading/encoding at capture.
+
+## Docs retirement, compaction bench, encoding tail and rebind review pass (2026-09-16, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+wave report says the host `make check` was green, and it stays the gate. `raj ctl
+lsp diagnostics` returned `status: ok` on `internal/docsindex/docsindex_test.go`,
+`internal/piecetable/compact_bench_test.go`, `internal/keys/table.go`,
+`internal/app/{journal,app,headless,journal_test,app_test,session_test}.go` and
+`internal/app/removals_test.go`. The wave was accepted and saved, so there were
+no pending sets to reconcile. This pass added one test, reworded two comments
+and retired three TODO items.
+
+### Verified by reading
+
+- **The docs guard is honest for (a) and (b), and was dormant for (c).**
+  `readIndex` only accepts lines starting `| [`, so the header and separator
+  cannot be counted; `linkTarget` takes the first link and `cells[2]`/`cells[3]`
+  are the kind and purpose columns. `TestEveryDocHasARow` fails an unlisted
+  `docs/*.md` and `TestEveryRowNamesAFileThatExists` fails a dangling row;
+  `filepath.Base` keeps both inside `docs/`. `docs/README.md` has exactly 15
+  rows naming the 15 on-disk `.md` files. `TestRetiredRowsHaveNoFile` iterated
+  zero rows after this wave deleted both the retired rows and their files, so
+  this pass named the predicate (`retiredRowsWithFiles`) and added
+  `TestRetiredRowPredicate`, which exercises both the "retired" and "delete
+  pending" markers and both the present-file and absent-file branches.
+- **The rebind is complete.** No `ctrl+super+d` or `100;13u` survives anywhere;
+  `cmd+ctrl+d` appears only in the note explaining why it was not chosen.
+  `100;7u` is `ctrl+alt+d`: the same modifier byte `7` decodes to ctrl+alt in
+  `119;7u -> ctrl+alt+w` (`keymap_test.go`) and `118;7u -> ctrl+alt+v`.
+  `docs/KEYBINDINGS.md`'s row is byte-for-byte the format `keys.Doc()` emits, and
+  `TestCheckedInDocMatchesTheTable` would fail if it were not. The group comment
+  now says "pinned in Bindings rather than Natives", true of ctrl+alt+d.
+- **The encoding recovery is shape-only, tail-only and startup-only.**
+  `restoredEncoding` returns early when `Log.Encoding()` is non-zero and
+  otherwise uses only `editor.Open(...).Enc`; an open error returns the zero
+  encoding, which `editorEncoding` maps to the default, and the caller's
+  `SetEncoding` cannot fail. It runs once from `restoreLog`, which only
+  `restoreJournals` calls at startup. The previous review's byte-digest guard
+  (`digestOf(p.File.SavedDigest())` against `mark.Hash`, the text hash against
+  `base.Hash`, the same split in `logIsCleanOnDisk`) is untouched.
+- **`pruneCompacted` is keyed consistently.** `a.compacted` is read only in
+  `compactTick`, and `pruneCompacted` runs before that read walk; a live pane is
+  retained because `Tabs.All` is the same set the tick then walks, and a closed
+  pane cannot be read at all. The cost is one pass per `CompactInterval` on the
+  idle tick.
+- **The benchmarks build their claimed shapes.** `buildCompactedSession` writes
+  n contiguous same-group appends, so the merge branch folds them to two pieces
+  (base + one) and `Compact` afterwards is a no-op that still runs `allOrigins`
+  over n and `pieceStable` twice; `buildUncompactableSession` gives each insert
+  its own Begin/End, so every owner differs and nothing merges. `Agent`,
+  `NewSession`, `NewDoc`, `Begin`/`End`/`Insert`, `Buffer().Len`,
+  `Version`/`Compact` all exist with the used signatures.
+- **`docs/BENCHMARKS.md` carries no compaction figure.** Every table cell is
+  "pending host run"; the prose has no ns/us number.
+
+### Findings (raw, with severity)
+
+- **Low -- the retired-row guard was vacuous.** Fixed this pass by naming
+  `retiredRowsWithFiles` and adding `TestRetiredRowPredicate`.
+- **Low -- the typing-shape explanation was wrong.** Both `docs/BENCHMARKS.md`
+  and `compact_bench_test.go` said plain typing reaches `Session.Insert` "with
+  no `Begin`/`End`". `Pane.HandleText` does bracket one `InsertRune` in
+  `File.Begin`/`End`; the per-keystroke grouping is real either way (a commit at
+  depth 0 bumps a fresh group). Fixed the wording in both; the fixture was
+  already correct.
+- **Low -- the persistent-removals TODO premise was stale.** `removals.go`
+  already had the status-line note and `reopenPendingRemoval`; the item still
+  read "they surface only as a prompt ... no way to act". Retired to COMPLETED.
+- **Low -- the docs-index TODO named three files that are now deleted.** Retired
+  to COMPLETED.
+
+### Test honesty
+
+- Fault-finders: `TestJournalRestoreRecoversPreTailEncoding` sets the buffer's
+  encoding to the default *before* the first base is written, asserts the log
+  and its base carry no tail, and would come back UTF-8/LF without
+  `restoredEncoding`; `TestAnnounceSurfacesFileWarning` would read an empty
+  status without the `announce` assignment; `TestCompactTickPrunesClosedPaneEntries`
+  would still find the closed pane's key. `TestRetiredRowsHaveNoFile` cannot fail
+  on the tree (no retired rows), so the new `TestRetiredRowPredicate` is the
+  exercised pin.
+- The rebind's existing tests are fault-finders: all four `removals_test.go`
+  presses of `ctrl+alt+d` would leave the prompt closed if the table still bound
+  the old chord.
+
+### Escalations (content/design, not decided here)
+
+- **A shape-only external edit is still silently reverted.** `Base.Hash` is a
+  text hash while `Written.Hash` is a byte hash, so a CRLF/LF, BOM or charset
+  move with identical text matches the base and the log's recorded shape
+  re-encodes over it. Filed in TODO as "A shape-only external edit is silently
+  reverted on restore"; the smallest fix is a byte digest on `Base`, a journal
+  format change.
+
+## Feedback reconciliation review pass (2026-09-16, between-wave)
+
+The wave reconciled `docs/TODO.md` → `docs/COMPLETED.md` (stale items retired
+with code evidence) and `docs/AGENT-FEEDBACK.md` → TODO coverage (26 untracked
+findings). This pass verified the retirements by reading the code, filed the
+26, resolved the flags the wave left open, and fixed the drift it exposed.
+Read-only evidence: the container has no Go toolchain, so nothing was built;
+the host `make check` is the gate and was green for the wave.
+
+### Retirements verified by reading
+
+- **The two hover parents are real.** `internal/hover/hover.go` `inline` has
+  the flanking guard for `*`/`**` (`wordByte` on both sides of the marker) and
+  the `_`-identifier guard, so `2 * 3 * 4` is left as written; `fenceOpen`
+  returns `trimmed[:fenceRun(...)]` and `markdown` closes only on
+  `strings.HasPrefix(trimmed, fence)`, so a four-backtick fence is not closed
+  by three and a code line beginning with three does not close it.
+- **The scroll behaviour is real.** `Panel.Scrollable`/`Top`/`Handle` claim
+  `keys.LineUp`/`LineDown`/`PageUp`/`PageDown` only while the last `Render`
+  showed fewer rows than it had; `scrollBy` clamps; the caret never moves.
+- **The three "already in COMPLETED" items are there.** `revert` (the `revert`
+  entry plus `Authored-text cleanup`), the completion `textEdit` (the
+  inlay-hints entry: "completion `textEdit` plus `additionalTextEdits`"), and
+  the review next-hunk jump (the review-flow chords and one-jump-path entries).
+  Removing them from TODO was right.
+
+### The 26 findings
+
+Filed into TODO's "Agent feedback — actionable" dated notes: the port-squat
+connect timeout; the connection-scoped restart marker; the undefined Stream
+A/B/C/D labels; the `whoami -as` suspected bug; the missing `ping` verb; the
+proposal tint; `braceTally` fence counting (with its fixture note folded in);
+the `TestEveryVerbHasACode` omissions; cursor remapping across a revert; the
+two verb-surface design passes (explicit write target; verb consolidation);
+`run -prog` unmapped payload paths; the vacuous symlink-escape assertions;
+`markInvalid`'s O(ops²) `Groups()`; the two encoding-classifier edges.
+
+Not filed: item 7 (`-new-file` brief discipline — already in the skill), item
+17 (mid-line two-row split — fixed by the `view.Build` merge, COMPLETED), item
+21 (`header.go` forward-compat comment — already corrected, COMPLETED), item 26
+(`hQuery` is a `prog.Writer` record — a next-brief wording note, not editor
+work). Item 8 (`braceTally` fixture discipline) is folded into the `braceTally` TODO
+bullet; item 18 (`sessionTopFor`) is folded into the D2b consumer list. Item 12
+(reconciler arity) was fixed in `docs/REVIEW-AGENT.md` rather than filed; items 22 and 25 were one-line comment corrections in
+`internal/app/control_test.go` and `internal/app/app.go`.
+
+### Flags resolved
+
+- **Encoding and compaction cores recorded.** COMPLETED had the follow-ons but
+  no dated core entry for either; added ("Encoding core", "Compaction core").
+- **The two superseded `## Hover` bullets** carry a dated supersession note now.
+- **Editor-side identity durability retired.** `Registry.lowestGone` recycles a
+  gone id at the cap (`TestGoneIDsAreRecycledAtTheCap`), `Seed` restores rows
+  across a restart, and `who -live` filters; the only remainder (dump snapshots
+  keyed by identity) already has its own TODO item, so the swarm-blocker
+  narrative was no longer true and was removed.
+- **"The user's save is all-or-nothing, but no longer silent" retired.** The
+  save-time review popup is host-verified and the review-flow chords (Wave 2)
+  landed, so nothing in the bullet remained open.
+
+### Drift fixed
+
+- `docs/COMPLETED.md`'s dangling `run -prog` payload-paths TODO pointer now
+  resolves (the item was filed); the mid-line row note in this file (2026-09-15
+  D2b) no longer claims a TODO item, because the fix landed.
+- TODO's "superseded or already tracked" list no longer calls the `read -lines`
+  report fixed (the byte-span half is open), drops the built `find`/file-listing
+  verb, and carries `/tmp/opencode` once.
+- TODO's verb-surface audit item now states what landed and points at the two
+  remaining design-pass items.
+
+## LSP L0–L4 campaign review pass (2026-09-16, between-wave)
+
+Read-only; the container has no Go toolchain, so nothing was built or run and
+the host `make check` remains the gate. The five-wave LSP campaign (L0–L4,
+~20 features) ran with no review, and most sets are still `proposed`, so the
+tree could not be treated as settled. `raj ctl lsp diagnostics` was run on
+every touched file and on `internal/control/control.go` so cross-file
+references resolved. Diagnostics reported parse errors and undefined symbols,
+but the session buffer is the union of overlapping proposed edits, so a read or
+diagnostic there describes that union, not necessarily the save composition;
+conclusions about what a save writes come from reconstructing
+`Project(AcceptedOnly)` out of the annotated runs and the group states.
+
+### Findings (raw, with severity)
+
+- **BLOCKER: the invalid sets are not dead; they hold unique feature text.**
+  `Invalid` is computed from `projectMember`; when many agents insert at the
+  same anchor the earlier insertion is marked invalid even though its bytes are
+  physically present. Reconstructing the agreed composition as the non-invalid
+  runs shows declarations living only in invalid runs: in
+  `internal/keys/action.go` the `References`, `Complete` and `SignatureHelp`
+  declarations sit only in invalid sets 2/3/5 (byte runs 4975..5005,
+  4273..4527, 5005..5502), and `internal/keys/table.go`'s `SignatureHelp`
+  binding only in invalid set 5. A save accepts `Pending()` (proposed with a
+  surviving run) and drops every invalid set, so the saved `action.go` would
+  not declare `References`/`Complete`/`SignatureHelp` and `app.go` would not
+  compile. Do NOT clear these; only the user can accept the invalid groups, or
+  they must be re-derived.
+- **`clear` is wedged for every dead set.** Nine invalid sets render no
+  physical run at all (pure insertions a later set replaced): `lsp.go` 3/8/13,
+  `app.go` 4/7, `picker.go` 4/6, `app/control.go` 2, `KEYBINDINGS.md` 2. Each
+  rejects cleanly but `clear` refuses, naming a collider
+  (`lsp.go` g8 blocked by g13, g13 by g19; `app.go` g4 by g5, g7 by g8;
+  `picker.go` g4 by g14, g6 by g23; `control.go` g2 by g8; `KEYBINDINGS.md` g2
+  by g3). Byte deltas were 0 for every file, so the sets were left rejected.
+- **Parse errors in the session text.** `internal/control/control.go` has a
+  duplicated `Hints` field on one line (`...omitempty"` + tab + `Hints ...`;
+  gopls `expected ';', found Hints`), a missing `LSPResult.Signatures` field
+  (the doc comment is truncated mid-sentence) and a stray `Col int ... }`
+  fragment before `LSPItem`; `client.go` then fails on `LSPResult.Symbols`.
+  `internal/control/cli.go` reports `expected '}', found 'case'`.
+  `internal/app/lsp.go` reports `expected declaration, found "didSave"` and the
+  read around `clientCapabilities`/`capabilityGap` shows a spliced function
+  tail. The editor syncs `File.Text()` to gopls, so if the union is what a save
+  would write the host gate fails. Reported, not fixed.
+- **`applyDocEdits` (rename) bypasses the lease pre-check.** `applyServerEdits`
+  (`internal/app/server_edits.go`) checks `EditLeased` on every span before
+  applying and refuses the whole batch naming the set; `applyDocEdits`
+  (`internal/app/rename.go`) does not, so a rename whose edits touch a
+  pending/rejected/invalidated run partially applies — the leased spans are
+  refused at the `File` layer and the rest land — with no status word.
+- **KEYBINDINGS.md is missing `run_code_lens` and `follow_link`.** The rows it
+  has follow table.go's order; those two, added late in the campaign, are
+  absent, so the hand-edited file cannot be trusted. Regenerate on the host.
+
+### Verified by reading
+
+- **Stale-data guards all pin a version and a generation.** Semantic tokens
+  (`semantic.go`: `semanticVersion` + `semanticGen`), code lenses
+  (`codelens.go`: `lensVersion` + `lensGen`), formatting (`format.go`:
+  `docVersion` + `lspGen`), on-type formatting (`format.go`: `docVersion` +
+  `onTypeGen`), and format-on-save (`willsave.go`: `pendingWrite.version` +
+  `saveGen`, plus a proposed set arriving mid-request re-routing the save back
+  through review). No path applies a stale answer at shifted offsets.
+- **Capability gates are per-feature.** `jump.go` maps declaration/type
+  definition/implementation to `DeclarationProvider`/`TypeDefinitionProvider`/
+  `ImplementationProvider`; `format.go` maps document formatting to
+  `DocumentFormattingProvider` and range formatting to
+  `DocumentRangeFormattingProvider`, with `needsRange` driving the selection
+  requirement. `TestSiblingJumpCapabilityGates` pins the three jump providers.
+- **`workspace/applyEdit` refusal and `workspace/configuration` nulls read as
+  intended** (`lsp.go` `handleServerRequest`): applyEdit answers
+  `applied:false` with a reason, configuration answers one null per requested
+  item in order, `window/showMessageRequest` dismisses with null, and unknown
+  requests get `-32601`.
+
+### Not reconciled
+
+- Every file with a unique invalid set: `internal/app/lsp.go` (17 sets),
+  `internal/app/app.go` (3), `internal/picker/picker.go` (6),
+  `internal/app/control.go` (4), `internal/keys/action.go` (4),
+  `internal/keys/table.go` (1), `internal/app/lsp_test.go` (1). Clearing them
+  would delete unique text and accepting them is the user's gesture. The union
+  buffers also carry the parse errors above, so "accept everything" would save
+  the union, not a coherent file: the campaign needs a deliberate
+  reconciliation, not a bulk accept.
+
+### Campaign close — landed and repaired (2026-09-17)
+
+The campaign is host-verified and the tree is saved: `go vet`, `go build`,
+`go test ./...` and `make check` are green. L0–L4 landed the feature list
+recorded in `docs/COMPLETED.md` ("LSP campaign L0–L4 — landed and repaired
+(2026-09-17)"). A repair wave then fixed twelve syntax/type defects across
+`internal/control/{control,cli,client,cli_test,host_test}.go`,
+`internal/app/{lsp,control,app}.go` and `internal/keys/action.go` — fused
+lines, a duplicated `Hints` struct field, a doubled `entry` struct, an early
+`)` closing a `Mode` const block, and a `clientCapabilities` body spliced onto
+another function's tail — restored the lost `References`/`Complete`/
+`SignatureHelp` declarations, and corrected three mis-calibrated tests. The
+review pass above found the defects by reading the unsaved union and by
+`lsp diagnostics`; nothing in the container could compile, so this close is
+written from the host-verified result and the repair wave's report, not from a
+run in the container.
+
+### Failure modes for the next campaign (2026-09-17)
+
+Raw, dated and kept for the next campaign. Provenance: items 1–5 and 7 come
+from the review pass above; 6, 8, 9 and 11 from the campaign and repair-wave
+reports; 10 was observed while writing this record; 12 and 13 come from the
+2026-09-17 regression-fix session, host-green (`gofmt -w && go test ./... &&
+make check`).
+
+1. **A save silently drops invalid/superseded change sets.** The text stays in
+   the buffer but is excluded from `Project(AcceptedOnly)`, so `cmd+s` can
+   write a file that does not compile while the buffer still shows the text —
+   `internal/keys/action.go`'s `References`/`Complete`/`SignatureHelp`
+   constants existed **only** in invalid runs.
+2. **A permanently dirty buffer looks clean.** `buffers`' `pending` excludes
+   invalid sets, so `internal/app/lsp_test.go` reported `pending=0` while no
+   save could clear it.
+3. **No disposal gesture.** `clear` wedges naming a collider (`clear g8`
+   blocked by g13, g13 by g19, …), so an invalid set cannot be resolved in one
+   step.
+4. **Overlapping advisory landings fuse lines** (the twelve defects above).
+5. **Test coordinate conventions drifted.** Three tests asserted 1-based
+   line:col from the 0-based `File.LineCol` while sibling tests with identical
+   fixtures asserted 0-based; the source could not be changed without breaking
+   the compiler-paste path that pins 1-based `Picker.Position`. Fix: use
+   `cursorLine`/`cursorCol`. No compile catches this.
+6. **A timing bug passed every reading-level check.** `parkSave` posted its own
+   `ui.Wake`, so the parked answer was consumed before the keystroke that
+   should have invalidated it — the version pin existed and could never fire;
+   the request goroutine must wake instead.
+7. **No workspace-wide diagnostics check.** Seven files were broken while
+   per-file `lsp diagnostics` read `ok`; the command's JSON field is
+   `diagnostics` (a check filtering `.items` silently counts nothing — that
+   mistake was made twice).
+8. **Environment.** The container was started before the image rebuild, so the
+   baked `raj ctl` refused campaign-era `lsp` subcommands with a pre-campaign
+   mode list and the baked skills were stale; and the container's `/work` is
+   empty, so any check that greps `/work` inside the container reads nothing.
+9. **Orchestration.** "Orthogonal agents" was wrong (L0's two agents both
+   needed `picker.go`); across five waves the same four files were edited by
+   nearly every agent. Per-wave ownership of hot files would have prevented
+   most of 1–4.
+10. **Unsaved proposals do not survive an editor restart** — proven today
+    (2026-09-17) when two docs agents' edits to
+    `COMPLETED.md`/`AGENT-FEEDBACK.md` vanished while a third file's survived.
+    This record is their redo; it must be accepted and saved (`cmd+s`) soon.
+11. **Not implemented, by decision or deferral.** `semanticTokens` range/delta,
+    refresh requests, `codeAction/resolve`, `codeLens` lazy resolve,
+    `documentLink` rendering/non-file targets, `signatureHelp` typing
+    triggers, on-type multi-cursor, dynamic registration beyond
+    `workspace/symbol`, a format-on-save setting, trace/progress,
+    `workspace/applyEdit` (refused).
+12. **A shortening undo took the process down.** `Pane.line`
+    (`internal/editor/pane.go:263`) served rows out of `p.disp`, the display
+    projection built for the pre-edit, longer text. Undo appends its reversing
+    ops and `Pane.history` (`internal/editor/actions.go:199`) runs
+    `FollowCursor` on the same keystroke, before the frame's `UpdateDisplay`
+    (`internal/app/render.go:317` is its one production caller), so a consumer
+    sliced the freshly shortened line with the stale `hi` and panicked on the
+    event thread. A non-nil projection exists whenever the buffer has any
+    decision (`AcceptedAndProposed` is projected), so an ordinary buffer holding
+    a pending agent proposal was enough; backspace/delete reached the same
+    slice. Fixed 2026-09-17 by clamping `hi`/`lo` in `Pane.line`; pinned by
+    `TestUndoOfAShorteningEditClampsTheStaleProjection`
+    (`internal/editor/display_test.go:554`).
+13. **Copy in one file did not paste into another.** The internal `Clip`
+    carried piece records from the source store (`PieceRec{Buf, Start, Length}`,
+    `internal/piecetable/flatpieces.go:124`) and `PasteClip`
+    (`internal/editor/clip.go:126`) reused them across files, so the foreign
+    records named out-of-range bytes in the destination store and nothing — or
+    unrelated bytes — inserted; same-file paste worked, which read as "copy is
+    broken". Copy also emits OSC 52, so the system clipboard was fine. Fixed
+    2026-09-17 with `Clip.Source`/`Clip.Gen` and `Clip.internalTo`
+    (`internal/editor/clip.go:33-48`), with `Reload` bumping `docGen`
+    (`internal/editor/reload.go:62`); a foreign or stale clip now falls through
+    to `Text`. Pinned by `TestClipDoesNotCrossFiles`,
+    `TestClipDoesNotCrossReload` (`internal/editor/clipround_test.go:98`, `:126`)
+    and `TestPasteAcrossBuffers` (`internal/app/clip_test.go:118`).
+    `internal/editor/clip.go` was not touched by the LSP campaign, so this is
+    most likely a pre-existing limitation of the internal path.
+
+## Whole-line paste + sidebar inset wave — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `gofmt -w && go test ./... && make check` is green for the saved wave and
+stays the gate. `raj ctl lsp diagnostics` returned `ok` on every touched file
+(`internal/editor/clip.go`, `clip_test.go`, `clipround_test.go`,
+`internal/app/layout.go`, `render.go`, `pointer.go`, `menu.go`, `panes_test.go`,
+`menu_test.go`, `internal/ui/host.go`, `native.go`, `fake.go`,
+`present_resize_test.go`) and on the package peers that reference the changed
+symbols (`internal/editor/{file,pane,edit,cursors}.go`,
+`internal/app/{app,app_test,wheel_test,pointer_panes_test,render_test}.go`,
+`internal/ui/screen.go`, and the explorer, search and problems panes). The wave
+was accepted and saved, so `proposals` and `groups` were empty and there was
+nothing to dispose of.
+
+### Friction reported by this wave's implementation agents (raw)
+
+- **`search -json`'s `byte_start`/`line_start` disagree on a match with a
+  leading tab.** Observed live: `line` is a 1-based line number, `line_start`
+  is the byte offset of the line start, and `byte_start` is the byte offset of
+  the match, so `line_start` includes the tab and `byte_start` does not; the
+  pair reads like a row range. The struct comment
+  (`internal/control/control.go:322`) already says `line_start` is a byte
+  offset and the skill says to take offsets from `search` only, so this is a
+  naming trap rather than wrong data. Filed in TODO as a naming decision.
+- **`groups -mine` answered nothing while `raj ctl proposals` listed the
+  author's sets.** `groups [path]` is buffer-scoped: with no path and no focused
+  buffer it refuses `no open buffer for that path`, so a driver that just saw
+  workspace-wide proposals can read the empty answer as "no sets". Possible
+  verb-surface gap; filed in TODO.
+- **An `apply` insertion at a line start needs an explicit trailing blank line
+  to keep declarations separated.** The text lands flush against the next line
+  when the inserted payload does not itself end in a newline. This is the
+  whole-line anchor rule in RECURSIVE-RAJ section 5 seen from the insertion
+  side; a discipline note, not a verb bug.
+- **`buffers -json` is a top-level array, not an object.** Correct and already
+  documented (the empty case is pinned in COMPLETED, 2026-09-15); recorded here
+  only because it cost a jq query.
+- **`groups`/`diff` report only pre-edit line ranges; there is no post-edit
+  range.** Already tracked as "Groups carry rebased ranges" in TODO; no new
+  item.
+- **`search` prints `no matches; "..." contains regex metacharacters — retry
+  with -regex` on a zero-match literal.** The sentence reads as a rejection in
+  the reports even though it is only a hint (the change landed 2026-09-17,
+  COMPLETED). The wording could say the pattern was searched literally; low.
+
+### Findings from this pass (raw, with severity)
+
+- **Medium — a terminal resize no longer reached the host's erase. FIXED in
+  this pass.** The `ui.Resize` handler calls `a.host.Invalidate()`
+  (`internal/app/app.go:1151`), but `Run` draws after every event and `Draw` saw
+  a changed layout, so it called `a.host.Repaint()` (`internal/app/render.go`),
+  whose `erase=false` (`internal/ui/native.go:110`) cancelled the clear. `Draw`
+  is now size-aware: it takes the `Invalidate` branch when `cols`/`rows` differ
+  from the last frame (zeros on the first frame) and `Repaint` only for a
+  same-size layout change; the new `lastCols`/`lastRows` fields carry the size
+  and subsume the old `lastLayout == (Layout{})` first-frame guard. The test gap
+  that hid it is closed too: `ui.FakeHost.SetSize` moves the reported size and
+  `TestResizeInvalidates` now asserts `Invalidations` rose while `Repaints` did
+  not.
+- **Low — `TestWholeLinePasteFillsFinalEmptyLine` is a guard, not a
+  fault-finder.** Pasting at `File.Len()` with the old `spliceAtPrimary` inserts
+  the same `"one\n"` at the same offset, so the test passes with and without
+  the linewise dispatch. `TestWholeLinePasteFillsEmptyLine` (the middle empty
+  line) is the discriminating sibling; the final-empty-line case only differs
+  once the captured span already carries the newline, which is the earlier
+  copy-round-trip fix.
+- **Low — the first-frame `Invalidate` still has no test.** `Draw` clears the
+  screen for the very first frame and Repaints only same-size layout changes,
+  but no test asserts the first Draw produces an `Invalidate` and no `Repaint`;
+  the resize and toggle tests both start after a setup frame. Filed under Tests
+  and workflow.
+- **Low — `TestResizeInvalidates` did not exercise the real resize path. FIXED
+  in this pass.** The fake host's `Size` was not updated by `Handle(ui.Resize)`,
+  so `syncSize` reverted the screen to the host size and the layout never
+  changed; the test pinned the handler's `Invalidate` only. `FakeHost.SetSize`
+  moves the reported size now, so the test drives the real size-driven layout
+  change and asserts both the invalidate and the absence of a repaint.
+- **Low — a characterwise selection ending at a line boundary now pastes
+  linewise.** The dispatch keys on `strings.HasSuffix(c.Text, "\n")` rather
+  than on "this was a whole-line copy", so a single-span selection that happens
+  to end exactly after a newline takes the linewise path too. It matches the
+  brief, but it is a broader behaviour change than "a whole-line copy pastes as
+  a line"; escalated as a design choice (carry a `Linewise` flag on `Clip` set
+  only by the `lineCopy` path, or keep the text-suffix rule).
+
+### Test honesty
+
+- Fault-finders: `TestWholeLinePasteGoesBelowNotAtCaret`,
+  `TestWholeLinePasteFillsEmptyLine`,
+  `TestLinewisePasteCursorAtFirstNonBlank`,
+  `TestLinewisePasteInternalMatchesExternal` (the `NewlinePiece` subtests,
+  where the old splice inserted the line without its newline while the text
+  path added one), and the extended `TestWholeLineCopyStillStoresNothing`.
+- `TestResizeInvalidates` (rewritten this pass) is a fault-finder for the
+  size-aware erase: under the old unconditional Repaint the repaint counter
+  rose, which its second assertion catches; `FakeHost.SetSize` is the seam that
+  lets it drive the real size change.
+- Guards: `TestWholeLineCopyKeepsItsNewline` and
+  `TestWholeLinePasteFillsFinalEmptyLine` (above); `TestLayoutChangeRepaints`
+  is a real fault-finder for "a layout change repaints without clearing" but
+  does not pin the first-frame guard; `TestRepaintWritesFullFrameWithoutErasing`
+  and `TestInvalidateWritesFullFrameWithErase` are the host-level pins.
+- `TestLinewisePasteInternalMatchesExternal` really builds both paths: cases
+  1-6 capture the source line's newline (captured-newline branch), and
+  `final source into empty line` and `final source pasted below` copy a final
+  line with no trailing newline, so `haveNL` is false and the `NewlinePiece`
+  path runs. The one uncovered combination -- internal, `empty && lineEnd ==
+  Len`, `haveNL` false -- is unreachable within one file: a clip with no
+  captured newline comes from a document that does not end in a newline, so
+  that document has no final empty line to fill.
+
+## In-file find & replace + backspace panic + sidebar pad wave — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `gofmt -w && go test ./... && make check` is the saved wave's gate.
+`raj ctl lsp diagnostics` returned `ok` on every touched file
+(`internal/editor/find.go`, `edit_test.go`, `autopair.go`, `autopair_test.go`;
+`internal/app/app.go`, `render.go`, `pointer.go`, `panes_test.go`,
+`layout.go`) and on the package peers that reference the changed symbols
+(`internal/editor/{pane,edit,cursors,render,clip,proposals_test}.go`,
+`internal/app/{mode,control,review,menu,app_test,control_test,render_test,mode_test,review_test,pointer_panes_test}.go`,
+`internal/keys/{keymap,table,action,keymap_test}.go`,
+`internal/widget/input.go`). The wave was accepted and saved, so `proposals`
+returned no pending sets and there was nothing to dispose of. No test was run;
+the panic path and every "would fail without" claim below are read from the
+code, not observed.
+
+### Friction reported by this wave's implementation agents (raw)
+
+- **`raj ctl` roots at cwd, so a driver run from `/tmp` cannot address
+  `/work/...`.** `inferMapper` (`internal/control/client.go`) takes
+  `WorkspaceRoot(cwd)` as the local side, so from `/tmp` the map is
+  `/tmp=<editorRoot>` and an absolute `/work/...` argument is neither rewritten
+  nor under the editor's root — refused outside the workspace. `RAJ_ROOT_MAP`
+  is the documented override; running from the mounted workspace root avoids
+  it. Promoted to TODO (make root inference cwd-independent, or state the
+  requirement).
+- **`edit`'s read gate forces a `version` call per write.** Every `edit`/`apply`
+  must base on a version the connection has read, so a multi-hunk splice costs
+  a fresh `read`/`version` before each write even when the previous reply
+  already carried the version. This is the gate working as designed (safety
+  over round trips); recorded, not promoted.
+- **`lsp diagnostics` gives per-file gopls errors but no package-wide signal.**
+  A file can read `ok` while a peer or a test in the same package does not
+  compile, and `go vet` findings never appear. The existing TODO sweep item is
+  extended with the package-wide gap; the host `go test`/`vet` stays the only
+  whole-package check.
+
+### Findings from this pass (raw, with severity)
+
+- **Medium — `Find.run`'s smart-case fold can shift byte offsets.** `hasUpper`
+  only detects ASCII `A-Z`, so an all-lowercase query takes the
+  `strings.ToLower` branch. The simple case fold is not
+  byte-length-preserving for runes such as `İ` (U+0130, 2 bytes → `i`, 1) and
+  `ẞ` (U+1E9E, 3 → `ß`, 2). The haystack is folded too, so a document
+  containing one of these *before* a match shifts every later offset, not just
+  a match that contains the rune; `replaceCurrent`/`replaceAll` edit at those
+  offsets, so this is a wrong-bytes edit path, not only a wrong jump. Exact fix:
+  fold
+  ASCII-only (map bytes outside `A-Z` unchanged) or store each match's
+  original byte length. Filed in TODO.
+- **Low — find searches the session text, not the drawn projection.** `Find.run`
+  reads `File.Text()` (every run, rejected included) while Edit mode draws the
+  `AcceptedAndProposed` projection and Review draws `Annotated`; a term inside
+  a folded rejected run still matches and `jump` moves the caret to a hidden
+  offset. Replace is protected (a rejected run is leased, so `applyEdit`
+  refuses); this is the same class as the open F3b-ii D2b item, not new here,
+  but the replace path makes it worth naming.
+- **Low — Review mode over-refuses `cmd+enter` in an open find bar.**
+  `WouldEdit` returns true for `keys.LineBelow` unconditionally, but
+  `Find.Handle` ignores it unless `replaceShown`, so with the replace row
+  hidden and Review on, `cmd+enter` sets the read-only note although nothing
+  would have changed. Exact fix: `case keys.LineBelow: return f.replaceShown`.
+  Filed in TODO.
+
+### Test honesty (new and changed tests)
+
+- `TestFindReplaceRefusedByLease` is a fault-finder: `propose` runs `ApplyDiff`
+  so `File.Text()` is `"user AGNT here"` and marks the run `Proposed`; the
+  query `"AGNT"` matches exactly the proposed span `5..9`. A replace of `4`
+  bytes at offset `5` is that same span, so `EditLeased` refuses it. Without
+  the lease check the text would become `"user ZZZZ here"` and the
+  `TakeLeaseRefusal == id` assertion would fail; the fixture really builds the
+  pending run, not a coincidental match.
+- `TestFindReplaceThroughKeybindings` is the fault-finder for the enter
+  normalization: `Bind(Editor, "enter", None)` makes `Resolve` return
+  `keys.None` + `"\n"`, and `widget.Input.Handle(None, "\n")` returns false, so
+  without the normalization the buffer would stay `"one two one"`. The `esc`
+  before `super+z` is load-bearing, not decoration: the open bar routes every
+  key to `Find.Handle`, which does not handle `Undo`, so an undo issued first
+  is swallowed. `TestFindReplaceAllThroughKeybindings` drives `cmd+enter`
+  (global `LineBelow`, no editor override) and pins the one-undo restore.
+- `TestFindReplaceRefusedInReviewMode` is a fault-finder for the bar gate:
+  without `WouldEdit`, `Find.Handle(Confirm)` on the replace row would edit
+  through the bar, which sits ahead of `reviewRefuses`; the test asserts both
+  the unchanged text and the `"read-only in review mode"` status.
+- `TestBackspaceOnEmptyDocumentDoesNothing` exercises the default-on
+  `AutoPairs` via `paired(t, "")`; both neighbour bytes read `0`, so the old
+  `pairs[before] != after` test could not tell "no opener" from a match and
+  reached `applyEdit(-1, 2, "")`. The `expect, isOpener :=` form covers every
+  non-opener byte, not just offset `0`.
+- Guards/non-fault-finders: `TestFindRows` pins `Rows()` across closed/open/
+  revealed/shift+tab/closed; `TestFindReplaceCurrent` and `TestFindReplaceAll`
+  pin the document edit and match count; `TestFindTabRevealsReplaceRow` pins
+  the reveal plus "tab did not indent". Ordinary newline insertion is guarded
+  by the pre-existing `TestNewlineIndentsThroughTheKeyPath`
+  (`press("enter")`), which is why the normalization cannot have broken the
+  closed-bar path. This wave added no newline-in-a-closed-bar test; the
+  pre-existing app test is the guard. One small gap: nothing types into the
+  query after `shift+tab`, so the focus-returns-to-query path is covered only
+  by `Rows()` staying 2.
+- `Rows()`/`ClickAt(dx, dy)` consistency: `render.go` draws from
+  `p.Find.Rows()` at its four sites, `pointer.go` hit-tests `ny < Rows()` then
+  forwards `(ev.Col-l.EditorX, ny)` to `ClickAt`, `editorCell`/`beyondEdge`
+  subtract the same count, and the only other `Find.Open` reads are cmd+f
+  toggling and the bar gate. No stale one-row height maths remains.
+
+### Arity checkpoint (read from the code)
+
+- `pairs[before]` is now a two-value map read bound to `expect, isOpener`
+  (`internal/editor/autopair.go:246`), the change's only new multi-return.
+- `File.Delete` returns `bool` and the ignoring call in `applyEdit` is a
+  statement; `File.EditLeased`, `Pane.TakeLeaseRefusal` and `File.Undo` are
+  two-value and each changed call binds both; `Pane.leaseBlocks` returns `bool`
+  and `replaceAll` branches on it; `applyEdit(pos, remove int, insert string)`
+  matches both `find.go` call sites.

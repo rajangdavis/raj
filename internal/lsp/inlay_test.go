@@ -92,6 +92,7 @@ func TestInlayHintTooltip(t *testing.T) {
 		{"absent", `{}`, ""},
 		{"empty", `{"tooltip":""}`, ""},
 		{"string", `{"tooltip":"a type"}`, "a type"},
+		{"markup plaintext", `{"tooltip":{"kind":"plaintext","value":"a type"}}`, "a type"},
 		{"markup", "{\"tooltip\":{\"kind\":\"markdown\",\"value\":\"```go\\nint\\n```\\n\\nA type.\"}}", "int\n\nA type."},
 	}
 	for _, c := range cases {
@@ -128,6 +129,60 @@ func TestInlayHintTextEditsDecode(t *testing.T) {
 	}
 	if got := hints[0].Edits[0]; got != want {
 		t.Errorf("edit = %+v, want %+v", got, want)
+	}
+}
+
+// A malformed edit is dropped without cost to the hint: the label and tooltip
+// still decode and the valid edits survive. Before the permissive decode the
+// whole answer failed to unmarshal and every hint in it was lost, so a server
+// typo in one edit silently blanked a file's hints.
+func TestInlayHintMalformedTextEditIsDropped(t *testing.T) {
+	raw := `[{"label":": int","tooltip":"the type","textEdits":[
+		{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"ok"},
+		{"range":"not a range","newText":"bad"}
+	]}]`
+	hints, err := inlay(t, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hints) != 1 {
+		t.Fatalf("got %d hints, want the one surviving hint", len(hints))
+	}
+	if hints[0].Text != ": int" || hints[0].Tooltip != "the type" {
+		t.Errorf("hint = %+v, want its label and tooltip intact", hints[0])
+	}
+	if len(hints[0].Edits) != 1 || hints[0].Edits[0].NewText != "ok" {
+		t.Errorf("edits = %+v, want only the valid edit", hints[0].Edits)
+	}
+}
+
+// A hint whose only edit is malformed keeps its label and tooltip with no
+// edits, rather than being dropped: the readable part is still worth showing.
+func TestInlayHintAllTextEditsMalformedKeepsTheHint(t *testing.T) {
+	raw := `[{"label":": int","textEdits":[{"range":7,"newText":42}]}]`
+	hints, err := inlay(t, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hints) != 1 || hints[0].Text != ": int" {
+		t.Fatalf("hints = %+v, want one hint with its label", hints)
+	}
+	if hints[0].Edits != nil {
+		t.Errorf("edits = %+v, want nil", hints[0].Edits)
+	}
+}
+
+// One malformed hint does not cost the answer the others. The old decode
+// unmarshalled the whole array in one go, so a single bad element returned no
+// hints at all.
+func TestInlayHintMalformedHintDoesNotDropTheRest(t *testing.T) {
+	raw := `[{"position":42},{"label":": int"}]`
+	hints, err := inlay(t, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hints) != 1 || hints[0].Text != ": int" {
+		t.Errorf("hints = %+v, want only the well-formed hint", hints)
 	}
 }
 

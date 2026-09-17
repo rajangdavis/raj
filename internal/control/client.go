@@ -325,14 +325,18 @@ func (c *Client) localise(res *Response) {
 			}
 		}
 	}
-	// LSPJSON nests the same way: a definition or reference answer carries
-	// caller-visible locations. Unmarshal, rebase the Locations, marshal back.
-	// Hover text is content, not a path, so only Locations is rewritten.
+	// LSPJSON nests the same way: a definition, reference or workspace-symbol
+	// answer carries caller-visible locations. Unmarshal, rebase the Locations
+	// and Symbols, marshal back. Hover text is content, not a path, so only the
+	// path-bearing fields are rewritten.
 	if res.LSPJSON != "" {
 		var lsp LSPResult
 		if err := json.Unmarshal([]byte(res.LSPJSON), &lsp); err == nil {
 			for i := range lsp.Locations {
 				lsp.Locations[i].Path = c.paths.FromEditor(lsp.Locations[i].Path)
+			}
+			for i := range lsp.Symbols {
+				lsp.Symbols[i].Path = c.paths.FromEditor(lsp.Symbols[i].Path)
 			}
 			if b, err := json.Marshal(lsp); err == nil {
 				res.LSPJSON = string(b)

@@ -1,6 +1,8 @@
 package explorer
 
 import (
+	"path/filepath"
+
 	"raj/internal/keys"
 	"raj/internal/ui"
 	"raj/internal/widget"
@@ -88,6 +90,8 @@ func (p *Pane) Handle(a keys.Action, text string) (open string, exit bool) {
 		if p.spot == spotTree {
 			p.list.Move(+1, len(p.Tree.Entries()))
 		}
+	case keys.ToggleExpandAll:
+		p.toggleExpandAll()
 	case keys.Confirm:
 		return p.activate()
 	case keys.None:
@@ -122,6 +126,27 @@ func (p *Pane) toggleFilter() {
 	p.list.Reset()
 }
 
+// toggleExpandAll expands or collapses the whole subtree of the selected row.
+// A file has no subtree of its own, so its parent directory is the target: the
+// gesture acts on where the file lives, which is more useful than a no-op on
+// the file's own path.
+//
+// The decision between expanding and collapsing belongs to the tree (see
+// Tree.ToggleExpandAll), which reads the state of the whole subtree, so a
+// partially collapsed subtree expands on the first press.
+func (p *Pane) toggleExpandAll() {
+	entries := p.Tree.Entries()
+	if p.list.Sel < 0 || p.list.Sel >= len(entries) {
+		return // nothing selected
+	}
+	e := entries[p.list.Sel]
+	target := e.Path
+	if !e.Dir {
+		target = filepath.Dir(e.Path)
+	}
+	p.Tree.ToggleExpandAll(target)
+}
+
 // Selected is the highlighted entry's path, empty when the tree is empty.
 // List exposes the scroll state, so a caller can assert on where the view is.
 func (p *Pane) List() *widget.List { return &p.list }
@@ -135,6 +160,22 @@ func (p *Pane) Selected() string {
 		return entries[p.list.Sel].Path
 	}
 	return ""
+}
+
+// SelectedPath is the highlighted entry's path when it is a file, and false
+// when it is a directory or nothing is selected. The explorer uses it to decide
+// whether arrowing should preview: directories expand on their own keys and are
+// never previewed.
+func (p *Pane) SelectedPath() (string, bool) {
+	entries := p.Tree.Entries()
+	if p.list.Sel < 0 || p.list.Sel >= len(entries) {
+		return "", false
+	}
+	e := entries[p.list.Sel]
+	if e.Dir {
+		return "", false
+	}
+	return e.Path, true
 }
 
 // Rows above and below the tree: the heading, the changed-only toggle, and the

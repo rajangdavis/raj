@@ -47,11 +47,10 @@ func (f *File) Reload() error {
 	if err != nil {
 		return err
 	}
-	if IsBinary(string(data)) {
-		return ErrBinary
+	text, enc, err := decode(data)
+	if err != nil {
+		return err
 	}
-
-	text, enc := decode(string(data))
 	f.Enc = enc
 	// The style is re-detected, because the content it was read from is not
 	// the content any more. The current style is the fallback, so a file with
@@ -60,6 +59,7 @@ func (f *File) Reload() error {
 	f.Indent, f.indentFrom = IndentFor(f.Path, text, f.Indent)
 
 	f.sess = piecetable.NewSession(piecetable.NewDoc(text, 0))
+	f.docGen++ // any clip captured from the old store can no longer splice
 	f.idx = view.NewIndex(text)
 	f.Syntax = syntax.New(f.Path, f.dark)
 	f.applied = f.sess.Version()

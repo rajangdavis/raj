@@ -143,24 +143,195 @@ type wireLocation struct {
 	TargetSelected *Range `json:"targetSelectionRange"`
 }
 
-func (w wireLocation) toLocation() (Location, bool) {
+// parts returns the URI and range a wire location names, whichever of the
+// Location and LocationLink spellings the server chose. The selection range
+// is the identifier itself; the target range is the whole declaration
+// including its doc comment. Jumping to the identifier is what "where is this
+// defined" means, so the selection wins when both are present.
+func (w wireLocation) parts() (string, *Range) {
 	uri, r := w.URI, w.Range
 	if uri == "" {
 		uri = w.TargetURI
 	}
-	// The selection range is the identifier itself; the target range is the
-	// whole declaration including its doc comment. Jumping to the identifier
-	// is what someone asking "where is this defined" means, so it wins when
-	// both are present.
 	if w.TargetSelected != nil {
 		r = w.TargetSelected
 	} else if r == nil {
 		r = w.TargetRange
 	}
+	return uri, r
+}
+
+func (w wireLocation) toLocation() (Location, bool) {
+	uri, r := w.parts()
 	if uri == "" || r == nil {
 		return Location{}, false
 	}
 	return Location{Path: Path(uri), Range: *r}, true
+}
+
+// symbolLocation reads the location of a workspace symbol. A range is optional
+// there: the specification allows a document URI alone, and such a symbol is
+// kept with a path but no place, so choosing it opens the file at the top
+// rather than being left out of the list.
+func symbolLocation(raw json.RawMessage) (Location, bool) {
+	if isNull(raw) {
+		return Location{}, false
+	}
+	var w wireLocation
+	if json.Unmarshal(raw, &w) != nil {
+		return Location{}, false
+	}
+	uri, r := w.parts()
+	if uri == "" {
+		return Location{}, false
+	}
+	if r == nil {
+		return Location{Path: Path(uri)}, false
+	}
+	return Location{Path: Path(uri), Range: *r}, true
+}
+
+// WorkspaceSymbol is one workspace/symbol result: a named declaration
+// somewhere in the project.
+//
+// It is a small typed result rather than a []Location plus a parallel label
+// slice, because the name, kind and container are what make the list readable
+// and a second slice is a second thing to keep in step. Location reuses the
+// path-and-range a definition names; HasRange is separate because the
+// specification lets a workspace symbol carry a document URI and nothing else
+// (the Location | {uri} form), and such a symbol must be listed, not dropped.
+type WorkspaceSymbol struct {
+	Name      string
+	Kind      SymbolKind
+	Container string
+	Location  Location
+	HasRange  bool
+}
+
+// SymbolKind is the protocol's symbol kind number. It shares the 1..26 range
+// with CompletionItemKind because the specification numbers two different
+// enums over the same span, not because the meanings match, so it is its own
+// type with its own names.
+type SymbolKind int
+
+// String names the kind for a list row. An unknown number reads as "" rather
+// than a guess, the way an unknown completion kind does.
+func (k SymbolKind) String() string {
+	switch k {
+	case 1:
+		return "file"
+	case 2:
+		return "module"
+	case 3:
+		return "namespace"
+	case 4:
+		return "package"
+	case 5:
+		return "class"
+	case 6:
+		return "method"
+	case 7:
+		return "property"
+	case 8:
+		return "field"
+	case 9:
+		return "constructor"
+	case 10:
+		return "enum"
+	case 11:
+		return "interface"
+	case 12:
+		return "function"
+	case 13:
+		return "variable"
+	case 14:
+		return "constant"
+	case 15:
+		return "string"
+	case 16:
+		return "number"
+	case 17:
+		return "boolean"
+	case 18:
+		return "array"
+	case 19:
+		return "object"
+	case 20:
+		return "key"
+	case 21:
+		return "null"
+	case 22:
+		return "enum member"
+	case 23:
+		return "struct"
+	case 24:
+		return "event"
+	case 25:
+		return "operator"
+	case 26:
+		return "type parameter"
+	}
+	return ""
+}
+
+// wireSymbol is the common shape of SymbolInformation and WorkspaceSymbol:
+// both carry a name, a kind and a location, and differ only in how the
+// location may be spelled.
+type wireSymbol struct {
+	Name          string          `json:"name"`
+	Kind          int             `json:"kind"`
+	ContainerName string          `json:"containerName"`
+	Location      json.RawMessage `json:"location"`
+}
+
+// RequestWorkspaceSymbols asks the whole project for declarations matching a
+// query.
+//
+// The query is the server's to match, not the client's: servers index by name
+// and rank by scope and type, which is the entire reason to ask. An empty
+// query is legal and means "everything you have"; the picker filters that list
+// as the user types, which is why the human path passes "".
+func RequestWorkspaceSymbols(ctx context.Context, c *Conn, query string) ([]WorkspaceSymbol, error) {
+	if c == nil {
+		return nil, ErrClosed
+	}
+	var raw json.RawMessage
+	if err := c.Call(ctx, "workspace/symbol", map[string]any{"query": query}, &raw); err != nil {
+		return nil, err
+	}
+	return decodeWorkspaceSymbols(raw), nil
+}
+
+// decodeWorkspaceSymbols reads the array, or null. Both SymbolInformation and
+// the newer WorkspaceSymbol are arrays of the wireSymbol shape, so one decoder
+// covers servers that send either; a symbol whose location carries no range is
+// kept, with HasRange false, rather than dropped.
+func decodeWorkspaceSymbols(raw json.RawMessage) []WorkspaceSymbol {
+	if isNull(raw) {
+		return nil
+	}
+	var many []wireSymbol
+	if json.Unmarshal(raw, &many) != nil {
+		return nil
+	}
+	var out []WorkspaceSymbol
+	for _, w := range many {
+		if w.Name == "" {
+			continue
+		}
+		loc, hasRange := symbolLocation(w.Location)
+		if loc.Path == "" {
+			continue
+		}
+		out = append(out, WorkspaceSymbol{
+			Name:      w.Name,
+			Kind:      SymbolKind(w.Kind),
+			Container: w.ContainerName,
+			Location:  loc,
+			HasRange:  hasRange,
+		})
+	}
+	return out
 }
 
 // RequestDefinition asks where the thing at a position is defined.
@@ -170,14 +341,50 @@ func (w wireLocation) toLocation() (Location, bool) {
 // return an array for an interface method. An empty result is "not found",
 // which is normal rather than an error.
 func RequestDefinition(ctx context.Context, c *Conn, path string, p Position) ([]Location, error) {
+	return requestLocations(ctx, c, "textDocument/definition", path, p)
+}
+
+// requestLocations is the shape every "ask about a position, get places back"
+// request shares: send the method for the position and decode the answer
+// permissively. Declaration, definition, type definition and implementation
+// differ only in the method name, so the wire handling lives here once rather
+// than once per method.
+func requestLocations(ctx context.Context, c *Conn, method, path string, p Position) ([]Location, error) {
 	if c == nil {
 		return nil, ErrClosed
 	}
 	var raw json.RawMessage
-	if err := c.Call(ctx, "textDocument/definition", positionParams(path, p), &raw); err != nil {
+	if err := c.Call(ctx, method, positionParams(path, p), &raw); err != nil {
 		return nil, err
 	}
 	return decodeLocations(raw), nil
+}
+
+// RequestDeclaration asks where the thing at a position is declared. It is
+// definition's twin and often the same place; where they differ, the
+// declaration is where the name is introduced and the definition supplies the
+// body (a prototype versus its definition).
+//
+// The result is a location, an array of them, or null, decoded the same way a
+// definition is: an empty list is "not found", which is normal rather than an
+// error.
+func RequestDeclaration(ctx context.Context, c *Conn, path string, p Position) ([]Location, error) {
+	return requestLocations(ctx, c, "textDocument/declaration", path, p)
+}
+
+// RequestTypeDefinition asks where the type of the thing at a position is
+// defined: the struct behind a variable, the interface behind a method value.
+// An empty answer is "not found" rather than an error.
+func RequestTypeDefinition(ctx context.Context, c *Conn, path string, p Position) ([]Location, error) {
+	return requestLocations(ctx, c, "textDocument/typeDefinition", path, p)
+}
+
+// RequestImplementation asks for the concrete implementations of the interface
+// or interface method at a position. Several is the normal answer — an
+// interface usually has more than one implementation — and the list is decoded
+// like a definition's.
+func RequestImplementation(ctx context.Context, c *Conn, path string, p Position) ([]Location, error) {
+	return requestLocations(ctx, c, "textDocument/implementation", path, p)
 }
 
 // RequestReferences asks for every place the symbol at a position is used.

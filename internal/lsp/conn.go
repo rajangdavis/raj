@@ -58,7 +58,33 @@ type Conn struct {
 	handler func(*Message) (any, *ResponseError)
 
 	Diagnostics chan Diagnostics
+
+	// ServerMessages carries window/showMessage and window/logMessage
+	// notifications to the event loop. Like Diagnostics it is a channel rather
+	// than a callback because the reader goroutine must not touch buffers or
+	// the screen; the event loop drains it on wake and decides what a human
+	// should see.
+	ServerMessages chan ServerMessage
 }
+
+// ServerMessage is a window/showMessage or window/logMessage notification: the
+// server telling the user something. Keeping it typed lets the event loop apply
+// the severity rule to logMessage without re-parsing JSON.
+type ServerMessage struct {
+	Method  string
+	Type    int
+	Message string
+}
+
+// MessageType is the severity window/showMessage and window/logMessage carry,
+// as the protocol numbers it. They are named so the log-filtering rule reads
+// as a rule rather than as a magic comparison.
+const (
+	MessageError   = 1
+	MessageWarning = 2
+	MessageInfo    = 3
+	MessageLog     = 4
+)
 
 // Diagnostics is a published diagnostic set for one document.
 //
@@ -77,6 +103,11 @@ type Diagnostic struct {
 	Severity int    `json:"severity"`
 	Source   string `json:"source"`
 	Message  string `json:"message"`
+	// Code is the server's problem identifier, which a code-action context has
+	// to carry back: a quick fix for a diagnostic is keyed by the code as much
+	// as by its range. It stays raw because the protocol allows a string or a
+	// number.
+	Code json.RawMessage `json:"code,omitempty"`
 }
 
 // NewConn starts serving a connection over the given pipes. stop terminates the
@@ -89,6 +120,10 @@ func NewConn(w io.WriteCloser, r io.Reader, stop, notify func()) *Conn {
 		notify:      notify,
 		pending:     map[int]chan *Message{},
 		Diagnostics: make(chan Diagnostics, 64),
+		// Buffered for the same reason as Diagnostics: the reader must never
+		// block on a full channel and stop reading the wire. The event loop
+		// drains it on wake and keeps the newest when it is behind.
+		ServerMessages: make(chan ServerMessage, 64),
 	}
 	if c.stop == nil {
 		c.stop = func() {}
@@ -247,6 +282,30 @@ func (c *Conn) dispatch(m *Message) {
 			default:
 			}
 		}
+
+	case m.Method == "window/showMessage" || m.Method == "window/logMessage":
+		// The server telling the user something. It reaches the event loop
+		// through a channel rather than being rendered here, because the
+		// reader goroutine owns the wire and nothing else.
+		var p struct {
+			Type    int    `json:"type"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(m.Params, &p) != nil {
+			return
+		}
+		c.postMessage(ServerMessage{Method: m.Method, Type: p.Type, Message: p.Message})
+
+	case m.Method == "$/cancelRequest":
+		// A cancellation the server sent for a request this client never asked
+		// is a no-op. The notification has no reply and there is no local work
+		// to stop, so ignoring it is the whole contract.
+
+	default:
+		// Every other notification is one this client does not implement. The
+		// protocol says to ignore it rather than error, and there is no reply
+		// to send anyway. `$/` methods in particular are reserved for future
+		// use and must be dropped quietly.
 	}
 }
 
@@ -262,12 +321,38 @@ func (c *Conn) replyToServer(m *Message) {
 		rerr = &ResponseError{Code: -32601, Message: "method not supported: " + m.Method}
 	}
 	reply := &Message{JSONRPC: "2.0", ID: m.ID, Error: rerr}
-	if rerr == nil && result != nil {
+	// A handler that returns no result still has to answer with one: JSON-RPC
+	// requires exactly one of result or error, and marshalling nil yields the
+	// null that window/showMessageRequest and workspace/applyEdit expect.
+	// Omitting the field would leave the server reading a malformed reply.
+	if rerr == nil {
 		if b, err := json.Marshal(result); err == nil {
 			reply.Result = b
 		}
 	}
 	_ = c.write(reply)
+}
+
+// postMessage hands a server notification to the event loop. The buffer keeps
+// the newest when the loop is behind: the status line shows one message at a
+// time, so an older one that has not been read is already superseded. These
+// are not absolute state the way diagnostics are, so dropping the oldest is
+// right rather than wrong.
+func (c *Conn) postMessage(m ServerMessage) {
+	select {
+	case c.ServerMessages <- m:
+		c.notify()
+	default:
+		select {
+		case <-c.ServerMessages:
+		default:
+		}
+		select {
+		case c.ServerMessages <- m:
+			c.notify()
+		default:
+		}
+	}
 }
 
 // Handle sets the responder for requests the server originates. Without one
@@ -325,18 +410,135 @@ func (c *Conn) Closed() bool {
 	return c.closed
 }
 
+// ServerCapabilities is the set of providers a server advertises in its
+// initialize reply: the gate every feature checks before it asks. Each one is
+// kept raw rather than typed, because the protocol allows most of them to be
+// either a boolean or an options object, and a server that sends the boolean
+// false must not fail the whole handshake. Supports is the one rule for
+// reading them; the accessors below decode only the nested options a caller
+// actually needs, so this struct does not become a second copy of the
+// specification.
+type ServerCapabilities struct {
+	TextDocumentSync json.RawMessage `json:"textDocumentSync"`
+
+	HoverProvider                    json.RawMessage `json:"hoverProvider"`
+	DefinitionProvider               json.RawMessage `json:"definitionProvider"`
+	DeclarationProvider              json.RawMessage `json:"declarationProvider"`
+	TypeDefinitionProvider           json.RawMessage `json:"typeDefinitionProvider"`
+	ImplementationProvider           json.RawMessage `json:"implementationProvider"`
+	ReferencesProvider               json.RawMessage `json:"referencesProvider"`
+	DocumentHighlightProvider        json.RawMessage `json:"documentHighlightProvider"`
+	CompletionProvider               json.RawMessage `json:"completionProvider"`
+	SignatureHelpProvider            json.RawMessage `json:"signatureHelpProvider"`
+	DocumentFormattingProvider       json.RawMessage `json:"documentFormattingProvider"`
+	DocumentRangeFormattingProvider  json.RawMessage `json:"documentRangeFormattingProvider"`
+	DocumentOnTypeFormattingProvider json.RawMessage `json:"documentOnTypeFormattingProvider"`
+
+	RenameProvider         json.RawMessage `json:"renameProvider"`
+	CodeActionProvider     json.RawMessage `json:"codeActionProvider"`
+	CodeLensProvider       json.RawMessage `json:"codeLensProvider"`
+	DocumentSymbolProvider json.RawMessage `json:"documentSymbolProvider"`
+	FoldingRangeProvider   json.RawMessage `json:"foldingRangeProvider"`
+	DocumentLinkProvider   json.RawMessage `json:"documentLinkProvider"`
+	ColorProvider          json.RawMessage `json:"colorProvider"`
+	InlayHintProvider      json.RawMessage `json:"inlayHintProvider"`
+	SemanticTokensProvider json.RawMessage `json:"semanticTokensProvider"`
+	ExecuteCommandProvider json.RawMessage `json:"executeCommandProvider"`
+
+	SelectionRangeProvider     json.RawMessage `json:"selectionRangeProvider"`
+	CallHierarchyProvider      json.RawMessage `json:"callHierarchyProvider"`
+	TypeHierarchyProvider      json.RawMessage `json:"typeHierarchyProvider"`
+	LinkedEditingRangeProvider json.RawMessage `json:"linkedEditingRangeProvider"`
+	MonikerProvider            json.RawMessage `json:"monikerProvider"`
+	InlineValueProvider        json.RawMessage `json:"inlineValueProvider"`
+	DiagnosticProvider         json.RawMessage `json:"diagnosticProvider"`
+	InlineCompletionProvider   json.RawMessage `json:"inlineCompletionProvider"`
+
+	WorkspaceSymbolProvider json.RawMessage `json:"workspaceSymbolProvider"`
+}
+
+// SignatureHelpTriggers is the trigger characters the server advertised for
+// signature help, or nil. The capability is an options object or a boolean, so
+// it stays raw and only the one option a caller needs is read here.
+func (c ServerCapabilities) SignatureHelpTriggers() []string {
+	if !Supports(c.SignatureHelpProvider) {
+		return nil
+	}
+	var opts struct {
+		TriggerCharacters []string `json:"triggerCharacters"`
+	}
+	if json.Unmarshal(c.SignatureHelpProvider, &opts) != nil {
+		return nil
+	}
+	return opts.TriggerCharacters
+}
+
+// RenamePrepare reports whether the server advertised the prepare half of
+// rename, the request that checks a new name before the edit is made.
+func (c ServerCapabilities) RenamePrepare() bool {
+	if !Supports(c.RenameProvider) {
+		return false
+	}
+	var opts struct {
+		PrepareProvider bool `json:"prepareProvider"`
+	}
+	if json.Unmarshal(c.RenameProvider, &opts) != nil {
+		return false
+	}
+	return opts.PrepareProvider
+}
+
+// WorkspaceSymbolResolve reports whether the server advertised the resolve
+// half of workspace symbols, the request that fills in a location range for a
+// symbol the server has already returned (3.17). The flag is an option on
+// workspaceSymbolProvider, so a bare presence check would call every
+// workspace-symbol server resolve-capable.
+func (c ServerCapabilities) WorkspaceSymbolResolve() bool {
+	if !Supports(c.WorkspaceSymbolProvider) {
+		return false
+	}
+	var opts struct {
+		ResolveProvider bool `json:"resolveProvider"`
+	}
+	if json.Unmarshal(c.WorkspaceSymbolProvider, &opts) != nil {
+		return false
+	}
+	return opts.ResolveProvider
+}
+
+// WillSave reports whether the server asked for the fire-and-forget
+// textDocument/willSave notification. The flag lives inside textDocumentSync's
+// options object; a server that advertised a bare change-kind number asked for
+// no save notifications at all.
+func (c ServerCapabilities) WillSave() bool {
+	var opts struct {
+		WillSave bool `json:"willSave"`
+	}
+	if json.Unmarshal(c.TextDocumentSync, &opts) != nil {
+		return false
+	}
+	return opts.WillSave
+}
+
+// WillSaveWaitUntil reports whether the server will answer a
+// textDocument/willSaveWaitUntil request with edits to apply before a save.
+// Like WillSave it reads the textDocumentSync options object, so a server that
+// advertised only a change kind is never asked.
+func (c ServerCapabilities) WillSaveWaitUntil() bool {
+	var opts struct {
+		WillSaveWaitUntil bool `json:"willSaveWaitUntil"`
+	}
+	if json.Unmarshal(c.TextDocumentSync, &opts) != nil {
+		return false
+	}
+	return opts.WillSaveWaitUntil
+}
+
 // InitializeResult is the part of the handshake raj acts on: what the server
 // says it can do.
 type InitializeResult struct {
-	Capabilities struct {
-		HoverProvider      json.RawMessage `json:"hoverProvider"`
-		DefinitionProvider json.RawMessage `json:"definitionProvider"`
-		CompletionProvider *struct {
-			TriggerCharacters []string `json:"triggerCharacters"`
-		} `json:"completionProvider"`
-		TextDocumentSync json.RawMessage `json:"textDocumentSync"`
-	} `json:"capabilities"`
-	ServerInfo struct {
+	Capabilities ServerCapabilities `json:"capabilities"`
+	ServerInfo   struct {
 		Name    string `json:"name"`
 		Version string `json:"version"`
 	} `json:"serverInfo"`

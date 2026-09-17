@@ -64,6 +64,16 @@ type memHost struct {
 	// test can assert the plumbing without a language server.
 	hintsJSON string
 	hintLines [2]int
+	// symbolsJSON is the canned workspace/symbol answer LSPWorkspaceSymbols
+	// hands back, and symbolsQuery records the query the request carried, so a
+	// Dispatch test can assert the plumbing without a language server.
+	symbolsJSON  string
+	symbolsQuery string
+	// formatJSON is the canned formatting answer LSPFormat hands back, and
+	// formatLines records the 1-based range the request carried, so a Dispatch
+	// test can assert the plumbing without a language server.
+	formatJSON  string
+	formatLines [2]int
 	// lease, leaseAuthor, leaseStart and leaseEnd let a test make Apply answer
 	// a stale base with a lease refusal carrying the owner and span the real
 	// app reports, so Dispatch and the CLI can be checked without a journal
@@ -1171,6 +1181,29 @@ func (h *memHost) LSPInlayHints(path string, lineStart, lineEnd int) (LSPCaller,
 		return nil, fmt.Errorf("no language server for this file type")
 	}
 	return fakeLSP{json: h.hintsJSON}, nil
+}
+
+// LSPWorkspaceSymbols records the query and hands back the canned symbol
+// answer, so the Dispatch plumbing can be exercised without a language server.
+// An empty symbolsJSON is the same clean "no server" answer LSP gives.
+func (h *memHost) LSPWorkspaceSymbols(path, query string) (LSPCaller, error) {
+	h.symbolsQuery = query
+	if h.symbolsJSON == "" {
+		return nil, fmt.Errorf("no language server for this file type")
+	}
+	return fakeLSP{json: h.symbolsJSON}, nil
+}
+
+// LSPFormat records the range the request carried and hands back the canned
+// formatting answer, so the Dispatch plumbing can be exercised without a
+// language server. An empty formatJSON is the same clean "no server" answer
+// LSP gives.
+func (h *memHost) LSPFormat(path string, lineStart, lineEnd int) (LSPCaller, error) {
+	h.formatLines = [2]int{lineStart, lineEnd}
+	if h.formatJSON == "" {
+		return nil, fmt.Errorf("no language server for this file type")
+	}
+	return fakeLSP{json: h.formatJSON}, nil
 }
 
 func (h *memHost) Dirty() []DirtyBuffer { return h.dirty }
@@ -2710,6 +2743,82 @@ func TestDispatchLSPInlayHints(t *testing.T) {
 	}
 }
 
+// A formatting request reaches the host's formatting variant with the lines the
+// request carried, and its caller's canned answer comes back as LSPJSON. The
+// real decode of the server's TextEdits is exercised in internal/lsp, and the
+// application in internal/app.
+func TestDispatchLSPFormat(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.formatJSON = `{"edits":[{"line":1,"col":1,"endLine":1,"endCol":3,"text":"  "}]}`
+	res := Dispatch(g, Request{Op: "lspprep", Path: path, LSPMode: "format"})
+	if !res.OK || res.LSP == nil {
+		t.Fatalf("lspprep format = %+v", res)
+	}
+	if h.formatLines != [2]int{0, 0} {
+		t.Errorf("host saw lines %v, want whole-document [0 0]", h.formatLines)
+	}
+	data, err := res.LSP.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out LSPResult
+	if uerr := json.Unmarshal(data, &out); uerr != nil {
+		t.Fatalf("answer is not JSON: %v", uerr)
+	}
+	if len(out.Edits) != 1 || out.Edits[0].Line != 1 || out.Edits[0].EndCol != 3 {
+		t.Errorf("edits = %+v", out.Edits)
+	}
+
+	// The range form carries the named lines through to the host.
+	a, b := 4, 7
+	res = Dispatch(g, Request{Op: "lspprep", Path: path, LSPMode: "range-format", LineStart: &a, LineEnd: &b})
+	if !res.OK || res.LSP == nil {
+		t.Fatalf("lspprep range-format = %+v", res)
+	}
+	if h.formatLines != [2]int{4, 7} {
+		t.Errorf("host saw lines %v, want [4 7]", h.formatLines)
+	}
+}
+
+// A workspace-symbol request reaches the host's query variant with the query
+// the request carried, and its caller's canned answer comes back as LSPJSON.
+// The server's own symbol shapes are decoded in internal/lsp and the
+// application of the picker in internal/app.
+func TestDispatchLSPWorkspaceSymbols(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.symbolsJSON = `{"symbols":[{"name":"Reader","kind":"interface","path":"/w/a.go","line":1,"col":6}]}`
+	res := Dispatch(g, Request{Op: "lspprep", Path: path, LSPMode: "symbols", Query: &SearchQuery{Text: "Read"}})
+	if !res.OK || res.LSP == nil {
+		t.Fatalf("lspprep symbols = %+v", res)
+	}
+	if h.symbolsQuery != "Read" {
+		t.Errorf("host saw query %q, want Read", h.symbolsQuery)
+	}
+	data, err := res.LSP.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out LSPResult
+	if uerr := json.Unmarshal(data, &out); uerr != nil {
+		t.Fatalf("answer is not JSON: %v", uerr)
+	}
+	if len(out.Symbols) != 1 || out.Symbols[0].Name != "Reader" || out.Symbols[0].Line != 1 {
+		t.Errorf("symbols = %+v", out.Symbols)
+	}
+
+	// An empty query rides the wire as no query at all, so the host sees the
+	// same empty string the CLI sends when the caller names none.
+	res = Dispatch(g, Request{Op: "lspprep", Path: path, LSPMode: "symbols"})
+	if !res.OK || res.LSP == nil {
+		t.Fatalf("lspprep symbols (no query) = %+v", res)
+	}
+	if h.symbolsQuery != "" {
+		t.Errorf("host saw query %q, want empty", h.symbolsQuery)
+	}
+}
+
 // DiffLines turns old text into new as byte hunks; the round trip through the
 // memHost is the same code the real host's Patch runs, so this pins the diff
 // before any LSP or diff verb leans on it.
@@ -2989,5 +3098,82 @@ func TestGuardRefusesSymlinkParentEscape(t *testing.T) {
 	}
 	if res := Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{through}}); res.OK {
 		t.Errorf("claim through a symlinked parent = %+v, want a refusal", res)
+	}
+}
+
+// A read can name several targets in one call: each path's text and version
+// comes back, so a read-read-read chain is one round trip. Buffers names each
+// target's path and version and the byte length of its text, and Spans carries
+// the concatenation, which is how the read is split back apart. The
+// single-target form is unchanged. Modelled on TestDispatchReadsByLines.
+func TestDispatchReadMultipleTargets(t *testing.T) {
+	g, h := guarded(t)
+	a := filepath.Join(h.root, "a.go")
+	b := filepath.Join(h.root, "b.go")
+	h.docs[b], h.vers[b] = "second file\n", 7
+
+	res := Dispatch(g, Request{Op: "text", Author: FirstAgent, Paths: []string{a, b}})
+	if !res.OK {
+		t.Fatalf("multi read = %+v", res)
+	}
+	if got := res.Text(); got != "hello world\nsecond file\n" {
+		t.Fatalf("text = %q, want both files", got)
+	}
+	if len(res.Buffers) != 2 {
+		t.Fatalf("buffers = %+v, want one per target", res.Buffers)
+	}
+	if res.Buffers[0].Path != a || res.Buffers[0].Version != 1 || res.Buffers[0].Bytes != len("hello world\n") {
+		t.Errorf("buffer 0 = %+v", res.Buffers[0])
+	}
+	if res.Buffers[1].Path != b || res.Buffers[1].Version != 7 || res.Buffers[1].Bytes != len("second file\n") {
+		t.Errorf("buffer 1 = %+v", res.Buffers[1])
+	}
+	// The single-target form still answers the old way: Version set, no
+	// per-file list.
+	single := Dispatch(g, Request{Op: "text", Author: FirstAgent, Path: a})
+	if !single.OK || single.Version != 1 || single.Text() != "hello world\n" || len(single.Buffers) != 0 {
+		t.Errorf("single read = %+v", single)
+	}
+}
+
+// Read-before-write is satisfied for every path a multi-target read named, so a
+// later apply to any of them is not refused for a missing read. Modelled on
+// TestGuardRequiresAReadBeforeAWrite.
+func TestDispatchReadMultipleAllowsLaterWrites(t *testing.T) {
+	g, h := guarded(t)
+	a := filepath.Join(h.root, "a.go")
+	b := filepath.Join(h.root, "b.go")
+	h.docs[b], h.vers[b] = "second file\n", 1
+	g.setClaims(FirstAgent, []string{a, b})
+
+	if res := Dispatch(g, Request{Op: "text", Author: FirstAgent, Paths: []string{a, b}}); !res.OK {
+		t.Fatalf("multi read = %+v", res)
+	}
+	if _, _, _, err := g.Apply(a, FirstAgent, 1, []Hunk{{Start: 0, End: 0, Text: "x"}}); err != nil {
+		t.Fatalf("apply to the first path was refused: %v", err)
+	}
+	if _, _, _, err := g.Apply(b, FirstAgent, 1, []Hunk{{Start: 0, End: 0, Text: "y"}}); err != nil {
+		t.Fatalf("apply to the second path was refused: %v", err)
+	}
+}
+
+// A multi-target read that fails on a later path must not satisfy the
+// read-before-write gate for an earlier one: the response is an error, so the
+// caller never received that target's text. Modelled on
+// TestDispatchReadMultipleAllowsLaterWrites.
+func TestDispatchReadMultipleFailureDoesNotMarkEarlierTargets(t *testing.T) {
+	g, h := guarded(t)
+	a := filepath.Join(h.root, "a.go")
+	missing := filepath.Join(h.root, "missing.go")
+	g.setClaims(FirstAgent, []string{a})
+
+	res := Dispatch(g, Request{Op: "text", Author: FirstAgent, Paths: []string{a, missing}})
+	if res.OK {
+		t.Fatalf("multi read with a missing target = %+v, want a refusal", res)
+	}
+	// The call failed, so no text reached the caller; the gate must still
+	// refuse the write even though the first target read cleanly.
+	if _, _, _, err := g.Apply(a, FirstAgent, 1, []Hunk{{Start: 0, End: 0, Text: "x"}}); err == nil {
+		t.Error("apply to a target whose text never arrived was allowed")
 	}
 }

@@ -84,14 +84,14 @@ func (s snapshotSearcher) runSearch(ctx context.Context, q control.SearchQuery,
 	res := search.RunStreamVersioned(ctx, root, search.Query{
 		Text: q.Text, Include: q.Include, Exclude: q.Exclude,
 		Regex: q.Regex, Case: q.Case, Word: q.Word,
-		Hidden: rules,
+		Hidden: rules, Context: q.Context,
 	}, s.docs, s.versions, func(batch []search.Match) {
 		out := make([]control.SearchMatch, 0, len(batch))
 		for _, m := range batch {
 			out = append(out, control.SearchMatch{
 				Path: m.Path, Line: m.Line, Col: m.Col, Len: m.Len,
 				LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
-				Version: m.Version, Text: m.Text})
+				Version: m.Version, Text: m.Text, Context: m.Context})
 		}
 		emit(out)
 	})

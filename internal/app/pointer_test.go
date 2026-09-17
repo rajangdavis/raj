@@ -1,6 +1,8 @@
 package app
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -248,4 +250,130 @@ func TestClickWithNoPane(t *testing.T) {
 	click(h, 20, 5, 0)
 	dragTo(h, 25, 6)
 	release(h)
+}
+
+// A ctrl+left-click is the context-menu gesture where the terminal cannot
+// deliver a right button. On an explorer row it opens that entry's menu,
+// exactly as a right-click does. Without the ctrl branch in pointer the press
+// is an ordinary left click: it falls through to clickSidebar, which opens the
+// file, and no menu ever appears.
+func TestCtrlClickExplorerRowOpensMenu(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.openSidebar("shift+super+e", SidebarExplorer)
+	h.drain()
+
+	col, row := explorerCell(t, h, "README.md")
+	click(h, col, row, keys.ModCtrl)
+
+	if !h.Menu.Open() {
+		t.Fatal("a ctrl+left-click on an explorer file opened no menu")
+	}
+	if h.menuTarget.kind != menuFile || !strings.HasSuffix(h.menuTarget.path, "README.md") {
+		t.Fatalf("target = %+v, want the README.md file", h.menuTarget)
+	}
+	frame := h.host.Text()
+	for _, label := range []string{"Open", "New File", "New Folder", "Rename", "Delete", "Copy Path"} {
+		if !strings.Contains(frame, label) {
+			t.Errorf("file menu is missing %q:\n%s", label, frame)
+		}
+	}
+}
+
+// The ctrl substitute reaches the tab bar too and opens the menu for the tab
+// under the pointer, not for the active one. Without the ctrl branch the press
+// is a plain left click, which selects the tab and opens no menu.
+func TestCtrlClickTabOpensTabMenu(t *testing.T) {
+	h := newWorkspace(t, 160, 24)
+	dir := h.Explorer.Tree.Root
+	h.OpenFile(filepath.Join(dir, "main.go"))
+	h.OpenFile(filepath.Join(dir, "README.md"))
+	h.drain()
+
+	col, row := findCell(t, h, "README.md")
+	click(h, col, row, keys.ModCtrl)
+
+	if !h.Menu.Open() {
+		t.Fatal("a ctrl+left-click on a tab opened no menu")
+	}
+	if h.menuTarget.kind != menuTab || !strings.HasSuffix(h.menuTarget.path, "README.md") {
+		t.Fatalf("target = %+v, want the README.md tab", h.menuTarget)
+	}
+	frame := h.host.Text()
+	for _, label := range []string{"Close", "Save", "Rename File", "Delete File", "Reveal"} {
+		if !strings.Contains(frame, label) {
+			t.Errorf("tab menu is missing %q:\n%s", label, frame)
+		}
+	}
+}
+
+// A ctrl+left-click that is not on a menu target is still a plain left click:
+// in the editor it moves the caret and opens nothing. This is why the gesture
+// is scoped by menuTargetAt. Without that scope — with the ctrl check wired
+// straight to rightClick — the press would resolve no target, rightClick would
+// return without opening anything, and the caret would never move.
+func TestCtrlClickInEditorIsAPlainClick(t *testing.T) {
+	h := newHarness(t, "first line\nsecond line\nthird line\n")
+	ox, oy := editorOrigin(h)
+
+	click(h, ox+3, oy+1, keys.ModCtrl)
+
+	if h.Menu.Open() {
+		t.Error("a ctrl+left-click in the editor opened a menu")
+	}
+	line, col := h.Pane().File.LineCol(h.Pane().Cursors.Primary().Head)
+	if line != 1 || col != 3 {
+		t.Errorf("cursor at %d:%d, want 1:3; ctrl+left must stay a plain click", line, col)
+	}
+}
+
+// A plain left-click is untouched: it selects the tab under the pointer and
+// opens no menu. The ctrl condition is what keeps the gesture from being wired
+// to every left press, which would open a menu instead of selecting.
+func TestPlainLeftClickStillSelectsNoMenu(t *testing.T) {
+	h := newWorkspace(t, 160, 24)
+	dir := h.Explorer.Tree.Root
+	h.OpenFile(filepath.Join(dir, "main.go"))
+	h.OpenFile(filepath.Join(dir, "README.md"))
+	h.drain()
+	if h.Tabs.Index() != 1 {
+		t.Fatalf("setup: active tab = %d, want README.md at 1", h.Tabs.Index())
+	}
+
+	col, row := findCell(t, h, "main.go")
+	click(h, col, row, 0)
+
+	if h.Menu.Open() {
+		t.Error("a plain left-click on a tab opened a menu")
+	}
+	if got := h.Tabs.Index(); got != 0 {
+		t.Errorf("active tab = %d after clicking main.go, want 0", got)
+	}
+}
+
+// Inside an open menu a ctrl+left-click chooses the row, exactly as a plain
+// left-click does: the first-refusal block in pointer takes any left press
+// before the gesture is classified. This passes before the change as well; it
+// is the ordering guard — a ctrl check placed above that block would dismiss
+// the menu and resolve the press again instead of choosing.
+func TestCtrlClickChoosesOpenMenuRow(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	h.openSidebar("shift+super+e", SidebarExplorer)
+	h.drain()
+
+	col, row := explorerCell(t, h, "README.md")
+	rightClick(h, col, row)
+	if !h.Menu.Open() {
+		t.Fatal("setup: no menu")
+	}
+	// The first row is Open, which opens the target file; a press that is not
+	// chosen leaves the menu open and changes nothing.
+	ox, oy := h.Menu.Origin()
+	click(h, ox+2, oy+1, keys.ModCtrl)
+
+	if h.Menu.Open() {
+		t.Error("a ctrl+left-click on a menu row did not choose it")
+	}
+	if p := h.Pane(); p == nil || !strings.HasSuffix(p.File.Path, "README.md") {
+		t.Errorf("the Open row did not run; pane = %v", p)
+	}
 }

@@ -1,6 +1,7 @@
 package complete
 
 import (
+	"raj/internal/hover"
 	"raj/internal/keys"
 	"raj/internal/ui"
 	"raj/internal/widget"
@@ -16,15 +17,25 @@ import (
 // worth reusing.
 //
 // Keys reach it before the editor only while it is open, and only the handful
-// it claims — up, down, tab, enter, escape. Everything else falls through and
-// types, which is what keeps the popup from being modal in practice: you can
-// ignore it entirely and keep typing.
+// it claims — up, down, tab, enter, escape, and the page keys while there is
+// documentation to scroll. Everything else falls through and types, which is
+// what keeps the popup from being modal in practice: you can ignore it entirely
+// and keep typing.
 type Popup struct {
 	Open bool
 
 	items  []Candidate
 	list   widget.List
 	prefix string
+
+	// doc is the documentation panel for the highlighted candidate. It is the
+	// hover panel rather than a second renderer, because that is the code that
+	// already reads the markdown subset and scrolls. It is a sub-panel of the
+	// list rather than a sibling overlay so the list's own up/down navigation
+	// keeps working: only the page keys, which the list does not use, are
+	// forwarded to it.
+	doc     hover.Panel
+	docText string
 
 	// anchorLine and anchorCol are where the word being completed starts, in
 	// document coordinates. The popup is placed from there rather than from the
@@ -50,6 +61,7 @@ func (p *Popup) Show(prefix string, cands []Candidate, line, col int) {
 	p.prefix = prefix
 	p.anchorLine, p.anchorCol = line, col
 	p.list.Reset()
+	p.setDoc(p.selectedDoc())
 }
 
 // Hide closes the popup.
@@ -57,6 +69,8 @@ func (p *Popup) Hide() {
 	p.Open = false
 	p.items = nil
 	p.prefix = ""
+	p.doc.Hide()
+	p.docText = ""
 }
 
 // Prefix is the text the current candidates complete, which a caller needs to
@@ -78,6 +92,60 @@ func (p *Popup) Selected() (Candidate, bool) {
 	return p.items[p.list.Sel], true
 }
 
+// selectedDoc is the documentation of the highlighted candidate, or "" when
+// nothing is selected. It is the one expression Show, navigation and Render
+// each use, so the panel follows the highlight the same way whichever path
+// moved it.
+func (p *Popup) selectedDoc() string {
+	c, _ := p.Selected()
+	return c.Documentation
+}
+
+// SetResolved records a resolved item's documentation and detail on every
+// candidate carrying its key, and refreshes the panel when the highlighted
+// candidate is one of them. Detail is replaced only when the server sent one,
+// so a resolve that fills documentation cannot blank a detail already shown.
+func (p *Popup) SetResolved(key, doc, detail string) {
+	if key == "" {
+		return
+	}
+	for i := range p.items {
+		if p.items[i].ResolveKey != key {
+			continue
+		}
+		if doc != "" {
+			p.items[i].Documentation = doc
+		}
+		if detail != "" {
+			p.items[i].Detail = detail
+		}
+	}
+	if c, ok := p.Selected(); ok && c.ResolveKey == key {
+		p.setDoc(c.Documentation)
+	}
+}
+
+// DocText is the documentation shown for the highlighted candidate, as the
+// markdown subset renders it. For tests and for a caller that wants the text
+// without the box.
+func (p *Popup) DocText() string { return p.doc.Text() }
+
+// setDoc points the documentation panel at text, hiding it when there is none.
+// It is the one place the panel is opened and closed, so Show, a resolved item
+// and the render path cannot disagree about what it shows. An unchanged text is
+// left alone so the reader's scroll position survives a redraw.
+func (p *Popup) setDoc(text string) {
+	if text == p.docText && p.doc.Open == (text != "") {
+		return
+	}
+	p.docText = text
+	if text == "" {
+		p.doc.Hide()
+		return
+	}
+	p.doc.Show(text, -1, 0)
+}
+
 // Handle consumes a key if the popup claims it, and reports whether it did.
 //
 // The claimed set is deliberately small. Every key the popup takes is a key the
@@ -91,13 +159,22 @@ func (p *Popup) Handle(a keys.Action) (accepted Candidate, ok bool, consumed boo
 	switch a {
 	case keys.LineUp:
 		p.list.Move(-1, len(p.items))
+		p.setDoc(p.selectedDoc())
 		return Candidate{}, false, true
 	case keys.LineDown:
 		p.list.Move(+1, len(p.items))
+		p.setDoc(p.selectedDoc())
 		return Candidate{}, false, true
 	case keys.Cancel:
 		p.Hide()
 		return Candidate{}, false, true
+	case keys.PageUp, keys.PageDown:
+		// The list navigates with up/down and leaves the page keys to the
+		// documentation, so a long doc scrolls without stealing a keystroke
+		// navigation already means something else by.
+		if p.doc.Handle(a) {
+			return Candidate{}, false, true
+		}
 	case keys.Indent, keys.Confirm:
 		// Tab and enter both accept. Tab because it is what every editor uses
 		// and what the fingers expect; enter because refusing it means the
@@ -153,6 +230,16 @@ func (p *Popup) Render(s *ui.Screen, originX, originY, w, h, topLine int, th wid
 	}
 	if y < originY {
 		y = originY
+	}
+
+	// The documentation is drawn before the list, so a panel that has to extend
+	// upward is covered by the list rather than covering it. The panel does its
+	// own placement: it flips up and clamps when the rows below do not fit, and
+	// the list drawn afterward hides any overlap.
+	p.setDoc(p.selectedDoc())
+	if p.doc.Open {
+		bottom := y + rows
+		p.doc.Render(s, x, bottom, originX+w-x, originY+h-bottom, 0, th)
 	}
 
 	p.list.Follow(len(p.items))

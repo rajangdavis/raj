@@ -21,7 +21,7 @@ rather than hidden.
 | focus_search | `shift+super+f` | cmd+shift+f | ctrl+shift+f | — |
 | focus_problems | `shift+super+m` | cmd+shift+m | ctrl+shift+m | m for markers, as VS Code names the same pane |
 | file_picker | `super+p` | cmd+p | ctrl+p | — |
-| command_palette **(unimplemented)** | `shift+super+p` | cmd+shift+p | ctrl+shift+p | no palette yet; the file picker is cmd+p |
+| command_palette | `shift+super+p` | cmd+shift+p | ctrl+shift+p | — |
 | find_in_file | `super+f` | cmd+f | ctrl+f | macOS default: find |
 | suspend | `ctrl+z` | ctrl+z | ctrl+alt+z | linux ctrl+z is undo, so suspend moves |
 | quit | `ctrl+c` | ctrl+c | ctrl+c | — |
@@ -97,7 +97,22 @@ rather than hidden.
 | goto_symbol | `shift+super+o` | cmd+shift+o | ctrl+shift+o | — |
 | hover | `super+i` | cmd+i | ctrl+i | — |
 | goto_definition | `super+j` | cmd+j | ctrl+alt+j | — |
+| references | `shift+super+j` | cmd+shift+j | ctrl+shift+j | shifted sibling of go-to-definition's super+j |
+| goto_declaration | `ctrl+super+b` | cmd+ctrl+b | ctrl+alt+b | IntelliJ's Ctrl+B is go-to-declaration; where the name is declared, not the body |
+| goto_type_definition | `ctrl+super+t` | cmd+ctrl+t | ctrl+alt+t | t for type: the definition of the thing's type |
+| goto_implementation | `ctrl+super+i` | cmd+ctrl+i | ctrl+alt+i | i for implementation; the picker opens when the server returns several |
+| workspace_symbols | `ctrl+super+o` | cmd+ctrl+o | ctrl+alt+o | project-wide symbols from the language server; the sibling of shift+super+o |
 | toggle_inlay_hints | `shift+super+i` | cmd+shift+i | ctrl+shift+i | toggle inline hints for the active pane |
+| apply_inlay_edit | `super+.` | cmd+period | ctrl+period | apply the inlay hint's edits on the caret's line |
+| signature_help | `shift+ctrl+space` | ctrl+shift+space | ctrl+shift+space | the conventional parameter-info chord; shifted sibling of ctrl+space, which summons completion |
+| code_action | `ctrl+super+a` | cmd+ctrl+a | ctrl+alt+a | a for action; list the server's fixes and refactors for the caret |
+| open_menu | `shift+f10` | shift+f10 | shift+f10 | the conventional context-menu key; right-click parity for the focused explorer entry, else the active tab |
+| run_code_lens | `ctrl+super+l` | cmd+ctrl+l | ctrl+alt+l | run the code lens on the caret's line |
+| toggle_fold | `ctrl+super+c` | cmd+ctrl+c | ctrl+alt+c | fold or unfold the language server's range at the caret |
+| rename | `ctrl+super+r` | cmd+ctrl+r | ctrl+alt+r | rename the symbol under the cursor; server edits land in every file they touch |
+| format | `shift+alt+f` | shift+alt+f | shift+alt+f | format the whole document through the language server |
+| format_range | `ctrl+alt+f` | ctrl+alt+f | ctrl+alt+f | format the selected range; needs a selection |
+| follow_link | `ctrl+super+y` | cmd+ctrl+y | ctrl+alt+y | follow the document link under the caret |
 
 ## proposals
 
@@ -109,6 +124,7 @@ rather than hidden.
 | clear_rejected | `ctrl+super+k` | cmd+ctrl+k | ctrl+alt+k | hard-purge the rejected change set at the caret |
 | prev_proposed | `ctrl+super+,` | cmd+ctrl+comma | ctrl+alt+comma | previous pending change set |
 | next_proposed | `ctrl+super+.` | cmd+ctrl+period | ctrl+alt+period | next pending change set |
+| pending_removals | `ctrl+alt+d` | ctrl+alt+d | ctrl+alt+d | re-raise the oldest pending deletion or dir-removal; macOS claims cmd+ctrl+d for Look Up in Dictionary |
 
 ## Handed back to the terminal
 

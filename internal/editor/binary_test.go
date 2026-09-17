@@ -18,7 +18,11 @@ func TestIsBinary(t *testing.T) {
 		{"empty", "", false},
 		{"nul byte", "text\x00more", true},
 		{"elf header", "\x7fELF\x02\x01\x01\x00", true},
-		{"invalid utf8", "\xff\xfe\xfd\xfc", true},
+		{"control with high byte", "\x01\xff", true},
+		// High bytes that are not valid UTF-8 are legacy text, not binary.
+		// The encoding decision is charset's, and IsBinary must agree.
+		{"latin1 high byte", "caf\xe9\n", false},
+		{"windows1252 high byte", "smart \x93quotes\x94\n", false},
 		{"long text", strings.Repeat("a line of source\n", 2000), false},
 		// A rune split by the sniff window is not evidence of binary.
 		{"split rune at boundary", strings.Repeat("a", sniffLen-1) + "日本語text", false},

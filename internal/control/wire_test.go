@@ -693,3 +693,25 @@ func TestServerStampsItsBuildRevision(t *testing.T) {
 		}
 	}
 }
+
+// A hit's context block crosses the response boundary in the sparse
+// hMatchContext field: dropping it from EncodeResponse or DecodeResponse
+// compiles and silently strips search -context's neighbouring lines. Modelled
+// on TestResponseCarriesMatchVersion.
+func TestResponseCarriesMatchContext(t *testing.T) {
+	want := []SearchMatch{{
+		Path: "/w/a.go", Line: 2, Col: 1, Len: 6, ByteStart: 10, ByteEnd: 16,
+		Version: 41, Text: "needle", Context: "head\nneedle\ntail",
+	}}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Matches: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Matches) != 1 {
+		t.Fatalf("matches = %+v, want one", got.Matches)
+	}
+	if got.Matches[0] != want[0] {
+		t.Errorf("match = %+v, want %+v", got.Matches[0], want[0])
+	}
+}

@@ -68,66 +68,68 @@ const (
 	hHidden     = 0x19 // ls: include hidden entries, the -hidden switch
 
 	// response fields
-	hExit           = 0x20
-	hDirty          = 0x21
-	hStats          = 0x22
-	hParticipants   = 0x23
-	hGroups         = 0x24
-	hMessages       = 0x25
-	hStream         = 0x26
-	hOutLen         = 0x27
-	hFinal          = 0x28
-	hOK             = 0x29
-	hErr            = 0x2a
-	hRoot           = 0x2b
-	hPID            = 0x2c
-	hVersion        = 0x2d
-	hBuffers        = 0x2e
-	hFiles          = 0x2f
-	hCapped         = 0x30
-	hMatches        = 0x31
-	hConflicts      = 0x32
-	hSpans          = 0x33
-	hLine           = 0x34 // 1-based line for goto
-	hCol            = 0x35 // 1-based column for goto
-	hStart          = 0x36 // byte offset for read span; absent means read whole file
-	hEnd            = 0x37 // byte offset for read span; absent means read whole file
-	hBytes          = 0x38 // buffer size in bytes, on a version response
-	hLines          = 0x39 // buffer size in lines, on a version response
-	hLineStart      = 0x3a // read: 1-based first line of the range
-	hLineEnd        = 0x3b // read: 1-based last line of the range
-	hDump           = 0x3c // patch: snapshot id to replace; dump: the id it returns
-	hHash           = 0x3d // dump: hash of the snapshot text
-	hLSPMode        = 0x3e // lsp: hover, definition, references, completion or diagnostics
-	hLSPJSON        = 0x3f // lsp: the JSON-encoded answer
-	hDiffJSON       = 0x40 // diff: the JSON-encoded pending change sets
-	hSrcVersion     = 0x41 // the build revision of the server, stamped on every response
-	hConsidered     = 0x42 // search: files opened and scanned; zero under an -include that matched nothing
-	hTruncated      = 0x43 // search: files the per-file cap cut down, with shown and total
-	hBufferState    = 0x44 // buffers: sparse pending and moved counts, one record per buffer that has either
-	hMatchLineStart = 0x45 // search: byte offset of each hit line start within the file
-	hStatesJSON     = 0x46 // read -annotated: the JSON-encoded []StateRun
-	hConflictGroup  = 0x47 // apply: sparse lease owner per conflict, one number per conflict
-	hBufferHeadless = 0x48 // buffers: sparse paths of buffers with no tab
-	hClaims         = 0x49 // claim: the resulting set, in stable order
-	hClaimWarnings  = 0x4a // claim: operands skipped, one warning per path
-	hClaimOverlaps  = 0x4b // claim: other identities sharing a claimed path
-	hDeletions      = 0x4c // deletions: pending removals, one {path, author} per record
-	hMatchLineEnd   = 0x4d // search: sparse byte offset one past each hit line end within the file
-	hDirRemovals    = 0x4e // rmdirs: pending dir-removals, one {path, author} per record
-	hProposals      = 0x4f // proposals: unified pending list, one {kind, path, author, group, start, end} per record
-	hMatchVersion   = 0x50 // search: sparse buffer version per hit, in hit order
-	hRemains        = 0x51 // close -discard: a file is still on disk at the discarded buffer's path
-	hCreated        = 0x52 // open: a new buffer was made rather than an existing one focused
-	hConflictLease  = 0x53 // apply: sparse lease owner author and span per conflict, three numbers per conflict
-	hGroupOverlaps  = 0x54 // groups: sparse per-group overlap lists, one count then {group, author, start, end} records each
-	hFound          = 0x55 // find: the pattern occurred in the buffer
-	hFindStart      = 0x56 // find: byte offset of the first match
-	hFindEnd        = 0x57 // find: one past the last byte of the first match
-	hFindCount      = 0x58 // find: how many matches the buffer holds, including the first
-	hEntries        = 0x59 // ls: immediate children, one {name, path, dir, size} per record
-	hGroupInvalid   = 0x5a // groups: sparse per-group Invalid flag and collider, a flag then (when set) {group, author, start, end}
-	hApplyWarnings  = 0x5b // apply: sparse overlapped-set warnings, one {group, author, start, end} per warning
+	hExit             = 0x20
+	hDirty            = 0x21
+	hStats            = 0x22
+	hParticipants     = 0x23
+	hGroups           = 0x24
+	hMessages         = 0x25
+	hStream           = 0x26
+	hOutLen           = 0x27
+	hFinal            = 0x28
+	hOK               = 0x29
+	hErr              = 0x2a
+	hRoot             = 0x2b
+	hPID              = 0x2c
+	hVersion          = 0x2d
+	hBuffers          = 0x2e
+	hFiles            = 0x2f
+	hCapped           = 0x30
+	hMatches          = 0x31
+	hConflicts        = 0x32
+	hSpans            = 0x33
+	hLine             = 0x34 // 1-based line for goto
+	hCol              = 0x35 // 1-based column for goto
+	hStart            = 0x36 // byte offset for read span; absent means read whole file
+	hEnd              = 0x37 // byte offset for read span; absent means read whole file
+	hBytes            = 0x38 // buffer size in bytes, on a version response
+	hLines            = 0x39 // buffer size in lines, on a version response
+	hLineStart        = 0x3a // read: 1-based first line of the range
+	hLineEnd          = 0x3b // read: 1-based last line of the range
+	hDump             = 0x3c // patch: snapshot id to replace; dump: the id it returns
+	hHash             = 0x3d // dump: hash of the snapshot text
+	hLSPMode          = 0x3e // lsp: hover, definition, references, completion or diagnostics
+	hLSPJSON          = 0x3f // lsp: the JSON-encoded answer
+	hDiffJSON         = 0x40 // diff: the JSON-encoded pending change sets
+	hSrcVersion       = 0x41 // the build revision of the server, stamped on every response
+	hConsidered       = 0x42 // search: files opened and scanned; zero under an -include that matched nothing
+	hTruncated        = 0x43 // search: files the per-file cap cut down, with shown and total
+	hBufferState      = 0x44 // buffers: sparse pending and moved counts, one record per buffer that has either
+	hMatchLineStart   = 0x45 // search: byte offset of each hit line start within the file
+	hStatesJSON       = 0x46 // read -annotated: the JSON-encoded []StateRun
+	hConflictGroup    = 0x47 // apply: sparse lease owner per conflict, one number per conflict
+	hBufferHeadless   = 0x48 // buffers: sparse paths of buffers with no tab
+	hClaims           = 0x49 // claim: the resulting set, in stable order
+	hClaimWarnings    = 0x4a // claim: operands skipped, one warning per path
+	hClaimOverlaps    = 0x4b // claim: other identities sharing a claimed path
+	hDeletions        = 0x4c // deletions: pending removals, one {path, author} per record
+	hMatchLineEnd     = 0x4d // search: sparse byte offset one past each hit line end within the file
+	hDirRemovals      = 0x4e // rmdirs: pending dir-removals, one {path, author} per record
+	hProposals        = 0x4f // proposals: unified pending list, one {kind, path, author, group, start, end} per record
+	hMatchVersion     = 0x50 // search: sparse buffer version per hit, in hit order
+	hRemains          = 0x51 // close -discard: a file is still on disk at the discarded buffer's path
+	hCreated          = 0x52 // open: a new buffer was made rather than an existing one focused
+	hConflictLease    = 0x53 // apply: sparse lease owner author and span per conflict, three numbers per conflict
+	hGroupOverlaps    = 0x54 // groups: sparse per-group overlap lists, one count then {group, author, start, end} records each
+	hFound            = 0x55 // find: the pattern occurred in the buffer
+	hFindStart        = 0x56 // find: byte offset of the first match
+	hFindEnd          = 0x57 // find: one past the last byte of the first match
+	hFindCount        = 0x58 // find: how many matches the buffer holds, including the first
+	hEntries          = 0x59 // ls: immediate children, one {name, path, dir, size} per record
+	hGroupInvalid     = 0x5a // groups: sparse per-group Invalid flag and collider, a flag then (when set) {group, author, start, end}
+	hApplyWarnings    = 0x5b // apply: sparse overlapped-set warnings, one {group, author, start, end} per warning
+	hMatchContext     = 0x5c // search: sparse per-hit context block, one string per hit, in hit order
+	hBufferSuperseded = 0x5d // buffers: sparse superseded count, one {path, count} per buffer that has one
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -325,7 +327,7 @@ func encodeHeader(h Header) []byte {
 		// Hidden is appended after Path for the same reason: a reader that
 		// knows it reads one more field, and one that predates it reads what
 		// it knows and leaves the flag false, which is the default walk.
-		w.Str(q.Path).Bool(q.Hidden)
+		w.Str(q.Path).Bool(q.Hidden).Num(q.Context)
 		ops = append(ops, Op8{hQuery, w.Done()})
 	}
 	if len(h.Hunks) > 0 {
@@ -514,6 +516,23 @@ func encodeHeader(h Header) []byte {
 			ops = append(ops, Op8{hBufferState, counts.Done()})
 		}
 
+		// The superseded count rides in a field of its own for the same
+		// positional-record reason, and because it is a different fact from
+		// Pending: a buffer can have no pending set and still be one a save
+		// refuses. One record per buffer that has a nonzero count.
+		var superseded prog.Writer
+		var anySuperseded bool
+		for _, b := range h.Buffers {
+			if b.Superseded == 0 {
+				continue
+			}
+			anySuperseded = true
+			superseded.Str(b.Path).Num(b.Superseded)
+		}
+		if anySuperseded {
+			ops = append(ops, Op8{hBufferSuperseded, superseded.Done()})
+		}
+
 		// The path of a headless buffer rides in a sparse field of its own
 		// too, one record per headless buffer. The reason matches the counts
 		// above: an hBuffers record is positional, so a field added inside
@@ -595,6 +614,22 @@ func encodeHeader(h Header) []byte {
 		}
 		if anyVersion {
 			ops = append(ops, Op8{hMatchVersion, vers.Done()})
+		}
+
+		// Context rides the same sparse way, one string per hit, in hit order.
+		// It is sent only when some hit carries context, so an omitted field
+		// means every hit was the hit line alone; an old reader skips the
+		// argument whole rather than misreading a positional record.
+		var contexts prog.Writer
+		anyContext := false
+		for _, m := range h.Matches {
+			if m.Context != "" {
+				anyContext = true
+			}
+			contexts.Str(m.Context)
+		}
+		if anyContext {
+			ops = append(ops, Op8{hMatchContext, contexts.Done()})
 		}
 	}
 	if len(h.Conflicts) > 0 {
@@ -694,6 +729,9 @@ func decodeHeader(b []byte) (Header, error) {
 	// and merge once every op has been read, so their position relative to
 	// hBuffers does not matter.
 	var states []bufferState
+	// Superseded counts arrive in their own sparse field, collected and merged
+	// after every op like the pending counts.
+	var supersededStates []bufferSuperseded
 	// Match line starts arrive in their own sparse field; collect them and
 	// merge after every op, so their position relative to hMatches does not
 	// matter.
@@ -704,6 +742,9 @@ func decodeHeader(b []byte) (Header, error) {
 	// Match buffer versions arrive the same sparse way, one number per hit,
 	// merged after every op like the offsets above.
 	var matchVersions []int
+	// Match context blocks arrive the same sparse way, one string per hit,
+	// merged after every op like the versions above.
+	var matchContexts []string
 	// Conflict lease owners arrive the same way, one number per conflict, so
 	// their position relative to hConflicts does not matter either.
 	var conflictGroups []int
@@ -864,6 +905,10 @@ func decodeHeader(b []byte) (Header, error) {
 			// leaves it false rather than a frame error, which is the default
 			// walk rather than an include-hidden one.
 			q.Hidden = r.Bool()
+			// Context is the newest field; a payload from before it existed
+			// leaves it zero rather than a frame error, which is the hit line
+			// alone rather than a block around it.
+			q.Context = r.Num()
 			h.Query = &q
 		case hHunks:
 			r := prog.NewReader(op.Payload)
@@ -1053,6 +1098,14 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "buffer state"); err != nil {
 				return Header{}, err
 			}
+		case hBufferSuperseded:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				supersededStates = append(supersededStates, bufferSuperseded{path: r.Str(), count: r.Num()})
+			}
+			if err := recordsOK(r, "buffer superseded"); err != nil {
+				return Header{}, err
+			}
 		case hBufferHeadless:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -1105,6 +1158,14 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "match versions"); err != nil {
 				return Header{}, err
 			}
+		case hMatchContext:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				matchContexts = append(matchContexts, r.Str())
+			}
+			if err := recordsOK(r, "match context"); err != nil {
+				return Header{}, err
+			}
 		case hConflicts:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -1150,6 +1211,14 @@ func decodeHeader(b []byte) (Header, error) {
 			}
 		}
 	}
+	for _, st := range supersededStates {
+		for i := range h.Buffers {
+			if h.Buffers[i].Path == st.path {
+				h.Buffers[i].Superseded = st.count
+				break
+			}
+		}
+	}
 	for _, p := range headless {
 		for i := range h.Buffers {
 			if h.Buffers[i].Path == p {
@@ -1171,6 +1240,11 @@ func decodeHeader(b []byte) (Header, error) {
 	for i, v := range matchVersions {
 		if i < len(h.Matches) {
 			h.Matches[i].Version = uint64(v)
+		}
+	}
+	for i, c := range matchContexts {
+		if i < len(h.Matches) {
+			h.Matches[i].Context = c
 		}
 	}
 	for i, g := range conflictGroups {
@@ -1220,6 +1294,13 @@ type bufferState struct {
 	path    string
 	pending int
 	moved   int
+}
+
+// bufferSuperseded is one buffer's superseded count as it crosses the wire,
+// carried in the sparse hBufferSuperseded field.
+type bufferSuperseded struct {
+	path  string
+	count int
 }
 
 // recordsOK turns a Reader that ran off the end of a record list into a named

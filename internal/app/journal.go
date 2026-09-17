@@ -223,7 +223,12 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 		a.status = "journal: " + err.Error()
 		return nil
 	}
-	if err := w.Append(journal.Base{Path: path, Hash: want, Bytes: append([]byte(nil), orig...)}); err != nil {
+	if err := w.Append(journal.Base{
+		Path:     path,
+		Hash:     want,
+		Bytes:    append([]byte(nil), orig...),
+		Encoding: journalEncoding(p.File.Enc),
+	}); err != nil {
 		_ = w.Close()
 		a.status = "journal: " + err.Error()
 		return nil
@@ -393,9 +398,10 @@ func (a *App) recordWritten(p *editor.Pane) {
 		return
 	}
 	if err := t.w.Append(journal.Written{
-		Path:    p.File.Path,
-		Hash:    digestOf(p.File.SavedDigest()),
-		Version: uint64(p.File.SavedVersion()),
+		Path:     p.File.Path,
+		Hash:     digestOf(p.File.SavedDigest()),
+		Version:  uint64(p.File.SavedVersion()),
+		Encoding: journalEncoding(p.File.Enc),
 	}); err != nil {
 		a.status = "journal: " + err.Error()
 	}
@@ -531,13 +537,19 @@ func (a *App) restoreLog(logPath string) {
 	store := p.File.Session().Store()
 	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
 	disk := hashBytes(orig)
+	// The base hash is over the decoded text, but the Written marker hashes the
+	// exact bytes the save wrote, encoding included. Compare each against its
+	// own kind: the pane's SavedDigest still names the bytes on disk at startup,
+	// so a CRLF or UTF-16 save matches its marker instead of reading as an
+	// external edit.
+	diskBytes := digestOf(p.File.SavedDigest())
 	// The disk is ours if it matches the origin the log started from, or the
 	// bytes the last save wrote: history is kept, so a save does not truncate
 	// the log, and the disk after a save is a log to restore, not one to skip.
 	// Neither match means the file moved under the editor: the log's ops no
 	// longer describe this document, so rotate it out of the restore path and
 	// let the clean file stand. A later edit starts a fresh base.
-	if disk != base.Hash && (!wrote || disk != mark.Hash) {
+	if disk != base.Hash && (!wrote || diskBytes != mark.Hash) {
 		archived := a.archiveLog(logPath)
 		a.status = filepath.Base(base.Path) + ": unsaved changes were not restored because the file changed on disk"
 		if archived != "" {
@@ -552,7 +564,7 @@ func (a *App) restoreLog(logPath string) {
 	// A disk matching the last write is a buffer that can baseline clean at the
 	// version those bytes were written at, rather than dirty against the origin.
 	saved := editor.RestoredWrite{}
-	if wrote && disk == mark.Hash {
+	if wrote && diskBytes == mark.Hash {
 		saved = editor.RestoredWrite{
 			Content: savedContent(base, sess, int(mark.Version)),
 			Version: piecetable.Version(mark.Version),
@@ -561,6 +573,13 @@ func (a *App) restoreLog(logPath string) {
 		}
 	}
 	p.File = editor.NewRestoredFile(base.Path, sess, a.tabWidth, saved)
+	// The log records the shape of the bytes on disk, so the restored buffer
+	// re-encodes the same way. A log that recorded none predates the encoding
+	// tail, so recover only the shape from the file still on disk -- never its
+	// text, which the log's replay owns. This must be installed before
+	// startTap below, or a fresh base would record the default instead of the
+	// shape the restored buffer actually has.
+	p.File.SetEncoding(editorEncoding(a.restoredEncoding(base.Path, l.Encoding())))
 	p.File.SetDark(a.host.Theme().Dark())
 	// The swap replaces the session the memoised projection was built from, so
 	// rebuild it now rather than leaving it to the first frame. The restored
@@ -579,6 +598,28 @@ func (a *App) restoreLog(logPath string) {
 	// startTap's reuse branch takes the log; a nil return has set the status.
 	a.startTap(p)
 	a.TouchSession()
+}
+
+// restoredEncoding resolves the shape a restored buffer re-encodes with. A log
+// that recorded one is trusted outright: those are the bytes the file had. A
+// log written before Base and Written carried an encoding records the zero
+// Encoding -- the field is version-compatible, so a pre-tail log is a
+// tail-less v2 one -- and the file still on disk is then the only source. This
+// recovers exactly the shape: the charset kind, the line-ending style and the
+// mark, from the editor's own classifier, and never the file's text. The
+// log's replay is the content either way, so a file that is missing,
+// unreadable, binary or in an encoding raj cannot reproduce leaves the default
+// rather than failing the restore: the restored text is work, and a shape is
+// not worth losing it over.
+func (a *App) restoredEncoding(path string, logged journal.Encoding) journal.Encoding {
+	if logged != (journal.Encoding{}) {
+		return logged
+	}
+	f, err := editor.Open(path, a.tabWidth)
+	if err != nil {
+		return journal.Encoding{}
+	}
+	return journalEncoding(f.Enc)
 }
 
 // logIsCleanOnDisk reports whether a log's replay is already the bytes on
@@ -600,7 +641,7 @@ func (a *App) logIsCleanOnDisk(base journal.Base, sess *piecetable.Session, mark
 	store := f.Session().Store()
 	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
 	disk := hashBytes(orig)
-	if wrote && disk == mark.Hash {
+	if wrote && digestOf(f.SavedDigest()) == mark.Hash {
 		return sess.Version() <= piecetable.Version(mark.Version)
 	}
 	return disk == base.Hash && sess.Version() == 0
@@ -788,6 +829,48 @@ func digestBytes(s string) [sha256.Size]byte {
 		copy(sum[:], h)
 	}
 	return sum
+}
+
+// editorEncoding maps the journal's persisted encoding to the editor's. The two
+// packages keep independent types, so the names line up by hand; both use the
+// same zero value — UTF-8, LF, no byte order mark — which is what a log that
+// recorded no encoding means. The mapping lives here, in the one package that
+// imports both.
+func editorEncoding(e journal.Encoding) editor.Encoding {
+	enc := editor.Encoding{CRLF: e.CRLF, BOM: e.BOM}
+	switch e.Kind {
+	case journal.EncodingUTF16LE:
+		enc.Kind = editor.UTF16LE
+	case journal.EncodingUTF16BE:
+		enc.Kind = editor.UTF16BE
+	case journal.EncodingWindows1252:
+		enc.Kind = editor.Windows1252
+	case journal.EncodingLatin1:
+		enc.Kind = editor.Latin1
+	default:
+		enc.Kind = editor.UTF8
+	}
+	return enc
+}
+
+// journalEncoding is the inverse: the shape of a live buffer's bytes as the
+// journal records them. A default buffer maps to the zero encoding, which the
+// encoder omits, so an older log's bytes are reproduced exactly.
+func journalEncoding(e editor.Encoding) journal.Encoding {
+	enc := journal.Encoding{CRLF: e.CRLF, BOM: e.BOM}
+	switch e.Kind {
+	case editor.UTF16LE:
+		enc.Kind = journal.EncodingUTF16LE
+	case editor.UTF16BE:
+		enc.Kind = journal.EncodingUTF16BE
+	case editor.Windows1252:
+		enc.Kind = journal.EncodingWindows1252
+	case editor.Latin1:
+		enc.Kind = journal.EncodingLatin1
+	default:
+		enc.Kind = journal.EncodingUTF8
+	}
+	return enc
 }
 
 // toJournalOp converts a live op to its persisted form.

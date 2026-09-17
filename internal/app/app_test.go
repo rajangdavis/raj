@@ -148,6 +148,67 @@ func TestSaveWritesFile(t *testing.T) {
 	}
 }
 
+// A mixed-ending file is normalised to the dominant ending when it is saved, so
+// the user is told at open, beside the indent warning
+// TestOpenSurfacesIndentAndEncodingWarnings pins. The normal-ending case is the
+// guard that the check stays silent when it has nothing to say. Modelled on
+// TestMixedEndingsWarn and TestSaveWritesFile.
+func TestOpenSurfacesMixedEndingWarning(t *testing.T) {
+	h := newHarness(t, "a\r\nb\nc\r\n")
+	if got := h.Status(); !strings.Contains(got, "mixed line endings") {
+		t.Errorf("mixed-ending status = %q, want the encoding warning", got)
+	}
+	quiet := newHarness(t, "a\nb\nc\n")
+	if got := quiet.Status(); got != "" {
+		t.Errorf("normal-ending status = %q, want quiet", got)
+	}
+}
+
+// A property of the file just opened must survive the open: a broken Makefile
+// carries both an indent warning and, when its endings are mixed, an encoding
+// warning, and both must appear in the one status sentence. The editor-layer
+// TestIndentWarning pins only the string; this pins the app wiring that was
+// dead before the wave. Modelled on TestOpenSurfacesMixedEndingWarning.
+func TestOpenSurfacesIndentAndEncodingWarnings(t *testing.T) {
+	h := newHarness(t, "content")
+	path := filepath.Join(h.root, "Makefile")
+	if err := os.WriteFile(path, []byte(".PHONY: b\r\nbuild:\r\n  go build\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(path)
+	got := h.Status()
+	if !strings.Contains(got, "tabs") {
+		t.Errorf("status = %q, want the indent warning", got)
+	}
+	if !strings.Contains(got, "mixed line endings") {
+		t.Errorf("status = %q, want the encoding warning", got)
+	}
+}
+
+// A buffer an agent inspected but never opened is revealed as a tab by the
+// first request that touches it, and owes the same warning a freshly opened one
+// does. announce gave it presentation state but not fileWarning, so a
+// mixed-ending file an agent revealed stayed silent. Modelled on
+// TestOpenSurfacesMixedEndingWarning, the open path this one must match.
+func TestAnnounceSurfacesFileWarning(t *testing.T) {
+	h := newHarness(t, "base\n")
+	path := filepath.Join(h.root, "mixed.txt")
+	if err := os.WriteFile(path, []byte("a\r\nb\nc\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := h.loadHeadless(path)
+	if err != nil {
+		t.Fatalf("loadHeadless: %v", err)
+	}
+	if p.File.EncodingWarning() == "" {
+		t.Fatal("fixture: the file has no encoding warning to surface")
+	}
+	h.announce(p)
+	if got := h.Status(); !strings.Contains(got, "mixed line endings") {
+		t.Errorf("status = %q, want the encoding warning on reveal", got)
+	}
+}
+
 // Vertical movement must remember the column it wanted, or arrowing down
 // through a short line and back up lands somewhere else.
 func TestGoalColumnSurvivesShortLines(t *testing.T) {
@@ -272,20 +333,9 @@ func TestEscapeCollapsesMultiCursor(t *testing.T) {
 // chord would test the keymap as well, and a chord that resolves differently on
 // one platform would make the test platform-dependent for no reason.
 func (h *harness) handleKeyAction(a keys.Action) {
-	// The same order handleKey uses: globals get first refusal, then the
-	// focused pane. Routing straight to handleEditor would report every global
-	// action as unhandled, which is how the first version of this reported
-	// cmd+s as unimplemented.
-	if !h.App.handleGlobal(a) {
-		switch h.App.focus {
-		case FocusPicker:
-			h.App.openFromPicker(h.App.Picker.Handle(a, ""))
-		case FocusSidebar:
-			h.App.handleSidebar(a, "")
-		default:
-			h.App.handleEditor(a, "")
-		}
-	}
+	// The same routing handleKey uses, so a test that walks the action set
+	// exercises the dispatch rather than a copy of it that can drift.
+	h.App.dispatch(a, "")
 	h.drain()
 }
 
@@ -477,6 +527,48 @@ func TestCompletionAnchorsBelowAFold(t *testing.T) {
 	}
 }
 
+// The completion prefix comes from the row on screen, not the session line: a
+// rejected mid-line insertion is hidden behind a fold, so it must not appear in
+// the word the popup completes. Reading the session bytes would fold the hidden
+// "REJ" into the prefix and find nothing for the visible "bar".
+func TestCompletionPrefixIsTheRowTextBelowAMidLineFold(t *testing.T) {
+	// "barbaz" is what the on-screen "bar" completes to; the rejected "REJ"
+	// sits between "foo" and "bar" in the session and is folded away.
+	h := newHarness(t, "foobar\nbarbaz\n")
+	p := h.Pane()
+	id := propose(t, h, piecetable.Hunk{Start: 3, End: 3, Text: "REJ"})
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	head := len("fooREJbar") // end of "bar", before its newline
+	p.Cursors.Set(head, head)
+	h.drain()
+
+	folded := false
+	for i := 0; i < p.DisplayLines(); i++ {
+		if _, _, ok := p.Fold(i); ok {
+			folded = true
+			break
+		}
+	}
+	if !folded {
+		t.Fatal("fixture built no fold for the rejected insertion")
+	}
+	row, _ := p.DispPos(head)
+	if row == p.File.LineOf(head) {
+		t.Fatalf("fixture does not exercise the split: row %d == session line %d", row, p.File.LineOf(head))
+	}
+	if got := p.RowText(row); got != "bar" {
+		t.Fatalf("RowText(%d) = %q, want the on-screen bar", row, got)
+	}
+	if !h.showCompletion(p, 0) {
+		t.Fatal("no completion was offered: the session prefix leaked past the fold")
+	}
+	if got := h.Complete.Prefix(); got != "bar" {
+		t.Errorf("completion prefix = %q, want bar, the on-screen text", got)
+	}
+}
+
 // A fold above the target shifts a jump too: the viewport must centre on the
 // display row, not the session line the target came in as.
 func TestJumpCentresOnTheDisplayRowBelowAFold(t *testing.T) {
@@ -537,6 +629,55 @@ func TestJumpSkipsALineInsideAFold(t *testing.T) {
 	}
 }
 
+// One jump path: jumpToSessionLine is the single map-aware jump the chord
+// (App.jumpTo), the sidebar, the review walk (cycleProposed) and EnterReview
+// all funnel through. A fold-hidden target is skipped, and a visible one
+// centres on its display row while the caret stays on the session line.
+func TestOneJumpPathSkipsHiddenAndCentresVisible(t *testing.T) {
+	h := newHarness(t, strings.Repeat("xxxxxxxx\n", 20))
+	p := h.Pane()
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
+	if !p.File.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	p.Cursors.Set(p.File.Len(), p.File.Len())
+	h.drain()
+
+	if row := p.DispOfDocLine(0); row != -1 {
+		t.Fatalf("session line 0 shows at row %d, want -1 inside the fold", row)
+	}
+	before := p.Cursors.Primary().Head
+	top := p.Viewport.Top
+	jumpToSessionLine(p, 1) // 1-based line 1, hidden by the fold
+	if got := p.Cursors.Primary().Head; got != before {
+		t.Errorf("caret moved to %d for a hidden line, want it left at %d", got, before)
+	}
+	if p.Viewport.Top != top {
+		t.Errorf("viewport scrolled to %d for a hidden line, want %d", p.Viewport.Top, top)
+	}
+
+	// Session line 15 is visible at display row 14, two hidden lines folded
+	// into one row above it: the caret is file-true and the centring is the row.
+	if got := p.DispOfDocLine(15); got != 14 {
+		t.Fatalf("DispOfDocLine(15) = %d, want 14 below the fold", got)
+	}
+	jumpToSessionLine(p, 16)
+	if got := p.File.LineOf(p.Cursors.Primary().Head); got != 15 {
+		t.Fatalf("caret on session line %d after the jump, want 15", got)
+	}
+	wantTop := 14 - p.Viewport.Rows/2
+	if wantTop < 0 {
+		wantTop = 0
+	}
+	if max := p.DisplayLines() - 1; wantTop > max {
+		wantTop = max
+	}
+	if p.Viewport.Top != wantTop {
+		t.Errorf("viewport top = %d after the jump, want %d (centred on display row 14)",
+			p.Viewport.Top, wantTop)
+	}
+}
+
 // With no decisions the projection is the identity, so a jump and a completion
 // anchor land exactly where they did before the display map existed.
 func TestJumpAndCompletionAreIdentityWithoutDecisions(t *testing.T) {
@@ -562,8 +703,105 @@ func TestJumpAndCompletionAreIdentityWithoutDecisions(t *testing.T) {
 	if !h.showCompletion(p, 0) {
 		t.Fatal("no completion was offered")
 	}
+	if got := h.Complete.Prefix(); got != "foo" {
+		t.Errorf("completion prefix = %q with no decisions, want foo", got)
+	}
 	if line, _ := h.Complete.Anchor(); line != p.File.LineOf(head) {
 		t.Errorf("completion anchored on row %d, want session line %d with no decisions",
 			line, p.File.LineOf(head))
+	}
+}
+
+// Every action the palette can offer must have a handler, chordless ones
+// included. TestEveryBoundActionIsHandled walks the bound set; this walks
+// keys.Unbound, so adding a palette-only command without a dispatch case fails
+// here rather than as a silent no-op. The signal is the same "unhandled:"
+// status the editor sets when an action reaches a pane with nobody to take it.
+//
+// Without the dispatch case the action falls through handleGlobal and the
+// editor reports it unhandled; before the action was in Unbound this test had
+// nothing to walk, which is why listing and handling are checked together.
+func TestEveryUnboundActionIsHandled(t *testing.T) {
+	skip := map[keys.Action]bool{
+		keys.Quit:    true, // ends the session
+		keys.Suspend: true, // stops the process
+	}
+	for _, action := range keys.Unbound {
+		if skip[action] {
+			continue
+		}
+		h := newHarness(t, "package main\nfunc F() {}\n")
+		h.handleKeyAction(action)
+		if strings.HasPrefix(h.Status(), "unhandled:") {
+			t.Errorf("%s is runnable from the palette but nothing handles it; "+
+				"either add a dispatch case or drop it from keys.Unbound", action)
+		}
+	}
+}
+
+// A palette-only command is listed by name alone: with an empty chord there is
+// nothing after the label separator, so the row must not carry one.
+//
+// Without the label guard the row is "copy relative path  ", with the trailing
+// separator of the empty chord column, and this fails.
+func TestPaletteRendersChordlessCommandByName(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.press("shift+super+p")
+	h.typeText("copy relative path")
+	if got, want := h.Picker.Top(), "copy relative path"; got != want {
+		t.Errorf("palette row = %q, want %q", got, want)
+	}
+}
+
+// copy_relative_path is palette-only and copies the workspace-relative spelling
+// of the active buffer, which is what a shell rooted at the workspace wants.
+//
+// Without the dispatch case the clipboard stays empty and the status is
+// "unhandled:", so both assertions fail.
+func TestCopyRelativePathCopiesRelativeSpelling(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.handleKeyAction(keys.CopyRelPath)
+	if got, want := h.host.Clipboard(), "test.go"; got != want {
+		t.Errorf("clipboard = %q, want %q", got, want)
+	}
+	if got := h.Status(); !strings.Contains(got, "test.go") {
+		t.Errorf("status = %q, want it to say what was copied", got)
+	}
+}
+
+// An unnamed buffer has no path, and an empty string on the clipboard would
+// look like a copy that worked. It is refused in words instead.
+//
+// Without the dispatch case the status is "unhandled:" rather than the refusal,
+// so the status assertion fails; the clipboard assertion holds either way and is
+// here to pin that nothing is written.
+func TestCopyRelativePathRefusesUnnamedBuffer(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.Pane().File.Path = ""
+	h.handleKeyAction(keys.CopyRelPath)
+	if got := h.host.Clipboard(); got != "" {
+		t.Errorf("clipboard = %q, want it untouched for an unnamed buffer", got)
+	}
+	if got := h.Status(); !strings.Contains(got, "no path") {
+		t.Errorf("status = %q, want a refusal naming the missing path", got)
+	}
+}
+
+// A path outside the workspace root — save-as permits one — has no relative
+// spelling, so the absolute path is copied and the status line says so rather
+// than inventing a "../" path that depends on the process work directory.
+//
+// Without the dispatch case the clipboard stays empty, so the clipboard
+// assertion fails.
+func TestCopyRelativePathFallsBackOutsideTheRoot(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	outside := filepath.Join(t.TempDir(), "elsewhere.go")
+	h.Pane().File.Path = outside
+	h.handleKeyAction(keys.CopyRelPath)
+	if got := h.host.Clipboard(); got != outside {
+		t.Errorf("clipboard = %q, want the absolute path %q", got, outside)
+	}
+	if got := h.Status(); !strings.Contains(got, "outside the workspace") {
+		t.Errorf("status = %q, want it to say the path is outside the workspace", got)
 	}
 }

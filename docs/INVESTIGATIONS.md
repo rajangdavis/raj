@@ -150,6 +150,22 @@ argument. The renderer lays each visible line out once while drawing it, and
 per call at 5 us a time — per frame and per keystroke work to recover something
 already in hand.
 
+### The human typing path stays strict over another writer Proposed span (2026-09-16)
+
+`apply` over another writer Proposed span lands — the lease is advisory for
+`Proposed` (spec §12.1) — but the human typing path (`File.Insert`,
+`File.Delete`, `EditLeased`) still treats every non-accepted run, `Proposed`
+included, as read-only, so typing into a draft is a refusal. **Decided: the
+asymmetry is deliberate and stays.** The human path is the stricter one, and it
+is the right one to be strict: the person at the keyboard is editing the
+document already in front of them, whereas an agent `apply` is a suggestion the
+user will later accept or reject. Edit mode already hides `Rejected` as folds,
+so the human cannot type into what they cannot see; keeping `Proposed`
+read-only to typing is the same rule, and it means a human never silently
+overwrites another writer draft. Making typing advisory would buy nothing the
+agent path does not already provide, and would remove the one guard the human
+has over a draft. The open TODO item is therefore closed rather than deferred.
+
 ## Why search does not use SIMD, and what it uses instead
 
 Prompted by GitHub's "Don't stop early: case-folding source code at memory

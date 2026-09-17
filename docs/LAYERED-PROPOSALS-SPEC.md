@@ -343,7 +343,11 @@ Resolved 2026-09-12 (supersedes 2, 4 and 6; retires the promote rule):
    only when every `Proposed` run the hunk catches is the writer's own. A hunk
    that also catches another writer's `Proposed` run -- or any `Rejected` run --
    is not a clean amendment and refuses, naming the writer's own set, and it
-   does so whichever run the projection meets first. The advisory path is
+   does so whichever run the projection meets first. When that set is the
+   caller's own draft, the CLI words the refusal as such and names the remedy
+   the caller actually has -- narrow the hunk off the peer's text -- because a
+   writer cannot accept or reject its own proposal; a refusal that names a peer
+   keeps the accept/reject wording. The advisory path is
    therefore taken only when every caught `Proposed` run belongs to another
    author, so run order never changes the outcome (`Session.proposedSpans`
    supplies the evidence).

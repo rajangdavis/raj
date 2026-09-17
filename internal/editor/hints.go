@@ -41,6 +41,11 @@ type Hint struct {
 	Kind    int
 	Tooltip string
 	Edits   []HintEdit
+	// Lens marks text that is a code lens rather than an inlay hint. Both share
+	// the inline column map and the line hint set; the flag is what lets the
+	// renderer give a lens its own style and what the run path keys on when it
+	// has to tell the two apart.
+	Lens bool
 }
 
 // LineHint is one hint and the line it is anchored on.
@@ -145,15 +150,34 @@ func HintCols(hints []Hint) []view.HintCol {
 	return cols
 }
 
-// HintsThatFit builds the hint set for a file from an answer, keeping only the
-// hints on lines whose whole line, hints included, fits in width display
-// columns. A line that does not fit contributes none of its hints: a hint that
+// HintAtCol is the hint whose painted cell span covers display column col of a
+// line, and whether there is one. It is the inverse of the column map drawHint
+// paints with: a hint anchored at Off occupies [ColOfHints(Off),
+// ColOfHints(Off)+Width), padding included, and any other cell is not over a
+// hint. The hit test deliberately shares the column map rather than the
+// mouse-clamp path, because File.OffsetAt maps the cell after a hint back to
+// the hint's anchor too — a cell over that byte is outside the hint's cells.
+func HintAtCol(hints []Hint, text string, cols view.Columns, col int) (Hint, bool) {
+	colsOf := HintCols(hints)
+	for _, h := range hints {
+		start := cols.ColOfHints(text, h.Off, colsOf)
+		if col >= start && col < start+h.Width() {
+			return h, true
+		}
+	}
+	return Hint{}, false
+}
+
+// thatFit keeps the candidate line hints on lines whose whole line, candidates
+// plus whatever the other inline set already holds, fits width display columns.
+// A line that does not fit contributes none of its candidates: a hint that
 // would fit by itself is still anchored to a line the pane cannot show in one
 // row, and a half-kept set is a column map that disagrees with the renderer.
 //
-// A width below one means the pane has not been laid out yet, so every hint is
-// kept and the width-aware refilter at the next frame trims them.
-func HintsThatFit(f *File, lineHints []LineHint, width int) *HintSet {
+// The other set is measured in because both inline features share one column
+// map: fitting a lens against a line that already carries an inlay hint would
+// undercount the line and install a pair the renderer cannot draw in one row.
+func thatFit(f *File, lineHints []LineHint, width int, other func(int) []Hint) *HintSet {
 	if len(lineHints) == 0 {
 		return nil
 	}
@@ -163,7 +187,10 @@ func HintsThatFit(f *File, lineHints []LineHint, width int) *HintSet {
 	}
 	var set HintSet
 	for line, hs := range byLine {
-		if width >= 1 && f.Cols.WidthHints(f.Line(line), HintCols(hs)) > width {
+		combined := make([]Hint, 0, len(hs)+4)
+		combined = append(combined, other(line)...)
+		combined = append(combined, hs...)
+		if width >= 1 && f.Cols.WidthHints(f.Line(line), HintCols(combined)) > width {
 			continue
 		}
 		for _, h := range hs {
@@ -174,4 +201,20 @@ func HintsThatFit(f *File, lineHints []LineHint, width int) *HintSet {
 		return nil
 	}
 	return &set
+}
+
+// HintsThatFit builds the inlay hint set for a file from an answer, keeping
+// only the hints on lines that still fit one display row once the lenses
+// already installed are counted. A width below one means the pane has not been
+// laid out yet, so every hint is kept and the width-aware refilter at the next
+// frame trims them.
+func HintsThatFit(f *File, lineHints []LineHint, width int) *HintSet {
+	return thatFit(f, lineHints, width, f.LensAt)
+}
+
+// LensesThatFit is HintsThatFit for code lenses, measuring against the inlay
+// hints already installed on each line so the two features' shared column map
+// stays consistent.
+func LensesThatFit(f *File, lineHints []LineHint, width int) *HintSet {
+	return thatFit(f, lineHints, width, f.inlayAt)
 }

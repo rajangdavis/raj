@@ -430,26 +430,39 @@ func TestSearchArrowsFold(t *testing.T) {
 }
 
 // A resize must force a full repaint: the terminal's contents outside the old
-// geometry are undefined, so the previous frame is not a safe diff basis.
+// geometry are undefined, so the previous frame is not a safe diff basis. The
+// host's reported size has to change too, or syncSize reverts the resize and
+// the size-driven layout change never reaches the clear — which is how the bug
+// hid while FakeHost had a fixed size.
 func TestResizeInvalidates(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
 	h.drain()
-	before := h.host.Invalidations()
+	beforeI, beforeR := h.host.Invalidations(), h.host.Repaints()
+	h.host.SetSize(100, 30)
 	h.Handle(ui.Resize{Cols: 100, Rows: 30})
 	h.Draw()
-	if h.host.Invalidations() <= before {
+	if h.host.Invalidations() <= beforeI {
 		t.Error("resize did not invalidate the frame")
+	}
+	if h.host.Repaints() != beforeR {
+		t.Error("resize repainted without clearing; a size change must erase")
 	}
 }
 
-// A layout change moves every pane boundary, so it invalidates too.
-func TestLayoutChangeInvalidates(t *testing.T) {
+// A layout change moves every pane boundary, so it repaints. It must Repaint
+// rather than Invalidate: the clear Invalidate emits flashes the whole screen
+// on every sidebar toggle, and a full write is enough when raj is the only
+// writer.
+func TestLayoutChangeRepaints(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
-	before := h.host.Invalidations()
+	beforeR, beforeI := h.host.Repaints(), h.host.Invalidations()
 	h.press("super+b") // closing the sidebar gives the editor the full width
-	if h.host.Invalidations() <= before {
-		t.Error("closing the sidebar did not invalidate the frame")
+	if h.host.Repaints() <= beforeR {
+		t.Error("closing the sidebar did not force a repaint")
+	}
+	if h.host.Invalidations() != beforeI {
+		t.Error("a layout change invalidated the frame; it should repaint without clearing")
 	}
 }
 
@@ -564,6 +577,65 @@ func TestFindCapturesTyping(t *testing.T) {
 	}
 	if got := h.Pane().Find.Query(); got != "b" {
 		t.Errorf("query = %q, want b", got)
+	}
+}
+
+// cmd+f, tab to the replace row, then enter replaces the current match. The
+// edit is one ordinary pane edit, so a single undo restores it.
+func TestFindReplaceThroughKeybindings(t *testing.T) {
+	h := newHarness(t, "one two one")
+	h.press("super+f")
+	h.typeText("one")
+	h.press("tab") // reveal and focus the replace row
+	h.typeText("1")
+	h.press("enter")
+	if got := h.text(); got != "1 two one" {
+		t.Fatalf("text = %q, want the current match replaced", got)
+	}
+	// The bar owns keys while it is open, so close it before undoing.
+	h.press("esc")
+	h.press("super+z")
+	if got := h.text(); got != "one two one" {
+		t.Errorf("after undo = %q, want the original", got)
+	}
+}
+
+// cmd+enter in the replace row replaces every match.
+func TestFindReplaceAllThroughKeybindings(t *testing.T) {
+	h := newHarness(t, "one two one")
+	h.press("super+f")
+	h.typeText("one")
+	h.press("tab")
+	h.typeText("1")
+	h.press("super+enter")
+	if got := h.text(); got != "1 two 1" {
+		t.Fatalf("text = %q, want every match replaced", got)
+	}
+	h.press("esc")
+	h.press("super+z")
+	if got := h.text(); got != "one two one" {
+		t.Errorf("after undo = %q, want the original", got)
+	}
+}
+
+// A replace in Review mode is refused with the read-only note: the bar sits
+// ahead of the editor's own read-only check, so the gate has to be inside it.
+func TestFindReplaceRefusedInReviewMode(t *testing.T) {
+	h := newHarness(t, "one two one")
+	h.press("super+r")
+	if h.mode != ModeReview {
+		t.Fatal("cmd+r did not enter Review mode")
+	}
+	h.press("super+f")
+	h.typeText("one")
+	h.press("tab")
+	h.typeText("1")
+	h.press("enter")
+	if got := h.text(); got != "one two one" {
+		t.Errorf("review mode allowed a replace: %q", got)
+	}
+	if !strings.Contains(h.Status(), "read-only in review mode") {
+		t.Errorf("status = %q, want the review refusal", h.Status())
 	}
 }
 
@@ -776,23 +848,25 @@ func TestTabSwitchFocusesEditor(t *testing.T) {
 	}
 }
 
-// Tab steps through find matches rather than indenting.
-func TestFindTabCyclesMatches(t *testing.T) {
+// Tab reveals the replace row rather than indenting. Once revealed the bar
+// stays two rows tall, and shift+tab walks focus back without closing it.
+func TestFindTabRevealsReplaceRow(t *testing.T) {
 	h := newHarness(t, "aa bb aa cc aa")
 	h.press("super+f")
 	h.typeText("aa")
-	first := h.Pane().Cursors.Primary().Head
+	if n := h.Pane().Find.Rows(); n != 1 {
+		t.Fatalf("rows = %d before tab, want the query row only", n)
+	}
 	h.press("tab")
-	second := h.Pane().Cursors.Primary().Head
-	if second == first {
-		t.Fatal("tab did not advance to the next match")
+	if n := h.Pane().Find.Rows(); n != 2 {
+		t.Fatalf("rows = %d after tab, want the replace row", n)
 	}
 	if got := h.text(); got != "aa bb aa cc aa" {
 		t.Errorf("tab indented the buffer: %q", got)
 	}
 	h.press("shift+tab")
-	if h.Pane().Cursors.Primary().Head != first {
-		t.Error("shift+tab did not go back")
+	if n := h.Pane().Find.Rows(); n != 2 {
+		t.Errorf("rows = %d after shift+tab, want the row to stay", n)
 	}
 }
 

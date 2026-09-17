@@ -1,8 +1,11 @@
 package app
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"raj/internal/ui"
 )
 
 // cut and copy are global actions, claimed before any pane sees the chord. The
@@ -106,5 +109,32 @@ func TestCopyInTheExplorerFallsThroughToTheDocument(t *testing.T) {
 
 	if got := h.host.Clipboard(); got != "alpha beta" {
 		t.Errorf("clipboard = %q, want the document", got)
+	}
+}
+
+// Copy in one buffer, switch tabs, paste in another. The clipboard crosses as
+// the system text the terminal re-delivers; the app must not reuse the source
+// buffer's piece records against the destination's store.
+func TestPasteAcrossBuffers(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	dir := h.Explorer.Tree.Root
+	h.OpenFile(filepath.Join(dir, "main.go"))
+	h.press("super+a")
+	h.press("super+c")
+	copied := h.host.Clipboard()
+	if copied == "" {
+		t.Fatal("setup: nothing was copied")
+	}
+
+	h.OpenFile(filepath.Join(dir, "README.md"))
+	before := h.Pane().File.Text()
+	h.Handle(ui.Paste{Text: copied})
+	h.Draw()
+	got := h.Pane().File.Text()
+	if got == before {
+		t.Errorf("paste into the second buffer did nothing: %q", got)
+	}
+	if !strings.Contains(got, copied) {
+		t.Errorf("paste into the second buffer dropped the copied text: %q", got)
 	}
 }

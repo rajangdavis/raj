@@ -459,3 +459,101 @@ The prototype columns and the after numbers for the shipped `Project` (the
 no-decisions short-circuit, the newest-first unapply pass and the indexed
 `stateRuns`) are pending the host run; the equality gate is what makes the
 alt-run timings trustworthy.
+
+## Agent call census
+
+Not an editor benchmark: this is where the *calls* go, read straight out of
+opencode's session store. Reproduce with `node scripts/call-census.mjs` where
+the sessions ran (the store is container-side); `node scripts/call-dag.mjs`
+draws the same data as a transition graph (`--verbs` for the verb view,
+`--mermaid` to paste into a viewer). Baseline 2026-09-16, every session then in
+the store.
+
+| tool | calls | share |
+|---|---:|---:|
+| bash | 26,059 | 98% |
+| task | 248 | |
+| skill | 196 | |
+| todowrite | 78 | |
+
+`raj ctl` verb invocations inside those bash calls (39,856 total):
+
+| verb | n | share | | verb | n |
+|---|---:|---:|---|---|---:|
+| read | 12,944 | 32.5% | | open | 1,760 |
+| search | 12,410 | 31.1% | | version | 1,165 |
+| edit | 3,148 | 7.9% | | apply | 1,072 |
+| lsp | 2,040 | 5.1% | | buffers | 1,065 |
+| groups | 841 | 2.1% | | goto | 501 |
+| claim | 450 | 1.1% | | diff | 433 |
+
+`read` + `search` are 64% of every verb invoked; the write doors
+(`edit`/`apply`/`patch`) are 11%. The adjacent transitions say the same —
+read→read 4,416, search→search 3,516, search→read 2,725, read→search 2,497 —
+against a write loop (read→edit 833, edit→read 603, edit→edit 893, edit→lsp
+294) of about 2,600. The cost is exploration round-trips, not missing write
+verbs.
+
+The graph says the same thing in one shape: `read→read` 4,459, `search→search`
+3,531, `search→read` 2,748, `read→search` 2,522 — one self-looping explore
+cluster — while every write and verify funnels straight back into it
+(`edit→read` 610, `lsp→read` 430, `apply→read` 173). (These are a later re-run
+than the table above — the store grew between them.) Phases (consecutive calls
+collapsed): explore → other/decide/write, and write → explore 1,197,
+verify → explore 720.
+
+Re-run 2026-09-16 during the cut-exploration review pass (it includes some of the
+review's own verification calls, so it is not a clean pre-use snapshot): 26,859
+tool calls (26,320 bash, 250 task, 197 skill, 78 todowrite); `read` 13,085
+(32.5%), `search` 12,569 (31.2%), `edit`
+3,170, `lsp` 2,062, `open` 1,765, `version` 1,181, `apply` 1,084, `buffers`
+1,071, `groups` 847, `goto` 501, `diff` 438. The baseline above is accurate for
+the sessions it names — the shares are unmoved — and the growth is the sessions
+since. Adjacent transitions in the same run: `read→read` 4,475, `search→search`
+3,540, `search→read` 2,761, `read→search` 2,534. The 4,416 and 4,459 above are
+two runs of the same script, not two methods; one number is the honest form.
+
+## Idle-tick compaction
+
+Noted 2026-09-16 (between-wave review); numbers pending the host run.
+
+`Compact`'s idle-tick skip memo keys on `(Session.Version,
+DecisionGeneration)`, and `Compact` does not move the version it is handed —
+so under sustained typing, where the version advances on every keystroke, the
+memo spares nothing: roughly every `CompactInterval` (2 s) `App.compactTick`
+calls `Session.Compact(File.SavedVersion())` again and each call rebuilds
+`allOrigins` over the whole journal and runs `pieceStable` once per piece. The
+cost is a pure scan and it is not yet measured.
+
+Two fixtures, both timed as a no-op `Compact` so the number is the scan rather
+than the fold:
+
+| benchmark | shape | what the tick pays |
+|---|---|---|
+| `BenchmarkCompactAlreadyCompacted/journal=N` | 2 pieces over an N-op journal | `allOrigins` over N, `pieceStable` x2 |
+| `BenchmarkCompactUncompactable/pieces=N` | N change-set pieces (one per keystroke) + base | `allOrigins` over N, `pieceStable` x N |
+
+Plain typing is the second shape: one keystroke is one change set
+(`Pane.HandleText` brackets a single `InsertRune` in `File.Begin`/`End`, and a
+commit with no open transaction bumps a fresh group anyway), so no two
+neighbouring pieces may merge. The first shape is a synthetic fixed point a
+compaction pass leaves, where the pieces have folded but the journal has not
+shrunk.
+
+Reproduce with:
+
+```
+go test ./internal/piecetable -run '^$' -bench '^BenchmarkCompact' -benchmem
+```
+
+Numbers pending host run:
+
+| benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| AlreadyCompacted/journal=1000 | pending host run | pending | pending |
+| AlreadyCompacted/journal=2000 | pending host run | pending | pending |
+| AlreadyCompacted/journal=4000 | pending host run | pending | pending |
+| Uncompactable/pieces=500 | pending host run | pending | pending |
+| Uncompactable/pieces=1000 | pending host run | pending | pending |
+| Uncompactable/pieces=2000 | pending host run | pending | pending |
+| Uncompactable/pieces=4000 | pending host run | pending | pending |

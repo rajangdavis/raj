@@ -163,6 +163,36 @@ func (d *Document) Span(r Range) (lo, hi int) {
 	return lo, hi
 }
 
+// SpanFrom converts a start position and a length in UTF-16 code units to a
+// byte range. It walks the runes forward from the start so a length that runs
+// past the end of a line is measured against the real text rather than assumed
+// to stay on one; the length of a token that ends mid-rune stops at that runes
+// start, the same rounding FromUTF16 applies to a mid-rune offset.
+//
+// It is the semantic-token conversion: the protocol gives a token a start and a
+// length, not an end position, and both are counted in UTF-16 code units.
+func (d *Document) SpanFrom(start Position, length int) (lo, hi int) {
+	if length < 0 {
+		length = 0
+	}
+	lo = d.Offset(start)
+	units := 0
+	i := lo
+	for i < len(d.text) && units < length {
+		r, size := utf8.DecodeRuneInString(d.text[i:])
+		if size == 0 {
+			break
+		}
+		n := utf16Len(r)
+		if units+n > length {
+			break // the length splits this rune: stop at its start
+		}
+		units += n
+		i += size
+	}
+	return lo, i
+}
+
 // line is the text of a line without its newline.
 func (d *Document) line(n int) string {
 	start := d.starts[n]

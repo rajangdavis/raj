@@ -170,6 +170,8 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   plus short `-fuzz` runs.
 
 
+- [x] **A mid-line proposal draws on one display row (2026-09-16).** `view.Build` absorbs contiguous kept pieces that continue the run (same composition line, contiguous, not behind a fold), so a hunk cutting a line no longer draws two rows; `TestBuildMidLineReplacementMergesKeptRuns` pins the merge and both boundaries. See `docs/AGENT-FEEDBACK.md`.
+
 ## Mouse
 
 - [x] **Every pane hit-tests against what it drew.** The geometry was factored
@@ -356,11 +358,15 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   fenced code, and the fences read as three stray backticks in a terminal box.
   What they contained is code, and code is the part whose spacing matters.
   Nothing else about the markdown is interpreted: a half-rendered subset is
-  more confusing than none.
+  more confusing than none. (Superseded 2026-09-16: a fence is now kept rather
+  than stripped, and inline code, bold/italic and lists are rendered — see the
+  Markdown bullet below.)
 - [x] **It claims exactly one key: escape.** Unlike the completion popup, this
   panel can sit on screen while you carry on reading, so claiming arrows to
   scroll it would steal navigation from the document underneath at the moment
-  it matters most. Content that does not fit says `+N more` instead — a label
+  it matters most. (Superseded 2026-09-16: escape is still always claimed, but an
+  overflowing panel now claims the scroll keys and draws an overflow hint
+  instead of `+N more` — see the overflowing-panel bullet below.) Content that does not fit says `+N more` instead — a label
   kept terse because the panel is narrowest exactly when it is most likely to
   overflow, and a truncated "… 31 more line" reads as a bug.
 - [x] **Any other action dismisses it.** A panel describes what the cursor was
@@ -372,6 +378,27 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   border and content, and the two differ in all four. What they share is three
   lines of arithmetic and a reason worth repeating where it applies. They do
   share `textArea`, so neither can disagree about where column zero is.
+- [x] **An overflowing hover panel scrolls, and says so (2026-09-16).**
+  `Panel.Scrollable`/`Top`/`Handle` (`internal/hover/hover.go`) claim
+  `keys.LineUp`/`LineDown`/`PageUp`/`PageDown` only while the last `Render`
+  showed fewer body rows than it had, so a panel whose answer fits still leaves
+  navigation to the document; `scrollBy` clamps the view to the content and the
+  caret never moves. `Render` draws the overflow hint via `hintText`.
+  `TestHoverPanelScrollsWithoutMovingTheCaret`
+  (`internal/app/complete_follow_test.go`) pins it. This supersedes the earlier
+  one-key rule: escape is always claimed, but an overflowing panel no longer
+  rests on `+N more` instead of scrolling. Host `make check` green.
+- [x] **Markdown beyond fences: inline code, bold/italic and lists
+  (2026-09-16).** `markdown`/`inline` (`internal/hover/hover.go`) render a
+  line-based subset at draw time — fenced code kept literally, inline code,
+  bold/italic and list markers — with the `_`-identifier guard and, now, a
+  flanking guard for `*`/`**`, so `2 * 3 * 4` is left as written. `fenceOpen`
+  returns the opener's run via `fenceRun`, and `markdown` closes only on
+  `strings.HasPrefix(trimmed, fence)`, so a four-backtick fence is not closed
+  by three and a code line starting with three does not close it. Tests in
+  `internal/hover/hover_test.go`. This supersedes the earlier "fences are
+  stripped, nothing else is interpreted" limit; a fence is now kept, not
+  stripped. Host `make check` green.
 
 ## Problems pane
 
@@ -484,6 +511,9 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 - [x] **The two unformatted files in internal/control are formatted**, and
   `fmt-check` is now what would catch the next ones.
 
+- [x] **Symlink escape is gated (2026-09-16).** `Guard.inRootResolved`/`resolveExistingPrefix` resolve symlinks before the root check and `RAJ_ALLOW_SYMLINK_ESCAPE` is the explicit opt-out; `host_test.go` pins in-root, escaped-parent and opt-in cases. A dangling link still resolves lexically by design; the decision is open in TODO.
+- [x] **`exec -dir` routes through `inRootDir` (2026-09-16).** `Guard.CheckExec` takes the relative directory its doc promised, matching `search -path`; the former absolute-only `inRootResolved` call refused it.
+
 ## Data loss
 
 - [x] **Saves are atomic.** `os.WriteFile` truncates before it writes, so an
@@ -577,6 +607,8 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   is not.
 - [x] **Clipping is by display column, not by byte**, since the disclosure
   marker is multi-byte and a byte clip would cut it in half.
+
+- [x] **`.raj/` is hidden by default (2026-09-16).** `internal/hidden` defaults hide `.raj/*` (journal, trash, session) while leaving `.raj/hidden`, the user config, visible; `hidden_test.go` covers both, so the tree, search and picker stop showing the editor scratch.
 
 ## Auto-indent
 
@@ -1767,3 +1799,201 @@ harness. Both now wait on the thing they are actually about.
   `TestControlPatchAllRefusedDoesNotReproposePriorSet`. Live-verified in both
   orders on scratch buffers with three identities against the rebuilt editor
   and a matching client. See `docs/AGENT-FEEDBACK.md`.
+
+- [x] **`read` returns the session view (2026-09-16).** Settled: the whole document in session coordinates, with `-annotated` adding the state runs; `AcceptedOnly` would desync driver offsets from the version `read` reports, because `apply`/`diff` operate on the session. Proposing against the agreed base is a separate design direction.
+- [x] **One path-resolution seam for every path-bearing field (2026-09-15).** `Client.toEditor` maps `Path`, `NewPath`, `Dir`, `Paths` and `Query.Path` outbound, `localise`/`Mapper.FromEditor` inbound, so relative, caller-mapped and editor spellings resolve alike; `run -prog` payload paths remain unmapped (TODO).
+- [x] **`search -json` uses snake_case field names (2026-09-13).** `SearchMatch`/`TruncatedFile`/`ExecStats`/`DirtyBuffer` carry json tags, so `-json` and `-jsonl` agree.
+- [x] **A refused `apply`/`patch` keeps its landed-hunk warnings (2026-09-16).** `reportConflicts` prints `noteOverlaps` to stderr and carries `warnings` in the `-json` `ok:false` reply, so a partial refusal cannot hide a hunk that landed; pinned by `TestCLIApplyRefusalStillCarriesTheWarning` and `TestCLIPatchRefusalStillCarriesTheWarning`.
+- [x] **Recomputed `Invalid` for wholly-overwritten proposals (2026-09-16).** `markInvalid`/`invalidBy` derive the flag from the same per-member projection that drops the set, so it clears with the collider; `Group.Invalid`/`InvalidBy` reach `groups`/`diff`/`proposals` and the sparse `hGroupInvalid` (0x5a) field, and the CLI names the collider. The app-layer mapping still lacks a test (TODO). See `docs/AGENT-FEEDBACK.md`.
+- [x] **Overlap reporting and the enriched lease refusal (2026-09-16).** `Session.PendingOverlaps`/`Group.Overlaps` report each live set via `hGroupOverlaps` (0x54) in `groups`/`diff`, and an `apply` conflict carries the owner author and rebased span via `hConflictLease` (0x53); a smoke-test false positive on adjacent sets was fixed by bounding each member surviving owned runs. The lease still prevents overlap rather than composing it. See `docs/AGENT-FEEDBACK.md`.
+- [x] **`revert` coverage for the partial wedge and shared-group decision (2026-09-15).** `TestRevertAuthorPartialWedgeLeavesNewerSetReversed` and `TestRevertAuthorKeepsASharedGroupsDecision` pin both; no `internal/editor` counterpart was added because the unnamed-block version guard needs an op the public API clamps away. See `docs/AGENT-FEEDBACK.md`.
+- [x] **Every superseded Proposed set is warned once (2026-09-16).** `Session.proposedSpans` reports each distinct Proposed run a hunk intersects and `ApplyDiff` accumulates one warning per set across the batch; `TestApplyDiffWarnsOverEveryProposedSet` and `TestApplyDiffWarnsOnceForASetCaughtTwice` pin it. The warning span is the first caught run, not the bounding span; the choice is open (TODO).
+- [x] **A superseded author is notified over the mailbox (2026-09-16).** `Server.PostNotice`/`App.notifySuperseded` enqueue one notice per superseded set on a landed `apply`/`patch`, carrying set, span and author and no path; `TestControlSupersededAuthorIsNotified` and `TestControlSupersededNoticeShipsNoPath` pin it.
+- [x] **`decodeHeader` forward-compat comment matches the code (2026-09-16).** It credits its own `switch` (no `default`) with dropping unknown codes and the nil known set with "every opcode is known".
+- [x] **The orphaned lease helpers are gone (2026-09-16).** `leaseSpan`/`leasedElsewhere` had no caller after the order-independence fix, and the design doc, the `Leased` comment and the `proposedSpans` doc were repointed.
+- [x] **The save-review timing instrument (2026-09-11).** `internal/timing` behind `RAJ_TIMING` logs the write-path phases, the per-frame draw and pending walk, and save-to-clean; the sink is a file (`1` names `defaultPath`) because stderr painted over the TUI. Diagnosing the lag is open work (TODO). Root cause in INVESTIGATIONS.md.
+
+- [x] **`exec` is reachable from a program (2026-09-16).** `OpExec` (0x96) consumes the argv accumulated by `arg` ops, and the serve loop re-checks the remote-execution gate for every exec, so a batch is not a way around the flag path; recv, hello and cancel stay out on purpose. See `docs/AGENT-FEEDBACK.md`.
+- [x] **`find` is a program opcode (2026-09-16).** `OpFind` (0x95) locates a pattern in a buffer and answers its byte span, so a find → read → apply batch is one round trip. It stays program-only: no `verbCodes` wire code yet (TODO).
+- [x] **The own+other conflict names the caller's own draft (2026-09-16).** `leaseView(c, self)` (`internal/control/cli.go`) words a conflict whose author is the caller as `change set N is your own draft (bytes s..e); this hunk also crosses another writer's text — narrow it to avoid their span`, and leaves the peer sentence `change set N owns this text (author A, bytes s..e); accept or reject it first` byte-for-byte unchanged; live over the socket with two identities the own+other refusal named the caller's set with no `accept or reject`, and the peer-only refusal kept the peer sentence. `TestCLIRefusalNamesTheCallersOwnDraft` pins it; `TestCLIRefusalKeepsThePeerWording` is a guard (it passes before the change too).
+- [x] **`Pane.RowText` and the completion prefix read the drawn row (2026-09-16).** `Pane.RowText(row)` returns the composition text a display row draws (`File.Line` with no projection, `""` on a fold row, the row's composition slice otherwise), and `showCompletion` takes its prefix from it with `head - p.DocAt(line, 0)` — the no-fold expression `complete.PrefixAt(File.Line(line), head-File.LineStart(line))` reproduced exactly — so a fold under the caret cannot leak session bytes into the completion. `TestCompletionPrefixIsTheRowTextBelowAMidLineFold`, `TestRowTextIsTheSessionLineWithoutDecisions` and `TestRowTextIsTheVisibleSliceAroundAFold` pin it.
+- [x] **One jump path for session and display (2026-09-16).** `App.jumpTo` and the review walk both call `jumpToSessionLine` (`internal/app/app.go`, `internal/app/review.go`) and `reviewJump` is deleted, so the chord and the review surfaces share one `DispPos`-centred jump with the fold-skip rule. `TestOneJumpPathSkipsHiddenAndCentresVisible` pins the hidden-skip and display-row centring. The column-addressed `host.Goto` stays separate (TODO).
+
+- [x] **Cut exploration round-trips — multi-target `read` and `search -context` (2026-09-16).** `raj ctl read [path]...` reads several targets in one call (a shared optional `-start`/`-end`/`-lines`, each file's text and version, a per-file `-json` list, `-annotated` refused with more than one path), reusing `Request.Paths` and the `Buffers`/`Spans` response shapes so no new wire field is needed. `search -context N` carries each hit's neighbouring lines and version, human and `-json`/`-jsonl`, with output byte-identical to before when the flag is absent; `hMatchContext` (0x5c) is a separate sparse argument field and `Query.Context` is appended last in the `hQuery` record. Verified live against the rebuilt editor and container client; the census success criteria are recorded in `docs/AGENT-FEEDBACK.md`.
+- [x] **Cut-exploration review pass fallout (2026-09-16).** `readPaths` marks each target read only after the whole multi-read succeeds, so a call that fails part-way no longer satisfies the read-before-write gate for a path whose text never reached the caller (`TestDispatchReadMultipleFailureDoesNotMarkEarlierTargets`); the every-field header round-trip now sets `SearchQuery.Context`/`MatchMeta.Context`; a `Path`+`Hidden`-without-`Context` query has a decode pin (`TestQueryWithoutContextStillDecodes`); the CLI `search -context -json` test unmarshals instead of matching key spacing; and `runSearch`'s Context forwarding is pinned app-layer (`TestSearchContextReachesTheEngine`). The raj-editor skill documents the new surface. In buffers for the user's save; host `make check` is the gate.
+
+## Between-wave review — docs retirement, compaction bench, encoding tail, rebind (2026-09-16)
+
+- [x] **Docs retirement and the index guard (2026-09-16).** `docs/AGENT-VERB-AUDIT.md`, `docs/PROPOSALS-SPEC.md` and `docs/RECONCILIATION-UX.md` deleted (their content was folded earlier), their `docs/README.md` rows removed, and `internal/docsindex/docsindex_test.go` now fails a `docs/*.md` with no row, a row naming a missing file, or a retired row whose file is still on disk. The retired branch is pinned by `TestRetiredRowPredicate` because no retired row remains. Host `make check` green.
+- [x] **Idle-tick compaction benchmark (2026-09-16).** `internal/piecetable/compact_bench_test.go` adds `BenchmarkCompactAlreadyCompacted` (the synthetic fixed point) and `BenchmarkCompactUncompactable` (one change set per keystroke); `docs/BENCHMARKS.md` carries the command and no numbers, pending the host run.
+- [x] **A pre-tail log recovers its encoding shape from disk (2026-09-16).** `internal/app/journal.go` `restoredEncoding` reads only the charset kind, CRLF and BOM from the file on disk when the log has no encoding tail, and any open error falls back to the default without failing the restore; `TestJournalRestoreRecoversPreTailEncoding` pins it. Host `make check` green.
+- [x] **Announcing a headless buffer surfaces the file warning (2026-09-16).** `internal/app/headless.go` `announce` sets `a.status = fileWarning(p.File)`, so a reveal reports mixed endings or a broken indent; `TestAnnounceSurfacesFileWarning` pins it. Host `make check` green.
+- [x] **The compaction memo forgets closed panes (2026-09-16).** `internal/app/app.go` `pruneCompacted` drops `compacted` entries not in `Tabs.All` before `compactTick` reads them, so a reused pane pointer cannot skip a needed compaction; `TestCompactTickPrunesClosedPaneEntries` pins it. Host `make check` green.
+- [x] **PendingRemovals moved to ctrl+alt+d (2026-09-16).** ctrl+super+d never arrived on macOS (ctrl+cmd+d is Look Up in Dictionary), so `internal/keys/table.go` binds ctrl+alt+d (Seq `100;7u`); `removals_test.go` and `docs/KEYBINDINGS.md` updated. The status-line note plus the re-raise chord is the persistent removal surface, so the old TODO item is retired. Host `make check` green.
+
+## Encoding and compaction cores (2026-09-16)
+
+- [x] **Encoding core — one classifier, five round-tripping encodings
+  (2026-09-16).** `internal/editor/charset` is the one classifier behind
+  `decode` and `IsBinary`: UTF-8 (±BOM), UTF-16LE/BE (±BOM, surrogate pairs,
+  CRLF), Windows-1252 and Latin-1 round-trip byte-for-byte, and UTF-32,
+  unmarked/malformed UTF-16 and binary are refused by name. `Open`/`Reload`
+  return the decode error before mutating and `SaveOver` returns the encode
+  error before `writeAtomic`, so a refused reload or save leaves the buffer and
+  the disk bytes alone; a refused save rolls its accept back
+  (`TestSaveFailedEncodeLeavesPendingProposed`). `FuzzEncodingRoundTrip` skips
+  the documented lossy `Mixed` case. Host `make check` green. The journal-tail
+  and warning-surfacing follow-ons are the separate entries above; the two
+  remaining classifier edges are filed in `docs/TODO.md`.
+- [x] **Compaction core — merge and flatten without moving history, wired to
+  the idle tick (2026-09-16).** `Session.Compact(saved)`
+  (`internal/piecetable/compact.go`) merges adjacent same-author, same-owner
+  contiguous pieces and flattens only spans that are both saved and committed,
+  through `pieceStable`; Proposed/Rejected and unsaved spans keep their pieces,
+  `Version()` (the journal length) is unchanged, and the projection oracle plus
+  Annotated states are pinned by `TestCompactKeepsProjectionOracle`.
+  `App.compactTick` runs it on the idle tick (2 s debounce, skipped below two
+  pieces, memoised on `(Session.Version, DecisionGeneration)` before
+  `journalTick`) with `File.SavedVersion()`, so the keystroke path never pays.
+  Host `make check` green; the scan-cost benchmark and the memo follow-ons are
+  the separate entries above.
+
+## LSP campaign L0–L4 — landed and repaired (2026-09-17)
+
+- [x] **LSP campaign L0–L4 landed (2026-09-17).** The five waves are on the
+  saved tree and host-verified: `go vet`, `go build`, `go test ./...` and
+  `make check` are green. L0 — the capability model (23 provider fields,
+  `lsp.Supports`, `app.capabilityGap`) plus announced client capabilities,
+  find references, and the command palette (the last `keys.Unimplemented`
+  entry). L1 — declaration / typeDefinition / implementation through one shared
+  jump pipeline, signature help (hover panel, UTF-16 parameter marking), and
+  workspace symbols. L2 — document and range formatting, rename / prepareRename
+  (multi-file `WorkspaceEdit`, all-or-nothing, unopened files loaded and
+  announced), and code actions (Command/CodeAction literals, a shared
+  lease-safe applier, `workspace/executeCommand`). L3 — document symbols
+  (hierarchical and flat, server-parsed with the keyword scanner as the
+  no-server fallback, jumping to `SelectionRange`), format on save
+  (`willSaveWaitUntil`, version-pinned, proposal-safe re-route), and code
+  lenses (store plus idle refresh, rendered through the inlay column map).
+  L4 — semantic tokens (server legend, delta decode, UTF-16 spans, an overlay
+  augmenting chroma), the server→client plumbing (`workspace/configuration`
+  answered with nulls in order, `showMessage`/`logMessage` to the status line,
+  `showMessageRequest` dismissed, dynamic registration honoured for
+  `workspace/symbol`, `workspace/applyEdit` refused by design, `-32601` for
+  unknown requests), document links (file targets only) and on-type
+  formatting. See `docs/AGENT-FEEDBACK.md` (2026-09-16 LSP campaign review
+  pass, extended with the 2026-09-17 closing record and failure modes).
+- [x] **LSP repair wave — twelve defects fixed (2026-09-17).** Overlapping
+  advisory landings had fused lines across
+  `internal/control/{control,cli,client,cli_test,host_test}.go`,
+  `internal/app/{lsp,control,app}.go` and `internal/keys/action.go`: fused
+  lines, a duplicated `Hints` struct field, a doubled `entry` struct, an early
+  `)` closing a `Mode` const block, and a `clientCapabilities` body spliced
+  onto another function's tail. The wave restored the lost
+  `References`/`Complete`/`SignatureHelp` declarations and corrected three
+  mis-calibrated tests. Host `make check` green. The failure modes are
+  recorded in `docs/AGENT-FEEDBACK.md` (2026-09-17).
+
+## Regression fixes — stale undo projection, cross-file clipboard (2026-09-17)
+
+- [x] **`cmd+z` no longer crashes on a shortening undo (2026-09-17).** Root
+  cause: `Pane.line` (`internal/editor/pane.go:263`) read `lo,hi` out of
+  `p.disp`, the display projection built for the pre-edit (longer) text. Undo
+  appends its reversing ops and then `Pane.history`
+  (`internal/editor/actions.go:199`) runs `FollowCursor`
+  (`internal/editor/pane.go:436`) on the same keystroke, before the frame
+  rebuilds the map — `drawEditor` (`internal/app/render.go:306`) is the one
+  production caller of `UpdateDisplay` (`internal/app/render.go:317`). A
+  consumer then sliced the freshly shortened line with the stale `hi` —
+  `full[lo:hi]` past the new line end, a process-killing panic on the event
+  thread. A non-nil projection exists whenever the buffer has any decision,
+  `AcceptedAndProposed` included, so the incident buffer — one holding a
+  pending agent proposal — was enough; backspace/delete on such a buffer hit
+  the same slice. Fix: `Pane.line` clamps the snapshot row against the line as
+  it stands now (`lineLen := p.File.LineEnd(sl) - p.File.LineStart(sl); if hi
+  > lineLen { hi = lineLen }`, with `lo` clamped and `lo > hi → lo = hi`), the
+  single chokepoint every `[lo:hi]` consumer goes through. Pinned by
+  `TestUndoOfAShorteningEditClampsTheStaleProjection`
+  (`internal/editor/display_test.go:554`), which builds a projected pane,
+  inserts mid-line, undoes through `p.history`, and asserts every row lies
+  inside its line (`assertRowsInsideTheirLines`). Host `gofmt -w && go test
+  ./... && make check` green.
+- [x] **Copy in one file can paste into another (2026-09-17).** Root cause: the
+  internal clipboard carried piece records, not just text — `Pane.Copy`
+  (`internal/editor/clip.go:57`) returns a `Clip` whose `Spans` are
+  `[][]piecetable.PieceRec` (one entry per cursor selection), each
+  `PieceRec{Buf, Start, Length}` (`internal/piecetable/flatpieces.go:124`)
+  naming the *source* file's store buffer and offsets; `Store.Slice`
+  (`internal/piecetable/store.go:46`) answers the destination's request.
+  `PasteClip` (`internal/editor/clip.go:126`) reused those records whenever
+  `Spans` was non-empty, so a cross-file paste grafted foreign records into the
+  destination store and the slice came back empty for the out-of-range record —
+  nothing inserted, or unrelated bytes. Same-file paste worked, which is why it
+  presented as "copy is broken"; copy also emits OSC 52, so the system
+  clipboard was unaffected. Fix: `Clip.Source`/`Clip.Gen`
+  (`internal/editor/clip.go:33-34`) tag the source `*File` and its document
+  generation; `Clip.internalTo` (`internal/editor/clip.go:47`) gates splicing on
+  `c.Source == f && c.Gen == f.docGen`, and a foreign or stale clip falls
+  through to the plain `Text` path; `Reload` bumps `docGen`
+  (`internal/editor/reload.go:62`), so a pre-reload clip cannot splice stale
+  offsets. Pinned by `TestClipDoesNotCrossFiles` and
+  `TestClipDoesNotCrossReload` (`internal/editor/clipround_test.go:98`, `:126`)
+  and `TestPasteAcrossBuffers` (`internal/app/clip_test.go:118`).
+  `internal/editor/clip.go` was not touched by the LSP campaign, so this is
+  most likely a pre-existing limitation of the internal paste path. Host
+  `gofmt -w && go test ./... && make check` green.
+
+## Whole-line paste, sidebar inset, non-erasing repaint (2026-09-17)
+
+- [x] **A whole-line paste is linewise.** A single caret with no selection and
+  text ending in a newline inserts below the current line, or fills an empty
+  one, keeping the copied indentation and putting the cursor on the first
+  non-blank byte; an internal clip splices captured pieces and stores nothing,
+  an external clip appends the text, and both produce the same document.
+  Pinned by `TestWholeLinePasteGoesBelowNotAtCaret`,
+  `TestWholeLinePasteFillsEmptyLine`, `TestLinewisePasteCursorAtFirstNonBlank`,
+  `TestLinewisePasteInternalMatchesExternal` and
+  `TestWholeLineCopyStillStoresNothing` (`internal/editor/clip*_test.go`).
+- [x] **The sidebar content is inset one row, and a layout change repaints
+  without erasing.** `SidebarTop`/`SidebarRows` push the panes below the tab
+  bar (clamped to `minSidebarRows`), every render, click and menu hit test
+  measures from the inset, and `Host.Repaint` writes the full frame without
+  `\x1b[2J`, so opening or closing a sidebar does not flash. Pinned by
+  `TestLayoutChangeRepaints` (`internal/app/panes_test.go`) and
+  `TestRepaintWritesFullFrameWithoutErasing`
+  (`internal/ui/present_resize_test.go`).
+- [x] **A resize clears before it repaints (2026-09-17).** `Draw` compares the
+  frame size with the one `lastLayout` was drawn at and takes the `Invalidate`
+  branch on a size change (and on the first frame, whose zeros), so the
+  terminal-initiated change is not cancelled by the sidebar-toggle `Repaint`;
+  `lastCols`/`lastRows` subsume the old `lastLayout == (Layout{})` guard.
+  `ui.FakeHost.SetSize` is the new test seam; `TestResizeInvalidates` asserts
+  the invalidate rose and the repaint did not.
+
+## In-file find & replace, empty-document backspace panic, sidebar pad (2026-09-17)
+
+- [x] **In-file find & replace (2026-09-17).** `Find` gained a hidden replace
+  row (`Rows()` returns 0/1/2, `ActiveInput()` follows the focused field,
+  `WouldEdit()` for the Review gate), and `replaceCurrent`/`replaceAll` route
+  through the pane's edit path so a replace is one undo step and a leased run
+  refuses it whole (`internal/editor/find.go`); `app.handleEditor` normalizes
+  `enter` (`keys.None` + `"\n"` → `keys.Confirm`) before the Review gate and
+  drains lease refusals; `render.go`/`pointer.go` draw and hit-test from
+  `p.Find.Rows()` and `ClickAt(dx, dy)`. Pinned by `TestFindRows`,
+  `TestFindReplaceCurrent`, `TestFindReplaceAll`,
+  `TestFindReplaceRefusedByLease` (`internal/editor/edit_test.go`) and
+  `TestFindTabRevealsReplaceRow`, `TestFindReplaceThroughKeybindings`,
+  `TestFindReplaceAllThroughKeybindings`,
+  `TestFindReplaceRefusedInReviewMode` (`internal/app/panes_test.go`); the old
+  `TestFindTabCyclesMatches` was renamed because tab now reveals the replace
+  row. Host `make check` is the gate.
+- [x] **Backspace on an empty document no longer panics (2026-09-17).**
+  `deletePair` treated two zero bytes as a matched pair and applied an edit at
+  offset `-1`; `expect, isOpener := pairs[before]` now distinguishes "no
+  opener", so any non-bracket backspace falls through to the normal path
+  (`internal/editor/autopair.go`). Pinned by
+  `TestBackspaceOnEmptyDocumentDoesNothing`
+  (`internal/editor/autopair_test.go`).
+- [x] **Sidebar pad revised 2→1 (2026-09-17).** `sidebarPad = 1`
+  (`internal/app/layout.go`), `minSidebarRows = 4` unchanged; the sidebar
+  content sits one row below the tab bar.

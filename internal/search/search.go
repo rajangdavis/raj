@@ -32,6 +32,12 @@ type Match struct {
 	// read, rather than trusting a hit against a document that has since
 	// changed under it.
 	Version uint64
+
+	// Context is the hit's line plus Context lines either side, without a
+	// trailing newline, and empty when the query asked for none. The hit line
+	// is in the middle, so Text stays the single trimmed line and Context is
+	// the block around it.
+	Context string
 }
 
 // Query describes a search.
@@ -50,6 +56,12 @@ type Query struct {
 	// differing only in that the user sets it once in a file rather than per
 	// search. Nil means the built-in defaults.
 	Hidden *hidden.Rules
+
+	// Context is how many full lines before and after each hit the engine
+	// returns with it, so a caller sees a hit in place without a follow-up
+	// read. Zero is the hit line alone, which is the behaviour before the
+	// option existed; a negative value is clamped to zero rather than refused.
+	Context int
 }
 
 // Limits keep an interactive search bounded. A search box that hangs the editor
@@ -231,6 +243,9 @@ func runStream(ctx context.Context, root string, q Query, open Docs,
 	if q.Text == "" {
 		return res
 	}
+	// A negative context is clamped rather than refused: it is a count, and
+	// zero already means "the hit line alone".
+	ctxLines := max(q.Context, 0)
 	re, err := compile(q)
 	if err != nil {
 		res.Err = err
@@ -304,7 +319,7 @@ func runStream(ctx context.Context, root string, q Query, open Docs,
 		}
 		res.Considered++
 		delete(pending, path)
-		record(path, scanOne(path, open, versions, m, &buf, &res), &res)
+		record(path, scanOne(path, open, versions, m, &buf, ctxLines, &res), &res)
 		flush()
 		return nil
 	})
@@ -331,7 +346,7 @@ func runStream(ctx context.Context, root string, q Query, open Docs,
 			return res
 		}
 		res.Considered++
-		record(path, scanOne(path, open, versions, m, &buf, &res), &res)
+		record(path, scanOne(path, open, versions, m, &buf, ctxLines, &res), &res)
 		flush()
 	}
 	return res
@@ -352,13 +367,13 @@ func record(path string, total int, res *Result) {
 // scanOne searches a path from the open document if there is one, and from disk
 // otherwise. The version is the open buffer's, or zero for a file read from
 // disk, and it rides on every hit so a caller can tell the document moved.
-func scanOne(path string, open Docs, versions DocVersions, m matcher, buf *[]byte, res *Result) (total int) {
+func scanOne(path string, open Docs, versions DocVersions, m matcher, buf *[]byte, ctxLines int, res *Result) (total int) {
 	version := versions[path]
 	if text, ok := open[path]; ok {
-		_, total = scanData(path, version, []byte(text), m, res)
+		_, total = scanData(path, version, []byte(text), m, ctxLines, res)
 		return total
 	}
-	_, total = scan(path, version, m, buf, res)
+	_, total = scan(path, version, m, buf, ctxLines, res)
 	return total
 }
 
@@ -428,7 +443,7 @@ func compile(q Query) (*regexp.Regexp, error) {
 // scan reports how many matches it recorded and how many the file actually
 // holds. The two differ once a file passes MaxPerFile, and the difference is
 // the whole point: the pane can then say how much it is not showing.
-func scan(path string, version uint64, m matcher, buf *[]byte, res *Result) (found, total int) {
+func scan(path string, version uint64, m matcher, buf *[]byte, ctxLines int, res *Result) (found, total int) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0
@@ -439,20 +454,20 @@ func scan(path string, version uint64, m matcher, buf *[]byte, res *Result) (fou
 	if err != nil {
 		return 0, 0
 	}
-	return scanData(path, version, data, m, res)
+	return scanData(path, version, data, m, ctxLines, res)
 }
 
 // scanData is the sweep itself, over bytes that are already in hand. It is
 // separate from scan because an open document arrives as memory rather than as
 // a file, and everything after the read is identical for both.
-func scanData(path string, version uint64, data []byte, m matcher, res *Result) (found, total int) {
+func scanData(path string, version uint64, data []byte, m matcher, ctxLines int, res *Result) (found, total int) {
 	if len(data) > MaxFileSize || bytes.IndexByte(data, 0) >= 0 {
 		return 0, 0 // too big, or a NUL byte somewhere: binary
 	}
 
 	hay, lineFallback := m.prepare(data)
 	if lineFallback != nil {
-		return scanLines(path, version, lineFallback, data, res)
+		return scanLines(path, version, lineFallback, data, ctxLines, res)
 	}
 
 	line, lineStart, from := 1, 0, 0
@@ -487,7 +502,7 @@ func scanData(path string, version uint64, data []byte, m matcher, res *Result) 
 		}
 		if found < MaxPerFile {
 			text := data[lineStart:lineEnd]
-			res.Matches = append(res.Matches, Match{
+			hit := Match{
 				Path: path, Line: line,
 				Text: strings.TrimRight(string(text), " \t"),
 				Col:  start - lineStart, Len: end - start,
@@ -495,7 +510,11 @@ func scanData(path string, version uint64, data []byte, m matcher, res *Result) 
 				LineEnd:   lineEnd,
 				ByteStart: start, ByteEnd: end,
 				Version: version,
-			})
+			}
+			if ctxLines > 0 {
+				hit.Context = string(contextBlock(data, lineStart, lineEnd, ctxLines))
+			}
+			res.Matches = append(res.Matches, hit)
 			found++
 		}
 
@@ -538,7 +557,7 @@ func readAll(f *os.File, buf *[]byte) ([]byte, error) {
 // bytes under a case-insensitive query, where folding in place would change
 // byte offsets. Only such files pay the per-line regexp cost, and only for
 // themselves.
-func scanLines(path string, version uint64, m matcher, data []byte, res *Result) (found, total int) {
+func scanLines(path string, version uint64, m matcher, data []byte, ctxLines int, res *Result) (found, total int) {
 	for line, off := 1, 0; off <= len(data); line++ {
 		end := len(data)
 		if nl := bytes.IndexByte(data[off:], '\n'); nl >= 0 {
@@ -552,7 +571,7 @@ func scanLines(path string, version uint64, m matcher, data []byte, res *Result)
 				return found, total
 			}
 			if found < MaxPerFile {
-				res.Matches = append(res.Matches, Match{
+				hit := Match{
 					Path: path, Line: line,
 					Text: strings.TrimRight(string(raw), " \t"),
 					Col:  start, Len: stop - start,
@@ -560,7 +579,11 @@ func scanLines(path string, version uint64, m matcher, data []byte, res *Result)
 					LineEnd:   end,
 					ByteStart: off + start, ByteEnd: off + stop,
 					Version: version,
-				})
+				}
+				if ctxLines > 0 {
+					hit.Context = string(contextBlock(data, off, end, ctxLines))
+				}
+				res.Matches = append(res.Matches, hit)
 				found++
 			}
 		}
@@ -570,6 +593,45 @@ func scanLines(path string, version uint64, m matcher, data []byte, res *Result)
 		off = end + 1
 	}
 	return found, total
+}
+
+// contextBlock returns the ctxLines full lines before and after [lineStart,
+// lineEnd) within data, with the hit line in the middle and no trailing
+// newline. It is what makes a hit actionable without a follow-up read: the
+// neighbouring lines travel with the match. Lines before the first or past the
+// last are clipped rather than padded.
+func contextBlock(data []byte, lineStart, lineEnd, ctxLines int) []byte {
+	start := lineStart
+	for k := 0; k < ctxLines && start > 0; k++ {
+		// start-1 is the newline that ends the preceding line; the line before
+		// it begins after the newline before that.
+		i := bytes.LastIndexByte(data[:start-1], '\n')
+		if i < 0 {
+			start = 0
+			break
+		}
+		start = i + 1
+	}
+	end := lineEnd
+	for range ctxLines {
+		if end >= len(data) || data[end] != '\n' {
+			break
+		}
+		next := end + 1
+		if next >= len(data) {
+			break // the newline is the last byte: no following line
+		}
+		i := bytes.IndexByte(data[next:], '\n')
+		if i < 0 {
+			end = len(data)
+			break
+		}
+		end = next + i
+	}
+	if start > end {
+		start = end
+	}
+	return data[start:end]
 }
 
 var errTooBig = errors.New("file exceeds MaxFileSize")

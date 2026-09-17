@@ -171,6 +171,11 @@ type Header struct {
 	// empty list and neither flag reports the set, so all three default to
 	// the reporting request. Presence flags like Create, so a peer that does
 	// not know them omits them and keeps the replacing default.
+	//
+	// A text request with paths reads each one in a single call: the list is
+	// the read's operand list too, and the span fields select the same span in
+	// every target. A peer that does not know the read form reads no paths and
+	// falls back to Path.
 	Paths      []string
 	ClaimAdd   bool
 	ClaimClear bool
@@ -324,6 +329,11 @@ type MatchMeta struct {
 	// records are positional, so appending a number there would shift every
 	// hit after the first for a reader that predates the field.
 	Version uint64 `json:"version"`
+	// Context is the hit's neighbouring lines when search -context asked for
+	// them. It rides in the sparse hMatchContext field rather than in this
+	// positional record: appending a string there would shift every later hit
+	// for a reader that predates the field.
+	Context string `json:"context,omitempty"`
 }
 
 // SpanMeta is one authored run of the document.
@@ -561,7 +571,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 		h.Matches = append(h.Matches, MatchMeta{Line: m.Line, Col: m.Col, Len: m.Len,
 			PathLen: len(m.Path), TextLen: len(m.Text),
 			LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
-			Version: m.Version})
+			Version: m.Version, Context: m.Context})
 		body = append(body, m.Path...)
 		body = append(body, m.Text...)
 	}
@@ -620,7 +630,7 @@ func DecodeResponse(f Frame) (Response, error) {
 			Path: string(runs[outRuns+2*i]), Text: string(runs[outRuns+2*i+1]),
 			Line: m.Line, Col: m.Col, Len: m.Len,
 			LineStart: m.LineStart, LineEnd: m.LineEnd, ByteStart: m.ByteStart, ByteEnd: m.ByteEnd,
-			Version: m.Version})
+			Version: m.Version, Context: m.Context})
 	}
 	for i, m := range f.Header.Spans {
 		res.Spans = append(res.Spans, Span{Text: string(runs[matchRuns+i]), Author: m.Author})

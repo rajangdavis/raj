@@ -27,9 +27,11 @@ import (
 // internal/app that presses each of these and asserts the application still
 // reports it as unhandled, so implementing one without unlisting it fails the
 // build.
-var Unimplemented = map[Action]string{
-	CommandPalette: "no palette yet; the file picker is cmd+p",
-}
+//
+// It is empty today: every bound action has behaviour behind it. It stays
+// because the next action bound ahead of its handler belongs here, and the
+// keybinding tests read it either way.
+var Unimplemented = map[Action]string{}
 
 // Doc renders the keybinding reference as markdown.
 func Doc() string {

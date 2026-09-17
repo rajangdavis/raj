@@ -99,6 +99,47 @@ func TestBindNoneMasksGlobal(t *testing.T) {
 	}
 }
 
+// cmd+return expands all in the explorer and search panes without stealing
+// the editor's line-below. The chord is a scope override rather than a
+// Bindings row, so the global map keeps LineBelow and only the two panes that
+// hold a tree shadow it while they have focus.
+//
+// Each assertion pins a different half. Without the explorer/search binds both
+// panes fall through to the global LineBelow, so the ToggleExpandAll checks
+// fail. Without the override being scoped -- a Bindings row instead -- the
+// editor check fails, which is why that one is the proof the override did not
+// steal the editor's chord; the global check fails the same way. And without
+// the palette being left alone, the action would appear in Commands() with one
+// arbitrary chord.
+func TestToggleExpandAllIsScopedOverride(t *testing.T) {
+	k := NewKeymap()
+	if got := k.Lookup(Explorer, "super+enter"); got != ToggleExpandAll {
+		t.Errorf("explorer super+enter = %q, want %q", got, ToggleExpandAll)
+	}
+	if got := k.Lookup(Search, "super+enter"); got != ToggleExpandAll {
+		t.Errorf("search super+enter = %q, want %q", got, ToggleExpandAll)
+	}
+	if got := k.Lookup(Editor, "super+enter"); got != LineBelow {
+		t.Errorf("editor super+enter = %q, want %q; the override must not steal the editor's chord", got, LineBelow)
+	}
+	if got := k.Lookup(Global, "super+enter"); got != LineBelow {
+		t.Errorf("global super+enter = %q, want %q", got, LineBelow)
+	}
+	// The wire chord must reach the scoped action, not merely the chord
+	// string: 13;9u is cmd+return, and the scoped chords elsewhere in this
+	// file prove themselves from CSI-u too.
+	if a, _, ok := k.Resolve(Explorer, mustParse(t, "\x1b[13;9u")); !ok || a != ToggleExpandAll {
+		t.Errorf("explorer 13;9u resolved to (%q, %v), want %q", a, ok, ToggleExpandAll)
+	}
+	// A scope-only action has no single chord to show, so the palette omits it
+	// the way it omits Indent and Outdent on tab.
+	for _, c := range Commands() {
+		if c.Action == ToggleExpandAll {
+			t.Errorf("toggle_expand_all is in the palette with chord %q; scope overrides are deliberately absent", c.Chord)
+		}
+	}
+}
+
 // Shift+alternates: the shifted codepoint must not be mistaken for the base key
 // when naming the chord, or shift+a would bind as "shift+A".
 func TestShiftedAlternateNaming(t *testing.T) {
@@ -357,5 +398,40 @@ func TestInlayHintsToggleChordResolves(t *testing.T) {
 	}
 	if why := Unimplemented[ToggleInlayHints]; why != "" {
 		t.Errorf("the inlay-hints toggle is listed as unimplemented: %s", why)
+	}
+}
+
+// The fold toggle is a bound, implemented chord: the canonical name resolves,
+// the CSI-u payload the table pins decodes to it, and it is deliberately absent
+// from Unimplemented. Without the binding ctrl+super+c resolves to nothing and
+// the chord is a dead key.
+func TestFoldToggleChordResolves(t *testing.T) {
+	k := NewKeymap()
+	if got := k.Lookup(Editor, "ctrl+super+c"); got != ToggleFold {
+		t.Errorf("ctrl+super+c = %q, want %q", got, ToggleFold)
+	}
+	if a, _, ok := k.Resolve(Editor, mustParse(t, "\x1b[99;13u")); !ok || a != ToggleFold {
+		t.Errorf("99;13u resolved to (%q, %v), want %q", a, ok, ToggleFold)
+	}
+	if why := Unimplemented[ToggleFold]; why != "" {
+		t.Errorf("the fold toggle is listed as unimplemented: %s", why)
+	}
+}
+
+// The context-menu action is a bound, implemented chord: the canonical name
+// resolves, the CSI-u payload the table pins decodes to it, and it is
+// deliberately absent from Unimplemented. Without the OpenMenu binding
+// shift+f10 resolves to nothing, so the menu a right-click opens has no
+// keyboard entry — the parity this action exists to provide.
+func TestOpenMenuChordResolves(t *testing.T) {
+	k := NewKeymap()
+	if got := k.Lookup(Editor, "shift+f10"); got != OpenMenu {
+		t.Errorf("shift+f10 = %q, want %q", got, OpenMenu)
+	}
+	if a, _, ok := k.Resolve(Editor, mustParse(t, "\x1b[21;2~")); !ok || a != OpenMenu {
+		t.Errorf("21;2~ resolved to (%q, %v), want %q", a, ok, OpenMenu)
+	}
+	if why := Unimplemented[OpenMenu]; why != "" {
+		t.Errorf("open_menu is listed as unimplemented: %s", why)
 	}
 }

@@ -244,6 +244,24 @@ type BufferHost interface {
 	// answer to retry.
 	LSPInlayHints(path string, lineStart, lineEnd int) (LSPCaller, error)
 
+	// LSPFormat prepares a whole-document or range formatting request. lineStart
+	// and lineEnd are 1-based inclusive lines; both zero asks about the whole
+	// document, so the range form is "some lines were named". It syncs the
+	// document first, builds FormattingOptions from the buffer's indent style,
+	// and returns a caller that runs the blocking request off the event thread.
+	// A nil caller with a non-nil error is a clean "no server", "not ready" or
+	// "this server does not format" answer.
+	LSPFormat(path string, lineStart, lineEnd int) (LSPCaller, error)
+
+	// LSPWorkspaceSymbols prepares a project-wide symbol query. There is no
+	// position: the query is the whole request, and the path names the document
+	// whose server should answer it. Like LSP it syncs the document first, so
+	// the answer can name a symbol in unsaved text, and returns a caller that
+	// runs the blocking request off the event thread. A nil caller with a
+	// non-nil error is a clean "no server", "not ready" or "this server has no
+	// workspace symbols" answer.
+	LSPWorkspaceSymbols(path, query string) (LSPCaller, error)
+
 	// Dirty lists unsaved buffers and whether the human wrote any of the
 	// unsaved text in each. Called on the event thread, immediately before a
 	// command runs.
@@ -1316,6 +1334,66 @@ func sortedPaths(set map[string]bool) []string {
 	return out
 }
 
+// readPaths answers a read that names several targets in one call. Each path is
+// read exactly as a single-target read is, and every target is marked read only
+// once the whole call has succeeded, so the read-before-write gate is satisfied
+// for all of them together or none. The results share the response's body
+// rather than a new shape: Buffers carries each target's path and version and
+// the byte length of the text it contributed, and
+// Spans carries the concatenated text in request order. Both are shapes a
+// buffers reply and a single read already use, so no new wire field is needed
+// and an older peer that does not know the multi-target form reads the
+// concatenated text as it would have read a single target's.
+//
+// StatesJSON, when annotated, is the state runs of every target with their
+// offsets rebased onto the concatenation.
+func readPaths(g *Guard, req Request, start, end, lineStart, lineEnd int) Response {
+	res := Response{OK: true}
+	var states []StateRun
+	var names []string
+	off := 0
+	for _, p := range req.Paths {
+		name, err := g.canonical(p)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		spans, st, v, err := g.Host.Read(name, req.Author, start, end, lineStart, lineEnd, req.Annotated)
+		if err != nil {
+			// Name the target: a shared byte span can be out of range for one
+			// target and fine for the others, and resolveSpan refuses rather
+			// than clamps (a clamp across concurrent writers is silent
+			// corruption), so the caller needs to know which file to fix.
+			return Response{Err: name + ": " + err.Error()}
+		}
+		n := 0
+		for _, sp := range spans {
+			n += len(sp.Text)
+		}
+		for _, r := range st {
+			r.Off += off
+			states = append(states, r)
+		}
+		res.Spans = append(res.Spans, spans...)
+		res.Buffers = append(res.Buffers, Buffer{Path: name, Version: v, Bytes: n})
+		names = append(names, name)
+		off += n
+	}
+	// Mark every target read only now: a failure partway through returned
+	// without marking anything, so an apply to an earlier target is still
+	// refused as blind rather than satisfied by text the caller never got.
+	for _, name := range names {
+		g.markRead(req.Author, name)
+	}
+	if len(states) > 0 {
+		data, err := json.Marshal(states)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		res.StatesJSON = string(data)
+	}
+	return res
+}
+
 // Dispatch turns one decoded request into a response. It is the only place the
 // verbs are interpreted, so the socket adapter and an in-process caller cannot
 // diverge about what an op means.
@@ -1425,6 +1503,9 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		if req.LineEnd != nil {
 			lineEnd = *req.LineEnd
+		}
+		if len(req.Paths) > 0 {
+			return readPaths(g, req, start, end, lineStart, lineEnd)
 		}
 		spans, states, v, err := g.Read(req.Path, req.Author, start, end, lineStart, lineEnd, req.Annotated)
 		if err != nil {
@@ -1581,6 +1662,30 @@ func Dispatch(g *Guard, req Request) Response {
 				lineEnd = *req.LineEnd
 			}
 			caller, err = g.Host.LSPInlayHints(name, lineStart, lineEnd)
+		} else if req.LSPMode == "format" || req.LSPMode == "range-format" {
+			// Formatting shares the range encoding with inlay-hints: both zero
+			// means the whole document, and any lines named mean a range over
+			// them. The capability gate and the FormattingOptions live in the
+			// host, which is also where the buffer's indent style is read.
+			lineStart, lineEnd := 0, 0
+			if req.LineStart != nil {
+				lineStart = *req.LineStart
+			}
+			if req.LineEnd != nil {
+				lineEnd = *req.LineEnd
+			}
+			caller, err = g.Host.LSPFormat(name, lineStart, lineEnd)
+		} else if req.LSPMode == "symbols" {
+			// The query rides the request's generic Query field rather than a
+			// field of its own: the wire already carries a run of query text,
+			// and no other part of an lsp request uses it. The position is not
+			// sent — workspace/symbol is not asked about a place — but the CLI
+			// still requires one for the lsp verb's shape.
+			query := ""
+			if req.Query != nil {
+				query = req.Query.Text
+			}
+			caller, err = g.Host.LSPWorkspaceSymbols(name, query)
 		} else {
 			caller, err = g.Host.LSP(name, req.Line, req.Col, req.LSPMode)
 		}

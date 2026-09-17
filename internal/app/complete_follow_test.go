@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 
 	"raj/internal/lsp"
@@ -271,5 +272,38 @@ func TestEscapeClosesTheHoverPanelFirst(t *testing.T) {
 	}
 	if !h.Pane().Cursors.Primary().HasSelection() {
 		t.Error("escape also cleared the selection; the panel should have claimed it")
+	}
+}
+
+// The panel scrolls without moving the caret: the key belongs to the box while
+// it overflows, and the document underneath stays where it was. Escape still
+// dismisses it. Modelled on TestHoverPanelClosesOnAnyAction.
+func TestHoverPanelScrollsWithoutMovingTheCaret(t *testing.T) {
+	h := newHarnessSize(t, "package main\n\nfunc F() {}\n", 100, 24)
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerHover, text: strings.Repeat("doc line\n", 30)})
+	h.applyAnswer()
+	h.Draw() // the panel learns its geometry before any key is handled
+	if !h.Hover.Scrollable() {
+		t.Fatal("setup: the panel does not overflow")
+	}
+
+	head := h.Pane().Cursors.Primary().Head
+	top := h.Hover.Top()
+	h.press("down")
+
+	if !h.Hover.Open {
+		t.Fatal("the panel closed instead of scrolling")
+	}
+	if h.Hover.Top() == top {
+		t.Error("down did not scroll the panel")
+	}
+	if got := h.Pane().Cursors.Primary().Head; got != head {
+		t.Errorf("caret moved from %d to %d while the panel scrolled", head, got)
+	}
+
+	h.press("esc")
+	if h.Hover.Open {
+		t.Error("escape did not dismiss the scrollable panel")
 	}
 }

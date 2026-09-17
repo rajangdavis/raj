@@ -20,6 +20,11 @@ type Tabs struct {
 	active int
 	closed []string
 	tab    int
+	// preview is the index of the one reusable preview pane, or -1 when there
+	// is none. A preview is a tab like any other except that arrowing through
+	// the explorer replaces it rather than opening beside it; opening the
+	// previewed path for real clears the marking. See OpenPreview.
+	preview int
 
 	// IndentTabs is the fallback style for buffers with nothing to detect —
 	// a new file, or one with no indentation yet. A file that answers for
@@ -28,7 +33,7 @@ type Tabs struct {
 }
 
 // New returns an empty tab set. tab is the indent width for files it opens.
-func New(tabWidth int) *Tabs { return &Tabs{tab: tabWidth} }
+func New(tabWidth int) *Tabs { return &Tabs{tab: tabWidth, preview: -1} }
 
 func (t *Tabs) Count() int          { return len(t.panes) }
 func (t *Tabs) All() []*editor.Pane { return t.panes }
@@ -54,6 +59,10 @@ func (t *Tabs) Open(path string) (*editor.Pane, error) {
 	for i, p := range t.panes {
 		if p.File.Path == path {
 			t.active = i
+			// A preview is provisional: opening its path for real makes it an
+			// ordinary tab, so enter in the explorer commits what the arrows
+			// were only showing.
+			t.Promote(p)
 			return p, nil
 		}
 	}
@@ -66,6 +75,91 @@ func (t *Tabs) Open(path string) (*editor.Pane, error) {
 	t.panes = append(t.panes, pane)
 	t.active = len(t.panes) - 1
 	return pane, nil
+}
+
+// OpenPreview shows path in a single reusable preview tab.
+//
+// Arrowing through the file tree must not spray a tab per file it passes over,
+// so there is one provisional slot. A path already open anywhere is shown as it
+// is; otherwise a clean preview pane is replaced in place and a dirty one is
+// promoted to an ordinary tab rather than discarded, because a preview is still
+// unsaved work. The caller decides whether to move focus: this only makes the
+// pane active, so the explorer keeps the keys.
+func (t *Tabs) OpenPreview(path string) (*editor.Pane, error) {
+	for i, p := range t.panes {
+		if p.File.Path == path {
+			t.active = i
+			return p, nil
+		}
+	}
+	f, err := editor.Open(path, t.tab)
+	if err != nil {
+		return nil, err
+	}
+	f.SetIndentDefault(editor.Indent{Tabs: t.IndentTabs, Width: t.tab})
+	return t.installPreview(editor.NewPane(f)), nil
+}
+
+// PreviewPane makes an already-built pane the preview, or focuses it when it is
+// already open. It is for a buffer that exists without a tab -- a headless one a
+// caller is revealing -- so previewing it shows the same document rather than
+// reading a second copy from disk.
+func (t *Tabs) PreviewPane(p *editor.Pane) {
+	for i, q := range t.panes {
+		if q == p {
+			t.active = i
+			return
+		}
+	}
+	t.installPreview(p)
+}
+
+// installPreview puts p in the preview slot: replacing a clean preview, or
+// appending and leaving a dirty one in place as an ordinary tab.
+func (t *Tabs) installPreview(p *editor.Pane) *editor.Pane {
+	if t.preview >= 0 && t.preview < len(t.panes) {
+		if t.panes[t.preview].File.ViewDirty() {
+			// The old preview has unsaved work, so it cannot be dropped: it
+			// stops being the preview and the new pane takes the slot.
+			t.preview = -1
+		} else {
+			t.panes[t.preview] = p
+			t.active = t.preview
+			return p
+		}
+	}
+	t.panes = append(t.panes, p)
+	t.preview = len(t.panes) - 1
+	t.active = t.preview
+	return p
+}
+
+// Promote clears p's preview marking, if it holds one. Opening a previewed file
+// for real calls this, so the tab stops being provisional.
+func (t *Tabs) Promote(p *editor.Pane) {
+	if p != nil && t.preview >= 0 && t.preview < len(t.panes) && t.panes[t.preview] == p {
+		t.preview = -1
+	}
+}
+
+// Preview is the live preview pane, or nil when there is none.
+func (t *Tabs) Preview() *editor.Pane {
+	if t.preview < 0 || t.preview >= len(t.panes) {
+		return nil
+	}
+	return t.panes[t.preview]
+}
+
+// Contains reports whether p is one of the open tabs. A caller that replaced a
+// preview can use it to tell a pane that was dropped in place from one that was
+// promoted and kept.
+func (t *Tabs) Contains(p *editor.Pane) bool {
+	for _, q := range t.panes {
+		if q == p {
+			return true
+		}
+	}
+	return false
 }
 
 // Add takes an already-built pane, for buffers not read from disk.
@@ -158,10 +252,17 @@ func (t *Tabs) Focus(p *editor.Pane) bool {
 	return false
 }
 
-// Paths lists the open files in order, for session persistence.
+// Paths lists the open files in order, for session persistence. A preview tab
+// is left out: it is transient view state, not a file the user committed to.
 func (t *Tabs) Paths() []string {
 	out := make([]string, 0, len(t.panes))
-	for _, p := range t.panes {
+	for i, p := range t.panes {
+		// A preview is transient, so it is left out: arrowing through files
+		// must not churn the session file, and a restart has no reason to
+		// reopen a file nobody committed to.
+		if i == t.preview {
+			continue
+		}
 		out = append(out, p.File.Path)
 	}
 	return out
@@ -236,6 +337,12 @@ func (t *Tabs) CloseIndex(i int) {
 		t.closed = append(t.closed, p.File.Path)
 	}
 	t.panes = append(t.panes[:i], t.panes[i+1:]...)
+	if t.preview == i {
+		// The preview was closed; there is nothing left to reuse.
+		t.preview = -1
+	} else if t.preview > i {
+		t.preview--
+	}
 	if t.active > i || t.active >= len(t.panes) {
 		t.active--
 	}
@@ -262,6 +369,11 @@ func (t *Tabs) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 		style := th.Dim
 		if i == t.active {
 			style = th.Active
+		}
+		// A preview is provisional; italic marks it without changing the
+		// label, so the bar's layout and hit-testing are untouched.
+		if i == t.preview {
+			style = style.Plus(ui.Italic)
 		}
 		if sp := spans[i]; sp.End > 0 && sp.Start < w {
 			at, text := sp.Start, label

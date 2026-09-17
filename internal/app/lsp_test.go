@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -145,6 +146,117 @@ func TestMultiLineHoverKeepsItsLines(t *testing.T) {
 	}
 }
 
+// A server that never advertised signature help is told apart from one with
+// nothing to say: the gate speaks before the request, in the same voice as the
+// no-server messages. A present-and-false provider means no.
+func TestSignatureHelpCapabilityGate(t *testing.T) {
+	const want = "language server does not support signature help"
+	if got := capabilityGap(nil, "signature help"); got != want {
+		t.Errorf("absent provider: gap = %q", got)
+	}
+	if got := capabilityGap(json.RawMessage(`false`), "signature help"); got != want {
+		t.Errorf("false provider: gap = %q", got)
+	}
+	if got := capabilityGap(json.RawMessage(`{"triggerCharacters":["("]}`), "signature help"); got != "" {
+		t.Errorf("advertised provider: gap = %q, want none", got)
+	}
+}
+
+// The host LSP gate accepts the signature mode. Without it wired into the mode
+// switch, host.LSP refuses it as "unknown lsp mode" before a server is ever
+// asked — the failure is in raj, not in the absence of a server.
+func TestSignatureHelpModeIsAcceptedByHostLSP(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	hs := host{a: h.App}
+	_, err := hs.LSP(h.Pane().File.Path, 1, 1, "signature")
+	// Whether a server is installed or not, the one wrong answer is a refusal
+	// of the mode itself: "no server" and a live caller are both correct here.
+	if err != nil && strings.Contains(err.Error(), "unknown lsp mode") {
+		t.Errorf("the signature mode was refused as unknown: %v", err)
+	}
+}
+
+// A signature answer opens the hover panel with the active signature and its
+// documentation, and does not move the caret: a signature help is something you
+// read, not a jump. It reuses the panel rather than a second widget.
+func TestSignatureHelpOpensThePanelWithoutMovingTheCaret(t *testing.T) {
+	h := newHarness(t, "package main\n\nfunc F(a int, b string) error { return nil }\n\nfunc G() { _ = F(1, \"x\") }\n")
+	head := h.Pane().Cursors.Primary().Head
+	h.lspGen = 1
+	h.park(lspAnswer{
+		gen:  1,
+		kind: answerSignature,
+		help: &lsp.SignatureHelp{
+			Signatures: []lsp.Signature{{
+				Label:         "func F(a int, b string) error",
+				Documentation: "F does a thing.",
+				Parameters: []lsp.Parameter{
+					{Label: "a int", Start: 7, End: 12, HasOffsets: true},
+					{Label: "b string", Start: 14, End: 22, HasOffsets: true},
+				},
+			}},
+			ActiveSignature: 0,
+			ActiveParameter: 1,
+		},
+		line: 1,
+		col:  3,
+	})
+	h.applyAnswer()
+
+	if !h.Hover.Open {
+		t.Fatal("no signature panel opened")
+	}
+	got := h.Hover.Text()
+	for _, want := range []string{"func F(a int, b string) error", "F does a thing."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel = %q, missing %q", got, want)
+		}
+	}
+	if h.Pane().Cursors.Primary().Head != head {
+		t.Error("the caret moved; a signature help must not jump")
+	}
+}
+
+// Nothing at the position is a word on the status line, not an empty overlay.
+func TestSignatureHelpNothingToShow(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerSignature})
+	h.applyAnswer()
+	if h.Hover.Open {
+		t.Error("an empty answer opened a panel")
+	}
+	if !strings.Contains(h.Status(), "no signature help") {
+		t.Errorf("status = %q", h.Status())
+	}
+}
+
+// A server sends parameter offsets in UTF-16 code units into the signature
+// label, the panel marks the active parameter with them, and the plain panel
+// text reads as the signature without the mark characters leaking through.
+func TestSignatureHelpMarksTheActiveParameter(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.lspGen = 1
+	h.park(lspAnswer{
+		gen:  1,
+		kind: answerSignature,
+		help: &lsp.SignatureHelp{
+			Signatures: []lsp.Signature{{
+				Label:      "func F(name string, n int)",
+				Parameters: []lsp.Parameter{{Label: "name string", Start: 7, End: 18, HasOffsets: true}, {Label: "n int", Start: 20, End: 25, HasOffsets: true}},
+			}},
+			ActiveSignature: 0,
+			ActiveParameter: 0,
+		},
+		line: 1,
+		col:  3,
+	})
+	h.applyAnswer()
+	if got := h.Hover.Text(); got != "func F(name string, n int)" {
+		t.Errorf("panel = %q, want the whole signature", got)
+	}
+}
+
 // A definition result moves the cursor to the named position, converting from
 // the server's UTF-16 coordinates to the buffer's byte offsets.
 func TestDefinitionJumps(t *testing.T) {
@@ -192,8 +304,284 @@ func TestServerSelection(t *testing.T) {
 			t.Errorf("%q got a server (state %d)", path, st)
 		}
 	}
-	if _, st := s.for_("/w/a.md", nil); st != serverNone {
-		t.Error("markdown has a language id but no configured server")
+	if _, st := s.for_("/w/a.java", nil); st != serverNone {
+		t.Error("java has a language id but no configured server")
+	}
+}
+
+// A markdown file must resolve to the remark server: LanguageID already names
+// the language, and the command table has to agree, or the editor reports a
+// markdown buffer as a file type with no server.
+func TestMarkdownFileResolvesToRemark(t *testing.T) {
+	// An empty PATH keeps the test hermetic: the binary is missing rather than
+	// started for real, and for_ still resolves the language. serverNone would
+	// mean no command was configured at all.
+	t.Setenv("PATH", "")
+	s := newServers("/w")
+	_, st := s.for_("/w/notes.md", nil)
+	if st == serverNone {
+		t.Fatal("a markdown file was reported as having no server configured")
+	}
+	if msg := st.message("/w/notes.md"); strings.Contains(msg, "file type") {
+		t.Errorf("message = %q; markdown is a supported file type", msg)
+	}
+	if msg := st.message("/w/notes.md"); !strings.Contains(msg, "remark-language-server") {
+		t.Errorf("message = %q, want it to name the remark server", msg)
+	}
+	// for_ consults exactly this entry after LanguageID, so the key and the
+	// --stdio argument are asserted where the lookup is decided.
+	got := command[lsp.LanguageID("/w/notes.md")]
+	want := []string{"remark-language-server", "--stdio"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("command[markdown] = %q, want %q", got, want)
+	}
+}
+
+// A server that never advertised references is told apart from one with nothing
+// to say: the gate speaks before the request, and its message names the feature
+// in the same voice as the no-server messages. A present-and-false provider is
+// the reason the capability fields are raw — it means no, and must not fail the
+// handshake.
+func TestReferencesCapabilityGate(t *testing.T) {
+	if got := capabilityGap(nil, "references"); got != "language server does not support references" {
+		t.Errorf("absent provider: gap = %q", got)
+	}
+	if got := capabilityGap(json.RawMessage(`false`), "references"); got != "language server does not support references" {
+		t.Errorf("false provider: gap = %q", got)
+	}
+	if got := capabilityGap(json.RawMessage(`{"workDoneProgress":true}`), "references"); got != "" {
+		t.Errorf("advertised provider: gap = %q, want none", got)
+	}
+}
+
+// The locations a references answer carries go to the picker, and Enter opens
+// the chosen use at its line and column. It reuses the picker path symbols
+// already jump through, so there is no second listing UI to keep in step.
+func TestReferencesOpenThePicker(t *testing.T) {
+	h := newHarness(t, "line one\nline two\nline three\n")
+	h.lspGen = 1
+	h.park(lspAnswer{
+		gen:  1,
+		kind: answerReferences,
+		locs: []lsp.Location{
+			{Path: h.Pane().File.Path, Range: lsp.Range{Start: lsp.Position{Line: 1, Character: 2}}},
+			{Path: h.Pane().File.Path, Range: lsp.Range{Start: lsp.Position{Line: 2, Character: 4}}},
+		},
+	})
+	h.applyAnswer()
+
+	if !h.Picker.Open || h.Focused() != FocusPicker {
+		t.Fatal("references did not open the picker")
+	}
+	if got := h.Picker.Results(); got != 2 {
+		t.Fatalf("picker results = %d, want 2", got)
+	}
+	h.press("enter")
+	if h.Picker.Open {
+		t.Error("choosing should close the picker")
+	}
+	line, col := cursorLine(h), cursorCol(h)
+	if line != 2 || col != 3 {
+		t.Errorf("cursor at %d:%d, want 2:3", line, col)
+	}
+}
+
+// No references is a word on the status line, not an empty overlay.
+func TestReferencesNotFound(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerReferences})
+	h.applyAnswer()
+	if h.Picker.Open {
+		t.Error("an empty answer opened the picker")
+	}
+	if !strings.Contains(h.Status(), "no references") {
+		t.Errorf("status = %q", h.Status())
+	}
+}
+
+// The provider set the campaign grows into is announced, or a server will not// Each sibling jump reads its own capability: a server that advertised one and
+// not another must be refused for the one it lacks, in the same voice as the
+// no-server messages, and reading the wrong field would ask for a method the
+// server will not answer.
+func TestSiblingJumpCapabilityGates(t *testing.T) {
+	caps := lsp.ServerCapabilities{
+		DeclarationProvider:    json.RawMessage(`true`),
+		TypeDefinitionProvider: json.RawMessage(`false`),
+		ImplementationProvider: json.RawMessage(`{"workDoneProgress":true}`),
+	}
+	cases := []struct {
+		name string
+		req  jumpRequest
+		want string
+	}{
+		{"declaration", declarationJump(), ""},
+		{"type definition", typeDefinitionJump(), "language server does not support type definition"},
+		{"implementation", implementationJump(), ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := capabilityGap(c.req.provider(caps), c.req.feature); got != c.want {
+				t.Errorf("gap = %q, want %q", got, c.want)
+			}
+		})
+	}
+	// An absent provider is a gap for each: a server that never mentioned the
+	// feature must not be asked, and the message names the feature.
+	for _, req := range []jumpRequest{declarationJump(), typeDefinitionJump(), implementationJump()} {
+		want := "language server does not support " + req.feature
+		if got := capabilityGap(req.provider(lsp.ServerCapabilities{}), req.feature); got != want {
+			t.Errorf("%s: absent provider gap = %q, want %q", req.feature, got, want)
+		}
+	}
+}
+
+// The host LSP gate accepts the three sibling modes. Without them wired into the
+// mode switch, host.LSP refuses each as "unknown lsp mode" before a server is
+// asked — the failure is in raj, not in the absence of a server.
+func TestSiblingJumpModesAreAcceptedByHostLSP(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	hs := host{a: h.App}
+	for _, mode := range []string{"declaration", "type-definition", "implementation"} {
+		if _, err := hs.LSP(h.Pane().File.Path, 1, 1, mode); err != nil && strings.Contains(err.Error(), "unknown lsp mode") {
+			t.Errorf("%s was refused as unknown: %v", mode, err)
+		}
+	}
+}
+
+// A declaration answer jumps like a definition, and the empty answer names the
+// feature rather than definition.
+func TestDeclarationJumps(t *testing.T) {
+	h := newHarness(t, "line one\nline two\nline three\n")
+	h.lspGen = 1
+	h.park(lspAnswer{
+		gen: 1, kind: answerJump, feature: "declaration", mode: jumpToFirst,
+		locs: []lsp.Location{{
+			Path:  h.Pane().File.Path,
+			Range: lsp.Range{Start: lsp.Position{Line: 2, Character: 5}},
+		}},
+	})
+	h.applyAnswer()
+
+	line, col := h.Pane().File.LineCol(h.Pane().Cursors.Primary().Head)
+	if line != 2 || col != 5 {
+		t.Errorf("cursor at %d:%d, want 2:5", line, col)
+	}
+}
+
+// No declaration is a word on the status line naming the lookup, not a silent
+// no-op and not "no definition found".
+func TestDeclarationNotFoundNamesTheFeature(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	head := h.Pane().Cursors.Primary().Head
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerJump, feature: "declaration", mode: jumpToFirst})
+	h.applyAnswer()
+	if h.Pane().Cursors.Primary().Head != head {
+		t.Error("the cursor moved with nothing found")
+	}
+	if !strings.Contains(h.Status(), "no declaration found") {
+		t.Errorf("status = %q", h.Status())
+	}
+}
+
+// Several implementations is the normal case, so the answer lists them and
+// Enter opens the chosen one. A single implementation jumps instead: an overlay
+// for one row is in the way.
+func TestImplementationPicksWhenSeveral(t *testing.T) {
+	h := newHarness(t, "line one\nline two\nline three\n")
+	h.lspGen = 1
+	h.park(lspAnswer{
+		gen: 1, kind: answerJump, feature: "implementation",
+		mode: pickWhenMany, title: "Implementations",
+		locs: []lsp.Location{
+			{Path: h.Pane().File.Path, Range: lsp.Range{Start: lsp.Position{Line: 1, Character: 2}}},
+			{Path: h.Pane().File.Path, Range: lsp.Range{Start: lsp.Position{Line: 2, Character: 4}}},
+		},
+	})
+	h.applyAnswer()
+
+	if !h.Picker.Open || h.Focused() != FocusPicker {
+		t.Fatal("several implementations did not open the picker")
+	}
+	h.press("enter")
+	if h.Picker.Open {
+		t.Error("choosing should close the picker")
+	}
+	line, col := cursorLine(h), cursorCol(h)
+	if line != 2 || col != 3 {
+		t.Errorf("cursor at %d:%d, want 2:3", line, col)
+	}
+}
+
+func TestSingleImplementationJumps(t *testing.T) {
+	h := newHarness(t, "line one\nline two\nline three\n")
+	h.lspGen = 1
+	h.park(lspAnswer{
+		gen: 1, kind: answerJump, feature: "implementation",
+		mode: pickWhenMany, title: "Implementations",
+		locs: []lsp.Location{{
+			Path:  h.Pane().File.Path,
+			Range: lsp.Range{Start: lsp.Position{Line: 2, Character: 5}},
+		}},
+	})
+	h.applyAnswer()
+	if h.Picker.Open {
+		t.Error("a single implementation opened the picker")
+	}
+	line, col := h.Pane().File.LineCol(h.Pane().Cursors.Primary().Head)
+	if line != 2 || col != 5 {
+		t.Errorf("cursor at %d:%d, want 2:5", line, col)
+	}
+}
+
+// The provider set the campaign grows into is announced, or a server will not
+// send the response shapes the later waves consume.
+func TestClientCapabilitiesAnnounceTheProviderSet(t *testing.T) {
+	caps := clientCapabilities()
+	td, _ := caps["textDocument"].(map[string]any)
+	if td == nil {
+		t.Fatal("no textDocument capabilities")
+	}
+	for _, name := range []string{
+		"hover", "definition", "declaration", "typeDefinition", "implementation",
+		"references", "documentHighlight", "completion", "signatureHelp",
+		"formatting", "rangeFormatting", "rename", "codeAction", "codeLens",
+		"documentSymbol", "documentLink", "semanticTokens",
+		"inlayHint", "foldingRange", "synchronization",
+	} {
+		if _, ok := td[name]; !ok {
+			t.Errorf("textDocument.%s is not advertised", name)
+		}
+	}
+	// foldingRange is advertised now that a feature requests it; without the
+	// advertisement a server never answers, and the fold toggle would have no
+	// ranges to toggle.
+	folding, ok := td["foldingRange"]
+	if !ok {
+		t.Error("textDocument.foldingRange is not advertised")
+	}
+	if _, isMap := folding.(map[string]any); !isMap {
+		t.Errorf("foldingRange = %T, want an options object", folding)
+	}
+
+	ws, _ := caps["workspace"].(map[string]any)
+	if ws == nil {
+		t.Fatal("no workspace capabilities")
+	}
+	for _, name := range []string{
+		"symbol", "configuration", "workspaceEdit", "executeCommand",
+		"didChangeWatchedFiles", "workspaceFolders",
+	} {
+		if _, ok := ws[name]; !ok {
+			t.Errorf("workspace.%s is not advertised", name)
+		}
+	}
+	// raj has one root and never sends workspace/didChangeWorkspaceFolders, so
+	// it must not claim folder support. true here asks servers for folder
+	// events and a workspace/workspaceFolders request nothing answers.
+	if got := ws["workspaceFolders"]; got != false {
+		t.Errorf("workspace.workspaceFolders = %v, want false for a single-root client", got)
 	}
 }
 
@@ -726,6 +1114,60 @@ func TestLSPSavedWithoutAServerIsHarmless(t *testing.T) {
 	}
 }
 
+// stubGopls puts a fake gopls on PATH so a start is observable in the server
+// table without a real language server. for_ records the entry synchronously,
+// before the handshake a stub cannot complete, so an assertion on the table
+// does not race the goroutine start.
+func stubGopls(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "gopls"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The stub goes first so it shadows a real gopls; the rest of PATH stays so
+	// the explorer tree's git lookups are unaffected by the save.
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// An ordinary save of an already-named file must not start a language server.
+// lspSaved stays live because a save is no reason to spawn something nothing
+// asked for; the gate is the rename, so a same-path save warms nothing even
+// with a server binary available. This pins the rule the rename gate relies
+// on, so a future change that warms on every save is caught here.
+func TestOrdinarySaveDoesNotWarmAServer(t *testing.T) {
+	stubGopls(t)
+	h := newHarness(t, "package main\n")
+	p := h.Pane()
+	h.write(p, p.File.Path, false, nil)
+	// The save landed, so the table is empty because nothing warmed and not
+	// because the write failed before the gate was reached.
+	if got := h.Status(); !strings.Contains(got, "saved") {
+		t.Fatalf("setup: the save did not land: status = %q", got)
+	}
+	if n := len(h.servers.byID); n != 0 {
+		t.Errorf("an ordinary save registered %d server(s), want none", n)
+	}
+}
+
+// The save that names a buffer is the first moment its language can be chosen,
+// so it must start the server then: without warmSaved, diagnostics and hints
+// wait for a hover or a reopen. The start is read out of the server table,
+// where for_ records it before the handshake finishes; the same-path save in
+// the test above is the negative half of the rename gate.
+func TestSaveAsWarmsTheLanguageServer(t *testing.T) {
+	stubGopls(t)
+	h := newHarness(t, "package main\n")
+	p := h.Pane()
+	renamed := filepath.Join(filepath.Dir(p.File.Path), "renamed.go")
+	h.write(p, renamed, false, nil)
+	if n := len(h.servers.byID); n != 1 {
+		t.Fatalf("the save-as registered %d server(s), want the go server started", n)
+	}
+	if _, ok := h.servers.byID["go"]; !ok {
+		t.Errorf("servers = %v, want the go server for the renamed .go file", h.servers.byID)
+	}
+}
+
 // openLanguages is the distinct language ids of the open panes, in the order
 // they are first seen. WarmServers starts one server per language, so a nil
 // pane, an unnamed buffer and a file type with no language must not appear in
@@ -798,5 +1240,225 @@ func TestServerInitOptionsTurnOnGoplsHints(t *testing.T) {
 		if got := serverInitOptions(id); got != nil {
 			t.Errorf("serverInitOptions(%q) = %#v, want nil", id, got)
 		}
+	}
+}
+
+// The server asks for settings and gets one null per item, in order. With no
+// settings surface the honest value is "unset"; the array length is the
+// contract that lets the server match answers to its requests. Inventing
+// settings would be worse than saying nothing is configured.
+func TestConfigurationIsAnsweredWithNulls(t *testing.T) {
+	ls := &langServer{}
+	res, rerr := ls.handleServerRequest(&lsp.Message{
+		Method: "workspace/configuration",
+		Params: json.RawMessage(`{"items":[{"section":"gopls"},{"section":"editor"}]}`),
+	})
+	if rerr != nil {
+		t.Fatalf("workspace/configuration refused: %v", rerr)
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != "[null,null]" {
+		t.Errorf("result = %s, want [null,null]", got)
+	}
+}
+
+// A showMessageRequest is dismissed rather than left hanging. The handler
+// returns no action item, which marshal turns into the protocol's null.
+func TestShowMessageRequestIsDismissed(t *testing.T) {
+	ls := &langServer{}
+	res, rerr := ls.handleServerRequest(&lsp.Message{
+		Method: "window/showMessageRequest",
+		Params: json.RawMessage(`{"type":1,"message":"restart?","actions":[{"title":"yes"}]}`),
+	})
+	if rerr != nil {
+		t.Fatalf("showMessageRequest refused: %v", rerr)
+	}
+	if res != nil {
+		t.Errorf("result = %#v, want the nil dismissal", res)
+	}
+}
+
+// A server-initiated edit is refused explicitly, so the server knows why it did
+// not land rather than waiting on silence. applied:false is the protocol's own
+// refusal shape, and the reason is what makes it actionable.
+func TestApplyEditIsRefusedExplicitly(t *testing.T) {
+	ls := &langServer{}
+	res, rerr := ls.handleServerRequest(&lsp.Message{
+		Method: "workspace/applyEdit",
+		Params: json.RawMessage(`{"edit":{"changes":{}}}`),
+	})
+	if rerr != nil {
+		t.Fatalf("applyEdit answered with an error: %v", rerr)
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Applied       bool   `json:"applied"`
+		FailureReason string `json:"failureReason"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("applyEdit result %s: %v", b, err)
+	}
+	if out.Applied {
+		t.Error("a server-initiated edit was reported as applied")
+	}
+	if out.FailureReason == "" {
+		t.Error("refusal carried no reason")
+	}
+}
+
+// Registration changes what the workspace-symbol gate allows. The server that
+// registers workspace/symbol after the handshake must be asked; one that never
+// registered it still reads as unsupported, and an unregistration closes the
+// gate again.
+func TestDynamicWorkspaceSymbolRegistrationOpensTheGate(t *testing.T) {
+	ls := &langServer{}
+	if got := ls.capabilityGapMethod(nil, "workspace/symbol", "workspace symbols"); got == "" {
+		t.Error("absent provider and no registration is not a gap")
+	}
+	ls.registerCapabilities(json.RawMessage(
+		`{"registrations":[{"id":"1","method":"workspace/symbol"}]}`))
+	if got := ls.capabilityGapMethod(nil, "workspace/symbol", "workspace symbols"); got != "" {
+		t.Errorf("dynamically registered workspace/symbol was gated: %q", got)
+	}
+	ls.unregisterCapabilities(json.RawMessage(
+		`{"unregisterations":[{"id":"1","method":"workspace/symbol"}]}`))
+	if got := ls.capabilityGapMethod(nil, "workspace/symbol", "workspace symbols"); got == "" {
+		t.Error("unregistration left the gate open")
+	}
+}
+
+// An unknown server request gets method-not-found rather than an empty success,
+// which is what a handler that fell through a switch would produce. The code is
+// the same one the connection sends with no handler at all.
+func TestUnknownServerRequestIsRefused(t *testing.T) {
+	ls := &langServer{}
+	_, rerr := ls.handleServerRequest(&lsp.Message{Method: "textDocument/futureFeature"})
+	if rerr == nil || rerr.Code != -32601 {
+		t.Errorf("error = %+v, want -32601", rerr)
+	}
+}
+
+// showMessage is user-facing and always reaches the status line; logMessage is
+// the log channel and only errors and warnings are worth the status line, since
+// info/log chatter would overwrite what other features put there.
+func TestServerMessagesHitTheStatusLine(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.applyServerMessage(lsp.ServerMessage{
+		Method: "window/showMessage", Type: lsp.MessageInfo, Message: "hello",
+	})
+	if got := h.Status(); got != "hello" {
+		t.Errorf("showMessage status = %q, want hello", got)
+	}
+	h.applyServerMessage(lsp.ServerMessage{
+		Method: "window/logMessage", Type: lsp.MessageInfo, Message: "chatter",
+	})
+	if got := h.Status(); got != "hello" {
+		t.Errorf("log info overwrote the status line: %q", got)
+	}
+	h.applyServerMessage(lsp.ServerMessage{
+		Method: "window/logMessage", Type: lsp.MessageWarning, Message: "careful",
+	})
+	if got := h.Status(); got != "careful" {
+		t.Errorf("log warning status = %q, want careful", got)
+	}
+}
+
+// Completion richness has to be announced or a server will not send it: the
+// documentation format, the resolve properties, and the 3.16/3.17 item shapes
+// the decoder reads.
+func TestClientCapabilitiesAdvertiseCompletionRichness(t *testing.T) {
+	caps := clientCapabilities()
+	td, _ := caps["textDocument"].(map[string]any)
+	comp, _ := td["completion"].(map[string]any)
+	ci, _ := comp["completionItem"].(map[string]any)
+	if ci == nil {
+		t.Fatal("no completionItem capabilities")
+	}
+	if ci["snippetSupport"] != true {
+		t.Errorf("snippetSupport = %v; the engine is not advertised", ci["snippetSupport"])
+	}
+	formats, _ := ci["documentationFormat"].([]string)
+	if len(formats) == 0 || formats[0] != "markdown" {
+		t.Errorf("documentationFormat = %v, want markdown first", formats)
+	}
+	rs, _ := ci["resolveSupport"].(map[string]any)
+	if rs == nil {
+		t.Fatal("resolveSupport is not advertised")
+	}
+	props, _ := rs["properties"].([]string)
+	if len(props) == 0 || props[0] != "documentation" {
+		t.Errorf("resolveSupport.properties = %v, want documentation", props)
+	}
+	if ci["labelDetailsSupport"] != true {
+		t.Errorf("labelDetailsSupport = %v, want true", ci["labelDetailsSupport"])
+	}
+	if ci["insertReplaceSupport"] != true {
+		t.Errorf("insertReplaceSupport = %v, want true", ci["insertReplaceSupport"])
+	}
+	list, _ := comp["completionList"].(map[string]any)
+	defaults, _ := list["itemDefaults"].([]string)
+	if len(defaults) == 0 {
+		t.Errorf("completionList.itemDefaults = %v, want the applied defaults", defaults)
+	}
+}
+
+// The popup shows the documentation a server sent with the item, through the
+// hover panel's markdown renderer. Buffer words carry none, so this only
+// appears for a server answer.
+func TestCompletionDocumentationIsShown(t *testing.T) {
+	h := newHarness(t, "handoff()\n\n")
+	h.press("ctrl+g")
+	h.typeText("2")
+	h.press("enter")
+	h.typeText("hand")
+	parkAnswer(h, "hand", []lsp.CompletionItem{{
+		Label:         "handleRequest",
+		Insert:        "handleRequest",
+		Documentation: "Does a thing.",
+	}})
+	// Draw exercises the popup's documentation renderer, so this covers the
+	// path that places and wraps the panel and not only the text it holds.
+	h.Draw()
+	if got := h.Complete.DocText(); !strings.Contains(got, "Does a thing.") {
+		t.Errorf("popup documentation = %q", got)
+	}
+}
+
+// A completionItem/resolve answer is applied to the item it names. The item's
+// data is the opaque key, so the answer finds the candidate and is memoised
+// against a later request for the same item.
+func TestResolvedCompletionDocumentationApplies(t *testing.T) {
+	h := newHarness(t, "handoff()\n\n")
+	h.press("ctrl+g")
+	h.typeText("2")
+	h.press("enter")
+	h.typeText("hand")
+	item := lsp.CompletionItem{
+		Label:  "handleRequest",
+		Insert: "handleRequest",
+		Data:   json.RawMessage(`{"i":1}`),
+	}
+	parkAnswer(h, "hand", []lsp.CompletionItem{item})
+	if got := h.Complete.DocText(); got != "" {
+		t.Fatalf("setup: documentation already present: %q", got)
+	}
+
+	h.park(lspAnswer{
+		kind: answerCompletionDoc, resolveKey: item.ResolveKey(),
+		doc: "Resolved docs.",
+	})
+	h.applyAnswer()
+
+	if got := h.Complete.DocText(); !strings.Contains(got, "Resolved docs.") {
+		t.Errorf("documentation = %q, want the resolved text", got)
+	}
+	if doc := h.completionDocs[item.ResolveKey()]; doc != "Resolved docs." {
+		t.Errorf("memo = %q, want the answer kept", doc)
 	}
 }

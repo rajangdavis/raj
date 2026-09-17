@@ -109,6 +109,16 @@ type Host interface {
 	// diff decides are already correct.
 	Invalidate()
 
+	// Repaint discards the host's record of what is on screen, so the next
+	// Present writes every cell — but it does NOT erase the terminal first.
+	//
+	// For a change raj itself caused, where the new frame covers every cell
+	// and no other writer has touched the screen, a full write is enough. The
+	// erase Invalidate emits would blank the screen for an instant, which
+	// reads as a flash; repainting without it looks like the layout simply
+	// moved.
+	Repaint()
+
 	// Suspend backgrounds the process, restoring the terminal first and
 	// rebuilding it on resume. A Suspended event follows.
 	Suspend() error

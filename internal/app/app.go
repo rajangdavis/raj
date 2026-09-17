@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"raj/internal/keys"
 	"raj/internal/lsp"
 	"raj/internal/picker"
+	"raj/internal/piecetable"
 	"raj/internal/problems"
 	"raj/internal/prompt"
 	"raj/internal/search"
@@ -44,6 +44,13 @@ type App struct {
 	Picker   *picker.Picker
 	Prompt   *prompt.Prompt
 	Complete complete.Popup
+	// snippet is the active snippet-expansion session, if any. It owns tab and
+	// shift+tab while it runs, so the editor's indent is suspended only across
+	// the stops of a completion the user just accepted; any other key ends it.
+	// It lives on the app rather than in the popup because accept closes the
+	// popup and the session outlives it, and it moves the caret in buffer
+	// coordinates the completion package never sees.
+	snippet snippetSession
 	// Hover is the floating panel for a language server's answer. Separate
 	// from Complete because the two can be open at once and mean different
 	// things: one is what you are typing, the other what you are reading.
@@ -51,6 +58,20 @@ type App struct {
 	// Problems is the workspace-wide diagnostics list. A view over a.diags,
 	// refreshed when that changes rather than owning any state of its own.
 	Problems *problems.Pane
+	// Menu is the right-click context menu. It floats above the panes and the
+	// picker, and the pointer gives it first refusal while it is open. Its
+	// Show/Handle/Render state lives in the widget; menuTarget is the app's
+	// record of what it is about, so a chosen item dispatches to the same
+	// entry point the keyboard already uses.
+	Menu widget.Menu
+	// menuTarget is what the open menu acts on, captured when it opens and
+	// cleared when it closes.
+	menuTarget menuTarget
+	// menuAnchorCol and menuAnchorRow are where the gesture asked for the
+	// menu; menuCol and menuRow are where the last frame drew it, which is
+	// what the pointer hit-tests against.
+	menuAnchorCol, menuAnchorRow int
+	menuCol, menuRow             int
 
 	// completeCache holds each buffer's words, keyed by its version, so typing
 	// rescans only the buffer being typed into. Without it, completion cost
@@ -75,6 +96,15 @@ type App struct {
 	// would make them cancel each other.
 	inlayGen int
 
+	// codeActionList is the last code-action answer, held for the picker rows to
+	// index into: the picker reports which row was chosen, and the action that
+	// row names lives here. codeActionPath is the document the request was made
+	// for, so a chosen command can find the same server that offered it, and
+	// codeActionVersions pins the open documents so a stale edit is refused.
+	codeActionList     []lsp.CodeAction
+	codeActionPath     string
+	codeActionVersions map[string]int
+
 	// cached is the last completion list a server returned, kept only when the
 	// server said the list was complete. A complete list is everything that
 	// could go at that point, so a longer prefix can only be a subset of it and
@@ -87,6 +117,15 @@ type App struct {
 	// forever, so a large package would show a handful of results that never
 	// improve however much more is typed.
 	cached completionCache
+
+	// completionDocs memoises completionItem/resolve answers by the item's
+	// opaque resolve key, so arrowing back through a list does not ask again
+	// and a later list carrying the same item shows its documentation at once.
+	completionDocs map[string]string
+	// resolvePending marks the resolve keys with a request in flight, so
+	// arrowing across an item and back does not send a second one before the
+	// first answers. It is cleared when the popup closes.
+	resolvePending map[string]bool
 
 	// diags is the current problems per file, published by servers rather than
 	// requested.
@@ -101,6 +140,33 @@ type App struct {
 	// range — so the idle tick asks again only when one of those has moved.
 	inlayReq inlayRequest
 
+	// lenses is the last code-lens answer per file, keyed by path and carrying
+	// the document version it describes. Like inlays it is filled from a
+	// goroutine and installed on the event thread.
+	lenses *lensStore
+	// lensGen is the cancellation generation for lens answers, separate from
+	// inlayGen because the two are requested and superseded independently.
+	lensGen int
+	// lensReq records the last lens request — path and document version — so
+	// the idle tick asks again only when the text has moved.
+	lensReq lensReq
+	// onTypeGen is the cancellation generation for on-type formatting answers,
+	// separate for the same reason lensGen is separate from inlayGen: it is a
+	// keystroke's answer and later typing supersedes it, not a cursor move.
+	onTypeGen int
+
+	// semantics is the last semantic-token overlay per file, keyed by path and
+	// carrying the document version it describes. Like lenses it is filled
+	// from a goroutine and installed on the event thread.
+	semantics *semanticStore
+	// semanticGen is the cancellation generation for semantic-token answers,
+	// separate from lensGen because the two are requested and superseded
+	// independently.
+	semanticGen int
+	// semanticReq records the last semantic-token request — path and document
+	// version — so the idle tick asks again only when the text has moved.
+	semanticReq semanticReq
+
 	// drag tracks a press-and-hold in the editor, and click counts a rapid
 	// sequence in one place so double and triple clicks can mean something.
 	drag bool
@@ -114,14 +180,32 @@ type App struct {
 	// can re-extend the selection to it after scrolling.
 	dragCol, dragRow int
 	click            clickTracker
-	lspMu            sync.Mutex
-	lspAnswer        *lspAnswer
+	// hintHover is the pointer tooltip state. The panel it shows is the same
+	// hover.Panel the caret-driven document hover writes, so it carries the
+	// text and anchor it showed to tell its own box from a replacement.
+	hintHover hintHover
+	lspMu     sync.Mutex
+	lspAnswer *lspAnswer
+	// saveAnswer is the parked willSaveWaitUntil answer, on its own slot so a
+	// save cannot be lost to another answer overwriting the shared slot.
+	saveAnswer *lspAnswer
+	// saveGen correlates a willSaveWaitUntil request with its answer; a later
+	// save gesture bumps it to supersede the earlier request.
+	saveGen int
+	// pendingWrite is the save waiting on that answer. Event-thread only, like
+	// the buffers it names.
+	pendingWrite *pendingWrite
 
 	root    string
 	sidebar Sidebar
 	focus   Focus
 	theme   editor.Theme
 	wth     widget.Theme
+
+	// previewPath is the path last shown in the reusable preview tab, so
+	// arrowing only reloads when the selection actually changed. It is the
+	// app's memo; Tabs holds the authoritative preview pane.
+	previewPath string
 
 	Debug     debugLog
 	clipboard editor.Clip
@@ -140,6 +224,12 @@ type App struct {
 	InlayHints bool
 	dark       bool
 	lastLayout Layout
+	// lastCols and lastRows are the frame size lastLayout was drawn at, so a
+	// size change can be told from a same-size layout change: the former is
+	// the terminal's doing and must clear, the latter is raj's own and may
+	// repaint without erasing. They are zero on the first frame, which is what
+	// makes that frame clear too.
+	lastCols, lastRows int
 	// promptReturn is where focus goes when a dialog closes. Captured when the
 	// first prompt in a chain opens, so an overwrite check answered three
 	// dialogs deep still lands back where the user was.
@@ -173,6 +263,18 @@ type App struct {
 	sessionDirty bool
 	sessionSaved time.Time
 	sessionTabs  string
+
+	// compactAt debounces the idle compaction pass so the origin-index walk does
+	// not run on every tick, and compacted records the (session version,
+	// decision generation) each pane was last attempted at. Compact leaves the
+	// version where it found it and a decision moves only the generation, so a
+	// pane whose pair has not moved has nothing new to fold and is skipped
+	// before Compact builds its origin index. The map is keyed on the pane, so
+	// compactTick prunes it to the live tabs first: a closed pane would
+	// otherwise outlive its buffer, and the allocator can hand its pointer to a
+	// new pane that then inherits the stale pair.
+	compactAt time.Time
+	compacted map[*editor.Pane]compactSeen
 
 	// journals is the op-log tap per buffer path, nil until the first dirty
 	// tick opens one. journalSaved debounces the append the same way
@@ -220,6 +322,12 @@ type App struct {
 	// removed until the user approves in the review tab.
 	pendingDirRemovals map[string]control.DirRemoval
 
+	// pendingRemovals is the arrival order of pendingDeletions and
+	// pendingDirRemovals, so the re-raise key can present the oldest proposal
+	// first. The maps hold the proposals; this is only the queue. See
+	// removals.go.
+	pendingRemovals []pendingRemoval
+
 	// deletionPromptPane is the active pane the deletion gate last evaluated.
 	// The tracked pane is what makes the gate once per focus: a pane that has
 	// not changed leaves it alone, and focusing the path again re-raises the
@@ -250,6 +358,8 @@ func New(host ui.Host, root string, tabWidth int) *App {
 		servers:       newServers(root),
 		diags:         newDiagnostics(),
 		inlays:        newInlayStore(),
+		lenses:        newLensStore(),
+		semantics:     newSemanticStore(),
 		Picker:        picker.New(root),
 		Prompt:        prompt.New(),
 		root:          root,
@@ -351,19 +461,70 @@ func (a *App) OpenFile(path string) {
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
 	p.Hints = a.InlayHints
-	// A Makefile whose recipe lines are indented with spaces is already broken,
-	// and make's own message names a line rather than the cause. Raj indents the
-	// next line correctly and leaves the rest alone, so without this the file
-	// stays broken silently.
-	if w := p.File.IndentWarning(); w != "" {
-		a.status = w
-	}
 	a.focus = FocusEditor
 	// Opening a tab is the change most worth not losing to a crash: a cursor
 	// position is a scroll, a missing tab is a file you have to find again.
 	a.TouchSession()
-	a.status = ""
+	// A property of the file just opened is the one thing worth saying here;
+	// this assignment is the clear, so an empty warning leaves the status line
+	// quiet.
+	a.status = fileWarning(p.File)
 	a.maybePromptDeletion()
+}
+
+// previewFile shows path in the one reusable preview tab without moving focus
+// to the editor, so arrowing through the explorer loads a file without
+// committing to it. Enter goes through OpenFile instead, and that is what
+// focuses the editor and places the cursor.
+func (a *App) previewFile(path string) {
+	if path == "" {
+		return
+	}
+	old := a.Tabs.Preview()
+	var p *editor.Pane
+	if h, ok := a.findHeadless(path); ok {
+		// The file is already loaded — possibly carrying an agent's proposal.
+		// Reveal that same pane rather than reading a second copy from disk,
+		// which would leave one path with two tabs when enter announces the
+		// headless copy.
+		a.unregisterHeadless(h)
+		a.Tabs.PreviewPane(h)
+		p = h
+	} else {
+		var err error
+		p, err = a.Tabs.OpenPreview(path)
+		if err != nil {
+			// A preview is a glance, not a request: a binary or unreadable file
+			// is left unshown rather than answered with a dialog nobody asked
+			// for. Enter still reports it through OpenFile.
+			return
+		}
+	}
+	if old != nil && old != p && !a.Tabs.Contains(old) {
+		// The preview slot was reused, so the pane it held is gone. Forget what
+		// was keyed on its path the way closing its tab would.
+		a.closeDoc(old)
+	}
+	p.File.SetDark(a.host.Theme().Dark())
+	p.Wrap = a.WrapDefault
+	p.AutoPairs = a.AutoPairs
+	p.Hints = a.InlayHints
+	a.previewPath = path
+}
+
+// fileWarning is the sentence, if any, a freshly opened buffer owes the user:
+// mixed line endings that a save will normalise, or indentation the file's own
+// format rejects. Both are said when both hold; an ordinary file says nothing,
+// so the status line stays quiet.
+func fileWarning(f *editor.File) string {
+	var w []string
+	if enc := f.EncodingWarning(); enc != "" {
+		w = append(w, enc)
+	}
+	if indent := f.IndentWarning(); indent != "" {
+		w = append(w, indent)
+	}
+	return strings.Join(w, "; ")
 }
 
 // refuse says why a file was not opened, and puts focus back where it came from
@@ -410,9 +571,18 @@ const wheelRows = 3
 // something the user cannot see.
 func (a *App) mouse(ev ui.Mouse) {
 	if !ev.IsWheel {
+		if !ev.Motion || ev.Button != keys.MouseNone {
+			// A click (or a drag) moves the caret, which leaves the snippet's
+			// stops behind. A bare pointer move must not: the hand resting on
+			// the mouse would otherwise end every snippet.
+			a.endSnippet()
+		}
 		a.pointer(ev)
 		return
 	}
+	// A scroll moves the rows under a resting pointer, so a tooltip it opened
+	// no longer describes what is there.
+	a.hideHint()
 	delta := wheelRows
 	if ev.Button == keys.WheelUp {
 		delta = -wheelRows
@@ -494,6 +664,10 @@ func (a *App) summonCompletion(p *editor.Pane) {
 func (a *App) hideCompletion() {
 	a.Complete.Hide()
 	a.cached = completionCache{}
+	// A request in flight for a closed popup is still worth completing — its
+	// answer fills the memo — but its pending marker must not survive to block
+	// a fresh request for the same item later.
+	a.resolvePending = nil
 }
 
 // showCompletion offers candidates for the word the cursor is in, reporting
@@ -514,10 +688,12 @@ func (a *App) showCompletion(p *editor.Pane, minPrefix int) bool {
 	// list a row off. With no decisions DispPos is File.LineCol exactly, so a
 	// clean buffer is unchanged.
 	line, col := p.DispPos(head)
-	// The prefix stays in session bytes: PrefixAt indexes the line's text, and
-	// a hidden run is not on screen to be completed from.
-	sessionLine := p.File.LineOf(head)
-	prefix := complete.PrefixAt(p.File.Line(sessionLine), head-p.File.LineStart(sessionLine))
+	// The prefix comes from the row's own text, not the session line: a fold
+	// can cut a rejected run out from under the caret, and completing from the
+	// session bytes would then offer to replace text that is not on screen.
+	// The offset within the row is the caret minus the row's first session
+	// byte, so a clean row indexes its session line exactly as before.
+	prefix := complete.PrefixAt(p.RowText(line), head-p.DocAt(line, 0))
 	if len(prefix) < minPrefix {
 		a.hideCompletion()
 		return false
@@ -565,7 +741,25 @@ func (a *App) showItems(p *editor.Pane, prefix string, items []lsp.CompletionIte
 		if i >= complete.MaxResults {
 			break
 		}
-		c := complete.Candidate{Word: it.Insert, Detail: it.Detail}
+		c := complete.Candidate{
+			Word:          it.Insert,
+			Detail:        it.Detail,
+			Documentation: it.Documentation,
+			Snippet:       it.Snippet,
+		}
+		// Only an item the server left undocumented needs its handle carried:
+		// an item with documentation is already complete, and the handle is the
+		// item verbatim, which is large enough not to carry for nothing.
+		if c.Documentation == "" {
+			c.ResolveKey = it.ResolveKey()
+		}
+		if c.ResolveKey != "" {
+			// A memoised resolve answer is what makes backtracking to a
+			// previously-resolved item instant rather than a second request.
+			if text, ok := a.completionDocs[c.ResolveKey]; ok {
+				c.Documentation = text
+			}
+		}
 		if doc != nil {
 			if it.Edit != nil {
 				start, end := doc.Span(it.Edit.Range)
@@ -582,6 +776,11 @@ func (a *App) showItems(p *editor.Pane, prefix string, items []lsp.CompletionIte
 		cands = append(cands, c)
 	}
 	a.Complete.Show(prefix, cands, line, col)
+	if a.Complete.Open {
+		// The first item is selected; if its documentation was deferred, ask
+		// for it now so the panel fills without the user having to move.
+		a.resolveSelectedCompletion()
+	}
 	return a.Complete.Open
 }
 
@@ -628,6 +827,195 @@ func (a *App) completionSymbols(p *editor.Pane, path string) []string {
 	return names
 }
 
+// snippetSession is an accepted snippet awaiting its tab stops. The stops are
+// buffer offsets, so the session is app state: the completion package knows
+// only the template's own coordinates, and translating them to the buffer means
+// knowing where the insert landed.
+type snippetSession struct {
+	active bool
+	pane   *editor.Pane
+	stops  []snippetStop
+	at     int
+}
+
+// snippetStop is one stop in buffer coordinates: the caret selects
+// [start, start+length) when the session arrives at it.
+type snippetStop struct {
+	start  int
+	length int
+}
+
+// startSnippetSession selects the first stop of a freshly inserted snippet.
+// base is where the literal text landed, end is just past it, and stops are the
+// parser's offsets into that text. No stops means no session: the caret is left
+// at end, which is where an ordinary insert leaves it.
+func (a *App) startSnippetSession(p *editor.Pane, base, end int, stops []complete.TabStop) {
+	if p == nil {
+		return
+	}
+	if len(stops) == 0 {
+		a.endSnippet()
+		if end < 0 {
+			end = 0
+		}
+		if n := p.File.Len(); end > n {
+			end = n
+		}
+		p.Cursors.Set(end, end)
+		p.FollowCursor()
+		return
+	}
+	ss := snippetSession{active: true, pane: p}
+	for _, s := range stops {
+		ss.stops = append(ss.stops, snippetStop{start: base + s.Offset, length: s.Length})
+	}
+	a.snippet = ss
+	a.selectSnippetStop()
+}
+
+// selectSnippetStop puts the caret on the session's current stop, selecting its
+// placeholder text. The offsets are clamped to the buffer: the session ends on
+// any edit, but a socket write or a tab switch landing on the event thread
+// between two keys must not be able to point a selection past the end.
+func (a *App) selectSnippetStop() {
+	p := a.snippet.pane
+	if p == nil || a.snippet.at < 0 || a.snippet.at >= len(a.snippet.stops) {
+		return
+	}
+	n := p.File.Len()
+	start := a.snippet.stops[a.snippet.at].start
+	if start < 0 {
+		start = 0
+	}
+	if start > n {
+		start = n
+	}
+	end := start + a.snippet.stops[a.snippet.at].length
+	if end > n {
+		end = n
+	}
+	if end < start {
+		end = start
+	}
+	p.Cursors.Set(end, start)
+	p.FollowCursor()
+}
+
+// snippetNext advances to the next stop, ending the session past the last one.
+func (a *App) snippetNext() {
+	if !a.snippet.active {
+		return
+	}
+	if a.snippet.at+1 >= len(a.snippet.stops) {
+		a.endSnippet()
+		return
+	}
+	a.snippet.at++
+	a.selectSnippetStop()
+}
+
+// snippetPrev steps back to the previous stop. The first stop is a floor: shift
+// tab at the beginning of a snippet neither wraps nor cancels, so a mistaken key
+// cannot drop the caret into text the session was not showing.
+func (a *App) snippetPrev() {
+	if !a.snippet.active || a.snippet.at == 0 {
+		return
+	}
+	a.snippet.at--
+	a.selectSnippetStop()
+}
+
+// endSnippet forgets the session without touching the caret or the selection:
+// the selection it left is the editor's to clear or replace as usual.
+func (a *App) endSnippet() { a.snippet = snippetSession{} }
+
+// handleSnippetKey arbitrates a key against an active session, reporting
+// whether the session consumed the action.
+//
+// While a session runs, tab and shift+tab mean next and previous stop rather
+// than indent and outdent — that is the only thing the session claims. Escape
+// ends it and falls through, so the editor's cancel still drops the selection;
+// every other key, including a typed character, ends the session and is then
+// handled normally.
+func (a *App) handleSnippetKey(action keys.Action) bool {
+	switch action {
+	case keys.Indent:
+		a.snippetNext()
+		return true
+	case keys.Outdent:
+		a.snippetPrev()
+		return true
+	case keys.Cancel:
+		a.endSnippet()
+		return false
+	default:
+		a.endSnippet()
+		return false
+	}
+}
+
+// acceptSnippet applies a completion whose insert is a snippet template.
+//
+// It expands the template first and then uses the path the plain accept uses: a
+// candidate with a server edit goes through applyServerEdits, and one without
+// replaces the typed prefix through ReplaceRange. Either way the edit is one
+// change set and one undo, and the literal text — never the template — is what
+// reaches the buffer. The parser's stops are translated to buffer coordinates
+// and handed to startSnippetSession.
+func (a *App) acceptSnippet(p *editor.Pane, prefix string, c complete.Candidate) {
+	text, stops := complete.ParseSnippet(c.Snippet)
+	if c.Edit == nil {
+		head := p.Cursors.Primary().Head
+		start := head - len(prefix)
+		if start < 0 {
+			start = 0
+		}
+		// One Begin/End brackets the replacement: ReplaceRange deletes the
+		// prefix and inserts the expansion, and without the group that is two
+		// undo steps rather than the one the plain accept path costs.
+		p.File.Begin()
+		p.ReplaceRange(start, head, text)
+		p.File.End()
+		if g, ok := p.TakeLeaseRefusal(); ok {
+			// A pending or rejected set owns the span: nothing landed and there
+			// is no text to put a session on.
+			a.status = leaseNote(g)
+			return
+		}
+		a.startSnippetSession(p, start, start+len(text), stops)
+		a.Explorer.Tree.MarkChanged(p.File.Path)
+		return
+	}
+
+	primary := *c.Edit
+	// The server range end is where the cursor was when it answered, but more
+	// may have been typed since. Extend the replaced span to the cursor on the
+	// same line, exactly as the plain accept path does.
+	if head := p.Cursors.Primary().Head; head >= primary.End &&
+		p.File.LineOf(head) == p.File.LineOf(primary.End) {
+		primary.End = head
+	}
+	primary.Text = text
+	edits := make([]complete.Edit, 0, len(c.Additional)+1)
+	edits = append(edits, primary)
+	edits = append(edits, c.Additional...)
+	if group, ok := applyServerEdits(p, edits); !ok {
+		a.status = leaseNote(group)
+		return
+	}
+	// An additional edit before the primary — an import line — moves the
+	// primary text right, and the stops move with it. This is the same shift
+	// the plain path applies to the caret.
+	shift := 0
+	for _, e := range c.Additional {
+		if e.Start <= primary.Start {
+			shift += len(e.Text) - (e.End - e.Start)
+		}
+	}
+	a.startSnippetSession(p, primary.Start+shift, primary.Start+shift+len(text), stops)
+	a.Explorer.Tree.MarkChanged(p.File.Path)
+}
+
 // acceptCompletion applies the chosen candidate.
 //
 // A candidate with no server edit replaces the typed prefix with the word, as
@@ -637,9 +1025,16 @@ func (a *App) completionSymbols(p *editor.Pane, path string) []string {
 //
 // A candidate from a language server can instead carry a textEdit — a range to
 // overwrite — and additional edits such as an import line that must land with
-// it. Those are applied highest offset first so earlier ranges stay valid, as
-// one undo step.
+// it. Those go through applyServerEdits, the same one-undo-step path formatting
+// uses, so the word and its import land as one change set and one undo.
 func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candidate) {
+	// A new accept supersedes any session the previous one left running, so a
+	// snippet's stops cannot outlive the word that put them there.
+	a.endSnippet()
+	if c.Snippet != "" {
+		a.acceptSnippet(p, prefix, c)
+		return
+	}
 	if c.Edit == nil {
 		if c.Word == "" || !strings.HasPrefix(c.Word, prefix) {
 			return
@@ -664,19 +1059,12 @@ func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candida
 	edits := make([]complete.Edit, 0, len(c.Additional)+1)
 	edits = append(edits, primary)
 	edits = append(edits, c.Additional...)
-	// Highest offset first so earlier spans stay valid, and for equal starts
-	// the wider span first so an insertion at the same point lands before the
-	// word rather than inside it.
-	sort.SliceStable(edits, func(i, j int) bool {
-		if edits[i].Start != edits[j].Start {
-			return edits[i].Start > edits[j].Start
-		}
-		return edits[i].End > edits[j].End
-	})
-
-	p.File.Begin()
-	for _, e := range edits {
-		p.ReplaceRange(e.Start, e.End, e.Text)
+	if group, ok := applyServerEdits(p, edits); !ok {
+		// A pending or rejected change set owns part of the span. Nothing
+		// landed; name the set rather than completing into text the user has
+		// not decided on.
+		a.status = leaseNote(group)
+		return
 	}
 	// The cursor belongs after the word the user chose, not in an import line
 	// the server added at the top of the file.
@@ -693,7 +1081,6 @@ func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candida
 		at = n
 	}
 	p.Cursors.Set(at, at)
-	p.File.End()
 	p.FollowCursor()
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 }
@@ -722,6 +1109,79 @@ func (a *App) Run() error {
 		a.Draw()
 	}
 	return nil
+}
+
+// CompactInterval bounds how often the idle tick attempts piece compaction.
+//
+// Compaction is maintenance, not work the user asked for: a merge is
+// behaviour-neutral and a flatten copies only bytes a save already wrote, so it
+// can wait seconds rather than frames and never sits on the keystroke path.
+const CompactInterval = 2 * time.Second
+
+// compactSeen is the session state the last compaction pass saw for a pane.
+type compactSeen struct {
+	version piecetable.Version
+	gen     uint64
+}
+
+// pruneCompacted forgets the state of panes that are no longer open. The map is
+// keyed on the pane, so a closed pane's entry outlives it, and Go can hand its
+// pointer to a new buffer whose (version, generation) happens to match the
+// stale pair -- skipping the compaction the new buffer needs. Tabs.All is the
+// set compactTick is about to walk, so anything outside it is stale by
+// definition.
+func (a *App) pruneCompacted() {
+	for p := range a.compacted {
+		live := false
+		for _, q := range a.Tabs.All() {
+			if q == p {
+				live = true
+				break
+			}
+		}
+		if !live {
+			delete(a.compacted, p)
+		}
+	}
+}
+
+// compactTick folds fragmented pieces on idle buffers.
+//
+// It calls Compact within the guarantees Compact documents rather than around
+// them. The saved baseline is SavedVersion -- the version the last write put on
+// disk -- so a flatten can only copy a span whose every op is already
+// committed; an unsaved or undecided span is left in place. Compact refuses a
+// Proposed or Rejected span on its own, so a buffer holding unsaved proposals
+// keeps the pieces its review hunks are rendered from. The composed text, the
+// decisions and the projection are unchanged either way.
+//
+// Two guards keep it off the frame budget. The interval debounce makes most
+// ticks a clock comparison, and a pane whose session version and decision
+// generation have not moved since the last attempt is skipped before Compact
+// builds its origin index: Compact leaves the version where it found it, so an
+// idle buffer is never rescanned for one edit.
+func (a *App) compactTick(now time.Time) {
+	if !a.compactAt.IsZero() && now.Sub(a.compactAt) < CompactInterval {
+		return
+	}
+	a.compactAt = now
+	// Drop the state of panes that are no longer open before reading any of it,
+	// so a reused pane pointer cannot match a closed buffer's pair.
+	a.pruneCompacted()
+	for _, p := range a.Tabs.All() {
+		if p == nil || p.File == nil || p.File.Pieces() < 2 {
+			continue
+		}
+		seen := compactSeen{version: p.File.Session().Version(), gen: p.File.DecisionGeneration()}
+		if last, ok := a.compacted[p]; ok && last == seen {
+			continue
+		}
+		if a.compacted == nil {
+			a.compacted = map[*editor.Pane]compactSeen{}
+		}
+		p.File.Session().Compact(p.File.SavedVersion())
+		a.compacted[p] = seen
+	}
 }
 
 // Handle applies one event. Exported so tests can drive the app a step at a
@@ -753,11 +1213,15 @@ func (a *App) Handle(e ui.Event) {
 		// answer is parked the same way and collected here.
 		a.applyAnswer()
 		a.drainDiagnostics()
+		a.drainServerMessages()
 		a.drainControl()
 	case ui.Tick:
 		// A drag held outside the pane scrolls from here, because the pointer
 		// is not moving and so there is no event to hang it on.
 		a.autoScrollStep()
+		// A pointer resting on a hint has sent its last motion event, so the
+		// dwell that opens the tooltip is completed here.
+		a.dwellHint()
 		// A burst of inspection can leave the headless registry over its cap;
 		// dropping the clean ones here keeps the bound on the idle path as
 		// well as on load.
@@ -778,7 +1242,15 @@ func (a *App) Handle(e ui.Event) {
 		// visible range or the document version has moved, so this is a
 		// debounce rather than a request per keystroke.
 		a.maybeRequestHints(a.Tabs.Active())
+		// Code lenses are whole-document and change only when the text does,
+		// so the same idle tick asks for them once the version has moved.
+		a.maybeRequestLenses(a.Tabs.Active())
+		// Semantic tokens are whole-document and change only when the text
+		// does, so the same idle tick asks for them once the version has
+		// moved. They refine the chroma colours rather than replace them.
+		a.maybeRequestSemantic(a.Tabs.Active())
 		a.sessionTick(time.Now())
+		a.compactTick(time.Now())
 		a.journalTick(time.Now())
 		a.Debug.sample()
 	case ui.Quit:
@@ -793,6 +1265,28 @@ func (a *App) Handle(e ui.Event) {
 // handleKey resolves a chord in the focused scope, then gives the global
 // actions first refusal before the focused pane sees it.
 func (a *App) handleKey(k ui.Key) {
+	if a.Menu.Open() {
+		// A context menu is modal for the keys it draws: up/down/home/end,
+		// enter and esc belong to it, and a key it does not claim is swallowed
+		// rather than leaking to the pane underneath. Quit is the one
+		// exception, so a stray menu can never wedge the session.
+		//
+		// Resolution uses the global scope, not the focused pane's: the
+		// editor rebinds enter to a newline, and a menu opened over the
+		// editor must still treat enter as "choose".
+		action, _, ok := a.keymap.Resolve(keys.Global, k.Event)
+		if !ok {
+			return
+		}
+		if action == keys.Quit {
+			a.dispatch(action, "")
+			return
+		}
+		if key, chosen := a.Menu.Handle(action); chosen {
+			a.chooseMenu(key)
+		}
+		return
+	}
 	scope := a.scope()
 	action, text, ok := a.keymap.Resolve(scope, k.Event)
 	if !ok {
@@ -807,6 +1301,15 @@ func (a *App) handleKey(k ui.Key) {
 		a.settlePrompt()
 		return
 	}
+	a.dispatch(action, text)
+}
+
+// dispatch routes an action the way a key press does: the globals get first
+// refusal, then the focused pane handles it. The command palette runs a chosen
+// action through here rather than calling a handler directly, so a palette
+// entry does exactly what its chord does — the same review-mode refusals, the
+// same per-pane meaning, the same status notes.
+func (a *App) dispatch(action keys.Action, text string) {
 	if a.handleGlobal(action) {
 		return
 	}
@@ -814,7 +1317,24 @@ func (a *App) handleKey(k ui.Key) {
 
 	switch a.focus {
 	case FocusPicker:
-		a.openFromPicker(a.Picker.Handle(action, text))
+		path := a.Picker.Handle(action, text)
+		if cmd := a.Picker.Action(); cmd != keys.None {
+			// A palette choice names an action and closes the overlay; run it
+			// from the editor the palette leaves behind, rather than routing
+			// the action back into the picker that named it.
+			a.focus = FocusEditor
+			a.dispatch(cmd, "")
+			return
+		}
+		if i, chosen := a.Picker.ChosenCodeAction(); chosen {
+			// A code-action choice names an index into the answer the app is
+			// holding; run it from the editor the picker leaves behind, for the
+			// same reason a palette choice dispatches from there.
+			a.focus = FocusEditor
+			a.runCodeAction(i)
+			return
+		}
+		a.openFromPicker(path)
 		if !a.Picker.Open && a.focus == FocusPicker {
 			a.focus = FocusEditor
 		}
@@ -856,11 +1376,17 @@ func (a *App) scope() keys.Scope {
 // when the action was consumed.
 func (a *App) handleGlobal(action keys.Action) bool {
 	switch action {
+	case keys.OpenMenu:
+		a.openContextMenu()
+	case keys.CommandPalette:
+		a.commandPalette()
 	case keys.ToggleDebug:
 		a.Debug.Open = !a.Debug.Open
 		a.Debug.sample()
 	case keys.ToggleInlayHints:
 		a.toggleInlayHints()
+	case keys.ApplyInlayEdit:
+		a.applyInlayEdit()
 	case keys.Quit:
 		a.tryQuit()
 	case keys.Suspend:
@@ -889,6 +1415,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.cycleProposed(true)
 	case keys.PrevProposed:
 		a.cycleProposed(false)
+	case keys.PendingRemovals:
+		a.reopenPendingRemoval()
 	case keys.Cut:
 		// Cut is an edit. Copy stays live; and cut in a dialog's own field is
 		// not the document, so only the editor is refused.
@@ -899,6 +1427,10 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.clip(true)
 	case keys.Copy:
 		a.clip(false)
+	case keys.CopyRelPath:
+		// Palette-only: the command has no chord, and the palette dispatches
+		// it through this same switch. See keys.Unbound.
+		a.copyRelativePath()
 	case keys.FocusExplorer:
 		a.openSidebar(SidebarExplorer)
 	case keys.FocusSearch:
@@ -941,6 +1473,32 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.hover()
 	case keys.GotoDef:
 		a.gotoDefinition()
+	case keys.References:
+		a.findReferences()
+	case keys.GotoDecl:
+		a.gotoDeclaration()
+	case keys.GotoTypeDef:
+		a.gotoTypeDefinition()
+	case keys.GotoImpl:
+		a.gotoImplementation()
+	case keys.SignatureHelp:
+		a.signatureHelp()
+	case keys.CodeAction:
+		a.codeActions()
+	case keys.RunCodeLens:
+		a.runCodeLens()
+	case keys.ToggleFold:
+		a.toggleFold()
+	case keys.WorkspaceSymbols:
+		a.workspaceSymbols()
+	case keys.Rename:
+		a.renameSymbol()
+	case keys.Format:
+		a.formatDocument()
+	case keys.FormatRange:
+		a.formatSelection()
+	case keys.FollowLink:
+		a.followLink()
 	case keys.NewFile:
 		a.newFile()
 	case keys.CloseTab:
@@ -1011,7 +1569,22 @@ func (a *App) handleSidebar(action keys.Action, text string) {
 	case SidebarExplorer:
 		path, exit := a.Explorer.Handle(action, text)
 		if path != "" {
+			// Enter opens for real: OpenFile promotes the preview and hands
+			// focus to the editor.
+			a.previewPath = ""
 			a.OpenFile(path)
+		} else if !exit {
+			// Arrowing only previews. The selection is compared against what
+			// is already shown so a key that did not move the cursor does not
+			// reload anything, and a directory (or nothing) clears the memo so
+			// coming back to a file previews it afresh.
+			if sel, ok := a.Explorer.SelectedPath(); ok {
+				if sel != a.previewPath || a.Tabs.Preview() == nil {
+					a.previewFile(sel)
+				}
+			} else {
+				a.previewPath = ""
+			}
 		}
 		if exit {
 			a.focus = FocusEditor
@@ -1040,7 +1613,25 @@ func (a *App) handleSidebar(action keys.Action, text string) {
 func (a *App) handleEditor(action keys.Action, text string) {
 	p := a.Tabs.Active()
 	if p != nil && p.Find.Open {
+		// Enter arrives as the literal newline in the editor scope: the keymap
+		// masks Confirm there so the pane can insert a line. The bar wants the
+		// Confirm meaning — next match on the query row, replace on the
+		// replacement row — so normalize it before the review gate, or a
+		// refused replace would not be recognised as one.
+		if action == keys.None && text == "\n" {
+			action, text = keys.Confirm, ""
+		}
+		// The bar is delegated to before the ordinary read-only check, so a
+		// replace would otherwise bypass it. Ask the bar whether the key would
+		// change the document and refuse it here if Review mode holds the
+		// buffer. A refused replace must still drain the lease the pane
+		// recorded, which is what the note below the handle call is for.
+		if a.mode == ModeReview && p.Find.WouldEdit(action) {
+			a.status = reviewReadOnlyNote()
+			return
+		}
 		p.Find.Handle(p, action, text)
+		a.noteLeaseRefusal(p)
 		return
 	}
 	if p == nil {
@@ -1055,6 +1646,18 @@ func (a *App) handleEditor(action keys.Action, text string) {
 	// refused with a note rather than silently dropped.
 	if a.mode == ModeReview && a.reviewRefuses(action, text) {
 		return
+	}
+	// An active snippet session claims tab and shift+tab — the stop-navigation
+	// keys — before the editor sees them as indent and outdent. Every other key
+	// ends the session and is handled normally, so indent comes back the moment
+	// the user leaves the snippet. A session whose pane is no longer the active
+	// one is stale and is dropped.
+	if a.snippet.active {
+		if a.snippet.pane != p {
+			a.endSnippet()
+		} else if a.handleSnippetKey(action) {
+			return
+		}
 	}
 	// Summoning the popup is claimed before the popup itself sees keys, so
 	// pressing the chord while it is already open re-asks rather than being
@@ -1073,7 +1676,7 @@ func (a *App) handleEditor(action keys.Action, text string) {
 	// describing something that is no longer there — and a stale box floating
 	// over the code is worse than the status line it replaced, because it is
 	// bigger and looks more authoritative. Asking again is one chord.
-	if action != keys.Hover {
+	if action != keys.Hover && action != keys.SignatureHelp {
 		a.Hover.Hide()
 	}
 	// The completion popup sees keys before the editor, but claims only the
@@ -1085,6 +1688,10 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		if accepted {
 			a.acceptCompletion(p, prefix, c)
 			a.noteLeaseRefusal(p)
+		} else {
+			// Moving the highlight may have landed on an item whose
+			// documentation the server deferred.
+			a.resolveSelectedCompletion()
 		}
 		return
 	}
@@ -1096,10 +1703,13 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		a.offerCompletion(p, action == keys.Backspace)
 		return
 	}
+	before := int(p.File.Session().Version())
 	p.HandleText(text)
+	changed := int(p.File.Session().Version()) != before
 	a.noteLeaseRefusal(p)
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 	a.offerCompletion(p, true)
+	a.maybeOnTypeFormat(p, text, changed)
 }
 
 // noteLeaseRefusal drains a lease refusal the pane recorded during the last
@@ -1129,6 +1739,7 @@ func (a *App) paste(text string) {
 			a.status = reviewReadOnlyNote()
 			return
 		}
+		a.endSnippet()
 		a.pasteIntoBuffer(text)
 		return
 	}
@@ -1191,12 +1802,21 @@ func firstLine(s string) string {
 // there would be pedantry.
 // gotoSymbol lists the active file's declarations in the quick-open overlay.
 //
+// The source is the language server when one is live and advertises
+// documentSymbolProvider, and the leading-keyword scanner otherwise. The server
+// parses, so it sees a function assigned to a variable and does not name a
+// keyword inside a string; the scanner needs no server and answers instantly,
+// which is why it remains the fallback rather than being deleted.
+//
 // It reuses the picker rather than adding an overlay: a symbol answers with the
-// file it lives in and a line, which is the same shape a pasted path already
+// file it lives in and a place, which is the same shape a pasted path already
 // had, so opening and jumping is the path openFromPicker was already on.
 func (a *App) gotoSymbol() {
 	p := a.Tabs.Active()
 	if p == nil {
+		return
+	}
+	if a.documentSymbols(p) {
 		return
 	}
 	if !symbols.Supported(p.File.Path) {
@@ -1209,6 +1829,37 @@ func (a *App) gotoSymbol() {
 		return
 	}
 	a.Picker.ShowSymbols(p.File.Path, syms)
+	a.focus = FocusPicker
+	a.status = ""
+}
+
+// commandPalette lists the keymap actions in the quick-open overlay, so a
+// chord can be found by name and run without remembering it. It is the same
+// picker as files and symbols; the rows come from keys.Commands and choosing
+// one dispatches the action a chord would have resolved to.
+//
+// The palette does not list itself: running "command palette" from inside the
+// palette would only reopen it, and an entry that does nothing is the silent
+// no-op this list exists to avoid.
+func (a *App) commandPalette() {
+	all := keys.Commands()
+	rows := make([]picker.Command, 0, len(all))
+	for _, c := range all {
+		if c.Action == keys.CommandPalette {
+			continue
+		}
+		// A chordless command renders as its name alone: appending an empty
+		// chord would leave a trailing separator with nothing after it.
+		label := c.Name
+		if c.Chord != "" {
+			label += "  " + c.Chord
+		}
+		rows = append(rows, picker.Command{
+			Label:  label,
+			Action: c.Action,
+		})
+	}
+	a.Picker.ShowCommands(rows)
 	a.focus = FocusPicker
 	a.status = ""
 }
@@ -1294,9 +1945,15 @@ func (a *App) jumpToColumn(line, col int) {
 	p.Cursors.Set(off, off)
 }
 
-// jumpTo moves the active pane's cursor to a 1-based line and centres it.
-func (a *App) jumpTo(line int) {
-	p := a.Tabs.Active()
+// jumpToSessionLine moves p's caret to a 1-based session line and centres the
+// viewport on the display row that draws it. The line stays file-true and the
+// caret lands at that session line's start; only the viewport arithmetic moves
+// onto the display map, because a fold above the target shifts its row away
+// from its session line. A line a fold hides has no row to land on, so the
+// jump is skipped rather than clamped onto the fold marker. With no decisions
+// the projection is the identity, so this is exactly the pre-map jump, and it
+// is the one path the chord, the sidebar, the review walk and EnterReview share.
+func jumpToSessionLine(p *editor.Pane, line int) {
 	if p == nil || line <= 0 {
 		return
 	}
@@ -1305,9 +1962,6 @@ func (a *App) jumpTo(line int) {
 	if last := p.File.Lines() - 1; last >= 0 && line-1 > last {
 		line = last + 1
 	}
-	// line is a 1-based session line; the viewport works in display rows. A
-	// line hidden inside a fold has no row to land on, so the jump is skipped
-	// rather than clamped onto the fold marker.
 	row := p.DispOfDocLine(line - 1)
 	if row < 0 {
 		return
@@ -1316,6 +1970,11 @@ func (a *App) jumpTo(line int) {
 	p.Cursors.Set(off, off)
 	p.Viewport.Center(row, p.DisplayLines())
 }
+
+// jumpTo moves the active pane's cursor to a 1-based session line and centres
+// it. The mapping lives entirely in jumpToSessionLine, so the chord and every
+// review surface cannot drift.
+func (a *App) jumpTo(line int) { jumpToSessionLine(a.Tabs.Active(), line) }
 
 // ---------- file lifecycle ----------
 //
@@ -1332,15 +1991,8 @@ func (a *App) newFile() {
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
 	p.Hints = a.InlayHints
-	// A Makefile whose recipe lines are indented with spaces is already broken,
-	// and make's own message names a line rather than the cause. Raj indents the
-	// next line correctly and leaves the rest alone, so without this the file
-	// stays broken silently.
-	if w := p.File.IndentWarning(); w != "" {
-		a.status = w
-	}
 	a.focus = FocusEditor
-	a.status = ""
+	a.status = fileWarning(p.File)
 }
 
 // closeTab closes the active tab.
@@ -1406,7 +2058,14 @@ func (a *App) closeTabAt(i int) {
 // save" and "the file was saved" are different events, and a caller about to
 // close a tab needs the second.
 func (a *App) saveActive(then func(saved bool)) {
-	p := a.Tabs.Active()
+	a.savePane(a.Tabs.Active(), then)
+}
+
+// savePane is saveActive for a specific pane. A resumed formatted save needs it
+// because the buffer being completed need not be the one on screen: the user
+// may have switched tabs while the server worked, and a change set that arrived
+// in the meantime is re-routed through the same review.
+func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 	if p == nil {
 		report(then, false)
 		return
@@ -1438,15 +2097,26 @@ func (a *App) saveNamed(p *editor.Pane, then func(saved bool)) {
 	a.ensureParent(p.File.Path, then, func() { a.writeTo(p, p.File.Path, then) })
 }
 
-// saveAs asks where an unnamed buffer should go.
-//
-// The field is seeded with the workspace root and a separator so the common
-// answer is a bare file name, and a relative answer is resolved against the
-// root rather than the process's working directory — which is wherever raj
-// happened to be launched from and is not what "notes.md" means to someone
-// looking at this tree.
+// saveAs asks where an unnamed buffer should go, starting at the workspace root.
 func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
-	a.askPath("Save as", a.root+string(filepath.Separator), func(answer string, ok bool) {
+	a.saveAsIn(p, a.root, then)
+}
+
+// saveAsIn is saveAs with the folder the prompt starts in named by the caller.
+//
+// The field is seeded with dir and a separator so the common answer is a bare
+// file name, and a relative answer is resolved against the root rather than the
+// process's working directory — which is wherever raj happened to be launched
+// from and is not what "notes.md" means to someone looking at this tree. The
+// explorer's New File item passes the folder the menu was opened in; every other
+// caller passes the workspace root through saveAs, so ordinary save-as is
+// unchanged. It is a seed hook, not a second save path: the prompt, the
+// overwrite question, the missing-parent offer and the write are all shared.
+func (a *App) saveAsIn(p *editor.Pane, dir string, then func(saved bool)) {
+	if dir == "" {
+		dir = a.root
+	}
+	a.askPath("Save as", dir+string(filepath.Separator), func(answer string, ok bool) {
 		if !ok || answer == "" {
 			a.status = "save cancelled"
 			report(then, false)
@@ -1473,6 +2143,32 @@ func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
 		}
 		a.ensureParent(path, then, func() { a.writeTo(p, path, then) })
 	})
+}
+
+// copyRelativePath copies the active buffer's path relative to the workspace
+// root. It is the palette-only sibling of the context menu's Copy Path: the
+// same clipboard helper, but spelled the way a shell rooted at the workspace
+// wants it.
+//
+// A buffer with no path has nothing to copy, so it is refused in words rather
+// than putting an empty string on the clipboard. A path outside the root —
+// save-as permits one — has no relative spelling, so the absolute path is
+// copied and the status line says which fallback happened.
+func (a *App) copyRelativePath() {
+	p := a.Tabs.Active()
+	if p == nil || p.File.Path == "" {
+		a.status = "nothing to copy: this buffer has no path"
+		return
+	}
+	path := p.File.Path
+	if underDir(a.root, path) {
+		if rel, err := filepath.Rel(a.root, path); err == nil {
+			a.copyPath(rel)
+			return
+		}
+	}
+	a.copyPath(path)
+	a.status = "path is outside the workspace; copied " + path
 }
 
 // reloadActive takes the version on disk deliberately, rather than as an answer
@@ -1623,15 +2319,45 @@ func (a *App) writeTo(p *editor.Pane, path string, then func(saved bool)) {
 // write is writeTo with the answer to the conflict question already given.
 // force is what an "Overwrite" answer turns into.
 func (a *App) write(p *editor.Pane, path string, force bool, then func(saved bool)) {
+	was := p.File.Path
+	renamed := was != path
+	p.File.SetPath(path)
+	a.appendJournal(p)
+	// At most one formatted save waits on a server at a time. A save that
+	// arrives while one is in flight supersedes it: the old request's answer is
+	// dropped by the generation, and every continuation waiting on the old save
+	// rides the new one, so a close or quit that was waiting still completes.
+	thens := []func(bool){then}
+	if ps := a.pendingWrite; ps != nil {
+		if ps.pane != p {
+			// Another buffer save owns the single wait slot. This save writes
+			// now without waiting, and that save still resumes.
+			a.finishWrite(p, path, force, renamed, was, thens)
+			return
+		}
+		// The same buffer saves again: supersede the in-flight request and
+		// carry its continuations onto this write.
+		a.saveGen++
+		a.pendingWrite = nil
+		thens = append(ps.thens, then)
+	}
+	if a.beginWillSave(p, path, force, thens) {
+		return // the write resumes when the server answer lands
+	}
+	a.finishWrite(p, path, force, renamed, was, thens)
+}
+
+// finishWrite is the write proper: the half of a save that puts bytes on disk,
+// after any willSaveWaitUntil answer has been applied. It is separate from
+// write so the server hook can defer it without re-deriving the rename and
+// conflict state, and so the synchronous and the resumed save run exactly the
+// same code. thens are every save continuation this one write answers.
+func (a *App) finishWrite(p *editor.Pane, path string, force, renamed bool, was string, thens []func(bool)) {
 	var saveStart time.Time
 	var tSaved time.Time
 	if timing.On {
 		saveStart = time.Now()
 	}
-	was := p.File.Path
-	renamed := was != path
-	p.File.SetPath(path)
-	a.appendJournal(p)
 	save := p.File.Save
 	if force {
 		save = p.File.SaveOver
@@ -1645,7 +2371,7 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 		// for a path.
 		if errors.Is(err, editor.ErrDiskChanged) {
 			p.File.SetPath(was)
-			a.conflict(p, path, then)
+			a.conflict(p, path, func(saved bool) { runThens(thens, saved) })
 			return
 		}
 		// Put the name back. Leaving it set means the buffer claims a path it
@@ -1653,7 +2379,7 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 		// which turns one visible failure into a silent one.
 		p.File.SetPath(was)
 		a.status = "save failed: " + err.Error()
-		report(then, false)
+		runThens(thens, false)
 		return
 	}
 	if timing.On {
@@ -1696,8 +2422,9 @@ func (a *App) write(p *editor.Pane, path string, force bool, then func(saved boo
 		// there before. Refreshing on every save would walk the directory on
 		// the keystroke path for nothing.
 		a.Explorer.Tree.Refresh()
+		a.warmSaved(p)
 	}
-	report(then, true)
+	runThens(thens, true)
 }
 
 func report(then func(bool), ok bool) {
@@ -1909,6 +2636,8 @@ func (a *App) beforePrompt() {
 		a.promptReturn = a.focus
 	}
 	a.Picker.Hide()
+	a.Menu.Hide()
+
 	if a.promptReturn == FocusPicker {
 		a.promptReturn = FocusEditor
 	}

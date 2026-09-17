@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -238,5 +239,148 @@ func TestNoTextEditLeavesEditNil(t *testing.T) {
 	}
 	if items[0].Additional != nil {
 		t.Errorf("additional = %+v, want nil", items[0].Additional)
+	}
+}
+
+// Documentation is legal as a plain string or as a MarkupContent object, and
+// servers use both. Only the value is kept; the rendering decision is the
+// popup's.
+func TestDocumentationDecodesBothShapes(t *testing.T) {
+	raw := `{"items":[
+		{"label":"A","documentation":"plain docs"},
+		{"label":"B","documentation":{"kind":"markdown","value":"**markdown** docs"}}]}`
+	items, _ := complete(t, raw)
+	if len(items) != 2 {
+		t.Fatalf("got %d items", len(items))
+	}
+	if items[0].Documentation != "plain docs" {
+		t.Errorf("string form = %q", items[0].Documentation)
+	}
+	if items[1].Documentation != "**markdown** docs" {
+		t.Errorf("MarkupContent form = %q", items[1].Documentation)
+	}
+}
+
+// Completion documentation is rendered as markdown by the popup, so a fence is
+// kept rather than flattened the way hoverText does it. Stripping it here would
+// leave the popup with prose where the server sent code.
+func TestDocumentationKeepsMarkdown(t *testing.T) {
+	raw := "{\"items\":[{\"label\":\"F\",\"documentation\":{\"kind\":\"markdown\",\"value\":\"Docs.\\n\\n```go\\nfunc F()\\n```\\n\"}}]}"
+	items, _ := complete(t, raw)
+	if !strings.Contains(items[0].Documentation, "```go") {
+		t.Errorf("documentation = %q; the fence was flattened", items[0].Documentation)
+	}
+}
+
+// An item with no data is already complete and must never be sent to resolve;
+// one with data carries the opaque handle verbatim so the server can finish it.
+func TestResolveKeyOnlyWithData(t *testing.T) {
+	items, _ := complete(t, `{"items":[
+		{"label":"NoData","detail":"d"},
+		{"label":"HasData","data":{"import":"x"}}]}`)
+	if got := items[0].ResolveKey(); got != "" {
+		t.Errorf("an item with no data has a resolve key: %q", got)
+	}
+	key := items[1].ResolveKey()
+	if !strings.Contains(key, `"import":"x"`) {
+		t.Errorf("resolve key = %q, want the item verbatim", key)
+	}
+}
+
+// resolveSupport lets a server defer documentation, so the client has to be
+// able to ask for it. The request body is the item as it arrived — the server's
+// own data included — and the answer is decoded like any other item.
+func TestResolveCompletionFillsDocumentation(t *testing.T) {
+	f := newFake(t)
+	f.on("completionItem/resolve", func(*Message) (any, *ResponseError) {
+		return json.RawMessage(`{"label":"Foo","documentation":{"kind":"markdown","value":"Does the thing."}}`), nil
+	})
+	ctx, cancel := ctx1s(t)
+	defer cancel()
+
+	item := CompletionItem{Label: "Foo", Data: json.RawMessage(`{"import":"x"}`)}
+	got, err := ResolveCompletion(ctx, f.conn, json.RawMessage(item.ResolveKey()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Documentation != "Does the thing." {
+		t.Errorf("documentation = %q", got.Documentation)
+	}
+	sent := f.params["completionItem/resolve"]
+	if len(sent) != 1 || !strings.Contains(string(sent[0]), `"import":"x"`) {
+		t.Errorf("resolve params = %s, want the item with its data", sent)
+	}
+}
+
+// A resolve that answers nothing is a nil item, not an error: a server may
+// decline to fill in an item it did not intend to defer.
+func TestResolveCompletionNullIsNoItem(t *testing.T) {
+	f := newFake(t)
+	f.on("completionItem/resolve", func(*Message) (any, *ResponseError) {
+		return nil, nil
+	})
+	ctx, cancel := ctx1s(t)
+	defer cancel()
+	got, err := ResolveCompletion(ctx, f.conn, json.RawMessage(`{"label":"Foo","data":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Label != "" {
+		t.Errorf("item = %+v, want the zero value", got)
+	}
+}
+
+// labelDetails is the 3.17 way to put a short type and a container beside the
+// label; the popup has one place to show detail, so both join it.
+func TestLabelDetailsJoinDetail(t *testing.T) {
+	raw := `{"items":[{"label":"F","detail":"func()","labelDetails":{"detail":"error","description":"pkg"}}]}`
+	items, _ := complete(t, raw)
+	if got := items[0].Detail; got != "func() error pkg" {
+		t.Errorf("detail = %q, want the joined detail", got)
+	}
+}
+
+// itemDefaults hoists the fields every item shares out of the list. The three
+// this client reads are the edit range, the insert format and the resolve data;
+// leaving them unapplied would lose the edit range and re-type a snippet.
+func TestItemDefaultsApply(t *testing.T) {
+	raw := `{
+		"itemDefaults":{
+			"editRange":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},
+			"insertTextFormat":2,
+			"data":{"import":"x"}},
+		"items":[{"label":"Foo","insertText":"Foo(${1:x})"}]}`
+	items, _ := complete(t, raw)
+	if len(items) != 1 {
+		t.Fatalf("got %d items", len(items))
+	}
+	it := items[0]
+	if it.Insert != "Foo" {
+		t.Errorf("insert = %q, want the label for a defaulted snippet", it.Insert)
+	}
+	if it.Edit == nil {
+		t.Fatal("the default editRange was not applied")
+	}
+	if it.Edit.Range.Start.Line != 1 || it.Edit.Range.End.Character != 3 {
+		t.Errorf("edit range = %+v", it.Edit.Range)
+	}
+	if it.Edit.NewText != "Foo" {
+		t.Errorf("newText = %q, want the refused-snippet insert text", it.Edit.NewText)
+	}
+	if it.ResolveKey() == "" {
+		t.Error("the default data was not applied")
+	}
+}
+
+// A default editRange may be the insert/replace pair, and replace is the span
+// accepting has to overwrite.
+func TestItemDefaultsEditRangePrefersReplace(t *testing.T) {
+	raw := `{"itemDefaults":{"editRange":{"insert":{"start":{"line":2,"character":4},"end":{"line":2,"character":6}},"replace":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}}}},"items":[{"label":"Bar"}]}`
+	items, _ := complete(t, raw)
+	if items[0].Edit == nil {
+		t.Fatal("the default editRange was not applied")
+	}
+	if got := items[0].Edit.Range; got.Start.Character != 0 || got.End.Character != 9 {
+		t.Errorf("range = %+v, want the replace span", got)
 	}
 }

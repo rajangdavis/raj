@@ -197,6 +197,17 @@ func TestBackspaceInsideANonEmptyPairIsNormal(t *testing.T) {
 	}
 }
 
+// Backspace on an empty document is a no-op. Both neighbour bytes read as 0,
+// which used to satisfy the pair check and reach an edit at offset -1, a
+// panic that took the editor down.
+func TestBackspaceOnEmptyDocumentDoesNothing(t *testing.T) {
+	p := paired(t, "")
+	p.DeleteBackward()
+	if got := body(p); got != "" {
+		t.Errorf("backspace changed an empty buffer to %q", got)
+	}
+}
+
 // With the setting off, every keystroke is literal — the escape hatch has to
 // actually work, and auto-indent stays on because it is not the same promise.
 func TestAutoPairsOff(t *testing.T) {

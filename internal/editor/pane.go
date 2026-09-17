@@ -60,6 +60,16 @@ type Pane struct {
 	dispGen      uint64
 	dispPolicy   piecetable.Policy
 	dispKeyValid bool
+	// folds are the reader's folding ranges for this file and which of them
+	// are closed. They are display state, not document state: closed folds feed
+	// hiddenFoldRanges into the same projection as proposal folds. foldVersion
+	// is the session version they were measured on, and hiddenFoldRanges
+	// ignores a list from another version; foldRev moves on every change, so
+	// the display memo rebuilds.
+	folds       []Fold
+	foldVersion int
+	foldRev     uint64
+	dispFoldRev uint64
 	// displayBuilds counts SetDisplay calls. It exists so a test can assert the
 	// memo skipped a rebuild honestly, including on the nil identity projection
 	// where a pointer comparison cannot tell a rebuild from a no-op.
@@ -181,11 +191,12 @@ func (p *Pane) SetDisplay(policy piecetable.Policy) {
 			}
 		}
 	}
-	p.disp = view.Build(comp.Text(), out)
+	p.disp = view.BuildFolds(comp.Text(), out, p.hiddenFoldRanges())
 	p.dispVersion = p.File.Session().Version()
 	p.dispGen = p.File.DecisionGeneration()
 	p.dispPolicy = policy
 	p.dispKeyValid = true
+	p.dispFoldRev = p.foldRev
 	p.displayBuilds++
 }
 
@@ -193,11 +204,12 @@ func (p *Pane) SetDisplay(policy piecetable.Policy) {
 // inputs moved.
 //
 // SetDisplay walks the journal through Session.Project, so it must not run on
-// every frame. The composition is a function of three things: the session
-// version, the decision generation, and the policy. A decision (propose,
-// accept, reject, clear, revert) moves the composition without moving the
-// version, so the generation is half the key; a mode switch moves neither, so
-// the policy is the other half. The key lives on the pane rather than in the
+// every frame. The composition is a function of four things: the session
+// version, the decision generation, the composition policy, and the reader
+// fold revision. A decision (propose, accept, reject, clear, revert) moves the
+// composition without moving the version, so the generation is one key; a mode
+// switch moves neither, so the policy is another; and a fold toggle moves only
+// the fold revision. The key lives on the pane rather than in the
 // application because the projection and the key that qualifies it are one
 // derived value: keeping them together means no caller can refresh one without
 // the other, and every Pane — test-built ones included — gets the memo without
@@ -205,7 +217,7 @@ func (p *Pane) SetDisplay(policy piecetable.Policy) {
 func (p *Pane) UpdateDisplay(policy piecetable.Policy) {
 	if p.dispKeyValid {
 		v, g := p.File.Session().Version(), p.File.DecisionGeneration()
-		if p.dispPolicy == policy && p.dispVersion == v && p.dispGen == g {
+		if p.dispPolicy == policy && p.dispVersion == v && p.dispGen == g && p.dispFoldRev == p.foldRev {
 			return
 		}
 	}
@@ -221,6 +233,7 @@ func (p *Pane) UpdateDisplay(policy piecetable.Policy) {
 func (p *Pane) invalidateDisplay() {
 	p.disp = nil
 	p.dispKeyValid = false
+	p.ClearFolds()
 }
 
 // DisplayLines is the number of display rows the projection yields, or the
@@ -230,6 +243,19 @@ func (p *Pane) DisplayLines() int {
 		return p.disp.Lines()
 	}
 	return p.File.Lines()
+}
+
+// RowText is the composition text display row i draws. With no projection it is
+// the session line itself, so a clean buffer reads its own bytes back
+// unchanged. A fold row draws a marker rather than text and returns "".
+func (p *Pane) RowText(i int) string {
+	if p.disp == nil {
+		if i < 0 || i >= p.File.Lines() {
+			return ""
+		}
+		return p.File.Line(i)
+	}
+	return p.disp.RowText(i)
 }
 
 // line describes display row i, the unit the renderer and every coordinate
@@ -261,7 +287,27 @@ func (p *Pane) line(i int) (sessionLine, lo, hi int, fold bool) {
 	if d.SessionLine < 0 {
 		return -1, 0, 0, d.Fold != 0
 	}
-	return d.SessionLine, d.Lo, d.Hi, false
+	// The projection is a snapshot of the version it was built for, and a
+	// caller can read it before the next UpdateDisplay rebuilds it: undo and
+	// delete run the cursor home on the same keystroke that shortened the
+	// line. The snapshot row then names bytes past the end of the line as it
+	// stands now, so clamp the slice rather than let the renderer take it out
+	// of range.
+	sl := d.SessionLine
+	lo, hi = d.Lo, d.Hi
+	if sl >= p.File.Lines() {
+		return sl, 0, 0, false
+	}
+	if lineLen := p.File.LineEnd(sl) - p.File.LineStart(sl); hi > lineLen {
+		hi = lineLen
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	if lo > hi {
+		lo = hi
+	}
+	return sl, lo, hi, false
 }
 
 // Fold reports the hidden run a fold display row stands for: its change set and
