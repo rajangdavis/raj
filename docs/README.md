@@ -18,6 +18,8 @@ Every document in this directory, and the rule for where new material goes.
 | [LAYERED-PROPOSALS-SPEC.md](LAYERED-PROPOSALS-SPEC.md) | spec | the layered-proposals model, projection, decisions and the `proposals` rollup | you are touching proposals, composition or review state |
 | [F3B-II-DESIGN.md](F3B-II-DESIGN.md) | design | the presentation half: folds and the display map | you are changing how proposals are rendered |
 | [HARNESS-BROKER-AGENT.md](HARNESS-BROKER-AGENT.md) | design record | how an agent authors changes against the live buffer | you are designing the agent/broker boundary |
+| [ATTACH-DESIGN.md](ATTACH-DESIGN.md) | design | workspace-scoped host and the local-render attach client that landed, plus the remaining detach/reattach and concurrent-view direction | you are designing multi-instance, a shared session or phone+laptop views |
+| [MOBILE-REVIEW-SPEC.md](MOBILE-REVIEW-SPEC.md) | spec | the `--phone` profile (which implies `--attach`): touch tabs, transient status, a review bar, ctrl aliases for super | you are changing the phone layout or its controls |
 | [README.md](README.md) | index | this file: what each doc is for | you are deciding where a new document or note belongs |
 
 ## Where new material goes

@@ -66,6 +66,11 @@ type Request struct {
 	ID   int
 	Op   string
 	Path string
+	// Gen is a watch's starting point: the generation the caller last saw.
+	// The watch answers as soon as the editor's generation differs from it,
+	// so a driver that reconnects and watches from zero is told to re-read
+	// rather than waiting for the next edit.
+	Gen uint64
 	// NewPath is rename's destination: the second path operand, which no other
 	// verb carries. It is encoded sparsely like every other string field, so a
 	// peer that does not know the verb omits it and a peer that does reads it
@@ -129,6 +134,10 @@ type Request struct {
 	// the ordinary close, which refuses a dirty buffer. It is not a text
 	// write, so it is deliberately not gated on claims or a prior read.
 	Discard bool
+	// Force, on a save, answers the disk-changed prompt with Overwrite: the
+	// buffer is written over a file that changed since raj last wrote it.
+	// Absent is the ordinary save, which refuses a stale disk stamp.
+	Force bool
 	// Paths, ClaimAdd and ClaimClear are the claim op: the file-level working
 	// set an identity declares it is editing. Paths is the set, replaced by
 	// default and extended when ClaimAdd is set; ClaimClear releases it. A
@@ -730,6 +739,11 @@ type Response struct {
 	Truncated []TruncatedFile
 	Spans     []Span
 	Version   uint64
+	// Gen is the editor's whole-workspace generation counter. Every answer
+	// carries it, so a client can snapshot and arm a watch from the same
+	// number; a watch wake carries the generation it woke at, so the client
+	// can tell a real change from a repeated notice.
+	Gen uint64
 	// Bytes and Lines describe the buffer a version answers for, so a driver
 	// can size an apply span or find the end of a file without a read.
 	Bytes int
@@ -756,13 +770,21 @@ type Response struct {
 	// them and name them back to a patch.
 	DumpID uint64
 	Hash   string
+	// SnapshotJSON is a document snapshot's encoded session, EncodingJSON the
+	// file encoding a client needs to rebuild it byte-for-byte, and
+	// SnapshotPath the buffer's own absolute path. They are sparse: a response
+	// that is not a snapshot sends none, so a peer that does not know the
+	// verb reads no document rather than an error.
+	SnapshotJSON string
+	EncodingJSON string
+	SnapshotPath string
 	// Author is the id the editor assigned this connection. It rides on every
 	// response, not just a handshake, because a client that reconnects or is
 	// restarted mid-session would otherwise be holding a stale one — and an
 	// agent that thinks it is author 3 when it is author 4 will read its own
 	// text as somebody else's.
 	Author uint8
-	// Searcher is returned by the internal "snapshot" op. It never crosses the
+	// Searcher is returned by the internal "searchsnapshot" op. It never crosses the
 	// wire: it is how the event thread hands a consistent view of the open
 	// buffers to a walk that runs off it.
 	Searcher Searcher
@@ -923,6 +945,23 @@ type Server struct {
 	// It has no effect on a Unix socket, where the caller could already run
 	// the command itself.
 	AllowRemoteExec bool
+
+	// heartbeat is a test seam: the per-connection heartbeat interval, with
+	// the zero value leaving a connection on heartbeatEvery. It is a server
+	// field rather than a package var so a test shortens its own server's
+	// connections without a live ticker reading state another test can write.
+	// Read under mu in serve and written under mu by a test, so the seam has a
+	// happens-before edge even when it is set after the accept loops start.
+	heartbeat time.Duration
+
+	// watch generation. gen moves on the event thread; a parked watch compares
+	// it against the Gen its request carried and wakes when they differ. The
+	// lock is separate from mu because a bump happens on the event thread
+	// while mu may be held by a submit, and waits on neither.
+	watchMu  sync.Mutex
+	gen      uint64
+	watchers map[uint64]chan struct{}
+	watchSeq uint64
 
 	path  string
 	paths []string
@@ -1209,8 +1248,13 @@ func (s *Server) serve(conn net.Conn, network string) {
 		}
 	})
 
+	s.mu.Lock()
+	every := s.heartbeat
+	s.mu.Unlock()
 	c := &connection{srv: s, out: out, author: author, network: network,
-		running: map[int]context.CancelFunc{}}
+		running:    map[int]context.CancelFunc{},
+		heartbeats: map[int]chan struct{}{},
+		heartbeat:  every}
 	r := bufio.NewReader(conn)
 	var wg sync.WaitGroup
 	for {
@@ -1324,13 +1368,34 @@ func (s *Server) serve(conn net.Conn, network string) {
 			continue
 		}
 		wg.Add(1)
-		safe.Go(func() { defer wg.Done(); c.handle(req) })
+		safe.Go(func() {
+			defer wg.Done()
+			// A request that sends no frames of its own for a while would look
+			// dead to the client's per-frame idle deadline; the heartbeat keeps
+			// it alive. recv is exempt: the client already arms no deadline for
+			// the long poll, so a heartbeat would only be noise.
+			if req.Op != "recv" && req.Op != "watch" {
+				c.startHeartbeat(req.ID)
+				defer c.stopHeartbeat(req.ID)
+			}
+			c.handle(req)
+		})
 	}
 	c.cancelAll()
 	wg.Wait()
 	close(out)
 	<-done
 }
+
+// heartbeatEvery is how often a connection emits a contentless heartbeat frame
+// while a request is in flight, and it is the production default. A connection
+// carries its own copy, set from the server at creation and shortenable by a
+// test, so a live ticker never reads shared state a later test can write. The
+// client's streamIdle is three of these, coupling the two so an idle deadline
+// can never fall inside a heartbeat interval. A long quiet operation - a build
+// with a silent phase longer than the client's idle - would otherwise look like
+// a dead peer to the client's per-frame idle deadline.
+const heartbeatEvery = 5 * time.Second
 
 type outFrame struct {
 	h    Header
@@ -1348,9 +1413,14 @@ type connection struct {
 	// refusal and anonymous minting key on this rather than on the server.
 	network string
 
-	mu      sync.Mutex
-	running map[int]context.CancelFunc
-	closed  bool
+	mu         sync.Mutex
+	running    map[int]context.CancelFunc
+	heartbeats map[int]chan struct{}
+	// heartbeat is this connection's tick interval: a copy of the server's
+	// seam, or heartbeatEvery when that is zero, captured before the ticker
+	// starts so the goroutine reads no shared mutable state.
+	heartbeat time.Duration
+	closed    bool
 }
 
 func (c *connection) send(res Response) {
@@ -1363,6 +1433,16 @@ func (c *connection) send(res Response) {
 	c.mu.Unlock()
 	res.SrcVersion = srcVersion
 	h, body := EncodeResponse(res)
+	// A final frame ends the request, so stop the heartbeat before the frame can
+	// reach the socket. This is best-effort, not strict ordering: a tick already
+	// inside send can still land after the final, because closing done cannot
+	// retract a send in flight. That is harmless -- the client returns on the
+	// final and ignores a stale id. This runs without holding mu, and
+	// stopHeartbeat is idempotent, so the dispatch's deferred stop is a harmless
+	// no-op and this cannot deadlock.
+	if res.Final {
+		c.stopHeartbeat(res.ID)
+	}
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
@@ -1376,6 +1456,60 @@ func (c *connection) send(res Response) {
 		_ = recover()
 	}()
 	c.out <- outFrame{h, body}
+}
+
+// startHeartbeat begins emitting a contentless, non-final frame with id every
+// heartbeatEvery (or this connection's shorter test interval), until
+// stopHeartbeat(id) closes its done channel or the connection closes. The frame
+// is ordinary and empty, so any client that loops on non-final frames consumes
+// it without knowing it is a heartbeat; its only job is to reset the client's
+// per-frame idle deadline while a long request has nothing of its own to say.
+func (c *connection) startHeartbeat(id int) {
+	done := make(chan struct{})
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if c.heartbeats == nil {
+		c.heartbeats = map[int]chan struct{}{}
+	}
+	c.heartbeats[id] = done
+	every := c.heartbeat
+	c.mu.Unlock()
+	if every <= 0 {
+		every = heartbeatEvery
+	}
+	safe.Go(func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				// send tolerates the writer closing out mid-flight; a frame
+				// racing the connection's end is dropped, not fatal.
+				c.send(Response{ID: id, Final: false})
+			}
+		}
+	})
+}
+
+// stopHeartbeat ends the heartbeat for id, if one is running. It is idempotent:
+// send calls it on the final frame and the dispatch calls it again on the way
+// out, so the second call must find nothing and do nothing. Closing the channel
+// wakes the ticker goroutine; the map entry is removed under mu so no second
+// close can race. It cannot retract a send already in flight, so the ordering
+// against a final frame is best-effort (see send).
+func (c *connection) stopHeartbeat(id int) {
+	c.mu.Lock()
+	done := c.heartbeats[id]
+	if done != nil {
+		delete(c.heartbeats, id)
+		close(done)
+	}
+	c.mu.Unlock()
 }
 
 func (c *connection) cancel(id int) {
@@ -1394,6 +1528,10 @@ func (c *connection) cancelAll() {
 		stop()
 	}
 	c.running = map[int]context.CancelFunc{}
+	for _, done := range c.heartbeats {
+		close(done)
+	}
+	c.heartbeats = map[int]chan struct{}{}
 	c.mu.Unlock()
 }
 
@@ -1433,6 +1571,9 @@ func (c *connection) one(req Request, emit func(Response)) {
 		return
 	case "recv":
 		c.recv(req, emit)
+		return
+	case "watch":
+		c.watch(req, emit)
 		return
 	case "lsp":
 		c.lsp(req, emit)
@@ -1509,6 +1650,57 @@ func (c *connection) recv(req Request, emit func(Response)) {
 		return
 	}
 	emit(Response{ID: req.ID, OK: true, Final: true, Messages: msgs})
+}
+
+// watch parks until the open buffers' generation differs from the one the
+// request carried. Like recv it never waits on the event thread — a parked
+// watch that did would park the editor with it — but unlike recv it asks the
+// event thread for the buffer list once the generation has moved, so the wake
+// carries a consistent view rather than a bare "something changed". The
+// register-then-compare loop closes the race where the generation moves between
+// the compare and the park: the bump would find no watcher and the watch would
+// sleep through it.
+func (c *connection) watch(req Request, emit func(Response)) {
+	ctx, stop := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.running[req.ID] = stop
+	c.mu.Unlock()
+	defer func() {
+		stop()
+		c.mu.Lock()
+		delete(c.running, req.ID)
+		c.mu.Unlock()
+	}()
+
+	for {
+		// Register before the compare, then compare again above the wait: a
+		// bump that landed between the two would otherwise find no watcher to
+		// wake and be slept through. In this order the bump either fills the
+		// buffered channel or the compare above the wait sees the new
+		// generation, so neither window can lose it.
+		_, ch, cancel := c.srv.watchRegister()
+		if c.srv.Gen() != req.Gen {
+			cancel()
+			list := c.srv.submit(Request{ID: req.ID, Op: "buffers"})
+			if list.Err != "" {
+				emit(Response{ID: req.ID, Err: list.Err, Final: true})
+				return
+			}
+			emit(Response{ID: req.ID, OK: true, Gen: c.srv.Gen(),
+				Buffers: list.Buffers, Final: true})
+			return
+		}
+		select {
+		case <-ch:
+			cancel()
+		case <-ctx.Done():
+			cancel()
+			// Answered rather than dropped, like recv: the client that
+			// cancelled is waiting for the frame that finishes its id.
+			emit(Response{ID: req.ID, Err: "cancelled", Final: true})
+			return
+		}
+	}
 }
 
 // exec runs a command, in the same two phases as search: the decision is made
@@ -1596,7 +1788,7 @@ func (c *connection) search(req Request, emit func(Response)) {
 		emit(Response{ID: req.ID, Err: "search needs a query", Final: true})
 		return
 	}
-	snap := c.srv.submit(Request{ID: req.ID, Op: "snapshot"})
+	snap := c.srv.submit(Request{ID: req.ID, Op: "searchsnapshot"})
 	if snap.Err != "" || snap.Searcher == nil {
 		if snap.Err == "" {
 			snap.Err = "search is not available"
@@ -1692,6 +1884,53 @@ func mintIdentity() (string, error) {
 		return "", err
 	}
 	return "tok_" + tok, nil
+}
+
+// Gen is the current generation counter, the value a watch compares against.
+func (s *Server) Gen() uint64 {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	return s.gen
+}
+
+// BumpGen records a new generation and wakes every parked watch. It runs on
+// the event thread, so the fan-out only takes the watch lock and never blocks:
+// a full or empty channel just means that watcher is already awake and will
+// read the new generation when it next runs.
+func (s *Server) BumpGen(gen uint64) {
+	s.watchMu.Lock()
+	if gen == s.gen {
+		s.watchMu.Unlock()
+		return
+	}
+	s.gen = gen
+	for _, ch := range s.watchers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	s.watchMu.Unlock()
+}
+
+// watchRegister parks one watcher and returns a cancel that removes it. The
+// channel is buffered so a bump never waits on the watcher to catch up.
+func (s *Server) watchRegister() (uint64, chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	s.watchMu.Lock()
+	if s.watchers == nil {
+		s.watchers = map[uint64]chan struct{}{}
+	}
+	s.watchSeq++
+	id := s.watchSeq
+	s.watchers[id] = ch
+	s.watchMu.Unlock()
+	cancel := func() {
+		s.watchMu.Lock()
+		delete(s.watchers, id)
+		s.watchMu.Unlock()
+	}
+	return id, ch, cancel
 }
 
 // submit parks a request and waits for the event thread to answer it.

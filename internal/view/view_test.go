@@ -204,3 +204,27 @@ func TestRebuild(t *testing.T) {
 		t.Errorf("lines = %d, want 6", ix.Lines())
 	}
 }
+
+// The caret's column must equal the cells the renderer draws. ↔ is East Asian
+// Ambiguous but the terminal draws it two cells wide, so the caret advances two
+// columns across it; an em-dash, also ambiguous, stays one cell.
+func TestColumnsCaretAdvanceMatchesDrawnArrows(t *testing.T) {
+	c := NewColumns(4)
+	arrow := "a↔b"
+	if got, want := c.ColOf(arrow, 1), 1; got != want {
+		t.Errorf("ColOf(%q, before arrow) = %d, want %d", arrow, got, want)
+	}
+	if got, want := c.ColOf(arrow, 4), 3; got != want {
+		t.Errorf("ColOf(%q, after arrow) = %d, want %d", arrow, got, want)
+	}
+	if got, want := c.ColOf(arrow, len(arrow)), 4; got != want {
+		t.Errorf("ColOf(%q, end) = %d, want %d", arrow, got, want)
+	}
+	dash := "a—b"
+	if got, want := c.ColOf(dash, 4), 2; got != want {
+		t.Errorf("ColOf(%q, after em-dash) = %d, want %d", dash, got, want)
+	}
+	if got, want := c.ColOf(dash, len(dash)), 3; got != want {
+		t.Errorf("ColOf(%q, end) = %d, want %d", dash, got, want)
+	}
+}

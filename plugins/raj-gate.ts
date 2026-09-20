@@ -1,4 +1,12 @@
 import type { Plugin } from "@opencode-ai/plugin"
+import { appendFileSync } from "node:fs"
+
+const ledgerPath = process.env.RAJ_TOOL_LEDGER ?? "/home/oc/.local/share/opencode/raj-tool-ledger.jsonl"
+function ledger(entry: Record<string, unknown>) {
+  try {
+    appendFileSync(ledgerPath, JSON.stringify(entry) + String.fromCharCode(10))
+  } catch {}
+}
 
 // Identity is explicit in raj now: an agent runs `raj ctl register` to mint a
 // short key, then passes `-as <key>` on every later call. This plugin no longer
@@ -28,6 +36,11 @@ export default (async ({ client }) => {
 
   return {
     "tool.execute.before": async (input, output) => {
+      try {
+        const args = (output.args ?? {}) as Record<string, unknown>
+        const cmd = typeof args.command === "string" ? args.command : undefined
+        ledger({ ts: Date.now(), session: input.sessionID, tool: input.tool, cmd: cmd ? cmd.slice(0, 400) : null })
+      } catch {}
       if (input.tool !== "task") return
       const caller = await callerAgent(input.sessionID)
       if (caller === undefined || !SWARMERS.has(caller)) return
@@ -35,6 +48,22 @@ export default (async ({ client }) => {
       if (type === undefined || !SPAWNABLE.has(type)) {
         throw new Error(`the ${caller} agent may only spawn ${[...SPAWNABLE].join(" or ")} subagents (got: ${type ?? "unspecified"})`)
       }
+    },
+    "tool.execute.after": async (input, output) => {
+      try {
+        const meta = (input ?? {}) as Record<string, unknown>
+        const out = (output ?? {}) as Record<string, unknown>
+        ledger({
+          ts: Date.now(),
+          session: meta.sessionID ?? null,
+          tool: meta.tool ?? null,
+          callID: meta.callID ?? null,
+          phase: "after",
+          exit: typeof out.exit === "number" ? out.exit : null,
+          durationMs: typeof out.duration === "number" ? out.duration : null,
+          bytes: typeof out.output === "string" ? out.output.length : null,
+        })
+      } catch {}
     },
   }
 }) satisfies Plugin

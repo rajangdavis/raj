@@ -152,6 +152,15 @@ type BufferHost interface {
 	// spans. The agreed composition as the default is a future change.
 	Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) (spans []Span, states []StateRun, version uint64, err error)
 
+	// DocSnapshot returns the whole document a client needs to render one
+	// buffer itself: the encoded piecetable session, the version it answers
+	// for, the file encoding as JSON, and the buffer's own canonical path.
+	// Unlike Read it is not a view or a span — it is the model, so a client
+	// that holds it can show unsaved text, pending change sets and the exact
+	// byte lengths an offset depends on without another round trip. It does
+	// not mark a read: a snapshot is for display, not for writing.
+	DocSnapshot(path string) (encoded []byte, version uint64, encJSON []byte, name string, err error)
+
 	// Find searches one buffer for a pattern and answers with the first
 	// match's span, the total number of matches it holds, and the version the
 	// search ran against. It is the single-document half of the search verb:
@@ -174,8 +183,15 @@ type BufferHost interface {
 	// that moved a draft, and a refusal stay distinguishable.
 	Apply(path string, author uint8, base uint64, hunks []Hunk) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
 
-	// Save writes a buffer to disk.
-	Save(path string) (uint64, error)
+	// Save writes a buffer to disk. force answers the disk-changed prompt with
+	// Overwrite, writing over a file that changed since the write raj last
+	// made; without it a stale stamp is refused.
+	Save(path string, force bool) (uint64, error)
+
+	// Reload takes the buffer version on disk, matching the editor Reload
+	// gesture. There is no human at the socket to ask, so it never prompts: a
+	// dirty buffer is reloaded and its unsaved changes are discarded.
+	Reload(path string) error
 
 	// Groups lists the change sets in a buffer, oldest first.
 	Groups(path string) ([]Group, error)
@@ -835,6 +851,14 @@ func (g *Guard) Read(path string, author uint8, start, end, lineStart, lineEnd i
 	return spans, states, v, err
 }
 
+func (g *Guard) DocSnapshot(path string) ([]byte, uint64, []byte, string, error) {
+	name, err := g.canonical(path)
+	if err != nil {
+		return nil, 0, nil, "", err
+	}
+	return g.Host.DocSnapshot(name)
+}
+
 func (g *Guard) Version(path string, author uint8) (uint64, error) {
 	name, err := g.canonical(path)
 	if err != nil {
@@ -1021,12 +1045,23 @@ func (s guardedSearcher) Search(ctx context.Context, q SearchQuery, emit func([]
 	return s.inner.Search(ctx, q, emit)
 }
 
-func (g *Guard) Save(path string) (uint64, error) {
+func (g *Guard) Save(path string, force bool) (uint64, error) {
 	name, err := g.canonical(path)
 	if err != nil {
 		return 0, err
 	}
-	return g.Host.Save(name)
+	return g.Host.Save(name, force)
+}
+
+// Reload takes the on-disk version for a buffer. It is a read of the disk into
+// the model, not a text write, so it runs no claim gate; the host owns the
+// reload and the dirty-buffer wording.
+func (g *Guard) Reload(path string) error {
+	name, err := g.canonical(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.Reload(name)
 }
 
 // Clear hard-purges a rejected change set, addressed by group rather than by
@@ -1633,6 +1668,16 @@ func Dispatch(g *Guard, req Request) Response {
 		// them to the result rather than the caller having to ask separately.
 		return Response{OK: true, Dirty: dirty}
 	case "snapshot":
+		// The document a client renders itself from. The payload travels as a
+		// JSON string like diff and lsp, because the wire's one text field is
+		// how a structured answer already crosses.
+		encoded, version, encJSON, name, err := g.DocSnapshot(req.Path)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true, Version: version, SnapshotPath: name,
+			SnapshotJSON: string(encoded), EncodingJSON: string(encJSON)}
+	case "searchsnapshot":
 		// Internal: the socket's search path asks for this on the event thread
 		// and then walks off it. It has no wire representation.
 		return Response{OK: true, Searcher: g.Snapshot()}
@@ -1714,8 +1759,13 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		return res
 	case "save":
-		v, err := g.Save(req.Path)
+		v, err := g.Save(req.Path, req.Force)
 		return done(v, err)
+	case "reload":
+		if err := g.Reload(req.Path); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
 	case "apply":
 		if req.Base == nil {
 			return Response{Err: "apply needs a base version; read the buffer or ask for its version first"}
@@ -1780,70 +1830,199 @@ func done(v uint64, err error) Response {
 // document, so the driver never re-derives an offset and never matches old
 // text. Lines are the unit because that is where edits land, and whole-line
 // hunks rebase cleanly across concurrent edits elsewhere in the file.
+//
+// The diff is patience-style: trim the common prefix and suffix, match the
+// lines that occur exactly once on both sides, keep a longest run of those
+// anchors whose order agrees, and recurse in the gaps between them. A region
+// with no such anchor becomes one hunk. That is O((n+m)·log(n+m)) on
+// realistic text. A per-region work budget (diffWorkCeiling, diffRegionCeiling)
+// keeps an adversarial or duplicate-heavy file from paying that on every
+// region: once it is spent the remaining regions each become one hunk, so the
+// work is bounded without collapsing the whole file the way the old line LCS
+// table did.
 func DiffLines(oldText, newText string) []Hunk {
+	return diffLines(oldText, newText, diffWorkCeiling)
+}
+
+// diffLines is DiffLines with the work ceiling as a parameter, so tests can
+// drive the fallback path with a small budget instead of building a region
+// large enough to exhaust the real one.
+func diffLines(oldText, newText string, workCeiling int) []Hunk {
 	if oldText == newText {
 		return nil
 	}
-	aLines := lineStarts(oldText)
-	bLines := lineStarts(newText)
-	n, m := len(aLines), len(bLines)
-
-	// A span-scoped chunk is bounded by construction, but guard the O(n·m) DP
-	// against a pathological whole-file dump anyway: past the cap the answer
-	// degrades to one coarse hunk, which is always correct if not minimal.
-	if n*m > 1<<20 {
-		return []Hunk{{Start: 0, End: len(oldText), Text: newText}}
+	aStarts := lineStarts(oldText)
+	bStarts := lineStarts(newText)
+	a := make([]string, len(aStarts))
+	for i := range aStarts {
+		a[i] = lineAt(oldText, aStarts, i)
 	}
-
-	// LCS length over lines, computed backwards so the forward walk below can
-	// read dp[i+1][j] and dp[i][j+1] as "which side does the LCS skip".
-	dp := make([][]int, n+1)
-	for i := range dp {
-		dp[i] = make([]int, m+1)
+	b := make([]string, len(bStarts))
+	for i := range bStarts {
+		b[i] = lineAt(newText, bStarts, i)
 	}
-	for i := n - 1; i >= 0; i-- {
-		ai := lineAt(oldText, aLines, i)
-		for j := m - 1; j >= 0; j-- {
-			switch {
-			case ai == lineAt(newText, bLines, j):
-				dp[i][j] = dp[i+1][j+1] + 1
-			case dp[i+1][j] >= dp[i][j+1]:
-				dp[i][j] = dp[i+1][j]
-			default:
-				dp[i][j] = dp[i][j+1]
-			}
+	var hunks []Hunk
+	remaining := workCeiling
+	diffRegion(a, b, aStarts, bStarts, oldText, newText, 0, len(a), 0, len(b), &remaining, &hunks)
+	return hunks
+}
+
+// The ceilings below bound the diff's work. They are work limits, not
+// correctness switches: a region that trips one is still diffed, as a single
+// coarse hunk, so the editor can show a larger change than it otherwise would
+// but never a wrong one. They sit far above any hand-edited file — a region
+// must be tens of thousands of lines on both sides, or the whole diff about a
+// million charged line-slots, before either bites — so realistic diffs keep
+// their fine hunks.
+const (
+	// diffWorkCeiling is the total line-work one DiffLines call may spend on
+	// anchor matching before every remaining region becomes one hunk.
+	diffWorkCeiling = 1 << 20
+
+	// diffRegionCeiling is the largest region, in lines on each side, still
+	// worth splitting into anchors; a larger region becomes one hunk even when
+	// budget remains.
+	diffRegionCeiling = 1 << 15
+)
+
+// diffFallback charges region a[aLo:aHi] vs b[bLo:bHi] to the remaining work
+// budget and reports whether it should be emitted as one coarse hunk instead
+// of anchor-matched. Once the budget is spent it stays spent, so the recursion
+// cannot revive deep work later in the file.
+func diffFallback(remaining *int, aLo, aHi, bLo, bHi int) bool {
+	*remaining -= (aHi - aLo) + (bHi - bLo)
+	if *remaining < 0 {
+		return true
+	}
+	return aHi-aLo > diffRegionCeiling && bHi-bLo > diffRegionCeiling
+}
+
+// diffRegion appends the hunks that turn a[aLo:aHi] into b[bLo:bHi]. Outside
+// the region the caller has already accounted for everything: the lines before
+// aLo are equal, and a[an.a] == b[an.b] at each anchor the caller chose.
+// remaining is the work budget shared by the whole recursion; a region that
+// exhausts it becomes one hunk instead of being anchor-matched.
+func diffRegion(a, b []string, aStarts, bStarts []int, oldText, newText string, aLo, aHi, bLo, bHi int, remaining *int, out *[]Hunk) {
+	for aLo < aHi && bLo < bHi && a[aLo] == b[bLo] {
+		aLo++
+		bLo++
+	}
+	for aHi > aLo && bHi > bLo && a[aHi-1] == b[bHi-1] {
+		aHi--
+		bHi--
+	}
+	if aLo == aHi && bLo == bHi {
+		return
+	}
+	if aLo == aHi || bLo == bHi {
+		*out = append(*out, diffHunk(aStarts, bStarts, oldText, newText, aLo, aHi, bLo, bHi))
+		return
+	}
+	if diffFallback(remaining, aLo, aHi, bLo, bHi) {
+		*out = append(*out, diffHunk(aStarts, bStarts, oldText, newText, aLo, aHi, bLo, bHi))
+		return
+	}
+	anchors := uniqueAnchors(a, b, aLo, aHi, bLo, bHi)
+	if len(anchors) == 0 {
+		*out = append(*out, diffHunk(aStarts, bStarts, oldText, newText, aLo, aHi, bLo, bHi))
+		return
+	}
+	aPrev, bPrev := aLo, bLo
+	for _, an := range anchors {
+		if aPrev < an.a || bPrev < an.b {
+			diffRegion(a, b, aStarts, bStarts, oldText, newText, aPrev, an.a, bPrev, an.b, remaining, out)
+		}
+		aPrev, bPrev = an.a+1, an.b+1
+	}
+	if aPrev < aHi || bPrev < bHi {
+		diffRegion(a, b, aStarts, bStarts, oldText, newText, aPrev, aHi, bPrev, bHi, remaining, out)
+	}
+}
+
+// diffHunk builds the hunk that replaces a[aLo:aHi] with b[bLo:bHi]. An empty
+// a span is an insertion, an empty b span a deletion.
+func diffHunk(aStarts, bStarts []int, oldText, newText string, aLo, aHi, bLo, bHi int) Hunk {
+	return Hunk{
+		Start: at(aStarts, len(oldText), aLo),
+		End:   at(aStarts, len(oldText), aHi),
+		Text:  newText[at(bStarts, len(newText), bLo):at(bStarts, len(newText), bHi)],
+	}
+}
+
+// diffAnchor is one line matched at a[i] and b[j]. The bytes at the two
+// positions are equal; they are kept as indices so the anchor search handles
+// positions, not the strings a second time.
+type diffAnchor struct{ a, b int }
+
+// uniqueAnchors pairs each line that occurs exactly once in both a[aLo:aHi]
+// and b[bLo:bHi], then keeps a longest run of those pairs whose b indices
+// increase. The paired line is unambiguous by construction, so matching it
+// cannot mislead the way a repeated line can, and the LIS drops the crossings
+// a greedy pairing would introduce.
+func uniqueAnchors(a, b []string, aLo, aHi, bLo, bHi int) []diffAnchor {
+	countA := make(map[string]int, aHi-aLo)
+	for i := aLo; i < aHi; i++ {
+		countA[a[i]]++
+	}
+	countB := make(map[string]int, bHi-bLo)
+	for j := bLo; j < bHi; j++ {
+		countB[b[j]]++
+	}
+	idxB := make(map[string]int, len(countB))
+	for j := bLo; j < bHi; j++ {
+		if countB[b[j]] == 1 {
+			idxB[b[j]] = j
 		}
 	}
-
-	// Walk the backtrace, delimited by matches, one hunk per maximal region of
-	// unmatched lines. A match ends a region without itself advancing either
-	// side; the outer loop consumes matches by moving i and j together.
-	var hunks []Hunk
-	i, j := 0, 0
-	for i < n || j < m {
-		if i < n && j < m && lineAt(oldText, aLines, i) == lineAt(newText, bLines, j) {
-			i++
-			j++
+	as := make([]int, 0, len(idxB))
+	bs := make([]int, 0, len(idxB))
+	for i := aLo; i < aHi; i++ {
+		if countA[a[i]] != 1 {
 			continue
 		}
-		di, dj := i, j
-		for i < n || j < m {
-			if i < n && j < m && lineAt(oldText, aLines, i) == lineAt(newText, bLines, j) {
-				break
-			}
-			if i < n && (j >= m || dp[i+1][j] >= dp[i][j+1]) {
-				i++
+		if j, ok := idxB[a[i]]; ok {
+			as = append(as, i)
+			bs = append(bs, j)
+		}
+	}
+	if len(as) == 0 {
+		return nil
+	}
+	return longestIncreasing(as, bs)
+}
+
+// longestIncreasing returns a longest strictly increasing subsequence of bs,
+// carrying as alongside it. tails[k] is the index of the smallest tail of an
+// increasing run of length k+1, and prev reconstructs the chosen run.
+func longestIncreasing(as, bs []int) []diffAnchor {
+	prev := make([]int, len(bs))
+	tails := make([]int, 0, len(bs))
+	for i, v := range bs {
+		prev[i] = -1
+		lo, hi := 0, len(tails)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if bs[tails[mid]] < v {
+				lo = mid + 1
 			} else {
-				j++
+				hi = mid
 			}
 		}
-		hunks = append(hunks, Hunk{
-			Start: at(aLines, len(oldText), di),
-			End:   at(aLines, len(oldText), i),
-			Text:  newText[at(bLines, len(newText), dj):at(bLines, len(newText), j)],
-		})
+		if lo > 0 {
+			prev[i] = tails[lo-1]
+		}
+		if lo == len(tails) {
+			tails = append(tails, i)
+		} else {
+			tails[lo] = i
+		}
 	}
-	return hunks
+	out := make([]diffAnchor, len(tails))
+	for k, i := len(tails)-1, tails[len(tails)-1]; k >= 0; k-- {
+		out[k] = diffAnchor{a: as[i], b: bs[i]}
+		i = prev[i]
+	}
+	return out
 }
 
 // lineStarts returns the byte offset where each line begins. A trailing newline

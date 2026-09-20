@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"raj/internal/piecetable"
+	"raj/internal/session"
 	"raj/internal/ui"
 )
 
@@ -267,7 +268,7 @@ func TestRemoveForeverTrashesWhenEnabled(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("file still at the original path after a trashing removal (err=%v)", err)
 	}
-	trash := filepath.Join(h.root, ".raj", "trash")
+	trash := filepath.Join(session.StateDir(h.root), "trash")
 	entries, err := os.ReadDir(trash)
 	if err != nil {
 		t.Fatalf("reading trash dir %s: %v", trash, err)
@@ -291,7 +292,7 @@ func TestRemoveForeverTrashesWhenEnabled(t *testing.T) {
 }
 
 // Any value other than the exact "1" -- unset, or a near miss like "0" or
-// "true" -- is the ordinary hard unlink, and nothing lands under .raj/trash/.
+// "true" -- is the ordinary hard unlink, and nothing lands in the state trash.
 func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
 	for _, val := range []string{"", "0", "true", "yes"} {
 		t.Run("RAJ_TRASH="+val, func(t *testing.T) {
@@ -306,12 +307,72 @@ func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
 			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				t.Errorf("file still on disk after Remove forever (err=%v)", err)
 			}
-			trash := filepath.Join(h.root, ".raj", "trash")
+			trash := filepath.Join(session.StateDir(h.root), "trash")
 			if entries, err := os.ReadDir(trash); err == nil {
 				t.Errorf("trash dir exists with %d entr(ies) for RAJ_TRASH=%q; want none", len(entries), val)
 			} else if !os.IsNotExist(err) {
 				t.Errorf("reading trash dir: %v", err)
 			}
 		})
+	}
+}
+
+// moveOrCopy is the cross-filesystem fallback the trash needs now that it lives
+// under $XDG_STATE_HOME. The destination's parent does not exist here, so the
+// rename fails and the helper must create the directory, copy the bytes and the
+// mode, then remove the source.
+func TestMoveOrCopyFallsBackToCopy(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	if err := os.WriteFile(src, []byte("payload"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile's mode is filtered through the umask; set it explicitly so the
+	// assertion does not depend on the test machine's.
+	if err := os.Chmod(src, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "nested", "deep", "dst.txt")
+	if err := moveOrCopy(src, dst); err != nil {
+		t.Fatalf("moveOrCopy: %v", err)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Errorf("source survived the move: %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read destination: %v", err)
+	}
+	if string(data) != "payload" {
+		t.Errorf("destination = %q, want payload", data)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o640); got != want {
+		t.Errorf("mode = %o, want %o", got, want)
+	}
+}
+
+// A move that cannot complete leaves the source exactly where it was, so the
+// caller keeping the file on error never loses bytes.
+func TestMoveOrCopyKeepsSourceOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	if err := os.WriteFile(src, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file where the destination's parent needs to be makes the copy
+	// fail after the rename already has.
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := moveOrCopy(src, filepath.Join(blocker, "dst.txt")); err == nil {
+		t.Fatal("moveOrCopy succeeded despite an unusable destination")
+	}
+	if b, err := os.ReadFile(src); err != nil || string(b) != "payload" {
+		t.Errorf("source lost after a failed move: %q, %v", b, err)
 	}
 }

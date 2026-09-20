@@ -142,11 +142,19 @@ func (s *Session) Project(p Policy) DerivedProject {
 		doc += piece.Length
 	}
 	// Newest first: each excluded edit is removed from a view that still
-	// contains it, after every later decision has already been undone.
+	// contains it, after every later decision has already been undone. A
+	// deletion-only proposal is excluded from the edit composition: with no
+	// text to show as a proposal, applying it would be the only thing the
+	// reader saw, and the bytes would be gone before the human could decide.
+	// Deferring it keeps the planned range visible and leasable until accept.
+	deferred := s.deferredDeletions(p)
 	var hidden []hiddenRun
 	for i := len(s.journal) - 1; i >= 0; i-- {
 		o := s.journal[i]
-		if o.Kind != KindEdit || !s.live(o.Seq) || s.included(o, p) {
+		if o.Kind != KindEdit || !s.live(o.Seq) {
+			continue
+		}
+		if s.included(o, p) && !deferred[o.Group] {
 			continue
 		}
 		at, removed, kept, dropped := s.unapplyRemoveIns(comp, prov, o.Ins, o.Group)
@@ -500,10 +508,11 @@ func (d DerivedProject) Segments() []ProjSeg { return d.segments }
 // this is the caret-side lease, not the whole rule.
 //
 // Coordinates are the live document's, because the runs come from the
-// Annotated projection and its composition is the view frame. Only inserted
-// runs carry an owner, so a change set that only deletes has no run and cannot
-// be addressed this way; that is a known limitation of every caret- and
-// range-addressed review surface, and the deletion is simply not leased.
+// Annotated projection and its composition is the view frame. A deletion-only
+// set has no inserted run for the projection to own, so its planned range is
+// reported by deletionLeases, the same projectMember walk DiffPending renders:
+// a pure deletion leaves a zero-width gap in the present, and that point is
+// what a later edit must not span.
 //
 // A zero length probes one insertion point, and the half-open intersection
 // rule makes it leased exactly when the point lies strictly inside a run
@@ -525,6 +534,9 @@ func (s *Session) Leased(pos, length int) (group uint64, ok bool) {
 		if pos < r.Off+r.Len && r.Off < pos+length {
 			return r.Group, true
 		}
+	}
+	if leases := s.deletionLeases(pos, length, Proposed); len(leases) > 0 {
+		return leases[0].Group, true
 	}
 	return 0, false
 }

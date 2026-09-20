@@ -1,5 +1,7 @@
 package app
 
+import "raj/internal/tabs"
+
 // Sidebar is which sidebar pane is showing.
 type Sidebar int
 
@@ -8,6 +10,7 @@ const (
 	SidebarExplorer
 	SidebarSearch
 	SidebarProblems
+	SidebarSettings
 )
 
 // Breakpoints for how many panes fit. Below Narrow, only one pane shows — the
@@ -29,6 +32,10 @@ const (
 	// explorer's heading, changed-only toggle and footer, plus one tree row.
 	// The pad yields before the pane becomes unusable.
 	minSidebarRows = 4
+
+	// phoneDrawerRows is the height of the phone profile collapsed action
+	// drawer: the whole bottom strip, so the handle is a two-row tap target.
+	phoneDrawerRows = 2
 )
 
 // Layout is the computed geometry for one frame.
@@ -36,9 +43,13 @@ type Layout struct {
 	SidebarX, SidebarW      int
 	EditorX, EditorW        int
 	TabY, TopY, Rows        int
+	TabRows                 int
 	SidebarTop, SidebarRows int
 	ShowSidebar             bool
 	ShowEditor              bool
+	// BarY is the row the phone profile's review bar occupies, or -1 when the
+	// profile has no bar (the ordinary layout).
+	BarY int
 }
 
 // computeLayout decides the geometry from the terminal size, which sidebar is
@@ -49,7 +60,38 @@ type Layout struct {
 // the sidebar chords behave as a switcher on a small window and as a toggle on
 // a large one, without either feeling like a special case.
 func computeLayout(cols, rows int, side Sidebar, focus Focus) Layout {
-	l := Layout{TabY: 0, TopY: 1, Rows: rows - 2} // tab bar above, status below
+	return computeLayoutChrome(cols, rows, side, focus, 1, 1, -1)
+}
+
+// layoutFor is the frame geometry for an explicit profile and bottom-row
+// choice. The ordinary profile is computeLayout unchanged; the phone profile
+// reserves a two-row tab strip, and the bottom row only when bar is set.
+func layoutFor(cols, rows int, side Sidebar, focus Focus, phone, bar bool) Layout {
+	if !phone {
+		return computeLayout(cols, rows, side, focus)
+	}
+	tabRows := tabs.PhoneStripRows
+	if bar {
+		return computeLayoutChrome(cols, rows, side, focus, tabRows, phoneDrawerRows, rows-phoneDrawerRows)
+	}
+	return computeLayoutChrome(cols, rows, side, focus, tabRows, 0, -1)
+}
+
+// layout is the frame geometry for the active profile. The phone profile always
+// reserves one bottom row for the action drawer's collapsed handle, in Edit and
+// Review alike; the expanded panel is drawn over the content rather than
+// reserving more. The renderer and the pointer both call this, so they cannot
+// disagree about which rows exist.
+func (a *App) layout(cols, rows int) Layout {
+	return layoutFor(cols, rows, a.sidebar, a.focus, a.phone, a.phone)
+}
+
+// computeLayoutChrome reserves the chrome rows above and below the panes, then
+// lays out the sidebar and editor exactly as before. tabRows is the tab strip
+// height, bottomRows the rows held out at the bottom (the status strip, the
+// phone bar, or neither) and barY the phone bar's row, -1 when there is none.
+func computeLayoutChrome(cols, rows int, side Sidebar, focus Focus, tabRows, bottomRows, barY int) Layout {
+	l := Layout{TabY: 0, TabRows: tabRows, TopY: tabRows, BarY: barY, Rows: rows - tabRows - bottomRows}
 	if l.Rows < 1 {
 		l.Rows = 1
 	}

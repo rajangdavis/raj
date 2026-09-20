@@ -38,6 +38,7 @@ func newWorkspace(t *testing.T, cols, rows int) *harness {
 	host := ui.NewFakeHost(cols, rows)
 	t.Cleanup(func() { host.Close() })
 	a := New(host, workspace(t), 2)
+	t.Cleanup(a.CloseState)
 	a.Search.Debounce = time.Nanosecond // tests wait on Settle, not on the clock
 	return &harness{App: a, host: host}
 }
@@ -51,6 +52,21 @@ func (h *harness) openSidebar(chord string, want Sidebar) {
 		return
 	}
 	h.press(chord)
+}
+
+// explorerSelect moves the tree selection onto the entry whose base name is
+// name. Tests address the tree by what it shows rather than by an index: the
+// visible .raj directory is one more entry at the top, so a fixed number of
+// down presses no longer lands where it used to.
+func explorerSelect(t *testing.T, h *harness, name string) {
+	t.Helper()
+	for i, e := range h.Explorer.Tree.Entries() {
+		if filepath.Base(e.Path) == name {
+			h.Explorer.List().Sel = i
+			return
+		}
+	}
+	t.Fatalf("no explorer entry named %q", name)
 }
 
 func TestExplorerOpensFile(t *testing.T) {
@@ -74,20 +90,24 @@ func TestExplorerExpandsDirectory(t *testing.T) {
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	before := len(h.Explorer.Tree.Entries())
-	h.press("enter") // pkg/ is first
+
+	// Select pkg/ by name: the tree lists .raj first, and expanding that
+	// reveals nothing because every child under .raj/* is hidden.
+	explorerSelect(t, h, "pkg")
+	h.press("enter")
 	if got := len(h.Explorer.Tree.Entries()); got <= before {
 		t.Errorf("entries %d -> %d; expanding should reveal children", before, got)
 	}
 }
 
-// Tab walks the sidebar's components and, past the last, leaves for the editor.
-// Shift+tab must not bring it back — that is the one-way rule.
-func TestSidebarTabEscapesOneWay(t *testing.T) {
+// Tab opens the selected file and hands focus to the editor; shift+tab walks
+// back through the changed-only toggle. Once focus is in the editor, shift+tab
+// is an outdent and cannot bring it back — the one-way rule.
+func TestSidebarTabOpensAndShiftTabWalksBack(t *testing.T) {
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 
-	// Focus lands on the tree, which is the last stop now that the toggle is
-	// drawn under the heading, so shift+tab is what reaches the toggle.
+	// Focus lands on the tree, so shift+tab is what reaches the toggle.
 	h.press("shift+tab") // tree -> changed-only toggle
 	if h.Focused() != FocusSidebar {
 		t.Fatal("shift+tab left the sidebar")
@@ -96,9 +116,15 @@ func TestSidebarTabEscapesOneWay(t *testing.T) {
 	if h.Focused() != FocusSidebar {
 		t.Fatal("tab left the sidebar too early")
 	}
-	h.press("tab") // past the last component -> editor
+
+	// Tab on a file opens it and moves focus to the editor.
+	explorerSelect(t, h, "main.go")
+	h.press("tab")
 	if h.Focused() != FocusEditor {
-		t.Fatal("tab did not hand focus to the editor")
+		t.Fatal("tab on a file did not hand focus to the editor")
+	}
+	if p := h.Tabs.Active(); p == nil || filepath.Base(p.File.Path) != "main.go" {
+		t.Fatalf("tab opened %v, want main.go", p)
 	}
 
 	h.press("shift+tab")
@@ -1267,7 +1293,7 @@ func TestExplorerFilterIsReachableWithCmdUpDown(t *testing.T) {
 	if !h.Explorer.Tree.ChangedOnly {
 		t.Fatal("cmd+up then enter did not reach the changed-only toggle")
 	}
-	h.press("super+down", "enter") // back to the tree: enter expands pkg/
+	h.press("super+down", "enter") // back to the tree; enter acts on the selected entry
 	if !h.Explorer.Tree.ChangedOnly {
 		t.Error("cmd+down left focus on the toggle; enter flipped it back")
 	}
@@ -1278,8 +1304,10 @@ func TestExplorerFilterIsReachableWithCmdUpDown(t *testing.T) {
 func TestExplorerShowsSelectedPath(t *testing.T) {
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
-	h.press("enter")        // expand pkg/
-	h.press("down", "down") // into it
+	explorerSelect(t, h, "pkg")
+	h.press("enter") // expand pkg/
+	explorerSelect(t, h, "helper.go")
+	h.drain() // the footer spells out the selection as it is drawn
 	sel := h.Explorer.Tree.Rel(h.Explorer.Selected())
 	if sel == "" {
 		t.Fatal("nothing selected")
@@ -1309,5 +1337,31 @@ func TestFindNextWithTheBarClosed(t *testing.T) {
 	h.press("shift+super+g")
 	if back := h.Pane().Cursors.Primary().Head; back != start {
 		t.Errorf("cmd+shift+g landed at %d, want back at %d", back, start)
+	}
+}
+
+// A file in an encoding raj can identify but not reproduce byte for byte is
+// declined with a dialog, the same way a binary is: opening it is a direct
+// request and a status line at the bottom of the screen looks like nothing
+// happened.
+func TestOpenUnsupportedEncodingIsDeclined(t *testing.T) {
+	h := newWorkspace(t, 120, 24)
+	path := filepath.Join(h.Explorer.Tree.Root, "utf32.txt")
+	// A UTF-32 little-endian byte order mark: identifiable, unsupported, and
+	// refused by name rather than mistaken for binary noise.
+	if err := os.WriteFile(path, []byte{0xFF, 0xFE, 0x00, 0x00, 'h', 0x00, 0x00, 0x00}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(path)
+	h.Draw()
+
+	if h.Pane() != nil {
+		t.Fatal("an unsupported-encoding file was opened")
+	}
+	if !h.Prompt.Open {
+		t.Fatal("no dialog explaining the refusal")
+	}
+	if !strings.Contains(h.host.Text(), "encoding") {
+		t.Errorf("refusal not on screen:\n%s", h.host.Text())
 	}
 }

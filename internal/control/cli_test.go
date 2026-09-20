@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -220,7 +221,7 @@ func (f *fakeEditor) run(req Request) Response {
 	switch req.Op {
 	case "execcheck", "stats":
 		return Dispatch(f.policy, req)
-	case "snapshot":
+	case "searchsnapshot":
 		return Response{OK: true, Searcher: f}
 	case "ping":
 		f.authors = append(f.authors, req.Author)
@@ -782,6 +783,360 @@ func TestCLIRecvJSONTimeoutExitsThree(t *testing.T) {
 	}
 	if len(msgs) != 0 {
 		t.Errorf("recv -json timeout = %+v, want no messages", msgs)
+	}
+}
+
+// A process squatting the control address accepts the connection and then says
+// nothing. The 2s connect timeout cannot catch it: the connect succeeded, so an
+// ordinary request must bound its wait for the answer and name the wrong
+// process rather than parking the driver forever.
+func TestOrdinaryRequestTimesOutOnASilentPeer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			accepted <- conn // held open and never written to: the squatter
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case conn := <-accepted:
+			conn.Close()
+		default:
+		}
+	})
+
+	c, err := Dial(TCPAddr(ln.Addr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.readTimeout = 100 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Do(Request{Op: "ping"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a request to a silent peer was answered")
+		}
+		if !strings.Contains(err.Error(), "no response") ||
+			!strings.Contains(err.Error(), "another process") {
+			t.Errorf("error = %q, want it to name the silent wrong-process case", err)
+		}
+		if !isTimeout(err) {
+			t.Errorf("error = %v, want it distinguishable as a deadline expiry", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a request to a silent peer hung; the answer deadline was not armed")
+	}
+}
+
+// recv is a long-poll: it parks until the user says something, which may be
+// hours. The answer deadline must not be armed on it, or a working recv becomes
+// a spurious timeout. A real server parks the request, so this only has to show
+// it is still parked well past the armed wait.
+func TestRecvWaitsPastTheAnswerDeadline(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.readTimeout = 50 * time.Millisecond
+	// An ordinary request first, so this also proves the deadline it armed was
+	// cleared: a recv made after it must still park, not inherit it.
+	if _, err := c.Do(Request{Op: "ping"}); err != nil {
+		t.Fatalf("ping before recv: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Do(Request{Op: "recv"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("recv returned within the armed wait; the deadline was not exempted: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	// Unblock the parked recv so the goroutine and the connection end.
+	c.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the client did not end the parked recv")
+	}
+}
+
+// A deadline expiry and an ordinary transport failure are different diagnoses:
+// one names a wrong process, the other a broken connection. isTimeout is what
+// tells them apart.
+func TestIsTimeoutDistinguishesDeadlineFromTransport(t *testing.T) {
+	if !isTimeout(os.ErrDeadlineExceeded) {
+		t.Error("os.ErrDeadlineExceeded was not recognised as a timeout")
+	}
+	if !isTimeout(fmt.Errorf("read: %w", os.ErrDeadlineExceeded)) {
+		t.Error("a wrapped deadline expiry was not recognised")
+	}
+	if isTimeout(fmt.Errorf("connection reset by peer")) {
+		t.Error("a transport failure was mistaken for a timeout")
+	}
+}
+
+// A single budget for every verb was too blunt: the wrong-process identity
+// check should be named quickly, while a batch wrapping a long exec and a cold
+// language server legitimately take longer. The table is pure, so it is checked
+// without a connection.
+func TestAnswerBudgetPerVerb(t *testing.T) {
+	cases := []struct {
+		op   string
+		want time.Duration
+	}{
+		{"ping", 3 * time.Second},
+		{"read", 10 * time.Second},
+		{"buffers", 10 * time.Second},
+		{"apply", 10 * time.Second},
+		{"prog", 60 * time.Second},
+		{"lsp", 30 * time.Second},
+	}
+	for _, c := range cases {
+		if got := answerBudget(c.op); got != c.want {
+			t.Errorf("answerBudget(%q) = %s, want %s", c.op, got, c.want)
+		}
+	}
+	// The ordering is the point: ping must be the quickest, and the heavy verbs
+	// must outlast the cheap default.
+	if answerBudget("ping") >= answerBudget("read") {
+		t.Error("ping is not shorter than the default; a squatter would not be named quickly")
+	}
+	if answerBudget("prog") <= answerBudget("read") || answerBudget("lsp") <= answerBudget("read") {
+		t.Error("a heavy verb is not more generous than the default; a slow answer would be cut off")
+	}
+}
+
+// answerWait turns the budget into the deadline Do arms, and leaves recv exempt
+// from all of them. The readTimeout seam replaces the budget for every bounded
+// verb, so a test can prove the silent-peer path in milliseconds.
+func TestAnswerWaitUsesBudgetAndSeam(t *testing.T) {
+	var c Client
+	for _, op := range []string{"ping", "read", "prog", "lsp"} {
+		wait, bounded := c.answerWait(op)
+		if !bounded {
+			t.Errorf("answerWait(%q) armed no deadline, want its budget", op)
+			continue
+		}
+		if want := answerBudget(op); wait != want {
+			t.Errorf("answerWait(%q) = %s, want the budget %s", op, wait, want)
+		}
+	}
+	if wait, bounded := c.answerWait("recv"); bounded || wait != 0 {
+		t.Errorf("answerWait(recv) = (%s, %v), want the long poll exempt", wait, bounded)
+	}
+
+	c.readTimeout = 7 * time.Millisecond
+	for _, op := range []string{"ping", "read", "prog", "lsp"} {
+		wait, bounded := c.answerWait(op)
+		if !bounded || wait != 7*time.Millisecond {
+			t.Errorf("answerWait(%q) = (%s, %v), want the readTimeout seam", op, wait, bounded)
+		}
+	}
+	if wait, bounded := c.answerWait("recv"); bounded || wait != 0 {
+		t.Errorf("answerWait(recv) = (%s, %v), want the seam to leave the long poll exempt", wait, bounded)
+	}
+}
+
+// silentStreamServer accepts one connection, reads one request, answers it with
+// a single non-final frame, then holds the connection open and silent. It is a
+// live peer that stalls rather than a dead one, so the per-frame idle deadline
+// is what has to end the wait. The address is a TCP one; cleanup drops it.
+func silentStreamServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	var once sync.Once
+	stop := func() { once.Do(func() { close(release); ln.Close() }) }
+	t.Cleanup(stop)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		f, err := ReadFrame(conn)
+		if err != nil {
+			return
+		}
+		req, err := DecodeRequest(f)
+		if err != nil {
+			return
+		}
+		res := Response{ID: req.ID}
+		if req.Op == "search" {
+			res.Matches = []SearchMatch{{Path: "/w/a.go", Line: 1, Version: 1, Text: "needle"}}
+		} else {
+			res.Stream, res.Out = StreamStdout, "partial"
+		}
+		h, body := EncodeResponse(res)
+		if WriteFrame(conn, h, body) != nil {
+			return
+		}
+		<-release
+	}()
+	return TCPAddr(ln.Addr())
+}
+
+// A streaming verb must not be killed by a total deadline; a long search or
+// exec is healthy. A peer that sends one frame and then stops is not, and the
+// idle deadline, reset on every frame, must end the wait shortly after the
+// configured idle with the same wrong-process wording Do gives a silent peer.
+// It is then cleared, so a later recv on the same client still parks.
+func TestStreamIdleNamesSilentPeer(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(*Client, func()) error
+	}{
+		{"exec", func(c *Client, onFrame func()) error {
+			_, err := c.DoExec(Request{Op: "exec", Argv: []string{"true"}},
+				func(stream uint8, b string) { onFrame() })
+			return err
+		}},
+		{"stream", func(c *Client, onFrame func()) error {
+			_, err := c.DoStream(Request{Op: "search", Query: &SearchQuery{Text: "needle"}},
+				func([]SearchMatch) { onFrame() })
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Dial(silentStreamServer(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.idleTimeout = 200 * time.Millisecond
+
+			delivered := make(chan struct{})
+			var once sync.Once
+			onFrame := func() { once.Do(func() { close(delivered) }) }
+			done := make(chan error, 1)
+			go func() { done <- tc.run(c, onFrame) }()
+
+			select {
+			case <-delivered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the one frame never reached the client; the answer was not read")
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("a streamed request against a stalled peer returned no error")
+				}
+				if !strings.Contains(err.Error(), "no response") ||
+					!strings.Contains(err.Error(), "another process") {
+					t.Errorf("error = %q, want the silent-peer wording", err)
+				}
+				if !isTimeout(err) {
+					t.Errorf("error = %v, want it distinguishable as a deadline expiry", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("a streamed request hung; the idle deadline was not armed")
+			}
+
+			// The idle must be cleared when the stream ends: a long poll on the
+			// same client has to park, not inherit the expired deadline.
+			parked := make(chan error, 1)
+			go func() {
+				_, err := c.Do(Request{Op: "recv"})
+				parked <- err
+			}()
+			select {
+			case err := <-parked:
+				t.Fatalf("recv returned within a stream idle; the deadline was left armed: %v", err)
+			case <-time.After(200 * time.Millisecond):
+			}
+			c.Close()
+			select {
+			case <-parked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("closing the client did not end the parked recv")
+			}
+		})
+	}
+}
+
+// A live stream must outlast the idle window as long as frames keep arriving:
+// the deadline is reset before each frame, not armed once for the whole
+// exchange. This server takes longer than the idle to finish, so a total
+// deadline would fail it while a per-frame one delivers every frame.
+func TestStreamIdleResetsPerFrame(t *testing.T) {
+	const (
+		frames = 8
+		gap    = 30 * time.Millisecond
+		idle   = 200 * time.Millisecond
+	)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		f, err := ReadFrame(conn)
+		if err != nil {
+			return
+		}
+		req, err := DecodeRequest(f)
+		if err != nil {
+			return
+		}
+		for i := 0; i < frames; i++ {
+			time.Sleep(gap)
+			h, body := EncodeResponse(Response{ID: req.ID, Stream: StreamStdout, Out: "x"})
+			if WriteFrame(conn, h, body) != nil {
+				return
+			}
+		}
+		time.Sleep(gap)
+		h, body := EncodeResponse(Response{ID: req.ID, Final: true})
+		WriteFrame(conn, h, body)
+	}()
+
+	c, err := Dial(TCPAddr(ln.Addr()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.idleTimeout = idle
+
+	start := time.Now()
+	res, err := c.DoExec(Request{Op: "exec", Argv: []string{"true"}},
+		func(stream uint8, b string) {})
+	if err != nil {
+		t.Fatalf("a stream that kept sending failed after %s with idle %s: %v",
+			time.Since(start), idle, err)
+	}
+	if !res.Final {
+		t.Errorf("the final frame was not marked final")
+	}
+	if want := "xxxxxxxx"; res.Out != want {
+		t.Errorf("output = %q, want %q (every frame accumulated)", res.Out, want)
+	}
+	if elapsed := time.Since(start); elapsed <= idle {
+		t.Errorf("stream finished in %s, inside one idle %s; it did not run long enough to prove a reset", elapsed, idle)
 	}
 }
 
@@ -3697,5 +4052,35 @@ func TestCLISearchContext(t *testing.T) {
 	}
 	if got.Matches[0].Version != 1 {
 		t.Errorf("json version = %d, want 1", got.Matches[0].Version)
+	}
+}
+
+// diagnostics may name several paths: one call sweeps them all rather than a
+// shell loop spending a round trip per file.
+func TestCLILSPDiagnosticsSweepsMultiplePaths(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.lspJSON = `{"status":"ok"}`
+	out, errs, code := run(t, "lsp", "diagnostics", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	if got := strings.Count(out, `"status": "ok"`); got != 2 {
+		t.Errorf("status lines = %d, want one per path (out %q)", got, out)
+	}
+}
+
+// The CLI usage lists the reload verb and the save force flag, so a driver
+// reading the help can find both.
+func TestCLIUsageListsReloadAndForce(t *testing.T) {
+	var out, errs strings.Builder
+	if code := CLI([]string{"help"}, &out, &errs); code != 0 {
+		t.Fatalf("help exit = %d, stderr %q", code, errs.String())
+	}
+	usage := out.String()
+	if !strings.Contains(usage, "reload") {
+		t.Errorf("usage does not list reload:\n%s", usage)
+	}
+	if !strings.Contains(usage, "-force") {
+		t.Errorf("usage does not list -force:\n%s", usage)
 	}
 }

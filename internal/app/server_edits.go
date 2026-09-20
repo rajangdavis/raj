@@ -29,12 +29,8 @@ func applyServerEdits(p *editor.Pane, edits []complete.Edit) (group uint64, ok b
 	if p == nil || len(edits) == 0 {
 		return 0, true
 	}
-	for _, e := range edits {
-		// A pure insertion has remove == 0, which probes the insertion point
-		// itself; a replacement is caught by the bytes it takes away.
-		if g, leased := p.File.EditLeased(e.Start, e.End-e.Start); leased {
-			return g, false
-		}
+	if group, leased := editsLeased(p, edits); leased {
+		return group, false
 	}
 	sorted := append([]complete.Edit(nil), edits...)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -51,4 +47,24 @@ func applyServerEdits(p *editor.Pane, edits []complete.Edit) (group uint64, ok b
 	}
 	p.File.End()
 	return 0, true
+}
+
+// editsLeased reports the first change set that leases a byte the edit batch
+// touches, or 0/false when the whole batch is clear. It is the all-or-nothing
+// gate every server-edit applier shares: checking each span before any is
+// applied is what keeps a pending, rejected or invalidated change set from
+// splitting a batch, and naming the set is what lets the caller point at the
+// decision that has to happen first.
+func editsLeased(p *editor.Pane, edits []complete.Edit) (group uint64, leased bool) {
+	if p == nil || p.File == nil {
+		return 0, false
+	}
+	for _, e := range edits {
+		// A pure insertion has End-Start == 0, which probes the insertion
+		// point itself; a replacement is caught by the bytes it takes away.
+		if g, ok := p.File.EditLeased(e.Start, e.End-e.Start); ok {
+			return g, true
+		}
+	}
+	return 0, false
 }

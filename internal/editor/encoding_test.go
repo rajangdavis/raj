@@ -474,3 +474,68 @@ func FuzzEncodingRoundTrip(f *testing.F) {
 		}
 	})
 }
+
+// The acceptance a save performs must be rolled back whole when the write it
+// stands for cannot happen. This is the SaveOver rollback the TODO names: every
+// pending set is accepted before encode can refuse, so a refusal has to put all
+// of them back, move no version and no decision generation, and leave the file
+// on disk and both projections exactly as they were. A test on a single set
+// (TestSaveFailedEncodeLeavesPendingProposed) cannot see a rollback that
+// restores the first set and drops the rest, so this one holds two pending sets
+// with the unencodable run in the older of them.
+func TestSaveFailedEncodeRollsBackEveryAcceptance(t *testing.T) {
+	f := openSingleByte(t)
+	// The arrow is unencodable in this file's single-byte encoding, so the
+	// write is guaranteed to refuse after both sets have been accepted.
+	older := proposeAt(t, f, 0, 0, "\u2192")
+	newer := proposeAt(t, f, 4, 4, "!")
+
+	if len(f.Session().Pending()) != 2 {
+		t.Fatalf("setup: pending = %d, want 2", len(f.Session().Pending()))
+	}
+	beforeText := f.Text()
+	beforeEdit := f.Session().Project(piecetable.AcceptedAndProposed).Text()
+	beforeAgreed := f.Session().Project(piecetable.AcceptedOnly).Text()
+	beforeVersion := f.Session().Version()
+	beforeOps := len(f.Session().Journal())
+	beforeGen := f.DecisionGeneration()
+
+	if err := f.SaveOver(); !errors.Is(err, ErrUnencodableText) {
+		t.Fatalf("SaveOver() = %v, want ErrUnencodableText", err)
+	}
+
+	if got := f.Session().GroupState(older); got != piecetable.Proposed {
+		t.Errorf("older set state = %v, want Proposed", got)
+	}
+	if got := f.Session().GroupState(newer); got != piecetable.Proposed {
+		t.Errorf("newer set state = %v, want Proposed", got)
+	}
+	if got := len(f.Session().Pending()); got != 2 {
+		t.Errorf("pending after a refused save = %d, want both sets still pending", got)
+	}
+	if got := f.Session().Version(); got != beforeVersion {
+		t.Errorf("version moved by a refused save: %d -> %d", beforeVersion, got)
+	}
+	if got := len(f.Session().Journal()); got != beforeOps {
+		t.Errorf("journal grew on a refused save: %d -> %d ops", beforeOps, got)
+	}
+	if got := f.DecisionGeneration(); got != beforeGen {
+		t.Errorf("decision generation moved by a refused save: %d -> %d", beforeGen, got)
+	}
+	if got := f.Text(); got != beforeText {
+		t.Errorf("a refused save changed the buffer: %q, want %q", got, beforeText)
+	}
+	if got := f.Session().Project(piecetable.AcceptedAndProposed).Text(); got != beforeEdit {
+		t.Errorf("edit projection changed: %q, want %q", got, beforeEdit)
+	}
+	if got := f.Session().Project(piecetable.AcceptedOnly).Text(); got != beforeAgreed {
+		t.Errorf("agreed projection changed: %q, want %q", got, beforeAgreed)
+	}
+	got, err := os.ReadFile(f.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "caf\xe9\n" {
+		t.Errorf("a refused save changed the file: %q", got)
+	}
+}

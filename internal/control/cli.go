@@ -84,6 +84,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] -dump N       replace a snapshot's text; the editor diffs and applies
   lsp MODE [path] LINE:COL   hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics, inlay-hints, symbols, format, range-format or document-symbols
+  lsp diagnostics [path...]  cached diagnostics for one or more files, in one call
   lsp symbols [path] LINE:COL [query]
                              project-wide symbols matching query, from the language server
   lsp document-symbols [path]
@@ -99,7 +100,8 @@ const ctlUsage = `usage: raj ctl <command> [options]
   edit [path] -old S -new S  replace an exact string (convenience over apply);
                              -- OLD NEW passes strings beginning with "-", and
                              -verbatim strips one trailing newline from a file
-  save [path]                write a buffer to disk
+  save [path]                write a buffer to disk; -force overwrites a file that changed on disk
+  reload [path]              take the version on disk, discarding unsaved changes
   exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
   stats                      what the exec policy has cost this session
   run -prog BYTES            run a program of opcodes; @FILE or - for stdin
@@ -180,6 +182,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	annotated := fs.Bool("annotated", false, "read: report the change set and state of each run; -json adds them as states, plain adds run lines after the text")
 	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
 	discard := fs.Bool("discard", false, "close: discard unsaved changes instead of refusing the close")
+	force := fs.Bool("force", false, "save: overwrite a file that changed on disk, the prompt Overwrite")
 	withdraw := fs.Bool("withdraw", false, "delete: retract your pending deletion instead of proposing one")
 	claimAdd := fs.Bool("add", false, "claim: extend the current set instead of replacing it")
 	claimClear := fs.Bool("clear", false, "claim: release the whole set")
@@ -400,8 +403,9 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "claim":
 		return claimCmd(c, fs.Args(), *claimAdd, *claimClear, stdout, stderr, *asJSON)
 	case "save":
-
-		return simple(c, Request{Op: "save", Path: path}, "saved", stdout, stderr, *asJSON)
+		return simple(c, Request{Op: "save", Path: path, Force: *force}, "saved", stdout, stderr, *asJSON)
+	case "reload":
+		return simple(c, Request{Op: "reload", Path: path}, "reloaded", stdout, stderr, *asJSON)
 	case "exec":
 		return doExec(c, argv, *dir, stdout, stderr, *asJSON)
 	case "run":
@@ -594,6 +598,22 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "patch":
 		return patchCmd(c, path, *dumpID, *textArg, *textFile, stdout, stderr, *asJSON)
 	case "lsp":
+		// diagnostics may name several files, so one call sweeps them all
+		// rather than a shell loop spending a round trip per file. Every other
+		// mode addresses one path and position.
+		if fs.Arg(0) == "diagnostics" {
+			paths := fs.Args()[1:]
+			if len(paths) == 0 {
+				paths = []string{""} // the buffer in front, as with one path
+			}
+			code := 0
+			for _, p := range paths {
+				if got := doLSP(c, "diagnostics", p, "", *lines, "", stdout, stderr, *asJSON); got != 0 {
+					code = got
+				}
+			}
+			return code
+		}
 		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, fs.Arg(3), stdout, stderr, *asJSON)
 	case "apply":
 		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile,
@@ -820,7 +840,8 @@ var argLimit = map[string]struct {
 	"rename":    {2, "rename takes <old> and <new> paths"},
 	"mv":        {2, "mv takes <old> and <new> paths"},
 	"close":     {1, "close takes a path and nothing else"},
-	"save":      {1, "save takes a path and nothing else"},
+	"save":      {1, "save takes a path; -force overwrites a file that changed on disk"},
+	"reload":    {1, "reload takes a path and nothing else"},
 	"groups":    {1, "groups takes a path and nothing else"},
 	"accept":    {1, "accept takes a path; the change set id goes to -group"},
 	"reject":    {1, "reject takes a path; the change set id goes to -group"},
@@ -865,6 +886,7 @@ var verbOperand = map[string]string{
 	"apply":    "[path] [TEXT]",
 	"edit":     "[path] [OLD NEW]",
 	"save":     "[path]",
+	"reload":   "[path]",
 	"lsp":      "MODE [path] LINE:COL [query]",
 	"register": "[-as KEY]",
 }

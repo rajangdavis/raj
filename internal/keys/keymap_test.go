@@ -1,6 +1,7 @@
 package keys
 
 import (
+	"maps"
 	"strings"
 	"testing"
 )
@@ -433,5 +434,124 @@ func TestOpenMenuChordResolves(t *testing.T) {
 	}
 	if why := Unimplemented[OpenMenu]; why != "" {
 		t.Errorf("open_menu is listed as unimplemented: %s", why)
+	}
+}
+
+// ctrlAlias replaces super with ctrl in the canonical modifier order and only
+// when the chord has no ctrl already, so the alias is the string the decoder
+// produces for a real keypress. Without the modifier rebuild, alt+super+right
+// would spell alt+ctrl+right, which the decoder never emits.
+func TestCtrlAliasSpelling(t *testing.T) {
+	cases := []struct {
+		chord string
+		want  string
+		ok    bool
+	}{
+		{"super+b", "ctrl+b", true},
+		{"shift+super+e", "shift+ctrl+e", true},
+		{"alt+super+right", "ctrl+alt+right", true},
+		{"shift+alt+super+f", "shift+ctrl+alt+f", true},
+		{"ctrl+super+m", "", false}, // already ctrl: no simple alias
+		{"alt+left", "", false},     // no super at all
+		{"tab", "", false},          // a bare key
+	}
+	for _, c := range cases {
+		got, ok := ctrlAlias(c.chord)
+		if ok != c.ok || got != c.want {
+			t.Errorf("ctrlAlias(%q) = %q, %v; want %q, %v", c.chord, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// Every super chord that can have an alias gets one that resolves to the same
+// action, and every chord that cannot is reported. An existing ctrl binding is
+// never overwritten: ctrl+c, ctrl+z and ctrl+g stay Quit, Suspend and GotoLine,
+// and their super chords are the reported collisions. Without the free-chord
+// check Copy, Undo and FindNext would take the bindings of Quit, Suspend and
+// GotoLine.
+func TestCtrlAliasesCoverAndDoNotOverwrite(t *testing.T) {
+	k := NewKeymap()
+	before := maps.Clone(k.global)
+	added, collisions := k.CtrlAliases()
+	reported := map[string]bool{}
+	for _, c := range collisions {
+		reported[c] = true
+	}
+
+	candidates := 0
+	check := func(chord string, action Action) {
+		alias, ok := ctrlAlias(chord)
+		if !ok || action == None {
+			return
+		}
+		candidates++
+		if reported[chord] {
+			if _, taken := before[alias]; !taken {
+				t.Errorf("%s was reported as a collision but %s was free", chord, alias)
+			}
+			return
+		}
+		if got := k.Lookup(Global, alias); got != action {
+			t.Errorf("%s gained no alias: %s = %q, want %q", chord, alias, got, action)
+		}
+	}
+	for _, b := range Bindings {
+		check(b.Chord, b.Action)
+	}
+	for _, b := range Reclaim {
+		check(b.Chord, b.Action)
+	}
+	for _, o := range scopeOverrides {
+		if alias, ok := ctrlAlias(o.Chord); ok && o.Action != None {
+			candidates++
+			if got := k.Lookup(o.Scope, alias); got != o.Action {
+				t.Errorf("scoped %s in %v gained no alias: %s = %q, want %q",
+					o.Chord, o.Scope, alias, got, o.Action)
+			}
+		}
+	}
+	if candidates == 0 {
+		t.Fatal("no alias candidates; the predicate or the table is wrong")
+	}
+	if added != candidates-len(collisions) {
+		t.Errorf("added %d, want %d candidates minus %d collisions", added, candidates, len(collisions))
+	}
+	for _, c := range []string{"super+c", "super+z", "super+g"} {
+		if !reported[c] {
+			t.Errorf("%s overlaps an existing ctrl binding but was not reported", c)
+		}
+	}
+	// The named aliases a phone depends on, pinned so a dropped one fails here
+	// rather than only as a dead key: ctrl+r enters Review, ctrl+s saves.
+	for chord, want := range map[string]Action{
+		"ctrl+r": ToggleReview,
+		"ctrl+s": Save,
+	} {
+		if got := k.Lookup(Editor, chord); got != want {
+			t.Errorf("%s = %q, want %q", chord, got, want)
+		}
+	}
+	for chord, a := range before {
+		if got := k.Lookup(Global, chord); got != a {
+			t.Errorf("existing binding %s changed from %q to %q", chord, a, got)
+		}
+	}
+}
+
+// A scoped super binding aliases inside its own scope, with its own action, and
+// does not leak: Explorer and Search ctrl+enter expand, while the global
+// ctrl+enter stays the line-below alias. Without the scope walk the scoped
+// override would be lost and both panes would insert a line below instead.
+func TestCtrlAliasKeepsScope(t *testing.T) {
+	k := NewKeymap()
+	k.CtrlAliases()
+	if got := k.Lookup(Explorer, "ctrl+enter"); got != ToggleExpandAll {
+		t.Errorf("Explorer ctrl+enter = %q, want %q", got, ToggleExpandAll)
+	}
+	if got := k.Lookup(Search, "ctrl+enter"); got != ToggleExpandAll {
+		t.Errorf("Search ctrl+enter = %q, want %q", got, ToggleExpandAll)
+	}
+	if got := k.Lookup(Global, "ctrl+enter"); got != LineBelow {
+		t.Errorf("global ctrl+enter = %q, want %q", got, LineBelow)
 	}
 }

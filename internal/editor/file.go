@@ -71,6 +71,10 @@ type File struct {
 	// which of them answered, so a weaker default cannot contradict it.
 	Indent     Indent
 	indentFrom IndentSource
+	// explicitWidth is the tab width SetTabWidth pinned, or 0 when the width
+	// came from the file, its format or the launch default. Reload re-detection
+	// keeps it: an explicit setting outlasts the content it was chosen against.
+	explicitWidth int
 
 	Syntax *syntax.Highlighter
 	sess   *piecetable.Session
@@ -119,6 +123,11 @@ type File struct {
 	// dark is the background the highlighter was built for. Kept so a rename
 	// can rebuild it without asking the application which terminal it is in.
 	dark bool
+
+	// snapshot records that this buffer was built from a session snapshot
+	// rather than read from disk. Save refuses it: the bytes belong to another
+	// process, and silently writing them over the path would clobber the file.
+	snapshot bool
 
 	// Enc is how the file's bytes are shaped around the text — line endings
 	// and byte order mark — so a save reproduces what was opened.
@@ -273,6 +282,21 @@ func (f *File) SetIndentDefault(i Indent) {
 	f.Indent = i
 }
 
+// SetTabWidth pins the tab width for this buffer: the display width a tab
+// advances and the width one indent level inserts. It is stronger than
+// SetIndentDefault — a file that detected its own indentation still takes the
+// width, because an explicit setting is a decision rather than a fallback —
+// and Reload re-detects with the pinned width, so the content cannot take it
+// back. A non-positive width is ignored.
+func (f *File) SetTabWidth(w int) {
+	if w <= 0 {
+		return
+	}
+	f.Cols.Tab = w
+	f.Indent.Width = w
+	f.explicitWidth = w
+}
+
 // IndentDetected reports whether the style came from something stronger than
 // the configured default.
 func (f *File) IndentDetected() bool { return f.indentFrom != IndentFromDefault }
@@ -301,12 +325,25 @@ func (f *File) IndentWarning() string {
 }
 
 func (f *File) Len() int                           { return f.sess.Buffer().Len() }
-func (f *File) Lines() int                         { return f.idx.Lines() }
+func (f *File) Lines() int                         { return f.index().Lines() }
 func (f *File) Text() string                       { return f.sess.Buffer().Slice(0, f.Len()) }
 func (f *File) Slice(pos, n int) string            { return f.sess.Buffer().Slice(pos, n) }
 func (f *File) Spans(pos, n int) []piecetable.Span { return f.sess.Buffer().Spans(pos, n) }
 func (f *File) Session() *piecetable.Session       { return f.sess }
 func (f *File) Pieces() int                        { return f.sess.Buffer().Pieces() }
+
+// index returns the line index, first catching it up on any op that reached
+// the journal without going through File. Every read of the index goes through
+// here, because the invariant it exists to keep — that it describes
+// File.Text()'s bytes exactly — cannot depend on a caller having remembered to
+// sync first. A decision made straight on the session, or any other path that
+// appends ops outside the File wrappers, would otherwise leave every line
+// number stale until the next edit happened to catch it up. sync is a version
+// compare when nothing has moved.
+func (f *File) index() *view.Index {
+	f.sync()
+	return f.idx
+}
 
 // MaxCleanCheck is the largest document raj will re-read to decide whether it
 // still matches what was saved. Digesting runs at ~1.6 GB/s, so 8 MB is about
@@ -323,7 +360,17 @@ const MaxCleanCheck = 8 << 20
 // means changed without reading a byte. Only a buffer that is the right length
 // but a different version — which is what undoing back to where you started
 // looks like — is worth digesting.
+// IsSnapshot reports that the buffer came from a session snapshot: it belongs
+// to another process, cannot be saved, and is therefore never locally dirty.
+func (f *File) IsSnapshot() bool { return f.snapshot }
+
 func (f *File) Dirty() bool {
+	if f.snapshot {
+		// The buffer is the daemon's text and this process cannot save it back,
+		// so it is never locally dirty; a dirty tab here would raise a save
+		// prompt the client has no way to satisfy.
+		return false
+	}
 	v := f.sess.Version()
 	if !f.layered {
 		if v == f.saved {
@@ -472,27 +519,28 @@ func (f *File) Name() string {
 
 // Line returns a line's text without its newline.
 func (f *File) Line(n int) string {
-	if n < 0 || n >= f.idx.Lines() {
+	if n < 0 || n >= f.index().Lines() {
 		return ""
 	}
-	start := f.idx.LineStart(n)
-	return f.Slice(start, f.idx.LineEnd(n, f.Len())-start)
+	start := f.index().LineStart(n)
+	return f.Slice(start, f.index().LineEnd(n, f.Len())-start)
 }
 
 // LineStart is the byte offset where a line begins.
-func (f *File) LineStart(n int) int { return f.idx.LineStart(n) }
+func (f *File) LineStart(n int) int { return f.index().LineStart(n) }
 
 // LineEnd is the offset just past a line's last byte, excluding the newline.
-func (f *File) LineEnd(n int) int { return f.idx.LineEnd(n, f.Len()) }
+func (f *File) LineEnd(n int) int { return f.index().LineEnd(n, f.Len()) }
 
 // LineOf reports which line an offset falls on.
-func (f *File) LineOf(off int) int { return f.idx.LineOf(off) }
+func (f *File) LineOf(off int) int { return f.index().LineOf(off) }
 
 // LineCol converts a byte offset to a line and display column.
 func (f *File) LineCol(off int) (line, col int) {
-	line = f.idx.LineOf(off)
+	ix := f.index()
+	line = ix.LineOf(off)
 	text := f.Line(line)
-	return line, f.Cols.ColOfHints(text, off-f.idx.LineStart(line), f.HintCols(line))
+	return line, f.Cols.ColOfHints(text, off-ix.LineStart(line), f.HintCols(line))
 }
 
 // OffsetAt converts a line and display column back to a byte offset, clamping
@@ -501,11 +549,12 @@ func (f *File) OffsetAt(line, col int) int {
 	if line < 0 {
 		return 0
 	}
-	if line >= f.idx.Lines() {
+	ix := f.index()
+	if line >= ix.Lines() {
 		return f.Len()
 	}
 	text := f.Line(line)
-	return f.idx.LineStart(line) + f.Cols.OffsetOfHints(text, col, f.HintCols(line))
+	return ix.LineStart(line) + f.Cols.OffsetOfHints(text, col, f.HintCols(line))
 }
 
 // HintsAt is every inline run anchored on a line — code lenses first, then
@@ -776,6 +825,7 @@ func (f *File) RevertAuthor(author piecetable.Author) (bool, piecetable.Block) {
 func (f *File) ProposeGroup(group uint64) {
 	f.sess.MarkGroup(group, piecetable.Proposed)
 	f.noteDecision()
+	f.sync()
 }
 
 // AcceptGroup agrees to a change set. Accepting is a decision, not an edit: the
@@ -784,6 +834,7 @@ func (f *File) ProposeGroup(group uint64) {
 func (f *File) AcceptGroup(group uint64) {
 	f.sess.AcceptGroup(group)
 	f.noteDecision()
+	f.sync()
 }
 
 // AcceptPending is the bulk accept the save gesture uses. It reports how many
@@ -793,6 +844,7 @@ func (f *File) AcceptPending() int {
 	if n > 0 {
 		f.noteDecision()
 	}
+	f.sync()
 	return n
 }
 
@@ -924,6 +976,9 @@ func (e *UnsavedProposedError) Error() string {
 // since raj last read or wrote it. Overwriting is still available through
 // SaveOver; what is not available is doing it without being asked.
 func (f *File) Save() error {
+	if f.snapshot {
+		return ErrSnapshotReadOnly
+	}
 	if f.DiskChanged() {
 		return ErrDiskChanged
 	}

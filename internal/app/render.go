@@ -2,9 +2,11 @@ package app
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"raj/internal/editor"
+	"raj/internal/keys"
 	"raj/internal/timing"
 	"raj/internal/ui"
 )
@@ -44,7 +46,7 @@ func (a *App) Draw() {
 		return
 	}
 
-	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	l := a.layout(cols, rows)
 	// A layout change moves every pane boundary, so the previous frame is a
 	// poor basis for a diff even though it is technically accurate. When only
 	// the panes moved, raj is the only writer and the frame covers every cell,
@@ -72,7 +74,14 @@ func (a *App) Draw() {
 		a.drawDiagnosticMarks(l)
 		a.drawProposalMarks(l)
 	}
-	a.drawStatus(cols, rows-1)
+	if a.phone {
+		// The phone profile keeps one bottom row for the action drawer, in Edit
+		// and Review alike; the expanded panel is drawn over the content. A
+		// live status shares the collapsed handle row.
+		a.drawPhoneDrawer(cols, l)
+	} else {
+		a.drawStatus(cols, rows-1)
+	}
 
 	// Completion sits over the editor but under the picker and any dialog: it
 	// is anchored to the caret, so it belongs with the text rather than with
@@ -148,6 +157,8 @@ func (a *App) drawSidebar(l Layout) {
 		a.Search.Render(a.screen, l.SidebarX, l.SidebarTop, w, l.SidebarRows, a.wth, focused)
 	case SidebarProblems:
 		a.Problems.Render(a.screen, l.SidebarX, l.SidebarTop, w, l.SidebarRows, a.wth, focused)
+	case SidebarSettings:
+		a.settingsPane.Render(a, a.screen, l.SidebarX, l.SidebarTop, w, l.SidebarRows, focused)
 	}
 	restore()
 	if l.ShowEditor {
@@ -450,6 +461,9 @@ func (a *App) focusName() string {
 		if a.sidebar == SidebarSearch {
 			return "search"
 		}
+		if a.sidebar == SidebarSettings {
+			return "settings"
+		}
 		return "explorer"
 	case FocusPicker:
 		return "go to file"
@@ -457,4 +471,415 @@ func (a *App) focusName() string {
 		return a.Prompt.Title()
 	}
 	return "raj"
+}
+
+// drawerItem is one touch target in the phone action drawer: a labelled button
+// drawn at row y over the columns [x, x+w). The handle carries action None; the
+// pointer toggles rather than dispatches it.
+type drawerItem struct {
+	label  string
+	action keys.Action
+	x, y   int
+	w, h   int
+}
+
+// drawerButton is one entry in the action drawer table. Every label names an
+// action the keyboard already binds, so a tap runs the same dispatch a chord
+// does.
+type drawerButtonDef struct {
+	label  string
+	action keys.Action
+}
+
+// drawerReviewButtons are the review controls. They are drawn only while the
+// app is in Review mode, because in Edit mode there is no change set on screen
+// to decide and a hidden cell must have no hit span.
+var drawerReviewButtons = []drawerButtonDef{
+	{"prev", keys.PrevProposed},
+	{"next", keys.NextProposed},
+	{"accept", keys.AcceptProposed},
+	{"reject", keys.RejectProposed},
+	{"clear", keys.ClearRejected},
+	{"list", keys.ReviewProposed},
+}
+
+// drawerGeneralButtons are always present: the editor actions a phone needs
+// whatever the mode. The navigation buttons come first, because reaching the
+// explorer or the search pane is how you get somewhere; then the buffer
+// actions.
+var drawerGeneralButtons = []drawerButtonDef{
+	{"files", keys.FocusExplorer},
+	{"search", keys.FocusSearch},
+	{"save", keys.Save},
+	{"open", keys.FilePicker},
+	{"close", keys.CloseTab},
+	{"exit", keys.Quit},
+}
+
+// drawerAllButtons is Review order: the review controls first, so Review opens
+// onto them, then the general controls.
+var drawerAllButtons = append(append([]drawerButtonDef{}, drawerReviewButtons...), drawerGeneralButtons...)
+
+// drawer cell geometry: each button cell is three screen rows tall — a top
+// border row, the label row, a bottom border row — two per row with a blank
+// column between them. The whole bordered block is the target, so a tap on a
+// border row is a tap on the button.
+const (
+	drawerCellRows = 3
+	drawerGap      = 1
+)
+
+// drawerLayout places the collapsed handle and, when open, the panel and its
+// buttons. It is the one function the renderer and the pointer share, so a tap
+// cannot land on a button other than the one drawn under it. Buttons sit two to
+// a row, so every target is a phone-sized cell.
+//
+// reviewControls selects the table: the general controls alone, or the review
+// controls followed by the general ones. The caller decides it from the mode
+// and whether the active pane has anything awaiting a decision, so the renderer
+// and the pointer cannot disagree about which cells exist.
+func drawerLayout(cols, rows int, open, reviewControls bool) (handle drawerItem, panelTop, panelRows int, buttons []drawerItem) {
+	handle = drawerItem{label: "[actions]", y: rows - phoneDrawerRows, w: cols, h: phoneDrawerRows}
+	if !open {
+		return handle, 0, 0, nil
+	}
+	table := drawerGeneralButtons
+	if reviewControls {
+		table = drawerAllButtons
+	}
+	const perRow = 2
+	rowsOfButtons := (len(table) + perRow - 1) / perRow
+	panelRows = rowsOfButtons * drawerCellRows
+	panelTop = handle.y - panelRows
+	if panelTop < 0 {
+		panelTop, panelRows = 0, handle.y
+	}
+	totalGap := (perRow - 1) * drawerGap
+	bw := (cols - totalGap) / perRow
+	for i, b := range table {
+		row, col := i/perRow, i%perRow
+		x := col * (bw + drawerGap)
+		w := bw
+		if col == perRow-1 {
+			w = cols - x
+		}
+		y := panelTop + row*drawerCellRows
+		if y+drawerCellRows > handle.y {
+			continue // the strip is too short for this cell
+		}
+		buttons = append(buttons, drawerItem{label: b.label, action: b.action, x: x, y: y, w: w, h: drawerCellRows})
+	}
+	return handle, panelTop, panelRows, buttons
+}
+
+// drawerCell paints one bordered button cell: a top border row, a label row
+// with the label centred, and a bottom border row. The border spans the same
+// columns the hit rectangle covers, so a tap anywhere on the block — border
+// rows included — is a tap on the button.
+func drawerCell(s *ui.Screen, b drawerItem, style ui.Style) {
+	if b.w < 2 || b.h < 3 {
+		s.SetString(b.x, b.y, b.label, style, b.w)
+		return
+	}
+	inner := b.w - 2
+	// Measure the label in runes, not bytes: the selected cell carries a
+	// multi-byte marker, and byte arithmetic would centre the block against the
+	// wrong edge and leave the right border short of x+w-1. The marker is part
+	// of the measured label, so the marked text itself is what centres.
+	label := []rune(b.label)
+	if len(label) > inner {
+		label = label[:inner]
+	}
+	pad := inner - len(label)
+	mid := "│" + strings.Repeat(" ", pad/2) + string(label) + strings.Repeat(" ", pad-pad/2) + "│"
+	s.SetString(b.x, b.y, "┌"+strings.Repeat("─", inner)+"┐", style, b.w)
+	s.SetString(b.x, b.y+1, mid, style, b.w)
+	s.SetString(b.x, b.y+2, "└"+strings.Repeat("─", inner)+"┘", style, b.w)
+}
+
+// drawerKey routes a keystroke to the phone action drawer while it is open, or
+// opens it on Up. It returns true when the drawer consumed the key, so the
+// editor never also sees Left/Right/Tab. It works on the resolved keys action,
+// not raw bytes, so it shares the keymap mapping and only the phone profile
+// reaches it.
+//
+// Clamp, not wrap: Left at the first button and Right at the last stay put, and
+// the linear index follows the two-per-row grid even when the last row holds a
+// single button.
+//
+// While the drawer is open every key is swallowed except Esc (it still toggles
+// the drawer closed), Quit (so a stray panel can never wedge the session) and
+// the review toggle (switching mode cannot edit, and it is how the review
+// controls become reachable); a panel over the editor must not let a stray key
+// edit underneath it.
+func (a *App) drawerKey(action keys.Action) bool {
+	if !a.phone {
+		return false
+	}
+	if !a.drawerOpen {
+		// The closed-drawer keys are a repurposing of the editor pane only.
+		// With the explorer, search, problems, picker or a prompt focused they
+		// are that surface keys, and Up must not open the drawer there: the
+		// handle tap is how a sidebar opens it.
+		if a.focus != FocusEditor {
+			return false
+		}
+		switch action {
+		case keys.LineUp:
+			// Up opens the drawer on the context default.
+			a.drawerOpen = true
+			a.drawerSel = 0
+			a.drawerWant = a.drawerOpenWant()
+			return true
+		case keys.CharLeft:
+			// Left/Right walk the tabs while the drawer is closed, mirroring
+			// the tab-cycle chord rather than a second implementation of it.
+			a.dispatch(keys.PrevTab, "")
+			return true
+		case keys.CharRight:
+			a.dispatch(keys.NextTab, "")
+			return true
+		}
+		return false
+	}
+	switch action {
+	case keys.ToggleDrawer, keys.Quit, keys.ToggleReview:
+		// Esc closes through the global handler, Quit is never swallowed, and
+		// the review toggle changes which buttons exist.
+		return false
+	case keys.LineUp:
+		// Movement is Left/Right while open.
+		return true
+	case keys.LineDown:
+		a.drawerOpen = false
+		return true
+	case keys.CharLeft:
+		a.drawerMove(-1)
+		return true
+	case keys.CharRight:
+		a.drawerMove(1)
+		return true
+	case keys.Indent, keys.CycleFocus:
+		// Tab, in the editor scope and beside it: activate the selection.
+		if it, ok := a.selectedDrawer(); ok {
+			a.drawerDispatch(it.action)
+		}
+		return true
+	}
+	return true
+}
+
+// drawerOpenWant is the button the drawer opens onto: next when a review is
+// under way (Review mode with something pending), else the first general
+// button, which is files. The target is named by action and resolved against
+// the drawn panel, so it survives the mode/pending button set and a short
+// screen. It is the open default only; the post-decision jumps are separate.
+func (a *App) drawerOpenWant() keys.Action {
+	if a.mode == ModeReview && a.activePending() > 0 {
+		return keys.NextProposed
+	}
+	return drawerGeneralButtons[0].action // files
+}
+
+// drawerDispatch runs a drawer button and closes the panel when the action
+// handed the keyboard to an overlay. It is the one place the rule lives, so a
+// button that opens a picker or a dialog inherits it: the drawer is modal for
+// the keys it draws and would otherwise swallow every key the new surface
+// needs. An action that stays in the editor keeps the panel up.
+func (a *App) drawerDispatch(action keys.Action) {
+	before := a.focus
+	beforePending := a.activePending()
+	a.dispatch(action, "")
+	if a.focus != before || a.Picker.Open || a.Prompt.Open {
+		a.drawerOpen = false
+	}
+	if !a.drawerOpen {
+		// The action handed the keyboard to an overlay, so the panel is gone
+		// and there is no selection to move; drop any pending jump.
+		a.drawerWant = keys.None
+		return
+	}
+	// The selection follows the review workflow. A decision that emptied the
+	// pending sets hands the next step to save; a save hands it to close. A
+	// refused decision, or one that left sets pending, leaves the selection
+	// alone. The button is named by action and resolved when the next frame
+	// draws the filtered set, so it survives the panel shrinking.
+	switch action {
+	case keys.Save:
+		a.drawerWant = keys.CloseTab
+	case keys.AcceptProposed, keys.RejectProposed, keys.ClearRejected:
+		if beforePending > 0 && a.activePending() == 0 {
+			a.drawerWant = keys.Save
+		}
+	}
+}
+
+// activePending is how many change sets the active pane still has awaiting a
+// decision.
+func (a *App) activePending() int {
+	p := a.Tabs.Active()
+	if p == nil {
+		return 0
+	}
+	return len(p.File.Session().Pending())
+}
+
+// drawerActionIndex finds a drawn cell by the action it runs, so selecting a
+// button by name survives a different mode/pending set and a short screen that
+// drops cells.
+func drawerActionIndex(buttons []drawerItem, action keys.Action) (int, bool) {
+	for i, b := range buttons {
+		if b.action == action {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// hasPendingChanges reports whether the active pane holds at least one change
+// set awaiting a decision. It is the same test save uses for its refusal, and
+// the cheapest accessor that answers it: Pending filters the diff walk, while
+// the mark and group projections allocate and sort. The drawer recomputes it
+// every frame because sets appear and vanish as agents write and the user
+// decides.
+func (a *App) hasPendingChanges() bool {
+	p := a.Tabs.Active()
+	return p != nil && len(p.File.Session().Pending()) > 0
+}
+
+// drawerMove moves the selection by delta within the drawn cells, clamping at
+// both ends.
+func (a *App) drawerMove(delta int) {
+	n := len(a.drawerPanel)
+	if n == 0 {
+		a.drawerSel = 0
+		return
+	}
+	a.drawerSel += delta
+	if a.drawerSel < 0 {
+		a.drawerSel = 0
+	}
+	if a.drawerSel >= n {
+		a.drawerSel = n - 1
+	}
+}
+
+// selectedDrawer is the button the selection names, when the drawer is open and
+// the index is inside the drawn panel.
+func (a *App) selectedDrawer() (drawerItem, bool) {
+	if !a.drawerOpen || a.drawerSel < 0 || a.drawerSel >= len(a.drawerPanel) {
+		return drawerItem{}, false
+	}
+	return a.drawerPanel[a.drawerSel], true
+}
+
+// drawPhoneDrawer paints the phone profile bottom row and, when open, the
+// action panel over the content. The handle shares its one row with a live
+// status: the status on the left, the handle on the right.
+func (a *App) drawPhoneDrawer(cols int, l Layout) {
+	a.drawerHandle = drawerItem{}
+	a.drawerPanel = a.drawerPanel[:0]
+	a.drawerPanelTop, a.drawerPanelRows = 0, 0
+	if l.BarY < 0 {
+		return
+	}
+	reviewControls := a.mode == ModeReview && a.hasPendingChanges()
+	handle, panelTop, panelRows, buttons := drawerLayout(cols, l.BarY+phoneDrawerRows, a.drawerOpen, reviewControls)
+	a.drawerHandle, a.drawerPanel = handle, buttons
+	a.drawerPanelTop, a.drawerPanelRows = panelTop, panelRows
+
+	style := ui.DefaultStyle.Plus(ui.Reverse)
+	if a.drawerOpen {
+		// The selection indexes the drawn cells, so a mode change or a short
+		// screen that drops a cell can never leave it naming a button that is
+		// not on screen.
+		if len(buttons) == 0 {
+			a.drawerSel = 0
+		} else if a.drawerSel >= len(buttons) {
+			a.drawerSel = len(buttons) - 1
+		} else if a.drawerSel < 0 {
+			a.drawerSel = 0
+		}
+		// A pending jump is resolved here, against the cells actually drawn:
+		// the target may have shifted index or gone (short screen), in which
+		// case the clamped selection stands.
+		if a.drawerWant != keys.None {
+			if i, ok := drawerActionIndex(buttons, a.drawerWant); ok {
+				a.drawerSel = i
+			}
+			a.drawerWant = keys.None
+		}
+		// The selected cell is the accent block — white on the BorderFocus
+		// blue — not a weight change, which reads faint on a phone. The marker
+		// keeps it unambiguous in a monochrome terminal.
+		selStyle := ui.DefaultStyle.With(ui.Ansi(15)).On(ui.Ansi(4))
+		for y := panelTop; y < panelTop+panelRows; y++ {
+			a.screen.Fill(0, y, cols, 1, style)
+		}
+		for i, b := range buttons {
+			st := style
+			if i == a.drawerSel {
+				st = selStyle
+				b.label = "▸ " + b.label
+			}
+			for dy := 0; dy < b.h; dy++ {
+				a.screen.Fill(b.x, b.y+dy, b.w, 1, st)
+			}
+			drawerCell(a.screen, b, st)
+		}
+	}
+
+	// The handle is a full-width, phoneDrawerRows-tall target. A live status
+	// shares the strip: it takes the first row and the label the last.
+	for dy := 0; dy < handle.h; dy++ {
+		a.screen.Fill(0, handle.y+dy, cols, 1, style)
+	}
+	if a.status != "" {
+		if a.status != a.statusShown {
+			a.statusShown = a.status
+			a.statusAt = time.Now()
+		}
+		a.screen.SetString(0, handle.y, " "+a.status, style, cols)
+	}
+	// Bottom row, left to right: the client connection dot (attached clients
+	// only), the tab count, and the [actions] label right-aligned. Precedence
+	// when the strip is narrow: the dot is pinned at column 0, the label keeps
+	// the right and never starts before column 1, and the count is truncated
+	// into whatever lies between them. The status is on the row above, so
+	// nothing here shares a cell with it.
+	bottom := handle.y + handle.h - 1
+	hx := cols - len(handle.label) - 1
+	if hx < 1 {
+		hx = 1
+	}
+	countX := 0
+	if a.attach {
+		countX = 2 // the dot owns column 0 and the gap after it
+	}
+	if hx > countX {
+		a.screen.SetString(countX, bottom, a.tabCountLabel(), style, hx-countX)
+	}
+	a.screen.SetString(hx, bottom, handle.label, style, cols-hx)
+	if a.attach {
+		dot := ui.DefaultStyle.With(ui.Ansi(2))
+		if a.clientIsDown() {
+			dot = ui.DefaultStyle.With(ui.Ansi(1))
+		}
+		a.screen.Set(0, bottom, '●', dot)
+	}
+}
+
+// tabCountLabel is the collapsed handle left-hand count: the tabs the user has
+// open. A preview slot is transient and left out, and a headless buffer is not
+// a tab at all. The count alone reads better than active/total because the tab
+// strip already marks the active tab, and it is shorter on a narrow phone.
+func (a *App) tabCountLabel() string {
+	n := a.Tabs.Count()
+	if a.Tabs.Preview() != nil {
+		n--
+	}
+	if n == 1 {
+		return "1 tab"
+	}
+	return fmt.Sprintf("%d tabs", n)
 }

@@ -49,6 +49,9 @@ func (a *App) loadHeadless(path string) (*editor.Pane, error) {
 		return nil, err
 	}
 	f.SetIndentDefault(editor.Indent{Tabs: a.Tabs.IndentTabs, Width: a.tabWidth})
+	if a.Tabs.TabWidthPinned() {
+		f.SetTabWidth(a.tabWidth)
+	}
 	p := editor.NewPane(f)
 	a.headless = append([]*editor.Pane{p}, a.headless...)
 	a.evictHeadless()
@@ -111,34 +114,61 @@ func (a *App) announceIfHeadless(p *editor.Pane) {
 	}
 }
 
-// announce reveals a loaded pane as a tab.
+// announceIfHeadlessQuiet is announceIfHeadless without the focus move. A
+// socket request that reveals a buffer gets it a tab to sit in, but the user
+// stays where they were: the tab is there to be found, not to interrupt.
+func (a *App) announceIfHeadlessQuiet(p *editor.Pane) {
+	if p != nil && a.isHeadless(p) {
+		a.announceQuiet(p)
+	}
+}
+
+// announce reveals a loaded pane as a tab and focuses it.
+func (a *App) announce(p *editor.Pane) {
+	if p == nil {
+		return
+	}
+	a.announceQuiet(p)
+	a.Tabs.Focus(p)
+	if !a.Prompt.Open {
+		a.focus = FocusEditor
+	}
+}
+
+// announceQuiet reveals a loaded pane as a tab without moving the user's active
+// tab or focus.
 //
 // The pane keeps its document state -- the piece table and journal are the same
 // objects -- and gains the presentation state OpenFile gives every tab. Adding
 // it rather than reopening it is what preserves the version an agent read
 // before it proposed, so the offsets still land on the bytes they were measured
 // against.
-func (a *App) announce(p *editor.Pane) {
+//
+// A tab the user has to find is still a tab: a proposal is never hidden. What
+// is left alone is which tab is in front. An already-open pane is simply left
+// as it is; a newly added one is appended and the previous active tab is
+// restored, or, when the editor had nothing open, keeps the slot so something
+// is visible.
+func (a *App) announceQuiet(p *editor.Pane) {
 	if p == nil {
 		return
 	}
 	for _, q := range a.Tabs.All() {
 		if q == p {
-			a.Tabs.Focus(p)
-			if !a.Prompt.Open {
-				a.focus = FocusEditor
-			}
+			// Already a tab: it has its presentation, and moving the user is
+			// not this call's business.
 			return
 		}
 	}
+	prev := a.Tabs.Active()
 	a.unregisterHeadless(p)
 	p.File.SetDark(a.host.Theme().Dark())
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
 	p.Hints = a.InlayHints
 	a.Tabs.Add(p)
-	if !a.Prompt.Open {
-		a.focus = FocusEditor
+	if prev != nil && a.Tabs.Contains(prev) {
+		a.Tabs.Focus(prev)
 	}
 	// A revealed buffer owes the same warning a freshly opened one does: mixed
 	// line endings a save will normalise, or indentation the file's format
@@ -157,6 +187,7 @@ func (a *App) dropHeadless(p *editor.Pane) bool {
 	for i, q := range a.headless {
 		if q == p {
 			a.headless = append(a.headless[:i], a.headless[i+1:]...)
+			a.rememberPosition(p)
 			a.closeDoc(p)
 			return true
 		}
@@ -193,6 +224,7 @@ func (a *App) evictHeadless() {
 			a.announce(p)
 			continue
 		}
+		a.rememberPosition(p)
 		a.closeDoc(p)
 	}
 }

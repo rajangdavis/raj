@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/lsp"
 	"raj/internal/safe"
@@ -40,8 +41,8 @@ import (
 // capability and, when the server advertised the prepare half, checks the
 // position before asking for a name.
 func (a *App) renameSymbol() {
-	if a.mode == ModeReview {
-		a.status = reviewReadOnlyNote()
+	if a.readOnly() {
+		a.status = a.readOnlyNote()
 		return
 	}
 	p := a.Tabs.Active()
@@ -205,10 +206,11 @@ func (a *App) renameTo(name string) {
 
 // applyRename resolves a WorkspaceEdit and applies it, or refuses it whole.
 //
-// All-or-nothing is the rule, and it is enforced in three places: a file
-// operation refuses the edit, a version mismatch refuses the edit, and a
-// document that cannot be loaded refuses the edit. Only after every target is
-// resolved does the first edit land.
+// All-or-nothing is the rule, and it is enforced in four places: a file
+// operation refuses the edit, a version mismatch refuses the edit, a document
+// that cannot be loaded refuses the edit, and a lease on any target's span
+// refuses the edit. Only after every target is resolved and clear does the
+// first edit land.
 func (a *App) applyRename(r lspAnswer) {
 	if r.edit == nil {
 		a.status = "rename made no changes"
@@ -238,7 +240,7 @@ func (a *App) applyRename(r lspAnswer) {
 	// the buffers loaded for the attempt are dropped again.
 	type target struct {
 		pane  *editor.Pane
-		edits []lsp.TextEdit
+		edits []complete.Edit
 	}
 	targets := make([]target, 0, len(r.edit.Docs))
 	var loaded []*editor.Pane
@@ -257,7 +259,28 @@ func (a *App) applyRename(r lspAnswer) {
 			p = q
 			loaded = append(loaded, q)
 		}
-		targets = append(targets, target{pane: p, edits: d.Edits})
+		doc := lsp.NewDocument(p.File.Text())
+		spans := make([]complete.Edit, 0, len(d.Edits))
+		for _, e := range d.Edits {
+			lo, hi := doc.Span(e.Range)
+			spans = append(spans, complete.Edit{Start: lo, End: hi, Text: e.NewText})
+		}
+		targets = append(targets, target{pane: p, edits: spans})
+	}
+
+	// The leases are checked for every target before any text changes. A rename
+	// is one edit even though it spans documents, so a pending, rejected or
+	// invalidated change set anywhere refuses the whole rename rather than
+	// leaving a symbol half renamed. The buffers loaded for this attempt are
+	// dropped again, since the refusal means nothing was changed.
+	for _, t := range targets {
+		if group, leased := editsLeased(t.pane, t.edits); leased {
+			for _, l := range loaded {
+				a.dropHeadless(l)
+			}
+			a.status = leaseNote(group)
+			return
+		}
 	}
 
 	// The original tab stays the one on screen; announcing a touched file adds
@@ -271,7 +294,12 @@ func (a *App) applyRename(r lspAnswer) {
 		a.announceIfHeadless(t.pane)
 	}
 	for _, t := range targets {
-		a.applyDocEdits(t.pane, t.edits)
+		if group, ok := a.applyDocEdits(t.pane, t.edits); !ok {
+			// Unreachable after the lease pre-check above; kept so a future
+			// reordering cannot leave the status claiming success.
+			a.status = leaseNote(group)
+			return
+		}
 	}
 	if orig != nil && a.Tabs.Focus(orig) {
 		a.focus = FocusEditor
@@ -280,36 +308,24 @@ func (a *App) applyRename(r lspAnswer) {
 }
 
 // applyDocEdits replaces a document's spans with the server's text as one undo
-// step, highest offset first so earlier spans stay valid. It is the same shape
-// acceptCompletion uses for a completion's textEdit and additionalTextEdits,
-// extended from one document to each document a workspace edit touches.
-func (a *App) applyDocEdits(p *editor.Pane, edits []lsp.TextEdit) {
+// step. It is the rename half of the server-edit path: the caller converts the
+// server's LSP ranges into byte spans, and this runs the same all-or-nothing
+// lease check, highest-offset-first sort and one Begin/End bracket that
+// applyServerEdits gives every other server edit. On a leased span it changes
+// nothing and returns the set, so the caller can refuse the whole rename.
+func (a *App) applyDocEdits(p *editor.Pane, edits []complete.Edit) (group uint64, ok bool) {
 	if p == nil || p.File == nil || len(edits) == 0 {
-		return
+		return 0, true
 	}
-	doc := lsp.NewDocument(p.File.Text())
-	type span struct {
-		lo, hi int
-		text   string
-	}
-	spans := make([]span, 0, len(edits))
-	for _, e := range edits {
-		lo, hi := doc.Span(e.Range)
-		spans = append(spans, span{lo: lo, hi: hi, text: e.NewText})
-	}
-	sort.SliceStable(spans, func(i, j int) bool {
-		if spans[i].lo != spans[j].lo {
-			return spans[i].lo > spans[j].lo
-		}
-		return spans[i].hi > spans[j].hi
-	})
+	// The caret offset is in the document's original coordinates, so read it
+	// before the edits land: applyServerEdits moves the cursor as it replaces
+	// spans, and a post-edit offset through renameShiftOffset would shift it
+	// twice.
 	head := p.Cursors.Primary().Head
-	at := renameShiftOffset(head, edits, doc)
-	p.File.Begin()
-	for _, s := range spans {
-		p.ReplaceRange(s.lo, s.hi, s.text)
+	if group, ok := applyServerEdits(p, edits); !ok {
+		return group, false
 	}
-	p.File.End()
+	at := renameShiftOffset(head, edits)
 	if n := p.File.Len(); at > n {
 		at = n
 	}
@@ -319,18 +335,18 @@ func (a *App) applyDocEdits(p *editor.Pane, edits []lsp.TextEdit) {
 	p.Cursors.Set(at, at)
 	p.FollowCursor()
 	a.Explorer.Tree.MarkChanged(p.File.Path)
+	return 0, true
 }
 
 // renameShiftOffset maps an original byte offset through a document's edits so
 // the caret stays where it was looking instead of jumping to whichever edit
 // happened to be applied last. Edits are spans in the document's original
 // coordinates; the result is in the edited document's coordinates.
-func renameShiftOffset(off int, edits []lsp.TextEdit, doc *lsp.Document) int {
+func renameShiftOffset(off int, edits []complete.Edit) int {
 	type span struct{ lo, hi, n int }
 	spans := make([]span, 0, len(edits))
 	for _, e := range edits {
-		lo, hi := doc.Span(e.Range)
-		spans = append(spans, span{lo: lo, hi: hi, n: len(e.NewText)})
+		spans = append(spans, span{lo: e.Start, hi: e.End, n: len(e.Text)})
 	}
 	sort.SliceStable(spans, func(i, j int) bool {
 		if spans[i].lo != spans[j].lo {

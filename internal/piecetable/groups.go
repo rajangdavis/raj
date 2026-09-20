@@ -904,6 +904,100 @@ func hunkOverlap(a, b DiffHunk) (int, int, bool) {
 	return 0, 0, false
 }
 
+// deferredDeletions names the live Proposed sets whose members all delete: the
+// deletion-only proposals the edit composition holds back until they are
+// accepted. A deletion has no text to show as a proposal, so applying it would
+// make the proposal invisible; deferring it keeps the bytes in the edit view,
+// where the planned range can be marked and leased. Only the edit composition
+// defers: AcceptedOnly already excludes a Proposed set, and Annotated stays the
+// session view so read and apply keep one coordinate frame.
+func (s *Session) deferredDeletions(p Policy) map[uint64]bool {
+	if p != AcceptedAndProposed {
+		return nil
+	}
+	inserted := map[uint64]bool{}
+	members := map[uint64]bool{}
+	for _, o := range s.journal {
+		if o.Kind != KindEdit || !s.live(o.Seq) || s.GroupState(o.Group) != Proposed {
+			continue
+		}
+		members[o.Group] = true
+		if o.InsLen() > 0 {
+			inserted[o.Group] = true
+		}
+	}
+	var out map[uint64]bool
+	for id := range members {
+		if inserted[id] {
+			continue
+		}
+		if out == nil {
+			out = map[uint64]bool{}
+		}
+		out[id] = true
+	}
+	return out
+}
+
+// deletionLeases reports the deletion-only sets in state want whose planned
+// range intersects [pos, pos+length). A deletion has no inserted run for
+// Project's StateRuns to own, so its lease cannot be read off the composition;
+// projectMember is the same walk DiffPending renders, and it maps a pure
+// deletion to the zero-width point its removed bytes leave in the present.
+// That gap is the planned range, and hunkOverlap applies the one intersection
+// rule every lease uses. The set is reported once, at the first member point
+// the hunk catches, so a caller sees each set once however many members it has.
+func (s *Session) deletionLeases(pos, length int, want GroupState) []Block {
+	if !s.HasDecisions() {
+		return nil
+	}
+	if length < 0 {
+		length = 0
+	}
+	// Classify the live sets in one pass: deletion-only means at least one
+	// member and none that inserted. order preserves the journal's first-seen
+	// order, so the result does not depend on map iteration.
+	inserted := map[uint64]bool{}
+	members := map[uint64]bool{}
+	var order []uint64
+	for _, o := range s.journal {
+		if o.Kind != KindEdit || !s.live(o.Seq) {
+			continue
+		}
+		if !members[o.Group] {
+			order = append(order, o.Group)
+		}
+		members[o.Group] = true
+		if o.InsLen() > 0 {
+			inserted[o.Group] = true
+		}
+	}
+	var out []Block
+	for _, id := range order {
+		if inserted[id] || s.GroupState(id) != want {
+			continue
+		}
+		for _, o := range s.journal {
+			if o.Group != id || o.Kind != KindEdit || !s.live(o.Seq) {
+				continue
+			}
+			hit := false
+			for _, h := range s.projectMember(o) {
+				if _, _, ok := hunkOverlap(DiffHunk{Start: h.Start, End: h.End},
+					DiffHunk{Start: pos, End: pos + length}); ok {
+					out = append(out, Block{Group: id, Author: o.Author, Start: h.Start, End: h.End})
+					hit = true
+					break
+				}
+			}
+			if hit {
+				break
+			}
+		}
+	}
+	return out
+}
+
 // proposedSpans reports every distinct Proposed change set whose run intersects
 // [pos, pos+length), each once, with its owning author and the run's bounds.
 // A hunk that lands needs every draft it moved past, so this reports them all.
@@ -929,6 +1023,9 @@ func (s *Session) proposedSpans(pos, length int) []Block {
 			out = append(out, Block{Group: r.Group, Author: owner, Start: r.Off, End: r.Off + r.Len})
 		}
 	}
+	// A deletion-only set owns no inserted run, so the states walk above cannot
+	// see it; deletionLeases names the gap its removed bytes leave.
+	out = append(out, s.deletionLeases(pos, length, Proposed)...)
 	return out
 }
 

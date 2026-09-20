@@ -196,11 +196,12 @@ func TestReloadBindingOnAnUnnamedBuffer(t *testing.T) {
 	}
 }
 
-// The idle tick asks each open tab whether its file changed on disk, so the
-// save prompt stops being a surprise: the tab is marked before the user presses
-// save, and a reload clears the mark.
-func TestIdleTickMarksDiskChangedTab(t *testing.T) {
+// The idle tick asks each open tab whether its file changed on disk. A dirty
+// buffer keeps the mark so the save prompt stops being a surprise, and its
+// unsaved text is not thrown away.
+func TestIdleTickMarksDirtyDiskChangedTab(t *testing.T) {
 	h := newHarness(t, "original\n")
+	h.typeText("mine ") // dirty: the tick must not discard it
 	rewriteOnDisk(t, h, "theirs\n")
 	if h.Pane().DiskStale() {
 		t.Fatal("tab marked before any tick ran")
@@ -209,18 +210,35 @@ func TestIdleTickMarksDiskChangedTab(t *testing.T) {
 	h.Handle(ui.Tick{})
 	h.Draw()
 	if !h.Pane().DiskStale() {
-		t.Fatal("tab not marked after the file changed on disk")
+		t.Fatal("dirty tab not marked after the file changed on disk")
+	}
+	if got := h.Pane().File.Text(); got != "mine original\n" {
+		t.Errorf("buffer = %q, want the unsaved text kept", got)
 	}
 	if !strings.Contains(h.host.Text(), "!") {
 		t.Errorf("changed-on-disk mark missing from the tab bar:\n%s", h.host.Text())
 	}
+}
 
-	h.press("shift+super+r")
+// A clean buffer has nothing to lose, so the idle tick takes the disk version
+// instead of marking a conflict the user would have to resolve.
+func TestIdleTickReloadsCleanDiskChangedTab(t *testing.T) {
+	h := newHarness(t, "original\n")
+	rewriteOnDisk(t, h, "theirs\n")
+
+	h.Handle(ui.Tick{})
+	h.Draw()
 	if h.Pane().DiskStale() {
-		t.Error("mark still set after reload")
+		t.Error("a clean tab was marked instead of reloaded")
 	}
 	if got := h.Pane().File.Text(); got != "theirs\n" {
 		t.Errorf("buffer = %q, want the disk version", got)
+	}
+	if h.Prompt.Open {
+		t.Error("a clean reload asked a question")
+	}
+	if !strings.Contains(h.Status(), "reloaded") {
+		t.Errorf("status = %q, want a reloaded note", h.Status())
 	}
 }
 

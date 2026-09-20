@@ -76,3 +76,26 @@ func TestLeaseEndsWhenTheSetIsAccepted(t *testing.T) {
 		t.Fatalf("text = %q, want typing to land once the lease is accepted", got)
 	}
 }
+
+// A deletion-only proposal is leased through the same caret-side check as any
+// other Proposed set: a replacement that spans the gap the removed bytes would
+// come back to is refused until the set is decided. Before deletionLeases a
+// pure-deletion set owned no inserted run and this write succeeded, which could
+// move the set past what its reversal could carry.
+func TestLeaseRefusesAWriteAcrossAProposedDeletion(t *testing.T) {
+	h := newHarness(t, "hello world\n")
+	id := propose(t, h, piecetable.Hunk{Start: 6, End: 11, Text: ""})
+	p := h.Pane()
+
+	// The whole line spans the gap at 6, where "world" would be restored.
+	p.Cursors.Set(0, 7)
+	h.typeText("HI")
+
+	if got := h.text(); got != "hello \n" {
+		t.Fatalf("text = %q, want the write refused and the session unchanged", got)
+	}
+	if !strings.Contains(h.Status(), "read-only") ||
+		!strings.Contains(h.Status(), fmt.Sprintf("change set %d", id)) {
+		t.Errorf("status = %q, want a lease refusal naming set %d", h.Status(), id)
+	}
+}

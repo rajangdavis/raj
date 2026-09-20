@@ -67,6 +67,12 @@ type logTap struct {
 // the session on this thread, and never fsyncs, because a tick is not a
 // commitment.
 func (a *App) journalTick(now time.Time) {
+	// A snapshot buffer is not this process's to log: the daemon holds the
+	// session, and a local op log would replay another process's document on
+	// the next local run.
+	if a.attach {
+		return
+	}
 	if !journalEnabled() || a.root == "" || a.NoRestore {
 		return
 	}
@@ -79,13 +85,13 @@ func (a *App) journalTick(now time.Time) {
 	}
 }
 
-// journalDir is the directory the per-buffer logs live under, beside the
-// session file that shares the same scratch-state directory.
+// journalDir is the directory the per-buffer logs live under, inside the
+// workspace's XDG state dir alongside the store and the trash.
 func (a *App) journalDir() string {
 	if a.root == "" {
 		return ""
 	}
-	return filepath.Join(session.Dir(a.root), "logs")
+	return filepath.Join(session.StateDir(a.root), "logs")
 }
 
 // journalName is the log file for a buffer path. A short digest makes it unique
@@ -132,7 +138,7 @@ func (a *App) archiveLog(logPath string) string {
 // It creates the log on the first call, when the buffer is dirty. A buffer that
 // is clean and has no log is left alone, so browsing files writes nothing.
 func (a *App) appendJournal(p *editor.Pane) {
-	if !journalEnabled() || a.root == "" || a.NoRestore || p == nil || p.File.Path == "" {
+	if !journalEnabled() || a.root == "" || a.NoRestore || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
 		return
 	}
 	tap := a.journals[p.File.Path]
@@ -389,7 +395,7 @@ func (t *logTap) matches(sess *piecetable.Session) bool {
 // additive: the origin base stays, because history is kept, and restore accepts
 // a log whose disk matches either.
 func (a *App) recordWritten(p *editor.Pane) {
-	if !journalEnabled() || a.root == "" || a.NoRestore || p == nil || p.File.Path == "" {
+	if !journalEnabled() || a.root == "" || a.NoRestore || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
 		return
 	}
 	a.appendJournal(p)
@@ -438,7 +444,13 @@ func (a *App) flushJournals() {
 // crash never reaches closeJournal, and quit still uses closeJournals, which
 // keeps leaving the files for the next start.
 func (a *App) closeJournal(p *editor.Pane) {
-	if !journalEnabled() || p == nil || p.File.Path == "" {
+	// A client has no local log to close or remove: the daemon holds the
+	// session, and writing a journal here would leave a file the next local run
+	// would try to restore against a document this process never owned.
+	if a.attach {
+		return
+	}
+	if !journalEnabled() || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
 		return
 	}
 	a.appendJournal(p)
@@ -511,6 +523,9 @@ func (a *App) restoreLog(logPath string) {
 	if !ok {
 		return
 	}
+	if isGitPath(base.Path) {
+		return // git transient: never restore a commit message as a tab
+	}
 	a.collectAuthors(l)
 	p := a.paneFor(base.Path)
 	mark, wrote := lastWritten(l)
@@ -581,6 +596,9 @@ func (a *App) restoreLog(logPath string) {
 	// shape the restored buffer actually has.
 	p.File.SetEncoding(editorEncoding(a.restoredEncoding(base.Path, l.Encoding())))
 	p.File.SetDark(a.host.Theme().Dark())
+	if a.Tabs.TabWidthPinned() {
+		p.File.SetTabWidth(a.tabWidth)
+	}
 	// The swap replaces the session the memoised projection was built from, so
 	// rebuild it now rather than leaving it to the first frame. The restored
 	// decisions are already in place, so SetDisplay derives exactly what the

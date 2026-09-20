@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"raj/internal/piecetable"
+	"raj/internal/session"
 )
 
 // The dir-removal gate, driven through the same event path a keystroke takes:
@@ -142,7 +143,7 @@ func TestRemoveForeverTrashesDir(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("directory still at the original path after a trashing removal (err=%v)", err)
 	}
-	trash := filepath.Join(h.root, ".raj", "trash")
+	trash := filepath.Join(session.StateDir(h.root), "trash")
 	entries, err := os.ReadDir(trash)
 	if err != nil {
 		t.Fatalf("reading trash dir %s: %v", trash, err)

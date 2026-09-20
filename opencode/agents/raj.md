@@ -1,6 +1,7 @@
 ---
 description: Raj-only agent: reads and writes only through the raj-editor skill (raj ctl).
 mode: all
+model: deepseek/deepseek-flash
 permission:
   read: deny
   edit: deny
@@ -24,6 +25,13 @@ search with `raj ctl search`. Your writes arrive as attributed proposals;
 leave accept and save to the user. For tests, builds and git use your own
 shell, and first check `raj ctl buffers` for unsaved changes. Direct file
 tools are removed by design.
+
+Batch your calls: one `raj ctl read A B C` for several files, `search -context`
+instead of search-then-read, reuse the version from `read -json` as `-base`,
+`apply -hunks` for multi-hunk edits, `dump`/`patch` for structural rewrites,
+and `claim` every target once up front. Session data: about 1.22 calls per
+assistant turn and under 12 percent adoption of these; every call avoided
+saves a context re-read.
 
 Standing workflow — primary sessions only; skip this when you were spawned
 as a subagent carrying a delegated brief. Follow the raj-recursive skill

@@ -48,20 +48,36 @@ func TestProjectOriginalInsertDoesNotDuplicate(t *testing.T) {
 	}
 }
 
-// An excluded deletion is never applied, so its bytes stay in the composition:
-// that is the whole restore, and it needs no special case.
-func TestProjectRestoresProposedDeletion(t *testing.T) {
+// A proposed deletion is deferred in the edit composition: the bytes the
+// proposal would remove stay visible until the human accepts, because a
+// deletion has no text to show as a proposal and applying it would be the only
+// thing a reviewer saw. Accepting applies it; rejecting restores it.
+func TestProjectDefersProposedDeletionUntilAccept(t *testing.T) {
 	s := NewSession(NewNaive("ABC"))
 	s.Begin()
 	s.Delete(User, 1, 1) // "B"
 	s.End()
-	s.MarkGroup(s.LastGroup(), Proposed)
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
 
 	if got := s.Project(AcceptedOnly).Text(); got != "ABC" {
 		t.Fatalf("excluded deletion was applied anyway: %q, want %q", got, "ABC")
 	}
+	if got := s.Project(AcceptedAndProposed).Text(); got != "ABC" {
+		t.Fatalf("edit composition %q, want the deferred deletion visible as %q", got, "ABC")
+	}
+
+	s.AcceptGroup(id)
 	if got := s.Project(AcceptedAndProposed).Text(); got != "AC" {
-		t.Fatalf("edit composition %q, want %q", got, "AC")
+		t.Fatalf("edit composition after accept = %q, want %q", got, "AC")
+	}
+	if got := s.Project(AcceptedOnly).Text(); got != "AC" {
+		t.Fatalf("agreed composition after accept = %q, want %q", got, "AC")
+	}
+
+	s.MarkGroup(id, Rejected)
+	if got := s.Project(AcceptedAndProposed).Text(); got != "ABC" {
+		t.Fatalf("edit composition after reject = %q, want the deferred %q", got, "ABC")
 	}
 }
 
@@ -432,8 +448,12 @@ func foldProjectOracle(orig string, s *Session, p Policy) projOracle {
 		return v
 	}
 
+	deferred := s.deferredDeletions(p)
 	included := func(o Op) bool {
 		if o.Kind != KindEdit || !isLive(o.Seq) {
+			return false
+		}
+		if deferred[o.Group] {
 			return false
 		}
 		switch p {
@@ -796,18 +816,57 @@ func TestLeasedNamesTheOwningRun(t *testing.T) {
 	}
 }
 
-// A change set that only deletes has no inserted run, so Leased cannot name it
-// and the deletion is not protected. This is the known limitation of a lease
-// built from inserted runs; it is reported, not hidden.
-func TestLeasedIgnoresPureDeletionSet(t *testing.T) {
+// A change set that only deletes has no inserted run, so Project's StateRuns
+// cannot name it; the lease comes from deletionLeases, which maps the removed
+// bytes to the zero-width gap they leave in the present. A range that spans
+// that gap is leased, and accepting the set ends the lease. Without the
+// deletionLeases walk the first assertion fails: the old lease saw only
+// inserted runs, so a pure deletion was never protected.
+func TestLeasedNamesAPureDeletionSet(t *testing.T) {
 	s := NewSession(NewNaive("ABC"))
 	s.Begin()
-	s.Delete(Agent, 1, 1) // "B", inserting nothing
+	s.Delete(Agent, 1, 1) // "B", inserting nothing, leaving the gap at 1
 	s.End()
-	s.MarkGroup(s.LastGroup(), Proposed)
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
 
+	if g, ok := s.Leased(0, 3); !ok || g != id {
+		t.Errorf("Leased across the gap = (%d,%v), want (%d,true)", g, ok, id)
+	}
+	// An insertion flush with the gap is beside the removed bytes, not in
+	// them, so it stays allowed; hunkOverlap's boundary rule is unchanged.
+	if _, ok := s.Leased(1, 0); ok {
+		t.Error("an insertion flush with the gap must not be leased")
+	}
+	if _, ok := s.Leased(1, 1); ok {
+		t.Error("a replacement starting at the gap must not be leased")
+	}
+
+	s.AcceptGroup(id)
 	if _, ok := s.Leased(0, 3); ok {
-		t.Error("a pure-deletion set has no inserted run and cannot be leased")
+		t.Error("an accepted deletion is applied and must not be leased")
+	}
+}
+
+// A deletion-only proposal is an advisory lease like any other Proposed run: a
+// hunk from another author that spans the gap lands, and the returned warning
+// names the deleted set once, so a peer is told rather than left to find the
+// overlap later. Without the deletionLeases walk ApplyDiff reports no warning.
+func TestApplyDiffWarnsOverProposedDeletion(t *testing.T) {
+	s := NewSession(NewNaive("hello world\n"))
+	s.Begin()
+	s.Delete(Agent, 6, 5) // "world", leaving the gap at 6
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	_, conflicts, warnings := s.ApplyDiff(User, s.Version(),
+		[]Hunk{{Start: 0, End: 7, Text: "HI"}})
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %+v, want none: a Proposed lease is advisory", conflicts)
+	}
+	if len(warnings) != 1 || warnings[0].Group != id {
+		t.Fatalf("warnings = %+v, want the deletion set %d named once", warnings, id)
 	}
 }
 

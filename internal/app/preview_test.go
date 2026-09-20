@@ -85,6 +85,41 @@ func TestExplorerEnterCommitsThePreview(t *testing.T) {
 	}
 }
 
+// A file an agent loaded headlessly is adopted into the preview slot rather
+// than read a second time: without the findHeadless branch the explorer would
+// show a duplicate tab, and the next preview replaces the adopted pane and
+// drops it while keeping one tab.
+func TestPreviewFileAdoptsAHeadlessPane(t *testing.T) {
+	h := newWorkspace(t, 120, 20)
+	target := filepath.Join(h.root, "main.go")
+	p, err := h.loadHeadless(target)
+	if err != nil {
+		t.Fatalf("loadHeadless: %v", err)
+	}
+	h.previewFile(target)
+	if h.Tabs.Count() != 1 {
+		t.Fatalf("previewing a headless file left %d tabs, want 1", h.Tabs.Count())
+	}
+	if h.Pane() != p {
+		t.Error("preview read a second copy instead of adopting the headless pane")
+	}
+	if h.Tabs.Preview() != p {
+		t.Error("the adopted pane is not the preview")
+	}
+	if _, ok := h.findHeadless(target); ok {
+		t.Error("the headless pane is still registered after adoption")
+	}
+
+	// The next preview takes the slot; the adopted pane must be dropped.
+	h.previewFile(filepath.Join(h.root, "README.md"))
+	if h.Tabs.Count() != 1 {
+		t.Fatalf("a second preview left %d tabs, want 1", h.Tabs.Count())
+	}
+	if h.Tabs.Contains(p) {
+		t.Error("the adopted pane survived the second preview")
+	}
+}
+
 // Directories are never previewed: arrowing across the directory rows must
 // leave the tab bar untouched. Without the SelectedPath directory rule the app
 // would try to load a directory path.

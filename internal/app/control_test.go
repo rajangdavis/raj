@@ -12,6 +12,7 @@ import (
 
 	"raj/internal/control"
 	"raj/internal/piecetable"
+	"raj/internal/ui"
 )
 
 // A client speaking the real protocol over a real socket, using the same
@@ -1247,7 +1248,7 @@ func TestControlAbsolutePathStillNamesTheBuffer(t *testing.T) {
 }
 
 // open accepts the relative spelling too, so a driver never joins the path
-// itself; reopening by the relative name focuses the tab the harness already
+// itself; reopening by the relative name reuses the tab the harness already
 // opened rather than stacking a duplicate.
 func TestControlOpenAcceptsARelativePath(t *testing.T) {
 	h := controlHarness(t, "hello\n")
@@ -1264,11 +1265,13 @@ func TestControlOpenAcceptsARelativePath(t *testing.T) {
 
 // open without -create refuses a path that is neither a buffer nor a file, so a
 // typo cannot quietly become a phantom tab. -create is the caller saying it
-// means to make a new buffer, and only then does the tab appear.
+// means to make a new buffer; the tab then appears in the background, because a
+// socket open does not steal the user's active tab.
 func TestControlOpenRefusesAMissingPathWithoutCreate(t *testing.T) {
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
-	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	original := h.Tabs.Active().File.Path
+	dir := filepath.Dir(original)
 	missing := filepath.Join(dir, "typo.go")
 	before := h.Tabs.Count()
 
@@ -1286,21 +1289,27 @@ func TestControlOpenRefusesAMissingPathWithoutCreate(t *testing.T) {
 	if r := c.do(h, control.Request{Op: "open", Path: missing, Create: true}); !r.OK {
 		t.Fatalf("open -create = %+v", r)
 	}
-	if got := h.Tabs.Active().File.Path; got != missing {
-		t.Errorf("active path = %q after open -create, want %q", got, missing)
+	if got := h.Tabs.Count(); got != before+1 {
+		t.Errorf("tab count = %d after open -create, want %d", got, before+1)
+	}
+	if _, ok := h.paneByPath(missing); !ok {
+		t.Errorf("open -create did not make a buffer for %q", missing)
+	}
+	if got := h.Tabs.Active().File.Path; got != original {
+		t.Errorf("active path = %q after open -create, want %q left in front", got, original)
 	}
 }
 
 // open's wire answer says which of the two things it did: made a new buffer or
-// focused one already loaded. A driver writing a file for the first time needs
-// to tell a create from a focus, or a name it only meant to make looks like a
+// reused one already loaded. A driver writing a file for the first time needs
+// to tell a create from a reuse, or a name it only meant to make looks like a
 // file that was there all along.
 func TestControlOpenReportsCreated(t *testing.T) {
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
 
-	// An already-open buffer is focused, not created.
+	// An already-open buffer is reused, not created.
 	if r := c.do(h, control.Request{Op: "open", Path: path}); !r.OK {
 		t.Fatalf("open = %+v", r)
 	} else if r.Created {
@@ -1318,7 +1327,7 @@ func TestControlOpenReportsCreated(t *testing.T) {
 		t.Error("open -create did not report the buffer as created")
 	}
 
-	// A second open of it focuses: not created again.
+	// A second open of it reuses it: not created again.
 	if r := c.do(h, control.Request{Op: "open", Path: fresh}); !r.OK {
 		t.Fatalf("second open = %+v", r)
 	} else if r.Created {
@@ -1365,6 +1374,18 @@ func TestControlLineIndexSurvivesApplyRejectCycles(t *testing.T) {
 		if v.Lines != want || f.Lines() != want {
 			t.Fatalf("%s: index has %d lines (version says %d), text has %d",
 				step, f.Lines(), v.Lines, want)
+		}
+		// Every line the index reports must be the line the text holds, not
+		// just the right number of them: a start drifted by one still counts.
+		lines := strings.Split(text, "\n")
+		for n := 0; n < f.Lines(); n++ {
+			start, end := f.LineStart(n), f.LineEnd(n)
+			if start < 0 || end < start || end > len(text) {
+				t.Fatalf("%s: line %d bounds %d..%d outside [0,%d)", step, n, start, end, len(text))
+			}
+			if got := f.Slice(start, end-start); got != lines[n] {
+				t.Fatalf("%s: line %d = %q, want %q", step, n, got, lines[n])
+			}
 		}
 		last := f.Lines() - 1
 		if start := f.LineStart(last); start > len(text) {
@@ -2277,7 +2298,13 @@ func TestControlRenameCarriesANotYetSavedBuffer(t *testing.T) {
 	if r := c.do(h, control.Request{Op: "open", Path: old, Create: true}); !r.OK {
 		t.Fatalf("open -create = %+v", r)
 	}
-	p := h.Tabs.Active()
+	// open is quiet: it makes the tab without bringing it forward, so the test
+	// focuses it deliberately before typing, the way the user would.
+	p, ok := h.paneByPath(old)
+	if !ok {
+		t.Fatalf("open -create did not make a buffer for %q", old)
+	}
+	h.Tabs.Focus(p)
 	h.typeText("draft\n")
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatalf("open -create wrote a file: %v", err)
@@ -2583,5 +2610,378 @@ func TestControlClearDisposesASupersededSet(t *testing.T) {
 	}
 	if g, _ := sessionGroup(t, sess, superseded); g.Invalid {
 		t.Errorf("set %d is still reported invalid after disposal", superseded)
+	}
+}
+
+// An agent open over the socket must not steal the user's focus. An already-open
+// path is reused and a new one gets a tab, but the active tab and focus stay
+// where the user left them: the tab is there to be found, not to interrupt.
+func TestControlOpenDoesNotStealFocus(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	aPath := h.Tabs.Active().File.Path
+	dir := filepath.Dir(aPath)
+	bPath := filepath.Join(dir, "b.go")
+	if err := os.WriteFile(bPath, []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// B is already open as a background tab, with A back in front and the user
+	// focused in the editor.
+	h.OpenFile(bPath)
+	h.OpenFile(aPath)
+	h.focus = FocusEditor
+	if got := h.Tabs.Active().File.Path; got != aPath {
+		t.Fatalf("setup: active = %q, want %q", got, aPath)
+	}
+
+	r := c.do(h, control.Request{Op: "open", Path: bPath})
+	if !r.OK {
+		t.Fatalf("open of an already-open path = %+v", r)
+	}
+	if got := h.Tabs.Active().File.Path; got != aPath {
+		t.Errorf("active = %q after an agent open, want %q left in front", got, aPath)
+	}
+	if h.focus != FocusEditor {
+		t.Errorf("focus = %v after an agent open, want it unchanged", h.focus)
+	}
+	var found bool
+	for _, p := range h.Tabs.All() {
+		if sameFile(bPath, p.File.Path) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the opened path lost its tab")
+	}
+}
+
+// A new path opened by an agent gets a tab without becoming active and without
+// moving focus, even when the user is not in the editor.
+func TestControlOpenNewPathDoesNotStealFocus(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	aPath := h.Tabs.Active().File.Path
+	dir := filepath.Dir(aPath)
+	bPath := filepath.Join(dir, "b.go")
+	if err := os.WriteFile(bPath, []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.focus = FocusSidebar
+	before := h.Tabs.Count()
+
+	if r := c.do(h, control.Request{Op: "open", Path: bPath}); !r.OK {
+		t.Fatalf("open of a new path = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != before+1 {
+		t.Fatalf("tab count = %d, want %d: the opened file got no tab", got, before+1)
+	}
+	if got := h.Tabs.Active().File.Path; got != aPath {
+		t.Errorf("active = %q after a quiet open, want %q", got, aPath)
+	}
+	if h.focus != FocusSidebar {
+		t.Errorf("focus = %v after a quiet open, want it unchanged", h.focus)
+	}
+}
+
+// A proposal landing on a headless buffer still announces a tab, but quietly:
+// the user's active tab and focus do not move.
+func TestHeadlessApplyAnnouncesQuietly(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	aPath := h.Tabs.Active().File.Path
+	dir := filepath.Dir(aPath)
+	path := filepath.Join(dir, "other.go")
+	if err := os.WriteFile(path, []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	read := c.do(h, control.Request{Op: "text", Path: path})
+	base := read.Version
+	before := h.Tabs.Count()
+	h.focus = FocusSidebar
+
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 5, Text: "howdy"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != before+1 {
+		t.Fatalf("tab count = %d, want %d: the proposal stayed hidden", got, before+1)
+	}
+	if got := h.Tabs.Active().File.Path; got != aPath {
+		t.Errorf("active = %q after a quiet reveal, want %q", got, aPath)
+	}
+	if h.focus != FocusSidebar {
+		t.Errorf("focus = %v after a quiet reveal, want it unchanged", h.focus)
+	}
+	var pending int
+	for _, p := range h.Tabs.All() {
+		if sameFile(path, p.File.Path) {
+			pending = len(p.File.Session().Pending())
+		}
+	}
+	if pending != 1 {
+		t.Errorf("pending = %d, want the one proposed set", pending)
+	}
+}
+
+// goto is the deliberate exception: it is a request to look at a place, so it
+// still brings the buffer forward and focuses the editor.
+func TestControlGotoStillBringsTheBufferForward(t *testing.T) {
+	h := controlHarness(t, "root\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	path := filepath.Join(dir, "other.go")
+	if err := os.WriteFile(path, []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.do(h, control.Request{Op: "text", Path: path}); !r.OK {
+		t.Fatalf("read = %+v", r)
+	}
+	h.focus = FocusSidebar
+
+	if r := c.do(h, control.Request{Op: "goto", Path: path, Line: 1}); !r.OK {
+		t.Fatalf("goto = %+v", r)
+	}
+	if got := h.Tabs.Active().File.Path; got != path {
+		t.Errorf("active = %q after goto, want the named buffer in front", got)
+	}
+	if h.focus != FocusEditor {
+		t.Errorf("focus = %v after goto, want the editor", h.focus)
+	}
+}
+
+// read -lines and search must agree about the same buffer text. read translates
+// a line number over a projection of the session, search scans the buffer's own
+// bytes; the original report was the two disagreeing on a buffer that held
+// change sets, which is how an offset taken from one and applied to the other
+// ate a newline. This pins the line search finds to the line read returns, with
+// its newline, on a buffer whose proposed text is in the view but not on disk.
+func TestControlReadLinesAndSearchAgree(t *testing.T) {
+	h := controlHarness(t, "alpha\nbravo\ncharlie\ndelta\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	// A proposal that adds a line only the buffer holds, then a rejection that
+	// leaves it in the view.
+	base := c.do(h, control.Request{Op: "text"}).Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "zero\n"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	gs := c.do(h, control.Request{Op: "groups", Path: path})
+	var id uint64
+	for _, g := range gs.Groups {
+		if g.State == "proposed" {
+			id = g.ID
+		}
+	}
+	if id == 0 {
+		t.Fatal("no proposed set to reject")
+	}
+	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: id}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
+
+	// Search sees the buffer's text, not the disk's.
+	res := c.do(h, control.Request{Op: "search", Query: &control.SearchQuery{Text: "zero"}})
+	var hit control.SearchMatch
+	for _, m := range res.Matches {
+		if m.Path == path {
+			hit = m
+		}
+	}
+	if hit.Path == "" {
+		t.Fatalf("search did not find the buffer's line: %+v", res.Matches)
+	}
+	// The same line number, read back, must be the bytes search reported.
+	read := c.do(h, control.Request{Op: "text", Path: path,
+		LineStart: intPtr(hit.Line), LineEnd: intPtr(hit.Line)})
+	if !read.OK {
+		t.Fatalf("read -lines %d = %+v", hit.Line, read)
+	}
+	if got := strings.TrimRight(read.Text(), "\n"); got != hit.Text {
+		t.Fatalf("read -lines %d = %q, search line %d = %q", hit.Line, got, hit.Line, hit.Text)
+	}
+	// The byte span search reports must fall inside the line read, so an apply
+	// built from the match lands on the bytes it matched.
+	if hit.ByteStart < hit.LineStart || hit.ByteEnd > hit.LineStart+len(read.Text()) {
+		t.Fatalf("search byte span %d..%d is not inside the line read (%q)",
+			hit.ByteStart, hit.ByteEnd, read.Text())
+	}
+}
+
+// The snapshot verb hands a client the whole document, not a span or a view:
+// the encoded session decodes back to the same unsaved text and version, and
+// the encoding and path ride with it so the client can rebuild the buffer
+// byte-for-byte without another read.
+func TestControlSnapshotIsTheWholeDocument(t *testing.T) {
+	h := controlHarness(t, "hello\nworld\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	snap := c.do(h, control.Request{Op: "snapshot"})
+	if !snap.OK {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+	if snap.SnapshotPath != path {
+		t.Errorf("path = %q, want %q", snap.SnapshotPath, path)
+	}
+	if want := c.do(h, control.Request{Op: "text"}).Version; snap.Version != want {
+		t.Errorf("version = %d, want the read version %d", snap.Version, want)
+	}
+	if snap.EncodingJSON == "" {
+		t.Error("no encoding rode with the snapshot")
+	}
+	sess, err := piecetable.DecodeSnapshot([]byte(snap.SnapshotJSON))
+	if err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if got := sess.Buffer().Slice(0, sess.Buffer().Len()); got != "hello\nworld\n" {
+		t.Errorf("decoded text = %q", got)
+	}
+
+	// The point of the model rather than a view: an unsaved edit is in the
+	// snapshot, at the version a client would base an apply on.
+	h.typeText("// ")
+	snap2 := c.do(h, control.Request{Op: "snapshot"})
+	sess2, err := piecetable.DecodeSnapshot([]byte(snap2.SnapshotJSON))
+	if err != nil {
+		t.Fatalf("decode snapshot 2: %v", err)
+	}
+	if got := sess2.Buffer().Slice(0, sess2.Buffer().Len()); !strings.HasPrefix(got, "// ") {
+		t.Errorf("snapshot did not carry the unsaved edit: %q", got)
+	}
+	if snap2.Version <= snap.Version {
+		t.Errorf("version did not move: %d then %d", snap.Version, snap2.Version)
+	}
+
+	// A path the workspace cannot reach is refused, not served as an empty
+	// document: the guard canonicalises before the host ever loads it.
+	if bad := c.do(h, control.Request{Op: "snapshot", Path: "/definitely/not/here"}); bad.OK {
+		t.Errorf("snapshot of an out-of-root path = %+v, want a refusal", bad)
+	}
+}
+
+// A watch parks until the open buffers move, then answers with the new
+// generation and the buffer list. Every parked watcher is woken, not just one,
+// and the wake comes from the app's idle tick rather than the edit itself, so
+// all of them see the same moment.
+func TestControlWatchWakesEveryWatcherOnAnEdit(t *testing.T) {
+	h := controlHarness(t, "hello\n")
+	// One tick settles the generation at the initial buffer, so the snapshot
+	// and the watch start from the same number rather than racing the first
+	// idle move.
+	h.Handle(ui.Tick{})
+	c := h.dial(t)
+	snap := c.do(h, control.Request{Op: "snapshot"})
+	if !snap.OK {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+
+	got := make(chan control.Response, 2)
+	for i := 0; i < 2; i++ {
+		w := h.dial(t)
+		go func(w *client) {
+			res, err := w.c.Do(control.Request{Op: "watch", Gen: snap.Gen})
+			if err != nil {
+				res = control.Response{Err: err.Error()}
+			}
+			got <- res
+		}(w)
+	}
+
+	// Nothing has changed, so neither may answer.
+	select {
+	case res := <-got:
+		t.Fatalf("watch answered %+v before an edit", res)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A local edit moves the buffer; the tick is what tells the watchers, and
+	// the drain later is the event thread answering their buffer-list follow-up.
+	h.typeText("x\n")
+	h.Handle(ui.Tick{})
+
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < 2; {
+		select {
+		case res := <-got:
+			if !res.OK {
+				t.Fatalf("watch = %+v", res)
+			}
+			if res.Gen <= snap.Gen {
+				t.Errorf("wake gen = %d, want > %d", res.Gen, snap.Gen)
+			}
+			if len(res.Buffers) != 1 || res.Buffers[0].Version <= snap.Version {
+				t.Errorf("wake buffers = %+v, want a version past %d", res.Buffers, snap.Version)
+			}
+			i++
+		case <-deadline:
+			t.Fatalf("only %d of 2 watchers woke", i)
+		default:
+			h.drain()
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// reload takes the disk version for a buffer over the socket, clean or dirty:
+// there is no human to ask, so it never prompts. Without the verb the request
+// is unknown.
+func TestControlReloadTakesDisk(t *testing.T) {
+	h := controlHarness(t, "original\n")
+	c := h.dial(t)
+
+	rewriteOnDisk(t, h, "clean-disk\n")
+	if r := c.do(h, control.Request{Op: "reload"}); !r.OK {
+		t.Fatalf("clean reload = %+v", r)
+	}
+	if got := h.Pane().File.Text(); got != "clean-disk\n" {
+		t.Errorf("clean reload text = %q, want the disk version", got)
+	}
+	if h.Pane().DiskStale() {
+		t.Error("clean reload left the stale mark")
+	}
+
+	h.typeText("mine ") // dirty: the reload discards it
+	rewriteOnDisk(t, h, "dirty-disk\n")
+	if r := c.do(h, control.Request{Op: "reload"}); !r.OK {
+		t.Fatalf("dirty reload = %+v", r)
+	}
+	if got := h.Pane().File.Text(); got != "dirty-disk\n" {
+		t.Errorf("dirty reload text = %q, want the disk version", got)
+	}
+	if !strings.Contains(h.Status(), "discarded") {
+		t.Errorf("status = %q, want the discarded note", h.Status())
+	}
+
+	if r := c.do(h, control.Request{Op: "reload", Path: "/definitely/not/here"}); r.OK {
+		t.Errorf("reload of a missing path = %+v, want a refusal", r)
+	}
+}
+
+// save -force answers the disk-changed prompt with Overwrite; the normal save
+// still refuses a stale stamp.
+func TestControlSaveForceOverwritesStaleDisk(t *testing.T) {
+	h := controlHarness(t, "original\n")
+	c := h.dial(t)
+	h.typeText("mine ") // dirty so the save has bytes to write
+	rewriteOnDisk(t, h, "theirs\n")
+
+	if r := c.do(h, control.Request{Op: "save"}); r.OK {
+		t.Fatalf("plain save = %+v, want the disk-changed refusal", r)
+	}
+	if r := c.do(h, control.Request{Op: "save", Force: true}); !r.OK {
+		t.Fatalf("save -force = %+v", r)
+	}
+	onDisk, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != "mine original\n" {
+		t.Errorf("disk = %q, want the buffer written over it", onDisk)
+	}
+	if h.Pane().DiskStale() {
+		t.Error("save -force left the stale mark")
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -108,28 +109,34 @@ func round(d time.Duration) string { return d.Round(time.Microsecond).String() }
 // pendingNanos and pendingCalls accumulate the pending-change journal walk
 // inside one frame. PendingMarks adds as it runs; Draw resets before it paints
 // and takes after, so work done between frames is not billed to the frame.
-// Rendering is single-threaded, so a plain pair is enough and no lock sits on
-// the frame path.
+//
+// The counters are process-global and atomic. Rendering is single-threaded in
+// production, but the accumulator is shared by every app in the process: a
+// client's start-up can walk pending marks on another goroutine while a second
+// app (a test, a harness) draws, so a plain pair is not enough.
 var (
-	pendingNanos int64
-	pendingCalls int
+	pendingNanos atomic.Int64
+	pendingCalls atomic.Int64
 )
 
 // AddPending records one pending-marks walk. Callers guard with On so a shut
 // gate pays nothing.
 func AddPending(d time.Duration) {
-	pendingNanos += int64(d)
-	pendingCalls++
+	pendingNanos.Add(int64(d))
+	pendingCalls.Add(1)
 }
 
 // ResetPending clears the accumulator at the top of a frame.
 func ResetPending() {
-	pendingNanos, pendingCalls = 0, 0
+	pendingNanos.Store(0)
+	pendingCalls.Store(0)
 }
 
 // TakePending returns and clears the accumulated pending-walk time and count.
+// Each swap is take-and-clear in one step, so an Add racing it lands in the
+// next frame rather than being lost.
 func TakePending() (time.Duration, int) {
-	d, n := time.Duration(pendingNanos), pendingCalls
-	ResetPending()
-	return d, n
+	d := pendingNanos.Swap(0)
+	n := pendingCalls.Swap(0)
+	return time.Duration(d), int(n)
 }

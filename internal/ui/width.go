@@ -9,7 +9,8 @@ import "unicode"
 // arithmetic has to agree with the terminal's, and a compact explicit table is
 // easier to correct against observed Ghostty behaviour than a large one whose
 // disagreements are buried. Ambiguous-width characters are treated as narrow,
-// which matches Ghostty's default.
+// which matches Ghostty's default; the horizontal arrows in ambiguousWide are
+// the exception, because the terminal draws those glyphs two cells wide.
 func RuneWidth(r rune) int {
 	switch {
 	case r == 0:
@@ -20,7 +21,7 @@ func RuneWidth(r rune) int {
 		return 1 // Latin fast path
 	case unicode.In(r, unicode.Mn, unicode.Me, unicode.Cf):
 		return 0 // combining marks and format characters
-	case inRanges(r, wide):
+	case inRanges(r, wide), inRanges(r, ambiguousWide):
 		return 2
 	}
 	return 1
@@ -61,4 +62,17 @@ var wide = [][2]rune{
 	{0x1F900, 0x1F9FF}, // emoji: supplemental symbols
 	{0x20000, 0x2FFFD}, // CJK extension B and beyond
 	{0x30000, 0x3FFFD},
+}
+
+// ambiguousWide lists the East Asian Ambiguous runes the terminal draws two
+// cells wide anyway. The ambiguous class is narrow by default (see RuneWidth),
+// but these three horizontal arrows are drawn double-width, so counting them
+// one column drifts the caret one cell left of the text per arrow. They are the
+// arrows that occur in real files: ← and → in prose, ↔ in a range.
+//
+// Sorted ascending for binary search, like wide.
+var ambiguousWide = [][2]rune{
+	{0x2190, 0x2190}, // ← LEFTWARDS ARROW
+	{0x2192, 0x2192}, // → RIGHTWARDS ARROW
+	{0x2194, 0x2194}, // ↔ LEFT RIGHT ARROW
 }

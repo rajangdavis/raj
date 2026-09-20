@@ -34,8 +34,8 @@ import (
 // always contain the caret's exact column (the caret at the end of a squiggled
 // word, say), so the line is the range that means "here".
 func (a *App) codeActions() {
-	if a.mode == ModeReview {
-		a.status = reviewReadOnlyNote()
+	if a.readOnly() {
+		a.status = a.readOnlyNote()
 		return
 	}
 	p := a.Tabs.Active()

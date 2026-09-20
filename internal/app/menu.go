@@ -60,15 +60,6 @@ type menuTarget struct {
 	tab  int    // the tab index for a tab menu; -1 otherwise
 }
 
-// explorerHeadRows mirrors the unexported explorer.headRows: the heading and
-// the changed-only toggle drawn above the tree. The explorer's own ClickAt
-// measures from the same two rows; this is the app's copy of that constant so
-// the menu's hit test cannot silently drift when the pane's header changes.
-const (
-	explorerHeadRows = 2
-	explorerFootRows = 1
-)
-
 // openMenu shows the menu for t, anchored at the cell the gesture asked for. A
 // target with no items opens nothing, which is the "no menu here" case.
 //
@@ -177,10 +168,10 @@ func (a *App) explorerMenu(l Layout, ev ui.Mouse) {
 	a.openMenu(menuTarget{kind: kind, path: e.Path}, ev.Col, ev.Row)
 }
 
-// explorerRowAt resolves a screen cell to the explorer row drawn in it. It
-// repeats the pane's own arithmetic (the header rows, list.Top) rather than
-// asking the pane to hit-test, because the pointer path must not toggle a
-// directory or open a file just to find out what is under the pointer.
+// explorerRowAt resolves a screen cell to the explorer row drawn in it. It uses
+// the pane RowAt, the same mapping the left-click path uses, so a tall block
+// resolves to one entry on both paths; RowAt never toggles or opens anything,
+// which is what the menu path needs.
 func (a *App) explorerRowAt(l Layout, col, row int) (int, explorer.Entry, bool) {
 	if !l.ShowSidebar || a.sidebar != SidebarExplorer {
 		return 0, explorer.Entry{}, false
@@ -191,19 +182,7 @@ func (a *App) explorerRowAt(l Layout, col, row int) (int, explorer.Entry, bool) 
 	if row < l.SidebarTop || row >= l.SidebarTop+l.SidebarRows {
 		return 0, explorer.Entry{}, false
 	}
-	idx := (row - l.SidebarTop) - explorerHeadRows
-	if idx < 0 {
-		return 0, explorer.Entry{}, false
-	}
-	if idx >= l.SidebarRows-explorerHeadRows-explorerFootRows {
-		return 0, explorer.Entry{}, false // the selected-path footer is not a tree row
-	}
-	entries := a.Explorer.Tree.Entries()
-	i := a.Explorer.List().Top + idx
-	if i < 0 || i >= len(entries) {
-		return 0, explorer.Entry{}, false
-	}
-	return i, entries[i], true
+	return a.Explorer.RowAt(row-l.SidebarTop, l.SidebarRows)
 }
 
 // openContextMenu opens the menu for whatever has focus: the focused explorer
@@ -211,7 +190,7 @@ func (a *App) explorerRowAt(l Layout, col, row int) (int, explorer.Entry, bool) 
 // a right-click opens, so every item is reachable without a mouse.
 func (a *App) openContextMenu() {
 	cols, rows := a.screen.Size()
-	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	l := a.layout(cols, rows)
 	if a.focus == FocusSidebar && a.sidebar == SidebarExplorer {
 		entries := a.Explorer.Tree.Entries()
 		sel := a.Explorer.List().Sel
@@ -221,7 +200,7 @@ func (a *App) openContextMenu() {
 			if e.Dir {
 				kind = menuDir
 			}
-			row := l.SidebarTop + explorerHeadRows + (sel - a.Explorer.List().Top)
+			row := l.SidebarTop + a.Explorer.RowOffset()
 			if row < l.SidebarTop || row >= l.SidebarTop+l.SidebarRows {
 				row = l.SidebarTop
 			}

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -375,5 +376,72 @@ func TestCtrlClickChoosesOpenMenuRow(t *testing.T) {
 	}
 	if p := h.Pane(); p == nil || !strings.HasSuffix(p.File.Path, "README.md") {
 		t.Errorf("the Open row did not run; pane = %v", p)
+	}
+}
+
+// In the phone profile an explorer entry is two rows tall and the whole block
+// is the target: a tap on the second row, at any column across the sidebar,
+// selects that entry. Without the tall rows the second row is the next entry
+// and the tap opens the wrong file.
+func TestPhoneExplorerTallBlockIsTheTapTarget(t *testing.T) {
+	h := newPhoneHarnessSize(t, "x\n", 120, 30)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	first := filepath.Join(dir, "aaa.go")
+	if err := os.WriteFile(first, []byte("package aaa\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.Explorer.Tree.Refresh()
+	h.drain()
+	if !h.Explorer.Tall {
+		t.Fatal("the phone profile did not make the explorer rows tall")
+	}
+	l := h.layout(120, 30)
+	second := h.Tabs.Active().File.Path
+	// Entries sort aaa.go then test.go. The second row of a block is the
+	// header, the blocks above it, and one row into its own block.
+	cases := []struct {
+		row  int
+		want string
+	}{
+		{l.SidebarTop + 3, first},
+		{l.SidebarTop + 5, second},
+	}
+	cols := []int{l.SidebarX + 1, l.SidebarX + l.SidebarW/2, l.SidebarX + l.SidebarW - 1}
+	for _, tc := range cases {
+		for _, col := range cols {
+			h.Explorer.List().Sel = -1
+			click(h, col, tc.row, 0)
+			if got := h.Tabs.Active().File.Path; got != tc.want {
+				t.Errorf("a tap at column %d, row %d selected %s, want %s", col, tc.row, got, tc.want)
+			}
+		}
+	}
+}
+
+// The context-menu hit test shares the explorer RowAt: both rows of a tall
+// block resolve to that entry, at every column inside the sidebar, and the
+// first row of the next block is the neighbour. Without the shared mapping the
+// app would resolve the lower row to the next entry.
+func TestPhoneExplorerMenuRowUsesTallBlocks(t *testing.T) {
+	h := newPhoneHarnessSize(t, "x\n", 120, 30)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+	if err := os.WriteFile(filepath.Join(dir, "aaa.go"), []byte("package aaa\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.Explorer.Tree.Refresh()
+	h.drain()
+	l := h.layout(120, 30)
+	cols := []int{l.SidebarX + 1, l.SidebarX + l.SidebarW/2, l.SidebarX + l.SidebarW - 1}
+	for _, row := range []int{l.SidebarTop + 2, l.SidebarTop + 3} {
+		for _, col := range cols {
+			idx, e, ok := h.explorerRowAt(l, col, row)
+			if !ok || idx != 0 || e.Name != "aaa.go" {
+				t.Errorf("explorerRowAt(col %d, row %d) = (%d, %q, %v), want entry 0 aaa.go",
+					col, row, idx, e.Name, ok)
+			}
+		}
+	}
+	if _, e, ok := h.explorerRowAt(l, l.SidebarX+1, l.SidebarTop+4); !ok || e.Name != "test.go" {
+		t.Errorf("the next block's first row = %q/%v, want test.go", e.Name, ok)
 	}
 }

@@ -1,6 +1,7 @@
 ---
 description: Between-wave review agent: reconciles a wave's changes and pays down debt, reading and writing only through the raj-editor skill (raj ctl).
 mode: all
+model: deepseek/deepseek-flash
 permission:
   read: deny
   edit: deny

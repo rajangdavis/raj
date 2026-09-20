@@ -28,11 +28,22 @@ func (a *App) reviewProposed(accept bool) {
 		return
 	}
 	if m, ok := a.proposalAtCaret(p); ok {
-		if a.decideProposed(p, m.Group, accept) {
-			a.status = decidedStatus(accept, m.Group)
-		} else {
-			a.status = fmt.Sprintf("change set %d is no longer awaiting a decision", m.Group)
+		decided := a.decideProposed(p, m.Group, accept)
+		if !decided {
+			// A refusal is the status decideRemote or the local flip left; it
+			// never advances, so the user stays on the set that was refused.
+			if !a.attach {
+				a.status = fmt.Sprintf("change set %d is no longer awaiting a decision", m.Group)
+			}
+			return
 		}
+		if !accept {
+			// A rejected set stays in view: only accept advances, so the user
+			// can read the rejection, and clear is still one chord away.
+			a.status = decidedStatus(false, m.Group)
+			return
+		}
+		a.advanceAfterDecision(decidedStatus(true, m.Group))
 		return
 	}
 	// Nothing under the caret: decide every proposed change on screen, so a
@@ -52,13 +63,21 @@ func (a *App) reviewProposed(accept bool) {
 		wanted[m.Group] = true
 	}
 	n := 0
+	refused := ""
+	record := func(ok bool) {
+		if ok {
+			n++
+			return
+		}
+		if a.attach {
+			refused = a.status
+		}
+	}
 	if accept {
 		// Accepting is order-independent: the text is already in the
 		// document, so the decision only clears a mark.
 		for _, m := range visible {
-			if a.decideProposed(p, m.Group, true) {
-				n++
-			}
+			record(a.decideProposed(p, m.Group, true))
 		}
 	} else {
 		attempted := map[uint64]bool{}
@@ -68,10 +87,14 @@ func (a *App) reviewProposed(accept bool) {
 				break
 			}
 			attempted[id] = true
-			if a.decideProposed(p, id, false) {
-				n++
-			}
+			record(a.decideProposed(p, id, false))
 		}
+	}
+	if refused != "" {
+		// A host refusal is what the user needs to see; a count of what landed
+		// before it would hide why the pass stopped.
+		a.status = refused
+		return
 	}
 	verb := "accepted"
 	if !accept {
@@ -117,6 +140,12 @@ func decidedStatus(accept bool, group uint64) string {
 // is already Rejected; it never removes text, so a later edit can no longer
 // wedge it.
 func (a *App) decideProposed(p *editor.Pane, group uint64, accept bool) bool {
+	// An attached client does not own the document: the decision goes to the
+	// daemon, and the local tab is replaced from the daemon answer rather than
+	// mutated, so the next wake cannot overwrite it.
+	if a.attach {
+		return a.decideRemote(p, group, accept)
+	}
 	defer a.flushJournal(p)
 	if accept {
 		p.File.AcceptGroup(group)
@@ -128,6 +157,19 @@ func (a *App) decideProposed(p *editor.Pane, group uint64, accept bool) bool {
 	p.Cursors.Normalize()
 	a.Explorer.Tree.MarkChanged(p.File.Path)
 	return true
+}
+
+// advanceAfterDecision moves the caret to the next pending change set after a
+// single decision, so repeated accept/reject walks the proposals one per press.
+// It reuses the review walk (document order, wrapping at the ends) and keeps
+// the decision confirmation in the status beside the new position. With no set
+// left to land on it stays where it is and the confirmation stands alone.
+func (a *App) advanceAfterDecision(confirm string) {
+	if pos, total, ok := a.cycleProposedTo(true); ok {
+		a.status = fmt.Sprintf("%s · proposal %d of %d", confirm, pos, total)
+		return
+	}
+	a.status = confirm
 }
 
 // clearRejected hard-purges the rejected change set at the caret. Clearing is
@@ -151,6 +193,10 @@ func (a *App) clearRejected() {
 		return
 	}
 	id := groups[0]
+	if a.attach {
+		a.clearRemote(p, id)
+		return
+	}
 	defer a.flushJournal(p)
 	if !p.File.ClearRejected(id) {
 		a.status = fmt.Sprintf("could not clear rejected change set %d: later edits overlap it", id)
@@ -256,20 +302,32 @@ func proposalGroups(p *editor.Pane) []editor.PendingMark {
 // starting point only: inside a set it steps from that set, and between sets it
 // steps to the nearest one in the direction of travel.
 func (a *App) cycleProposed(forward bool) {
+	pos, total, ok := a.cycleProposedTo(forward)
+	if !ok {
+		a.status = "no proposed changes"
+		return
+	}
+	a.status = fmt.Sprintf("proposal %d of %d", pos, total)
+}
+
+// cycleProposedTo is the walk cycleProposed and the post-decision advance
+// share: it moves the caret to the next or previous pending set in document
+// order and returns its 1-based position and the total, or ok false when
+// nothing is pending. The ends wrap, so the walk never dead-ends.
+func (a *App) cycleProposedTo(forward bool) (pos, total int, ok bool) {
 	p := a.Tabs.Active()
 	if p == nil {
-		return
+		return 0, 0, false
 	}
 	groups := proposalGroups(p)
 	if len(groups) == 0 {
-		a.status = "no proposed changes"
-		return
+		return 0, 0, false
 	}
 	on, hasOn := a.proposalAtCaret(p)
 	caretLine := p.File.LineOf(p.Cursors.Primary().Head)
 	next := cycleTarget(groups, caretLine, on.Group, hasOn, forward)
 	jumpToSessionLine(p, groups[next].Line+1)
-	a.status = fmt.Sprintf("proposal %d of %d", next+1, len(groups))
+	return next + 1, len(groups), true
 }
 
 // cycleTarget is the index cycleProposed lands on. A caret inside a set steps

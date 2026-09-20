@@ -154,6 +154,22 @@ func (a *App) resumeSave(ans lspAnswer) {
 	}
 	a.pendingWrite = nil
 	p := ps.pane
+	// A tab closed while the server was thinking is the one move a save must
+	// not survive. The pane outlives its tab in memory -- closeDoc and
+	// CloseIndex drop it from the tab set, they do not free it -- so without
+	// this check the resumed write would put the closed buffer's bytes on disk
+	// as though the close had never happened, and report a save for a file the
+	// user just deliberately closed. Contains is the right test rather than a
+	// focus check: a save that merely moved behind another tab is still a save
+	// the user asked for, and the pane's own finishWrite comment says so.
+	// Report the save as not having happened to every continuation, so a close
+	// or quit that had been waiting on it does not treat the dropped write as
+	// permission to carry on.
+	if !a.Tabs.Contains(p) {
+		a.status = "save dropped: the buffer was closed before the save completed"
+		runThens(ps.thens, false)
+		return
+	}
 	// A change set that arrived while the server was thinking was not in the
 	// buffer the save gesture approved. Applying the server's edits over it, or
 	// letting File.Save accept it, would approve work the user never saw, so

@@ -2,6 +2,8 @@ package app
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +36,12 @@ func (a *App) TouchSession() { a.sessionDirty = true }
 // sessionTick writes the session if something changed and enough time has
 // passed. Called from the idle tick, where the cost cannot land on a keystroke.
 func (a *App) sessionTick(now time.Time) {
+	// A client keeps no local session: the daemon owns the document, and
+	// writing positions for buffers this process does not own would make the
+	// next local run restore them.
+	if a.attach {
+		return
+	}
 	if !a.sessionDirty || a.root == "" || a.NoRestore {
 		return
 	}
@@ -79,8 +87,10 @@ func (a *App) SessionState() session.State {
 			continue
 		}
 		// An unnamed buffer is keyed on nothing, so there is nowhere to put it.
-		// It needs the dirty-buffer journal, not a path.
-		if p.File.Path == "" {
+		// It needs the dirty-buffer journal, not a path. A git transient is
+		// skipped too: git invoked the editor, not the user, and a commit
+		// message that reappears next launch is noise.
+		if p.File.Path == "" || isGitPath(p.File.Path) {
 			continue
 		}
 		hints := p.Hints
@@ -102,6 +112,8 @@ func (a *App) SessionState() session.State {
 	if a.Explorer != nil && a.Explorer.Tree != nil {
 		st.Expanded = a.Explorer.Tree.ExpandedDirs()
 	}
+	sb := sidebarName(a.sidebar)
+	st.Sidebar = &sb
 	return st
 }
 
@@ -139,7 +151,179 @@ func (a *App) SaveSession() error {
 	if a.root == "" || a.NoRestore {
 		return nil
 	}
-	return session.Save(a.root, a.SessionState())
+	if a.state == nil {
+		// No store: nowhere to persist. The legacy session.json is read by the
+		// one-shot migration but nothing writes it any more, so this is a
+		// no-op rather than a resurrected file fallback.
+		return nil
+	}
+	st := a.SessionState()
+	// Record each saved tab position as part of the save, so a file whose tab
+	// is closed later is still remembered. The blob is the session; the rows
+	// are per-file hints that outlive the tab set.
+	for _, t := range st.Tabs {
+		_ = a.state.SetPosition(t.Path, t.Cursor, t.Top)
+	}
+	blob, err := session.Encode(st)
+	if err != nil {
+		return err
+	}
+	return a.state.PutSession(blob)
+}
+
+// CloseState releases the workspace state database. It is nil-safe and
+// idempotent, so it can be deferred whether or not a store was ever opened.
+func (a *App) CloseState() {
+	if a.state == nil {
+		return
+	}
+	_ = a.state.Close()
+}
+
+// migrateState moves a workspace's legacy .raj state into the XDG state
+// directory the first time a build that keeps state there runs. The store
+// database, the op logs and the trash all move; .raj/hidden is workspace
+// config, not state, and is never touched.
+//
+// It is best-effort and runs before the store opens: the destination is created
+// first, a move whose destination already exists is skipped (which also absorbs
+// a race with another instance migrating at once), and a move that fails leaves
+// the legacy file in place and returns the first error. The caller continues
+// against the new location rather than failing to start.
+//
+// The database's WAL and SHM sidecars move after state.db, and only if the
+// database itself moved: a sidecar without its database is worse than leaving
+// it behind. A crashed writer's sidecars therefore travel with it, and the
+// migrated database keeps its un-checkpointed transactions.
+func migrateState(root string) error {
+	dir := session.StateDir(root)
+	legacy := session.Dir(root)
+	if dir == "" || legacy == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	var firstErr error
+	note := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	// moveOne relocates one entry and reports whether it moved anything, so
+	// the database's sidecars can be gated on the database itself: a WAL or
+	// SHM that arrived without its database would be worse than leaving it.
+	moveOne := func(name string) bool {
+		src := filepath.Join(legacy, name)
+		dst := filepath.Join(dir, name)
+		if _, err := os.Stat(src); err != nil {
+			return false // nothing legacy of this kind
+		}
+		if _, err := os.Stat(dst); err == nil {
+			return false // already migrated, or another instance got there first
+		}
+		if err := os.Rename(src, dst); err != nil {
+			if os.IsExist(err) || os.IsNotExist(err) {
+				return false // another instance won the race
+			}
+			note(err)
+			return false
+		}
+		return true
+	}
+	if moveOne("state.db") {
+		// The WAL and SHM are part of the database. They follow it only after
+		// the database itself has moved, and each is best-effort: a missing or
+		// already-moved sidecar is not an error, and one that will not move is
+		// reported once and left for inspection.
+		moveOne("state.db-wal")
+		moveOne("state.db-shm")
+	}
+	moveOne("logs")
+	moveOne("trash")
+	return firstErr
+}
+
+// loadSession reads the remembered state, preferring the store and adopting a
+// session.json left by an older build. A store that is absent or unreadable
+// degrades to the file: persistence is a convenience, never a reason not to
+// start.
+func (a *App) loadSession() session.State {
+	if a.state == nil {
+		return session.Load(a.root)
+	}
+	blob, ok, err := a.state.Session()
+	if err != nil {
+		// A store read that failed still leaves the file as a source, so the
+		// session is not lost to a database problem.
+		return session.Load(a.root)
+	}
+	if ok {
+		// The store is the source of truth now, so a session.json left behind
+		// by an earlier migration (or one whose os.Remove failed) would
+		// otherwise linger forever. Best-effort and harmless if it will not go.
+		if path := session.File(a.root); path != "" {
+			_ = os.Remove(path)
+		}
+		return session.Decode(blob, a.root)
+	}
+	// No stored session: adopt a session.json from before the store. The
+	// store is populated before the file is removed, so a crash between the
+	// two migrates again rather than losing the state.
+	path := session.File(a.root)
+	if path == "" {
+		return session.State{}
+	}
+	if _, err := os.Stat(path); err != nil {
+		return session.State{}
+	}
+	st := session.Load(a.root)
+	if blob, err := session.Encode(st); err == nil {
+		if a.state.PutSession(blob) == nil {
+			// Best-effort: a file that will not go is re-migrated next time,
+			// which is harmless.
+			_ = os.Remove(path)
+		}
+	}
+	return st
+}
+
+// rememberPosition records where a pane was before it is dropped. An unnamed
+// buffer has no path and a nil store has nowhere to put it, so both are
+// no-ops.
+func (a *App) rememberPosition(p *editor.Pane) {
+	if a.state == nil || p == nil || p.File.Path == "" {
+		return
+	}
+	_ = a.state.SetPosition(p.File.Path, p.Cursors.Primary().Head, p.Viewport.Top)
+}
+
+// applyStoredPosition moves a newly opened pane to the cursor and scroll row
+// recorded for its path, if any. Both are clamped to the buffer as it is now:
+// a remembered position is a hint, and the file may have changed underneath
+// it.
+func (a *App) applyStoredPosition(p *editor.Pane) {
+	if a.state == nil || p == nil || p.File.Path == "" {
+		return
+	}
+	cursor, top, ok, err := a.state.Position(p.File.Path)
+	if err != nil || !ok {
+		return
+	}
+	if cursor > p.File.Len() {
+		cursor = p.File.Len()
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	p.Cursors.Set(cursor, cursor)
+	if max := p.DisplayLines() - 1; top > max {
+		top = max
+	}
+	if top < 0 {
+		top = 0
+	}
+	p.Viewport.Top = top
 }
 
 // RestoreSession reopens what was left. It is a hint: anything that fails to
@@ -150,8 +334,8 @@ func (a *App) RestoreSession() {
 		return
 	}
 	defer a.restoreJournals()
-	st := session.Load(a.root)
-	if len(st.Tabs) == 0 && len(st.Expanded) == 0 {
+	st := a.loadSession()
+	if len(st.Tabs) == 0 && len(st.Expanded) == 0 && st.Sidebar == nil {
 		return
 	}
 	for _, d := range st.Expanded {
@@ -206,10 +390,10 @@ func (a *App) RestoreSession() {
 		p.Viewport.Top = top
 		restored++
 	}
-	if restored == 0 {
+	if restored == 0 && st.Sidebar == nil {
 		return
 	}
-	if st.Active < restored {
+	if restored > 0 && st.Active < restored {
 		a.Tabs.Goto(st.Active + 1)
 	}
 	if f, ok := focusValue(st.Focus); ok {
@@ -217,10 +401,77 @@ func (a *App) RestoreSession() {
 	} else {
 		a.focus = FocusEditor
 	}
+	a.restoreSidebar(st.Sidebar)
 	// The viewport was restored before the pane knew its height, so the first
 	// resize clamps it. Nothing else to do here: leaving Top as saved and
 	// letting the frame reconcile is what keeps a restored scroll position
 	// exact when the terminal is the same size, and sane when it is not.
+}
+
+// sidebarName is the session name for a sidebar pane: empty means it was
+// closed.
+func sidebarName(s Sidebar) string {
+	switch s {
+	case SidebarExplorer:
+		return "explorer"
+	case SidebarSearch:
+		return "search"
+	case SidebarProblems:
+		return "problems"
+	case SidebarSettings:
+		return "settings"
+	}
+	return ""
+}
+
+// restoreSidebar applies a saved sidebar kind. A nil pointer means the session
+// predates the field, so the default pane is kept; an empty name means the
+// sidebar was closed. When the saved focus was the sidebar, the pane's own
+// Focus is restored too, the same way openSidebar does it.
+func (a *App) restoreSidebar(name *string) {
+	if name == nil {
+		return
+	}
+	switch *name {
+	case "":
+		a.sidebar = SidebarNone
+	case "explorer":
+		a.sidebar = SidebarExplorer
+	case "search":
+		a.sidebar = SidebarSearch
+	case "problems":
+		a.sidebar = SidebarProblems
+	case "settings":
+		a.sidebar = SidebarSettings
+	default:
+		return
+	}
+	if a.focus != FocusSidebar {
+		return
+	}
+	switch a.sidebar {
+	case SidebarExplorer:
+		a.Explorer.Focus()
+	case SidebarSearch:
+		a.Search.Focus()
+	case SidebarProblems:
+		a.Problems.Focus()
+	case SidebarSettings:
+		a.settingsPane.Focus()
+	}
+}
+
+// isGitPath reports whether a path lives under a .git directory. Git opens its
+// own transient files (COMMIT_EDITMSG, MERGE_MSG, rebase todos) in the editor,
+// and those must not persist as tabs or dirty-buffer journals: the user did not
+// open them, and a commit message that reappears next launch is noise.
+func isGitPath(path string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part == ".git" {
+			return true
+		}
+	}
+	return false
 }
 
 // settle applies the per-pane defaults a freshly opened tab gets, so a restored

@@ -287,10 +287,22 @@ func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (u
 	return h.vers[path], nil, h.warnings, nil
 }
 
-func (h *memHost) Save(path string) (uint64, error) {
+func (h *memHost) Save(path string, force bool) (uint64, error) {
 	h.saves++
 	h.disk[path] = h.docs[path]
 	return h.vers[path], nil
+}
+
+// Reload answers the reload verb with the in-memory disk: memHost has no
+// filesystem, so disk stands in for the bytes raj last read or wrote.
+func (h *memHost) Reload(path string) error {
+	if _, ok := h.docs[path]; !ok {
+		return ErrNoBuffer
+	}
+	if disk, ok := h.disk[path]; ok {
+		h.docs[path] = disk
+	}
+	return nil
 }
 
 func (h *memHost) Dump(path string, start, end int, author uint8) (uint64, uint64, string, string, error) {
@@ -1155,6 +1167,17 @@ func TestAnnotatedReadCarriesStates(t *testing.T) {
 }
 
 func (h *memHost) Snapshot() Searcher { return h }
+
+// DocSnapshot answers the whole-document read with the in-memory text. The
+// encoding is the UTF-8 default written out as JSON, which is enough for the
+// guard and Dispatch tests; the real editor's encoding is covered in app.
+func (h *memHost) DocSnapshot(path string) ([]byte, uint64, []byte, string, error) {
+	t, ok := h.docs[path]
+	if !ok {
+		return nil, 0, nil, "", ErrNoBuffer
+	}
+	return []byte(t), h.vers[path], []byte(`{"Kind":0,"CRLF":false,"BOM":false,"Mixed":false}`), path, nil
+}
 
 // SearchHidden records that the include-hidden walk was asked for, then
 // answers exactly as Search does. It exists so the Guard's dispatch on the
@@ -2845,6 +2868,239 @@ func TestDiffLines(t *testing.T) {
 		if got != tc.b {
 			t.Errorf("DiffLines(%q, %q): applied to %q, want %q (hunks %+v)", tc.a, tc.b, got, tc.b, hunks)
 		}
+	}
+}
+
+// applyDiffHunks applies hunks the way Patch does, back to front so a hunk's
+// offsets never move under one already applied.
+func applyDiffHunks(old string, hunks []Hunk) string {
+	for i := len(hunks) - 1; i >= 0; i-- {
+		h := hunks[i]
+		old = old[:h.Start] + h.Text + old[h.End:]
+	}
+	return old
+}
+
+// TestDiffLinesRoundTrip is the contract in both directions: applying the diff
+// to one side must yield the other byte for byte, and the hunks must be
+// ordered and non-overlapping so back-to-front apply is defined. It covers the
+// ends the single-direction test above does not: no trailing newline on either
+// side, a newline added or removed, blank lines, and empty inputs.
+func TestDiffLinesRoundTrip(t *testing.T) {
+	shapes := []struct{ a, b string }{
+		{"", ""},
+		{"", "x\n"},
+		{"x\n", ""},
+		{"a\nb\nc\n", "a\nB\nc\n"},
+		{"a\nb\nc\n", "a\nX\nY\nc\n"},
+		{"a\nb\nc", "a\nB\nc"},
+		{"a\nb\nc", "a\nb\nc\n"},
+		{"a\nb\nc\n", "a\nb\nc"},
+		{"a\n\nb\n", "a\nb\n"},
+		{"a\nb\n", "a\n\nb\n"},
+		{"a\nb\nc\nd\ne\n", "a\nX\nc\nY\ne\n"},
+		{"x\nx\nx\n", "x\nY\nx\n"},
+		{"a\nb\nc\n", "c\nb\na\n"},
+		{"one\ntwo\nthree\n", "one\nthree\n"},
+		{"same\nsame\n", "same\nsame\n"},
+	}
+	for _, tc := range shapes {
+		fwd := DiffLines(tc.a, tc.b)
+		if got := applyDiffHunks(tc.a, fwd); got != tc.b {
+			t.Errorf("DiffLines(%q, %q) applied = %q, want %q (hunks %+v)", tc.a, tc.b, got, tc.b, fwd)
+		}
+		rev := DiffLines(tc.b, tc.a)
+		if got := applyDiffHunks(tc.b, rev); got != tc.a {
+			t.Errorf("DiffLines(%q, %q) applied = %q, want %q (hunks %+v)", tc.b, tc.a, got, tc.a, rev)
+		}
+		for i, h := range fwd {
+			if h.Start > h.End {
+				t.Errorf("DiffLines(%q, %q): hunk %d starts at %d past its end %d", tc.a, tc.b, i, h.Start, h.End)
+			}
+			if i > 0 && fwd[i-1].End > h.Start {
+				t.Errorf("DiffLines(%q, %q): hunk %d ends at %d, hunk %d starts at %d",
+					tc.a, tc.b, i-1, fwd[i-1].End, i, h.Start)
+			}
+		}
+	}
+}
+
+// TestDiffLinesLargeFile is the regression for the old n*m cap. Past a million
+// line pairs DiffLines used to give up and return one hunk covering the whole
+// text, so a two-thousand-line dump with three edits reviewed as an
+// unreviewable wall and its lease blocked every other writer. The same input
+// must now come back as the three small hunks the edits actually were.
+func TestDiffLinesLargeFile(t *testing.T) {
+	const lines = 2000
+	body := func(i int) string {
+		return fmt.Sprintf("line %04d: the quick brown fox jumps over the lazy dog\n", i)
+	}
+	var old strings.Builder
+	for i := 0; i < lines; i++ {
+		old.WriteString(body(i))
+	}
+	base := old.String()
+	if got := strings.Count(base, "\n"); got < 1700 {
+		t.Fatalf("test file has %d lines, want at least 1700 to exercise the old cap", got)
+	}
+
+	var edited strings.Builder
+	for i := 0; i < lines; i++ {
+		switch i {
+		case 137: // modify one line
+			edited.WriteString("line 0137: THE QUICK BROWN FOX\n")
+		case 901: // keep the line, then insert another after it
+			edited.WriteString(body(i))
+			edited.WriteString("line 0901b: a new line\n")
+		case 1655: // delete one line
+		default:
+			edited.WriteString(body(i))
+		}
+	}
+	want := edited.String()
+	if base == want {
+		t.Fatal("the test edits did not change the text")
+	}
+
+	hunks := DiffLines(base, want)
+	if len(hunks) != 3 {
+		t.Fatalf("DiffLines over %d lines with three edits = %d hunks (%+v), want 3", lines, len(hunks), hunks)
+	}
+	for i, h := range hunks {
+		if h.Start == 0 && h.End == len(base) {
+			t.Fatalf("hunk %d covers the whole file: %+v", i, h)
+		}
+		if h.End-h.Start > 512 {
+			t.Errorf("hunk %d replaces %d bytes, want a bounded region: %+v", i, h.End-h.Start, h)
+		}
+	}
+	if got := applyDiffHunks(base, hunks); got != want {
+		t.Errorf("applying the hunks did not reconstruct the new text (got %d bytes, want %d)", len(got), len(want))
+	}
+}
+
+// TestDiffFallback pins the work-ceiling decision without building a region
+// large enough to trip it. diffFallback is the seam that decides: it charges
+// the region to the shared budget and reports when to stop splitting.
+func TestDiffFallback(t *testing.T) {
+	remaining := 100
+	if diffFallback(&remaining, 0, 10, 0, 10) {
+		t.Fatal("a small region with budget to spare fell back")
+	}
+	if remaining != 80 {
+		t.Errorf("remaining after a 10+10 region = %d, want 80", remaining)
+	}
+	if !diffFallback(&remaining, 0, 90, 0, 90) {
+		t.Error("a region that exhausts the budget did not fall back")
+	}
+	if remaining >= 0 {
+		t.Errorf("remaining after an overspend = %d, want negative", remaining)
+	}
+	if !diffFallback(&remaining, 0, 1, 0, 1) {
+		t.Error("a tiny region after the budget was spent did not fall back")
+	}
+
+	remaining = 1 << 20
+	if !diffFallback(&remaining, 0, diffRegionCeiling+1, 0, diffRegionCeiling+1) {
+		t.Error("a region past the region ceiling did not fall back")
+	}
+	remaining = 1 << 20
+	if diffFallback(&remaining, 0, diffRegionCeiling+1, 0, 1) {
+		t.Error("a region huge on one side only fell back on the region ceiling")
+	}
+}
+
+// TestDiffLinesBudget drives the fallback through the diffLines test seam.
+// With a zero budget the first region that would need anchors collapses to one
+// hunk, while the same input with budget to spare splits at its anchors; the
+// text is identical either way. Without the diffFallback check in diffRegion,
+// the zero budget would be ignored and both runs would return the split hunks.
+func TestDiffLinesBudget(t *testing.T) {
+	base := "head\nA\nB\nC\nanchor1\nD\nE\nF\nanchor2\nG\nH\nI\ntail\n"
+	edited := "head\nA2\nB2\nC2\nanchor1\nD2\nE2\nF2\nanchor2\nG2\nH2\nI2\ntail\n"
+
+	coarse := diffLines(base, edited, 0)
+	if len(coarse) != 1 {
+		t.Fatalf("budget 0 diff = %d hunks (%+v), want one coarse hunk", len(coarse), coarse)
+	}
+	if got := applyDiffHunks(base, coarse); got != edited {
+		t.Errorf("budget 0 diff applied = %q, want %q", got, edited)
+	}
+
+	fine := diffLines(base, edited, diffWorkCeiling)
+	if len(fine) <= len(coarse) {
+		t.Errorf("full-budget diff = %d hunks, want more than the coarse %d", len(fine), len(coarse))
+	}
+	if got := applyDiffHunks(base, fine); got != edited {
+		t.Errorf("full-budget diff applied = %q, want %q", got, edited)
+	}
+}
+
+// TestDiffLinesAdversarial runs the diff over two large pathological shapes.
+// The first is anchor-heavy and splits into thousands of fine hunks: every
+// line is unique, so uniqueAnchors always pairs them, and the new text is the
+// evens followed by the odds, so their order disagrees and the recursion has
+// to work the whole file. The second is duplicate-heavy and has no line unique
+// on both sides, so it takes the existing anchor-free path. Both must
+// round-trip, stay ordered and non-overlapping, and come back bounded rather
+// than as one hunk per line. The budgeted run through the seam shows the
+// fallback bounding the same input; wall-clock cost is not asserted.
+func TestDiffLinesAdversarial(t *testing.T) {
+	const n = 20000
+	body := func(i int) string { return fmt.Sprintf("line %05d: unique payload\n", i) }
+	var oldB, newB strings.Builder
+	for i := 0; i < n; i++ {
+		oldB.WriteString(body(i))
+	}
+	for i := 0; i < n; i += 2 {
+		newB.WriteString(body(i))
+	}
+	for i := 1; i < n; i += 2 {
+		newB.WriteString(body(i))
+	}
+	base, want := oldB.String(), newB.String()
+
+	check := func(name string, hunks []Hunk) {
+		t.Helper()
+		if got := applyDiffHunks(base, hunks); got != want {
+			t.Errorf("%s: applying %d hunks to %d bytes gave %d bytes, want %d", name, len(hunks), len(base), len(got), len(want))
+		}
+		for i, h := range hunks {
+			if h.Start > h.End {
+				t.Errorf("%s: hunk %d starts at %d past its end %d", name, i, h.Start, h.End)
+			}
+			if i > 0 && hunks[i-1].End > h.Start {
+				t.Errorf("%s: hunk %d ends at %d, hunk %d starts at %d", name, i-1, hunks[i-1].End, i, h.Start)
+			}
+		}
+		if len(hunks) > n {
+			t.Errorf("%s: %d hunks, want at most %d", name, len(hunks), n)
+		}
+	}
+
+	fine := DiffLines(base, want)
+	if len(fine) < 2 {
+		t.Fatalf("anchor-heavy diff = %d hunks, want it to split", len(fine))
+	}
+	check("anchor-heavy", fine)
+
+	// A budget too small for the whole file must collapse it to one hunk: that
+	// is the fallback path running at scale, and it must still round-trip.
+	budgeted := diffLines(base, want, 1000)
+	if len(budgeted) >= len(fine) {
+		t.Errorf("budgeted diff = %d hunks, want fewer than the fine %d", len(budgeted), len(fine))
+	}
+	check("budgeted", budgeted)
+
+	// Duplicate-heavy text has no line unique on both sides, so uniqueAnchors
+	// is empty and the region already collapses; at size it must still
+	// round-trip rather than overflow the budget or the stack.
+	half := strings.Repeat("repeat me\n", n/2)
+	dupOld := half + half
+	dupNew := half + "a unique marker\n" + half
+	dup := DiffLines(dupOld, dupNew)
+	if got := applyDiffHunks(dupOld, dup); got != dupNew {
+		t.Errorf("duplicate-heavy diff applied to %d bytes, want %d", len(got), len(dupNew))
 	}
 }
 

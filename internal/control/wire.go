@@ -146,6 +146,10 @@ type Header struct {
 	DumpID uint64
 	Hash   string
 
+	// Gen rides both directions: a watch names the generation it last saw, and
+	// every answer reports the current one so a client can re-arm.
+	Gen uint64
+
 	// ReviewList is the review request's list-only switch: it returns the
 	// pending change sets without entering Review mode. Absent means false,
 	// which enters the mode; `-json` sets it.
@@ -165,6 +169,10 @@ type Header struct {
 	// work in it. It crosses as a presence flag like Create, so a peer that
 	// does not know it omits it and keeps the refusing default.
 	Discard bool
+	// Force is save's overwrite switch: absent keeps the disk-changed
+	// refusal, present writes over a file that changed since raj last wrote it.
+	// A presence flag like Discard.
+	Force bool
 	// Paths is the claim op's operand list, one file per record. ClaimAdd
 	// and ClaimClear are its mode flags: with neither, the list replaces the
 	// set; ClaimAdd extends it and ClaimClear releases it. A claim with an
@@ -205,6 +213,13 @@ type Header struct {
 	// the same escape hatch DiffJSON uses: the run list has no flat-record
 	// shape and its offsets are a projection of the journal.
 	StatesJSON string
+	// SnapshotJSON carries a document snapshot's encoded session as one JSON
+	// string, the same escape hatch StatesJSON uses. EncodingJSON describes the
+	// file's encoding and SnapshotPath names the buffer, so a client can
+	// rebuild it byte-for-byte without a second read.
+	SnapshotJSON string
+	EncodingJSON string
+	SnapshotPath string
 
 	// Exit, Dirty and Stats are exec's answers. Stream marks an output frame:
 	// 1 stdout, 2 stderr, with the bytes in the body.
@@ -463,7 +478,7 @@ func EncodeRequest(req Request) (Header, []byte) {
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
 		Annotated: req.Annotated, Create: req.Create, Discard: req.Discard,
 		Paths: req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
-		Withdraw: req.Withdraw, Hidden: req.Hidden,
+		Withdraw: req.Withdraw, Hidden: req.Hidden, Gen: req.Gen, Force: req.Force,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
@@ -507,7 +522,7 @@ func DecodeRequest(f Frame) (Request, error) {
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
 		Annotated: f.Header.Annotated, Create: f.Header.Create, Discard: f.Header.Discard,
 		Paths: f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear,
-		Withdraw: f.Header.Withdraw, Hidden: f.Header.Hidden}
+		Withdraw: f.Header.Withdraw, Hidden: f.Header.Hidden, Gen: f.Header.Gen, Force: f.Header.Force}
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -552,8 +567,9 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
 		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
 		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON,
-		StatesJSON: res.StatesJSON,
-		Claims:     res.Claims, ClaimWarnings: res.ClaimWarnings, ClaimOverlaps: res.ClaimOverlaps,
+		StatesJSON: res.StatesJSON, Gen: res.Gen,
+		SnapshotJSON: res.SnapshotJSON, EncodingJSON: res.EncodingJSON, SnapshotPath: res.SnapshotPath,
+		Claims: res.Claims, ClaimWarnings: res.ClaimWarnings, ClaimOverlaps: res.ClaimOverlaps,
 		Deletions:   res.Deletions,
 		DirRemovals: res.DirRemovals,
 		Proposals:   res.Proposals,
@@ -597,8 +613,10 @@ func DecodeResponse(f Frame) (Response, error) {
 		Participants: f.Header.Participants, Groups: f.Header.Groups,
 		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
 		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON,
-		StatesJSON: f.Header.StatesJSON,
-		Claims:     f.Header.Claims, ClaimWarnings: f.Header.ClaimWarnings,
+		StatesJSON: f.Header.StatesJSON, Gen: f.Header.Gen,
+		SnapshotJSON: f.Header.SnapshotJSON, EncodingJSON: f.Header.EncodingJSON,
+		SnapshotPath: f.Header.SnapshotPath,
+		Claims:       f.Header.Claims, ClaimWarnings: f.Header.ClaimWarnings,
 		ClaimOverlaps: f.Header.ClaimOverlaps,
 		Deletions:     f.Header.Deletions,
 		DirRemovals:   f.Header.DirRemovals,

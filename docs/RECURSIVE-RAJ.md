@@ -37,6 +37,12 @@ behave; they are not the goal.
    BENCHMARKS.md are how a person keeps up with AI-generated code; update them
    when behaviour or structure changes.
 
+8. **UX is the user's call.** Anything a person sees or touches -- layout,
+   what is on screen, key choices, gestures, flow -- the agent brings options
+   and trade-offs but does not choose; it implements on the user's direction.
+   Agent-facing surfaces (control verbs, proposal semantics, tool ergonomics,
+   error and reply shapes) are where the agent's own judgement applies.
+
 ## 0. Standing workflow: plan, review, then focused agents
 
 This section is the prompt the user autoloads; executing it is what
@@ -236,10 +242,30 @@ in docs/TODO.md, do not route around it. Workarounds drift; verbs do not.
   State the tooling rules (raj ctl for content, `jq` allowed for shaping
   `raj ctl -json` output, no /tmp copies of source) and the identity rule
   (`register` once, `-as <key>` on every call) in every brief.
+- Briefs must also carry the call-batching discipline: several reads in one
+  call (`read A B C`), `search -context` instead of search-then-read, the
+  version from `read -json` reused as `-base`, `apply -hunks` for multi-hunk
+  edits, `dump`/`patch` for structural rewrites, and `claim` once up front.
+  Session data shows these facilities used in under 12 percent of the calls
+  they apply to; adoption is the gap, and the brief is where it is set.
 - Every implementation brief must say the agent **owns the fallout** of its
   change: update the call sites, interfaces and tests its edit breaks, and
   report what it touched. A wave whose agents leave dangling call sites exports
   its failures to the host's `make check`.
+- Every brief that changes behaviour, a type or a UI surface must carry the
+  **test-integrity rules**: drive the real entry path (the constructor and the
+  dispatch the app uses) and assert the preconditions (focus, mode, cursor,
+  selection) before the action; sweep every reader of the changed type,
+  function or UI element and update it or state why it is unaffected; build
+  fixtures from the real wire types, never a hand-rolled string; gate profile-
+  or mode-specific behaviour at the call site as well as inside the handler;
+  and assert through semantic accessors (e.g. `Screen.At`) where the surface
+  trims (e.g. `Screen.Row`). The report must list each changed or
+  confirmed-unaffected test and the precondition its fixture constructs.
+- One writer per file per wave: the orchestrator does not land its own edit to
+  a file a subagent is rewriting. Reconcile overlapping change sets before the
+  next wave; an orchestrator identity editing an agent's file is how a
+  superseded set survives into a save.
 - `raj ctl who` tells participants apart. `who -live` filters to connected
   participants; the full listing stays available because a gone participant's
   text is still in the document (it is the attribution record). Identity is

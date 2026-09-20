@@ -55,8 +55,14 @@ func (f *File) Reload() error {
 	// The style is re-detected, because the content it was read from is not
 	// the content any more. The current style is the fallback, so a file with
 	// nothing to detect keeps what the tab already had rather than snapping
-	// back to the flag default.
-	f.Indent, f.indentFrom = IndentFor(f.Path, text, f.Indent)
+	// back to the flag default. An explicit tab width is stronger still: it is
+	// put back over whatever the content now says, so a buffer the person sized
+	// themselves does not resize under them on the next external save.
+	style, from := IndentFor(f.Path, text, f.Indent)
+	if f.explicitWidth > 0 {
+		style.Width = f.explicitWidth
+	}
+	f.Indent, f.indentFrom = style, from
 
 	f.sess = piecetable.NewSession(piecetable.NewDoc(text, 0))
 	f.docGen++ // any clip captured from the old store can no longer splice

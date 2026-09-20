@@ -1973,3 +1973,730 @@ code, not observed.
   two-value and each changed call binds both; `Pane.leaseBlocks` returns `bool`
   and `replaceAll` branches on it; `applyEdit(pos, remove int, insert string)`
   matches both `find.go` call sites.
+
+## Warm-on-save-as + explorer preview wave — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `gofmt -w && go test ./... && make check` is the saved wave's gate.
+`proposals` returned no pending sets — the wave was accepted and saved — so
+there was nothing to dispose of. `raj ctl lsp diagnostics` was run on every
+touched file and its package peers and returned `ok` with no diagnostics:
+`internal/app/{lsp,app,session,headless,control,pointer,menu,willsave,diagnostics,codeaction,rename}.go`,
+`internal/app/{lsp,session,panes,control,preview}_test.go`,
+`internal/tabs/{tabs,tabs_test,hittest_test,preview_test}.go`,
+`internal/explorer/{pane,tree,pane_test,scroll_test,selected_test}.go` and
+`internal/ui/style.go`. Diagnostics are cached and lag, and the container cannot
+run `go vet`, so the cross-file and test-only conclusions below are read, not
+observed.
+
+### Friction reported by this wave's implementation agents (raw)
+
+- **`/tmp/opencode` is not writable to the sandbox user** (root-owned 0755), so
+  the LSP agent used `-text-file -` instead of a scratch file. `/tmp` itself is
+  writable; only the pre-approved scratch dir is not. Harness environment, not
+  raj: write the payload on stdin or under `/tmp`.
+- **No compile/verify verb in the container.** The LSP agent noted there is no
+  way to ask raj to build the tree; that is the deliberate no-toolchain
+  boundary (the host gate is the check), not a missing verb.
+- **`search`'s regex-metachar hint misleads on a literal miss.** A literal
+  pattern containing regex syntax that matches nothing prints `no matches; %q
+  contains regex metacharacters — retry with -regex` (`internal/control/cli.go`
+  `hasRegexMeta`). When the literal really is absent, `-regex` is the wrong
+  advice — it changes the semantics rather than fixing the query. Verified
+  live: `-q 'a.b'` and `-q 'x*y'` print the hint; `-q 'func (a *App)
+  warmSaved'` searches literally and prints nothing. Promoted to TODO.
+- **`search -json`'s `line_start`/`line_end` are byte offsets while `text` is
+  the trimmed line.** The preview agent read the three together and set two
+  `apply` spans wrong (an extra `}` and a stray `.`), both caught only by
+  re-reading. The skill states the semantics and TODO already tracks the naming
+  fix; recorded here as evidence, deduped against that item.
+- **`read -json` carries no `bytes`/`lines`; `version -json` does.** Verified
+  live: `read -json`'s keys are `author`, `spans`, `text`, `version`; `version
+  -json` returns `bytes` and `lines`. A driver that just read a buffer makes a
+  second call for the count. Promoted to TODO.
+- **`lsp diagnostics` takes one path.** Same shape as the existing
+  workspace-sweep item; deduped, not re-filed.
+- **`apply` names no resulting span.** A mis-set hunk lands silently and only a
+  re-read catches it; a dry-run or a reply echoing the applied byte span would
+  catch it immediately. Deduped against the existing `apply`/`edit` reply item.
+
+### Findings from this pass (raw, with severity)
+
+- **Medium — a duplicated doc comment in `internal/app/lsp.go` was fixed.**
+  Two identical four-line blocks preceded `type lspAnswer struct` (lines
+  899-906); the second copy was removed. Cosmetic, but the file is in this
+  wave and `gofmt` will not remove it.
+- **Medium — control `open` does not promote a preview.** `host.Open`
+  (`internal/app/control.go`) focuses an already-open tab with `Tabs.Focus` and
+  returns, without `Tabs.Promote`, so a socket `open` on the path currently
+  held in the preview slot leaves it marked provisional and the next explorer
+  arrow replaces the tab the caller just showed. Exact fix: call
+  `h.a.Tabs.Promote(p)` in that branch, as `Tabs.Open` does for Enter. Flagged,
+  not applied: it is adjacent to the queued quiet-reveal change and the user
+  may want `open` to stay non-committal. Filed under that TODO item.
+- **Low — `Tabs.Paths` is now production-dead.** Every session write goes
+  through `SessionState` (`internal/app/session.go`), which iterates
+  `Tabs.All()` itself; `Tabs.Paths` (`internal/tabs/tabs.go`) survives only in
+  `preview_test.go` and duplicates the preview-exclusion rule. Retire it or
+  make it the one copy of the rule. Filed in TODO.
+- **Low — warm-on-save-as may not sync a pane the user has left.** `warmSaved`
+  starts the server into `byID` but `for_` returns nil until the handshake
+  finishes, so the immediate `syncDoc` is skipped; the eventual sync comes from
+  `maybeRequestHints(a.Tabs.Active())` on the idle tick, gated on `InlayHints`
+  (default true) and `ModeEdit`. A just-saved-as buffer that is no longer the
+  active tab is clean and unopened, so `needsSync` leaves it alone and
+  diagnostics wait for a hover/reopen — the symptom the change set out to
+  remove, in the non-active case. Exact fix: remember the warmed path and sync
+  it once on the next idle tick, regardless of dirty state.
+- **Info — selecting a preview tab by click or tab-cycle does not promote it.**
+  Only `Tabs.Open` and the explorer's Enter do. A user who clicks the preview
+  tab then arrows again loses it. A design call, named for the user rather than
+  decided.
+
+### Test honesty (new and changed tests)
+
+- `TestSaveAsWarmsTheLanguageServer` is a fault-finder. In `h.write(p, renamed,
+  …)` the prior path is `p.File.Path` and the new path is `…/renamed.go`, so
+  `renamed` is true and only the rename branch reaches `warmSaved`. `stubGopls`
+  puts a `#!/bin/sh; exit 0` `gopls` first on `PATH`, so `exec.LookPath` finds
+  it; the fixture is a real `.go` file so the language is `go`, and `for_`
+  inserts the entry into `byID` under `s.mu` *before* returning, so
+  `len(byID)==1` and `byID["go"]` are deterministic and do not race the
+  `go s.start` goroutine (which never removes the entry). Without `warmSaved`
+  the table stays empty.
+- `TestOrdinarySaveDoesNotWarmAServer` exercises `renamed=false`:
+  `h.write(p, p.File.Path, …)` passes the same path, and the test asserts the
+  save landed (status contains "saved") so the empty table means the rename gate
+  held rather than that the write failed early. It is the negative half of the
+  gate.
+- `TestDirtyPreviewIsPromotedNotDiscarded` dirties the pane the way the code
+  checks: `dirty.InsertText("edit")` bumps the session version, so
+  `dirty.File.ViewDirty()` (the method `installPreview` reads) is true. Without
+  the dirty check `installPreview` would overwrite `panes[preview]`, the count
+  would be 1 and `Contains(dirty)` false; the text assertion (`"editx\n"`) also
+  pins that the promoted pane kept its content.
+- `TestExplorerArrowPreviewsWithoutLeavingTheSidebar` asserts focus stays
+  `FocusSidebar` after both the first and second arrow, the active pane is the
+  previewed path, and `Tabs.Count()==1` after a second file — so a second tab
+  or a focus jump fails it. `explorerFile` walks onto a file until
+  `SelectedPath` says file and `Tabs.Preview()!=nil`, so it does not depend on
+  the fixture's directory/file ordering.
+- `TestOpenPreviewReusesOneSlot`, `TestOpenPreviewReusesAnOpenTab`,
+  `TestOpenPromotesThePreview` and `TestCloseClearsThePreview` pin the slot
+  semantics (append/replace/promote/forget) and all build through `New`, so the
+  zero value of `preview` (which would mean index 0) never leaks in; no test
+  constructs `Tabs` by literal.
+- `TestPathsOmitsThePreview` covers `Tabs.Paths` only, but the same rule now
+  lives in `SessionState` — the file the agent also had to change — with no
+  app-level test. Added `TestPreviewIsNotSavedInTheSession`, which would see two
+  saved tabs without the `p == a.Tabs.Preview()` skip.
+- `internal/explorer`'s `TestSelectedPathReportsFilesOnly` /
+  `TestSelectedPathWithNoSelection` build the state they assert:
+  `selectedFixture` expands `pkg` and refreshes, so `selectEntry` finds both the
+  directory and the file, and the no-selection cases set `Sel` to `-1` and past
+  the end. Without the bounds and `Dir` checks the first would panic or pass a
+  directory path on.
+- Gap filled: the `previewFile` headless-adoption branch
+  (`findHeadless`/`unregisterHeadless`/`PreviewPane`/`closeDoc`) had no test.
+  Added `TestPreviewFileAdoptsAHeadlessPane`, pinning one tab, the same pane
+  object, `Preview()==p`, the registry entry gone, and the adopted pane dropped
+  by the next preview.
+
+### Arity checkpoint (read from the code)
+
+- `Tabs.OpenPreview` returns `(*editor.Pane, error)`; the only production call
+  (`internal/app/app.go:495`) binds both.
+- `servers.for_` returns `(*langServer, serverState)`; `warmSaved`
+  (`internal/app/lsp.go`) binds both (`ls, _`), matching every other caller.
+- `Explorer.SelectedPath` returns `(string, bool)`; the call site at
+  `internal/app/app.go:1581` binds both.
+- `Tabs.Preview`, `Tabs.Contains`, `Tabs.PreviewPane`/`Promote` are
+  single- or zero-value and match their uses.
+- `Explorer.Handle` still returns `(string, bool)`; `handleSidebar` binds both.
+
+## Quiet-reveal + client-timeout + rename-lease wave — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `gofmt -w && go test ./... && make check` is this wave's gate.
+
+### Friction reported by this wave's implementation agents (raw)
+
+- **The quiet `open` broke a test that assumed it focuses.**
+  `TestControlRenameCarriesANotYetSavedBuffer` typed into `h.Tabs.Active()`
+  after `open -create`; with the reveal quiet the new tab is not active, so the
+  test now focuses the pane it found by path. The assumption was the test's, and
+  the fix is the honest one, but a behaviour change whose only failing test is
+  one that assumed the old focus is worth recording.
+- **The 10s answer deadline now covers `prog` and `lsp`.** `Client.Do` bounds
+  every non-`recv` request; `run -prog` (which may run a long `exec` inside the
+  program) and `lsp` (which may wait on a cold server) can exceed 10s and be
+  reported as the wrong-process hang. Promoted to TODO as a decision.
+- **`DoStream`/`DoExec` stay unbounded.** `search` and `exec` do not arm the
+  deadline, so the misconfigured-port goal is only half met; promoted to TODO.
+- **`search -json`'s `line_end` is the newline offset, not one-past.** The
+  rename agent set `apply` spans from `search -json` and got a stray blank line
+  because `line_end` points at the `\n`, so `-end line_end` leaves the newline
+  inside the replaced range. `read -json` spans are one-past; the two disagree.
+  Author 7's note records the byte-offset naming; this is the sharper root
+  cause. Deduped against the TODO naming item.
+- **`search` rejects a positional path; `version` takes one.** Several agents
+  reached for `raj ctl search <dir> <pattern>` (refused) and `raj ctl version
+  <path>` (accepted) and had to check `-h` each time. Same shape as author 7's
+  "lsp diagnostics takes one path" note; deduped.
+
+### Findings from this pass (raw, with severity)
+
+- **Medium — the rename refactor read the caret after applying the batch.**
+  `applyDocEdits` moved `head := p.Cursors.Primary().Head` below the new
+  `applyServerEdits` delegation, but `ReplaceRange` sets the cursor as it
+  replaces each span, so the offset was already in the edited document and
+  `renameShiftOffset` shifted it a second time; the caret dropped to the
+  lowest-start edit. Fixed in this pass (read `head` before the batch) and
+  pinned by `TestRenameKeepsTheCaretNearWhereItWas`.
+- **Info — `host.Open`'s headless branch calls `Tabs.Promote` after
+  `announceIfHeadlessQuiet`, which is a no-op** (a headless pane is not the
+  preview). Harmless, but the branch where Promote matters is the already-open
+  tab loop above it.
+
+## Bounded-diff + undo-path hardening wave — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `make check` is this wave's gate. `lsp diagnostics` read `ok` on every
+touched file and its package peers.
+
+### Friction reported by this wave (raw, deduped)
+
+- **`read -json` has no `bytes`/`lines`, and `jq .text|length` is the wrong
+  substitute.** The obvious workaround for the missing count counts runes, not
+  bytes, so it silently under-counts any buffer with a multi-byte rune:
+  `jq .text|length` on `docs/TODO.md` gave 20878 while `version -json` `.bytes`
+  gave 20911. Use `version -json` for the count, not `jq` on the read text. Same
+  gap as author 7's `read -json` note; the byte-vs-rune trap is the sharper
+  part, promoted with the existing TODO item.
+- **`/tmp/opencode` is root-owned and unwritable** (the agent used `mktemp`
+  under `/tmp` instead); already recorded by author 7 for the previous wave —
+  deduped.
+- **`lsp diagnostics` `ok` is not a compiled signal.** Diagnostics do not run
+  `go vet`, and a test-only or unregistered-file error stays invisible; already
+  the workspace-sweep TODO item — deduped.
+
+- **`diff`'s `old` side is not a coherent base for a multi-op set.** Reviewing
+  the `live` rewrite, the `diff -json` hunks for one three-op set rendered as
+  four hunks whose `old` blocks contradicted each other (one ended "the
+  recursion is cheap"; the next began "It is iterative rather than recursive"),
+  so neither could be trusted as the pre-wave text, and the set is +1445 bytes
+  with `ops=3` while the diff showed four hunks. A reviewer cannot judge a
+  rewrite from `diff` when `old` is stitched from different versions. Needs a
+  decision: is `old` meant to be the single base, and what is it for a set whose
+  members were recorded at different versions?
+
+## Per-verb/idle client deadlines + diff work budget — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `make check` is this wave's gate. `lsp diagnostics` read `ok` on every
+touched file and its package peers.
+
+### Friction reported by this wave (raw, deduped)
+
+- **A `$'...'` payload broke on an apostrophe and inserted a literal `\n`.**
+  The implementation agent applied a `-text` body quoted with `$'...'`; the
+  quoting lost at an apostrophe inside the comment being written, so the editor
+  received the two characters `\` and `n` where a newline was meant, producing
+  one very long line. Caught by re-reading the seam and replaced with a second
+  apply. Use `-text-file -` (stdin) or a single-quoted body for text that
+  contains an apostrophe, and always re-read the seam after an apply.
+- **`apply -text-file -` keeps the heredoc's trailing newline.** Replacing only
+  a line's content with a span that excludes the newline inserts the stdin
+  body's final newline *alongside* the one the span left in place, so the line
+  doubles its newline. End the replaced span through the newline (`-end` at the
+  start of the next line), or strip the body's final newline. Sharper than the
+  existing heredoc-quoting note, which did not name this.
+- **`raj ctl search` matches case-insensitively.** Searching for `func diffLines`
+  returned `func DiffLines` too (and the reverse), so a hit list cannot separate
+  the two identifiers; read the exact spelling off the hit line rather than the
+  query. Same family as the literal-vs-regex hint.
+
+Deduped: the `read -json | jq .text|length` byte-vs-rune trap is already
+recorded above (the previous pass's `jq .text|length` item), so it is not
+repeated. The multi-op `diff` whose `old` side is stitched from different
+versions recurred in this wave's `client.go` and `host.go` sets; the prior
+pass's item already records it.
+
+## Heartbeat frames — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `make check` is this wave's gate. `lsp diagnostics` read `ok` on every
+touched file and its package peers.
+
+### Friction reported by this wave (raw, deduped)
+
+- **Never derive an `apply` span from `search -json`'s `text`.** `text` is the
+  whole line, not the matched pattern, so an agent sizing a replacement from it
+  sized past the match and left an extra brace behind; the pattern's `byte_start`
+  and `byte_end` are the only safe range. Same family as the byte-vs-rune trap
+  already recorded above, with the range-vs-match confusion as the sharper part.
+- **A span that drops the closing brace of a composite literal applies cleanly
+  but does not compile.** Replacing the `heartbeats: map[...]{}}` line removed
+  both the map's `}` and the literal's `}`; `lsp diagnostics` caught it as
+  "missing ',' before newline in composite literal" and the seam re-read
+  confirmed it. Do not eyeball a brace at a span's end — run diagnostics before
+  reading on.
+- **`diff`'s `old` side is still not a coherent base for a multi-op set.** All
+  three sets reported `1 moved`, and the `old` hunks overlapped each other; the
+  prior pass's item already records it — deduped.
+
+### Fixed in this pass
+
+- **A package var a live ticker read was a `-race` hazard.** `heartbeatEvery`
+  was mutated by tests while connection/server goroutines read it (and across
+  tests, a ticker goroutine outliving the test that wrote it). It is now a
+  `const` production default; each `connection` carries a `heartbeat` field set
+  from a per-`Server` seam at creation, and `startHeartbeat` captures it before
+  the goroutine starts. No test writes shared state.
+- **The heartbeat ticker used a raw `go func()`.** A panic in it would skip the
+  terminal-restoring cleanups `safe.Go` exists to run; switched to `safe.Go`.
+- **`streamIdle` is a `const` too**, derived from the `const` default, so the
+  coupling cannot drift through a global.
+
+### Escalated (product decision)
+
+- **A tick already inside `send` can enqueue a heartbeat after the final frame.**
+  `stopHeartbeat` closes the done channel, but a tick past its `select` and
+  inside `c.send` still reaches the out channel; the client returns on the final
+  and ignores the stale id, so it is benign today. Decide whether to accept it
+  (and document the guarantee as best-effort) or sequence the final against the
+  tick.
+
+## Line-index read-site sync + SQLite store Phase 1 — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `gofmt -w && go test ./... && make check` is green for the saved wave and
+stays the gate. `raj ctl lsp diagnostics` read `ok` on every touched file
+(`internal/editor/{file,layered_test}.go`, `internal/app/control_test.go`,
+`internal/store/{store,schema,driver,store_test}.go`) and on the package peers
+that reference the changed getters
+(`internal/editor/{reload,pane,actions,proposals}.go`,
+`internal/app/{control,review}.go`).
+
+### Fixed in this pass
+
+- **`INSERT OR IGNORE` ignored nothing: the bootstrap `schema` table had no
+  uniqueness constraint.** `CREATE TABLE IF NOT EXISTS schema (version INTEGER
+  NOT NULL)` plus `INSERT OR IGNORE INTO schema (version) VALUES (0)` appends a
+  fresh row on every `Open`, because `OR IGNORE` has no constraint to trip; the
+  `migrate` comment claiming the race's loser "inserts nothing" was wrong. With
+  two rows of different versions, `SELECT version ... LIMIT 1` is also unordered
+  and could read the stray 0 ahead of a future version, after which
+  `UPDATE schema SET version = ?` would downgrade every row — the outcome the
+  too-new refusal exists to prevent. Fixed by giving the table the same
+  singleton shape as `session` (`id INTEGER PRIMARY KEY CHECK (id = 1)`,
+  `INSERT OR IGNORE ... VALUES (1, 0)`, `SELECT ... WHERE id = 1`); pinned by
+  `TestSchemaTableIsASingleton`. The store is wired into nothing yet, so no
+  existing database changes shape.
+
+### Findings (raw, with severity)
+
+- **Info — the read-site `sync()` is defensive, not load-bearing on today's
+  production paths.** Every session text mutation in package `editor` already
+  goes through a `File` wrapper that syncs; the direct `Session` calls left in
+  production are `SaveOver`'s accept/rollback decisions and `App.compactTick`'s
+  `Compact`, none of which move text. `File.index()` pays off for the class of
+  future caller that reaches the session directly, which is exactly what
+  `TestLineIndexCatchesUpOnAnOutOfBandReversal` simulates. Worth stating so the
+  guard is not mistaken for a re-fix of the 2026-09-15 bug.
+- **Info — `TestControlReadLinesAndSearchAgree` and the per-line `check`
+  assertions are characterization, not this wave's fault-finder.** `host.Read`
+  translates `-lines` with its own `view.NewIndex` over the projection and
+  `search` scans the buffer, and the test's `apply`/`reject` go through
+  `File.ApplyDiff`/`File.RejectGroup`, which have synced since the 2026-09-15
+  fix — so the test would pass without `File.index()`. The fault-finder is the
+  editor test: with a direct `Session.ClearRejected`, `Lines()` reports 6
+  against a four-line text pre-fix, and `checkIndexMatchesText` catches it by
+  comparing every line's bytes, not the count.
+
+### Escalated (product decisions)
+
+- **An unknown settings `scope` is stored, not refused.** `SetSetting` accepts
+  any non-empty scope (`ScopeUser`/`ScopeWorkspace` are documented as
+  convention, not a closed set), so a typo like `"workpsace"` becomes a live
+  scope that `Settings` returns faithfully. Decide: validate against the known
+  scopes and refuse, or keep open and document.
+- **Negative cursor/top are refused, not clamped.** `SetPosition` returns
+  `errNegative`. A caller restoring a position from a shrunken document may
+  prefer a clamp; decide whether the store validates or records.
+- **`Close` returns the first call's error on later calls.** It is idempotent
+  in that it never touches the database twice, but a caller that sees a
+  non-nil error on the second call cannot tell whether that close just failed.
+  Decide whether later calls return nil.
+
+## Store in sessions, settings, live tab width — review pass (2026-09-17, between-wave)
+
+Read-only: the container has no Go toolchain, so nothing was built or run; the
+host `gofmt -w && go test ./... && make check` is green for the saved wave and
+stays the gate. `raj ctl lsp diagnostics` read `ok` on every touched file
+(`internal/app/{app,session,settings,headless,journal,control,deletion,rmdir,lsp,menu,codeaction,rename,willsave}.go`,
+`internal/tabs/tabs.go`, `internal/editor/{file,reload}.go`,
+`internal/session/session.go`, `internal/store/store.go`) and their test peers
+(`internal/app/{session,settings,panes,control,app}_test.go`,
+`internal/tabs/tabs_test.go`, `internal/tabs/hittest_test.go`,
+`internal/editor/{indent_style,reload,layered}_test.go`,
+`internal/session/session_test.go`, `internal/store/store_test.go`). `proposals`
+returned none: the wave was accepted and saved, so there was no set to dispose.
+
+### Changed in this pass
+
+- Added `TestStoredTabWidthPinsDetection` (`internal/app/settings_test.go`):
+  the stored-setting pin at launch had no app-level test (the `SetSetting`
+  live path and the `Tabs`/`File` units did), and added a `TabWidthPinned`
+  assertion to `TestNewKeepsBuiltInDefaults` so a default launch is pinned as
+  leaving detection the winner.
+- **`SetSetting` now applies the resolved settings, not the raw write**
+  (`internal/app/settings.go`). After the store write, both scopes are re-read
+  and layered (`defaults < user < workspace`) and the written key takes that
+  resolved value, so a lower-scope write cannot beat a higher scope in the
+  running app; a runtime write overrides a launch flag for this session, and
+  the flag is layered over the scopes again on the next launch. A value that
+  does not parse is persisted but left inert (`settingValueValid`), so it
+  cannot pin or flip a live setting.
+- **A non-positive explicit `--tab` is ignored** (`internal/app/app.go`,
+  `internal/app/settings.go`). `NewWithOptions` only takes `o.TabWidth` when
+  it is positive, and `tabWidthExplicit` only treats a positive flag as
+  explicit, so the fallback stands and no bad pin is set.
+- **A stale `session.json` is removed once the store holds a session**
+  (`internal/app/session.go`), so a leftover from an earlier migration cannot
+  linger next to the source of truth.
+
+### Resolved from the Phase 1 store review pass (2026-09-17)
+
+The three store escalations recorded in the previous pass were decided and
+implemented in this wave, so they are no longer open:
+
+- the settings scope is now a **closed set** (`ScopeUser`/`ScopeWorkspace`);
+  `Settings`/`SetSetting`/`DeleteSetting` refuse a typo with `errUnknownScope`
+  (empty keeps `errEmptyScope`), pinned by `TestUnknownScopeIsRefused`;
+- negative cursor/top are still refused by the store, and the restore path
+  **clamps** instead of relying on the store (`applyStoredPosition`);
+- `Close` now returns nil after the first call, pinned by
+  `TestCloseIsIdempotent`.
+
+### Verified by reading (not compiled)
+
+- **Migration.** `session.json` is removed only inside `PutSession(...) == nil`,
+  so a failed write is re-migrated next start; `RestoreSession` short-circuits
+  on `root == ""`/`NoRestore` before `loadSession`; `session.Decode` runs
+  `validate`, so deleted files are dropped and cursor/top clamped; a
+  `state.Session()` error falls back to `session.Load` without writing.
+- **Positions.** Every drop path records first (`closeTabAt`,
+  `host.Close`/`CloseDiscard`, `closeDeletedPane`, `dropHeadless`,
+  `evictHeadless`, preview reuse); `openFile` computes `alreadyOpen` before
+  `Tabs.Open` and skips `applyStoredPosition` for a tab or the preview;
+  `previewFile` never applies one.
+- **Arity.** Each changed multi-return call was read against its callee:
+  `store.Open`→`(*Store,error)`, `Settings`→`(map,error)`,
+  `Session`→`([]byte,bool,error)`, `Position`→`(int,int,bool,error)`,
+  `parseIntSetting`→`(int,bool)`, `parseBoolSetting`→`(bool,bool)`,
+  `resolveSettings`→`(ResolvedSettings,[]string)`, `IndentFor`→`(Indent,IndentSource)`.
+- **Tests.** The new tests are fault-finders, not characterization:
+  `TestReopenRestoresClosedPositionButPreviewDoesNot` fails pre-wave because
+  `closeTabAt`/`openFile` did not record/apply a position;
+  `TestControlCloseRemembersPosition` fails without the control `Close`
+  recording; `TestLegacySessionJSONMigratesToTheStore` and
+  `TestSaveSessionWritesTheStore` fail with a file-only session;
+  `TestSetSettingTabWidthIsLive`, `TestSetTabWidthOutranksDetectionOnOpen` and
+  `TestSetTabWidthSurvivesRedetection` fail without the pin.
+  `TestNewKeepsBuiltInDefaults` is the regression guard that `New` is
+  unchanged for a store with no settings rows.
+
+### Findings (raw, with severity)
+
+- **Info — a settings read error is silent.** `settingScopes` discards the
+  error from `state.Settings`, so a database that answers `Session` but fails
+  `Settings` runs on defaults with no line on the status line, where a bad
+  *value* does report. Same choice, different visibility; decide.
+
+### Escalated (product decisions)
+
+- **`.raj` is visible in the explorer from the first run.** The store opens
+  eagerly, so `<root>/.raj` is created before anything is saved and the
+  directory appears in the tree. The defaults hide `.raj/*` but deliberately
+  walk `.raj` so `.raj/hidden` stays reachable, so the directory itself shows.
+  Decide: hide `.raj` and lose tree access to `.raj/hidden`, or move the store
+  to XDG keyed by workspace.
+- **An explicit tab width overrides a file's detected indentation.** Previously
+  `--tab` was only a fallback; now a flag or stored `tab_width` pins both the
+  display advance and the indent unit and survives `Reload` re-detection, while
+  a default launch still lets detection win. Confirm this is the wanted
+  semantics, or revert the pin to a fallback.
+- **The settings key set and the future menu's default scope.** The resolver
+  knows exactly `tab_width`/`tabs`/`wrap`/`auto_pairs`/`inlay_hints` and leaves
+  an unknown key alone (`SetSetting` refuses one), which keeps a newer build's
+  key safe from an older one. Decide the final set, and whether the settings
+  pane saves a change to the user or the workspace scope by default.
+
+### Friction (tooling)
+
+- **`/tmp/opencode` is pre-approved but not writable.** It is `root:root 0755`
+  and the agent runs as uid 501, so the first `cat >` failed with permission
+  denied; the pass fell back to a fresh `/tmp/oc-review`. The skill points
+  agents at this exact directory, and the Phase 1 pass recorded the same
+  symptom for subagents, so make it sticky (`chmod 1777`) or stop naming it as
+  the scratch location.
+
+## Settings pane + session sidebar + `.git` transients + `lsp diagnostics` batching — review pass (2026-09-18, between-wave)
+
+Read-only for compile/test: the container has no Go toolchain, so nothing was
+built or run; the host `make check` is this wave's gate and is green. `raj ctl
+lsp diagnostics` read `ok` on every touched file
+(`internal/app/{settings_pane,settings_pane_test,session,session_test,journal,layout,app,render,pointer}.go`,
+`internal/keys/{action,table,settings_test}.go`,
+`internal/session/{session,session_test}.go`,
+`internal/control/{cli,cli_test}.go`) and on the package peers
+(`internal/app/{settings,inlay,review,mode,menu}.go`,
+`internal/keys/{keymap,commands,doc}.go`,
+`internal/control/{host,client,control}.go`). The verb was driven live over the
+socket: the multi-path sweep prints one `-json` status per path, a good path
+beside a missing one exits 1 with the good status still printed and the missing
+one on stderr, and single-path and no-path are unchanged. The `.git` and
+session semantics were reviewed by reading and by the tests, not exercised live.
+
+### Friction reported this wave (raw, deduped)
+
+- **The model pin broke subagent spawning.** `opencode/agents/{raj,review}.md`
+  and `opencode/opencode.json` named `opencode-go/deepseek-v4-1-flash`, which
+  the provider rejects, so a subagent could not be spawned at all; repinned to
+  `deepseek/deepseek-flash`. The failure surfaced only at spawn time, not at
+  config load.
+- **The image bakes the agent config, so repo edits did nothing until the image
+  was rebuilt.** Editing `opencode/agents/*`, `opencode/opencode.json` or
+  `plugins/raj-gate.ts` in the repo changes nothing the running opencode reads;
+  the installed copies are under `~/.config/opencode/`. Rebuild the container
+  image (not just the Go binary) when this config changes, and verify the
+  installed copy, not the repo one.
+- **Two stale containers held the volume.** A previous run's container still
+  existed; the new one could not take the workspace until both were removed.
+  Same family as the existing container-lag TODO item.
+- **`claim` without `-add` replaces the set.** Already a TODO item under
+  "Tests and workflow"; recorded here as hit this wave. Re-claiming by path
+  silently dropped the previous set.
+- **A claim outlived its gone identity.** `raj ctl claim` warned that
+  `internal/app/session_test.go` was still claimed by `raj-7d0cf365`, which
+  `who` reports `gone`; the write was still allowed because the file was in my
+  set, but a claim the owner can no longer clear (`claim -clear` clears only
+  the caller's set) is stale state the next writer cannot tidy. Decide whether
+  a gone identity's claims should expire.
+
+### Fixed in this pass
+
+- **`TestGitTransientIsNotPersisted` ran with the journal gate off, so its
+  journal half was vacuous.** `newHarnessAt` never sets `RAJ_JOURNAL`, so
+  `appendJournal` returned at `!journalEnabled()` before the `.git` check and
+  the log-directory scan could never see a log for any path; it also `return`ed
+  early when the logs directory was absent. The test now sets `t.Setenv(JournalEnv,
+  "1")` and asserts directly that no log file exists for the transient, which
+  fails without the `isGitPath` guard in `appendJournal`.
+- **Added `TestRestoreSidebarTriState`** (`internal/app/session_test.go`): the
+  app layer pinned only the closed case, so nil keeping the explorer default, a
+  named pane selecting, and an unknown name leaving the pane alone were
+  untested. `session.validate` re-derivation preserving `Sidebar` was confirmed
+  by reading (`out := State{Version: st.Version, Focus: st.Focus, Sidebar:
+  st.Sidebar}`).
+
+### Findings (raw, with severity)
+
+- **Low — `settingsPane.ClickAt` lacks `Render`'s `w < 8 || h < 2` guard.** A
+  click in a squeezed sidebar can activate a row that was not drawn; the
+  `minSidebarRows` floor makes it hard to reach. Filed in TODO with the missing
+  click test.
+- **Low — the escape-close of the settings pane does not `TouchSession()`.**
+  `handleSidebar`'s `SidebarSettings` `Cancel` branch (and `clickSidebar`) set
+  `a.sidebar`/`a.focus` without marking the session dirty, where
+  `openSidebar`/`toggleSidebar` do; the exit save covers it, but a hard kill
+  inside the 3 s window loses the close.
+- **Low — the `settingsPane.Handle` `keys.Cancel: return true` branch is
+  unreachable in production.** `handleSidebar` intercepts escape before
+  delegating, so the pane's close lives in the app; the duplicate is dead code
+  (or the sign to move the close into the pane).
+- **Info — `App.Settings()` can drift from the live app default after the
+  `cmd+alt+w` wrap chord.** `keys.ToggleWrap` sets `a.WrapDefault` (and the
+  active pane) but not `a.settings.Wrap`, so the pane's "Wrap lines" row shows
+  the stored value until the next `SetSetting`. `ToggleInlayHints` is
+  deliberately per-pane and does not have the problem. Decide whether the chord
+  updates `a.settings` or the pane reads the live defaults.
+- **Info — `settingOrigins` ignores an explicit launch flag.** It layers only
+  the two store scopes, so a `--tab`-pinned value whose scopes are empty is
+  annotated `default` even though the flag won. The margin only; the displayed
+  value is right.
+- **Info — the repo plugin source is `plugins/raj-gate.ts` but the config
+  references `./plugin/raj-gate.ts`.** The running install resolves (the ledger
+  file is live), so the extra `s` is a source-vs-install naming trap rather than
+  a break; align the two names when next touched.
+- **Info — a multi-path diagnostics sweep has no per-path attribution.** `-json`
+  prints one bare status object per path in argv order and the plain form
+  streams with no `==> path` header, so a mixed sweep needs the caller to count
+  positions. Consider a per-path header or a path field.
+
+### Escalated (product decisions)
+
+- **Is `cmd+comma` reclaimable?** The table binds it deliberately (a `kkp_on`
+  line plus a note) but `internal/keys/macos_test.go` lists it under macOS
+  reserved chords — spelled `super+comma`, which never matches the bound
+  `super+,`, so neither `TestNoMacOSSystemShortcuts` nor
+  `TestTerminalDefaultsAreAcknowledged` sees it. Decide: treat cmd+comma as
+  reclaimable (fix the key to `super+,`, drop it from the reserved set, keep the
+  terminal note) or move the chord. Filed in TODO.
+- **The settings key set is now the open half only.** The pane defaults writes
+  to the workspace scope, which settles the default-scope question; the key set
+  (and the future LSP section the pane sketch reserves a place for) remains
+  open. Direction in TODO updated to say so.
+
+## Wave A review pass — deferred deletions and ambiguous arrows (2026-09-18, between-wave)
+
+Scope: `internal/piecetable/{groups,project,project_test}.go`,
+`internal/editor/layered_test.go`, `internal/app/lease_test.go`,
+`internal/ui/width.go`, `internal/ui/width_test.go`,
+`internal/view/view_test.go`. The user had accepted and saved both items, so
+`proposals`, `groups`, `diff`, `deletions` and `rmdirs` were empty and there was
+no set to dispose of; the wave was enumerated from the brief file list.
+`lsp diagnostics` on all eight files in one call returned `ok` for every path
+(the only messages were severity-4 modernize hints, pre-existing), so the
+cross-file symbols `deferredDeletions`/`deletionLeases` resolve in the package
+and the test helpers resolve in theirs. Read-only verification: no host build.
+
+- **The composition fixture builds the state it asserts.**
+  `TestProjectDefersProposedDeletionUntilAccept` deletes one byte, marks it
+  Proposed, and asserts `AcceptedAndProposed` keeps the bytes; without
+  `deferredDeletions` that assertion reads "AC" and fails.
+- **The gap lease fails without the walk at all three layers.**
+  `TestLeasedNamesAPureDeletionSet` (span leased, flush insert/replacement
+  allowed, accept ends it), `TestApplyDiffWarnsOverProposedDeletion` (advisory
+  warning names the set once),
+  `TestDeleteRefusedAcrossAProposedDeletion` (`File.Delete`) and
+  `TestLeaseRefusesAWriteAcrossAProposedDeletion` (typed replacement) each
+  depend on `deletionLeases`; a pure deletion previously owned no inserted run.
+- **The arrow width is pinned through the view layer.**
+  `TestColumnsCaretAdvanceMatchesDrawnArrows` goes through `view.NewColumns`
+  and `ui.RuneWidth`, so it fails before the table change; the em-dash
+  assertions keep the exception from becoming a blanket ambiguous-wide switch.
+
+Raw findings; the actionable ones were promoted to TODO and the already-tracked
+friction was not repeated here:
+
+- **The deletion-only classification is written twice.** `deferredDeletions`
+  and the head of `deletionLeases` recompute the same live-Proposed,
+  no-insertion predicate, and `foldProjectOracle` calls `deferredDeletions`, so
+  the fuzz oracle shares the predicate with production and cannot catch a wrong
+  classification. Promoted to TODO (Layered proposals).
+- **An invalid deletion-only set still lands as before.** `deferredDeletions`
+  marks it, but the unapply can only restore removed bytes when the member's
+  rebase succeeds; for an invalid member it does not, so the Phase 1c
+  "undefined case" note is unchanged. Recorded, not decided.
+- **New friction promoted to TODO:** `apply`/`edit` name the new version but not
+  the set id; `lsp diagnostics`' multi-path reply prints a non-JSON cold-start
+  line and one unframed JSON object per file; `read -json` echoes no byte span
+  for a `-start`/`-end` or `-lines` read. The `-as`-after-the-verb placement and
+  the literal-pattern regex-metachar miss are already in this file, and the
+  latter extends TODO's existing hint item rather than adding a row.
+- **`/tmp/opencode` is still root-owned 0755 to uid 501**, so the edit payloads
+  went under a `mktemp -d /tmp/waveA.XXXXXX`. Recurrence of the container-image
+  item; already tracked.
+
+Escalated to the user rather than decided:
+
+- The arrow exception is confirmed only on the terminal that drifted (Ghostty);
+  a terminal drawing Ambiguous arrows narrow would regress the caret the other
+  way. TODO Direction.
+- Whether a Rejected deletion-only set deserves the same gap lease; the wave
+  left `Rejected` unchanged deliberately. TODO Direction.
+
+## Client-is-editor wave — between-wave review (2026-09-18)
+
+Read-only for compile/test: the container has no Go toolchain, so nothing was
+built or run; the host `make check` is the gate and this pass expects it green.
+`lsp diagnostics` returned `ok` for all 34 touched Go files (one pre-existing
+modernize hint in `internal/prog/prog.go`); the markdown docs have no language
+server, so their diagnostics are unverified by construction.
+
+Disposed: three provably no-op change sets left by same-author amendments
+(`internal/prog/prog.go` group 1 and `internal/control/prog.go` groups 1 and 4,
+all `bytes=0`, `moved=1`, each adding an `OpGen` argument op that no code uses —
+the watch generation travels as header field `hGen` instead). Cleared after
+`reject`; no buffer text changed. `control/prog.go` group 3 keeps a moved member
+but still carries live work (removing `OpWatch` from `verbNames`).
+
+Verified as a reader (no build): the snapshot round-trip fixture builds its
+state from real `piecetable` calls (insert/Begin/delete/mark/reject/undo) and
+the decode test uses real JSON; the watch park/wake tests dial real clients and
+assert no answer before an edit and generation/version movement after `Tick`;
+the client decision tests propose through real wire `control.Request`/`Hunk`
+and assert daemon state, not the client copy. Each changed call's arity was
+read against its callee.
+
+Friction (raw, deduped):
+
+- The internal searcher snapshot had to be renamed `searchsnapshot` because the
+  new client `snapshot` verb took the name; a verb colliding with an internal
+  op is a naming trap that is mechanical once seen and easy to miss before.
+- `watch` is deliberately non-batchable like `recv` (it parks), so it is absent
+  from `knownOps`/`verbNames` but present in the `names`/verb-code tables. The
+  asymmetry is correct but reads as an omission; `prog_test.go` still said the
+  table "ends at OpExec" (fixed in this pass).
+- Two client connections are required: the watch parks one for the client's
+  lifetime, so decisions need a second author/connection (and `clear` claims on
+  it). Any future client-side verb must know which connection owns the document.
+- `clear` needs the caller to `claim` the file first, even when the set is a
+  provably no-op with nothing to reverse; a review pass disposing of another
+  author's stale sets must claim files it is not otherwise editing.
+- `groups` takes one path only, so sweeping the wave for moved/no-op sets took
+  one call per file; `proposals -json` reports neither `moved` nor `ops`.
+- A claim outlives a gone identity: `internal/prog/prog.go` and
+  `internal/control/prog.go` were still claimed by `raj-4badff8c` (`gone`) and
+  the clear warned about it. Recurrence of the stale-claim friction.
+- `TestAttachPackageIsGone` reads the tree from disk, so it passes only once the
+  pending `rmdir internal/attach` is accepted and saved.
+
+Escalated to the user rather than decided:
+
+- Client review-mode semantics: leaving Review is edit-refused in every mode, so
+  the toggle changes only chrome.
+- The watch generation hashes buffer versions, so a decision-only change
+  (accept/reject/clear) may not wake it; the client refetches its own decisions
+  explicitly, which hides the miss for itself but not for a second client.
+- The snapshot omits `Session.depth`, so a snapshot taken mid-`Begin`/`End`
+  loses the open undo transaction.
+- The compacted-origin path is captured and restored but no test calls
+  `Compact` before `SnapshotState`.
+
+### Test-integrity misfires across the client/phone waves (2026-09-18)
+
+Five host-gate failures in a row, all from a test that did not build the state
+it claimed, or from a shape change whose consumers were not swept:
+
+1. `TestClientRefusesTypingOutsideReview` — the client installed tabs but never
+   took editor focus, so the typed rune reached the sidebar and the read-only
+   gate never ran; the status assertion read a stale `EnterReview` message. The
+   gate was verified by reading, not by driving the real key path.
+2. `TestTickLeavesAnUnchangedQueueAlone` — the fixture moved `selected` without
+   settling the code view, so the first tick legitimately re-synced; the
+   steady-state assertion measured the wrong frame.
+3. `TestPhoneChipCentresLabelAndFillsEveryRow` — panicked slicing `Screen.Row`
+   to the chip width; `Row` trims trailing spaces, so an all-fill row is empty.
+   The test used a raw row where the cell accessor (`At`) is the semantic one.
+4. `TestRenderPhoneShowsSummaryAndDecisionRow` — still asserted the pre-drawer
+   decision row after the drawer replaced it; no consumer sweep.
+5. `TestOrdinaryProfileUpAndTabUnchanged` — the new drawer hook sat in the
+   shared key path guarded only inside `drawerKey`, and the test relied on the
+   harness's implicit focus/cursor; the ordinary profile is now gated at the
+   call site and the test states its fixture.
+
+Root causes, in order: fixtures that build an approximate state; a changed UI
+surface with un-swept tests; assumed wire or accessor semantics; and
+profile/mode hooks without a call-site guard. None was a reasoning failure
+about the feature — all were verification failures about the *path* the test
+drives, which the container cannot run.
+
+Rules recorded in `docs/RECURSIVE-RAJ.md` §7: drive the real entry path and
+assert its preconditions; sweep every reader of a changed type/function/UI
+element; build fixtures from the real wire types; gate profile/mode behaviour
+at the call site and inside the handler; assert through semantic accessors
+where the surface trims; list each changed or confirmed-unaffected test and the
+precondition its fixture constructs; one writer per file per wave.

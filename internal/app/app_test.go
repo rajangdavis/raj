@@ -11,6 +11,7 @@ import (
 	"raj/internal/keys"
 	"raj/internal/piecetable"
 	"raj/internal/prompt"
+	"raj/internal/tabs"
 	"raj/internal/ui"
 	"raj/internal/widget"
 )
@@ -21,6 +22,23 @@ import (
 type harness struct {
 	*App
 	host *ui.FakeHost
+}
+
+// TestMain points XDG_STATE_HOME at a temp dir for the whole package, so the
+// tests that open a workspace store write their state there instead of into
+// the user's real state home. The editor's state lives outside .raj now, so a
+// test root no longer contains it, and this is what keeps the suite hermetic.
+func TestMain(m *testing.M) {
+	state, err := os.MkdirTemp("", "raj-test-state-")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("XDG_STATE_HOME", state); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(state)
+	os.Exit(code)
 }
 
 func newHarness(t *testing.T, content string) *harness {
@@ -39,9 +57,157 @@ func newHarnessSize(t *testing.T, content string, cols, rows int) *harness {
 	host := ui.NewFakeHost(cols, rows)
 	t.Cleanup(func() { host.Close() })
 	a := New(host, dir, 2)
+	// Release the workspace store on the way out, so a test binary with many
+	// apps does not leak one SQLite handle each.
+	t.Cleanup(a.CloseState)
 	a.Search.Debounce = time.Nanosecond // tests wait on Settle, not on the clock
 	a.OpenFile(path)
 	return &harness{App: a, host: host}
+}
+
+// newOptionsHarness is newHarness launched with explicit Options, so a test
+// exercises the real profile resolution rather than poking the App fields.
+func newOptionsHarness(t *testing.T, content string, o Options) *harness {
+	t.Helper()
+	return newOptionsHarnessSize(t, content, 120, 12, o)
+}
+
+// newOptionsHarnessSize is newOptionsHarness at an explicit terminal size, for
+// the phone drawer whose expanded panel needs more than a dozen rows.
+func newOptionsHarnessSize(t *testing.T, content string, cols, rows int, o Options) *harness {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.go")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	host := ui.NewFakeHost(cols, rows)
+	t.Cleanup(func() { host.Close() })
+	o.TabWidth = 2
+	a := NewWithOptions(host, dir, o)
+	t.Cleanup(a.CloseState)
+	a.Search.Debounce = time.Nanosecond
+	a.OpenFile(path)
+	return &harness{App: a, host: host}
+}
+
+// newPhoneHarness is the bare --phone profile: the layout plus the ctrl
+// aliases the implication turns on.
+func newPhoneHarness(t *testing.T, content string) *harness {
+	t.Helper()
+	return newOptionsHarness(t, content, Options{Phone: true})
+}
+
+// newPhoneHarnessSize is a phone harness at an explicit size, so the expanded
+// drawer panel has room above its collapsed handle.
+func newPhoneHarnessSize(t *testing.T, content string, cols, rows int) *harness {
+	t.Helper()
+	return newOptionsHarnessSize(t, content, cols, rows, Options{Phone: true})
+}
+
+// The phone flag is a profile switch, not a stored setting: it reaches the app
+// and the tab strip, and it reserves a two-row strip. Options has no *Set
+// partner for it, so it never enters main's flag.Visit override logic and a
+// stored setting cannot turn it on.
+func TestPhoneProfilePlumbing(t *testing.T) {
+	h := newHarness(t, "x\n")
+	if h.App.phone || h.App.Tabs.Phone() || h.App.ctrlAliases {
+		t.Fatal("the default profile must not be phone and must not alias")
+	}
+	plain := layoutFor(120, 24, h.sidebar, h.focus, false, false)
+	if plain.TabRows != 1 || plain.BarY != -1 {
+		t.Errorf("ordinary layout = TabRows %d BarY %d, want 1/-1", plain.TabRows, plain.BarY)
+	}
+	if plain != computeLayout(120, 24, h.sidebar, h.focus) {
+		t.Error("layoutFor(false) differs from computeLayout; the ordinary profile must be unchanged")
+	}
+
+	p := newPhoneHarness(t, "x\n")
+	if !p.phone || !p.Tabs.Phone() {
+		t.Fatal("Options.Phone did not reach the app and its tab strip")
+	}
+	if !p.ctrlAliases {
+		t.Fatal("the default phone profile did not turn on the ctrl aliases")
+	}
+	if got := p.Tabs.StripRows(); got != tabs.PhoneStripRows {
+		t.Errorf("phone StripRows = %d, want %d", got, tabs.PhoneStripRows)
+	}
+	// The phone profile always keeps one bottom row for the action drawer,
+	// whether or not there is a review target.
+	l := p.layout(120, 24)
+	if l.TabRows != tabs.PhoneStripRows || l.BarY != 24-phoneDrawerRows {
+		t.Errorf("phone layout = TabRows %d BarY %d, want %d/%d", l.TabRows, l.BarY, tabs.PhoneStripRows, 24-phoneDrawerRows)
+	}
+	if want := 24 - tabs.PhoneStripRows - phoneDrawerRows; l.Rows != want {
+		t.Errorf("phone editor Rows = %d, want %d (24 - %d tab rows - %d handle rows)", l.Rows, want, tabs.PhoneStripRows, phoneDrawerRows)
+	}
+	// The drawer key fallback is bound only under --phone, so the ordinary
+	// keymap keeps esc as Cancel.
+	if got := p.keymap.Lookup(keys.Editor, "esc"); got != keys.ToggleDrawer {
+		t.Errorf("phone esc = %q, want ToggleDrawer", got)
+	}
+	if got := h.keymap.Lookup(keys.Editor, "esc"); got != keys.Cancel {
+		t.Errorf("ordinary esc = %q, want Cancel", got)
+	}
+}
+
+// TestPhoneAliasProfileMatrix pins the implication rule: --phone implies the
+// ctrl aliases unless --ctrl-aliases was passed explicitly. It drives the same
+// ProfileFlags main uses and then builds the app, so a rule that only lived in
+// the pure function would still fail here.
+func TestPhoneAliasProfileMatrix(t *testing.T) {
+	cases := []struct {
+		name               string
+		phone, ctrl, cSet  bool
+		wantPhone, wantAlt bool
+	}{
+		{"neither", false, false, false, false, false},
+		{"phone implies aliases", true, false, false, true, true},
+		{"phone keeps aliases off", true, false, true, true, false},
+		{"aliases without the layout", false, true, true, false, true},
+		{"explicit aliases on", true, true, true, true, true},
+		{"explicit aliases off alone", false, false, true, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			phoneOn, aliasesOn := ProfileFlags(tc.phone, tc.ctrl, tc.cSet)
+			if phoneOn != tc.wantPhone || aliasesOn != tc.wantAlt {
+				t.Fatalf("ProfileFlags = phone %v aliases %v, want %v/%v",
+					phoneOn, aliasesOn, tc.wantPhone, tc.wantAlt)
+			}
+			h := newOptionsHarness(t, "x\n", Options{
+				Phone:          tc.phone,
+				CtrlAliases:    tc.ctrl,
+				CtrlAliasesSet: tc.cSet,
+			})
+			if h.phone != tc.wantPhone || h.ctrlAliases != tc.wantAlt {
+				t.Errorf("app phone=%v ctrlAliases=%v, want %v/%v",
+					h.phone, h.ctrlAliases, tc.wantPhone, tc.wantAlt)
+			}
+			if got := h.Tabs.StripRows() == tabs.PhoneStripRows; got != tc.wantPhone {
+				t.Errorf("phone layout = %v, want %v", got, tc.wantPhone)
+			}
+			// ctrl+s is a free alias of super+s (Save): it exists exactly when
+			// the aliases are on.
+			if got := h.keymap.Lookup(keys.Editor, "ctrl+s") == keys.Save; got != tc.wantAlt {
+				t.Errorf("ctrl+s resolves to Save = %v, want %v", got, tc.wantAlt)
+			}
+			// ctrl+r is the alias the phone uses to enter Review; without it the
+			// review controls are unreachable from a super-less terminal.
+			if got := h.keymap.Lookup(keys.Editor, "ctrl+r") == keys.ToggleReview; got != tc.wantAlt {
+				t.Errorf("ctrl+r resolves to ToggleReview = %v, want %v", got, tc.wantAlt)
+			}
+			// The startup report is empty off and names the known collisions on:
+			// without the report plumbing a phone would silently lose them.
+			report := h.CtrlAliasReport()
+			if tc.wantAlt && report == "" {
+				t.Error("aliases on but the collision report is empty; the ctrl+c/z/g overlaps should be reported")
+			}
+			if !tc.wantAlt && report != "" {
+				t.Errorf("aliases off but the report is %q", report)
+			}
+		})
+	}
 }
 
 // drain feeds every queued event through the app, then draws.
@@ -803,5 +969,101 @@ func TestCopyRelativePathFallsBackOutsideTheRoot(t *testing.T) {
 	}
 	if got := h.Status(); !strings.Contains(got, "outside the workspace") {
 		t.Errorf("status = %q, want it to say the path is outside the workspace", got)
+	}
+}
+
+// A daemon app built on the headless host still serves the control socket: the
+// request parks for the event thread, the host-parked wake drives that thread,
+// and the reply arrives with no terminal in the loop. Without the headless host
+// a daemon had no host to construct; without the host wake the request would
+// time out pumping only ticks.
+func TestHeadlessHostServesControl(t *testing.T) {
+	h := ui.NewHeadlessHost()
+	t.Cleanup(func() { h.Close() })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := NewWithOptions(h, dir, Options{TabWidth: 2})
+	t.Cleanup(a.CloseState)
+	a.OpenFile(path)
+	sock := controlSock(t, "headless.sock")
+	if err := a.StartControl(sock, false); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.StopControl)
+	c, err := control.Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	type result struct {
+		res control.Response
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		res, err := c.Do(control.Request{Op: "buffers"})
+		got <- result{res, err}
+	}()
+	deadline := time.After(control.ReplyTimeout)
+	for {
+		select {
+		case r := <-got:
+			if r.err != nil {
+				t.Fatalf("buffers: %v", r.err)
+			}
+			if !r.res.OK || len(r.res.Buffers) != 1 {
+				t.Fatalf("buffers = %+v, want the one open buffer", r.res)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no reply: the headless event loop did not drain control")
+		default:
+			// Pump the headless event loop the way Run would.
+			select {
+			case e := <-h.Events():
+				a.Handle(e)
+			default:
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// The daemon graceful path is closing the headless host: Run returns on the
+// closed event stream, and its deferred save writes the session. Without the
+// headless host there is nothing to close; without Run deferred save the
+// session would be lost on shutdown.
+func TestHeadlessShutdownSavesSession(t *testing.T) {
+	h := ui.NewHeadlessHost()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := NewWithOptions(h, dir, Options{TabWidth: 2})
+	t.Cleanup(a.CloseState)
+	a.OpenFile(path)
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run() }()
+	// Close at once: the graceful path, before any idle tick can start a
+	// language server. The ticker first tick is 150 ms away.
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after the host closed")
+	}
+	if st := storedSession(t, a); len(st.Tabs) != 1 || st.Tabs[0].Path != path {
+		t.Errorf("session = %+v, want the open file saved on the graceful path", st.Tabs)
 	}
 }

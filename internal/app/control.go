@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
@@ -158,6 +159,73 @@ func (a *App) StopControl() {
 	}
 }
 
+// controlTick advances the review generation clients watch whenever the
+// workspace review surface moves. It runs on the event thread, so the version
+// reads it makes are the model's own. Doing it here rather than at every
+// mutation site means no verb — apply, accept, reject, clear, withdraw or a
+// removal — can change what a client is looking at and forget to wake a
+// watcher.
+func (a *App) controlTick() {
+	if a.control == nil {
+		return
+	}
+	sum := a.reviewGeneration()
+	if sum == a.controlHash {
+		return
+	}
+	a.controlHash = sum
+	a.controlGen++
+	a.control.BumpGen(a.controlGen)
+}
+
+// reviewGeneration folds the whole workspace review surface into one value:
+// every open tab's and headless buffer's path, session version, decision
+// generation and view-dirty flag, plus every pending workspace removal's path
+// and author. Paths are included so a rename or a removal moves the generation
+// even when no session
+// version does; the decision generation is included so an accept, reject,
+// clear or withdraw — decisions that move the composition without moving the
+// session version — moves it too; view-dirty is included so a bare save that
+// only clears dirty moves it, which neither of the other two does. This is the
+// value clients watch, and it will carry a workspace identity when multi-root
+// lands.
+//
+// It runs on the event thread on every tick, so it stays a cheap fold: ViewDirty
+// caches on the session version and decision generation, so an unchanged buffer
+// costs two comparisons, and it never calls Proposals or DiffPending. The
+// removal keys are sorted so Go's map iteration order cannot change the hash.
+func (a *App) reviewGeneration() uint64 {
+	h := fnv.New64a()
+	write := func(path string, version, decisions uint64, dirty bool) {
+		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%t\n", path, version, decisions, dirty)
+	}
+	for _, p := range a.Tabs.All() {
+		write(p.File.Path, uint64(p.File.Session().Version()), p.File.DecisionGeneration(), p.File.ViewDirty())
+	}
+	for _, p := range a.headless {
+		write(p.File.Path, uint64(p.File.Session().Version()), p.File.DecisionGeneration(), p.File.ViewDirty())
+	}
+	deletions := make([]string, 0, len(a.pendingDeletions))
+	for path := range a.pendingDeletions {
+		deletions = append(deletions, path)
+	}
+	sort.Strings(deletions)
+	for _, path := range deletions {
+		d := a.pendingDeletions[path]
+		fmt.Fprintf(h, "delete\x00%s\x00%d\n", path, d.Author)
+	}
+	dirRemovals := make([]string, 0, len(a.pendingDirRemovals))
+	for path := range a.pendingDirRemovals {
+		dirRemovals = append(dirRemovals, path)
+	}
+	sort.Strings(dirRemovals)
+	for _, path := range dirRemovals {
+		d := a.pendingDirRemovals[path]
+		fmt.Fprintf(h, "rmdir\x00%s\x00%d\n", path, d.Author)
+	}
+	return h.Sum64()
+}
+
 // drainControl executes every parked request. One Wake may cover several.
 func (a *App) drainControl() {
 	if a.control == nil {
@@ -171,6 +239,10 @@ func (a *App) drainControl() {
 	}
 	for _, p := range a.control.Take() {
 		res := control.Dispatch(a.guard, p.Req)
+		// Every answer carries the current generation, so a client can take a
+		// snapshot and arm a watch from the same number without a second round
+		// trip. A watch wake overwrites its own Gen with the moment it woke.
+		res.Gen = a.controlGen
 		a.notifySuperseded(p.Req, res)
 		p.Reply(res)
 	}
@@ -337,18 +409,49 @@ func (h host) Resolve(path string) (string, error) {
 	return p.File.Path, nil
 }
 
+// DocSnapshot hands a client the whole document for one buffer: the encoded
+// session, its version, the file encoding and the buffer's own path. The pane is
+// found or loaded like any read, but no read is marked — a snapshot is what a
+// client renders itself from, not evidence of a write.
+func (h host) DocSnapshot(path string) ([]byte, uint64, []byte, string, error) {
+	p, err := h.findOrLoad(path)
+	if err != nil {
+		return nil, 0, nil, "", err
+	}
+	sess := p.File.Session()
+	snap, err := sess.SnapshotState()
+	if err != nil {
+		return nil, 0, nil, "", err
+	}
+	encoded, err := snap.Encode()
+	if err != nil {
+		return nil, 0, nil, "", err
+	}
+	encJSON, err := json.Marshal(p.File.Enc)
+	if err != nil {
+		return nil, 0, nil, "", err
+	}
+	return encoded, uint64(sess.Version()), encJSON, p.File.Path, nil
+}
+
 func (h host) Open(path string, create bool) (uint64, bool, error) {
 	// A path names a file on disk, and a file can be spelled several ways —
 	// through a symlink, through .., through the tab's own form. Reopening one
-	// that is already open should focus its tab rather than stack a duplicate:
-	// the identity comparison is by file, not by string. Canonicalising first
-	// is the step every other verb takes, so a relative path opens the buffer
-	// its absolute spelling names rather than one keyed on the process's
-	// working directory.
+	// that is already open reuses its tab rather than stacking a duplicate, and
+	// commits a provisional preview. The identity comparison is by file, not by
+	// string. Canonicalising first is the step every other verb takes, so a
+	// relative path opens the buffer its absolute spelling names rather than one
+	// keyed on the process's working directory. None of it moves the user's
+	// active tab or focus: revealing a file over the socket is not a request to
+	// interrupt.
 	path = h.canonicalPath(path)
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		for _, p := range h.a.Tabs.All() {
-			if sameFile(resolved, p.File.Path) && h.a.Tabs.Focus(p) {
+			if sameFile(resolved, p.File.Path) {
+				// A socket open is an explicit request to show the file, so a
+				// provisional preview becomes a real tab. It does not move the
+				// user's active tab or focus: the tab is there to be found.
+				h.a.Tabs.Promote(p)
 				return uint64(p.File.Session().Version()), false, nil
 			}
 		}
@@ -356,10 +459,12 @@ func (h host) Open(path string, create bool) (uint64, bool, error) {
 	// A headless buffer is already loaded, and open is the request to show it:
 	// announce rather than load a second copy under the same path. This also
 	// covers -create, which skips the stat below and would otherwise make a
-	// duplicate for a file an agent had only inspected.
+	// duplicate for a file an agent had only inspected. The reveal is quiet, so
+	// opening over the socket does not move the user, and it commits a preview
+	// the same way Tabs.Open does.
 	if p, err := h.find(path); err == nil {
-		h.a.announceIfHeadless(p)
-		h.a.Tabs.Focus(p)
+		h.a.announceIfHeadlessQuiet(p)
+		h.a.Tabs.Promote(p)
 		return uint64(p.File.Session().Version()), false, nil
 	}
 	// Without -create, open reaches only something that already exists: a
@@ -373,7 +478,7 @@ func (h host) Open(path string, create bool) (uint64, bool, error) {
 			return 0, false, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
 		}
 	}
-	h.a.OpenFile(path)
+	h.a.openFileQuiet(path)
 	p, err := h.find(path)
 	if err != nil {
 		// OpenFile reports its own refusals to the user; the caller gets the
@@ -460,10 +565,12 @@ func (h host) Close(path string) error {
 	}
 	for i, q := range h.a.Tabs.All() {
 		if q == p {
-			// The UI close path (closeTabAt) runs closeDoc before removing a tab,
-			// forgetting the journal, the LSP document and the diagnostics. A
-			// socket close skipped that, leaving the journal behind to be
-			// reopened as a tab on the next start.
+			// The UI close path (closeTabAt) remembers the position and runs
+			// closeDoc before removing a tab, forgetting the journal, the LSP
+			// document and the diagnostics. A socket close skipped that,
+			// leaving the journal behind to be reopened as a tab on the next
+			// start.
+			h.a.rememberPosition(p)
 			h.a.closeDoc(p)
 			h.a.Tabs.CloseIndex(i)
 			// The tab set is the session, so a socket close must persist the
@@ -496,6 +603,7 @@ func (h host) CloseDiscard(path string) (bool, error) {
 	for i, q := range h.a.Tabs.All() {
 		if q == p {
 			name := p.File.Path
+			h.a.rememberPosition(p)
 			h.a.closeDoc(p)
 			h.a.Tabs.CloseIndex(i)
 			h.a.TouchSession()
@@ -971,8 +1079,9 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 		return 0, nil, nil, err
 	}
 	// A proposal the user has to decide about must be visible: a headless
-	// buffer is announced before the change set lands, never left hidden.
-	h.a.announceIfHeadless(p)
+	// buffer is announced before the change set lands, never left hidden. The
+	// reveal is quiet, so the tab appears without moving the user.
+	h.a.announceIfHeadlessQuiet(p)
 	// A hunk's offsets are in the coordinates of base, not of the document as
 	// it stands now, so the bounds check has to measure against the length the
 	// base had. A base past the journal has no such length -- the session never
@@ -1100,8 +1209,9 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 		return 0, nil, nil, err
 	}
 	// A patch creates a proposal too, so it is announced by the same rule as
-	// apply: work the user has to decide about is never hidden.
-	h.a.announceIfHeadless(p)
+	// apply: work the user has to decide about is never hidden. Quiet, for the
+	// same reason: the tab appears without moving the user.
+	h.a.announceIfHeadlessQuiet(p)
 	if snap.path != p.File.Path {
 		return 0, nil, nil, fmt.Errorf("snapshot %d is of %s, not %s", id, snap.path, p.File.Path)
 	}
@@ -1557,7 +1667,26 @@ func saveRefusal(err error) (string, []uint64) {
 	return msg, ids
 }
 
-func (h host) Save(path string) (uint64, error) {
+// Reload takes the version on disk for a buffer, matching the editor Reload
+// gesture. The socket has no human to ask, so it never prompts: a dirty buffer
+// is reloaded and its unsaved changes are discarded, and the status line says
+// so.
+func (h host) Reload(path string) error {
+	p, err := h.find(path)
+	if err != nil {
+		return err
+	}
+	dirty := p.File.ViewDirty()
+	if err := h.a.reload(p, nil); err != nil {
+		return err
+	}
+	if dirty {
+		h.a.status = "reloaded " + p.File.Name() + " from disk (unsaved changes discarded)"
+	}
+	return nil
+}
+
+func (h host) Save(path string, force bool) (uint64, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return 0, err
@@ -1566,7 +1695,17 @@ func (h host) Save(path string) (uint64, error) {
 		return 0, fmt.Errorf("%d proposed change set(s) await the user's approval; "+
 			"the edit is in the buffer and will reach disk when they save", len(pending))
 	}
-	if err := p.File.Save(); err != nil {
+	save := p.File.Save
+	if force {
+		// force is the prompt Overwrite: write over a file that changed on
+		// disk. A snapshot still refuses, because its bytes belong to the
+		// daemon, not to this disk.
+		if p.File.IsSnapshot() {
+			return 0, editor.ErrSnapshotReadOnly
+		}
+		save = p.File.SaveOver
+	}
+	if err := save(); err != nil {
 		// The only save that can refuse for a reason beyond disk or encoding is
 		// one whose agreed composition would drop a superseded set; give the
 		// caller the same actionable wording the user's own save shows.

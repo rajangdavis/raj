@@ -88,6 +88,7 @@ func Commands() []Command {
 // TestUnboundActionsAreListedChordless holds that end.
 var Unbound = []Action{
 	CopyRelPath,
+	Settings,
 }
 
 // nameOf opens an action's underscores into the words the palette shows. The

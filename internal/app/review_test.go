@@ -92,9 +92,13 @@ func TestReviewFallsBackToAllVisible(t *testing.T) {
 	h.Pane().Cursors.Set(len(reviewFixture)+1, len(reviewFixture)+1) // line 1, off the hunk (byte 12 is the newline, which line 0 owns)
 	h.drain()                                                        // lay the pane out first: Run draws before the first event, and without a frame the viewport has 0 rows and nothing is visible
 
+	before := h.Pane().Cursors.Primary().Head
 	h.press("ctrl+super+m")
 	if marks := h.Pane().PendingMarks(); len(marks) != 0 {
 		t.Errorf("marks after the visible accept = %+v, want none", marks)
+	}
+	if got := h.Pane().Cursors.Primary().Head; got != before {
+		t.Errorf("bulk accept moved the caret from %d to %d", before, got)
 	}
 	if !strings.Contains(h.Status(), "1 of 1") {
 		t.Errorf("status = %q, want the count of what was decided", h.Status())
@@ -583,5 +587,99 @@ func TestReviewMapsAreIdentityWithoutDecisions(t *testing.T) {
 	jumpToSessionLine(p, 1)
 	if line := p.File.LineOf(p.Cursors.Primary().Head); line != 0 {
 		t.Errorf("caret line = %d after a jump to line 1, want 0", line)
+	}
+}
+
+// twoSets proposes one set on line 0 and one on line 2 and returns their ids.
+func twoSets(t *testing.T, h *harness) (first, second uint64) {
+	t.Helper()
+	first = propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "AAA"})
+	second = propose(t, h, piecetable.Hunk{Start: 8, End: 11, Text: "CCC"})
+	return first, second
+}
+
+// A single accept moves the caret to the next pending set, so a review pass is
+// one press per decision, and the status keeps both the decision and the
+// position. Without the advance the caret stays on the decided set.
+func TestAcceptProposedAdvancesToNext(t *testing.T) {
+	h := newHarness(t, "aaa\nbbb\nccc\n")
+	first, second := twoSets(t, h)
+	p := h.Pane()
+	p.Cursors.Set(1, 1) // inside the first set
+
+	h.press("ctrl+super+m")
+	if st := p.File.Session().GroupState(first); st != piecetable.Accepted {
+		t.Errorf("group %d state = %v, want accepted", first, st)
+	}
+	if st := p.File.Session().GroupState(second); st != piecetable.Proposed {
+		t.Errorf("group %d state = %v, want still proposed", second, st)
+	}
+	if line, _ := p.File.LineCol(p.Cursors.Primary().Head); line != 2 {
+		t.Errorf("caret line = %d, want the next set on line 2", line)
+	}
+	if got := h.Status(); !strings.Contains(got, "accepted change set") || !strings.Contains(got, "proposal 1 of 1") {
+		t.Errorf("status = %q, want the decision and the new position", got)
+	}
+}
+
+// A single reject stays put: only accept advances, so the rejected set remains
+// in view for a clear or a re-read. Without the accept-only rule the reject
+// would jump to the next set.
+func TestRejectProposedStaysPut(t *testing.T) {
+	h := newHarness(t, "aaa\nbbb\nccc\n")
+	first, _ := twoSets(t, h)
+	p := h.Pane()
+	p.Cursors.Set(1, 1)
+
+	h.press("ctrl+super+/")
+	if st := p.File.Session().GroupState(first); st != piecetable.Rejected {
+		t.Errorf("group %d state = %v, want rejected", first, st)
+	}
+	if line, _ := p.File.LineCol(p.Cursors.Primary().Head); line != 0 {
+		t.Errorf("caret line = %d, want it left on the rejected set at line 0", line)
+	}
+	if got := h.Status(); !strings.Contains(got, "rejected change set") {
+		t.Errorf("status = %q, want the rejection", got)
+	}
+}
+
+// Deciding the last set wraps to the first, matching cycleProposed. Without
+// the advance the caret stays on the now-decided last set.
+func TestDecisionOnLastSetWraps(t *testing.T) {
+	h := newHarness(t, "aaa\nbbb\nccc\n")
+	first, second := twoSets(t, h)
+	p := h.Pane()
+	p.Cursors.Set(9, 9) // inside the second set
+
+	h.press("ctrl+super+m")
+	if st := p.File.Session().GroupState(second); st != piecetable.Accepted {
+		t.Errorf("group %d state = %v, want accepted", second, st)
+	}
+	if st := p.File.Session().GroupState(first); st != piecetable.Proposed {
+		t.Errorf("group %d state = %v, want still proposed", first, st)
+	}
+	if line, _ := p.File.LineCol(p.Cursors.Primary().Head); line != 0 {
+		t.Errorf("caret line = %d, want the wrap to the first set on line 0", line)
+	}
+	if got := h.Status(); !strings.Contains(got, "proposal 1 of 1") {
+		t.Errorf("status = %q, want the wrapped position", got)
+	}
+}
+
+// With no set left to land on the caret stays put and the confirmation stands
+// alone: the ends wrap only when there is somewhere to wrap to.
+func TestDecisionOnOnlySetStops(t *testing.T) {
+	h := newHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	p := h.Pane()
+	p.Cursors.Set(reviewAt+1, reviewAt+1)
+	before := p.Cursors.Primary().Head
+
+	h.press("ctrl+super+m")
+	if got := p.Cursors.Primary().Head; got != before {
+		t.Errorf("caret moved from %d to %d with no next set", before, got)
+	}
+	if got := h.Status(); !strings.Contains(got, "accepted change set") || strings.Contains(got, "proposal") {
+		t.Errorf("status = %q, want the confirmation alone", got)
 	}
 }

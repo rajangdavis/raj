@@ -83,6 +83,10 @@ type CodeAction struct {
 type Picker struct {
 	Root string
 	Open bool
+	// Tall draws each result row two screen rows high, for a touch surface.
+	// The hit test divides by the same row height, so a tap anywhere in a row
+	// chooses what is drawn there.
+	Tall bool
 
 	// Hidden is the visibility policy, the same one the tree and the search
 	// use, so a file you can see in the sidebar is a file cmd+p can reach.
@@ -286,6 +290,15 @@ func (p *Picker) Resolve(rel string) string {
 		return rel
 	}
 	return filepath.Join(p.Root, rel)
+}
+
+// rowHeight is how many screen rows one result occupies. The renderer and
+// ClickAt both read it, so the hit test cannot disagree with the drawing.
+func (p *Picker) rowHeight() int {
+	if p.Tall {
+		return 2
+	}
+	return 1
 }
 
 // Scroll moves the visible window without moving the selection, for the wheel.
@@ -786,12 +799,17 @@ func (p *Picker) ClickAt(cols, rows, col, row int) (path string, inside bool) {
 	if p.input.ClickAt(dx-2, dy-1, w-4) {
 		return "", true
 	}
-	// Bounded by the rows the list was drawn with, not by the overlay: the
-	// last row inside the border is the result count, and a press on it is
-	// inside the picker but on nothing selectable.
-	listRow := dy - listTop
+	// The row is divided by the drawn row height so a tap anywhere in a tall
+	// cell resolves to it; a press above the list is inside the picker but on
+	// nothing selectable. The count line below the list is bounded by the rows
+	// the list was drawn with, not by the overlay.
+	rel := dy - listTop
+	if rel < 0 {
+		return "", true
+	}
+	listRow := rel / p.rowHeight()
 	i := p.list.Top + listRow
-	if listRow < 0 || listRow >= p.list.Rows || i >= len(p.shown) {
+	if listRow >= p.list.Rows || i >= len(p.shown) {
 		return "", true
 	}
 	p.list.Sel = i
@@ -814,7 +832,8 @@ func (p *Picker) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 	p.input.Render(s, x+2, y+1, w-4, th)
 
 	top := y + listTop
-	p.list.Settle(h-listTop-1, len(p.shown))
+	rh := p.rowHeight()
+	p.list.Settle((h-listTop-1)/rh, len(p.shown))
 	for row := 0; row < p.list.Rows; row++ {
 		i := p.list.Top + row
 		if i >= len(p.shown) {
@@ -827,8 +846,10 @@ func (p *Picker) Render(s *ui.Screen, cols, rows int, th widget.Theme) {
 		if p.mode == Files {
 			label = widget.TruncateLeft(p.shown[i].label, w-4)
 		}
-		s.Fill(x+1, top+row, w-2, 1, style)
-		s.SetString(x+2, top+row, label, style, w-4)
+		// The whole cell is the target, so its style covers every row; the
+		// label sits on the first row.
+		s.Fill(x+1, top+row*rh, w-2, rh, style)
+		s.SetString(x+2, top+row*rh, label, style, w-4)
 	}
 	noun := " files "
 	if p.mode == Symbols {

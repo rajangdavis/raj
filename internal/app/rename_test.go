@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"raj/internal/editor"
 	"raj/internal/lsp"
+	"raj/internal/piecetable"
 )
 
 // renameRangeOf locates sub in text and returns the LSP range covering it, so
@@ -316,5 +318,102 @@ func TestRenameWordCoversTheWholeIdentifier(t *testing.T) {
 	}
 	if lo, hi := renameWord(text, 6); lo != hi {
 		t.Errorf("a caret on punctuation selected %q", text[lo:hi])
+	}
+}
+
+// A rename leaves the caret where the user was looking, not at whichever edit
+// happened to be applied last. The caret is mapped through the edits in the
+// document's original coordinates, so it must be read before the batch lands:
+// applyServerEdits moves the cursor as it replaces each span.
+func TestRenameKeepsTheCaretNearWhereItWas(t *testing.T) {
+	h := newHarness(t, "hello world\n")
+	text := h.text()
+	path := h.Pane().File.Path
+	h.Pane().Cursors.Set(8, 8) // inside "world"
+
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerRename, text: "pin", edit: &lsp.WorkspaceEdit{
+		Docs: []lsp.DocumentEdits{
+			{Path: path, Edits: []lsp.TextEdit{
+				{Range: renameRangeOf(t, text, "hello"), NewText: "hi"},
+				{Range: renameRangeOf(t, text, "world"), NewText: "socket"},
+			}},
+		},
+	}})
+	h.applyAnswer()
+
+	if got := h.text(); got != "hi socket\n" {
+		t.Fatalf("buffer = %q, want both edits applied", got)
+	}
+	// "world" became "socket"; the caret was inside the replaced span, so it
+	// lands at the end of the replacement, before the newline. Reading it after
+	// the batch instead leaves it at 2, the end of "hi".
+	if got := h.Pane().Cursors.Primary().Head; got != 9 {
+		t.Errorf("caret = %d, want 9 (mapped through the edits)", got)
+	}
+}
+
+// A rename whose span overlaps a pending change set changes no text at all and
+// names the set. A rename is one edit even though it spans a document's spans,
+// and which of the two texts is right is the user's decision: applying the
+// spans that do not overlap would leave the symbol half renamed with no note of
+// which half landed. Without the batch lease check the non-overlapping span
+// lands and the buffer changes.
+func TestRenameRefusesOverAProposedSpan(t *testing.T) {
+	h := newHarness(t, "hello world\n")
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 5, Text: "HELLO"})
+	text := h.text()
+	if text != "HELLO world\n" {
+		t.Fatalf("setup text = %q, want the proposal applied", text)
+	}
+	before := text
+
+	path := h.Pane().File.Path
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerRename, text: "pin", edit: &lsp.WorkspaceEdit{
+		Docs: []lsp.DocumentEdits{
+			{Path: path, Edits: []lsp.TextEdit{
+				{Range: renameRangeOf(t, text, "HELLO"), NewText: "hi"},
+				{Range: renameRangeOf(t, text, "world"), NewText: "socket"},
+			}},
+		},
+	}})
+	h.applyAnswer()
+
+	if got := h.text(); got != before {
+		t.Errorf("a rename overlapping a proposed span changed the buffer: %q", got)
+	}
+	if !strings.Contains(h.Status(), "change set") ||
+		!strings.Contains(h.Status(), fmt.Sprintf("change set %d", id)) {
+		t.Errorf("status = %q, want the lease refusal naming set %d", h.Status(), id)
+	}
+}
+
+// A rename with no leases still applies to every span and is one undo step:
+// the whole batch is one user action, so a single undo reverses it. Without the
+// shared applier each span would be its own undo step.
+func TestRenameWithoutLeasesIsOneUndo(t *testing.T) {
+	h := newHarness(t, "hello world\n")
+	before := h.text()
+	text := before
+
+	path := h.Pane().File.Path
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerRename, text: "pin", edit: &lsp.WorkspaceEdit{
+		Docs: []lsp.DocumentEdits{
+			{Path: path, Edits: []lsp.TextEdit{
+				{Range: renameRangeOf(t, text, "hello"), NewText: "hi"},
+				{Range: renameRangeOf(t, text, "world"), NewText: "socket"},
+			}},
+		},
+	}})
+	h.applyAnswer()
+
+	if got := h.text(); got != "hi socket\n" {
+		t.Fatalf("buffer = %q, want both edits applied", got)
+	}
+	h.press("super+z")
+	if got := h.text(); got != before {
+		t.Errorf("one undo left %q, want %q", got, before)
 	}
 }

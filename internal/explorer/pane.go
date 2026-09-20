@@ -10,13 +10,20 @@ import (
 
 // Pane is the file tree sidebar.
 //
-// Tab moves forward through the pane's components and, at the end, leaves for
-// the editor. Shift+tab moves back but stops at the first component: once focus
-// has crossed into the editor, tab is indentation and cannot bring you back.
-// Returning is deliberately a chord (shift+cmd+e), so that editing is never one
-// stray keypress away from being interrupted.
+// Arrows navigate: Up/Down move one entry, Right opens the selected directory
+// and then enters its first child, Left closes it and then steps to its parent.
+// Tab opens the selection: a file hands its path to the editor, a directory
+// expands in place. Shift+tab walks back through the pane and out to the
+// editor, but nothing walks back in — returning is deliberately the
+// shift+cmd+e chord, so that editing is never one stray keypress away from
+// being interrupted.
 type Pane struct {
 	Tree *Tree
+	// Tall draws each entry two screen rows high, for a touch surface, the
+	// same mechanism the picker uses. Render, Settle, ClickAt and RowAt all
+	// read rowHeight, so the drawing and the hit testing cannot disagree about
+	// where a block is.
+	Tall bool
 	list widget.List
 	// left is the horizontal offset, in columns. See follow: it moves only
 	// when the selected row does not fit, which is what keeps the tree from
@@ -63,33 +70,35 @@ func (p *Pane) Handle(a keys.Action, text string) (open string, exit bool) {
 	case keys.DocEnd:
 		p.spot = spotTree
 	case keys.CycleFocus:
-		if p.spot+1 >= spotCount {
-			return "", true
+		// Tab is not a focus ring in the tree: on the changed-only toggle it
+		// steps down to the tree, and on the tree it opens what is selected --
+		// a file leaves for the editor, a directory expands.
+		if p.spot == spotFilter {
+			p.spot = spotTree
+			return "", false
 		}
-		p.spot++
+		return p.openSelected()
 	case keys.CycleFocusBack:
-		// Symmetric with tab walking off the last component: the pane is a
-		// segment of the ring with an exit at each end, and both lead to the
-		// editor. Wrapping round to the results instead would make backwards
-		// mean something different from forwards, and land focus on the far
-		// end of the pane rather than out of it.
-		//
-		// The original reason for stopping here does not apply to leaving. It
-		// was that tab indents in the editor, so a one-key route back IN would
-		// make editing interruptible — and that is untouched, since shift+tab
-		// outdents once focus is in the document.
+		// Shift+tab walks back through the pane's components and, past the
+		// first, leaves for the editor. Coming back is deliberately a chord
+		// (shift+cmd+e): tab indents in the editor, so a one-key route back IN
+		// would make editing interruptible, and shift+tab only outdents.
 		if p.spot == 0 {
 			return "", true
 		}
 		p.spot--
-	case keys.LineUp, keys.CharLeft:
+	case keys.LineUp:
 		if p.spot == spotTree {
 			p.list.Move(-1, len(p.Tree.Entries()))
 		}
-	case keys.LineDown, keys.CharRight:
+	case keys.LineDown:
 		if p.spot == spotTree {
 			p.list.Move(+1, len(p.Tree.Entries()))
 		}
+	case keys.CharRight:
+		return p.openDir()
+	case keys.CharLeft:
+		return p.closeDir()
 	case keys.ToggleExpandAll:
 		p.toggleExpandAll()
 	case keys.Confirm:
@@ -118,6 +127,94 @@ func (p *Pane) activate() (string, bool) {
 		return "", false
 	}
 	return e.Path, false
+}
+
+// selected is the highlighted entry and its index, false when the toggle holds
+// focus or the tree is empty.
+func (p *Pane) selected() (int, Entry, bool) {
+	if p.spot != spotTree {
+		return 0, Entry{}, false
+	}
+	entries := p.Tree.Entries()
+	if p.list.Sel < 0 || p.list.Sel >= len(entries) {
+		return 0, Entry{}, false
+	}
+	return p.list.Sel, entries[p.list.Sel], true
+}
+
+// moveTo moves the selection to i and pulls the view back to it, exactly as an
+// arrow key does.
+func (p *Pane) moveTo(i, n int) {
+	p.list.Sel = i
+	p.list.Move(0, n)
+}
+
+// openDir is Right: open the selected directory. A collapsed directory opens;
+// an already open one moves the selection into its first child. A file is not a
+// directory, so Right does nothing for it.
+func (p *Pane) openDir() (string, bool) {
+	i, e, ok := p.selected()
+	if !ok || !e.Dir {
+		return "", false
+	}
+	if !p.Tree.Expanded(e.Path) {
+		p.Tree.Toggle(e.Path)
+		return "", false
+	}
+	entries := p.Tree.Entries()
+	if i+1 < len(entries) && entries[i+1].Depth > e.Depth {
+		p.moveTo(i+1, len(entries))
+	}
+	return "", false
+}
+
+// closeDir is Left: close the selected directory. An open directory collapses;
+// a collapsed directory moves the selection to its parent, and a file moves to
+// the directory it lives in, so Left is one consistent step up the tree. A
+// top-level entry has no parent, so there the press is a no-op.
+func (p *Pane) closeDir() (string, bool) {
+	i, e, ok := p.selected()
+	if !ok {
+		return "", false
+	}
+	if e.Dir && p.Tree.Expanded(e.Path) {
+		p.Tree.Toggle(e.Path)
+		return "", false
+	}
+	entries := p.Tree.Entries()
+	if parent := parentIndex(entries, i); parent >= 0 {
+		p.moveTo(parent, len(entries))
+	}
+	return "", false
+}
+
+// openSelected is Tab on the tree: a file opens and leaves for the editor, and
+// a directory opens and keeps focus. The app receives a file path and focuses
+// the existing tab when there is one, so Tab never opens a duplicate.
+func (p *Pane) openSelected() (string, bool) {
+	_, e, ok := p.selected()
+	if !ok {
+		return "", false
+	}
+	if e.Dir {
+		if !p.Tree.Expanded(e.Path) {
+			p.Tree.Toggle(e.Path)
+		}
+		return "", false
+	}
+	return e.Path, true
+}
+
+// parentIndex is the row of i's parent: the nearest earlier row shallower than
+// i. -1 for a top-level row, which has no parent among the entries.
+func parentIndex(entries []Entry, i int) int {
+	depth := entries[i].Depth
+	for j := i - 1; j >= 0; j-- {
+		if entries[j].Depth < depth {
+			return j
+		}
+	}
+	return -1
 }
 
 func (p *Pane) toggleFilter() {
@@ -187,8 +284,24 @@ const (
 	footRows = 1 // the selected path
 )
 
-// treeRows is how many entries fit in a pane h rows tall.
+// treeRows is how many screen rows the tree gets in a pane h rows tall.
 func treeRows(h int) int { return h - headRows - footRows }
+
+// rowHeight is how many screen rows one entry occupies: two on a touch
+// surface, one otherwise. It is the picker Tall mechanism applied here, and it
+// is the one place the renderer, the scroll count and both hit tests read the
+// block size.
+func (p *Pane) rowHeight() int {
+	if p.Tall {
+		return 2
+	}
+	return 1
+}
+
+// visibleRows is how many entries fit in a pane h rows tall at the current row
+// height. The list tracks items, not screen rows, so this is the count Settle
+// is given and a scroll or follow moves by whole entries.
+func (p *Pane) visibleRows(h int) int { return treeRows(h) / p.rowHeight() }
 
 // ClickAt handles a press at (dy) rows below the pane's origin, in a pane h
 // rows tall. It returns a file to open, and reports whether the press landed on
@@ -207,19 +320,44 @@ func (p *Pane) ClickAt(dy, h int) (open string, ok bool) {
 		p.toggleFilter()
 		return "", true
 	}
-	rows := treeRows(h)
-	row := dy - headRows
-	if row < 0 || row >= rows {
-		return "", false // the heading or the path line
-	}
-	entries := p.Tree.Entries()
-	i := p.list.Top + row
-	if i >= len(entries) {
-		return "", false // empty space below the last entry
+	i, _, ok := p.RowAt(dy, h)
+	if !ok {
+		return "", false
 	}
 	p.spot = spotTree
 	p.list.Sel = i
-	return p.activate()
+	// activate's bool belongs to the keyboard path, where a file reports no
+	// and the caller opens it by path. A press is a landing whether it hit a
+	// file or a directory, so report that here and keep the open path as the
+	// signal.
+	open, _ = p.activate()
+	return open, true
+}
+
+// RowAt resolves a press at dy rows below the pane origin, in a pane h rows
+// tall, to the entry drawn there, without activating it. It is the one mapping
+// ClickAt and the app context-menu hit test share, so the left-click and
+// right-click paths cannot disagree about which entry a tall block holds.
+func (p *Pane) RowAt(dy, h int) (int, Entry, bool) {
+	if dy < 0 || dy >= h || dy < headRows {
+		return 0, Entry{}, false
+	}
+	row := (dy - headRows) / p.rowHeight()
+	if row >= p.visibleRows(h) {
+		return 0, Entry{}, false
+	}
+	entries := p.Tree.Entries()
+	i := p.list.Top + row
+	if i < 0 || i >= len(entries) {
+		return 0, Entry{}, false
+	}
+	return i, entries[i], true
+}
+
+// RowOffset is the pane-relative row the selected entry starts on, for
+// anchoring a menu drawn beside it.
+func (p *Pane) RowOffset() int {
+	return headRows + (p.list.Sel-p.list.Top)*p.rowHeight()
 }
 
 // Render draws the pane. focused dims the whole thing when the editor has
@@ -238,10 +376,11 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 	p.renderFilter(s, x, y+1, w, th, focused)
 	p.renderPath(s, x, y+h-1, w, th)
 
-	rows := treeRows(h)
+	rows := p.visibleRows(h)
 	p.list.Settle(rows, len(p.Tree.Entries()))
 	entries := p.Tree.Entries()
 	p.follow(w)
+	rh := p.rowHeight()
 
 	for row := 0; row < rows; row++ {
 		i := p.list.Top + row
@@ -251,7 +390,15 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 		e := entries[i]
 		style := th.Focus(i == p.list.Sel, focused && p.spot == spotTree)
 		at, label := indentOf(e)-p.left, labelOf(e)
-		s.Fill(x, y+2+row, w, 1, ui.DefaultStyle)
+		// The block is rh rows: the label sits on the first and the rest is
+		// padding, so a tap anywhere in the block has a drawn cell under it.
+		top := y + 2 + row*rh
+		s.Fill(x, top, w, rh, ui.DefaultStyle)
+		if rh > 1 && i == p.list.Sel {
+			// The selection highlight covers the whole tall block, not only
+			// the row the label sits on.
+			s.Fill(x, top, w, rh, style)
+		}
 		if at < 0 {
 			// Scrolled past this row's start: drop the columns that are off to
 			// the left, so a deep row keeps the tail of its name rather than
@@ -261,7 +408,7 @@ func (p *Pane) Render(s *ui.Screen, x, y, w, h int, th widget.Theme, focused boo
 		if at >= w-1 || label == "" {
 			continue
 		}
-		s.SetString(x+at, y+2+row, widget.Truncate(label, w-at-1), style, w-at-1)
+		s.SetString(x+at, top, widget.Truncate(label, w-at-1), style, w-at-1)
 	}
 }
 

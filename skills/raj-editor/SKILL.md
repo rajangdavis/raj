@@ -121,6 +121,31 @@ would. The one thing you lose is the unsaved-buffer warning, so check
 `raj ctl buffers` yourself before you trust a test result: if a file you are
 about to test has unsaved changes, the command is reading older text.
 
+## Do fewer round trips - batch your calls
+
+Measured over the session history: agents average **1.22 `raj ctl` calls per
+assistant turn** - one command, then a model round trip that re-reads context.
+`read` and `search` are half of all calls, and the facilities this file
+documents for cutting that are barely used (`read A B C` 2%,
+`search -context` 2%, `apply -hunks` 12%). Batching same-verb runs alone
+removes about a third of all calls; with the merges below, closer to 44%.
+
+- Need several files? One `raj ctl read A.go B.go C.go`. It also satisfies the
+  read-before-write gate for every one of them.
+- `search -q PATTERN -context N` returns the hit and its neighbours in one
+  call. Do not `search` and then `read` the same place.
+- `read -json` already returned the version. Reuse it as `-base`; do not spend
+  a separate `version` call.
+- Several hunks in one file? One `apply -hunks` (or a `run -prog` program),
+  not k applies.
+- A structural rewrite of a function or block? `dump` then `patch`, not a
+  chain of `edit -old`.
+- `claim` every path you will write once, up front; do not discover them one
+  failure at a time.
+- Tests, builds and git go through your own shell; `raj ctl exec` is refused
+  over TCP by design.
+- `recv` blocks on purpose. There is no need to poll it.
+
 ## Searching
 
 ```
@@ -445,9 +470,9 @@ Two things to get right:
 
 - **Keep one identity across calls.** The mailbox belongs to your
   participant, not to a connection — `recv` only finds your messages if every
-  call carries the same stable author id. The plugin now provides that
-  automatically (see "Say who you are"), so this takes no action on your part;
-  it is why you must not override it with `-as`.
+  call carries the same stable author id. That is why `register` mints a key once per run and every later call
+  passes `-as <key>`: each `raj ctl` invocation is a fresh connection, and an
+  anonymous one gets a fresh id, so the mailbox would never find you.
 - **Messages keep while you are gone.** Anything said while you were restarting
   is delivered when you come back, so a `recv` after a reconnect may return
   several at once, oldest first.
@@ -879,3 +904,23 @@ skills file does not send an agent back to a shell tool for something
 Rule of thumb: if an agent — or a subagent it spawned — pipes anything other
 than `raj ctl`, it is a candidate for a new flag or verb. Document the gap and
 keep the container surface small.
+
+## Test-writing field notes (from host-gate misfires)
+
+The container has no Go toolchain, so the host gate is the first time a test
+runs. These cost us repeated failures; build the real state and they stop:
+
+- **Draw a frame before a movement chord.** An unlaid-out pane has
+  `Viewport.Cols == 0` and `textWidth() == 1`, so a wrapped `LineDown` moves
+  the caret *within* a long line instead of to the next line. Real input always
+  follows a frame; call `h.Draw()` (or press a non-movement chord) first.
+- **`ui.Screen.Row` trims trailing spaces.** An all-fill row reads as `""`, so
+  a fixed-width slice of `Row` can panic or miss. Assert cells with `At`, or
+  slice the row's rune slice, when padding matters.
+- **Drive the real path.** `harness.press`/`typeText` through the host, call
+  `focusEditor` before typing, and build profiles with `NewWithOptions`; do not
+  set `App` fields to fake a state a real key would not reach.
+- **Sweep the consumers.** When a UI surface changes (a row becomes a drawer,
+  a field moves), search every test and reader of it and update or exempt each.
+- **Gate profile/mode behaviour at the call site** (`if a.phone && ...`) as
+  well as inside the handler, so the ordinary path cannot leak.

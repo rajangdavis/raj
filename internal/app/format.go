@@ -96,8 +96,8 @@ func (a *App) requestFormat(r formatRequest) {
 	// Formatting rewrites the document, so Review mode refuses it like any
 	// other text edit. The gate is here rather than in handleGlobal because a
 	// global action never reaches the editor's read-only check.
-	if a.mode == ModeReview {
-		a.status = reviewReadOnlyNote()
+	if a.readOnly() {
+		a.status = a.readOnlyNote()
 		return
 	}
 	path := a.docPath(p)

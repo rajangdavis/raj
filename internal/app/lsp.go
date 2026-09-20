@@ -53,6 +53,14 @@ type servers struct {
 	// text-driven, so path and version are the whole guard.
 	foldReq foldRequest
 	foldGen int
+
+	// resolveCommand resolves a language's command line from settings and
+	// reports whether a server should run at all: false covers both a disabled
+	// override and a language with no server. App installs App.lspCommand so
+	// the per-language overrides are a cached map read rather than a store read
+	// on every request; a servers built without an App (tests) leaves it nil
+	// and the built-in command map is the whole answer.
+	resolveCommand func(id string) ([]string, bool)
 }
 
 type langServer struct {
@@ -114,6 +122,96 @@ func serverInitOptions(languageID string) any {
 
 func newServers(root string) *servers {
 	return &servers{root: root, byID: map[string]*langServer{}}
+}
+
+// lspCommand resolves the command line for a language id, layering the stored
+// lsp.<lang>.command/args overrides over the built-in command map. It reports
+// false when the language has no server: no override and no built-in, or an
+// override whose command is empty, which disables the server for that
+// language. The overrides are cached by refreshLSPOverrides, so the request
+// path is a map read and never touches the store.
+func (a *App) lspCommand(id string) ([]string, bool) {
+	a.lspForcedMu.RLock()
+	argv, forced := a.lspForced[id]
+	a.lspForcedMu.RUnlock()
+	if forced {
+		return argv, len(argv) > 0
+	}
+	argv, ok := command[id]
+	if !ok || len(argv) == 0 {
+		return nil, false
+	}
+	return argv, true
+}
+
+// refreshLSPOverrides rebuilds the cached per-language command overrides from
+// the user and workspace scopes. It runs once at construction and again after
+// every SetSetting write, so servers.for_ reads a map rather than the store.
+// A nil store is not an error: with no scopes the built-ins apply alone.
+func (a *App) refreshLSPOverrides() {
+	user, workspace := settingScopes(a.state)
+	forced := map[string][]string{}
+	seen := map[string]bool{}
+	scan := func(values map[string]string) {
+		for key := range values {
+			id, _, ok := parseLPSSettingKey(key)
+			if !ok || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if argv, present := lspOverride(id, user, workspace); present {
+				forced[id] = argv
+			}
+		}
+	}
+	scan(user)
+	scan(workspace)
+	a.lspForcedMu.Lock()
+	a.lspForced = forced
+	a.lspForcedMu.Unlock()
+}
+
+// lspOverride resolves one language's override from the two scopes, workspace
+// over user. present reports that an lsp.<lang>.* key is set at all; a present
+// override with a nil argv means the command is the empty string and the
+// server is disabled. A command that is unset falls back to the built-in
+// command map, and an explicitly set args list then replaces the built-in
+// arguments. Arguments split on whitespace with no quoting: an argument that
+// must contain a space is not expressible through this setting.
+func lspOverride(id string, user, workspace map[string]string) ([]string, bool) {
+	cmd, cmdSet := scopeSetting(user, workspace, lspSettingPrefix+id+"."+lspCommandField)
+	args, argsSet := scopeSetting(user, workspace, lspSettingPrefix+id+"."+lspArgsField)
+	if !cmdSet && !argsSet {
+		return nil, false
+	}
+	if !cmdSet {
+		builtin, ok := command[id]
+		if !ok || len(builtin) == 0 {
+			return nil, false // args alone name no executable to run
+		}
+		if !argsSet {
+			return append([]string(nil), builtin...), true
+		}
+		return append(append([]string(nil), builtin[0]), strings.Fields(args)...), true
+	}
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return nil, true // an empty command disables the language
+	}
+	return append([]string{cmd}, strings.Fields(args)...), true
+}
+
+// scopeSetting reads one key the way the resolver layers scopes: a workspace
+// value wins when present, else a user value. present distinguishes an empty
+// string someone wrote from a key nobody set.
+func scopeSetting(user, workspace map[string]string, key string) (string, bool) {
+	if v, ok := workspace[key]; ok {
+		return v, true
+	}
+	if v, ok := user[key]; ok {
+		return v, true
+	}
+	return "", false
 }
 
 // openLanguages is the distinct language ids of a set of panes, in first-seen
@@ -220,6 +318,21 @@ func (s *servers) live(path string) *langServer {
 	return ls
 }
 
+// argvFor returns the command line to run for a language and whether one
+// should run at all. A settings override installed by App wins over the
+// built-in command map; with no resolver, the built-ins are the whole answer.
+// A nil or empty argv is no server.
+func (s *servers) argvFor(id string) ([]string, bool) {
+	if s.resolveCommand != nil {
+		return s.resolveCommand(id)
+	}
+	argv, ok := command[id]
+	if !ok || len(argv) == 0 {
+		return nil, false
+	}
+	return argv, true
+}
+
 // for_ returns the server for a path's language, starting it if needed, along
 // with why it is or is not available.
 func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
@@ -227,8 +340,8 @@ func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 	if id == "" {
 		return nil, serverNone
 	}
-	argv, ok := command[id]
-	if !ok {
+	argv, ok := s.argvFor(id)
+	if !ok || len(argv) == 0 {
 		return nil, serverNone
 	}
 	// Checked before spawning so a missing binary is reported as missing
@@ -896,10 +1009,6 @@ func (a *App) docPath(p *editor.Pane) string {
 	return filepath.Join(a.root, p.File.Path)
 }
 
-// An answer is parked where the event thread already looks and a Wake is
-// posted, which is the same shape the search pane uses. Applying it from the
-// request goroutine would touch panes and the screen from somewhere that must
-// not; ui.Event is sealed, so a result cannot be an event either.
 // An answer is parked where the event thread already looks and a Wake is
 // posted, which is the same shape the search pane uses. Applying it from the
 // request goroutine would touch panes and the screen from somewhere that must

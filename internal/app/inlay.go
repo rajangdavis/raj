@@ -413,8 +413,8 @@ func (a *App) applyInlayEdit() {
 	// The apply is a key gesture, so the pointer tooltip (if one is up) is
 	// stale the moment the edits land; the caret hover is not ours to close.
 	a.hideHint()
-	if a.mode == ModeReview {
-		a.status = reviewReadOnlyNote()
+	if a.readOnly() {
+		a.status = a.readOnlyNote()
 		return
 	}
 	path := a.docPath(p)

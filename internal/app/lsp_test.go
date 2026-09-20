@@ -1462,3 +1462,53 @@ func TestResolvedCompletionDocumentationApplies(t *testing.T) {
 		t.Errorf("memo = %q, want the answer kept", doc)
 	}
 }
+
+// A language with no override still runs the built-in command. Configuring a
+// server is an addition, not a replacement, so an untouched install keeps
+// gopls and a file type with no built-in and no override has none.
+func TestLSPCommandFallsBackToBuiltIn(t *testing.T) {
+	s := newServers("/w")
+	argv, ok := s.argvFor("go")
+	if !ok || len(argv) != 1 || argv[0] != "gopls" {
+		t.Errorf("argvFor(go) = %q, %v; want the built-in gopls", argv, ok)
+	}
+	if argv, ok := s.argvFor("java"); ok {
+		t.Errorf("argvFor(java) = %q, %v; want no server", argv, ok)
+	}
+}
+
+// for_ resolves through argvFor, so an installed resolver reaches the spawn
+// decision. The language has no built-in command, so without the override the
+// state would be serverNone; an empty PATH makes the overridden binary missing
+// without starting anything.
+func TestLSPCommandOverrideReachesFor(t *testing.T) {
+	t.Setenv("PATH", "")
+	s := newServers("/w")
+	s.resolveCommand = func(id string) ([]string, bool) {
+		if id == "java" {
+			return []string{"jdtls", "--stdio"}, true
+		}
+		return nil, false
+	}
+	if _, st := s.for_("/w/a.java", nil); st != serverMissing {
+		t.Errorf("state = %d, want serverMissing for the overridden command", st)
+	}
+	if n := len(s.byID); n != 0 {
+		t.Errorf("a missing override registered %d server(s), want none", n)
+	}
+}
+
+// A disabled server is not a missing binary: for_ reports serverNone and
+// registers nothing, so a settings override that disables a language never
+// reaches the spawn attempt.
+func TestLSPCommandDisabledReportsNone(t *testing.T) {
+	t.Setenv("PATH", "")
+	s := newServers("/w")
+	s.resolveCommand = func(id string) ([]string, bool) { return nil, false }
+	if _, st := s.for_("/w/a.py", nil); st != serverNone {
+		t.Errorf("state = %d, want serverNone for a disabled server", st)
+	}
+	if n := len(s.byID); n != 0 {
+		t.Errorf("a disabled server registered %d entry(ies), want none", n)
+	}
+}

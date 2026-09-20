@@ -341,7 +341,7 @@ than trusted because it looks right.
   found by the properties in CURSOR-VIEWPORT-SPEC.md within seconds of writing
   them, having survived every example test in the repository.
 
-- [~] **Reject bypassed `File`, and `ApplyDiff` anchored its catch-up at the
+- [x] **Reject bypassed `File`, and `ApplyDiff` anchored its catch-up at the
   version on entry.** `host.Decide` and `App.decideProposed` called
   `Session.RejectGroup` directly, so the reversal's ops never reached `f.idx`
   and `f.applied` stayed put; the next `ApplyDiff` then mirrored only its own
@@ -351,7 +351,8 @@ than trusted because it looks right.
   cycles) and line starts near EOF addressed past the buffer. Fixed in buffer
   2026-09-11: `File.RejectGroup` delegates then `sync`s (even when a reverse
   rolls back), both callers route through it, and `ApplyDiff` catches up from
-  `f.applied` rather than a local `before`. Host verification pending.
+  `f.applied` rather than a local `before`. Host-verified 2026-09-17; the read path is now the second guard — `File.index()` syncs before returning the index, so any op that reaches the journal outside a `File` wrapper is mirrored before a line is read.
+
 
 ### Escape never arrived without KKP
 

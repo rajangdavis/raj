@@ -640,12 +640,40 @@ func (s *Session) rollback(applied []Version) {
 }
 
 // live reports whether an op currently affects the document: it does unless
-// some op that reverses it is itself live. The chain is short — an op, its
-// undo, its redo — so the recursion is cheap and always terminates, because a
-// reverser is always a later op than what it reverses.
+// some op that reverses it is itself live.
+//
+// A well-formed journal's chain is short — an op, its undo, its redo — and
+// always terminates, because a reverser is a later op than what it reverses.
+// A restored journal is data on disk, though, and nothing stops a truncated or
+// hand-edited log from claiming a cycle: op A reverses B while B reverses A,
+// or an op lists itself. Following that cycle forever is a stack overflow that
+// takes the editor down, so the walk below carries a visited set: each op is
+// entered at most once per call, which bounds the recursion depth by the
+// journal's length rather than by however long a malformed chain happens to be.
 func (s *Session) live(seq Version) bool {
+	// An op with no reverser is live, and that is the common case: an ordinary
+	// edit is never reversed. Answering it before the map is built keeps the
+	// guard off the hot path, where live() is asked once per op per rebase.
+	if len(s.reversers[seq]) == 0 {
+		return true
+	}
+	return s.liveFrom(seq, map[Version]bool{seq: true})
+}
+
+// liveFrom is live() carrying the set of ops this call has already asked
+// about. An edge back into that set is the malformed cycle, and dropping it is
+// what makes live() terminate on a journal no honest writer produced: the node
+// is already being answered, so re-entering it can only repeat the same
+// question. The set lives for the whole call and is shared by every branch,
+// because liveness is a reachability question — once an op is being resolved,
+// reaching it again from a different branch adds nothing.
+func (s *Session) liveFrom(seq Version, seen map[Version]bool) bool {
 	for _, r := range s.reversers[seq] {
-		if s.live(r) {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		if s.liveFrom(r, seen) {
 			return false
 		}
 	}

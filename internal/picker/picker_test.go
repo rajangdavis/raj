@@ -1,6 +1,11 @@
 package picker
 
-import "testing"
+import (
+	"testing"
+
+	"raj/internal/ui"
+	"raj/internal/widget"
+)
 
 // A file whose name contains the query must outrank one that only matches as a
 // scattered subsequence across directories. "test" is a subsequence of
@@ -41,5 +46,52 @@ func TestFuzzyPrefersPrefixAndShortPaths(t *testing.T) {
 func TestFuzzyRejectsNonSubsequence(t *testing.T) {
 	if _, _, ok := fuzzy("main.go", "zzz"); ok {
 		t.Error("matched a query that is not a subsequence")
+	}
+}
+
+// In phone mode every result cell is two screen rows tall and the whole cell is
+// the target: a press on either row chooses that row, and the count line below
+// the list chooses nothing. The ordinary one-row picker fails the two-row taps.
+func TestTallPickerRowsTapWholeCell(t *testing.T) {
+	p := New(".")
+	p.Tall = true
+	p.shown = []scored{
+		{entry: entry{label: "a.go"}},
+		{entry: entry{label: "b.go"}},
+		{entry: entry{label: "c.go"}},
+	}
+	p.list.Reset()
+	const cols, rows = 40, 30
+	x, y, _, h, ok := p.box(cols, rows)
+	if !ok {
+		t.Fatal("the picker box did not fit")
+	}
+	p.Open = true
+	s := ui.NewScreen(cols, rows)
+	p.Render(s, cols, rows, widget.DefaultTheme())
+	rh := p.rowHeight()
+	if rh != 2 {
+		t.Fatalf("Tall rowHeight = %d, want 2", rh)
+	}
+	top := y + listTop
+	for i := range 3 {
+		for dy := range rh {
+			p.Open = true
+			if _, inside := p.ClickAt(cols, rows, x+2, top+i*rh+dy); !inside {
+				t.Fatalf("cell %d row %d read as outside", i, dy)
+			}
+			if p.list.Sel != i {
+				t.Errorf("tap at cell %d row %d selected %d, want %d", i, dy, p.list.Sel, i)
+			}
+		}
+	}
+	// The count line at the bottom border is inside the overlay but not a row.
+	p.Open = true
+	p.list.Sel = -1
+	if _, inside := p.ClickAt(cols, rows, x+2, y+h-1); !inside {
+		t.Error("the count line read as outside the picker")
+	}
+	if p.list.Sel != -1 {
+		t.Errorf("the count line selected %d, want nothing", p.list.Sel)
 	}
 }

@@ -18,6 +18,7 @@ const (
 	FocusExplorer  Action = "focus_explorer"
 	FocusSearch    Action = "focus_search"
 	FocusProblems  Action = "focus_problems"
+	Settings       Action = "settings"
 	FilePicker     Action = "file_picker"
 	CommandPalette Action = "command_palette"
 	FindInFile     Action = "find_in_file"
@@ -187,6 +188,11 @@ const (
 	// second press; scope-bound to cmd+return so it does not disturb the
 	// editor's line-below.
 	ToggleExpandAll Action = "toggle_expand_all"
+
+	// ToggleDrawer opens or closes the phone profile's bottom action drawer.
+	// It is unbound in the ordinary keymap; the phone profile binds esc to it,
+	// so the editor's own esc (Cancel) is untouched off the phone.
+	ToggleDrawer Action = "toggle_drawer"
 
 	// proposals — an agent change set lands as a proposal: in the document,
 	// tinted, save-blocked, and decided one gesture at a time. Accept marks it

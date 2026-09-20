@@ -128,6 +128,12 @@ const (
 	OpFind    = 0x95 // locate a pattern in the buffer and answer its byte span
 	OpExec    = 0x96 // run a command; its argv accumulates from arg ops
 
+	// The client-facing pair, added after the attach work. The blank line is
+	// the gofmt alignment boundary; without it the two long names realign
+	// every verb above them.
+	OpSnapshot = 0x97 // the whole document a client needs to render it itself
+	OpWatch    = 0x98 // park until the open buffers change generation
+
 )
 
 // Search flags, the bits of an OpFlags payload. A bitfield rather than three
@@ -156,7 +162,7 @@ var names = map[byte]string{
 	OpDumpID: "dump-id", OpDump: "dump", OpPatch: "patch",
 	OpLSPMode: "lsp-mode", OpLSP: "lsp", OpDiff: "diff",
 	OpReviewList: "review-list", OpArg: "arg", OpReview: "review", OpClear: "clear",
-	OpFind: "find", OpExec: "exec",
+	OpFind: "find", OpExec: "exec", OpSnapshot: "snapshot", OpWatch: "watch",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

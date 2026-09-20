@@ -68,7 +68,7 @@ func (a *App) pointer(ev ui.Mouse) {
 		}
 	}
 	cols, rows := a.screen.Size()
-	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	l := a.layout(cols, rows)
 
 	if ev.Motion {
 		// A drag only ever extends a selection in the document. Dragging
@@ -110,7 +110,7 @@ func (a *App) pointer(ev ui.Mouse) {
 	// missed as often as it is hit at sidebar widths; middle-click is what
 	// every browser and most editors already use for the same thing.
 	if ev.Button == keys.MouseMiddle {
-		if i, ok := a.Tabs.HitTest(0, cols, ev.Col); ok && ev.Row == l.TabY {
+		if i, ok := a.Tabs.HitTest(0, cols, ev.Col); ok && ev.Row >= l.TabY && ev.Row < l.TabY+a.Tabs.StripRows() {
 			a.closeTabAt(i)
 		}
 		return
@@ -156,7 +156,32 @@ func (a *App) pointer(ev ui.Mouse) {
 		a.focus = FocusEditor
 	}
 
-	if ev.Row == l.TabY {
+	// The phone action drawer owns the bottom row and, while open, the panel
+	// above it. A tap on a button dispatches it and leaves the panel up, so a
+	// review pass is a run of taps rather than an open/dispatch/open cycle; a
+	// tap on the handle toggles it; a tap elsewhere collapses an open panel and
+	// is swallowed rather than falling through to the editor behind it.
+	if a.phone && a.drawerHandle.h > 0 {
+		if a.drawerOpen {
+			if b, ok := a.drawerAt(ev.Col, ev.Row); ok {
+				a.drawerDispatch(b)
+				return
+			}
+			if ev.Row >= a.drawerPanelTop && ev.Row < a.drawerPanelTop+a.drawerPanelRows {
+				return // the panel background, not a button: keep it open
+			}
+			a.drawerOpen = false
+			return
+		}
+		if ev.Row >= a.drawerHandle.y && ev.Row < a.drawerHandle.y+a.drawerHandle.h {
+			a.drawerOpen = true
+			a.drawerSel = 0
+			a.drawerWant = a.drawerOpenWant()
+			return
+		}
+	}
+
+	if ev.Row >= l.TabY && ev.Row < l.TabY+a.Tabs.StripRows() {
 		if i, ok := a.Tabs.HitTest(0, cols, ev.Col); ok {
 			a.Tabs.Goto(i + 1)
 			a.focusEditor()
@@ -174,6 +199,18 @@ func (a *App) pointer(ev ui.Mouse) {
 	}
 }
 
+// drawerAt resolves a screen cell to the action of the panel button drawn
+// there, if any. The panel spans are rebuilt by each frame, so a tap is only
+// matched against what was painted.
+func (a *App) drawerAt(col, row int) (keys.Action, bool) {
+	for _, b := range a.drawerPanel {
+		if row >= b.y && row < b.y+b.h && col >= b.x && col < b.x+b.w {
+			return b.action, true
+		}
+	}
+	return keys.None, false
+}
+
 // menuTargetAt reports whether a context menu has a target under the press: a
 // tab on the tab bar, or a row in the explorer. It is the scope of the
 // ctrl+left-click substitute for a right button, so a ctrl+left that misses
@@ -184,7 +221,7 @@ func (a *App) menuTargetAt(l Layout, ev ui.Mouse) bool {
 	if a.Prompt.Open || a.Picker.Open {
 		return false
 	}
-	if ev.Row == l.TabY {
+	if ev.Row >= l.TabY && ev.Row < l.TabY+a.Tabs.StripRows() {
 		cols, _ := a.screen.Size()
 		_, ok := a.Tabs.HitTest(0, cols, ev.Col)
 		return ok
@@ -339,6 +376,12 @@ func (a *App) clickSidebar(l Layout, ev ui.Mouse) {
 			a.OpenFile(path)
 			a.jumpTo(line)
 		}
+	case SidebarSettings:
+		// A press selects the row it lands on and does what enter would, so a
+		// click can toggle a bool or open the width field. dy is already
+		// measured from the pane content origin, the same origin Render draws
+		// the rows from.
+		a.settingsPane.ClickAt(a, dy)
 	}
 }
 
@@ -483,7 +526,7 @@ func (a *App) autoScrollStep() {
 		return // already at the end of the document; nothing to extend to
 	}
 	cols, rows := a.screen.Size()
-	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	l := a.layout(cols, rows)
 	x, y, _ := a.editorCell(l, p, a.dragCol, a.dragRow)
 	// ExtendTo rather than DragTo: the edge row is on screen by construction,
 	// and following the cursor would scroll a second time on top of the step

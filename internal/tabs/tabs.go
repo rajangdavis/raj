@@ -20,20 +20,106 @@ type Tabs struct {
 	active int
 	closed []string
 	tab    int
+	// widthPinned is set by SetTabWidth. Files opened after an explicit width
+	// is named take it even when their content suggests another, because an
+	// explicit setting outranks detection.
+	widthPinned bool
 	// preview is the index of the one reusable preview pane, or -1 when there
 	// is none. A preview is a tab like any other except that arrowing through
 	// the explorer replaces it rather than opening beside it; opening the
 	// previewed path for real clears the marking. See OpenPreview.
 	preview int
+	// phone renders the bar as the phone profile's taller, scrollable chips;
+	// see layout. It is fixed when the set is built.
+	phone bool
+	// scroll is the phone strip's horizontal offset in columns. layout clamps
+	// it, so a value past either end is harmless.
+	scroll int
+	// activeSeen is the active index whose chip the last layout revealed. A
+	// user scroll is kept until the active tab changes, then pulled back into
+	// view.
+	activeSeen int
 
 	// IndentTabs is the fallback style for buffers with nothing to detect —
 	// a new file, or one with no indentation yet. A file that answers for
 	// itself is left alone, so this is a preference rather than an override.
 	IndentTabs bool
+
+	// Load reads a path into a File. Nil means editor.Open. The app sets it to
+	// a reader that consults the persisted journal first, so a buffer comes
+	// back with its proposals; a caller that never sets it gets the plain disk
+	// open, which is what non-App users and tests want.
+	Load func(path string, tab int) (*editor.File, error)
+}
+
+// load reads path through Load when one is set, and editor.Open otherwise.
+func (t *Tabs) load(path string) (*editor.File, error) {
+	if t.Load != nil {
+		return t.Load(path, t.tab)
+	}
+	return editor.Open(path, t.tab)
 }
 
 // New returns an empty tab set. tab is the indent width for files it opens.
-func New(tabWidth int) *Tabs { return &Tabs{tab: tabWidth, preview: -1} }
+func New(tabWidth int) *Tabs { return &Tabs{tab: tabWidth, preview: -1, activeSeen: -1} }
+
+// SetTabWidth changes the indent width for files opened from now on. It is an
+// explicit width: a file opened afterwards takes it even when its own
+// indentation suggests a different one, and Reload re-detection cannot take it
+// back. Already-open panes are not touched; the app re-applies the width to
+// those through the editor, which owns both the indent unit and the display
+// width. A non-positive width is ignored.
+func (t *Tabs) SetTabWidth(w int) {
+	if w <= 0 {
+		return
+	}
+	t.tab = w
+	t.widthPinned = true
+}
+
+// TabWidth is the width new files are opened with.
+func (t *Tabs) TabWidth() int { return t.tab }
+
+// TabWidthPinned reports whether SetTabWidth has named an explicit width.
+func (t *Tabs) TabWidthPinned() bool { return t.widthPinned }
+
+// PhoneStripRows is how many screen rows the phone tab strip occupies. The
+// renderer and the pointer row test both read StripRows, which agrees.
+const PhoneStripRows = 3
+
+// Phone chip geometry: a chip is at least phoneChipW columns so it is a
+// comfortable touch target, and phoneChipGap columns separate neighbours.
+const (
+	phoneChipW   = 16
+	phoneChipGap = 1
+)
+
+// SetPhone switches the tab strip to the phone profile. It is a launch
+// profile, not a stored setting, so nothing flips it after construction.
+func (t *Tabs) SetPhone(on bool) { t.phone = on }
+
+// Phone reports whether the phone tab strip is on.
+func (t *Tabs) Phone() bool { return t.phone }
+
+// StripRows is how many screen rows the bar occupies: two in the phone
+// profile, one otherwise. The pointer's row test reads this rather than
+// assuming one, so a tap can only land on a row the bar drew.
+func (t *Tabs) StripRows() int {
+	if t.phone {
+		return PhoneStripRows
+	}
+	return 1
+}
+
+// ScrollTabs moves the phone strip's horizontal offset by d columns. The next
+// layout clamps it and reveals the active chip if the active tab moved. It is
+// a no-op on the ordinary bar.
+func (t *Tabs) ScrollTabs(d int) {
+	if !t.phone {
+		return
+	}
+	t.scroll += d
+}
 
 func (t *Tabs) Count() int          { return len(t.panes) }
 func (t *Tabs) All() []*editor.Pane { return t.panes }
@@ -66,11 +152,14 @@ func (t *Tabs) Open(path string) (*editor.Pane, error) {
 			return p, nil
 		}
 	}
-	f, err := editor.Open(path, t.tab)
+	f, err := t.load(path)
 	if err != nil {
 		return nil, err
 	}
 	f.SetIndentDefault(editor.Indent{Tabs: t.IndentTabs, Width: t.tab})
+	if t.widthPinned {
+		f.SetTabWidth(t.tab)
+	}
 	pane := editor.NewPane(f)
 	t.panes = append(t.panes, pane)
 	t.active = len(t.panes) - 1
@@ -92,11 +181,14 @@ func (t *Tabs) OpenPreview(path string) (*editor.Pane, error) {
 			return p, nil
 		}
 	}
-	f, err := editor.Open(path, t.tab)
+	f, err := t.load(path)
 	if err != nil {
 		return nil, err
 	}
 	f.SetIndentDefault(editor.Indent{Tabs: t.IndentTabs, Width: t.tab})
+	if t.widthPinned {
+		f.SetTabWidth(t.tab)
+	}
 	return t.installPreview(editor.NewPane(f)), nil
 }
 
@@ -176,6 +268,9 @@ func (t *Tabs) Add(p *editor.Pane) {
 func (t *Tabs) NewFile() *editor.Pane {
 	f := editor.NewFile("", "", t.tab)
 	f.SetIndentDefault(editor.Indent{Tabs: t.IndentTabs, Width: t.tab})
+	if t.widthPinned {
+		f.SetTabWidth(t.tab)
+	}
 	p := editor.NewPane(f)
 	t.Add(p)
 	return p
@@ -280,6 +375,9 @@ type Span struct{ Start, End int }
 // under the pointer, and nothing on screen would show why.
 func (t *Tabs) layout(w int) (labels []string, spans []Span) {
 	labels = t.labels()
+	if t.phone {
+		return labels, t.layoutPhone(labels, w)
+	}
 	total := 0
 	for _, l := range labels {
 		total += len(l) + 1 // plus the separator
@@ -305,6 +403,50 @@ func (t *Tabs) layout(w int) (labels []string, spans []Span) {
 		col += len(label) + 1 // the separator sits between tabs
 	}
 	return labels, spans
+}
+
+// layoutPhone places the phone profile's chips. Each chip is at least
+// phoneChipW columns wide so it is a comfortable target, with its label
+// centred, and the strip scrolls horizontally when the chips do not fit. It
+// is the one layout the renderer and HitTest share, so a tap cannot land on a
+// chip other than the one drawn under it.
+func (t *Tabs) layoutPhone(labels []string, w int) []Span {
+	widths := make([]int, len(labels))
+	total := 0
+	for i, l := range labels {
+		cw := max(len(l)+2, phoneChipW)
+		widths[i] = cw
+		total += cw + phoneChipGap
+	}
+	if len(labels) > 0 {
+		total -= phoneChipGap
+	}
+	limit := max(total-w, 0)
+	// Reveal the active chip when the active tab changed; otherwise keep the
+	// offset the user scrolled to.
+	if t.active >= 0 && t.active < len(widths) && t.active != t.activeSeen {
+		t.activeSeen = t.active
+		start := 0
+		for i := 0; i < t.active; i++ {
+			start += widths[i] + phoneChipGap
+		}
+		if start < t.scroll || start+widths[t.active] > t.scroll+w {
+			t.scroll = start
+		}
+	}
+	if t.scroll > limit {
+		t.scroll = limit
+	}
+	if t.scroll < 0 {
+		t.scroll = 0
+	}
+	spans := make([]Span, len(labels))
+	col := -t.scroll
+	for i, cw := range widths {
+		spans[i] = Span{Start: col, End: col + cw}
+		col += cw + phoneChipGap
+	}
+	return spans
 }
 
 // HitTest returns the tab drawn at a screen column, given the bar's origin and
@@ -358,13 +500,17 @@ func (t *Tabs) CloseIndex(i int) {
 // theme with low contrast bold may not be distinguishable at all. Separators
 // keep adjacent names from reading as one string.
 func (t *Tabs) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
-	s.Fill(x, y, w, 1, th.Dim)
+	s.Fill(x, y, w, t.StripRows(), th.Dim)
 	if len(t.panes) == 0 {
 		s.SetString(x+1, y, "no files open", th.Dim, w-1)
 		return
 	}
 
 	labels, spans := t.layout(w)
+	if t.phone {
+		t.renderPhone(s, x, y, w, th, labels, spans)
+		return
+	}
 	for i, label := range labels {
 		style := th.Dim
 		if i == t.active {
@@ -388,6 +534,38 @@ func (t *Tabs) Render(s *ui.Screen, x, y, w int, th widget.Theme) {
 	}
 }
 
+// renderPhone draws the phone chips: a two-row cell per tab with its label
+// centred horizontally, clipped at the bar's edges as the strip scrolls. Both
+// rows are filled with the chip style so the whole cell is a touch target.
+func (t *Tabs) renderPhone(s *ui.Screen, x, y, w int, th widget.Theme, labels []string, spans []Span) {
+	for i, label := range labels {
+		style := th.Dim
+		if i == t.active {
+			style = th.Active
+		}
+		if i == t.preview {
+			style = style.Plus(ui.Italic)
+		}
+		sp := spans[i]
+		for dy := range PhoneStripRows {
+			for col := sp.Start; col < sp.End; col++ {
+				if col < 0 || col >= w {
+					continue
+				}
+				s.Set(x+col, y+dy, ' ', style)
+			}
+		}
+		pad := (sp.End - sp.Start - len(label)) / 2
+		at, text := sp.Start+pad, label
+		if at < 0 {
+			text, at = clipLeft(text, -at), 0
+		}
+		if at < w {
+			s.SetString(x+at, y+PhoneStripRows/2, text, style, w-at)
+		}
+	}
+}
+
 // labels names each tab, adding enough parent directory to tell apart files
 // that share a base name. Three tabs all reading "main.go" is worse than no
 // labels at all.
@@ -404,7 +582,9 @@ func (t *Tabs) labels() []string {
 				name = dir + "/" + name
 			}
 		}
-		if p.File.ViewDirty() {
+		// A snapshot buffer cannot be saved, so a dirty dot on it would be a
+		// lie; the local editor keeps its own marker.
+		if p.File.ViewDirty() && !p.File.IsSnapshot() {
 			name += " •"
 		}
 		if p.DiskStale() {

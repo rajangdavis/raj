@@ -58,6 +58,66 @@ func TestFileLocation(t *testing.T) {
 	}
 }
 
+// State lives in the XDG state home, outside the workspace, keyed per
+// workspace. XDG_STATE_HOME wins when it is set.
+func TestStateDirRespectsXDGStateHome(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	root := workspace(t)
+
+	got := StateDir(root)
+	wantUnder := filepath.Join(stateHome, "raj", "workspaces")
+	if filepath.Dir(got) != wantUnder {
+		t.Errorf("StateDir = %q, want a child of %q", got, wantUnder)
+	}
+	if again := StateDir(root); again != got {
+		t.Errorf("StateDir is not stable: %q then %q", got, again)
+	}
+	if key := filepath.Base(got); !strings.HasPrefix(key, "raj-") {
+		t.Errorf("key %q is not a raj workspace key", key)
+	}
+	if StateDir("") != "" {
+		t.Error("no root should mean no state dir")
+	}
+}
+
+// Without XDG_STATE_HOME the spec's default applies: $HOME/.local/state.
+func TestStateDirFallsBackToHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+
+	got := StateDir(root)
+	wantUnder := filepath.Join(home, ".local", "state", "raj", "workspaces")
+	if filepath.Dir(got) != wantUnder {
+		t.Errorf("StateDir = %q, want a child of %q", got, wantUnder)
+	}
+}
+
+// Two workspaces can share a base name; the digest of the full path is what
+// keeps their state apart, and a moved workspace gets a fresh directory.
+func TestStateDirDistinguishesSameNamedRoots(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	a := filepath.Join(t.TempDir(), "repo")
+	b := filepath.Join(t.TempDir(), "repo")
+	moved := filepath.Join(t.TempDir(), "repo")
+	for _, dir := range []string{a, b, moved} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if StateDir(a) == StateDir(b) {
+		t.Fatalf("same base name collided on %q", StateDir(a))
+	}
+	if StateDir(a) == StateDir(moved) {
+		t.Errorf("a moved workspace kept its key: %q", StateDir(a))
+	}
+	if key := filepath.Base(StateDir(a)); !strings.Contains(key, "repo") {
+		t.Errorf("key %q has no readable slug", key)
+	}
+}
+
 // A session is a hint. Every one of these used to be a way to fail at startup
 // over a scratch file, which is a much worse outcome than a lost scroll.
 func TestLoadIsNeverFatal(t *testing.T) {
@@ -245,5 +305,37 @@ func TestHintsRoundTripAndAbsence(t *testing.T) {
 	st = Load(root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Hints != nil {
 		t.Errorf("tabs = %+v, want Hints nil so the app default applies", st.Tabs)
+	}
+}
+
+// The sidebar field is tri-state: a named pane and an explicit closed state
+// both survive a round trip, and a session written before the field decodes
+// nil so the caller keeps its default.
+func TestSidebarRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	search := "search"
+	closed := ""
+	for _, tc := range []struct {
+		name string
+		in   *string
+	}{
+		{"named", &search},
+		{"closed", &closed},
+		{"absent", nil},
+	} {
+		blob, err := Encode(State{Version: Version, Sidebar: tc.in})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := Decode(blob, root)
+		if tc.in == nil {
+			if got.Sidebar != nil {
+				t.Errorf("%s: sidebar = %q, want nil", tc.name, *got.Sidebar)
+			}
+			continue
+		}
+		if got.Sidebar == nil || *got.Sidebar != *tc.in {
+			t.Errorf("%s: sidebar did not round-trip", tc.name)
+		}
 	}
 }

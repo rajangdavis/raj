@@ -342,3 +342,45 @@ func TestGoConventionYieldsToContent(t *testing.T) {
 		t.Errorf("space-indented .go: %+v from %v, want spaces from content", spaced.Indent, spaced.IndentSource())
 	}
 }
+
+// SetTabWidth is an explicit width, so it outranks the file's own detection and
+// Reload's re-detection: a buffer resized by the person must not resize back
+// when the file changes on disk.
+func TestSetTabWidthSurvivesRedetection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("  x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Open(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Indent.Width != 2 || f.Cols.Tab != 2 {
+		t.Fatalf("setup: indent %d cols %d, want 2/2", f.Indent.Width, f.Cols.Tab)
+	}
+
+	f.SetTabWidth(8)
+	if f.Indent.Width != 8 || f.Cols.Tab != 8 {
+		t.Fatalf("after SetTabWidth: indent %d cols %d, want 8/8", f.Indent.Width, f.Cols.Tab)
+	}
+	if got := f.Cols.ColOf("\tx", 1); got != 8 {
+		t.Errorf("column after a tab = %d, want the display width 8", got)
+	}
+
+	// The file now says four spaces; the pinned width must not follow it.
+	if err := os.WriteFile(path, []byte("    y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if f.Indent.Width != 8 || f.Cols.Tab != 8 {
+		t.Errorf("after Reload: indent %d cols %d, want the pinned 8/8", f.Indent.Width, f.Cols.Tab)
+	}
+
+	f.SetTabWidth(0)
+	if f.Indent.Width != 8 || f.Cols.Tab != 8 {
+		t.Errorf("SetTabWidth(0) changed the width: indent %d cols %d", f.Indent.Width, f.Cols.Tab)
+	}
+}

@@ -66,6 +66,8 @@ const (
 	hWithdraw   = 0x17 // delete: retract this identity's proposal instead of making one
 	hNewPath    = 0x18 // rename: the destination path, alongside Path
 	hHidden     = 0x19 // ls: include hidden entries, the -hidden switch
+	hGen        = 0x1a // watch: the generation the client last saw
+	hForce      = 0x1b // save: overwrite a file that changed on disk
 
 	// response fields
 	hExit             = 0x20
@@ -130,6 +132,10 @@ const (
 	hApplyWarnings    = 0x5b // apply: sparse overlapped-set warnings, one {group, author, start, end} per warning
 	hMatchContext     = 0x5c // search: sparse per-hit context block, one string per hit, in hit order
 	hBufferSuperseded = 0x5d // buffers: sparse superseded count, one {path, count} per buffer that has one
+	hGenOut           = 0x5e // the whole-workspace generation current at this answer
+	hSnapshotJSON     = 0x5f // snapshot: the encoded piecetable session a client renders from
+	hEncodingJSON     = 0x60 // snapshot: the file encoding, as JSON
+	hSnapshotPath     = 0x61 // snapshot: the buffer's own path
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -166,6 +172,7 @@ var verbCodes = map[string]byte{
 	"revert": 41,
 	"token":  42,
 	"ls":     43,
+	"watch":  44,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -234,6 +241,7 @@ func encodeHeader(h Header) []byte {
 	str(hPath, h.Path)
 	str(hNewPath, h.NewPath)
 	num(hAuthor, int(h.Author))
+	num(hGen, int(h.Gen))
 	str(hToken, h.Token)
 	if h.Base != nil {
 		// A pointer because zero is a real version and "not stated" is not the
@@ -248,6 +256,7 @@ func encodeHeader(h Header) []byte {
 	flag(hAnnotated, h.Annotated)
 	flag(hCreate, h.Create)
 	flag(hDiscard, h.Discard)
+	flag(hForce, h.Force)
 	flag(hClaimAdd, h.ClaimAdd)
 	flag(hClaimClear, h.ClaimClear)
 	flag(hWithdraw, h.Withdraw)
@@ -294,7 +303,11 @@ func encodeHeader(h Header) []byte {
 	num(hConsidered, h.Considered)
 	flag(hCapped, h.Capped)
 	num(hDump, int(h.DumpID))
+	num(hGenOut, int(h.Gen))
 	str(hHash, h.Hash)
+	str(hSnapshotJSON, h.SnapshotJSON)
+	str(hEncodingJSON, h.EncodingJSON)
+	str(hSnapshotPath, h.SnapshotPath)
 	str(hLSPMode, h.LSPMode)
 	str(hLSPJSON, h.LSPJSON)
 	str(hDiffJSON, h.DiffJSON)
@@ -805,6 +818,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Create = true
 		case hDiscard:
 			h.Discard = true
+		case hForce:
+			h.Force = true
 		case hClaimAdd:
 			h.ClaimAdd = true
 		case hClaimClear:
@@ -814,6 +829,8 @@ func decodeHeader(b []byte) (Header, error) {
 		case hHidden:
 			h.Hidden = true
 
+		case hGen:
+			h.Gen = uint64(prog.ReadNumber(op.Payload))
 		case hGroup:
 			h.Group = uint64(prog.ReadNumber(op.Payload))
 		case hIdentity:
@@ -864,8 +881,16 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Capped = true
 		case hDump:
 			h.DumpID = uint64(prog.ReadNumber(op.Payload))
+		case hGenOut:
+			h.Gen = uint64(prog.ReadNumber(op.Payload))
 		case hHash:
 			h.Hash = string(op.Payload)
+		case hSnapshotJSON:
+			h.SnapshotJSON = string(op.Payload)
+		case hEncodingJSON:
+			h.EncodingJSON = string(op.Payload)
+		case hSnapshotPath:
+			h.SnapshotPath = string(op.Payload)
 		case hLSPMode:
 			h.LSPMode = string(op.Payload)
 		case hLSPJSON:

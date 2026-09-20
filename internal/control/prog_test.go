@@ -288,11 +288,11 @@ func TestSearchArgumentsCompileInAnyOrder(t *testing.T) {
 	}
 }
 
-// A verb this build has not allocated is refused by the ordinary unknown-verb
-// rule rather than by a special case: the table now ends at OpExec, and these
-// codes are past it.
+// A verb that deliberately stays out of programs (watch, which parks) and any
+// opcode this build has not allocated are refused by the ordinary unknown-verb
+// rule rather than by a special case.
 func TestVerbsThatStayOutOfPrograms(t *testing.T) {
-	for _, code := range []byte{0x97, 0x98, 0xff} { // unallocated verb range; the table now ends at OpExec
+	for _, code := range []byte{0x98, 0x99, 0xff} { // OpWatch, then unallocated verbs
 		p := prog.Encode([]prog.Op{{Code: code}})
 		if _, err := Requests(p, 1); !errors.Is(err, prog.ErrUnknownVerb) {
 			t.Errorf("verb %#x = %v, want ErrUnknownVerb", code, err)

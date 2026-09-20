@@ -3,8 +3,10 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"raj/internal/control"
@@ -176,20 +178,24 @@ func (a *App) promptDeletion(p *editor.Pane, d control.Deletion) {
 }
 
 // trashDir is where RAJ_TRASH=1 sends a removed file: a trash/ directory in
-// the workspace's scratch-state dir, beside the session file and the op logs.
+// the workspace's XDG state dir, alongside the store and the op logs.
 func (a *App) trashDir() string {
 	if a.root == "" {
 		return ""
 	}
-	return filepath.Join(session.Dir(a.root), "trash")
+	return filepath.Join(session.StateDir(a.root), "trash")
 }
 
-// moveToTrash renames path into the workspace trash under a timestamped name
+// moveToTrash moves path into the workspace trash under a timestamped name
 // rather than unlinking it, so a RAJ_TRASH=1 removal can be recovered by hand.
 // The name keeps the original basename so the directory reads by eye and
 // carries a UTC nanosecond stamp so removing the same name twice does not
-// clobber the earlier copy. os.Rename is a same-filesystem move here: the file
-// and the trash dir both live under the workspace root.
+// clobber the earlier copy.
+//
+// The trash lives in the XDG state dir now, which is commonly a different
+// filesystem from the workspace, so this goes through moveOrCopy rather than a
+// bare rename. On failure the file is left where it is, the caller reports the
+// error and keeps the proposal, and no bytes are lost.
 func (a *App) moveToTrash(path string) error {
 	dir := a.trashDir()
 	if dir == "" {
@@ -199,7 +205,77 @@ func (a *App) moveToTrash(path string) error {
 		return err
 	}
 	name := filepath.Base(path) + "." + time.Now().UTC().Format("20060102T150405.000000000")
-	return os.Rename(path, filepath.Join(dir, name))
+	return moveOrCopy(path, filepath.Join(dir, name))
+}
+
+// moveOrCopy moves src to dst, falling back to a copy when a rename cannot do
+// the job. A bare rename is preferred: it is atomic and costs nothing. It
+// cannot cross a filesystem boundary, though, and the trash lives under
+// $XDG_STATE_HOME, which is commonly a different mount from the workspace, so
+// a rename there fails with EXDEV.
+//
+// The fallback is deliberately broader than EXDEV alone: any rename failure
+// except a destination that already exists is retried as a copy. A copy that
+// cannot succeed reports its own error and leaves the source untouched, so the
+// retry can lose nothing; a destination collision is the one failure a copy
+// must not paper over, because it would clobber bytes that are not ours.
+func moveOrCopy(src, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if errors.Is(err, syscall.EXDEV) {
+		return copyThenRemove(src, dst)
+	}
+	// Not a collision and not reported as cross-device: retry as a copy all
+	// the same, and let the copy report the real failure if it cannot.
+	return copyThenRemove(src, dst)
+}
+
+// copyThenRemove copies src's bytes and permission bits to dst, creating the
+// destination's parent directories, and removes src only after the copy has
+// been written and closed. A failure at any point leaves src in place and
+// removes a partial dst, so a caller that keeps the source on error never
+// loses bytes.
+func copyThenRemove(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		// The fallback copies a single file's contents; a directory still needs
+		// a rename, so report it rather than writing a half-destination.
+		return fmt.Errorf("moveOrCopy: %s is a directory", src)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return os.Remove(src)
 }
 
 // removeFile is the disk half of a removal. RAJ_TRASH=1 and only that value
@@ -249,6 +325,7 @@ func (a *App) closeDeletedPane(p *editor.Pane) {
 	}
 	for i, q := range a.Tabs.All() {
 		if q == p {
+			a.rememberPosition(p)
 			a.closeDoc(p)
 			a.Tabs.CloseIndex(i)
 			return

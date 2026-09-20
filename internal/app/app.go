@@ -25,6 +25,8 @@ import (
 	"raj/internal/problems"
 	"raj/internal/prompt"
 	"raj/internal/search"
+	"raj/internal/session"
+	"raj/internal/store"
 	"raj/internal/symbols"
 	"raj/internal/tabs"
 	"raj/internal/timing"
@@ -58,6 +60,10 @@ type App struct {
 	// Problems is the workspace-wide diagnostics list. A view over a.diags,
 	// refreshed when that changes rather than owning any state of its own.
 	Problems *problems.Pane
+	// settingsPane is the model behind the settings sidebar: the selected row,
+	// the scope a change is written to, and a half-typed width. Every displayed
+	// value is re-read from Settings, so it holds no value of its own to drift.
+	settingsPane settingsPane
 	// Menu is the right-click context menu. It floats above the panes and the
 	// picker, and the pointer gives it first refusal while it is open. Its
 	// Show/Handle/Render state lives in the widget; menuTarget is the app's
@@ -85,6 +91,13 @@ type App struct {
 	// moved on describes a position the cursor has left, and is dropped.
 	servers *servers
 	lspGen  int
+	// lspForced caches the per-language command overrides resolved from
+	// settings, keyed by lsp.LanguageID. A present key with a nil command
+	// disables the language's server. lspForcedMu guards the map because
+	// SetSetting replaces it on the event thread while a request goroutine may
+	// read it through lspCommand.
+	lspForced   map[string][]string
+	lspForcedMu sync.RWMutex
 	// completeGen is a separate generation from lspGen: a completion answer is
 	// superseded by later typing, not by a cursor move for a hover, and
 	// sharing one counter would make each cancel the other.
@@ -196,7 +209,11 @@ type App struct {
 	// the buffers it names.
 	pendingWrite *pendingWrite
 
-	root    string
+	root string
+	// state is the workspace SQLite store, nil when it could not be opened or
+	// there is no workspace root. Every read and write is nil-safe: without it
+	// persistence degrades to the session file, or to nothing.
+	state   *store.Store
 	sidebar Sidebar
 	focus   Focus
 	theme   editor.Theme
@@ -222,6 +239,9 @@ type App struct {
 	// InlayHints is the application default for language-server hints, applied
 	// to panes as they open the way WrapDefault and AutoPairs are.
 	InlayHints bool
+	// settings is the effective configuration resolved at startup and kept
+	// current by SetSetting, so Settings reports what is in force.
+	settings   ResolvedSettings
 	dark       bool
 	lastLayout Layout
 	// lastCols and lastRows are the frame size lastLayout was drawn at, so a
@@ -236,8 +256,44 @@ type App struct {
 	promptReturn Focus
 	mode         Mode
 	status       string
-	focused      bool
-	quit         bool
+	// phone is the launch profile: taller scrollable tab chips, no status
+	// strip, and a review action bar. It is fixed at construction, so no
+	// stored setting can turn it on or off.
+	phone bool
+	// ctrlAliases is on when the keymap carries a ctrl+<key> alias for every
+	// super+<key> binding it could. main turns it on for --phone unless
+	// --ctrl-aliases says otherwise. ctrlAliasAdded and ctrlAliasCollisions are
+	// what the builder did, kept for the startup notice.
+	ctrlAliases         bool
+	ctrlAliasAdded      int
+	ctrlAliasCollisions []string // statusShown and statusAt date the phone profile's transient status
+	// overlay: Draw timestamps a message when it first appears and the idle
+	// tick expires it. The ordinary profile ignores both.
+	statusShown string
+	statusAt    time.Time
+	// drawerOpen is the phone action drawer's expanded state. drawerHandle and
+	// drawerPanel are where the last frame drew its touch targets, so the
+	// pointer resolves a tap against what was painted rather than against a
+	// second copy of the arithmetic.
+	drawerOpen bool
+	drawerSel  int
+	// drawerWant is the action whose button the drawer should select on the
+	// next frame. It is resolved against the drawn, mode/pending-filtered cells
+	// then, so a jump survives the panel being rebuilt when a decision empties
+	// the review controls. Event-thread only.
+	drawerWant      keys.Action
+	drawerHandle    drawerItem
+	drawerPanel     []drawerItem
+	drawerPanelTop  int
+	drawerPanelRows int
+	// swipe follows a bare-motion run across the phone tab strip: swipeOn is
+	// true while one is in progress, swipeCol the last column seen and
+	// swipeAcc the horizontal distance not yet spent as scroll.
+	swipeOn  bool
+	swipeCol int
+	swipeAcc int
+	focused  bool
+	quit     bool
 	// quitAsked is true while the quit confirmation is on screen, so a second
 	// Quit forces the exit instead of reopening the same question.
 	quitAsked bool
@@ -282,6 +338,12 @@ type App struct {
 	// durability is the save, close and quit flush.
 	journals     map[string]*logTap
 	journalSaved time.Time
+	// journalPersisted debounces the store-backed journal write and
+	// journalWritten is the change token last persisted per path; journalNote
+	// carries a one-shot message from the loader to the open that follows it.
+	journalPersisted time.Time
+	journalWritten   map[string]journalStamp
+	journalNote      string
 	// restoredAuthors is the author table read from the op logs at startup,
 	// waiting for the control registry StartControl builds later in startup.
 	// Ids are explicit, so a restored op's author resolves to the identity,
@@ -304,6 +366,69 @@ type App struct {
 	// guard is the validation chokepoint in front of the buffer host. One per
 	// app, so read-before-write is remembered across requests.
 	guard *control.Guard
+
+	// attach records that this app is a client of a running editor: documents
+	// arrive as snapshots and the idle tick must not touch the local disk or
+	// write a session.
+	attach bool
+	// attachAddr is the daemon address the attach requested; empty means
+	// discovery. It is settled by StartClient once a dial succeeds.
+	attachAddr string
+	// attachKey names the saved client view in the store, so two clients of one
+	// workspace keep separate tab sets. It is the --name value when given, else
+	// the profile (phone, else attach).
+	attachKey string
+	// clientStop is closed by CloseClient to tell the watch goroutine that the
+	// transport error it is about to see is an orderly shutdown, not news.
+	clientStop chan struct{}
+	// clientTabMu guards clientMirrored, the set of paths the client shows as
+	// tabs. The value is true for a path mirrored from a daemon real tab and
+	// false for one the client loaded itself; that distinction lets a reconcile
+	// drop a mirrored tab the daemon closed while it keeps a client-loaded
+	// headless buffer.
+	clientTabMu    sync.Mutex
+	clientMirrored map[string]bool
+	// clientClosed records the daemon facts for a path the user closed on this
+	// client. It is a snooze, not a mute: the path is skipped while the daemon
+	// buffer still matches the mark, and re-added once the version or review
+	// state moves. That is what lets a close survive a reconcile yet a later
+	// proposal or edit bring the tab back.
+	clientClosed map[string]bufferMark
+	// client is the daemon connection, nil in a local editor. StartClient
+	// sets it once before the watch goroutine starts; CloseClient closes it on
+	// the way out, which unblocks a parked watch. It is owned by the watch
+	// goroutine after that, so it cannot also carry decisions: a parked watch
+	// holds the client lock for the length of the park. A reconnect swaps it
+	// under clientConnMu.
+	client clientConn
+	// clientDecide is the second daemon connection, owned by the event thread.
+	// Decisions use it so a decision never waits on the parked watch, and clear
+	// claims the path on this connection, the same author the clear verb must
+	// satisfy. A reconnect swaps it under clientConnMu.
+	clientDecide clientConn
+	// clientMu guards the handoff from the watch goroutine to the event
+	// thread: files the goroutine rebuilt, and the one-line lost-connection
+	// status it wants shown.
+	clientMu    sync.Mutex
+	clientFiles []clientFile
+	clientLost  string
+	// clientDown is the connection dot state: true once the watch transport
+	// fails, false while it is healthy. Guarded by clientMu because the watch
+	// goroutine sets it and the frame reads it.
+	clientDown bool
+	// clientConnMu guards the watch and decision connections, which the watch
+	// goroutine swaps on a reconnect while the event thread reads the decision
+	// one. It is separate from clientMu, which guards the file handoff.
+	clientConnMu sync.Mutex
+	// clientDone is closed when the watch goroutine returns, so shutdown and a
+	// test can tell that the retry loop has actually stopped.
+	clientDone chan struct{}
+	// controlGen is the review generation handed to control.Server and watched
+	// by clients; controlHash is the hash of that workspace review surface — the
+	// open buffers with their decisions, plus the pending removals — so the idle
+	// tick only bumps Gen when something a client watches actually moved.
+	controlGen  uint64
+	controlHash uint64
 
 	// pendingDeletions is the workspace-level set of paths an agent has
 	// proposed to delete, keyed by the canonical path, each carrying the
@@ -342,46 +467,157 @@ type App struct {
 	snapSeq   uint64
 }
 
-// New builds an application rooted at a directory.
+// New builds an application rooted at a directory. It applies no explicit flag
+// overrides, so a stored setting still beats its tabWidth argument; main uses
+// NewWithOptions to say which command-line flags the user actually typed.
 func New(host ui.Host, root string, tabWidth int) *App {
+	return NewWithOptions(host, root, Options{TabWidth: tabWidth})
+}
+
+// NewWithOptions builds an application, resolving the effective settings
+// before anything is constructed. A workspace value beats a user value, both
+// beat built-in defaults, and an explicit flag — a *Set field on Options —
+// beats them all. The tab width is decided here because tabs.New bakes it into
+// the tab set, so a later override could not reach it.
+func NewWithOptions(host ui.Host, root string, o Options) *App {
 	cols, rows := host.Size()
+	// The store opens before the tab set because settings decide the tab
+	// width; it is also where the session and positions live. State lives in
+	// the XDG state dir, outside the workspace, so a failed migration or an
+	// unwritable state dir is not fatal: the editor runs on the built-in
+	// defaults with persistence off, and the failure is left for the status
+	// line below.
+	var state *store.Store
+	var stateErr error
+	var migErr error
+	if root != "" {
+		if dir := session.StateDir(root); dir != "" {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				stateErr = err
+			} else {
+				migErr = migrateState(root)
+				if s, err := store.Open(filepath.Join(dir, "state.db")); err != nil {
+					stateErr = err
+				} else {
+					state = s
+				}
+			}
+		}
+	}
+	user, workspace := settingScopes(state)
+	res, bad := resolveSettings(defaultSettings(o.TabWidth), user, workspace)
+	// An explicit flag is a decision made now, so it wins over anything stored.
+	// A non-positive width is not a width: it is ignored so the default stands,
+	// rather than reaching tabs.New(0) and a pin SetTabWidth refuses.
+	if o.TabWidthSet && o.TabWidth > 0 {
+		res.TabWidth = o.TabWidth
+	}
+	if o.TabsSet {
+		res.Tabs = o.Tabs
+	}
+	if o.WrapSet {
+		res.Wrap = o.Wrap
+	}
+	// The profile implication: --phone turns on the ctrl aliases unless
+	// --ctrl-aliases was passed explicitly. Resolved here so main can pass the
+	// raw flags and the rule lives in one place.
+	phoneOn, aliasesOn := ProfileFlags(o.Phone, o.CtrlAliases, o.CtrlAliasesSet)
 	a := &App{
-		host:          host,
-		keymap:        keys.NewKeymap(),
-		screen:        ui.NewScreen(cols, rows),
-		Tabs:          tabs.New(tabWidth),
-		tabWidth:      tabWidth,
-		Explorer:      explorer.NewPane(root),
-		Search:        search.NewPane(root),
-		Problems:      problems.New(),
-		completeCache: complete.NewCache(),
-		servers:       newServers(root),
-		diags:         newDiagnostics(),
-		inlays:        newInlayStore(),
-		lenses:        newLensStore(),
-		semantics:     newSemanticStore(),
-		Picker:        picker.New(root),
-		Prompt:        prompt.New(),
-		root:          root,
-		sidebar:       SidebarExplorer,
-		focus:         FocusSidebar,
-		theme:         editor.DefaultTheme(),
-		// On unless a caller turns it off, so an App built in a test or by a
-		// future entry point wraps too rather than depending on who remembered
-		// to set the field.
-		WrapDefault: true,
-		AutoPairs:   true,
-		InlayHints:  true,
+		host:           host,
+		keymap:         keys.NewKeymap(),
+		screen:         ui.NewScreen(cols, rows),
+		Tabs:           tabs.New(res.TabWidth),
+		tabWidth:       res.TabWidth,
+		Explorer:       explorer.NewPane(root),
+		Search:         search.NewPane(root),
+		Problems:       problems.New(),
+		settingsPane:   newSettingsPane(),
+		completeCache:  complete.NewCache(),
+		servers:        newServers(root),
+		diags:          newDiagnostics(),
+		inlays:         newInlayStore(),
+		lenses:         newLensStore(),
+		semantics:      newSemanticStore(),
+		Picker:         picker.New(root),
+		Prompt:         prompt.New(),
+		root:           root,
+		state:          state,
+		journalWritten: make(map[string]journalStamp),
+		settings:       res,
+		sidebar:        SidebarExplorer,
+		focus:          FocusSidebar,
+		theme:          editor.DefaultTheme(),
+		// The effective settings, not the raw defaults: a stored value or an
+		// explicit flag has already been layered over them. On by default, so
+		// an App built in a test or by a future entry point wraps rather than
+		// depending on who remembered to set the field.
+		WrapDefault: res.Wrap,
+		AutoPairs:   res.AutoPairs,
+		InlayHints:  res.InlayHints,
+		NoRestore:   o.NoRestore,
+		attach:      o.Attach,
+		attachAddr:  o.AttachAddr,
+		attachKey:   clientViewKey(o, phoneOn),
+		phone:       phoneOn,
+		ctrlAliases: aliasesOn,
 		dark:        host.Theme().Dark(),
 		wth:         widget.DefaultTheme(),
 		focused:     true,
 	}
+	a.Tabs.IndentTabs = res.Tabs
+	a.Tabs.SetPhone(phoneOn)
+	a.Tabs.Load = a.loadFile
+	a.Picker.Tall = phoneOn
+	a.Explorer.Tall = phoneOn
+	if phoneOn {
+		// The drawer is a phone surface. esc is the editor's Cancel in the
+		// ordinary keymap, so it is bound only here; a tap is the primary
+		// route and this is for an attached keyboard.
+		a.keymap.Bind(keys.Editor, "esc", keys.ToggleDrawer)
+	}
+	if a.ctrlAliases {
+		a.ctrlAliasAdded, a.ctrlAliasCollisions = a.keymap.CtrlAliases()
+	}
+	// The LSP command overrides are settings the typed struct cannot carry.
+	// Resolve them before anything can ask for a server, and point the server
+	// table at the App method that reads the cache.
+	a.servers.resolveCommand = a.lspCommand
+	a.refreshLSPOverrides()
+	// An explicit tab width is pinned onto buffers as they open, so it survives a
+	// file detecting its own indentation; the default is only a fallback.
+	if tabWidthExplicit(o, user, workspace) {
+		a.Tabs.SetTabWidth(res.TabWidth)
+	}
 	// A bad line in .raj/hidden is skipped rather than fatal, but silently
 	// skipped is how a typo becomes "raj ignores my config". The status line is
 	// the only place it can be said at startup.
-	if bad := a.Explorer.Tree.Hidden.Bad; len(bad) > 0 {
+	if badHidden := a.Explorer.Tree.Hidden.Bad; len(badHidden) > 0 {
 		a.status = fmt.Sprintf("%s: ignoring %d bad pattern(s): %s",
-			hidden.File, len(bad), strings.Join(bad, ", "))
+			hidden.File, len(badHidden), strings.Join(badHidden, ", "))
+	}
+	// A store that failed to open, and a setting whose value will not parse,
+	// are the same kind of problem: the editor runs, but a typo that would
+	// otherwise look like "raj ignores my setting" is said once. A bad value
+	// is ignored rather than zeroed, so it cannot silently turn a setting off.
+	if stateErr != nil {
+		if a.status != "" {
+			a.status += "; "
+		}
+		a.status += "state: " + stateErr.Error()
+	}
+	// A legacy state directory that would not move is not fatal either: the
+	// editor runs against the new location and the old files are left behind.
+	if migErr != nil {
+		if a.status != "" {
+			a.status += "; "
+		}
+		a.status += "state migration: " + migErr.Error()
+	}
+	if len(bad) > 0 {
+		if a.status != "" {
+			a.status += "; "
+		}
+		a.status += fmt.Sprintf("settings: ignoring %d bad value(s): %s", len(bad), strings.Join(bad, ", "))
 	}
 	// A finished search used to wait for the 150 ms tick, because the result is
 	// installed on the event thread and nothing woke that thread. Posting a
@@ -432,7 +668,26 @@ func (a *App) syncTheme() {
 // last file, and the only evidence is somewhere the eye is not. A permissions
 // error stays in the status line: that is a transient condition rather than a
 // statement about what the file is.
+//
+// openFileQuiet is the same open without the focus move, for the control
+// surface: an agent asking to open a file gets it a tab, but the user's active
+// tab and focus stay put.
 func (a *App) OpenFile(path string) {
+	a.openFile(path, true)
+}
+
+// openFileQuiet opens a path in a tab without moving the active tab or focus.
+// It shares openFile's body, so the two cannot drift.
+func (a *App) openFileQuiet(path string) {
+	a.openFile(path, false)
+}
+
+// openFile opens a path in a tab, moving the active tab and focus only when
+// focus is set. A quiet open still adds the tab -- the caller has a reason the
+// user should be able to find it -- and leaves the active tab alone when there
+// was one; with nothing open the new tab takes the slot so something is
+// visible.
+func (a *App) openFile(path string, focus bool) {
 	if path == "" {
 		return
 	}
@@ -441,10 +696,33 @@ func (a *App) OpenFile(path string) {
 	// user then clicked would exist twice, the tab and the hidden pane free to
 	// drift.
 	if p, ok := a.findHeadless(path); ok {
-		a.announce(p)
+		if focus {
+			a.announce(p)
+		} else {
+			a.announceQuiet(p)
+		}
 		a.maybePromptDeletion()
 		return
 	}
+	// A pane for this path may already exist, as a tab or the preview. Only a
+	// genuinely new pane gets the remembered position: re-opening a file that
+	// is already on screen must not yank the caret back.
+	alreadyOpen := false
+	for _, q := range a.Tabs.All() {
+		if q.File.Path == path {
+			alreadyOpen = true
+			break
+		}
+	}
+	// An attached client opens through the daemon: the file is loaded there
+	// and comes back as a snapshot, so this process never reads the disk and
+	// never owns a writable copy. A path already among the client tabs falls
+	// through to the focus path below and is not re-opened.
+	if a.attach && !alreadyOpen {
+		a.openRemote(path, focus)
+		return
+	}
+	prev := a.Tabs.Active()
 	p, err := a.Tabs.Open(path)
 	if err != nil {
 		switch {
@@ -452,6 +730,8 @@ func (a *App) OpenFile(path string) {
 			a.refuse(path, "is not a text file, so raj will not open it.")
 		case errors.Is(err, editor.ErrTooLarge):
 			a.refuse(path, "is larger than raj will open.")
+		case errors.Is(err, editor.ErrUnsupportedEncoding):
+			a.refuse(path, "uses a text encoding raj cannot open.")
 		default:
 			a.status = "cannot open: " + err.Error()
 		}
@@ -461,14 +741,23 @@ func (a *App) OpenFile(path string) {
 	p.Wrap = a.WrapDefault
 	p.AutoPairs = a.AutoPairs
 	p.Hints = a.InlayHints
-	a.focus = FocusEditor
+	if !alreadyOpen {
+		a.applyStoredPosition(p)
+	}
+	if focus {
+		a.focus = FocusEditor
+	} else if prev != nil && a.Tabs.Contains(prev) {
+		// The quiet open left the new tab active; put the user's tab back in
+		// front. With no previous tab the new one keeps the slot.
+		a.Tabs.Focus(prev)
+	}
 	// Opening a tab is the change most worth not losing to a crash: a cursor
 	// position is a scroll, a missing tab is a file you have to find again.
 	a.TouchSession()
 	// A property of the file just opened is the one thing worth saying here;
 	// this assignment is the clear, so an empty warning leaves the status line
 	// quiet.
-	a.status = fileWarning(p.File)
+	a.status = a.journalStatus(fileWarning(p.File))
 	a.maybePromptDeletion()
 }
 
@@ -501,8 +790,10 @@ func (a *App) previewFile(path string) {
 		}
 	}
 	if old != nil && old != p && !a.Tabs.Contains(old) {
-		// The preview slot was reused, so the pane it held is gone. Forget what
-		// was keyed on its path the way closing its tab would.
+		// The preview slot was reused, so the pane it held is gone. Remember
+		// where it was, then forget what was keyed on its path the way closing
+		// its tab would.
+		a.rememberPosition(old)
 		a.closeDoc(old)
 	}
 	p.File.SetDark(a.host.Theme().Dark())
@@ -562,6 +853,11 @@ func (a *App) openFromPicker(path string) {
 // sends, so matching it means the feel does not change with the terminal.
 const wheelRows = 3
 
+// wheelCols is how far one horizontal notch scrolls the phone tab strip.
+// Wider than wheelRows because the chips are wide and a notch should cross
+// most of one.
+const wheelCols = 6
+
 // mouse handles a pointer event. Only the wheel does anything today.
 //
 // It scrolls whatever is under the pointer rather than whatever has focus,
@@ -571,6 +867,11 @@ const wheelRows = 3
 // something the user cannot see.
 func (a *App) mouse(ev ui.Mouse) {
 	if !ev.IsWheel {
+		// A bare-motion run over the phone tab strip is a swipe; it consumes
+		// the event before the ordinary hover path can see it.
+		if a.swipeTabs(ev) {
+			return
+		}
 		if !ev.Motion || ev.Button != keys.MouseNone {
 			// A click (or a drag) moves the caret, which leaves the snippet's
 			// stops behind. A bare pointer move must not: the hand resting on
@@ -583,12 +884,27 @@ func (a *App) mouse(ev ui.Mouse) {
 	// A scroll moves the rows under a resting pointer, so a tooltip it opened
 	// no longer describes what is there.
 	a.hideHint()
+	// A wheel notch ends any tab-strip motion run, so a later motion does not
+	// accumulate a delta across the gap.
+	a.swipeOn = false
+	// The phone tab strip scrolls sideways on a horizontal wheel notch. The
+	// ordinary profile has nowhere sideways to go, so the notch is dropped.
+	if ev.Button == keys.WheelLeft || ev.Button == keys.WheelRight {
+		if a.phone {
+			step := wheelCols
+			if ev.Button == keys.WheelLeft {
+				step = -step
+			}
+			a.Tabs.ScrollTabs(step)
+		}
+		return
+	}
 	delta := wheelRows
 	if ev.Button == keys.WheelUp {
 		delta = -wheelRows
 	}
 	if ev.Button != keys.WheelUp && ev.Button != keys.WheelDown {
-		return // horizontal wheels: nothing scrolls sideways yet
+		return // no other wheel direction scrolls the panes
 	}
 
 	if a.Picker.Open {
@@ -596,7 +912,7 @@ func (a *App) mouse(ev ui.Mouse) {
 		return
 	}
 	cols, rows := a.screen.Size()
-	l := computeLayout(cols, rows, a.sidebar, a.focus)
+	l := a.layout(cols, rows)
 	if l.ShowSidebar && ev.Col >= l.SidebarX && ev.Col < l.SidebarX+l.SidebarW {
 		switch a.sidebar {
 		case SidebarExplorer:
@@ -610,6 +926,61 @@ func (a *App) mouse(ev ui.Mouse) {
 		if p := a.Tabs.Active(); p != nil {
 			p.ScrollRows(delta)
 		}
+	}
+}
+
+// swipeStep is how many columns a horizontal bare-motion run must cover before
+// it counts as a swipe rather than jitter. A phone's motion reports arrive
+// more than a column apart, and a threshold keeps a resting finger from
+// scrolling the strip.
+const swipeStep = 3
+
+// swipeTabs turns a bare-motion run over the phone tab strip into a horizontal
+// scroll. It reports whether it consumed the event: a motion run on the strip
+// is not a hover, so the caller must not pass it on. A press, a release, a
+// wheel, or motion anywhere else ends the run and leaves the event for its
+// usual path.
+func (a *App) swipeTabs(ev ui.Mouse) bool {
+	if !a.phone || !ev.Motion || ev.Button != keys.MouseNone {
+		a.swipeOn = false
+		return false
+	}
+	if ev.Row < 0 || ev.Row >= a.Tabs.StripRows() {
+		a.swipeOn = false
+		return false
+	}
+	if !a.swipeOn {
+		a.swipeOn = true
+		a.swipeCol = ev.Col
+		a.swipeAcc = 0
+		return true
+	}
+	a.swipeAcc += ev.Col - a.swipeCol
+	a.swipeCol = ev.Col
+	// Dragging left reveals later tabs, which is a positive scroll offset.
+	if a.swipeAcc >= swipeStep || a.swipeAcc <= -swipeStep {
+		a.Tabs.ScrollTabs(-a.swipeAcc)
+		a.swipeAcc = 0
+	}
+	return true
+}
+
+// phoneStatusTTL is how long the phone profile's transient status stays up.
+// Long enough to read a one-line note, short enough that it does not become
+// the status strip the profile removed.
+const phoneStatusTTL = 3 * time.Second
+
+// expirePhoneStatus drops a phone status once it has had its time. The idle
+// tick is the clock because a message needs no event to expire it, and the
+// ordinary profile never expires its status strip.
+func (a *App) expirePhoneStatus() {
+	if !a.phone || a.status == "" || a.statusAt.IsZero() {
+		return
+	}
+	if time.Since(a.statusAt) >= phoneStatusTTL {
+		a.status = ""
+		a.statusShown = ""
+		a.statusAt = time.Time{}
 	}
 }
 
@@ -1028,6 +1399,13 @@ func (a *App) acceptSnippet(p *editor.Pane, prefix string, c complete.Candidate)
 // it. Those go through applyServerEdits, the same one-undo-step path formatting
 // uses, so the word and its import land as one change set and one undo.
 func (a *App) acceptCompletion(p *editor.Pane, prefix string, c complete.Candidate) {
+	// Accepting writes into the buffer, so the same read-only gate every other
+	// edit takes applies here too: a popup left open across a mode change must
+	// not become the one way text lands.
+	if a.readOnly() {
+		a.status = a.readOnlyNote()
+		return
+	}
 	// A new accept supersedes any session the previous one left running, so a
 	// snippet's stops cannot outlive the word that put them there.
 	a.endSnippet()
@@ -1215,6 +1593,7 @@ func (a *App) Handle(e ui.Event) {
 		a.drainDiagnostics()
 		a.drainServerMessages()
 		a.drainControl()
+		a.drainClient()
 	case ui.Tick:
 		// A drag held outside the pane scrolls from here, because the pointer
 		// is not moving and so there is no event to hang it on.
@@ -1252,7 +1631,13 @@ func (a *App) Handle(e ui.Event) {
 		a.sessionTick(time.Now())
 		a.compactTick(time.Now())
 		a.journalTick(time.Now())
+		a.persistTick(time.Now())
 		a.Debug.sample()
+		// The phone status overlay is transient; the idle tick is its clock.
+		a.expirePhoneStatus()
+		// Clients parked on watch are woken here, once per change, rather
+		// than at every mutation site.
+		a.controlTick()
 	case ui.Quit:
 		a.quit = true
 	}
@@ -1299,6 +1684,13 @@ func (a *App) handleKey(k ui.Key) {
 	if a.Prompt.Open && !passesModal(action) {
 		a.Prompt.Handle(action, text)
 		a.settlePrompt()
+		return
+	}
+	// The phone drawer is modal for the keys it draws; it routes before the
+	// focused pane so Left/Right/Tab cannot also move, indent or complete. The
+	// profile guard is repeated at the call site so the ordinary editor never
+	// enters the drawer path at all.
+	if a.phone && a.drawerKey(action) {
 		return
 	}
 	a.dispatch(action, text)
@@ -1395,11 +1787,21 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.saveActive(nil)
 	case keys.ToggleReview:
 		a.toggleReview()
+	case keys.ToggleDrawer:
+		// The phone drawer's key fallback. Only the phone profile binds it,
+		// so the ordinary editor never reaches this.
+		a.drawerOpen = !a.drawerOpen
+		if a.drawerOpen {
+			a.drawerSel = 0
+			a.drawerWant = a.drawerOpenWant()
+		}
+		return true
 	case keys.Reload:
-		// Reload replaces the buffer from disk. Refused in Review: it is not an
-		// edit, but it would discard the proposals being reviewed.
-		if a.mode == ModeReview {
-			a.status = reviewReadOnlyNote()
+		// Reload replaces the buffer from disk. Refused in Review, and in a
+		// client where the disk is not the daemon: it is not an edit, but it
+		// would discard the proposals being reviewed.
+		if a.readOnly() {
+			a.status = a.readOnlyNote()
 			return true
 		}
 		a.reloadActive()
@@ -1420,8 +1822,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 	case keys.Cut:
 		// Cut is an edit. Copy stays live; and cut in a dialog's own field is
 		// not the document, so only the editor is refused.
-		if a.mode == ModeReview && a.focus == FocusEditor {
-			a.status = reviewReadOnlyNote()
+		if a.readOnly() && a.focus == FocusEditor {
+			a.status = a.readOnlyNote()
 			return true
 		}
 		a.clip(true)
@@ -1437,6 +1839,8 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.openSidebar(SidebarSearch)
 	case keys.FocusProblems:
 		a.openSidebar(SidebarProblems)
+	case keys.Settings:
+		a.openSidebar(SidebarSettings)
 	case keys.ToggleWrap:
 		if p := a.Tabs.Active(); p != nil {
 			p.Wrap = !p.Wrap
@@ -1533,10 +1937,12 @@ func (a *App) openSidebar(s Sidebar) {
 	if a.sidebar == s && a.focus == FocusSidebar {
 		a.sidebar = SidebarNone
 		a.focus = FocusEditor
+		a.TouchSession()
 		return
 	}
 	a.sidebar = s
 	a.focus = FocusSidebar
+	a.TouchSession()
 	switch s {
 	case SidebarExplorer:
 		a.Explorer.Focus()
@@ -1545,6 +1951,8 @@ func (a *App) openSidebar(s Sidebar) {
 	case SidebarProblems:
 		a.refreshProblems()
 		a.Problems.Focus()
+	case SidebarSettings:
+		a.settingsPane.Focus()
 	}
 }
 
@@ -1553,17 +1961,18 @@ func (a *App) toggleSidebar() {
 		a.sidebar = SidebarExplorer
 		a.focus = FocusSidebar
 		a.Explorer.Focus()
+		a.TouchSession()
 		return
 	}
 	a.sidebar = SidebarNone
 	a.focus = FocusEditor
+	a.TouchSession()
 }
 
-// handleSidebar routes to the open sidebar pane. Both panes report when focus
-// has walked off either end — tab past the last component or shift+tab back
-// past the first — at which point it crosses to the editor. Coming back is a
-// chord, deliberately: tab indents in the document, so a one-key route in would
-// make editing interruptible.
+// handleSidebar routes to the open sidebar pane. The explorer reports an open
+// file (open) or a walk out of the pane (exit); either way focus crosses to the
+// editor. Coming back is a chord, deliberately: tab indents in the document, so
+// a one-key route in would make editing interruptible.
 func (a *App) handleSidebar(action keys.Action, text string) {
 	switch a.sidebar {
 	case SidebarExplorer:
@@ -1607,6 +2016,17 @@ func (a *App) handleSidebar(action keys.Action, text string) {
 		if exit {
 			a.focus = FocusEditor
 		}
+	case SidebarSettings:
+		// Escape closes the pane. While the width field is open the pane
+		// consumes escape itself to cancel the edit, so that gate comes first.
+		if action == keys.Cancel && !a.settingsPane.editing {
+			a.sidebar = SidebarNone
+			a.focus = FocusEditor
+			return
+		}
+		if a.settingsPane.Handle(a, action, text) {
+			a.focus = FocusEditor
+		}
 	}
 }
 
@@ -1626,8 +2046,8 @@ func (a *App) handleEditor(action keys.Action, text string) {
 		// change the document and refuse it here if Review mode holds the
 		// buffer. A refused replace must still drain the lease the pane
 		// recorded, which is what the note below the handle call is for.
-		if a.mode == ModeReview && p.Find.WouldEdit(action) {
-			a.status = reviewReadOnlyNote()
+		if a.readOnly() && p.Find.WouldEdit(action) {
+			a.status = a.readOnlyNote()
 			return
 		}
 		p.Find.Handle(p, action, text)
@@ -1644,7 +2064,7 @@ func (a *App) handleEditor(action keys.Action, text string) {
 	// Review mode is read-only for the document. Movement, selection, search,
 	// hover and goto fall through; any keystroke that would change the text is
 	// refused with a note rather than silently dropped.
-	if a.mode == ModeReview && a.reviewRefuses(action, text) {
+	if a.readOnly() && a.reviewRefuses(action, text) {
 		return
 	}
 	// An active snippet session claims tab and shift+tab — the stop-navigation
@@ -1733,10 +2153,11 @@ func (a *App) paste(text string) {
 		return
 	}
 	if a.focus == FocusEditor {
-		// Paste is an edit, refused in Review mode with the same note a typed
-		// character gets. Fields and dialogs are not the document.
-		if a.mode == ModeReview {
-			a.status = reviewReadOnlyNote()
+		// Paste is an edit, refused in Review mode and in a client with the
+		// same note a typed character gets. Fields and dialogs are not the
+		// document.
+		if a.readOnly() {
+			a.status = a.readOnlyNote()
 			return
 		}
 		a.endSnippet()
@@ -1992,7 +2413,7 @@ func (a *App) newFile() {
 	p.AutoPairs = a.AutoPairs
 	p.Hints = a.InlayHints
 	a.focus = FocusEditor
-	a.status = fileWarning(p.File)
+	a.status = a.journalStatus(fileWarning(p.File))
 }
 
 // closeTab closes the active tab.
@@ -2015,15 +2436,24 @@ func (a *App) closeTabAt(i int) {
 		return
 	}
 	p := panes[i]
-	if !p.File.ViewDirty() {
+	// A client tab is the daemon document, not unsaved local work: closing it
+	// just closes the view, so it never prompts and never saves. The watch is
+	// told the path was closed locally so a reconcile does not re-add it.
+	if a.attach || !p.File.ViewDirty() {
+		a.rememberPosition(p)
 		a.closeDoc(p)
 		a.Tabs.CloseIndex(i)
+		if a.attach {
+			a.markClientClosed(p.File.Path, p.File)
+			a.saveClientView()
+		}
 		a.refreshProblems() // the open-files filter just lost a file
 		return
 	}
 	closePane := func() {
 		for j, q := range a.Tabs.All() {
 			if q == p {
+				a.rememberPosition(p)
 				a.closeDoc(p)
 				a.Tabs.CloseIndex(j)
 				return
@@ -2068,6 +2498,13 @@ func (a *App) saveActive(then func(saved bool)) {
 func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 	if p == nil {
 		report(then, false)
+		return
+	}
+	// An attached client does not own the bytes: save acts on the daemon, and a
+	// refusal (pending proposals, disk conflict) is the status rather than a
+	// local write the next wake would overwrite.
+	if a.attach {
+		a.saveRemote(p, then)
 		return
 	}
 	// Proposed change sets get reviewed before they get saved: the gesture
@@ -2259,16 +2696,17 @@ func (a *App) conflict(p *editor.Pane, path string, then func(saved bool)) {
 // reload takes the version on disk. It reports the save as not having happened,
 // which is true: the caller that asked to save — closing a tab, quitting — must
 // not treat a reload as permission to carry on and drop the buffer.
-func (a *App) reload(p *editor.Pane, then func(saved bool)) {
+func (a *App) reload(p *editor.Pane, then func(saved bool)) error {
 	name := p.File.Name()
 	if err := p.Reload(); err != nil {
 		a.status = "cannot reload: " + err.Error()
 		report(then, false)
-		return
+		return err
 	}
 	p.ClearDiskStale()
 	a.status = "reloaded " + name + " from disk"
 	report(then, false)
+	return nil
 }
 
 // ensureParent makes sure a path's directory exists, asking first.
@@ -2406,6 +2844,7 @@ func (a *App) finishWrite(p *editor.Pane, path string, force, renamed bool, was 
 	}
 	a.recordWritten(p)
 	a.flushJournal(p)
+	a.dropJournal(path)
 
 	if timing.On {
 		// The save proper is tSaved-saveStart: text materialise, writeAtomic
@@ -2444,6 +2883,12 @@ func report(then func(bool), ok bool) {
 // again is the wedge the modal was written to avoid.
 func (a *App) tryQuit() {
 	if a.quitAsked {
+		a.quit = true
+		return
+	}
+	// A client owns no bytes: every tab is the daemon document, so there is
+	// nothing unsaved to save and quit goes.
+	if a.attach {
 		a.quit = true
 		return
 	}
@@ -2678,6 +3123,18 @@ func (a *App) Notice(msg string) {
 	}
 }
 
+// CtrlAliasReport is what CtrlAliases did, for the startup notice: empty when
+// aliases are off or nothing collided, otherwise the count of super chords
+// with no free ctrl alias and which they were. main writes it to stderr, not
+// the status line, because it describes the keymap rather than the document.
+func (a *App) CtrlAliasReport() string {
+	if !a.ctrlAliases || len(a.ctrlAliasCollisions) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d super chord(s) have no free ctrl alias: %s",
+		len(a.ctrlAliasCollisions), strings.Join(a.ctrlAliasCollisions, ", "))
+}
+
 // Focused reports which pane has focus, for tests.
 func (a *App) Focused() Focus { return a.focus }
 
@@ -2710,13 +3167,26 @@ func (a *App) refreshSyntax() {
 // it, so the prompt on save stops being a surprise. One stat per open tab, on
 // the idle tick; panes already marked are skipped until the user acts.
 func (a *App) diskCheck() {
+	// A snapshot buffer has no disk of its own to become stale: the daemon is
+	// the file, and a local stat would only raise a false prompt.
+	if a.attach {
+		return
+	}
 	for _, p := range a.Tabs.All() {
 		if p.DiskStale() {
 			continue
 		}
-		if p.File.Path != "" && p.File.DiskChanged() {
-			p.MarkDiskStale()
+		if p.File.Path == "" || !p.File.DiskChanged() {
+			continue
 		}
+		if p.File.ViewDirty() {
+			// Unsaved work: keep the mark and let save raise the question.
+			p.MarkDiskStale()
+			continue
+		}
+		// Clean: take the disk version now, the same path the Reload gesture
+		// uses, rather than marking a conflict the user would have to resolve.
+		a.reload(p, nil)
 	}
 }
 

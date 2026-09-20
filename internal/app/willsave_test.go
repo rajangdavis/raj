@@ -177,3 +177,62 @@ func TestWillSaveWithoutAServerSavesNormally(t *testing.T) {
 		t.Error("the buffer is dirty after an ordinary save")
 	}
 }
+
+// A pane closed while willSaveWaitUntil is outstanding must not be written when
+// the answer lands. The pending write names a pane, not a tab, and the pane is
+// still alive in memory after its tab is gone -- closeDoc and CloseIndex drop it
+// from the tab set, they do not free it -- so the resumed write would put this
+// buffer's bytes on disk as though the close had never happened, and finishWrite
+// would go on to report a save for a file the user just deliberately closed and
+// chose to discard. resumeSave checks that the pane is still open before it
+// writes and drops the answer otherwise.
+func TestWillSaveResumeDoesNotWriteAClosedPane(t *testing.T) {
+	h := newHarness(t, "package main\n")
+	h.typeText("x") // a change, so the close is a decision the user made
+	p := h.Pane()
+	path := p.File.Path
+	want := p.File.Text()
+
+	waitForWillSave(h, []lsp.TextEdit{{
+		Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 8}, End: lsp.Position{Line: 0, Character: 12}},
+		NewText: "fmt",
+	}})
+
+	// Close the pane while the server is thinking. The buffer is dirty, so the
+	// close asks first; discarding is the answer that removes the tab.
+	h.press("super+w")
+	if !h.Prompt.Open {
+		t.Fatal("setup: closing a dirty buffer did not ask")
+	}
+	h.press("right", "enter") // SaveOptions: [Save, Discard, Cancel]
+	if h.Tabs.Contains(p) {
+		t.Fatal("setup: the pane is still open")
+	}
+
+	h.applyAnswer()
+
+	// The write must not have happened: the buffer was closed without saving,
+	// so the file keeps its original bytes and no server edit was installed.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "package main\n" {
+		t.Errorf("on disk = %q, want the file untouched by a write to a closed pane", string(data))
+	}
+	if strings.Contains(string(data), "fmt") {
+		t.Error("the willSaveWaitUntil edit was applied to a closed pane")
+	}
+	if got := p.File.Text(); got != want {
+		t.Errorf("closed pane text = %q, want %q (the server edit must not have been installed)", got, want)
+	}
+	if strings.Contains(h.Status(), "saved") {
+		t.Errorf("status = %q, want no save reported for a closed pane", h.Status())
+	}
+	// The answer must not resurrect the tab either: a resume that wrote the
+	// closed pane would be bad enough, but one that reopened it would put a
+	// buffer the user discarded back on screen.
+	if h.Tabs.Contains(p) {
+		t.Error("the save answer recreated the closed pane")
+	}
+}

@@ -166,6 +166,25 @@ func TestApplyDiffRefusedOverALease(t *testing.T) {
 	}
 }
 
+// A deletion-only proposal leases the gap its removed bytes would come back
+// to, so the caret-side delete path refuses an edit that spans it. Before
+// deletionLeases a pure-deletion set owned no inserted run, so this delete
+// landed and could move the set past what its reversal could carry.
+func TestDeleteRefusedAcrossAProposedDeletion(t *testing.T) {
+	f := NewFile("lease.go", "hello world\n", 8)
+	id := proposeAt(t, f, 6, 11, "") // delete "world", leaving the gap at 6
+
+	if f.Delete(piecetable.User, 0, 7) {
+		t.Fatal("a delete spanning a proposed deletion's gap was not refused")
+	}
+	if got := f.Text(); got != "hello \n" {
+		t.Errorf("text = %q, want the refused delete to have changed nothing", got)
+	}
+	if got := f.Session().GroupState(id); got != piecetable.Proposed {
+		t.Errorf("state = %v, want the set still proposed", got)
+	}
+}
+
 // A save whose agreed composition would drop a superseded set that the edit
 // view still shows is refused, and the refusal is a no-op: no bytes written, no
 // pending set accepted. The historical case is a declaration that exists only
@@ -337,4 +356,116 @@ func sessionGroupOf(f *File, id uint64) (piecetable.Group, bool) {
 		}
 	}
 	return piecetable.Group{}, false
+}
+
+// checkIndexMatchesText asserts the invariant the line index exists to keep:
+// every line File reports is the line File.Text() actually holds, and the count
+// matches a rescan. It is stronger than a line count, because a line start that
+// has drifted by one still counts the same lines; only comparing each line's
+// bytes catches it. The offset conversions are checked too, since a stale index
+// turns every position question into a different line's answer at once.
+func checkIndexMatchesText(t *testing.T, f *File) {
+	t.Helper()
+	text := f.Text()
+	want := strings.Count(text, "\n") + 1
+	if got := f.Lines(); got != want {
+		t.Fatalf("Lines() = %d, want %d (text %q)", got, want, text)
+	}
+	lines := strings.Split(text, "\n")
+	for n := 0; n < f.Lines(); n++ {
+		start, end := f.LineStart(n), f.LineEnd(n)
+		if start < 0 || end < start || end > len(text) {
+			t.Fatalf("line %d bounds %d..%d outside [0,%d)", n, start, end, len(text))
+		}
+		if got, want := f.Slice(start, end-start), lines[n]; got != want {
+			t.Fatalf("line %d = %q, want %q (text %q)", n, got, want, text)
+		}
+		if got := f.Line(n); got != lines[n] {
+			t.Fatalf("Line(%d) = %q, want %q", n, got, lines[n])
+		}
+		if got := f.LineOf(start); got != n {
+			t.Fatalf("LineOf(LineStart(%d)) = %d", n, got)
+		}
+	}
+	for n := 0; n < f.Lines(); n++ {
+		off := f.LineStart(n)
+		line, col := f.LineCol(off)
+		if line != n {
+			t.Fatalf("LineCol(%d) line = %d, want %d", off, line, n)
+		}
+		if back := f.OffsetAt(line, col); back != off {
+			t.Fatalf("OffsetAt(LineCol(%d)) = %d, want %d", off, back, off)
+		}
+	}
+}
+
+// The index must describe File.Text() after every decision a layered buffer
+// can hold: apply, propose, reject, clear, a superseded set disposed of, and a
+// whole author reverted. Each step changes the text or the composition, and
+// each one has to leave the index on the text that remains. A regression here
+// is silent: read -lines and the renderer answer with another line's bytes.
+func TestLineIndexMirrorsTextAcrossDecisionCycles(t *testing.T) {
+	f := NewFile("cycle.go", "one\ntwo\nthree\nfour\n", 8)
+	checkIndexMatchesText(t, f)
+
+	// A proposed insertion with newlines, then the reject/clear cycle: reject
+	// keeps the text, clear reverses it out.
+	id := proposeAt(t, f, 0, 3, "ONE\nuno\n")
+	checkIndexMatchesText(t, f)
+	if !f.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	checkIndexMatchesText(t, f)
+	if !f.ClearRejected(id) {
+		t.Fatal("clear rejected failed")
+	}
+	checkIndexMatchesText(t, f)
+
+	// RevertAuthor reverses the whole contribution, a real edit.
+	reverted := proposeAt(t, f, 0, 0, "X\nY\n")
+	if _, block := f.RevertAuthor(piecetable.Agent); block.Group != 0 {
+		t.Fatalf("RevertAuthor wedged on %+v", block)
+	}
+	if got := f.Session().GroupState(reverted); got != piecetable.Accepted {
+		t.Errorf("reverted set state = %v, want Accepted (nothing left to decide)", got)
+	}
+	checkIndexMatchesText(t, f)
+
+	// A proposal a later accepted edit overwrites whole goes Invalid; ClearGroup
+	// disposes of it as a state-only move that still changes the composition.
+	superseded := proposeAt(t, f, 4, 7, "TWO\n")
+	f.Begin()
+	f.ApplyDiff(piecetable.User, f.Session().Version(),
+		[]piecetable.Hunk{{Start: 4, End: 8, Text: ""}})
+	f.End()
+	checkIndexMatchesText(t, f)
+	if g, _ := sessionGroupOf(f, superseded); !g.Invalid {
+		t.Fatalf("setup: set %d is not invalid", superseded)
+	}
+	if ok, block := f.ClearGroup(superseded); !ok {
+		t.Fatalf("ClearGroup = false (block %+v)", block)
+	}
+	checkIndexMatchesText(t, f)
+}
+
+// A reversal that reaches the journal without going through a File wrapper must
+// not leave the index behind. File.sync is anchored at f.applied, but nothing
+// forced it to run before a line was read, so a caller that decided a set
+// straight on the session -- the class host.Decide and App.decideProposed used
+// to be -- left every line number stale until the next edit happened to catch
+// it up. The index reads now catch up themselves.
+func TestLineIndexCatchesUpOnAnOutOfBandReversal(t *testing.T) {
+	f := NewFile("stale.go", "a\nb\nc\n", 8)
+	id := proposeAt(t, f, 0, 0, "X\nY\n")
+	if got := f.Lines(); got != 6 {
+		t.Fatalf("setup: Lines() = %d, want 6", got)
+	}
+	if !f.RejectGroup(id) {
+		t.Fatal("reject failed")
+	}
+	// Straight on the session: the journal moves, f.applied does not.
+	if !f.Session().ClearRejected(id) {
+		t.Fatal("session clear failed")
+	}
+	checkIndexMatchesText(t, f)
 }

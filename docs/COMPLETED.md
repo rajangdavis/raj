@@ -172,6 +172,21 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 
 - [x] **A mid-line proposal draws on one display row (2026-09-16).** `view.Build` absorbs contiguous kept pieces that continue the run (same composition line, contiguous, not behind a fold), so a hunk cutting a line no longer draws two rows; `TestBuildMidLineReplacementMergesKeptRuns` pins the merge and both boundaries. See `docs/AGENT-FEEDBACK.md`.
 
+- [x] **A control-socket `open` no longer steals focus (2026-09-17).**
+  `host.Open` reuses an open tab and reveals a headless buffer through
+  `openFileQuiet`/`announceQuiet`, which add the tab and restore the previous
+  active tab without touching `a.focus`; `apply` and `patch` announce quietly
+  too, while `goto`/`review` still bring the buffer forward
+  (`internal/app/control.go`, `headless.go`, `app.go`). Pinned by
+  `TestControlOpenDoesNotStealFocus`,
+  `TestControlOpenNewPathDoesNotStealFocus`,
+  `TestHeadlessApplyAnnouncesQuietly`,
+  `TestControlGotoStillBringsTheBufferForward` (`internal/app/control_test.go`).
+- [x] **An unsupported-encoding open is refused by name (2026-09-17).**
+  `App.OpenFile` turns `editor.ErrUnsupportedEncoding` into the same refusal
+  dialog as `ErrBinary`/`ErrTooLarge` (`internal/app/app.go`). Pinned by
+  `TestOpenUnsupportedEncodingIsDeclined` (`internal/app/panes_test.go`).
+
 ## Mouse
 
 - [x] **Every pane hit-tests against what it drew.** The geometry was factored
@@ -247,6 +262,15 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   session — the "unblocked" bullet above was stale; TestEditsSinceMultiHunkDiff
   added 2026-09-10. Host verification of the fuzz gates and a live gopls hover
   check ride the next rebuild+restart.
+
+- [x] **Server edits share one lease-checked applier (2026-09-17).**
+  `applyDocEdits` now converts rename's LSP ranges to `complete.Edit` and
+  delegates to `applyServerEdits`; `editsLeased` is the shared all-or-nothing
+  pre-check, and `applyRename` checks every target before any text changes and
+  drops the headless buffers it loaded on a refusal (`internal/app/rename.go`,
+  `server_edits.go`). Pinned by `TestRenameRefusesOverAProposedSpan`,
+  `TestRenameWithoutLeasesIsOneUndo` and `TestRenameKeepsTheCaretNearWhereItWas`
+  (`internal/app/rename_test.go`).
 
 ## Brackets
 
@@ -496,6 +520,12 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   path that had just failed, so the next plain save would write there without
   asking — turning one visible failure into a silent one.
 
+- [x] **A save-as starts the language server for the new name (2026-09-17).**
+  An unnamed buffer has no language until it is named, so `warmSaved`
+  (`internal/app/lsp.go`) starts the server for the saved path; an ordinary
+  same-path save still starts nothing and `lspSaved` stays live-only. Pinned by
+  `TestSaveAsWarmsTheLanguageServer` and `TestOrdinarySaveDoesNotWarmAServer`.
+
 ## Gates
 
 - [x] **`make check` is the gate**: fmt, vet, build, `go test ./...` and the race
@@ -513,6 +543,17 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 
 - [x] **Symlink escape is gated (2026-09-16).** `Guard.inRootResolved`/`resolveExistingPrefix` resolve symlinks before the root check and `RAJ_ALLOW_SYMLINK_ESCAPE` is the explicit opt-out; `host_test.go` pins in-root, escaped-parent and opt-in cases. A dangling link still resolves lexically by design; the decision is open in TODO.
 - [x] **`exec -dir` routes through `inRootDir` (2026-09-16).** `Guard.CheckExec` takes the relative directory its doc promised, matching `search -path`; the former absolute-only `inRootResolved` call refused it.
+
+- [x] **A silent process on the control address no longer hangs the driver
+  (2026-09-17).** `control.Client.Do` arms a 10s `answerTimeout` read deadline
+  around `collect` (cleared on return), exempts the `recv` long-poll, and wraps
+  a deadline expiry in a message naming the wrong-process case; `readTimeout`
+  is the test seam (`internal/control/client.go`). Pinned by
+  `TestOrdinaryRequestTimesOutOnASilentPeer`,
+  `TestRecvWaitsPastTheAnswerDeadline`,
+  `TestIsTimeoutDistinguishesDeadlineFromTransport`
+  (`internal/control/cli_test.go`). The streaming verbs stay unbounded — see
+  TODO.
 
 ## Data loss
 
@@ -557,6 +598,18 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   ops leave the document. `reverseGroup` keeps the filter for undo and redo,
   where it is load-bearing: undo is personal and must not back out a
   collaborator's op just because it shares a group.
+
+- [x] **Undo-path liveness and rollback are pinned (2026-09-17).**
+  `Session.live` short-circuits an op with no reverser and resolves liveness
+  through `liveFrom` with a per-call visited set, so a corrupt or hand-edited
+  restored journal that claims a cycle cannot run the walk forever; `SaveOver`'s
+  failed-encode rollback re-proposes every accepted set, not just the first; and
+  `resumeSave` drops a write whose pane was closed while `willSaveWaitUntil` was
+  outstanding. Pinned by `TestRestoredLiveTerminatesOnACyclicJournal` and
+  `TestRestoredLiveTerminatesOnASelfReversingOp`,
+  `TestRollbackLeavesNoHalfReversedGroup` (`internal/piecetable/`),
+  `TestSaveFailedEncodeRollsBackEveryAcceptance` (`internal/editor/`) and
+  `TestWillSaveResumeDoesNotWriteAClosedPane` (`internal/app/`).
 
 ## Reload
 
@@ -609,6 +662,12 @@ picker fields have real selections. raj runs on a patched Ghostty via the
   marker is multi-byte and a byte clip would cut it in half.
 
 - [x] **`.raj/` is hidden by default (2026-09-16).** `internal/hidden` defaults hide `.raj/*` (journal, trash, session) while leaving `.raj/hidden`, the user config, visible; `hidden_test.go` covers both, so the tree, search and picker stop showing the editor scratch.
+
+- [x] **Arrowing the explorer previews in one reusable tab (2026-09-17).**
+  A clean preview is replaced in place and a dirty one is promoted, Enter
+  commits it through `OpenFile`, the tab is drawn italic, and a preview is left
+  out of the session. `internal/tabs/{tabs,preview}_test.go`,
+  `internal/app/preview_test.go`, `internal/explorer/selected_test.go`.
 
 ## Auto-indent
 
@@ -1401,6 +1460,45 @@ harness. Both now wait on the thing they are actually about.
 
 ## Control socket and agent driving
 
+- [x] **A large-file `patch` lands as bounded hunks (2026-09-17).**
+  `control.DiffLines` is a patience diff over lines — trim the common prefix and
+  suffix, anchor on the lines unique to both sides, keep a longest increasing
+  run of anchors, recurse the gaps — so past `n*m > 1<<20` it no longer degrades
+  to one whole-file hunk, and it no longer builds the O(n·m) LCS table at all.
+  Pinned by `TestDiffLinesRoundTrip` (15 shapes, both directions) and
+  `TestDiffLinesLargeFile` (2000 lines, three scattered edits → three hunks) in
+  `internal/control/host_test.go`.
+
+- [x] **Per-verb and per-frame client deadlines (2026-09-17).** `Client.Do`
+  bounds each verb by `answerBudget` — `ping` 3s, default 10s, `prog` 60s, `lsp`
+  30s — and leaves `recv` exempt as a long poll. `DoStream`/`DoExec` arm a
+  `streamIdle` (30s) read deadline reset before every frame and cleared on
+  return, so a stalled peer is named on every verb while a long but live walk
+  survives; `readTimeout` and `idleTimeout` are the test seams. Pinned by
+  `TestAnswerBudgetPerVerb`, `TestAnswerWaitUsesBudgetAndSeam`,
+  `TestStreamIdleNamesSilentPeer` and `TestStreamIdleResetsPerFrame`
+  (`internal/control/cli_test.go`).
+
+- [x] **Heartbeat frames keep a quiet stream alive (2026-09-17).** A connection
+  emits a contentless non-final frame with the request's id every
+  `heartbeatEvery` (5s) while a request is in flight, and `send` stops it on the
+  final frame; `recv` is exempt as a long poll. `streamIdle` is now 15s (three
+  intervals, down from 30s), and the interval is a per-connection field set from
+  a per-`Server` seam, so a test shortens its own connection instead of a
+  package var a live ticker might read. Pinned by `TestHeartbeatEmitsUntilFinal`,
+  `TestHeartbeatStopIdempotent`, `TestHeartbeatCancelAllStops`,
+  `TestServerHeartbeatReachesClient`, `TestHeartbeatKeepsQuietStreamAlive` and
+  `TestStreamIdleOutlastsHeartbeat` (`internal/control/heartbeat_test.go`).
+
+- [x] **A per-region diff work budget (2026-09-17).** `DiffLines` charges
+  each region's line count against `diffWorkCeiling` (1<<20) and collapses a
+  region over `diffRegionCeiling` (1<<15) on both sides to one coarse hunk, so an
+  adversarial or duplicate-heavy file is bounded without the old whole-file
+  fallback; `diffFallback` is the decision and `diffLines(old, new, workCeiling)`
+  the test seam. Pinned by `TestDiffFallback`, `TestDiffLinesBudget` and
+  `TestDiffLinesAdversarial` (`internal/control/host_test.go`);
+  `TestDiffLinesLargeFile` still yields three hunks.
+
 - [x] **`revert` — a writer discards its own live pieces.** `raj ctl revert
   [-mine|-author N]` reverses every change set the calling writer holds,
   newest-first, journaled as the reversal (not a second forward edit); claim-
@@ -1997,3 +2095,184 @@ harness. Both now wait on the thing they are actually about.
 - [x] **Sidebar pad revised 2→1 (2026-09-17).** `sidebarPad = 1`
   (`internal/app/layout.go`), `minSidebarRows = 4` unchanged; the sidebar
   content sits one row below the tab bar.
+
+## Line-index read-site sync, SQLite store Phase 1 (2026-09-17)
+
+- [x] **The line index catches up on the read path (2026-09-17).**
+  `File.index()` calls `File.sync()` and returns the index, and every getter
+  (`Lines`, `Line`, `LineStart`, `LineEnd`, `LineOf`, `LineCol`, `OffsetAt`)
+  reads through it; `ProposeGroup`/`AcceptGroup`/`AcceptPending` sync too. An op
+  that reached the journal without a `File` wrapper (a decision made straight on
+  the session) can no longer leave every line number stale until the next edit —
+  the desync that made `read -lines` and `search` disagree and an `edit` eat a
+  newline. `sync` calls `applyToIndex`, never a getter, so the read path cannot
+  recurse. Pinned by `TestLineIndexCatchesUpOnAnOutOfBandReversal` and
+  `TestLineIndexMirrorsTextAcrossDecisionCycles`
+  (`internal/editor/layered_test.go`, whose `checkIndexMatchesText` compares
+  every line's bytes) and by the per-line `check` assertions in
+  `TestControlLineIndexSurvivesApplyRejectCycles` and
+  `TestControlReadLinesAndSearchAgree` (`internal/app/control_test.go`). Host
+  `gofmt -w && go test ./... && make check` green.
+- [x] **SQLite store Phase 1 — session, positions, settings (2026-09-17).**
+  `internal/store` opens one workspace DB at `<root>/.raj/state.db` with WAL, a
+  5 s busy timeout and `SetMaxOpenConns(1)` through DSN `_pragma` arguments, and
+  a versioned schema (`schemaVersion = 1`) whose migrations run one forward step
+  per transaction with the version bump, refusing a newer database rather than
+  downgrading. The API is `Open`/`Close` (idempotent), `PutSession`/`Session`,
+  `SetPosition`/`Position`/`Positions`,
+  `Settings`/`SetSetting`/`DeleteSetting` with
+  `ScopeUser`/`ScopeWorkspace`; empty identity values and negative offsets are
+  refused, absent and empty-but-present session blobs are distinct, and scopes
+  are isolated. `modernc.org/sqlite v1.59.0` (pure Go, CGO-free) is named only
+  in `driver.go` and `go.sum` is committed; no app code wires the store yet.
+  Ten tests in `internal/store/store_test.go`. Host
+  `gofmt -w && go test ./... && make check` green.
+
+## Store in sessions, settings precedence, live tab width (2026-09-17)
+
+- [x] **The workspace store is wired into sessions (2026-09-17).**
+  `app.New` opens `<session.Dir(root)>/state.db` and degrades to a nil store
+  when that fails; `App.CloseState` releases it, nil-safe and idempotent, and
+  `cmd/raj/main.go` defers it. `SaveSession`/`RestoreSession` read and write
+  through `store.PutSession`/`Session`, with `session.Load`/`Save` as the
+  file fallback when the store is absent or a read failed; a legacy
+  `.raj/session.json` is migrated (`Load` → `Encode` → `PutSession` →
+  `os.Remove`) and removed only once `PutSession` succeeds, so a failure
+  retries next start. `session.Decode`/`Encode` split out of `Load`/`Save` as
+  the one codec, so the DB blob gets the same version check and clamp-and-drop
+  `validate`. Per-file cursor/top are recorded on every pane-drop path
+  (`closeTabAt`, control `Close`/`CloseDiscard`, `closeDeletedPane`,
+  `dropHeadless`/`evictHeadless`, preview reuse) and applied only for a
+  genuinely new pane in `openFile`, clamped, never by `previewFile`. Pinned by
+  `TestLegacySessionJSONMigratesToTheStore`, `TestSaveSessionWritesTheStore`,
+  `TestReopenRestoresClosedPositionButPreviewDoesNot`,
+  `TestControlCloseRemembersPosition`, `TestCloseStateIsIdempotent`
+  (`internal/app`), and `TestUnknownScopeIsRefused`/`TestCloseIsIdempotent`
+  (`internal/store`). Host `gofmt -w && go test ./... && make check` green.
+- [x] **Settings resolve defaults < user < workspace, and explicit flags beat
+  both (2026-09-17).** `resolveSettings` is pure and returns the bad keys;
+  `tab_width`/`tabs`/`wrap`/`auto_pairs`/`inlay_hints` parse-or-ignore (a bad
+  value never zeroes a lower scope or the default) and the ignored keys are
+  reported once on the status line. `App.Settings()`/`App.SetSetting(scope,
+  key, value)` are the menu seam: the store refuses an unknown scope, an
+  unknown key is refused, and the valid keys live-apply. `Options` +
+  `NewWithOptions` let `main` use `flag.Visit` so an explicit `--tab`/`--tabs`/
+  `--wrap` beats a stored setting while an omitted flag leaves it in charge;
+  `New` is preserved for tests. Pinned by `TestResolveSettings*`,
+  `TestNewWithOptions*`, `TestSettingsReturnsResolvedMap`,
+  `TestSetSetting*`, `TestNewKeepsBuiltInDefaults`
+  (`internal/app/settings_test.go`).
+- [x] **Live tab width (2026-09-17).** `Tabs.SetTabWidth`/`TabWidth`/
+  `widthPinned`, `File.SetTabWidth` (sets `Cols.Tab` and `Indent.Width`, pins
+  `explicitWidth`), and `reload.go` honouring the pin, so an explicit width —
+  a flag or a stored `tab_width` — outranks a file's detected indentation,
+  reaches buffers opened after it, resizes open panes (display advance and
+  indent unit both), survives `Reload` re-detection, and is refused for
+  `w <= 0`; a default launch still leaves detection the winner. Pinned by
+  `TestSetTabWidthOutranksDetectionOnOpen` (`internal/tabs`),
+  `TestSetTabWidthSurvivesRedetection` (`internal/editor`), and
+  `TestSetSettingTabWidthIsLive`/`TestStoredTabWidthPinsDetection`
+  (`internal/app`).
+- [x] **The explorer test addresses entries by name, not index (2026-09-17).**
+  The store opening eagerly puts `.raj` in the tree, so
+  `TestExplorerShowsSelectedPath` now resolves its selection through
+  `Explorer.Tree.Rel` and asserts that non-empty path is on screen; the shared
+  `explorerSelect` helper picks by base name instead of a fixed number of
+  down-presses, which had gone vacuous when `.raj` shifted the list
+  (`internal/app/panes_test.go`).
+- [x] **Review-pass follow-up: settings precedence and a non-positive tab
+  (2026-09-17).** `SetSetting` now re-reads both scopes and applies the
+  *resolved* value for the written key, so a lower-scope write cannot beat a
+  higher scope in the running app and `Settings()` agrees with a restart; a
+  runtime write overrides a launch flag for the session, and the flag wins
+  again next launch. A non-positive explicit `--tab` is ignored (the fallback
+  stands, no bad pin), and a stale `session.json` is removed once the store
+  holds a session. Pinned by `TestSetSettingLowerScopeDoesNotBeatHigherScope`,
+  `TestSetSettingBeatsLaunchFlagForTheSession`,
+  `TestExplicitNonPositiveTabWidthIsIgnored`,
+  `TestSetSettingBadValueIsStoredButInert` (`internal/app/settings_test.go`)
+  and `TestStaleSessionJSONIsRemovedWhenStoreHasOne`
+  (`internal/app/session_test.go`).
+
+## Settings pane, session sidebar, `.git` transients, `lsp diagnostics` batching (2026-09-18)
+
+- [x] **Settings/menu pane (2026-09-18).** `cmd+,` opens a new
+  `SidebarSettings` sidebar (`internal/app/settings_pane.go`): a row model over
+  the five settings plus a write-scope selector defaulting to workspace,
+  enter/space to act, left/right to step a width or flip a bool, digit-entry to
+  type `tab_width`, tab out to the editor and escape to close. Every displayed
+  value is re-read from `App.Settings()` each frame and every write goes through
+  `App.SetSetting`, which reports a nil store on the status line; the mouse
+  selects and activates the row under the press. Bound through
+  `internal/keys/{action,table}.go` (`keys.Settings`, `super+,`/`cmd+comma`
+  reclaimed with a `kkp_on` line) and listed in the command palette. Pinned by
+  `internal/keys/settings_test.go` and `internal/app/settings_pane_test.go`.
+  Host `make check` green.
+- [x] **Session sidebar persistence and `.git` transients (2026-09-18).**
+  `session.State.Sidebar` is a tri-state `*string`: nil is a session written
+  before the field (keep the startup default), `""` is closed, a name is the
+  pane; `SessionState` writes it and `restoreSidebar` applies it, re-focusing
+  the pane only when the saved focus was the sidebar, and `validate`
+  re-derivation preserves the pointer. `openSidebar`/`toggleSidebar` touch the
+  session. `isGitPath` (any path component `.git`) skips git transients from
+  `SessionState`, `appendJournal`/`recordWritten`/`closeJournal` and
+  `restoreLog`, so a commit message is neither a saved tab nor a journal log.
+  Pinned by `internal/session/session_test.go` (`TestSidebarRoundTrip`) and
+  `internal/app/session_test.go` (`TestSessionRestoresSidebar`,
+  `TestIsGitPath`, `TestGitTransientIsNotPersisted`).
+- [x] **`lsp diagnostics` batches paths (2026-09-18).** `raj ctl lsp
+  diagnostics [path...]` sweeps every operand in one call, printing one status
+  per path; a failing path reports on stderr and leaves the exit nonzero while
+  the rest still run; the no-path form keeps resolving the active buffer.
+  Verified live: a nine-path sweep, a good+bad pair exiting 1 with the good
+  status still printed, and single/no-path unchanged. Pinned by
+  `TestCLILSPDiagnosticsSweepsMultiplePaths` (`internal/control/cli_test.go`).
+- [x] **Harness: model pin, image config, tool ledger (2026-09-18).** The
+  `opencode/agents/{raj,review}.md` and `opencode/opencode.json` model is
+  pinned to `deepseek/deepseek-flash` (the prior
+  `opencode-go/deepseek-v4-1-flash` was invalid and broke subagent spawning);
+  `skills/raj-editor/SKILL.md` gains the "Do fewer round trips" section and
+  `docs/RECURSIVE-RAJ.md` §7 requires the call-batching discipline in every
+  brief; `plugins/raj-gate.ts` appends a JSONL telemetry ledger per tool call
+  behind `RAJ_TOOL_LEDGER` and still gates spawning to raj/review.
+- [x] **Deferred deletions (2026-09-18).** `Project(AcceptedAndProposed)`
+  excludes a Proposed deletion-only set (`Session.deferredDeletions`,
+  `internal/piecetable/groups.go`), so the bytes it would remove stay visible
+  until the human accepts instead of vanishing with no inserted run to show as
+  the proposal; `Session.deletionLeases` maps the set's rebased zero-width gap
+  through `projectMember`/`hunkOverlap`, so the caret path (`Leased`, hence
+  `File.Insert`/`File.Delete`) refuses an edit spanning it and the agent diff
+  path (`proposedSpans`) warns about it. `Annotated`, `AcceptedOnly` and
+  `Rejected` are unchanged: only the edit composition defers. Pinned by
+  `TestProjectDefersProposedDeletionUntilAccept`,
+  `TestLeasedNamesAPureDeletionSet`, `TestApplyDiffWarnsOverProposedDeletion`
+  (`internal/piecetable/project_test.go`),
+  `TestDeleteRefusedAcrossAProposedDeletion` (`internal/editor/layered_test.go`)
+  and `TestLeaseRefusesAWriteAcrossAProposedDeletion`
+  (`internal/app/lease_test.go`). Host `make check` green.
+- [x] **Display width: the three horizontal arrows are two cells (2026-09-18).**
+  `internal/ui/width.go` adds `ambiguousWide` (`←` U+2190, `→` U+2192, `↔`
+  U+2194), the East Asian Ambiguous runes the terminal draws wide, so
+  `RuneWidth` counts them 2 and the caret stops drifting one column per arrow;
+  an em-dash (also ambiguous) stays 1 and the wide/combining/control classes
+  are untouched. Pinned by `TestHorizontalArrowsAreWide`/
+  `TestWidthClassesUnchanged` (`internal/ui/width_test.go`) and
+  `TestColumnsCaretAdvanceMatchesDrawnArrows` (`internal/view/view_test.go`).
+  Confirmed on the one terminal that drifted; other terminals are an open
+  escalation (TODO Direction).
+
+## Client mode: the editor app renders a daemon-owned document (2026-09-18)
+
+`raj --attach` (and `--phone`, which implies it) is the editor app running as
+a client of a daemon: it renders the daemon's document locally instead of
+starting a second local editor. The daemon serves each buffer's whole session
+over a new `snapshot` wire op and signals changes with a `watch` push; the
+client rebuilds tabs from `editor.OpenSnapshot`, mounts them read-only, and
+proxies accept/reject/clear back to the daemon, refetching the result.
+`internal/attach` is deleted and its routing hook removed.
+
+- [x] **Session snapshot** (`piecetable.SnapshotState`/`Restore`/`Encode`/`DecodeSnapshot`): base, store, journal, group decisions, next group id and compacted origins; round-trips exactly and refuses truncated/garbage/out-of-store payloads.
+- [x] **`snapshot` and `watch` control ops**: `snapshot` returns the encoded session, version, encoding and canonical path; `watch` parks until the open buffers' version hash moves, then answers with the buffer list. `watch` stays out of programs like `recv`; the internal searcher op is now `searchsnapshot` to free the name.
+- [x] **`editor.OpenSnapshot`/`ErrSnapshotReadOnly`**: a snapshot buffer renders the daemon text without reading disk; a plain save is refused so only save-as can write it.
+- [x] **Client mode** (`internal/app/client.go`): `--attach`/`--phone` load the daemon's tabs and arm a watch on one connection while decisions use a second; idle session/journal/disk work is off and every edit gate is refused read-only.
+- [x] **`internal/attach` removed**; `TestAttachPackageIsGone` guards the import path and the gone directory.

@@ -1,6 +1,9 @@
 package keys
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // macOS claims some chords system-wide and swallows them before any terminal
 // sees them. A binding on one of these is not merely inconvenient — it never
@@ -26,10 +29,9 @@ func TestNoMacOSSystemShortcuts(t *testing.T) {
 		"alt+super+esc":   "force quit",
 		"ctrl+super+f":    "full screen",
 		"shift+super+q":   "log out",
-		"super+comma":     "application preferences",
 	}
 	for _, b := range Bindings {
-		if why, bad := reserved[b.Chord]; bad {
+		if why, bad := chordReason(reserved, b.Chord); bad {
 			t.Errorf("%s is bound to %q, which macOS uses for %s — it will never arrive",
 				b.Action, b.Chord, why)
 		}
@@ -59,12 +61,11 @@ func TestTerminalDefaultsAreAcknowledged(t *testing.T) {
 		"super+k":           "clear the buffer (iTerm2)",
 		"super+enter":       "full screen",
 		"shift+super+enter": "full screen",
-		"super+comma":       "settings",
 		"super+f":           "find in terminal",
 		"super+l":           "clear screen (Linux default)",
 	}
 	for _, b := range Bindings {
-		why, claimed := terminal[b.Chord]
+		why, claimed := chordReason(terminal, b.Chord)
 		if !claimed {
 			continue
 		}
@@ -72,5 +73,43 @@ func TestTerminalDefaultsAreAcknowledged(t *testing.T) {
 			t.Errorf("%s takes %q, which the terminal uses for %s, without a note saying so",
 				b.Action, b.Chord, why)
 		}
+	}
+}
+
+// chordReason reports a table's reason for a chord, comparing the normalized
+// spelling so a table entry and a bound chord match whichever form each uses.
+// Event.Chord renders the comma as ","; the tables here spell it "comma", so a
+// raw map lookup was blind to every comma binding — the settings chord slipped
+// both guards for exactly that reason.
+func chordReason(set map[string]string, chord string) (string, bool) {
+	want := normalizeChord(chord)
+	for c, why := range set {
+		if normalizeChord(c) == want {
+			return why, true
+		}
+	}
+	return "", false
+}
+
+// normalizeChord folds the two spellings of a key name into the one Event.Chord
+// emits: a comma is "," in a chord and "comma" in prose, and the guards have to
+// treat them as the same key.
+func normalizeChord(chord string) string {
+	return strings.ReplaceAll(chord, "comma", ",")
+}
+
+// A comma binding must be caught however the two sides spell the key. This one
+// is synthetic: the table names the key "comma", the binding names it "," — the
+// guard has to resolve them to the same chord.
+func TestReservedCommaChordIsCaught(t *testing.T) {
+	reserved := map[string]string{"super+comma": "application preferences"}
+	if why, bad := chordReason(reserved, "super+,"); !bad {
+		t.Error("super+, is not caught by a reserved super+comma entry; the guard is blind to comma chords")
+	} else if why != "application preferences" {
+		t.Errorf("reason = %q, want the reserved entry's", why)
+	}
+	terminal := map[string]string{"shift+super+comma": "reload config (Ghostty)"}
+	if _, bad := chordReason(terminal, "shift+super+,"); !bad {
+		t.Error("shift+super+, is not caught by a terminal shift+super+comma entry")
 	}
 }

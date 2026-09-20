@@ -3,6 +3,7 @@ package control
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -50,6 +51,106 @@ type Client struct {
 	// caller that forgot one would send an unmapped path that the editor
 	// refuses for a reason unrelated to what went wrong.
 	paths Mapper
+	// readTimeout replaces answerBudget for this connection when non-zero.
+	// It is a test seam: production leaves it zero, so the shipped wait is the
+	// const, while a test can prove a silent peer is caught in milliseconds.
+	readTimeout time.Duration
+	// idleTimeout replaces streamIdle for this connection when non-zero. It is
+	// the streaming verbs' test seam, so a test can prove a peer that goes
+	// silent mid-stream is caught in milliseconds.
+	idleTimeout time.Duration
+}
+
+// Per-verb answer budgets. A process squatting the control address accepts the
+// TCP connection and then says nothing; the connect timeout cannot see that,
+// so without a post-connect deadline the client parks in collect forever and
+// the driver hangs with no diagnosis. One budget for every verb was too blunt:
+// ping is the identity check and should name a squatter quickly, while a batch
+// wrapping a long exec or a cold language server legitimately takes longer.
+const (
+	answerPing    = 3 * time.Second
+	answerDefault = 10 * time.Second
+	answerProg    = 60 * time.Second
+	answerLSP     = 30 * time.Second
+)
+
+// answerBudget is how long op may wait for an answer before the
+// silent-peer diagnosis fires. Pure and table-driven, so the per-verb policy
+// can be tested without a connection.
+func answerBudget(op string) time.Duration {
+	switch op {
+	case "ping":
+		return answerPing
+	case "prog":
+		return answerProg
+	case "lsp":
+		return answerLSP
+	default:
+		return answerDefault
+	}
+}
+
+// longPoll reports whether op is expected to block until something outside the
+// editor happens rather than until the editor answers. recv waits for the user,
+// which may be hours, so arming the answer deadline on it would turn a working
+// long-poll into a spurious timeout. It is the only such verb, and the only
+// exemption Do needs: search and exec stream through DoStream and DoExec, which
+// arm a per-frame idle instead of a total deadline.
+func longPoll(op string) bool { return op == "recv" }
+
+// answerWait returns the read deadline to arm for op, and whether to arm one.
+// A long poll gets none, whatever the configured timeout is. The readTimeout
+// test seam, when set, stands in for the budget of every bounded verb.
+func (c *Client) answerWait(op string) (time.Duration, bool) {
+	if longPoll(op) {
+		return 0, false
+	}
+	if c.readTimeout > 0 {
+		return c.readTimeout, true
+	}
+	return answerBudget(op), true
+}
+
+// streamIdle bounds the gap between frames on a streaming verb. A search over a
+// large tree or a long exec can run for minutes, so a total deadline would kill
+// a healthy stream; an idle deadline fires only when the peer actually stops
+// sending. Do arms a total answer deadline instead and passes 0 to collectAll.
+//
+// It is three heartbeat intervals. The server emits a contentless non-final
+// frame from heartbeatEvery while a request is in flight, so a quiet-but-live
+// stream is kept alive by those frames and a peer that sends nothing at all
+// still trips this idle. Derived from heartbeatEvery rather than repeating the
+// number so the two cannot drift out of step.
+const streamIdle = 3 * heartbeatEvery
+
+// streamWait returns the idle deadline for a streaming verb, with the
+// idleTimeout test seam standing in for streamIdle when set.
+func (c *Client) streamWait() time.Duration {
+	if c.idleTimeout > 0 {
+		return c.idleTimeout
+	}
+	return streamIdle
+}
+
+// silentPeerErr names the wrong-process diagnosis a read deadline produces: the
+// peer answered no frame in time, which for a connected socket means the
+// process on the other end is not the editor. It wraps the deadline error so
+// isTimeout still recognises the underlying condition.
+func silentPeerErr(wait time.Duration, err error) error {
+	return fmt.Errorf("no response from the control address within %s; "+
+		"another process may be listening there: %w", wait, err)
+}
+
+// isTimeout reports whether err is a read deadline that expired rather than an
+// ordinary transport failure. net returns an *net.OpError wrapping
+// os.ErrDeadlineExceeded, so the sentinel catches the wrapped form while
+// net.Error.Timeout catches a peer that reports the same condition its own way.
+func isTimeout(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // Dial connects to a Unix path or a `tcp://host:port` address.
@@ -109,6 +210,11 @@ func (c *Client) Close() error { return c.conn.Close() }
 // Do sends one request and returns the editor's answer. A transport failure is
 // an error; a refusal by the editor is a Response with Err set, because those
 // are different things to a caller: one means retry, the other means do not.
+//
+// An ordinary exchange is bounded by answerBudget, so a silent peer (a wrong
+// process on the control address) yields a named error instead of a hang.
+// recv is exempt because parking is its purpose, and the deadline is always
+// cleared before returning so a later recv on this client still waits.
 func (c *Client) Do(req Request) (Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -119,18 +225,30 @@ func (c *Client) Do(req Request) (Response, error) {
 	if err := c.write(req); err != nil {
 		return Response{}, err
 	}
+	wait, bounded := c.answerWait(req.Op)
+	if bounded {
+		if err := c.conn.SetReadDeadline(time.Now().Add(wait)); err != nil {
+			return Response{}, err
+		}
+		defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	}
 	// A streamed response is several frames sharing an id, the last marked
 	// Final. Do collects them, so a caller that does not care about progress
 	// writes nothing extra; DoStream is for one that does.
-	res, err := c.collect(req.ID, nil)
+	res, err := c.collect(req.ID, nil, 0)
 	if err != nil {
+		if bounded && isTimeout(err) {
+			return Response{}, silentPeerErr(wait, err)
+		}
 		return Response{}, err
 	}
 	return res, nil
 }
 
 // DoStream sends a request and calls onBatch with each streamed batch of
-// matches as it arrives, returning the final frame. Cancel abandons it.
+// matches as it arrives, returning the final frame. Cancel abandons it. A gap
+// between frames longer than the stream idle names the silent peer, so a
+// stalled walk is caught while a long but live one survives.
 func (c *Client) DoStream(req Request, onBatch func([]SearchMatch)) (Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -141,7 +259,7 @@ func (c *Client) DoStream(req Request, onBatch func([]SearchMatch)) (Response, e
 	if err := c.write(req); err != nil {
 		return Response{}, err
 	}
-	return c.collect(req.ID, onBatch)
+	return c.collect(req.ID, onBatch, c.streamWait())
 }
 
 // write serialises one frame onto the socket. Separate from mu so a cancel can
@@ -202,11 +320,15 @@ func (c *Client) CancelCurrent() error {
 }
 
 // collect reads frames until the one marked Final, merging streamed matches.
-func (c *Client) collect(id int, onBatch func([]SearchMatch)) (Response, error) {
-	return c.collectAll(id, onBatch, nil)
+// idle, when non-zero, bounds the gap between frames; Do passes 0 because it
+// already armed a total answer deadline.
+func (c *Client) collect(id int, onBatch func([]SearchMatch), idle time.Duration) (Response, error) {
+	return c.collectAll(id, onBatch, nil, idle)
 }
 
-// DoExec runs a command, calling onOutput with each chunk as it arrives.
+// DoExec runs a command, calling onOutput with each chunk as it arrives. A gap
+// between frames longer than the stream idle names the silent peer, so a long
+// command is not killed while a stalled one is.
 func (c *Client) DoExec(req Request, onOutput func(stream uint8, b string)) (Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -217,15 +339,30 @@ func (c *Client) DoExec(req Request, onOutput func(stream uint8, b string)) (Res
 	if err := c.write(req); err != nil {
 		return Response{}, err
 	}
-	return c.collectAll(req.ID, nil, onOutput)
+	return c.collectAll(req.ID, nil, onOutput, c.streamWait())
 }
 
 func (c *Client) collectAll(id int, onBatch func([]SearchMatch),
-	onOutput func(stream uint8, b string)) (Response, error) {
+	onOutput func(stream uint8, b string), idle time.Duration) (Response, error) {
+	// A streaming verb gets an idle deadline, reset before each frame read so a
+	// long but live walk is not killed while a stalled peer is. It is cleared
+	// on the way out, whatever the outcome, so a later recv on this client
+	// still parks. Do passes 0 because it armed a total deadline itself.
+	if idle > 0 {
+		defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	}
 	var acc Response
 	for {
+		if idle > 0 {
+			if err := c.conn.SetReadDeadline(time.Now().Add(idle)); err != nil {
+				return Response{}, err
+			}
+		}
 		f, err := ReadFrame(c.r)
 		if err != nil {
+			if idle > 0 && isTimeout(err) {
+				return Response{}, silentPeerErr(idle, err)
+			}
 			return Response{}, err
 		}
 		res, err := DecodeResponse(f)
@@ -270,6 +407,9 @@ func (c *Client) localise(res *Response) {
 		return
 	}
 	res.Root = c.paths.FromEditor(res.Root)
+	if res.SnapshotPath != "" {
+		res.SnapshotPath = c.paths.FromEditor(res.SnapshotPath)
+	}
 	for i := range res.Buffers {
 		res.Buffers[i].Path = c.paths.FromEditor(res.Buffers[i].Path)
 	}

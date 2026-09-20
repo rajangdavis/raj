@@ -364,9 +364,9 @@ func TestEveryVerbHasACode(t *testing.T) {
 		"ping", "buffers", "text", "open", "apply", "save", "version", "search",
 		"groups", "accept", "reject", "clear", "exec", "execcheck", "stats", "hello",
 		"cancel", "recv", "snapshot", "prog", "diff", "review", "claim",
-		"mkdir", "delete", "deletions", "rename",
+		"mkdir", "delete", "deletions", "rename", "reload",
 		"proposals", "revert", "token",
-		"rmdir", "rmdirs", "ls",
+		"rmdir", "rmdirs", "ls", "watch",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)
