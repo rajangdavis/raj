@@ -58,7 +58,7 @@ This section is the prompt the user autoloads; executing it is what
 4. **Implement with focused raj subagents** (section 7): one item, or one
    tight cluster, per `subagent_type: "raj"` task, each with a
    self-contained brief — the tooling rules (section 6), the identity rule
-   (section 2: each subagent runs `register` and uses `-as`), the read-gate
+   (section 2: each subagent runs `register` and uses `--as`), the read-gate
    discipline (section 5), the files in scope,
    and what to report back. Changes to this file, the agent definitions and
    other opencode config are made by the orchestrator directly, never
@@ -108,23 +108,23 @@ filesystem. All file reads and writes go through `raj ctl` ONLY. Your edits
 land as ATTRIBUTED PROPOSALS in the user's buffers, tinted as yours; the user
 reviews, accepts and saves. Never accept or save your own proposals.
 
-## 2. Identity is explicit — register once, then `-as`
+## 2. Identity is explicit — register once, then `--as`
 
 Identity is no longer absorbed for you. Mint a key once per run:
 
     raj ctl register
 
 It prints a short random key (`raj-1a2b3c4d`) and binds it server-side. Pass
-`-as <key>` on every later call:
+`--as <key>` on every later call:
 
-    raj ctl read -as raj-1a2b3c4d docs/TODO.md
+    raj ctl read --as raj-1a2b3c4d docs/TODO.md
 
-Every `raj ctl` invocation is a fresh connection, so without `-as` each call
+Every `raj ctl` invocation is a fresh connection, so without `--as` each call
 mints a fresh author id from a `uint8` space capped at 256 — attribution
 scatters across dead ids and per-author state (dump snapshots) does not
-survive. One `register` per run and `-as` on every call keep your author
+survive. One `register` per run and `--as` on every call keep your author
 stable. Subagents each run `register` themselves and get their own key;
-`-name` gives the participant a display name in `who`.
+`--name` gives the participant a display name in `who`.
 
 ## 3. The rebuild boundary
 
@@ -166,8 +166,8 @@ Your proof of work is a clean proposal plus seam re-reads, not a green run.
 
 ## 5. Editing discipline (field notes, hard-won)
 
-- Read-gate every `apply` against a version you JUST read (`read -json`).
-- Byte offsets come from `read -json` / `search -json` only — never from line
+- Read-gate every `apply` against a version you JUST read (`read --json`).
+- Byte offsets come from `read --json` / `search --json` only — never from line
   counts, char counts, or shift arithmetic on earlier offsets.
 - After each hunk, run `lsp diagnostics` on the file before the seam re-read:
   a malformed hunk (unbalanced brace, a quoted block one line short) shows up
@@ -176,7 +176,7 @@ Your proof of work is a clean proposal plus seam re-reads, not a green run.
   replaces, the seam re-read.
 - Re-read the SEAM after each hunk: one function/paragraph before through one
   after. Study the seams, not the center.
-- Quote `edit -old` EXACTLY, indentation included, and quote the WHOLE block
+- Quote `edit --old` EXACTLY, indentation included, and quote the WHOLE block
   including its final line — a block quoted one line short applies cleanly and
   leaves a dangling tail that nothing warns about.
 - Heredoc stdin ends with a newline; anchor the following line too when
@@ -193,7 +193,7 @@ reach it. A cheap walk and a session spent re-reading are the difference.
    points at before touching code; the design names the files and the seams. Do
    not start from search alone.
 2. **Locate with `search -q SYMBOL`, never by opening files.** Search is the
-   tree-wide, unsaved-inclusive index. Scope with `-include 'relative/path.go'`
+   tree-wide, unsaved-inclusive index. Scope with `--include 'relative/path.go'`
    or an extension glob; `*` does not cross `/`, so `*_test.go` matches nothing
    nested — use `*.go` or a full relative path.
 3. **Read by path; `open` only to show.** `read <path>` loads a closed file
@@ -201,14 +201,14 @@ reach it. A cheap walk and a session spent re-reading are the difference.
    tab bar. `open` is the verb that shows a file to the user; use it when you
    mean to. A nonexistent path under `open` opens *empty and silently*, so never
    `open` a path typed from memory; `read` of a missing path is an error.
-4. **Read ranges, not files.** `read <path> -lines A,B` around the hit; widen
+4. **Read ranges, not files.** `read <path> --lines A,B` around the hit; widen
    only to the enclosing function plus one either side (the seam).
 5. **Own the whole block before editing.** Find its first and last line and
-   quote `edit -old` through the final line; a block one line short applies
+   quote `edit --old` through the final line; a block one line short applies
    cleanly and dangles (see §5).
-6. **`apply` one hunk at a time** under the review loop. Re-read `-json`
+6. **`apply` one hunk at a time** under the review loop. Re-read `--json`
    immediately before each apply; take offsets only from that read or from
-   `search -json`'s `byte_start`/`byte_end`.
+   `search --json`'s `byte_start`/`byte_end`.
 7. **After each hunk:** `lsp diagnostics` on the file, then re-read the seam.
    Diagnostics are cached and lag, and a non-`ok` status means *the check did
    not run*, not that the file is clean — the seam read is the authority.
@@ -227,7 +227,7 @@ reach it. A cheap walk and a session spent re-reading are the difference.
 ## 6. Tooling rule — `raj ctl` for content, `jq` for shaping
 
 Only `raj ctl` verbs read and write file content. `jq` is allowed for shaping
-`raj ctl -json` output. No python/node/sed/awk anywhere. If output is hard to
+`raj ctl --json` output. No python/node/sed/awk anywhere. If output is hard to
 consume even with `jq`, that is still a verb-surface GAP: report it and file it
 in docs/TODO.md, do not route around it. Workarounds drift; verbs do not.
 
@@ -237,14 +237,14 @@ in docs/TODO.md, do not route around it. Workarounds drift; verbs do not.
   and close each wave with one `subagent_type: "review"` pass (the plugin gates
   spawning to those two).
 - Each subagent mints its own identity: brief it to run `raj ctl register`
-  first, then pass `-as <key>` on every call. Never brief a token you minted.
+  first, then pass `--as <key>` on every call. Never brief a token you minted.
 - Briefs must be self-contained: a subagent starts with NO skill context.
   State the tooling rules (raj ctl for content, `jq` allowed for shaping
-  `raj ctl -json` output, no /tmp copies of source) and the identity rule
-  (`register` once, `-as <key>` on every call) in every brief.
+  `raj ctl --json` output, no /tmp copies of source) and the identity rule
+  (`register` once, `--as <key>` on every call) in every brief.
 - Briefs must also carry the call-batching discipline: several reads in one
-  call (`read A B C`), `search -context` instead of search-then-read, the
-  version from `read -json` reused as `-base`, `apply -hunks` for multi-hunk
+  call (`read A B C`), `search --context` instead of search-then-read, the
+  version from `read --json` reused as `--base`, `apply --hunks` for multi-hunk
   edits, `dump`/`patch` for structural rewrites, and `claim` once up front.
   Session data shows these facilities used in under 12 percent of the calls
   they apply to; adoption is the gap, and the brief is where it is set.
@@ -266,10 +266,10 @@ in docs/TODO.md, do not route around it. Workarounds drift; verbs do not.
   a file a subagent is rewriting. Reconcile overlapping change sets before the
   next wave; an orchestrator identity editing an agent's file is how a
   superseded set survives into a save.
-- `raj ctl who` tells participants apart. `who -live` filters to connected
+- `raj ctl who` tells participants apart. `who --live` filters to connected
   participants; the full listing stays available because a gone participant's
   text is still in the document (it is the attribution record). Identity is
-  durable: `register`/`-as` bind an author id that survives reconnects, and a
+  durable: `register`/`--as` bind an author id that survives reconnects, and a
   connection that has not declared itself holds a *reserved* id with no row, so
   it never appears in `who` and never leaks a row per `raj ctl` invocation. A
   `gone` id is still recycled at the 255 cap (lowest first, never the local

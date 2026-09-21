@@ -312,6 +312,11 @@ type App struct {
 	// and for tests that must not touch a workspace they did not create.
 	NoRestore bool
 
+	// standalone is --standalone: a single-file throwaway editor. The workspace
+	// store is never opened and the session is inert; the sidebar cannot be
+	// shown or opened, so the editor is one file and its tab strip.
+	standalone bool
+
 	// sessionDirty and sessionSaved debounce writing the session file, so a
 	// crash loses seconds rather than the whole session. sessionTabs is the
 	// last-written tab-set fingerprint, so opening or closing a tab is flushed
@@ -360,8 +365,8 @@ type App struct {
 	// used first, bounded by headlessMax; see headless.go.
 	headless []*editor.Pane
 
-	// control is the Unix-socket server, nil unless --control was given. Its
-	// requests are executed in drainControl, on this thread.
+	// control is the control server, nil until StartControl runs. Its requests
+	// are executed in drainControl, on this thread.
 	control *control.Server
 	// guard is the validation chokepoint in front of the buffer host. One per
 	// app, so read-before-write is remembered across requests.
@@ -490,7 +495,7 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 	var state *store.Store
 	var stateErr error
 	var migErr error
-	if root != "" {
+	if root != "" && !o.Standalone {
 		if dir := session.StateDir(root); dir != "" {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				stateErr = err
@@ -522,6 +527,13 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 	// --ctrl-aliases was passed explicitly. Resolved here so main can pass the
 	// raw flags and the rule lives in one place.
 	phoneOn, aliasesOn := ProfileFlags(o.Phone, o.CtrlAliases, o.CtrlAliasesSet)
+	// A standalone editor is one file: the sidebar starts closed and the editor
+	// starts focused, whatever the ordinary default is. The store is never
+	// opened, so there is nothing to restore a session from either.
+	side, focus := SidebarExplorer, FocusSidebar
+	if o.Standalone {
+		side, focus = SidebarNone, FocusEditor
+	}
 	a := &App{
 		host:           host,
 		keymap:         keys.NewKeymap(),
@@ -544,8 +556,8 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 		state:          state,
 		journalWritten: make(map[string]journalStamp),
 		settings:       res,
-		sidebar:        SidebarExplorer,
-		focus:          FocusSidebar,
+		sidebar:        side,
+		focus:          focus,
 		theme:          editor.DefaultTheme(),
 		// The effective settings, not the raw defaults: a stored value or an
 		// explicit flag has already been layered over them. On by default, so
@@ -554,7 +566,8 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 		WrapDefault: res.Wrap,
 		AutoPairs:   res.AutoPairs,
 		InlayHints:  res.InlayHints,
-		NoRestore:   o.NoRestore,
+		NoRestore:   o.NoRestore || o.Standalone,
+		standalone:  o.Standalone,
 		attach:      o.Attach,
 		attachAddr:  o.AttachAddr,
 		attachKey:   clientViewKey(o, phoneOn),
@@ -1934,6 +1947,11 @@ func (a *App) handleGlobal(action keys.Action) bool {
 // pane that already has focus closes it, which makes the binding a toggle
 // without needing a second key.
 func (a *App) openSidebar(s Sidebar) {
+	if a.standalone {
+		// No sidebar exists in a standalone editor, so every chord that would
+		// open one is a no-op rather than a way to conjure it.
+		return
+	}
 	if a.sidebar == s && a.focus == FocusSidebar {
 		a.sidebar = SidebarNone
 		a.focus = FocusEditor
@@ -1957,6 +1975,9 @@ func (a *App) openSidebar(s Sidebar) {
 }
 
 func (a *App) toggleSidebar() {
+	if a.standalone {
+		return
+	}
 	if a.sidebar == SidebarNone {
 		a.sidebar = SidebarExplorer
 		a.focus = FocusSidebar

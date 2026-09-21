@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"raj/internal/control"
 )
 
 // stateRoot is a temp workspace root with a temp XDG state home, so a test's
@@ -351,17 +353,272 @@ func TestStatusCLIStopped(t *testing.T) {
 	}
 }
 
+// The removed control flags stay removed in what the daemon advertises.
+// Driving CLI, not a hand-built FlagSet, keeps this honest about the shipped
+// command: the usage names --control-addr and neither --control-socket nor
+// --control-exec.
+func TestUsageNamesOnlyTheLiveControlFlags(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := CLI(nil, &out, &errb); code != 2 {
+		t.Fatalf("CLI with no args = %d, want 2", code)
+	}
+	text := errb.String()
+	if !strings.Contains(text, "--control-addr") {
+		t.Errorf("usage does not name --control-addr:\n%s", text)
+	}
+	if !strings.Contains(text, "--no-restore") {
+		t.Errorf("usage does not name --no-restore: %s", text)
+	}
+	for _, gone := range []string{"--control-socket", "--control-exec"} {
+		if strings.Contains(text, gone) {
+			t.Errorf("usage still names removed flag %s:\n%s", gone, text)
+		}
+	}
+}
+
+// start and restart refuse the removed flags rather than silently ignoring
+// them, so a script carrying an old invocation fails loudly.
+func TestRemovedControlFlagsAreRefused(t *testing.T) {
+	for _, cmd := range []string{"start", "restart"} {
+		for _, gone := range []string{"--control-socket", "--control-exec"} {
+			var out, errb bytes.Buffer
+			if code := CLI([]string{cmd, gone, "x"}, &out, &errb); code == 0 {
+				t.Errorf("%s accepted removed flag %s", cmd, gone)
+			}
+			if !strings.Contains(errb.String(), "not defined") {
+				t.Errorf("%s %s: stderr = %q, want the flag refused", cmd, gone, errb.String())
+			}
+		}
+	}
+}
+
 // The directory may be typed before or after the control flags; flagsFirst
 // moves it to the positional flag.Parse expects while keeping each value-taking
 // flag beside its value.
 func TestFlagsFirstKeepsDirPositional(t *testing.T) {
-	got := flagsFirst([]string{"/ws", "--control-addr", "tcp://127.0.0.1:9"})
+	got, err := flagsFirst([]string{"/ws", "--control-addr", "tcp://127.0.0.1:9"}, startSpec)
+	if err != nil {
+		t.Fatalf("flagsFirst = %v", err)
+	}
 	want := []string{"--control-addr", "tcp://127.0.0.1:9", "/ws"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("flagsFirst = %q, want %q", got, want)
 	}
-	got = flagsFirst([]string{"--control-addr=tcp://x", "/ws"})
+	got, err = flagsFirst([]string{"--control-addr=tcp://x", "/ws"}, startSpec)
+	if err != nil {
+		t.Fatalf("flagsFirst with = form = %v", err)
+	}
 	if strings.Join(got, "\x00") != strings.Join([]string{"--control-addr=tcp://x", "/ws"}, "\x00") {
 		t.Errorf("flagsFirst with = form = %q", got)
+	}
+}
+
+// --no-restore reaches the spawned `daemon run` argv, so a start typed with the
+// flag cannot silently restore the previous session.
+func TestStartForwardsNoRestore(t *testing.T) {
+	root := stateRoot(t)
+	var got *exec.Cmd
+	r := Runner{Root: root, Exe: "/bin/raj", Log: io.Discard,
+		Args: controlForward("tcp://127.0.0.1:9", true), Ops: Ops{
+			Alive: func(int) bool { return false },
+			Spawn: func(cmd *exec.Cmd) (int, error) { got = cmd; return 7, nil },
+		}}
+	if _, err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("spawn was not called")
+	}
+	want := []string{"/bin/raj", "daemon", "run", "--control-addr", "tcp://127.0.0.1:9", "--no-restore", root}
+	if strings.Join(got.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("argv = %q, want %q", got.Args, want)
+	}
+}
+
+// An empty control address drops --control-addr but keeps --no-restore, so a
+// start that asks only for a fresh session forwards exactly that.
+func TestControlForwardCarriesOnlyWhatWasAsked(t *testing.T) {
+	if got := controlForward("", false); got != nil {
+		t.Errorf("controlForward(none) = %q, want nil", got)
+	}
+	got := controlForward("", true)
+	want := []string{"--no-restore"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("controlForward(no-restore) = %q, want %q", got, want)
+	}
+}
+
+// A bare token that names a flag is refused with the double-dash spelling
+// rather than taken for the workspace directory: `daemon start no-restore`
+// must not quietly start a daemon rooted at ./no-restore. A real directory is
+// still a directory.
+func TestFlagsFirstRefusesBareFlagName(t *testing.T) {
+	if _, err := flagsFirst([]string{"no-restore"}, startSpec); err == nil ||
+		!strings.Contains(err.Error(), `did you mean --no-restore?`) {
+		t.Errorf("flagsFirst(no-restore) = %v, want the double-dash suggestion", err)
+	}
+	got, err := flagsFirst([]string{"/ws"}, startSpec)
+	if err != nil {
+		t.Fatalf("flagsFirst(/ws) = %v, want a directory", err)
+	}
+	if strings.Join(got, "\x00") != "/ws" {
+		t.Errorf("flagsFirst(/ws) = %q, want the directory kept", got)
+	}
+}
+
+// The refusal reaches the shipped command: `raj daemon start no-restore` exits
+// as a usage error naming the flag, before anything is spawned.
+func TestCLIRefusesBareFlagName(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := CLI([]string{"start", "no-restore"}, &out, &errb); code != 2 {
+		t.Fatalf("CLI start no-restore = %d, want 2", code)
+	}
+	if !strings.Contains(errb.String(), `unknown argument "no-restore"`) ||
+		!strings.Contains(errb.String(), "did you mean --no-restore?") {
+		t.Errorf("stderr = %q, want the bare flag refused", errb.String())
+	}
+}
+
+// Restart stops the running daemon and then starts a fresh one with the
+// recorded TCP address forwarded, so a client that knew the old address keeps
+// reaching the daemon across the restart. The socket is per-process and is not
+// carried.
+func TestRestartForwardsRecordedControl(t *testing.T) {
+	root := stateRoot(t)
+	if err := Record(root, State{PID: 4242, Socket: "/run/x.sock", TCP: "tcp://127.0.0.1:7391", Token: "tok"}); err != nil {
+		t.Fatal(err)
+	}
+	live := true
+	var events []string
+	var sig syscall.Signal
+	var got *exec.Cmd
+	r := Runner{Root: root, Exe: "/bin/raj", Log: io.Discard, Wait: 50 * time.Millisecond, Step: time.Millisecond, Ops: Ops{
+		Alive: func(int) bool { return live },
+		Signal: func(_ int, s syscall.Signal) error {
+			sig = s
+			live = false
+			events = append(events, "stop")
+			return nil
+		},
+		Spawn: func(cmd *exec.Cmd) (int, error) { got = cmd; events = append(events, "spawn"); return 777, nil },
+	}}
+	pid, st, err := r.Restart("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 777 {
+		t.Errorf("pid = %d, want 777", pid)
+	}
+	if sig != syscall.SIGTERM {
+		t.Errorf("signal = %v, want SIGTERM", sig)
+	}
+	if strings.Join(events, ",") != "stop,spawn" {
+		t.Errorf("ops = %v, want the stop before the spawn", events)
+	}
+	if got == nil {
+		t.Fatal("spawn was not called")
+	}
+	want := []string{"/bin/raj", "daemon", "run", "--control-addr", "tcp://127.0.0.1:7391", root}
+	if strings.Join(got.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("argv = %q, want %q", got.Args, want)
+	}
+	if st.Socket != "" || st.TCP != "tcp://127.0.0.1:7391" || st.Token != "tok" {
+		t.Errorf("restart state = %+v, want the recorded TCP address and token and no socket", st)
+	}
+}
+
+// The child sees RAJ_CONTROL_TOKEN fixed to the recorded token, and exactly
+// once even when the parent already carried a different one: a duplicate would
+// leave which value wins to the OS.
+func TestRestartPreservesTokenExactlyOnce(t *testing.T) {
+	root := stateRoot(t)
+	t.Setenv(control.TokenEnv, "stale-parent")
+	if err := Record(root, State{PID: 4242, Socket: "/run/x.sock", Token: "recorded"}); err != nil {
+		t.Fatal(err)
+	}
+	live := true
+	var got *exec.Cmd
+	r := Runner{Root: root, Exe: "/bin/raj", Log: io.Discard, Ops: Ops{
+		Alive:  func(int) bool { return live },
+		Signal: func(int, syscall.Signal) error { live = false; return nil },
+		Spawn:  func(cmd *exec.Cmd) (int, error) { got = cmd; return 1, nil },
+	}}
+	if _, _, err := r.Restart("", false); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("spawn was not called")
+	}
+	var values []string
+	for _, kv := range got.Env {
+		if k, v, _ := strings.Cut(kv, "="); k == control.TokenEnv {
+			values = append(values, v)
+		}
+	}
+	if len(values) != 1 || values[0] != "recorded" {
+		t.Errorf("%s entries = %q, want exactly [recorded]", control.TokenEnv, values)
+	}
+}
+
+// An explicit control address overrides the recorded one; the per-process
+// socket is never carried across.
+func TestRestartExplicitAddrOverridesRecord(t *testing.T) {
+	root := stateRoot(t)
+	if err := Record(root, State{PID: 4242, Socket: "/run/x.sock", TCP: "tcp://127.0.0.1:7391"}); err != nil {
+		t.Fatal(err)
+	}
+	live := true
+	var got *exec.Cmd
+	r := Runner{Root: root, Exe: "/bin/raj", Log: io.Discard, Ops: Ops{
+		Alive:  func(int) bool { return live },
+		Signal: func(int, syscall.Signal) error { live = false; return nil },
+		Spawn:  func(cmd *exec.Cmd) (int, error) { got = cmd; return 1, nil },
+	}}
+	_, st, err := r.Restart("tcp://127.0.0.1:9999", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("spawn was not called")
+	}
+	want := []string{"/bin/raj", "daemon", "run", "--control-addr", "tcp://127.0.0.1:9999", root}
+	if strings.Join(got.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("argv = %q, want the explicit address", got.Args)
+	}
+	if st.TCP != "tcp://127.0.0.1:9999" {
+		t.Errorf("state TCP = %q, want the explicit address", st.TCP)
+	}
+}
+
+// With nothing running, restart is a start: it spawns with no control flags and
+// never signals, because there is no record to carry across.
+func TestRestartNoDaemonBehavesLikeStart(t *testing.T) {
+	root := stateRoot(t)
+	signalled := false
+	var got *exec.Cmd
+	r := Runner{Root: root, Exe: "/bin/raj", Log: io.Discard, Ops: Ops{
+		Alive:  func(int) bool { return false },
+		Signal: func(int, syscall.Signal) error { signalled = true; return nil },
+		Spawn:  func(cmd *exec.Cmd) (int, error) { got = cmd; return 42, nil },
+	}}
+	pid, st, err := r.Restart("", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signalled {
+		t.Error("restart signalled with no daemon running")
+	}
+	if pid != 42 {
+		t.Errorf("pid = %d, want 42", pid)
+	}
+	if got == nil {
+		t.Fatal("spawn was not called")
+	}
+	want := []string{"/bin/raj", "daemon", "run", root}
+	if strings.Join(got.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("argv = %q, want a plain start", got.Args)
+	}
+	if st.Socket != "" || st.TCP != "" || st.Token != "" {
+		t.Errorf("state = %+v, want no carried control facts", st)
 	}
 }

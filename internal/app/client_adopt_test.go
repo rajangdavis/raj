@@ -34,13 +34,16 @@ func hostPropose(t *testing.T, srv *harness) string {
 	return path
 }
 
-// pumpUntilAdopted pumps both event loops until the client shows path.
+// pumpUntilAdopted pumps both event loops until the client shows path carrying
+// its host proposal. The tab alone is not enough: with the immediate generation
+// bump the mirror can show the tab from the daemon open before the apply's
+// snapshot lands, so a caller that inspects the pending set would race it.
 func pumpUntilAdopted(t *testing.T, ch *clientHarness, path string) *editor.Pane {
 	t.Helper()
 	deadline := time.After(3 * time.Second)
 	for {
 		for _, p := range ch.cli.Tabs.All() {
-			if p.File.Path == path {
+			if p.File.Path == path && len(p.File.Session().Pending()) > 0 {
 				return p
 			}
 		}

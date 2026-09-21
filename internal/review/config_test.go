@@ -58,7 +58,7 @@ func TestRequestedRoutesOnlyReview(t *testing.T) {
 		{[]string{"--phone", "--review"}, true},
 		{[]string{"file.go"}, false},
 		{[]string{"file.go", "--review"}, false},
-		{[]string{"--control", "."}, false},
+		{[]string{"--no-restore", "."}, false},
 	}
 	for _, c := range cases {
 		if got := Requested(c.args); got != c.want {

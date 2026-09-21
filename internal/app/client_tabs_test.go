@@ -558,15 +558,23 @@ func TestClientClosedPathDropsAStaleInstall(t *testing.T) {
 	}
 }
 
-// A client snapshot with a pending set is ViewDirty, but the client tab must
-// not show the dirty dot: it cannot save, so the dot would be a lie. The local
-// editor keeps its own marker.
-func TestClientTabHasNoDirtyDot(t *testing.T) {
-	ch := newClientHarness(t) // carries a pending proposal, so ViewDirty is true
+// A client tab with a pending proposal shows the marker, so review work is
+// visible in the tab bar; a clean client tab shows none. The client marker is
+// the mirrored review state, not a local save state, and the local editor's
+// save-oriented dot is unchanged.
+func TestClientTabShowsProposalMarker(t *testing.T) {
+	ch := newClientHarness(t) // carries a pending proposal
 	ch.cli.drain()
-	if got := ch.cli.host.Text(); strings.Contains(got, " •") {
-		t.Errorf("a client tab showed the dirty dot:\n%s", got)
+	if got := ch.cli.host.Text(); !strings.Contains(got, " •") {
+		t.Errorf("a client tab with a proposal showed no marker:\n%s", got)
 	}
+
+	clean := attachClientAt(t, controlHarness(t, "hello\n"), Options{}, 120, 30)
+	clean.cli.drain()
+	if got := clean.cli.host.Text(); strings.Contains(got, " •") {
+		t.Errorf("a clean client tab showed the marker:\n%s", got)
+	}
+
 	h := newHarness(t, "one\ntwo\n")
 	h.typeText("x")
 	h.Draw()

@@ -152,7 +152,7 @@ type Header struct {
 
 	// ReviewList is the review request's list-only switch: it returns the
 	// pending change sets without entering Review mode. Absent means false,
-	// which enters the mode; `-json` sets it.
+	// which enters the mode; `--json` sets it.
 	ReviewList bool
 	// Annotated is a read's switch for the review view's per-run change set
 	// and state. Absent means no state runs; the text is the buffer's view

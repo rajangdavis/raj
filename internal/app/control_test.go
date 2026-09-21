@@ -90,7 +90,7 @@ func controlHarness(t *testing.T, content string) *harness {
 	t.Helper()
 	h := newHarness(t, content)
 	sock := controlSock(t, "c.sock")
-	if err := h.StartControl(sock, false); err != nil {
+	if err := h.StartControl(sock); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(h.StopControl)
@@ -659,11 +659,12 @@ func TestControlCleansUpItsSocket(t *testing.T) {
 	}
 }
 
-// Off unless asked for.
+// The App itself does not listen until the CLI starts the listeners: a plain
+// editor serves nothing, and main owns which addresses, if any, are started.
 func TestControlIsOffByDefault(t *testing.T) {
 	h := newHarness(t, "x\n")
 	if h.ControlPath() != "" {
-		t.Error("a socket exists without --control")
+		t.Error("a socket exists before StartControl")
 	}
 	h.drainControl() // must be a no-op rather than a nil dereference
 }
@@ -1279,7 +1280,7 @@ func TestControlOpenRefusesAMissingPathWithoutCreate(t *testing.T) {
 	if r.OK {
 		t.Fatalf("open of a missing path without -create = %+v, want a refusal", r)
 	}
-	if !strings.Contains(r.Err, "pass -create") {
+	if !strings.Contains(r.Err, "pass --create") {
 		t.Errorf("refusal = %q, want it to point at -create", r.Err)
 	}
 	if got := h.Tabs.Count(); got != before {
@@ -1316,7 +1317,7 @@ func TestControlOpenReportsCreated(t *testing.T) {
 		t.Error("open of an existing buffer reported a create")
 	}
 
-	// A new buffer with -create is reported as made.
+	// A new buffer with --create is reported as made.
 	dir := filepath.Dir(path)
 	fresh := filepath.Join(dir, "fresh.go")
 	r := c.do(h, control.Request{Op: "open", Path: fresh, Create: true})

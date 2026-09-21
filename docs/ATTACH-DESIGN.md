@@ -172,3 +172,17 @@ Staging:
    local-render client (`snapshot` + `watch`);
 3. **phone profile and review surface** — the profile and the client-side
    review proxy landed with it; touch tabs and the review bar remain.
+
+## Decided (2026-09-20)
+
+- **`--attach` means mirror the daemon.** There is no review-tabs mode: an
+  attached client mirrors the daemon's real tabs continuously, adopts any host
+  buffer holding a pending change set, and keeps both up to date. The
+  `--review-tabs` flag and `Options.ReviewTabs`/`ReviewTabsSet` are removed;
+  `ProfileFlags(phone, ctrlAliases, ctrlAliasesSet)` resolves only the
+  `--phone`-implies-`--ctrl-aliases` rule.
+- **A local client close is a snooze, not a mute.** It hides the tab until that
+  buffer's facts (version or review state) change, then it returns. Clients may
+  legitimately differ by what each has closed; the closed marks are per client
+  and saved with the per-client view, with a legacy list-of-paths fallback that
+  re-adds the path because it carries no facts to match.

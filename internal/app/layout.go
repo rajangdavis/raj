@@ -83,7 +83,13 @@ func layoutFor(cols, rows int, side Sidebar, focus Focus, phone, bar bool) Layou
 // reserving more. The renderer and the pointer both call this, so they cannot
 // disagree about which rows exist.
 func (a *App) layout(cols, rows int) Layout {
-	return layoutFor(cols, rows, a.sidebar, a.focus, a.phone, a.phone)
+	// A standalone editor has no sidebar, whatever a stray state might say: it
+	// is one file and its tab strip.
+	side := a.sidebar
+	if a.standalone {
+		side = SidebarNone
+	}
+	return layoutFor(cols, rows, side, a.focus, a.phone, a.phone)
 }
 
 // computeLayoutChrome reserves the chrome rows above and below the panes, then

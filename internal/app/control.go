@@ -33,15 +33,13 @@ func pid() int            { return os.Getpid() }
 // internal/control can reach these types, so the unsafe version — editing from
 // the accept goroutine — is not merely discouraged, it is not expressible.
 
-// StartControl begins listening. Off unless asked for: a listener that exists
-// whenever raj runs is an attack surface for a feature most sessions do not
-// use, and on a Unix socket the trust boundary is the filesystem.
+// StartControl begins listening on one address.
 //
-// addr is a socket path or `tcp://host:port`. remoteExec permits a TCP client
-// to run commands here — off by default, because a driver in a container
-// asking for that is asking to run outside its container.
-func (a *App) StartControl(addr string, remoteExec bool) error {
-	return a.StartControlAddrs([]string{addr}, remoteExec)
+// addr is a socket path or `tcp://host:port`. It is the one-address form of
+// StartControlAddrs; the editor passes its resolved socket and TCP address
+// together through that, so both are up at once.
+func (a *App) StartControl(addr string) error {
+	return a.StartControlAddrs([]string{addr})
 }
 
 // StartControlAddrs begins listening on each address at once, over one queue
@@ -52,7 +50,12 @@ func (a *App) StartControl(addr string, remoteExec bool) error {
 //
 // An empty entry means the default socket, so a caller that has a flag can
 // pass "" rather than resolve the convention itself.
-func (a *App) StartControlAddrs(addrs []string, remoteExec bool) error {
+func (a *App) StartControlAddrs(addrs []string) error {
+	if a.standalone {
+		// A standalone editor is private: it serves no control listener even
+		// when an address was named on the command line.
+		return nil
+	}
 	if len(addrs) == 0 {
 		addrs = []string{""}
 	}
@@ -67,7 +70,6 @@ func (a *App) StartControlAddrs(addrs []string, remoteExec bool) error {
 	if err != nil {
 		return err
 	}
-	srv.AllowRemoteExec = remoteExec
 	a.control = srv
 	a.seedParticipants()
 	return nil
@@ -114,7 +116,7 @@ func (a *App) ControlPaths() []string {
 // than about messaging.
 func (a *App) Tell(to uint8, text string) error {
 	if a.control == nil {
-		return fmt.Errorf("no control listener; start raj with --control")
+		return fmt.Errorf("no control listener")
 	}
 	return a.control.Send(to, text)
 }
@@ -125,7 +127,7 @@ func (a *App) Tell(to uint8, text string) error {
 // mailbox is full or that went away between the listing and the send must not
 // turn that into a failed save. Errors are dropped for the same reason. With no
 // control listener there is nothing to tell, which is the ordinary case for a
-// session started without --control.
+// client, which serves none.
 //
 // The path is the whole message: a driver knows what it asked for and needs to
 // know which save landed. It is a helper rather than an inline loop so both
@@ -246,6 +248,11 @@ func (a *App) drainControl() {
 		a.notifySuperseded(p.Req, res)
 		p.Reply(res)
 	}
+	// A control-driven change wakes the parked watchers now rather than on the
+	// next idle tick, so a decision on one client reaches the others at the
+	// same beat its own author sees it. The idle tick still calls controlTick,
+	// which is what catches a change made outside a control request.
+	a.controlTick()
 }
 
 // notifySuperseded tells the author of each Proposed set that a landed apply or
@@ -475,7 +482,7 @@ func (h host) Open(path string, create bool) (uint64, bool, error) {
 	// one.
 	if !create {
 		if _, err := os.Stat(path); err != nil {
-			return 0, false, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
+			return 0, false, fmt.Errorf("no open buffer or file at %s; pass --create to make a new buffer", path)
 		}
 	}
 	h.a.openFileQuiet(path)

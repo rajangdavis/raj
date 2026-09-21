@@ -119,7 +119,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   `documentLink` rendering, `signatureHelp` triggers, `onTypeFormatting`
   multi-cursor, dynamic registration beyond `workspace/symbol`, a format-on-save
   setting, `$/progress` and `$/trace`.
-- File lifecycle remaining: directory rename and `run -prog` reachability for
+- File lifecycle remaining: directory rename and `run --prog` reachability for
   the new verbs.
 - Small and split panes, and how they resize.
 - No Bubbletea adapter yet (the `ui.Host` surface keeps growing).
@@ -151,19 +151,19 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   deterministic truncation before a worker pool, and a multicore box to measure.
 - Re-run the call census after the next wave against the success criteria in
   AGENT-FEEDBACK (read share from 32.5%, `search→read` from 2,761).
-- `search -path` into a hidden directory ignores `-hidden`; decide and state it.
-- Multi-target read: `-json` shape differs from the single read (no author, no
+- `search --path` into a hidden directory ignores `--hidden`; decide and state it.
+- Multi-target read: `--json` shape differs from the single read (no author, no
   per-file spans); decide whether it carries authorship.
 - Multi-target read: a shared span that overruns one target refuses the whole
-  call while a shared `-lines` clamps per file; decide clamp or refuse.
+  call while a shared `--lines` clamps per file; decide clamp or refuse.
 - `Buffer.Bytes` means document length in a `buffers` reply and contributed
   bytes in a multi-read; document it.
 - `readMany`'s `annotated` parameter is always false; drop it.
-- `read -lines` carries no byte offsets; a byte-span read is still wanted, and a
-  `-start`/`-end` or `-lines` `read -json` reply does not echo the span it read
+- `read --lines` carries no byte offsets; a byte-span read is still wanted, and a
+  `--start`/`--end` or `--lines` `read --json` reply does not echo the span it read
   (the keys are `author`/`spans`/`text`/`version`). Echo `start`/`end` (or
   `bytes`) so a driver re-derives offsets without a second call.
-- `run -prog` payload paths are unmapped (`Client.toEditor` maps the field verbs
+- `run --prog` payload paths are unmapped (`Client.toEditor` maps the field verbs
   only).
 - `braceTally` counts markdown fences as code; a per-language "is this source"
   answer is the real fix.
@@ -211,7 +211,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - Dump snapshots are keyed by author id, not identity; `dump` to `patch` fails
   across a reconnect.
 - Only `revert` compares the author to the connection; `patch`,
-  `delete -withdraw` and `rmdir -withdraw` trust the field.
+  `delete --withdraw` and `rmdir --withdraw` trust the field.
 - Nothing in the editor calls `App.Tell` except saves; the user-facing prompt,
   its chord and a multi-driver picker are missing.
 - A full mailbox is reported to nobody (same missing caller).
@@ -223,15 +223,13 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - A saved wave has no enumerable diff for the review pass: add a
   `history`/`changes` verb, or make the brief's file list the explicit contract.
 
+- The installed `raj-editor` skill
+  (`~/.config/opencode/skills/raj-editor/SKILL.md`) still names
+  `--control-exec`; only the repo copy was updated. The orchestrator edits
+  opencode config directly.
+
 ### Client mode and attach
 
-- **A decision-only change may not wake the watch.** `bufferVersionHash`
-  (`internal/app/control.go`) hashes open-buffer versions, so accept/reject/
-  clear — which do not move `Session.Version` — leave the generation unchanged.
-  The client refetches its own decisions explicitly, but a second client or the
-  daemon UI deciding a set would not be seen. Decide whether the hash includes
-  `DecisionGeneration` (or the tick watches the group list) so decisions wake
-  watchers. *A watcher sees every change the screen shows.*
 - **A snapshot cannot capture mid-transaction.** `SnapshotState` omits
   `Session.depth`, so a snapshot taken between `Begin` and `End` loses the open
   undo transaction and the restored session groups those edits differently.
@@ -293,7 +291,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   final against the tick.
 - The container `raj` can lag the editor; rework the release/rebuild step or
   make an empty `srcVersion` detectable.
-- A `claim` without `-add` silently replaces the set; warn when it replaces a
+- A `claim` without `--add` silently replaces the set; warn when it replaces a
   non-empty set.
 - The standing between-wave reconciler needs a thin wrapper so the pass is
   invoked rather than remembered.
@@ -301,17 +299,35 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   needs a reproduction.
 - A buffer that is entirely another author's pending proposal was uneditable;
   the overlap/reconciliation case.
-- New `raj ctl` against an old server warns falsely on `-include` (the shipped
+- New `raj ctl` against an old server warns falsely on `--include` (the shipped
   skew warning does not suppress the zero-`Considered` message).
 - Subagent transcripts feed the efficiency loop (mine task outputs for wasted
   tool calls and brief-quality patterns).
 
 ### Agent feedback — actionable (context in AGENT-FEEDBACK.md)
 
+- **`buffers` never populates `Superseded`, so the field and the client mark's
+  `superseded` component are inert (2026-09-20).** `host.Buffers()` sets
+  `Pending` and `Moved` but not `Superseded`, so the sparse `hBufferSuperseded`
+  (0x5d) field is never emitted and `bufferMark.superseded`/`closedMark.Superseded`
+  are always zero; the comparison they feed cannot move. Populate it from the
+  invalid sets a save would drop (`Session.UnsavedProposed`) or drop the field
+  and the mark component. *A wire fact with no producer is a comparison that
+  cannot fail.*
+- **Multi-path `lsp diagnostics --json` loses the path (2026-09-20).** A batch
+  prints one bare `{"status":"ok"}` per operand with no path, so a reader can
+  only attribute a status by position; carry the path on each entry (or return a
+  JSON list keyed by path). *A batch answer names each thing it answers for.*
+- **`TestClientViewReadsLegacyClosedPaths` is vacuous (2026-09-20).** A failed
+  legacy parse and a legacy mark both re-add the same daemon tab, so the test
+  passes without the `closedMarks.UnmarshalJSON` legacy branch it names; seed a
+  case where the two diverge. *A test that passes for the bug it guards is not a
+  test.*
+
 - Name the search hit's offsets so a row cannot be mistaken for a byte range:
   `line` is a line number while `line_start`/`line_end` are byte offsets.
 - State or fix the scope split between `groups` (one buffer) and `proposals`
-  (whole workspace), so `groups -mine` with no focused buffer does not read as
+  (whole workspace), so `groups --mine` with no focused buffer does not read as
   "no sets".
 - **DECIDED (user, 2026-09-17): keep the linewise paste text-suffix
   rule.** `PasteClip` keeps keying on `strings.HasSuffix(Text, "\n")`, so a
@@ -345,7 +361,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - Line/col in `apply`/`edit` replies needs a wire and coordinate decision; the
   reply names the new version but not the new change-set id, so a driver must
   call `groups`/`proposals` to reject, clear or `goto` the set it just applied.
-- Make the write target explicit (a mandatory path or `-active`/`-here`).
+- Make the write target explicit (a mandatory path or `--active`/`--here`).
 - Consolidate `read`/`version`/`dump` and collapse the write verbs onto one
   door.
 - Raw-LSP passthrough: decide whether it earns its surface, then file it or drop
@@ -353,29 +369,66 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - Define or drop the Stream A/B/C/D labels; the user's definitions are needed.
 - No `ping`/health-check CLI verb (the protocol op exists).
 - `help`/`-h` are reachable but absent from the usage list.
-- `whoami -as X` printed a fresh anon id once; confirm before trusting `whoami`
+- `whoami --as X` printed a fresh anon id once; confirm before trusting `whoami`
   as the bind check.
-- **`-as` must follow the verb.** `raj ctl -as KEY search` fails with `unknown
-  command "-as"` and prints the whole usage, so a driver that puts the identity
+- **`--as` must follow the verb.** `raj ctl --as KEY search` fails with `unknown
+  command "--as"` and prints the whole usage, so a driver that puts the identity
   flag first is stuck; accept it before the verb too, or state the placement in
   the usage text.
 
 - **`search`'s regex-metachar hint misleads on a literal miss.** The hint
   (`internal/control/cli.go` `hasRegexMeta`) fires whenever a zero-match
-  literal pattern contains regex syntax and says "retry with -regex"; when the
-  literal really is absent, `-regex` is the wrong fix. It also exits nonzero as
+  literal pattern contains regex syntax and says "retry with --regex"; when the
+  literal really is absent, `--regex` is the wrong fix. It also exits nonzero as
   if the pattern were refused, so a caller cannot tell a literal absence from a
   rejected query (`search -q 'zzq[unlikely'` prints the hint and exits 1).
-  Reword to offer both readings (pass `-regex` if you meant a regex; otherwise
+  Reword to offer both readings (pass `--regex` if you meant a regex; otherwise
   the literal matched nothing) and keep the nonzero exit for "no matches" only.
-- **`read -json` omits `bytes`/`lines`.** `version -json` returns them and
-  `read -json` does not, so a driver that just read the text makes a second
+- **`read --json` omits `bytes`/`lines`.** `version --json` returns them and
+  `read --json` does not, so a driver that just read the text makes a second
   call for the count. Add them to the read reply or state the split.
 - **`lsp diagnostics`' multi-path reply is not machine-readable.** A cold start
-  prints `starting language server…` per path (non-JSON) and the `-json` form
+  prints `starting language server…` per path (non-JSON) and the `--json` form
   emits one unframed JSON object per file instead of one array, so a driver must
   split lines and has no status for a path that never answered. Frame the batch
   as one array and carry the cold-start state in `status` or on stderr only.
+
+### Flag usage printing
+
+- **The `--daemon` alias is not hidden.** The init in `cmd/raj/main.go` guards
+  `flag.FlagSet.MarkHidden` behind an interface assertion, but released Go has
+  no `MarkHidden` and no `Flag.Hidden`/`hidden` field, so the assertion never
+  fires and `control.flagHidden` can never be true. Live `raj --help` prints
+  `--daemon daemon run`, the backquoted `` `daemon run` `` taken as the value
+  placeholder. Decide: hide it by name in `editorUsage`, or accept it visible
+  and delete the dead guard and the false comment. Escalated 2026-09-20.
+- **The editor `--help` lost its header.** `editorUsage` calls only
+  `control.PrintFlagUsage`, so `raj --help` opens on the flag list with no
+  `usage: raj [options] [file|dir]` line where the default printed
+  `Usage of <path>:`. Decide whether to add one. Escalated 2026-09-20 (UX).
+- **`--q` prints with two dashes.** `PrintFlagUsage` prints every flag as
+  `--name`, so `raj ctl search -h` says `--q string` while the hand-written
+  usage says `search -q PATTERN` and the convention keeps single-letter shorts
+  on one dash. Print a one-letter flag with one dash and assert it.
+- **Backquoted words in a usage string leak into the placeholder.**
+  `flag.UnquoteUsage` treats a backquoted word as the value name, so
+  `raj ctl apply -h` prints `--group groups` and `--dump dump` where the value
+  is a uint; the same mechanism renders `--daemon daemon run` in the editor
+  help. Drop the backquotes or accept the rendering.
+- **`PrintFlagUsage` has no panic guard on a default text.** `flag.isZeroValue`
+  wraps the zero `String()` call in `recover`; `flagDefaultText` does not, so a
+  custom `flag.Value` that panics on a zero receiver would panic the help
+  path. Latent: no custom `Value` is registered today. Mirror the stdlib
+  recover, or state why not.
+
+### Claim surface
+
+- **`claim` with a bare path silently replaces the working set.** `claim` with
+  operands replaces the set unless `--add` is given (documented), so an agent
+  that claims a later path loses the earlier ones and its writes are refused
+  until it re-claims; both a subagent and this review pass paid a retry for it.
+  Warn when a replace would drop a non-empty set, or make `--add` the default
+  with an explicit `--replace`. Escalated 2026-09-20.
 
 ## Direction (documented, not scheduled)
 
@@ -414,7 +467,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   renderer project, not an LSP one.
 - **Conflict navigation over git diffs** (not scheduled): navigation in terms of
   git diffs, with resolution staying native — no work trees or branch hackery.
-- **`edit -base` and miss-point reporting** — under discussion with the user;
+- **`edit --base` and miss-point reporting** — under discussion with the user;
   not scheduled.
 - **East Asian Ambiguous arrow width is terminal-dependent (escalated,
   2026-09-18).** `RuneWidth` now counts `←`/`→`/`↔` two cells, confirmed only

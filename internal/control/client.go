@@ -585,17 +585,21 @@ func Discover() []Instance {
 
 // Locate picks the socket to talk to.
 //
-// Explicit beats implicit throughout: an argument, then RAJ_CONTROL_ADDR or its
-// older spelling RAJ_SOCKET, then
-// discovery. Discovery prefers an editor whose root contains the working
-// directory, since a bridge is normally started inside the project it is meant
-// to drive. Several matches is an error rather than a guess — editing the wrong
-// repository is not a mistake worth being convenient about.
+// Explicit beats implicit throughout: an argument, then RAJ_CONTROL_ADDR, then
+// SocketEnv (a socket the server and client were both pinned to), then the
+// older spelling RAJ_SOCKET, then discovery. Discovery prefers an editor whose
+// root contains the working directory, since a bridge is normally started
+// inside the project it is meant to drive. Several matches is an error rather
+// than a guess — editing the wrong repository is not a mistake worth being
+// convenient about.
 func Locate(explicit, cwd string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
 	}
 	if env := os.Getenv(AddrEnv); env != "" {
+		return env, nil
+	}
+	if env := os.Getenv(SocketEnv); env != "" {
 		return env, nil
 	}
 	if env := os.Getenv("RAJ_SOCKET"); env != "" {
@@ -604,7 +608,7 @@ func Locate(explicit, cwd string) (string, error) {
 	found := Discover()
 	switch len(found) {
 	case 0:
-		return "", fmt.Errorf("no running raj found in %s; start one with --control, "+
+		return "", fmt.Errorf("no running raj found in %s; start raj, "+
 			"or set %s (a path, or tcp://host:port for a raj on another machine "+
 			"or outside this container)", filepath.Dir(DefaultPath()), AddrEnv)
 	case 1:

@@ -160,7 +160,7 @@ func (h *memHost) Open(path string, create bool) (uint64, bool, error) {
 		// the missing file the real host stats for. create is what tells the
 		// two apart.
 		if !create {
-			return 0, false, fmt.Errorf("no open buffer or file at %s; pass -create to make a new buffer", path)
+			return 0, false, fmt.Errorf("no open buffer or file at %s; pass --create to make a new buffer", path)
 		}
 		h.docs[path], h.vers[path] = "", 1
 		created = true
@@ -603,7 +603,7 @@ func TestDispatchOpenReportsCreated(t *testing.T) {
 		t.Errorf("open of an existing buffer = %+v, want ok and not created", res)
 	}
 
-	// A new path with -create reports the buffer as made.
+	// A new path with --create reports the buffer as made.
 	fresh := filepath.Join(h.root, "new.go")
 	res = Dispatch(g, Request{Op: "open", Path: fresh, Author: FirstAgent, Create: true})
 	if !res.OK || !res.Created {

@@ -471,7 +471,7 @@ func (a *App) copyPath(path string) {
 // revealPath shows a tab's file in the explorer: it opens the explorer,
 // expands every ancestor above the file, and selects its row.
 func (a *App) revealPath(path string) {
-	if path == "" {
+	if path == "" || a.standalone {
 		return
 	}
 	a.sidebar = SidebarExplorer

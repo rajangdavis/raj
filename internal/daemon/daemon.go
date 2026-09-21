@@ -201,6 +201,11 @@ type Runner struct {
 	// Args are the extra arguments between "daemon run" and the root: the
 	// control flags start forwards.
 	Args []string
+	// Env is extra environment for the spawned daemon, layered over the process
+	// environment. A key the process already sets is replaced, not duplicated:
+	// Go passes the slice through and two RAJ_CONTROL_TOKEN entries would leave
+	// which one wins unspecified.
+	Env []string
 	// Log receives the daemon stdout and stderr; nil opens Paths.Log.
 	Log io.Writer
 	// Ops is the OS seam.
@@ -215,6 +220,29 @@ const (
 	defaultWait = 5 * time.Second
 	defaultStep = 20 * time.Millisecond
 )
+
+// withEnv layers extra over base, replacing a key base already carries rather
+// than appending a second copy. os/exec passes a duplicate RAJ_CONTROL_TOKEN
+// straight to the OS, and which one wins is then unspecified, so replacing is
+// the only reliable way to fix a spawned child's token.
+func withEnv(base, extra []string) []string {
+	out := append([]string(nil), base...)
+	for _, kv := range extra {
+		key, _, _ := strings.Cut(kv, "=")
+		replaced := false
+		for i, have := range out {
+			if k, _, _ := strings.Cut(have, "="); k == key {
+				out[i] = kv
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
 
 // Pid returns the recorded pid, without judging liveness. ok is false when no
 // pidfile exists.
@@ -251,6 +279,9 @@ func (r Runner) Start() (int, error) {
 	argv := append([]string{"daemon", "run"}, r.Args...)
 	argv = append(argv, r.Root)
 	cmd := Detached(exe, argv, log)
+	if len(r.Env) > 0 {
+		cmd.Env = withEnv(os.Environ(), r.Env)
+	}
 	pid, err := r.Ops.spawn()(cmd)
 	if err != nil {
 		return 0, err
@@ -259,6 +290,38 @@ func (r Runner) Start() (int, error) {
 		return 0, err
 	}
 	return pid, nil
+}
+
+// Restart stops the running daemon and starts it again, carrying the running
+// daemon's TCP address and token across unless the caller overrides the
+// address. A workspace with no daemon is the no-op Stop already is, so this
+// then behaves like a first start.
+//
+// The socket path is not carried: it is per-process, so the new daemon binds
+// its own DefaultPath (or the SocketEnv override it inherits). An empty addr
+// keeps the recorded address.
+func (r Runner) Restart(addr string, noRestore bool) (int, State, error) {
+	old, running := r.Status()
+	if addr == "" {
+		addr = old.TCP
+	}
+	token := ""
+	var env []string
+	if running && old.Token != "" {
+		token = old.Token
+		env = []string{control.TokenEnv + "=" + old.Token}
+	}
+	if _, err := r.Stop(); err != nil {
+		return 0, State{}, err
+	}
+	start := r
+	start.Args = controlForward(addr, noRestore)
+	start.Env = env
+	pid, err := start.Start()
+	if err != nil {
+		return 0, State{}, err
+	}
+	return pid, State{PID: pid, TCP: addr, Token: token}, nil
 }
 
 // logWriter picks the daemon's output sink: a test-supplied writer, else the
@@ -377,9 +440,15 @@ func ResolveRoot(arg string) (string, error) {
 
 const usage = `usage: raj daemon <command> [dir] [options]
 
-  start [dir] [--control-addr ADDR] [--control-socket PATH] [--control-exec]
+  start [dir] [--control-addr ADDR] [--no-restore]
                              run the headless host in the background; refused
-                             while one already runs for the workspace
+                             while one already runs for the workspace; --no-restore
+                             starts it without the previous session
+  restart [dir] [--control-addr ADDR] [--no-restore]
+                             stop the daemon and start a fresh one, keeping its
+                             TCP address and token unless --control-addr
+                             overrides the address; the socket path is always
+                             the new process default (RAJ_CONTROL_SOCKET/XDG)
   stop [dir]                 stop the background daemon; a no-op when none runs
   status [dir]               report whether the daemon runs, and its socket,
                              TCP address and token
@@ -404,6 +473,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return startCLI(args[1:], stdout, stderr)
 	case "stop":
 		return stopCLI(args[1:], stdout, stderr)
+	case "restart":
+		return restartCLI(args[1:], stdout, stderr)
 	case "status":
 		return statusCLI(args[1:], stdout, stderr)
 	case "run":
@@ -415,17 +486,37 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+// controlForward builds the daemon run flags for the control listener and the
+// session choice from the start and restart CLI values. An empty address is
+// omitted so the child keeps its own default rather than being handed an empty
+// one; --no-restore is a bool and carries no value.
+func controlForward(addr string, noRestore bool) []string {
+	var args []string
+	if addr != "" {
+		args = append(args, "--control-addr", addr)
+	}
+	if noRestore {
+		args = append(args, "--no-restore")
+	}
+	return args
+}
+
 func startCLI(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("raj daemon start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: raj daemon start [dir] [--control-addr ADDR] [--control-socket PATH] [--control-exec]")
-		fs.PrintDefaults()
+		out := fs.Output()
+		fmt.Fprintln(out, "usage: raj daemon start [dir] [--control-addr ADDR] [--no-restore]")
+		control.PrintFlagUsage(out, fs)
 	}
-	addr := fs.String("control-addr", "", "also listen on tcp://host:port")
-	sock := fs.String("control-socket", "", "path for the control socket")
-	remote := fs.Bool("control-exec", false, "with --control-addr: let a remote driver run commands here")
-	if err := fs.Parse(flagsFirst(args)); err != nil {
+	addr := fs.String("control-addr", control.DefaultTCPAddr, "TCP control address for the daemon; "+control.DefaultTCPAddr+" is the default")
+	noRestore := fs.Bool("no-restore", false, "start the daemon without restoring the previous session")
+	prepared, err := flagsFirst(args, startSpec)
+	if err != nil {
+		fmt.Fprintln(stderr, "raj daemon start:", err)
+		return 2
+	}
+	if err := fs.Parse(prepared); err != nil {
 		return 2
 	}
 	root, err := ResolveRoot(fs.Arg(0))
@@ -433,16 +524,7 @@ func startCLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "raj daemon start:", err)
 		return 1
 	}
-	var forward []string
-	if *addr != "" {
-		forward = append(forward, "--control-addr", *addr)
-	}
-	if *sock != "" {
-		forward = append(forward, "--control-socket", *sock)
-	}
-	if *remote {
-		forward = append(forward, "--control-exec")
-	}
+	forward := controlForward(*addr, *noRestore)
 	pid, err := Runner{Root: root, Args: forward}.Start()
 	if err != nil {
 		fmt.Fprintln(stderr, "raj daemon start:", err)
@@ -484,39 +566,116 @@ func statusCLI(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "raj daemon: running (pid %d)\n", s.PID)
-	if s.Socket != "" {
-		fmt.Fprintf(stdout, "  socket %s\n", s.Socket)
-	}
-	if s.TCP != "" {
-		fmt.Fprintf(stdout, "  tcp %s\n", s.TCP)
-	}
-	if s.Token != "" {
-		fmt.Fprintf(stdout, "  token %s\n", s.Token)
-	}
+	printState(stdout, s)
 	return 0
 }
+
+func restartCLI(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("raj daemon restart", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintln(out, "usage: raj daemon restart [dir] [--control-addr ADDR] [--no-restore]")
+		fmt.Fprintln(out, "restart the daemon, keeping the running one's TCP address and token")
+		fmt.Fprintln(out, "unless --control-addr overrides the address. The socket path is not")
+		fmt.Fprintln(out, "recorded, so the new daemon binds its own default.")
+		control.PrintFlagUsage(out, fs)
+	}
+	addr := fs.String("control-addr", control.DefaultTCPAddr, "TCP control address; default: the running daemon's")
+	noRestore := fs.Bool("no-restore", false, "restart the daemon without restoring the previous session")
+	prepared, err := flagsFirst(args, restartSpec)
+	if err != nil {
+		fmt.Fprintln(stderr, "raj daemon restart:", err)
+		return 2
+	}
+	if err := fs.Parse(prepared); err != nil {
+		return 2
+	}
+	// Only a flag the user typed overrides the recorded address: a default is
+	// not a decision, and passing it would move a daemon off the address its
+	// clients already know on every restart.
+	var addrSet bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "control-addr" {
+			addrSet = true
+		}
+	})
+	root, err := ResolveRoot(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintln(stderr, "raj daemon restart:", err)
+		return 1
+	}
+	preserve := ""
+	if addrSet {
+		preserve = *addr
+	}
+	pid, s, err := (Runner{Root: root}).Restart(preserve, *noRestore)
+	if err != nil {
+		fmt.Fprintln(stderr, "raj daemon restart:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "raj daemon: restarted pid %d\n", pid)
+	printState(stdout, s)
+	return 0
+}
+
+// printState writes the control address and token lines status and restart
+// share, so a restart reports the same facts a status would.
+func printState(w io.Writer, s State) {
+	if s.Socket != "" {
+		fmt.Fprintf(w, "  socket %s\n", s.Socket)
+	}
+	if s.TCP != "" {
+		fmt.Fprintf(w, "  tcp %s\n", s.TCP)
+	}
+	if s.Token != "" {
+		fmt.Fprintf(w, "  token %s\n", s.Token)
+	}
+}
+
+// flagSpec is one daemon subcommand's flag surface: known is every flag name,
+// so a bare token that matches one is refused, and takesValue marks the flags
+// that consume the next argument so flagsFirst keeps a value beside its flag.
+type flagSpec struct {
+	known      map[string]bool
+	takesValue map[string]bool
+}
+
+var (
+	startSpec = flagSpec{
+		known:      map[string]bool{"control-addr": true, "no-restore": true},
+		takesValue: map[string]bool{"control-addr": true},
+	}
+	restartSpec = startSpec
+)
 
 // flagsFirst moves the one bare [dir] argument to the end, so flag.Parse sees
 // the flags first and the directory as its positional whichever order the user
 // typed them in: `raj daemon start --control-addr X dir` and `... dir
 // --control-addr X` both work. Value-taking flags keep the value beside them.
-func flagsFirst(args []string) []string {
-	takesValue := map[string]bool{"control-addr": true, "control-socket": true}
+//
+// A bare token that names a flag is refused rather than taken for the
+// directory, with the double-dash spelling named: `start no-restore` would
+// otherwise quietly start a daemon rooted at ./no-restore.
+func flagsFirst(args []string, spec flagSpec) ([]string, error) {
 	var flags, dirs []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
 			flags = append(flags, a)
 			name := strings.TrimLeft(strings.SplitN(a, "=", 2)[0], "-")
-			if takesValue[name] && !strings.Contains(a, "=") && i+1 < len(args) {
+			if spec.takesValue[name] && !strings.Contains(a, "=") && i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
 			}
 			continue
 		}
+		if spec.known[a] {
+			return nil, fmt.Errorf("unknown argument %q; did you mean --%s?", a, a)
+		}
 		dirs = append(dirs, a)
 	}
-	return append(flags, dirs...)
+	return append(flags, dirs...), nil
 }
 
 // commandRoot parses the lone optional dir argument the stop and status

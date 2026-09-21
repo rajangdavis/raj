@@ -989,7 +989,7 @@ func TestHeadlessHostServesControl(t *testing.T) {
 	t.Cleanup(a.CloseState)
 	a.OpenFile(path)
 	sock := controlSock(t, "headless.sock")
-	if err := a.StartControl(sock, false); err != nil {
+	if err := a.StartControl(sock); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(a.StopControl)

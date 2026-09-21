@@ -1,8 +1,8 @@
 # Claim — design note and verb spec
 
 Status: built and live 2026-09-13/14 (rebuilt and host-verified). Supersedes
-the earlier enforced/TTL version. `claim`/`-add`/`-clear`, Guard enforcement,
-and `open -create` auto-extend are in the binary; see COMPLETED.md.
+the earlier enforced/TTL version. `claim`/`--add`/`--clear`, Guard enforcement,
+and `open --create` auto-extend are in the binary; see COMPLETED.md.
 
 ## 1. Purpose
 
@@ -15,7 +15,7 @@ stays `Session.Leased`'s reactive job).
 
 ## 2. Model
 
-- A claim set is per **identity** (the explicit `register`/`-as` key), not per
+- A claim set is per **identity** (the explicit `register`/`--as` key), not per
   connection and not per app.
 - Let n = size of the set. Enforcement (socket writers only; the human UI is
   never gated):
@@ -38,18 +38,18 @@ stays `Session.Leased`'s reactive job).
   editor spellings resolve as every verb does; each path is validated in-root.
   A path that is neither on disk nor an already-open buffer is warned per-path
   and skipped; a path that exists on disk, or that is already open (a buffer
-  created with `open -create` before it is saved), is claimed and the command
+  created with `open --create` before it is saved), is claimed and the command
   succeeds.
 - `raj ctl claim <dir>` — a directory operand walks the subtree and claims each
   file under it (a snapshot at claim time; a file created afterwards is not
   auto-claimed). The directory path is also held as a set entry, so `rmdir
   <dir>` is one `claimCheck` on the dir itself (see
   `docs/FILE-LIFECYCLE-SPEC.md` §11).
-- `raj ctl claim -add <path>...` — extend the current set.
+- `raj ctl claim --add <path>...` — extend the current set.
 - `raj ctl claim -clear` — release it.
 - `raj ctl claim` (no operands) — report the current set (and other live
   claimants).
-- `open -create <path>` — creates the buffer AND auto-extends the claim with
+- `open --create <path>` — creates the buffer AND auto-extends the claim with
   `<path>` (when the set was empty this is `{path}`). The create itself is the
   declaration of intent; no second command.
 - Response shape (proposal): `Claims []string`, `ClaimWarnings []string`,
@@ -57,15 +57,15 @@ stays `Session.Leased`'s reactive job).
 
 ## 4. Enforcement
 
-- Server-side in the `Guard` (the validation chokepoint), so `run -prog`'s
+- Server-side in the `Guard` (the validation chokepoint), so `run --prog`'s
   apply cannot bypass it — not only in the CLI.
 - "Write" = text-mutating socket verbs: `apply`, `edit`, `patch`, and the
-  apply reachable through `run -prog`.
+  apply reachable through `run --prog`.
 - The Guard resolves the effective target (explicit path, or the sole claimed
   file for a pathless write) and checks set membership before touching the
   buffer.
 - Refusal text names the set size/remedy, e.g. "not in your claim set (a.go,
-  b.go); `claim -add <path>`" and, for n > 1 and pathless, "claim set has 2
+  b.go); `claim --add <path>`" and, for n > 1 and pathless, "claim set has 2
   files; name one".
 - `save` is the human approval gesture, not an agent write. Recommended
   treatment: a socket `save` is NOT gated, because it writes the accepted
@@ -76,9 +76,9 @@ stays `Session.Leased`'s reactive job).
 
 ## 5. Create and directories
 
-- `open -create` auto-extends (section 3).
+- `open --create` auto-extends (section 3).
 - A created file whose parent directory does not exist is a mkdir problem —
-  see the lifecycle plan; for now the parent-dir handling of `open -create` is
+  see the lifecycle plan; for now the parent-dir handling of `open --create` is
   an open implementation point.
 
 ## 6. File lifecycle
@@ -125,11 +125,11 @@ kept as the decision history they became:
 
 ## 9. Work items (proposed order)
 
-1. `claim`/`-add`/`-clear`/report verb, per-identity in-memory state, CLI +
+1. `claim`/`--add`/`--clear`/report verb, per-identity in-memory state, CLI +
    tests.
 2. Enforcement in the Guard + the n==1 pathless rule + refusal messages +
    tests.
-3. `open -create` auto-extend.
+3. `open --create` auto-extend.
 4. File lifecycle verbs (`mkdir`/`rmdir`/`delete`/`rename`) with claim gating —
    its own design pass before code.
 5. Journal persistence of claims (later).
@@ -143,4 +143,4 @@ kept as the decision history they became:
 - is a socket `save` gated.
 - how overlap is surfaced to a second claimant (`who`, or a future `watch`
   push).
-- interaction with `open -create` when the parent directory is missing.
+- interaction with `open --create` when the parent directory is missing.

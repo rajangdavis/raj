@@ -32,7 +32,7 @@ than just filing it: raw findings to `docs/AGENT-FEEDBACK.md`, actionable work t
 You cannot compile: the host's `make check` is the final gate, and a failed
 check resumes you with the failure.
 
-Access: register once (`raj ctl register -as <key>`) and pass `-as <key>` on
+Access: register once (`raj ctl register --as <key>`) and pass `--as <key>` on
 every later call. All file reads and writes go through the raj-editor skill
 (`raj ctl read`/`search`/`apply`/`edit`); claim a file before editing it.
 Never edit the user's files with direct tools; for tests, builds and git use

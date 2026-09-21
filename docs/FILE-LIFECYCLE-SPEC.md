@@ -58,17 +58,17 @@ rename remain.
 - `delete` requires the path to be in the caller's claim set (the W2 gate), so
   an agent can only propose removing a file it declared. Reads are unaffected.
 - `delete` is a socket write of a path, not of text; it must still run through
-  the `Guard` so `run -prog` cannot bypass the claim check.
+  the `Guard` so `run --prog` cannot bypass the claim check.
 
 ## 6. Verb surface (built — delete/deletions; rmdir in §11)
 
 - `raj ctl delete <path>` — record a pending deletion (claim-gated).
-- `raj ctl delete -withdraw <path>` — the proposing agent withdraws it.
+- `raj ctl delete --withdraw <path>` — the proposing agent withdraws it.
 - `raj ctl deletions` — list pending deletions (path, author), so a driver
   can see them without opening the file. (A timestamp is a later nicety.)
 - Approval is the **human prompt** (section 3). No socket accept/reject in v1:
   the whole point is that the human, on seeing the file, decides.
-- `run -prog` reachability is out of scope for v1 (as with `mkdir`).
+- `run --prog` reachability is out of scope for v1 (as with `mkdir`).
 
 ## 7. Folders
 
@@ -80,7 +80,7 @@ rename remain.
 
 1. Pending-deletion state in the app (workspace-level, with author), plus
    `deletions` listing.
-2. `delete` / `delete -withdraw` verbs, wire, and the claim gate through the
+2. `delete` / `delete --withdraw` verbs, wire, and the claim gate through the
    Guard.
 3. The prompt on open/focus and for already-open buffers; Ignore / Remove
    forever; refuse Remove forever while dirty or pending.
@@ -93,7 +93,7 @@ rename remain.
 - Whether a driver should ever be able to accept/reject over the socket, or the
   human prompt stays the only gate.
 - Where pending deletions surface: `who`, the status line, or both.
-- `run -prog` reachability, punted with `mkdir`'s.
+- `run --prog` reachability, punted with `mkdir`'s.
 
 ## 10. W4c — `rename` (decided 2026-09-13; W4c-1 built 2026-09-14)
 
@@ -129,11 +129,11 @@ than a one-file prompt.
 
 - `raj ctl rmdir <dir>` — propose removing the directory and its subtree;
   records a pending dir-removal (with author), unlinks nothing. Idempotent.
-- `raj ctl rmdir -withdraw <dir>` — the proposing author retracts it; no-op
+- `raj ctl rmdir --withdraw <dir>` — the proposing author retracts it; no-op
   when absent, refused for a proposal from another author.
 - `raj ctl rmdirs` — list pending dir-removals (dir, author).
 - Approval is the human **remove** answer in the review tab; no socket
-  accept/reject in v1. `run -prog` reachability is out of scope, as with
+  accept/reject in v1. `run --prog` reachability is out of scope, as with
   `mkdir`/`delete`.
 
 **Claim gate.** `claim <dir>` records the directory path as a set entry and
@@ -167,4 +167,4 @@ tree are dropped the way `closeDeletedPane` drops a deleted file buffer, and
 the tree and session are refreshed.
 
 **Left for later.** Per-entry (partial) removal; a permanent dismiss answer; a
-socket accept/reject; `run -prog` reachability; directory rename.
+socket accept/reject; `run --prog` reachability; directory rename.

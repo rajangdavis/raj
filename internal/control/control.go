@@ -43,6 +43,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"raj/internal/safe"
@@ -117,7 +118,7 @@ type Request struct {
 	LSPMode string
 	// ReviewList is set on a review request to return the pending change sets
 	// without entering Review mode. Its absence enters the mode, which is what
-	// a plain `raj ctl review` asks for; `-json` sets it.
+	// a plain `raj ctl review` asks for; `--json` sets it.
 	ReviewList bool
 	// Annotated is set on a read to return the per-run change set and state of
 	// the review view — every live edit with its owner and its state. The text
@@ -936,16 +937,6 @@ type Server struct {
 	// the one thing that layer must never do.
 	Mail Mailbox
 
-	// AllowRemoteExec permits `exec` from a TCP client. Off by default, and
-	// deliberately: an agent in a container asking the editor to run a command
-	// gets it run in the editor's process, on the host, outside the sandbox
-	// that was the reason for the container. That is a sandbox escape wearing
-	// the clothes of a convenience, so it has to be asked for.
-	//
-	// It has no effect on a Unix socket, where the caller could already run
-	// the command itself.
-	AllowRemoteExec bool
-
 	// heartbeat is a test seam: the per-connection heartbeat interval, with
 	// the zero value leaving a connection on heartbeatEvery. It is a server
 	// field rather than a package var so a test shortens its own server's
@@ -1040,6 +1031,9 @@ func (s *Server) Drivers() []Participant {
 // and ask each socket what root it holds, which is one round trip and cannot be
 // stale.
 func DefaultPath() string {
+	if path := os.Getenv(SocketEnv); path != "" {
+		return path
+	}
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {
 		dir = filepath.Join(os.TempDir(), "raj-"+strconv.Itoa(os.Getuid()))
@@ -1053,8 +1047,7 @@ func DefaultPath() string {
 //
 // For a Unix socket the directory is created 0700 and the socket 0600:
 // authorisation is the filesystem, so anything the user can run can drive the
-// editor — the same trust boundary as the user's own shell, and the reason this
-// is off unless asked for.
+// editor — the same trust boundary as the user's own shell.
 //
 // A TCP listener has no filesystem to lean on, so it mints a token instead and
 // refuses any request that does not carry it. See addr.go for why that is the
@@ -1159,6 +1152,10 @@ func (s *Server) addTCP(address string) error {
 	}
 	ln, err := net.Listen("tcp", address)
 	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return fmt.Errorf("%s is already in use; pass --control-addr tcp://127.0.0.1:<other>",
+				tcpScheme+address)
+		}
 		return err
 	}
 	// Path reports the resolved address, not the requested one, so a port of 0
@@ -1290,7 +1287,7 @@ func (s *Server) serve(conn net.Conn, network string) {
 			c.send(Response{ID: req.ID, OK: true, Final: true, Token: s.token})
 			continue
 		}
-		if req.Op == "exec" && network == "tcp" && !s.AllowRemoteExec {
+		if req.Op == "exec" && network == "tcp" {
 			c.send(Response{ID: req.ID, Err: errRemoteExec, Final: true})
 			continue
 		}
@@ -1557,8 +1554,8 @@ func (c *connection) one(req Request, emit func(Response)) {
 	// sees the outer request: a program arrives as one "prog" frame and its
 	// exec verb would otherwise slip past the refusal that a direct exec gets.
 	// Re-checking at the single chokepoint every request passes through keeps a
-	// batch from being a way around the flag path's gate.
-	if req.Op == "exec" && c.network == "tcp" && !c.srv.AllowRemoteExec {
+	// batch from being a way around the refusal.
+	if req.Op == "exec" && c.network == "tcp" {
 		emit(Response{ID: req.ID, Err: errRemoteExec, Final: true})
 		return
 	}
@@ -1828,7 +1825,7 @@ func (c *connection) search(req Request, emit func(Response)) {
 const (
 	errUnauthorised = "unauthorized: set " + TokenEnv + " to the token raj printed when it started"
 	errRemoteExec   = "exec is refused over TCP: the command would run on the editor's machine, " +
-		"outside your sandbox — run it with your own shell instead, or start raj with --control-exec"
+		"outside your sandbox — run it with your own shell instead"
 )
 
 // authorised checks a request's token against the server's. A Unix connection

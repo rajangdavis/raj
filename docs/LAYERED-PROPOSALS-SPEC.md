@@ -122,7 +122,7 @@ Resolved 2026-09-11:
 
 ## 6. Consumers
 
-- **`read`** — returns the session view, with `-annotated` adding the state
+- **`read`** — returns the session view, with `--annotated` adding the state
   runs. It reports the session version, so a driver's offsets must be session
   coordinates for a later `apply`/`diff` to base on (decision 3). (TODO's
   "which composition does read return?" is settled.)
@@ -303,7 +303,7 @@ Resolved 2026-09-11:
 2. A rejected span is visible **only in Review mode**; outside it, rejected
    text is absent from the view.
 3. `read` returns the **session view** — the whole document, proposed and
-   rejected text included, in the session's coordinates — with `-annotated`
+   rejected text included, in the session's coordinates — with `--annotated`
    adding the state runs. (Corrected 2026-09-16: the original "defaults to
    `AcceptedOnly`" predated the lease/version model and cannot hold — `read`
    reports the **session** version, so a driver's offsets must be session
@@ -394,13 +394,13 @@ Still open:
 Built in buffers 2026-09-15; host verification pending. One verb to list
 everything an agent has proposed and is awaiting the human on, instead of one
 verb per kind. Implemented as a read-only rollup (`App.Proposals`) behind the
-CLI `raj ctl proposals [-mine]`; `-json` is one flat tagged list. This section
+CLI `raj ctl proposals [--mine]`; `--json` is one flat tagged list. This section
 folds in the former standalone proposals-listing note.
 
 ### Purpose
 
 The pending surface is three disjoint listings today: `groups` (change sets,
-with `-mine`), `deletions` (pending file deletions), and — after the `rmdir`
+with `--mine`), `deletions` (pending file deletions), and — after the `rmdir`
 wave — `rmdirs` (pending dir-removals). A driver asking "what have I proposed,
 and what is left for the human to decide" must call all three and merge by
 hand. `proposals` is that merge.
@@ -414,15 +414,15 @@ Lists only the true proposals — work that waits on a human decision:
 - **pending deletions** — `deletions` (path, author).
 - **pending dir-removals** — `rmdirs` (dir, author).
 
-`mkdir`, `create` (`open -create`) and `rename` are immediate and do NOT
+`mkdir`, `create` (`open --create`) and `rename` are immediate and do NOT
 appear. If "every mutation is a proposal" later becomes the direction (option
 B from the design review), those verbs surface here; until then they stay out.
 
 ### Verb
 
 - `raj ctl proposals` — list every pending proposal, all authors.
-- `raj ctl proposals -mine` — this identity only.
-- `-json` — machine shape: a single flat tagged list, `{kind, path, author,
+- `raj ctl proposals --mine` — this identity only.
+- `--json` — machine shape: a single flat tagged list, `{kind, path, author,
   ...}`, so a driver sorts by whichever axis it cares about. Human output
   groups per kind under a short header.
 
@@ -436,8 +436,8 @@ and the pending dir-removals the way their own verbs do.
 
 ### Open questions
 
-- ~~`-json` single payload vs `-jsonl`~~ — decided 2026-09-15: one flat `-json`
-  payload, no `-jsonl`; the rollup is bounded by the pending set.
+- ~~`--json` single payload vs `--jsonl`~~ — decided 2026-09-15: one flat `--json`
+  payload, no `--jsonl`; the rollup is bounded by the pending set.
 - Whether a single tab or picker should drive accept/reject across all three
   kinds (the human side), instead of the per-kind prompts that exist today.
   Still open: `proposals` is read-only, so approval stays per kind for now.

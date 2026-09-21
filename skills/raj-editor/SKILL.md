@@ -5,9 +5,16 @@ description: Read, search and edit the files open in the user's running raj edit
 
 # Working in the user's open buffers
 
-`raj` is the user's terminal editor. Run with `--control` it exposes a control
-channel — a Unix socket, or a TCP port when you are somewhere that cannot reach
-a socket — and `raj ctl` talks to it.
+`raj` is the user's terminal editor. It exposes a control channel only when
+asked: a plain `raj` serves nothing, while `--control-addr` serves a Unix socket
+and that TCP port, and `--daemon` always serves. `raj ctl` talks to the channel
+that was enabled.
+
+A plain `raj` is only one of the shapes: `raj --standalone FILE` is a private
+single-file editor with no workspace, no session and no control listener, so
+there is nothing for `raj ctl` to reach. It is what `$EDITOR` wants:
+
+    git config core.editor 'raj --standalone'
 
 This matters for one reason: **a buffer open in raj can differ from the file on
 disk.** Reading the file with normal tools shows you the saved version. Writing
@@ -27,25 +34,30 @@ raj ctl buffers
 ```
 
 Lists what is open, with sizes and whether each has unsaved changes. If it exits
-non-zero, raj is not running with `--control`; fall back to your normal file
+non-zero, there is no running editor to talk to; fall back to your normal file
 tools rather than telling the user to restart their editor.
 
 Inspection does not need `open`. `read`, `version` and `lsp diagnostics` load a
 closed file on demand — no tab, nothing on the user's screen — so read freely.
 `raj ctl open <path>` is the verb that shows a file: it loads the file and
 focuses a tab, so use it when you mean to put the file in front of the user, not
-to make a path readable. `open -create` is the one way to name a path that is
+to make a path readable. `open --create` is the one way to name a path that is
 not on disk yet: without it a path that is neither an open buffer nor a file is
 refused as a typo rather than made into an empty buffer for a misspelled name to
 become later. A pending proposal also opens a tab on its own, because the file
 now has something for the user to decide.
 
 Every command takes an optional path; omit it for the buffer the user is
-currently looking at. Add `-json` to any command for machine-readable output.
+currently looking at. Add `--json` to any command for machine-readable output.
 
-`buffers -json` adds `pending` (change sets still awaiting a decision) and
+`buffers --json` adds `pending` (change sets still awaiting a decision) and
 `moved` (their members a later edit has moved past) per buffer, so one call
 tells you which open files hold review work.
+
+`raj ctl status` answers whether the workspace is ready for the host gate: it
+exits 0 when every buffer is saved and holds no pending set, and exits 1 naming
+every dirty or pending buffer when any is. `status --json` carries the same exit
+code with `ready` and a `blocking` list.
 
 ## If you are in a container and the editor is not
 
@@ -72,10 +84,13 @@ No tmux, and no raj inside the container. raj stays in the user's own terminal
 because that is the only place its chords are delivered — a raj under tmux loses
 them, and a raj inside the container never sees them at all.
 
+Control is opt-in, so the host command passes `--control-addr` (or runs
+`--daemon`); a plain `raj` serves nothing for the container to reach.
+
 On their machine, in the workspace:
 
 ```
-export RAJ_CONTROL_TOKEN=$(openssl rand -hex 32)
+export RAJ_CONTROL_TOKEN=$(openssl rand --hex 32)
 raj --control-addr tcp://127.0.0.1:7391 .
 ```
 
@@ -106,7 +121,7 @@ reproducible without reading it back.
 the editor's, so if the repository is `/workspace` to you and
 `/Users/them/src/proj` to raj, you pass `/workspace/main.go` and that is what
 comes back from `buffers` and `search`. Do not try to construct the editor's
-paths yourself. `raj ctl whoami -json` prints `root_map` when a translation is
+paths yourself. `raj ctl whoami --json` prints `root_map` when a translation is
 in force, which is worth checking once if paths are being refused.
 
 If the mapping is wrong — an unusual mount layout — the user can set
@@ -127,19 +142,19 @@ Measured over the session history: agents average **1.22 `raj ctl` calls per
 assistant turn** - one command, then a model round trip that re-reads context.
 `read` and `search` are half of all calls, and the facilities this file
 documents for cutting that are barely used (`read A B C` 2%,
-`search -context` 2%, `apply -hunks` 12%). Batching same-verb runs alone
+`search --context` 2%, `apply --hunks` 12%). Batching same-verb runs alone
 removes about a third of all calls; with the merges below, closer to 44%.
 
 - Need several files? One `raj ctl read A.go B.go C.go`. It also satisfies the
   read-before-write gate for every one of them.
-- `search -q PATTERN -context N` returns the hit and its neighbours in one
+- `search -q PATTERN --context N` returns the hit and its neighbours in one
   call. Do not `search` and then `read` the same place.
-- `read -json` already returned the version. Reuse it as `-base`; do not spend
+- `read --json` already returned the version. Reuse it as `--base`; do not spend
   a separate `version` call.
-- Several hunks in one file? One `apply -hunks` (or a `run -prog` program),
+- Several hunks in one file? One `apply --hunks` (or a `run --prog` program),
   not k applies.
 - A structural rewrite of a function or block? `dump` then `patch`, not a
-  chain of `edit -old`.
+  chain of `edit --old`.
 - `claim` every path you will write once, up front; do not discover them one
   failure at a time.
 - Tests, builds and git go through your own shell; `raj ctl exec` is refused
@@ -149,7 +164,7 @@ removes about a third of all calls; with the merges below, closer to 44%.
 ## Searching
 
 ```
-raj ctl search -q 'func handleRequest' -include '*.go'
+raj ctl search -q 'func handleRequest' --include '*.go'
 ```
 
 Prints `path:line:col:text`. Use this rather than grep or ripgrep whenever the
@@ -160,27 +175,27 @@ and sends you off to edit against it.
 
 Hits print as they are found, so a slow search over a large tree is still
 usable, and ctrl+C stops the walk inside the editor rather than just detaching
-from it. `-regex`, `-case` and `-word` are available. `-context N` adds N lines
+from it. `--regex`, `--case` and `--word` are available. `--context N` adds N lines
 either side of each hit and prints the block under a `path:line:col version V`
 header, so a hit and its neighbours arrive in one call rather than a search
-followed by a read. `-include` and `-exclude` take comma-separated globs and
+followed by a read. `--include` and `--exclude` take comma-separated globs and
 must stay inside the workspace.
 
 Exit is non-zero when there are no matches, as with grep.
 
 A pattern with no `/` matches the basename as well as the relative path, like
-`grep --include`: `-include '*_test.go'` finds test files at any depth and
-`-include 'search.go'` finds that file wherever it sits, while a pattern
+`grep --include`: `--include '*_test.go'` finds test files at any depth and
+`--include 'search.go'` finds that file wherever it sits, while a pattern
 containing `/` stays path-scoped. A bare positional argument is refused — the
-pattern goes to `-q` — and a search whose `-include` matched no files says so
+pattern goes to `-q` — and a search whose `--include` matched no files says so
 rather than returning an authoritative empty result.
 
 ## Read before you edit, every time
 
 ```
 raj ctl read /abs/path/to/file.go                  # the text
-raj ctl read -start 120 -end 148 /abs/path/to/file.go  # a byte span
-raj ctl read -json /abs/path/to/file.go            # text, version, and authorship
+raj ctl read --start 120 --end 148 /abs/path/to/file.go  # a byte span
+raj ctl read --json /abs/path/to/file.go            # text, version, and authorship
 raj ctl read A.go B.go C.go                        # several files, one call
 ```
 
@@ -189,16 +204,16 @@ The editor refuses a write from a caller that has not read the buffer, because
 byte offsets only mean something in the coordinates of a version somebody has
 actually seen.
 
-`-start` and `-end` are byte offsets, half-open like `apply`: `-start 120
--end 148` returns the 28 bytes starting at offset 120. Use them to verify a
-splice without reading the whole file. A shared `-start`/`-end`/`-lines` applies
+`--start` and `--end` are byte offsets, half-open like `apply`: `--start 120
+--end 148` returns the 28 bytes starting at offset 120. Use them to verify a
+splice without reading the whole file. A shared `--start`/`--end`/`--lines` applies
 to every target of a multi-path read.
 
 `read` takes several paths in one call — `raj ctl read A.go B.go C.go` returns
 each file's text and version and satisfies the read-before-write gate for every
 one of them, so a sweep of the files you are about to touch is one round trip
 rather than three. A path that fails fails the whole call and marks none of them
-read. `-annotated` still takes a single path, because the state runs are
+read. `--annotated` still takes a single path, because the state runs are
 relative to one buffer's text.
 
 If you only need coordinates and not the whole document — appending, say —
@@ -207,14 +222,14 @@ If you only need coordinates and not the whole document — appending, say —
 ## Edit by offsets
 
 ```
-raj ctl read -json /abs/path/to/file.go
+raj ctl read --json /abs/path/to/file.go
 # {"text": "...", "version": 41, "author": 3, "spans": [...]}
 
-raj ctl apply /abs/path/to/file.go -base 41 -start 120 -end 148 -text 'func g() {'
+raj ctl apply /abs/path/to/file.go --base 41 --start 120 --end 148 --text 'func g() {'
 ```
 
-`-start` and `-end` are byte offsets into the text you just read, counted from
-zero, replacing the half-open range `[start, end)`. `-base` is the version that
+`--start` and `--end` are byte offsets into the text you just read, counted from
+zero, replacing the half-open range `[start, end)`. `--base` is the version that
 read returned.
 
 This is the verb to prefer. The editor rebases your hunk onto whatever the
@@ -223,31 +238,31 @@ text instead of landing where the text used to be. There is no string to match,
 so indentation and whitespace cannot make an edit fail.
 
 For replacement text containing newlines, write it to a file and use
-`-text-file /tmp/new.txt`, or `-text-file -` for stdin.
+`--text-file /tmp/new.txt`, or `--text-file -` for stdin.
 
 ### Apply several hunks at once
 
 ```
-raj ctl apply /abs/path/to/file.go -base 41 -hunks /tmp/hunks.jsonl
+raj ctl apply /abs/path/to/file.go --base 41 --hunks /tmp/hunks.jsonl
 ```
 
-`-hunks` reads JSON Lines — one `{"start":S,"end":E,"text":"..."}` per line,
-`-` for stdin — and applies every hunk as one change set at one `-base`. A
+`--hunks` reads JSON Lines — one `{"start":S,"end":E,"text":"..."}` per line,
+`-` for stdin — and applies every hunk as one change set at one `--base`. A
 k-site edit is then one call instead of k reads and k applies. Each hunk is
-rebased against `-base`, so order does not matter; the flag is exclusive with
-`-start`/`-end`/`-text`/`-text-file`. Blank lines are skipped.
+rebased against `--base`, so order does not matter; the flag is exclusive with
+`--start`/`--end`/`--text`/`--text-file`. Blank lines are skipped.
 
 ## Or edit by quoting text
 
 ```
-raj ctl edit /abs/path/to/file.go -old 'func f() {' -new 'func g() {'
+raj ctl edit /abs/path/to/file.go --old 'func f() {' --new 'func g() {'
 ```
 
 `edit` is string replacement built on top of `apply`, for when quoting a line is
 easier than counting to it. It inherits string replacement's weaknesses, so
 prefer `apply` when you have offsets.
 
-`-old` must match the buffer **exactly** and appear **exactly once**. Copy it
+`--old` must match the buffer **exactly** and appear **exactly once**. Copy it
 out of what `read` printed rather than retyping it — in particular, copy the
 indentation. raj indents each file the way that file is already indented, so a
 Go file or a Makefile uses tabs where you may have assumed spaces, and a leading
@@ -266,29 +281,29 @@ cat > /tmp/new.txt <<'EOF'
 		return fmt.Errorf("reading config: %w", err)
 	}
 EOF
-raj ctl edit /abs/path/to/file.go -old-file /tmp/old.txt -new-file /tmp/new.txt
+raj ctl edit /abs/path/to/file.go --old-file /tmp/old.txt --new-file /tmp/new.txt
 ```
 
-To delete, pass an empty `-new`. To insert, include a surrounding line in `-old`
-and repeat it in `-new` — there is no insert-at-position for `edit`,
+To delete, pass an empty `--new`. To insert, include a surrounding line in `--old`
+and repeat it in `--new` — there is no insert-at-position for `edit`,
 deliberately, since a line you can quote is one you have actually read. Use
-`apply` with `-start N -end N` for a true insertion at an offset.
+`apply` with `--start N --end N` for a true insertion at an offset.
 
 ## Editor-side scratch: dump and patch
 
 For a structural rewrite — a whole function, a comment block, a config stanza —
-`apply` makes you compute byte offsets and `edit -old` makes you quote the
+`apply` makes you compute byte offsets and `edit --old` makes you quote the
 exact text. `dump`/`patch` removes both: the editor holds the snapshot and
 computes the diff itself.
 
 ```
 raj ctl dump /abs/path/to/file.go                          # whole buffer
-raj ctl dump -start 120 -end 1480 /abs/path/to/file.go     # one structural span
+raj ctl dump --start 120 --end 1480 /abs/path/to/file.go     # one structural span
 # -> {"DumpID": 7, "Hash": "...", "text": "...", ...}
 
 # edit the text locally, then hand the whole thing back:
-raj ctl patch /abs/path/to/file.go -dump 7 -text-file /tmp/new.go
-raj ctl patch /abs/path/to/file.go -dump 7 -text-file -    # from stdin
+raj ctl patch /abs/path/to/file.go --dump 7 --text-file /tmp/new.go
+raj ctl patch /abs/path/to/file.go --dump 7 --text-file -    # from stdin
 ```
 
 `dump` returns a snapshot id, a hash of the text, and the text. You edit that
@@ -311,15 +326,15 @@ one change. `raj ctl run` takes a *program* — a byte string of opcodes — and
 runs it in order in a single frame.
 
 ```
-raj ctl run -prog "$(gen-edits)"   # the program itself, as an argument
-raj ctl run -prog @edits.bin       # from a file
-gen-edits | raj ctl run -prog -    # from stdin
+raj ctl run --prog "$(gen-edits)"   # the program itself, as an argument
+raj ctl run --prog @edits.bin       # from a file
+gen-edits | raj ctl run --prog -    # from stdin
 ```
 
 The program is passed as an ordinary argument. That works because no byte of
 the framing is ever zero — see below — and a command line carries every byte
 except zero. If a *payload* of yours contains a zero byte, which text raj will
-open never does, use `-hex` instead.
+open never does, use `--hex` instead.
 
 The encoding, which you can emit directly:
 
@@ -377,8 +392,8 @@ can find → read → apply in a single frame.
 
 **`exec` is available in a program** through the `arg` argument op: each `arg`
 appends one argv element and the following `exec` verb consumes them. The
-remote-execution gate is unchanged — over TCP the verb is refused unless raj
-started with `--control-exec`. **recv, hello and cancel are still not available
+remote-execution rule is unchanged — over TCP the verb is always refused.
+**recv, hello and cancel are still not available
 in a program**: recv parks until the user speaks, which would hold every verb
 behind it; hello and cancel act on the connection rather than a document, and a
 cancel queued behind the search it means to interrupt would never arrive in
@@ -401,8 +416,8 @@ The high bit is the difference: arguments are below `0x80`, verbs at or above.
 
 When a program is refused, the error names the opcode it choked on.
 
-**Prefer the flags for one edit.** `raj ctl apply -base 41 -start 120 -end 148
--text '...'` is one round trip and is easier to get right. Reach for a program
+**Prefer the flags for one edit.** `raj ctl apply --base 41 --start 120 --end 148
+--text '...'` is one round trip and is easier to get right. Reach for a program
 when you have a batch, or when you are replaying one you recorded.
 
 ## Say who you are
@@ -411,19 +426,19 @@ Identity is explicit. Mint a key once at the start of your run:
 
     raj ctl register
 
-It prints a short random key and binds it on the server. Pass `-as <key>` on
+It prints a short random key and binds it on the server. Pass `--as <key>` on
 every later call:
 
-    raj ctl read -as raj-1a2b3c4d docs/TODO.md
+    raj ctl read --as raj-1a2b3c4d docs/TODO.md
 
 Why: **every `raj ctl` invocation is a fresh connection**, and an anonymous
 connection mints a fresh author id from a `uint8` space capped at 256 — so
-without `-as` your proposals scatter across dead ids, per-author state (dump
+without `--as` your proposals scatter across dead ids, per-author state (dump
 snapshots) does not survive between calls, and the space drains. One
-`register` per run plus `-as` on every call keeps your author stable.
+`register` per run plus `--as` on every call keeps your author stable.
 
 `register` will not hand you a key another participant already owns; if you
-want a specific one, `register -as mykey` binds it deliberately. `-name NAME`
+want a specific one, `register --as mykey` binds it deliberately. `--name NAME`
 sets your display name in `who`.
 
 ## Claim the files you will write
@@ -431,16 +446,16 @@ sets your display name in `who`.
 Socket writes are restricted to your claim set. Declare the files before your
 first write in a run:
 
-    raj ctl claim -as <key> path/a.go path/b.go
+    raj ctl claim --as <key> path/a.go path/b.go
 
 - An explicit write to a path outside the set is refused: `not in your claim
-  set (...); claim -add <path>`.
+  set (...); claim --add <path>`.
 - A **pathless** write is allowed only when exactly one file is claimed, and
   then it targets that file. None claimed says `claim a file first`; several
   says `claim set has N files; name one`.
 - Reads are never gated. `claim` with no operands reports the set; `claim
-  -add` extends it; `claim -clear` releases it. A file you create with `open
-  -create` must be added with `claim -add` before you can write it.
+  --add` extends it; `claim --clear` releases it. A file you create with `open
+  --create` must be added with `claim --add` before you can write it.
 - The set is in-memory and resets when the editor restarts, so re-claim after
   a restart.
 
@@ -454,8 +469,8 @@ It arrives here:
 
 ```
 raj ctl recv                 # waits until they say something, then prints it
-raj ctl recv -wait 5s        # gives up after five seconds; exit 3 means nothing
-raj ctl recv -json           # the messages as JSON
+raj ctl recv --wait 5s        # gives up after five seconds; exit 3 means nothing
+raj ctl recv --json           # the messages as JSON
 ```
 
 `recv` blocks. That is the point — there is no polling to do and no interval to
@@ -471,7 +486,7 @@ Two things to get right:
 - **Keep one identity across calls.** The mailbox belongs to your
   participant, not to a connection — `recv` only finds your messages if every
   call carries the same stable author id. That is why `register` mints a key once per run and every later call
-  passes `-as <key>`: each `raj ctl` invocation is a fresh connection, and an
+  passes `--as <key>`: each `raj ctl` invocation is a fresh connection, and an
   anonymous one gets a fresh id, so the mailbox would never find you.
 - **Messages keep while you are gone.** Anything said while you were restarting
   is delivered when you come back, so a `recv` after a reconnect may return
@@ -488,7 +503,7 @@ with an author id, and shown to the user tinted so they can see what did not
 come from them. Their undo will not reverse your edits, and yours will not
 reverse theirs.
 
-`raj ctl whoami` prints the id you write as. `raj ctl read -json` returns the
+`raj ctl whoami` prints the id you write as. `raj ctl read --json` returns the
 document split into runs, each marked `mine`, `by_user`, and with its raw
 `author`, so you can tell your own text from the user's and from another agent's
 before touching anything.
@@ -504,7 +519,7 @@ document and the user can see it, but it is flagged as awaiting their decision.
 
 ```
 raj ctl groups /abs/path/to/file.go     # id, author, state, size
-raj ctl reject /abs/path/to/file.go -group 12
+raj ctl reject /abs/path/to/file.go --group 12
 ```
 
 `reject` is a decision, not an edit: it marks the set rejected and the text
@@ -524,7 +539,7 @@ them is a short loop; run through it before saving, and the agent should have
 already jumped you to the first change and closed the files that have none.
 
 - **See every pending change set.** `raj ctl groups <path>` lists them with
-  author, state and size. `groups -mine` filters to the agent's own. This is
+  author, state and size. `groups --mine` filters to the agent's own. This is
   the list, not the first hunk in the file.
 - **Read the actual edits, not just the summary.** `raj ctl diff <path>`
   renders each pending group as old→new text with byte-offset anchors. Read
@@ -532,8 +547,8 @@ already jumped you to the first change and closed the files that have none.
 - **Jump to each change.** `raj ctl goto <path> LINE` moves the cursor to
   where the review matters. Ask the agent to goto its hunks as it makes them;
   if it did not, the group's byte offsets in `diff` tell you where.
-- **Accept deliberately, or back out.** `raj ctl accept <path> -group N`
-  approves one change set; `raj ctl reject <path> -group N` rejects it — the
+- **Accept deliberately, or back out.** `raj ctl accept <path> --group N`
+  approves one change set; `raj ctl reject <path> --group N` rejects it — the
   text stays until you `clear` the rejected set, which reverses it out. The
   plain `save` accepts everything pending in that file at once — use it when
   the whole pending set is reviewed, not as the discovery step.
@@ -541,8 +556,8 @@ already jumped you to the first change and closed the files that have none.
   rejected; `clear` removes it from the document and the record. Editing over
   it leaves both your fix and the original diff in the history.
 
-- **Decide a whole file at once.** `accept` and `reject` take `-all`: every
-  pending set for the path is decided in one command (honor `-mine` to keep to
+- **Decide a whole file at once.** `accept` and `reject` take `--all`: every
+  pending set for the path is decided in one command (honor `--mine` to keep to
   your own). A set wedged behind a later edit is named and skipped rather than
   silently counted, and the rest still proceed.
 
@@ -595,7 +610,7 @@ briefly (about two seconds) for the server's publish; its answer carries a
 when the status says so. A cold start answers `starting`, and the caller
 retries; `missing`/`no-server` is refused rather than read as clean. A file type
 with no server is a clean error, not a hang. Results come back as JSON — add
-`-json` to read the structured form.
+`--json` to read the structured form.
 
 Use this rather than parsing compiler output or grepping for a definition: the
 answer reflects the buffer as it is now, unsaved edits included.
@@ -635,10 +650,10 @@ unchanged.
 
 | message | what to do |
 | --- | --- |
-| `does not appear in the buffer` | Your `-old` does not match. Re-read and copy it exactly; check the indentation first. |
-| `appears N times` | Add surrounding context until it is unique, or pass `-all` if you truly mean every occurrence. |
+| `does not appear in the buffer` | Your `--old` does not match. Re-read and copy it exactly; check the indentation first. |
+| `appears N times` | Add surrounding context until it is unique, or pass `--all` if you truly mean every occurrence. |
 | `read the buffer before writing it` | Run `read` or `version` on that path first. |
-| `apply needs a base version` | Pass `-base` from the version `read` returned. |
+| `apply needs a base version` | Pass `--base` from the version `read` returned. |
 | `hunks could not be placed` | The user typed while you worked; nothing was written. Re-read and redo against the new version. |
 | `no open buffer for ...` | The path is missing, outside the workspace, or unreadable; check the spelling against `search`. `read`/`version`/`lsp diagnostics` load an existing file on demand, so you rarely need `open`. |
 | `is not under <root>` | The path or glob leaves the workspace. Not permitted. |
@@ -672,9 +687,9 @@ counts. Character-count indexing silently disagrees: any multi-byte character
 before the anchor — an em-dash in a comment, a non-ASCII name — shifts the
 numbers, and `apply` happily splices at the wrong byte because it validates the
 range, not the text. A LINE number is not an offset either: feeding the output
-of a `grep -n` dump to `-start`/`-end` lands in the wrong place — a small line
-number reads the top of the file. Take offsets from `read -json` or
-`search -json`, never from a line count.
+of a `grep -n` dump to `--start`/`--end` lands in the wrong place — a small line
+number reads the top of the file. Take offsets from `read --json` or
+`search --json`, never from a line count.
 
 `jq` is the sharpest version of this trap, now that it is allowed for shaping
 output: its string indexing and slicing count **codepoints, not bytes**, so
@@ -682,13 +697,13 @@ output: its string indexing and slicing count **codepoints, not bytes**, so
 lands at a different byte. Query and reshape with `jq` freely (`jq -r
 '.matches[].byte_start'`), but never derive a byte offset by indexing or
 slicing text with it — take `byte_start`/`byte_end` straight from `search
--json`.
+--json`.
 
 The two verbs that make offsets unnecessary in the common case are `raj ctl
-edit -old S -new S`, the exact-string replacement, and `raj ctl search -q
+edit --old S --new S`, the exact-string replacement, and `raj ctl search -q
 PATTERN`, which locates text in the editor's own coordinates. Use them first.
 
-For the search path, `raj ctl search -q PATTERN -json` reports per hit both
+For the search path, `raj ctl search -q PATTERN --json` reports per hit both
 the match (`byte_start`..`byte_end`) and its line (`line_start`..`line_end`),
 so an agent can turn a search result directly into an `apply` span without
 recomputing offsets itself — use `byte_*` for the matched substring and
@@ -702,17 +717,17 @@ Read-gate the `apply`, and re-read the seam after it lands. Neither needs a
 prior `open`: `read` loads the file headlessly, and `apply` announces a tab the
 moment the proposal lands.
 
-### Read-gate every apply, and let -base do the rebasing
+### Read-gate every apply, and let --base do the rebasing
 
 A chain that never writes blind is: read the file, and only if that succeeds
 apply against the version you just read, with the replacement piped in on
 stdin:
 
 ```
-raj ctl read F >/dev/null && raj ctl apply F -base N -start S -end E -text-file -
+raj ctl read F >/dev/null && raj ctl apply F --base N --start S --end E --text-file -
 ```
 
-`-base` is the version the offsets were measured against — almost always the
+`--base` is the version the offsets were measured against — almost always the
 version you just read. After a hunk lands the version moves, but applying the
 next hunk with the SAME base still works: the tool rebases later hunks on top
 of whatever the buffer has become, exactly like the edit path agents use.
@@ -720,7 +735,7 @@ Re-reading between hunks is equally fine; just carry the new version forward.
 
 ### A heredoc ends with a newline
 
-`-text-file -` reads stdin to EOF, so replacement text carries a trailing
+`--text-file -` reads stdin to EOF, so replacement text carries a trailing
 newline. If your anchor was a single line followed by an empty line, the result
 is a doubled blank line. Fix by anchoring the line AND what follows it when
 spacing matters, then re-read the edited region — the same check catches the
@@ -750,7 +765,7 @@ both are where mistakes live. Fingerprints:
   you already consumed makes the next line climb into the previous one.
   Anchor whole lines: span start at the line start, span end at the line end
   INCLUDING its newline.
-- `edit -old` that ends one line short of the block applies cleanly and leaves
+- `edit --old` that ends one line short of the block applies cleanly and leaves
   the tail as a dangling line — the reply says "applied 1 hunk(s)" and nothing
   warns you. Replacing a bullet up to its second-to-last line left its final
   line behind, reading as a duplicate of the replacement's last line. Quote the
@@ -764,20 +779,20 @@ read on "\n" is encoding-safe even when byte offsets are not.
 ### include/exclude globs: no-slash matches the basename too
 
 A pattern containing `/` is matched against each file's path relative to the
-search root, so a path-scoped glob works: `-include 'internal/control/*.go'`
+search root, so a path-scoped glob works: `--include 'internal/control/*.go'`
 matches only files under `internal/control/`. A pattern with NO `/` is matched
-against the basename as well, like `grep --include`: `-include '*_test.go'`
-matches every test file in the tree and `-include 'search.go'` matches that file
+against the basename as well, like `grep --include`: `--include '*_test.go'`
+matches every test file in the tree and `--include 'search.go'` matches that file
 wherever it sits. `filepath.Match`'s `*` does NOT cross `/`, so `*.go` matches
 tree-wide only through the extension fast path; rely on the no-slash basename
 rule rather than assuming a bare `*` crosses directories.
 (Updated 2026-09-11; the basename rule was previously absent.)
 
-### -q is the pattern; -regex is a flag
+### -q is the pattern; --regex is a flag
 
-`raj ctl search -regex 'x'` reads `-regex` as an operand and fails: the search
+`raj ctl search --regex 'x'` reads `--regex` as an operand and fails: the search
 pattern lives under `-q` only. Patterns are literal and case-sensitive unless
-`-regex` or `-case` is given.
+`--regex` or `--case` is given.
 
 ### Every apply is a proposal, and the version moves
 
@@ -838,11 +853,11 @@ make the review surface what actually changed:
   by construction: plain `close` is refused while a buffer has unsaved work, so
   a file with pending proposals cannot be closed that way. Check `raj ctl
   buffers` before closing that a file really has nothing pending. `close
-  -discard` drops a buffer without saving; it discards unsaved work and pending
+  --discard` drops a buffer without saving; it discards unsaved work and pending
   proposals, so use it only to abandon a buffer deliberately.
 
 What is still missing is a way to reveal a *span* or to make the jump
-automatic: either `raj ctl reveal <path> -start N -end N`, or an option on
+automatic: either `raj ctl reveal <path> --start N --end N`, or an option on
 `apply`/`edit` that returns or jumps to the affected line, would make reviewing
 agent changes feel direct rather than archaeological.
 
@@ -862,8 +877,8 @@ reach for a shell workaround.
 A delegated subagent starts with no skill context, so the same rule has to be
 written into its brief: "use only raj ctl verbs for file content — no node, no
 grep or sed over files, no /tmp scratch; jq is allowed for shaping raj ctl
--json output." The workarounds this kills are the ones that drift: parsing
-`read -json` with node re-implements the editor's JSON by hand, and grepping a
+--json output." The workarounds this kills are the ones that drift: parsing
+`read --json` with node re-implements the editor's JSON by hand, and grepping a
 `/tmp` dump reads text that is already stale. If a verb is genuinely missing,
 the subagent should stop and report the gap — that is how this list grows —
 rather than reach for a host tool.
@@ -871,8 +886,8 @@ rather than reach for a host tool.
 The prohibition has to name the temptation, not just the file access: "use only
 raj ctl verbs" invites the reading "for file access", so say explicitly that no
 interpreter (python/node) may touch file content. jq is the one exception,
-allowed for shaping `raj ctl -json` output; a query flag on the verb
-(`read -json -field text`, in the spirit of the flat-record item) is still the
+allowed for shaping `raj ctl --json` output; a query flag on the verb
+(`read --json --field text`, in the spirit of the flat-record item) is still the
 sanctioned shape for anything the CLI should answer itself. If the output is
 hard to consume even with jq, that is a verb-surface gap to report.
 
@@ -882,17 +897,17 @@ skills file does not send an agent back to a shell tool for something
 `raj ctl` already does:
 
 - **Pretty-printing JSON.** `jq` is available in the container and is allowed
-  for shaping `raj ctl -json` output. `raj ctl ... -json` is already
+  for shaping `raj ctl --json` output. `raj ctl ... --json` is already
   machine-readable; pipe it through `jq` when you want it pretty. It is for
   querying and reshaping only — its string indexing counts codepoints, not
   bytes, so never compute an `apply` offset with it. Take `byte_start`/
-  `byte_end` from `search -json` (see "Byte offsets, not string offsets").
-- **Reading a line range.** `raj ctl read -lines A,B` (1-based inclusive; a
+  `byte_end` from `search --json` (see "Byte offsets, not string offsets").
+- **Reading a line range.** `raj ctl read --lines A,B` (1-based inclusive; a
   bare `A` reads to the end) is live. Use it instead of `sed -n` / `head | tail`.
-- **Counting bytes or lines.** `raj ctl version -json` returns `bytes` and
+- **Counting bytes or lines.** `raj ctl version --json` returns `bytes` and
   `lines` alongside the version. Use it instead of `wc`.
-- **Editor-side scratch.** `raj ctl dump <path> [-start -end]` snapshots a span
-  and `raj ctl patch <path> -dump <id> -text-file -` takes the edited text back
+- **Editor-side scratch.** `raj ctl dump <path> [--start --end]` snapshots a span
+  and `raj ctl patch <path> --dump <id> --text-file -` takes the edited text back
   and lets the editor diff and rebase it — the agent never re-derives offsets.
   Use these instead of a `/tmp` copy plus hand-computed `apply` spans.
 - **Language-server queries.** `raj ctl lsp hover|definition|completion

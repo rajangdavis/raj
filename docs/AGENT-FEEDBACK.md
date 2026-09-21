@@ -2700,3 +2700,89 @@ element; build fixtures from the real wire types; gate profile/mode behaviour
 at the call site and inside the handler; assert through semantic accessors
 where the surface trims; list each changed or confirmed-unaffected test and the
 precondition its fixture constructs; one writer per file per wave.
+
+## Between-wave review — attach mirror (2026-09-20)
+
+Read-only pass over the landed "attach mirrors the daemon" wave (S1 + S1b + S2).
+`proposals`/`groups`/`diff` showed no pending sets, so there was nothing to
+dispose. Per-file `raj ctl lsp diagnostics` read `ok` on all eleven changed Go
+files; a clean per-file reading is not a package check (no `go vet`, no
+whole-package compile), so the host `make check` remains the gate. Findings:
+
+- **`control.Buffer.Superseded` has no producer.** `host.Buffers()`
+  (`internal/app/control.go`) sets `Pending` and `Moved` but never `Superseded`,
+  so the sparse `hBufferSuperseded` (0x5d) field never emits and the
+  `bufferMark.superseded`/`closedMark.Superseded` the wave added always compare
+  zero — the fact cannot move. The `Superseded` count exists to say "no pending
+  set, yet a save would drop text"; populate it from
+  `Session.UnsavedProposed()` or remove the field and the mark component. Filed
+  in TODO.md.
+- **Multi-path `lsp diagnostics -json` loses the path.** The batch prints one
+  bare `{"status":"ok"}` per operand, in order, with no path; a driver must
+  attribute statuses positionally and cannot tell which named file a non-`ok`
+  status belongs to. Filed in TODO.md.
+
+- **The legacy closed-view test does not pin the legacy fallback.** `TestClientViewReadsLegacyClosedPaths` seeds `{"open":[],"closed":["<path>"]}` for a path the daemon also lists as a real tab, then asserts the client shows that one tab. With `closedMarks.UnmarshalJSON`'s legacy branch removed the unmarshal fails, `readClientView` returns false, and the mirror loop adds the same one tab — so the assertion holds with and without the code it names. A discriminating fixture needs a case where a failed parse and a legacy mark diverge: a closed path the daemon does not list as a real tab, or an assertion that the legacy path is not snoozed. `TestReviewGenerationStableWhenIdle` is probabilistic in the same family — with two removal keys, unsorted map iteration can read equal twice by chance, so the stability assertion only catches the missing sort about half the time. Filed in TODO.md.
+
+## Between-wave review — flag spelling and daemon flag forwarding (2026-09-20)
+
+Read-only pass over the landed flag-spelling/daemon-forwarding wave, plus the
+two orchestrator-authored agent definitions left pending by design.
+`proposals` showed no pending code change sets (the wave is saved); the eight
+pending sets are all in `opencode/agents/raj.md` (6) and `review.md` (2), the
+deliberate `-` to `--` conversion. Per-file `raj ctl lsp diagnostics` read `ok`
+on all six changed Go files; a clean per-file reading is not a package check,
+so the host `make check` stays the gate. Findings:
+
+- **`--daemon` is not hidden, and cannot be via the standard `flag` package.**
+  The init in `cmd/raj/main.go` guards `MarkHidden` behind an interface
+  assertion, and `control.flagHidden` reflects over `flag.Flag`, but neither
+  `FlagSet.MarkHidden` nor a `Flag.Hidden`/`hidden` field exists in released Go
+  (checked the go1.25.0 source and the pkg.go.dev index through go1.27.1), so
+  the assertion never fires and the helper can never return true. Live
+  `raj --help` prints `--daemon daemon run`: the flag is visible, and the
+  backquoted daemon-run text in its usage string has been taken by
+  `flag.UnquoteUsage` as the value placeholder. The comment claiming a hidden
+  alias is false. Escalated 2026-09-20; filed in TODO.md.
+- **The editor `--help` lost its header.** `editorUsage` calls only
+  `control.PrintFlagUsage`, so `raj --help` now opens on `  --attach` with no
+  `usage: raj [options] [file|dir]` line where the default `flag.Usage`
+  printed `Usage of <path>:`. Escalated 2026-09-20 (UX); filed in TODO.md.
+- **`--q` contradicts the short-flag rule.** `PrintFlagUsage` prints every flag
+  with two dashes, so `raj ctl search -h` says `--q string` while the
+  hand-written `ctlUsage` says `search -q PATTERN` and the wave convention
+  keeps single-letter shorts on one dash; the same backquote leak prints
+  `--group groups` and `--dump dump` in the ctl help, where the value is a
+  uint. Filed in TODO.md.
+- **`flagDefaultText` drops the stdlib panic guard.** `flag.isZeroValue` wraps
+  the zero `String()` call in `recover`; the new helper does not, so a custom
+  `flag.Value` that panics on a zero receiver would panic the help path.
+  Latent: no custom `Value` is registered today. Filed in TODO.md.
+- **Single-dash long flags survived the conversion in live files** (fixed in
+  this pass): `docs/CLAIM-SPEC.md` (`-clear`, two), `docs/TODO.md` (`-hidden`,
+  `-active`/`-here`), and code comments in `internal/control/cli.go`,
+  `cli_test.go` and `control.go` (`-json`). Historical COMPLETED.md,
+  INVESTIGATIONS.md and older AGENT-FEEDBACK.md entries are deliberately left
+  as written.
+- **`claim --add` is correct.** `Guard.Claim` replaces the set by default and
+  extends on `add` (`internal/control/host.go`), the CLI forwards `ClaimAdd`
+  over the wire, and `TestCLIClaim` and `TestClaimSetAddClearReport` cover
+  both; the usage line and the skill both say `--add` extends. The subagent
+  report of a replacing claim was the documented default, not a bug; the same
+  footgun (a bare `claim` drops the current set) cost this pass a retry too,
+  so a warning or an `--add` default is filed in TODO.md.
+
+Not compile-verified: the wave test changes and the pending agent-definition
+conversion were read, not run. `TestStartForwardsNoRestore` (Runner/Spawn
+fixture, asserts `--no-restore` in the child argv),
+`TestControlForwardCarriesOnlyWhatWasAsked` (pure function, nil versus
+`["--no-restore"]`), `TestFlagsFirstRefusesBareFlagName` (bare `no-restore`
+refused, a real directory kept), `TestCLIRefusesBareFlagName` (CLI exit 2 and
+the suggestion in stderr), `TestEditorUsageUsesDoubleDash` (prints
+`--no-restore`/`--control-addr`/`--wrap`) and
+`TestUsageNamesOnlyTheLiveControlFlags` (daemon usage names `--control-addr`
+and `--no-restore`) are discriminating against their fixtures.
+`TestEditorUsageUsesDoubleDash` is presence-only: it does not assert that any
+single-dash form is absent, nor the `--daemon` hiddenness, nor the missing
+header; and the `Restart` `--no-restore` forwarding has no direct test
+(`TestRestartForwardsRecordedControl` passes false).

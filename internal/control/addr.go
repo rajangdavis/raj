@@ -47,6 +47,16 @@ const TokenEnv = "RAJ_CONTROL_TOKEN"
 // not have to wonder whether the variable is doing something Unix-specific.
 const AddrEnv = "RAJ_CONTROL_ADDR"
 
+// SocketEnv names an explicit Unix control socket path. Both the server bind
+// and client discovery read it, so it overrides the per-process default on
+// both sides; unset or empty falls back to DefaultPath's convention.
+const SocketEnv = "RAJ_CONTROL_SOCKET"
+
+// DefaultTCPAddr is the loopback control port a normal editor serves alongside
+// its Unix socket. Loopback on purpose: the token still guards the port, and a
+// stranger scanning the local network should not find it at all.
+const DefaultTCPAddr = tcpScheme + "127.0.0.1:7391"
+
 // ParseAddr splits a control address into a network and an address for it.
 func ParseAddr(s string) (network, address string) {
 	if rest, ok := strings.CutPrefix(s, tcpScheme); ok {

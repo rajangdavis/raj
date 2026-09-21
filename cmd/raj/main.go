@@ -5,9 +5,12 @@
 //	raj some/dir              open a directory as the workspace
 //	raj --tab 4 file.go       set the indent width
 //	raj --tabs file.go        indent with tabs where the file does not say
-//	raj --control             listen on a control socket for buffer edits
 //	raj --control-addr tcp://0.0.0.0:7391
-//	                          also listen on TCP, for a driver in a container
+//	                          serve the control socket and this TCP address
+//	                          for a driver in a container; a plain raj serves
+//	                          no control listener
+//	raj --standalone file.go  edit one file with no workspace, no session and no
+//	                          control listener, for use as $EDITOR
 //	raj --no-restore          start fresh instead of where you left off
 //	raj ctl <cmd>             read and edit a running raj's buffers
 //	raj --attach              attach to a running raj and render its workspace locally
@@ -32,6 +35,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -50,19 +54,49 @@ import (
 	"raj/internal/safe"
 )
 
-// daemonFlag is package-scoped so a test can see the flag is registered; the
-// other flags stay local to main because only main reads them.
+// daemonFlag is package-scoped so a test can see the flag is registered. The
+// rest are package-scoped too, so a test can print the usage the running
+// editor serves without driving main.
 var daemonFlag = flag.Bool("daemon", false, "run headless and serve the control socket for attached clients (alias for `daemon run`)")
 
-// The advertised daemon entry point is `raj daemon run`; --daemon is kept as a
-// hidden alias so existing invocations keep working. MarkHidden is reached
-// through an interface because the editor also builds against Go versions
-// before it existed; where it is absent the flag stays visible rather than the
-// build failing.
+// standaloneFlag is --standalone: a single-file throwaway editor for $EDITOR.
+// It is package-scoped so a test can see the flag is registered and
+// editorUsage prints it.
+var standaloneFlag = flag.Bool("standalone", false, "edit one file with no workspace, no session and no control listener; for use as $EDITOR")
+
+var (
+	tab       = flag.Int("tab", 2, "indent width in spaces, and the display width of a tab")
+	useTabs   = flag.Bool("tabs", false, "indent with tabs in files that have no indentation to detect")
+	ctlAddr   = flag.String("control-addr", control.DefaultTCPAddr, "TCP control listener, and the address --attach dials; "+control.DefaultTCPAddr+" is the default")
+	noRestore = flag.Bool("no-restore", false, "do not reopen the previous session")
+	wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
+	configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
+	install   = flag.Bool("install", false, "with --config: write the file where the terminal reads it, instead of to stdout")
+	keyDoc    = flag.Bool("keys", false, "print the keybinding reference as markdown")
+	runProbe  = flag.Bool("probe", false, "report what chords this terminal delivers")
+	checklist = flag.Bool("checklist", false, "with --probe: walk every binding in order")
+	motions   = flag.Bool("motions", false, "with --probe: measure touch and trackpad motions")
+	phone     = flag.Bool("phone", false, "attach with the phone profile: it implies --attach")
+	attach    = flag.Bool("attach", false, "attach to a running raj and render its workspace locally")
+	name      = flag.String("name", "", "with --attach: name this client saved tab view, so clients keep separate views")
+	ctrlAlias = flag.Bool("ctrl-aliases", false, "add ctrl+<key> aliases for super+<key> bindings (implied by --phone)")
+	kkpFlags  = flag.Int("kkp", 0, "with --probe: KKP flags to push (0 = raj's own)")
+)
+
+// editorUsage writes the flag reference the help path prints. Go's default help
+// spells every long option with a single dash, so it is rewritten through
+// control's printer to the --name spelling every usage line and script uses.
+// `--daemon` is omitted by name: it is a hidden alias for `raj daemon run`, and
+// the standard flag package offers no way to mark a flag hidden.
+func editorUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: raj [options] [file|dir]")
+	control.PrintFlagUsage(w, flag.CommandLine, "daemon")
+}
+
+// The advertised daemon entry point is `raj daemon run`; --daemon stays
+// registered and functional as its hidden alias, omitted from editorUsage.
 func init() {
-	if h, ok := any(flag.CommandLine).(interface{ MarkHidden(string) error }); ok {
-		_ = h.MarkHidden("daemon")
-	}
+	flag.Usage = func() { editorUsage(flag.CommandLine.Output()) }
 }
 
 func main() {
@@ -86,27 +120,6 @@ func main() {
 			os.Exit(daemon.CLI(os.Args[2:], os.Stdout, os.Stderr))
 		}
 	}
-	var (
-		tab       = flag.Int("tab", 2, "indent width in spaces, and the display width of a tab")
-		useTabs   = flag.Bool("tabs", false, "indent with tabs in files that have no indentation to detect")
-		ctl       = flag.Bool("control", false, "listen on a Unix socket for buffer reads and edits")
-		ctlPath   = flag.String("control-socket", "", "path for the control socket; implies it")
-		ctlAddr   = flag.String("control-addr", "", "also listen on tcp://host:port, or set the socket path; implies --control")
-		ctlExec   = flag.Bool("control-exec", false, "with --control-addr: let a remote driver run commands on this machine")
-		noRestore = flag.Bool("no-restore", false, "do not reopen the previous session")
-		wrap      = flag.Bool("wrap", true, "wrap long lines; --wrap=false scrolls horizontally instead")
-		configFor = flag.String("config", "", "emit keybindings: ghostty, ghostty-linux, or iterm2")
-		install   = flag.Bool("install", false, "with --config: write the file where the terminal reads it, instead of to stdout")
-		keyDoc    = flag.Bool("keys", false, "print the keybinding reference as markdown")
-		runProbe  = flag.Bool("probe", false, "report what chords this terminal delivers")
-		checklist = flag.Bool("checklist", false, "with --probe: walk every binding in order")
-		motions   = flag.Bool("motions", false, "with --probe: measure touch and trackpad motions")
-		phone     = flag.Bool("phone", false, "attach with the phone profile: it implies --attach")
-		attach    = flag.Bool("attach", false, "attach to a running raj and render its workspace locally")
-		name      = flag.String("name", "", "with --attach: name this client saved tab view, so clients keep separate views")
-		ctrlAlias = flag.Bool("ctrl-aliases", false, "add ctrl+<key> aliases for super+<key> bindings (implied by --phone)")
-		kkpFlags  = flag.Int("kkp", 0, "with --probe: KKP flags to push (0 = raj's own)")
-	)
 	flag.Parse()
 
 	// daemonRun is `raj daemon run`; --daemon is the same mode and stays a
@@ -115,13 +128,9 @@ func main() {
 
 	// --attach, and --phone which implies it, make this process a client of a
 	// running editor rather than a second editor of its own. Both are
-	// ordinary flags now; the address comes from the address flags, or from
-	// discovery when they are empty.
+	// ordinary flags now; the address comes from --control-addr when the user
+	// passes it, or from discovery otherwise.
 	clientMode := attachMode(*attach, *phone)
-	attachAddr := *ctlPath
-	if *ctlAddr != "" {
-		attachAddr = *ctlAddr
-	}
 
 	if *keyDoc {
 		fmt.Print(keys.Doc())
@@ -153,31 +162,25 @@ func main() {
 		}
 		return
 	}
-	// A control session always has a Unix socket: it is the local trust
-	// anchor, and the one place a script on this machine can read the token
-	// out of a running session. A `tcp://` address adds a listener for a
-	// driver that does not share the filesystem rather than replacing the
-	// socket, so the two can drive one session at once. `--control-socket`,
-	// or `--control-addr` naming a path, chooses where the socket lives.
-	sock := *ctlPath
-	if *ctlAddr != "" && !control.IsTCP(*ctlAddr) {
-		sock = *ctlAddr
-	}
-	var ctlAddrs []string
-	if !clientMode && (daemonMode || *ctl || sock != "" || *ctlAddr != "") {
-		if sock == "" {
-			sock = control.DefaultPath()
+	// A standalone editor is one file in a throwaway directory: it is neither
+	// a daemon host nor a client of one, and it must name exactly the file it
+	// edits.
+	if *standaloneFlag {
+		if daemonMode {
+			fail(errors.New("--standalone cannot be combined with --daemon"))
 		}
-		ctlAddrs = append(ctlAddrs, sock)
-	}
-	if !clientMode && control.IsTCP(*ctlAddr) {
-		ctlAddrs = append(ctlAddrs, *ctlAddr)
+		if clientMode {
+			fail(errors.New("--standalone cannot be combined with --attach or --phone"))
+		}
+		if flag.NArg() != 1 {
+			fail(errors.New("--standalone needs exactly one file argument"))
+		}
 	}
 	// Only a flag the user actually typed may override a stored setting. A flag
 	// left at its default is not a decision, and treating it as one would make
 	// every setting unreachable behind the command line defaults; flag.Visit
 	// visits exactly the flags that were set.
-	var tabSet, tabsSet, wrapSet, ctrlAliasesSet bool
+	var tabSet, tabsSet, wrapSet, ctrlAliasesSet, ctlAddrSet bool
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "tab":
@@ -188,8 +191,23 @@ func main() {
 			wrapSet = true
 		case "ctrl-aliases":
 			ctrlAliasesSet = true
+		case "control-addr":
+			ctlAddrSet = true
 		}
 	})
+	// Control is opt-in. A daemon serves the Unix socket and the default TCP
+	// port because it exists to be driven; an editor serves only when
+	// --control-addr asks for it, and then the socket listens alongside the
+	// named address. A client serves nothing. A standalone editor is private
+	// and serves nothing even when an address was named.
+	ctlAddrs := controlAddrs(clientMode, daemonMode, ctlAddrSet, control.DefaultPath(), *ctlAddr)
+	if *standaloneFlag {
+		ctlAddrs = nil
+	}
+	// A flag left at its default is not a decision: only a --control-addr the
+	// user actually typed names the daemon a client dials, and an unset flag
+	// leaves the client to discover the local socket.
+	attachAddr := clientAddr(*ctlAddr, ctlAddrSet)
 	// --phone implies the ctrl aliases unless --ctrl-aliases was passed
 	// explicitly: a phone has no super key, but a keyboard attached to one might,
 	// and the explicit flag is how that choice is made. NewWithOptions resolves
@@ -208,8 +226,9 @@ func main() {
 		Phone:          *phone,
 		CtrlAliases:    *ctrlAlias,
 		CtrlAliasesSet: ctrlAliasesSet,
+		Standalone:     *standaloneFlag,
 	}
-	if err := run(flag.Arg(0), opts, ctlAddrs, *ctlExec, daemonMode); err != nil {
+	if err := run(flag.Arg(0), opts, ctlAddrs, daemonMode); err != nil {
 		fail(err)
 	}
 }
@@ -250,6 +269,31 @@ func fail(err error) {
 // --phone implies it: the phone profile exists to read a workspace from a
 // terminal that cannot drive the local editor, which is the attach story.
 func attachMode(attach, phone bool) bool { return attach || phone }
+
+// controlAddrs is the listener set a run serves. Control is opt-in: a plain
+// editor serves nothing, so nothing on the machine can read its buffers until
+// it is asked. --daemon always serves the Unix socket and the default TCP
+// address because it exists to be driven; an explicit --control-addr serves the
+// socket alongside the address the user named. A client serves nothing.
+func controlAddrs(clientMode, daemon, addrSet bool, sock, tcpAddr string) []string {
+	if clientMode {
+		return nil
+	}
+	if daemon || addrSet {
+		return []string{sock, tcpAddr}
+	}
+	return nil
+}
+
+// clientAddr is the address an attach client dials. It is the explicit
+// --control-addr only when the user passed it; a flag left at its default is
+// not a decision, so an unset flag yields "" and discovery finds the socket.
+func clientAddr(addr string, set bool) string {
+	if !set {
+		return ""
+	}
+	return addr
+}
 
 // runHost builds the host a run drives. --daemon is headless: no terminal, no
 // raw mode, frames discarded, and the idle tick as its only input, because a
@@ -296,8 +340,8 @@ func signalShutdown(daemon bool, ch chan os.Signal, shutdown func(), exit func(i
 	}
 }
 
-func run(path string, opts app.Options, ctlAddrs []string, ctlExec, headless bool) error {
-	root, path, err := resolve(path)
+func run(path string, opts app.Options, ctlAddrs []string, headless bool) error {
+	root, path, err := resolve(path, opts.Standalone)
 	if err != nil {
 		return err
 	}
@@ -366,7 +410,7 @@ func run(path string, opts app.Options, ctlAddrs []string, ctlExec, headless boo
 		}()
 	}
 	if len(ctlAddrs) > 0 {
-		if err := a.StartControlAddrs(ctlAddrs, ctlExec); err != nil {
+		if err := a.StartControlAddrs(ctlAddrs); err != nil {
 			return err
 		}
 		// Printed before the alternate screen is entered, so a harness that
@@ -430,10 +474,27 @@ func run(path string, opts app.Options, ctlAddrs []string, ctlExec, headless boo
 }
 
 // resolve splits the argument into a workspace root and a file to open.
-func resolve(arg string) (root, file string, err error) {
+//
+// standalone is --standalone: the file's own directory is the root, with no
+// walk up to a repository, because a throwaway editor must not adopt the
+// project around a file. It requires exactly one file and refuses a directory.
+func resolve(arg string, standalone bool) (root, file string, err error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", "", err
+	}
+	if standalone {
+		if arg == "" {
+			return "", "", errors.New("--standalone needs exactly one file argument")
+		}
+		abs, err := filepath.Abs(arg)
+		if err != nil {
+			return "", "", err
+		}
+		if info, err := os.Stat(abs); err == nil && info.IsDir() {
+			return "", "", fmt.Errorf("--standalone needs a file, not a directory: %s", arg)
+		}
+		return filepath.Dir(abs), abs, nil
 	}
 	if arg == "" {
 		return workspace(cwd), "", nil

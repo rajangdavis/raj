@@ -36,6 +36,12 @@ type Options struct {
 	WrapSet     bool
 	NoRestore   bool
 
+	// Standalone is the single-file throwaway editor --standalone selects: no
+	// workspace store, no session, and no sidebar. It is a launch mode, not a
+	// stored setting, so it has no *Set partner and never enters the
+	// flag.Visit override logic. It implies NoRestore.
+	Standalone bool
+
 	// Phone selects the phone profile of the normal editor: taller,
 	// horizontally scrollable tab chips and a review action bar instead of a
 	// status strip. It is a profile switch, not a stored setting, so it has no

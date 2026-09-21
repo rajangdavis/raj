@@ -395,6 +395,36 @@ func driveClientWatch(t *testing.T, ch *clientHarness, cond func() bool) {
 	ch.cli.drain()
 }
 
+// A decision delivered over the control connection wakes the watchers from
+// drainControl itself, without waiting for the next idle tick: a client that
+// did not make the decision still clears. Without the drainControl bump the
+// watch stays parked until some unrelated ui.Tick arrives.
+func TestClientRefreshesWithoutAnIdleTick(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	id := p.File.Session().LastGroup()
+	c := ch.srv.dial(t)
+	if r := c.do(ch.srv, control.Request{Op: "accept", Path: p.File.Path, Group: id}); !r.OK {
+		t.Fatalf("accept = %+v", r)
+	}
+	// Pump both event loops, but never deliver the daemon a ui.Tick.
+	deadline := time.After(3 * time.Second)
+	for len(p.File.Session().Pending()) != 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("client did not refresh without an idle tick; pending = %d", len(p.File.Session().Pending()))
+		default:
+		}
+		ch.srv.drain()
+		ch.cli.drain()
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // A decision made on the daemon, not through this client, still refreshes the
 // client copy. Accept drops Pending without moving the version, so a client
 // that only compared versions kept showing a proposal the daemon had already

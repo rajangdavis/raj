@@ -72,6 +72,43 @@ func TestTCPListenerReportsADialableAddress(t *testing.T) {
 	}
 }
 
+// SocketEnv overrides DefaultPath verbatim, which is what lets a fixed socket
+// outlive a restart and lets a client that cannot guess a pid find the editor.
+// An empty value is not an override, so the per-process convention still wins.
+func TestDefaultPathHonorsSocketEnv(t *testing.T) {
+	want := controlSock(t, "env.sock")
+	t.Setenv(SocketEnv, want)
+	if got := DefaultPath(); got != want {
+		t.Errorf("DefaultPath() = %q, want the %s override %q", got, SocketEnv, want)
+	}
+	t.Setenv(SocketEnv, "")
+	if got := DefaultPath(); got == want {
+		t.Errorf("DefaultPath() = %q, want the per-process convention when %s is empty", got, SocketEnv)
+	}
+}
+
+// A port already in use fails the bind rather than moving to the next port: the
+// address a client was told is the address it gets, and a silent move would
+// strand every client that knew the old one. The error names the flag that
+// changes the address.
+func TestTCPPortInUseFailsWithoutBumping(t *testing.T) {
+	first := newTCPEditor(t, map[string]string{"/w/a.go": "x"})
+	addr := first.srv.Path()
+	if !IsTCP(addr) {
+		t.Fatalf("first listener address %q is not TCP", addr)
+	}
+	srv, err := ListenAll([]string{addr}, func() {})
+	if err == nil {
+		srv.Close()
+		t.Fatal("a second bind on the same port succeeded")
+	}
+	for _, want := range []string{addr, "already in use", "--control-addr"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("bind error %q does not mention %q", err, want)
+		}
+	}
+}
+
 // A server can listen on a Unix socket and a TCP port at once, and both
 // listeners drain the same queue and answer from the same document. The write
 // that lands over the port is read back over the socket.
@@ -303,9 +340,9 @@ func TestUnixIgnoresTheToken(t *testing.T) {
 }
 
 // exec over TCP runs on the editor's machine, which for a driver in a container
-// is outside the container. Refused unless the user asked for it, and the
-// refusal says where to run the command instead.
-func TestTCPRefusesExecUnlessAllowed(t *testing.T) {
+// is outside the container. It is refused unconditionally, and the refusal says
+// where to run the command instead.
+func TestTCPRefusesExec(t *testing.T) {
 	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x"})
 	t.Setenv(TokenEnv, ed.srv.Token())
 	c, err := Dial(ed.srv.Path())
@@ -319,18 +356,10 @@ func TestTCPRefusesExecUnlessAllowed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Err == "" {
-		t.Fatal("exec was allowed over TCP by default")
+		t.Fatal("exec was allowed over TCP")
 	}
-	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "--control-exec") {
-		t.Errorf("refusal %q does not say why, or how to allow it", res.Err)
-	}
-
-	ed.srv.AllowRemoteExec = true
-	if res, err = c.DoExec(Request{Op: "exec", Argv: []string{"true"}}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if res.Err != "" {
-		t.Errorf("exec still refused once allowed: %q", res.Err)
+	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "your own shell") {
+		t.Errorf("refusal %q does not say why, or where to run it", res.Err)
 	}
 }
 
@@ -348,11 +377,11 @@ func TestUnixAllowsExec(t *testing.T) {
 	}
 }
 
-// The remote-exec gate is not bypassed by a batch. A program arrives as one
+// The remote-exec refusal is not bypassed by a batch. A program arrives as one
 // "prog" frame, so the serve loop's direct-exec check never sees the exec
-// inside it; connection.one re-checks the gate for every exec it runs. Without
-// the re-check, a container driver could run a command on the host by wrapping
-// it in a program — the sandbox escape the flag exists to prevent.
+// inside it; connection.one re-checks it for every exec it runs. Without the
+// re-check, a container driver could run a command on the host by wrapping it
+// in a program — the sandbox escape the refusal exists to prevent.
 func TestTCPRefusesExecInsideAProgram(t *testing.T) {
 	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x"})
 	t.Setenv(TokenEnv, ed.srv.Token())
@@ -371,18 +400,10 @@ func TestTCPRefusesExecInsideAProgram(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Err == "" {
-		t.Fatal("exec inside a program was allowed over TCP by default")
+		t.Fatal("exec inside a program was allowed over TCP")
 	}
-	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "--control-exec") {
-		t.Errorf("refusal %q does not say why, or how to allow it", res.Err)
-	}
-
-	ed.srv.AllowRemoteExec = true
-	if res, err = c.Do(Request{Op: "prog", Program: p}); err != nil {
-		t.Fatal(err)
-	}
-	if res.Err != "" {
-		t.Errorf("exec inside a program still refused once allowed: %q", res.Err)
+	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "your own shell") {
+		t.Errorf("refusal %q does not say why, or where to run it", res.Err)
 	}
 }
 

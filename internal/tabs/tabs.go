@@ -582,9 +582,14 @@ func (t *Tabs) labels() []string {
 				name = dir + "/" + name
 			}
 		}
-		// A snapshot buffer cannot be saved, so a dirty dot on it would be a
-		// lie; the local editor keeps its own marker.
-		if p.File.ViewDirty() && !p.File.IsSnapshot() {
+		// A snapshot buffer has no local save baseline, so ViewDirty is true
+		// for almost any non-empty one. The honest marker for a client tab is
+		// the review state it mirrors; a local buffer keeps the save test.
+		if p.File.IsSnapshot() {
+			if len(p.File.Session().Pending()) > 0 {
+				name += " •"
+			}
+		} else if p.File.ViewDirty() {
 			name += " •"
 		}
 		if p.DiskStale() {

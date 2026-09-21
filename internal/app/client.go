@@ -733,7 +733,11 @@ func (a *App) applyClientFile(p *editor.Pane, f *editor.File) {
 		top = 0
 	}
 	p.Viewport.Top = top
-	p.FollowCursor()
+	// Deliberately no FollowCursor: this is a background refresh of a document
+	// the viewer may have scrolled away from. The top adjustment above already
+	// keeps the same rows under the cursor, and following would instead drag
+	// the viewport back to the cursor, which is what makes scrolling a
+	// refreshed tab feel impossible until it is reopened.
 }
 
 // removeClientTab closes the tab for a path the daemon no longer lists as open.

@@ -73,7 +73,9 @@ func start(t *testing.T, files map[string]string) *editor {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(binary(t), "--control", "--no-restore", root)
+	// Control is always on, so no flag turns it on; the ephemeral TCP port
+	// keeps a smoke editor from colliding with a real one on the default port.
+	cmd := exec.Command(binary(t), "--no-restore", "--control-addr", "tcp://127.0.0.1:0", root)
 	cmd.Dir = root
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, errFile
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")

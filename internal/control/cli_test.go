@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -92,6 +93,12 @@ type fakeEditor struct {
 	// headless names docs the fake reports as loaded with no tab, so the CLI
 	// buffers output can be tested on the field that says so.
 	headless map[string]bool
+	// dirty, pending and moved are the per-buffer gate state `buffers` reports,
+	// so `status` can be driven against the real Buffer fields without a real
+	// Session. An absent key reads as zero, which is a clean buffer.
+	dirty        map[string]bool
+	pendingCount map[string]int
+	moved        map[string]int
 	// claims is the fake's working set, and lastClaim the request that last
 	// touched it, so a CLI test can assert the wire fields. claimWarnings and
 	// claimOverlaps are canned answers the CLI can be tested on.
@@ -233,7 +240,11 @@ func (f *fakeEditor) run(req Request) Response {
 			// directly; taking the lock again here deadlocks the fake.
 			bufs = append(bufs, Buffer{Path: p, Version: f.vers[p], Bytes: len(text),
 				Lines: strings.Count(text, "\n"), Active: p == f.active,
-				Headless: f.headless[p]})
+				Headless: f.headless[p],
+				Dirty:    f.dirty[p],
+				Pending:  f.pendingCount[p],
+				Moved:    f.moved[p]})
+
 		}
 		return Response{OK: true, Root: "/w", Buffers: bufs}
 	case "text":
@@ -595,6 +606,124 @@ func TestCLIBuffersEmptyJSONIsAList(t *testing.T) {
 	}
 }
 
+// status turns the per-buffer gate state into one answer for a host `make
+// check`: a clean workspace is exit 0 and names nothing, and anything dirty or
+// pending is exit 1 with every offending path named. These tests pin the three
+// facts the answer is built from -- dirty, pending and moved -- so a regression
+// that drops one is caught by the verb rather than by a broken gate.
+func TestCLIStatusCleanIsReady(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	out, errs, code := run(t, "status")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "clean") {
+		t.Errorf("status on a clean workspace = %q, want a clean summary", out)
+	}
+	if strings.Contains(out, "/w/a.go") {
+		t.Errorf("status on a clean workspace named %q; a clean answer names no path", out)
+	}
+}
+
+// A dirty buffer blocks the gate even with nothing proposed: the host would
+// read the file on disk, which is not the text the editor holds. The path and
+// the word dirty are both asserted because a count alone would not say which
+// buffer to save.
+func TestCLIStatusNamesDirtyBuffer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.dirty = map[string]bool{"/w/a.go": true}
+
+	out, errs, code := run(t, "status")
+	if code != 1 {
+		t.Fatalf("code %d: %s; want 1 for a dirty buffer", code, errs)
+	}
+	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "dirty") {
+		t.Errorf("status = %q, want it to name /w/a.go and say dirty", out)
+	}
+}
+
+// A pending change set blocks the gate on its own, and moved is reported as
+// detail beside it: the counts distinguish "one save away" from "a rebase could
+// not carry these", which are two different next steps.
+func TestCLIStatusNamesPendingAndMoved(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/b.go": "package b\n"})
+	ed.pendingCount = map[string]int{"/w/b.go": 2}
+	ed.moved = map[string]int{"/w/b.go": 1}
+
+	out, errs, code := run(t, "status")
+	if code != 1 {
+		t.Fatalf("code %d: %s; want 1 for a pending buffer", code, errs)
+	}
+	if !strings.Contains(out, "/w/b.go") {
+		t.Errorf("status = %q, want it to name /w/b.go", out)
+	}
+	if !strings.Contains(out, "2 pending") || !strings.Contains(out, "1 moved") {
+		t.Errorf("status = %q, want 2 pending and 1 moved", out)
+	}
+}
+
+// -json is the same facts for a script. It is decoded into the real Buffer
+// type rather than a map, so a field the plain answer names cannot silently
+// disappear from the structured one.
+func TestCLIStatusJSONCarriesTheSameFacts(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.dirty = map[string]bool{"/w/a.go": true}
+	ed.pendingCount = map[string]int{"/w/b.go": 2}
+	ed.moved = map[string]int{"/w/b.go": 1}
+
+	var got struct {
+		Ready    bool     `json:"ready"`
+		Total    int      `json:"total"`
+		Blocking []Buffer `json:"blocking"`
+	}
+	out, errs, code := run(t, "status", "-json")
+	if code != 1 {
+		t.Fatalf("code %d: %s; want 1 for a dirty or pending buffer", code, errs)
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("status -json is not parseable: %v (%q)", err, out)
+	}
+	if got.Ready {
+		t.Errorf("ready = true with dirty and pending buffers")
+	}
+	if got.Total != 2 {
+		t.Errorf("total = %d, want 2", got.Total)
+	}
+	byPath := map[string]Buffer{}
+	for _, b := range got.Blocking {
+		byPath[b.Path] = b
+	}
+	if b, ok := byPath["/w/a.go"]; !ok || !b.Dirty {
+		t.Errorf("blocking = %+v, want /w/a.go dirty", got.Blocking)
+	}
+	if b, ok := byPath["/w/b.go"]; !ok || b.Pending != 2 || b.Moved != 1 {
+		t.Errorf("blocking = %+v, want /w/b.go pending 2 moved 1", got.Blocking)
+	}
+}
+
+// The clean -json answer is ready:true with an empty list, so a script can test
+// one field and never special-case null.
+func TestCLIStatusCleanJSONIsReadyWithAList(t *testing.T) {
+	newFakeEditor(t, map[string]string{})
+
+	var got struct {
+		Ready    bool     `json:"ready"`
+		Total    int      `json:"total"`
+		Blocking []Buffer `json:"blocking"`
+	}
+	out, errs, code := run(t, "status", "-json")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("status -json is not parseable: %v (%q)", err, out)
+	}
+	if !got.Ready || got.Blocking == nil || len(got.Blocking) != 0 {
+		t.Errorf("clean status -json = %+v, want ready with an empty list", got)
+	}
+}
+
 func TestCLIReadSpan(t *testing.T) {
 	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
 
@@ -645,7 +774,7 @@ func TestCLIRefusesPositionalSpan(t *testing.T) {
 	}
 
 	out, errs, code = run(t, "dump", "/w/a.go", "0", "10")
-	if code != 2 || out != "" || !strings.Contains(errs, "-start/-end") {
+	if code != 2 || out != "" || !strings.Contains(errs, "--start/--end") {
 		t.Errorf("dump with a positional span: code = %d, stdout %q, stderr %q", code, out, errs)
 	}
 
@@ -766,7 +895,7 @@ func TestCLIApplyVerbatimStdin(t *testing.T) {
 }
 
 // A recv that times out exits 3 in JSON mode too. The empty JSON list is still
-// written so `-json` always parses, but the code is what a polling loop reads
+// written so `--json` always parses, but the code is what a polling loop reads
 // and it must not depend on the output shape. The cancelled frame is the real
 // server's, driven with -wait so the parked recv is cancelled. Modelled on
 // TestCLIRefusalsExitNonZero (exit-code assertions over the same fake server).
@@ -1280,7 +1409,7 @@ func TestCLILSPInlayHintsBadLines(t *testing.T) {
 	if code != 2 {
 		t.Errorf("code = %d, want 2 (usage) for -lines 0", code)
 	}
-	if !strings.Contains(errs, "-lines") {
+	if !strings.Contains(errs, "--lines") {
 		t.Errorf("stderr = %q, want the -lines hint", errs)
 	}
 }
@@ -1317,7 +1446,7 @@ func TestCLILSPRangeFormatNeedsLinesAndSendsThem(t *testing.T) {
 	if code != 2 {
 		t.Errorf("code = %d, want 2 (usage) without -lines; stderr %q", code, errs)
 	}
-	if !strings.Contains(errs, "-lines") {
+	if !strings.Contains(errs, "--lines") {
 		t.Errorf("stderr = %q, want the -lines hint", errs)
 	}
 
@@ -1434,7 +1563,7 @@ func TestSearchRefusesBareArgument(t *testing.T) {
 	if code != 2 {
 		t.Errorf("code = %d, want 2 (usage); stdout %q", code, out)
 	}
-	want := `search: unexpected argument "needle" — the pattern goes to -q; to limit paths use -include or -path`
+	want := `search: unexpected argument "needle" — the pattern goes to -q; to limit paths use --include or --path`
 	if !strings.Contains(errs, want) {
 		t.Errorf("stderr = %q, want %q", errs, want)
 	}
@@ -1448,7 +1577,7 @@ func TestSearchWarnsWhenIncludeMatchesNoFiles(t *testing.T) {
 	if code != 1 {
 		t.Errorf("code = %d, want 1 (no hits)", code)
 	}
-	if !strings.Contains(errs, "search: warning: -include pattern(s) matched no files") {
+	if !strings.Contains(errs, "search: warning: --include pattern(s) matched no files") {
 		t.Errorf("stderr = %q, want the include warning", errs)
 	}
 }
@@ -1461,7 +1590,7 @@ func TestSearchIncludeWarningStaysQuietWhenFilesWereSearched(t *testing.T) {
 	if code != 0 {
 		t.Errorf("code = %d, want 0; stderr %q", code, errs)
 	}
-	if strings.Contains(errs, "-include") {
+	if strings.Contains(errs, "--include") {
 		t.Errorf("stderr = %q, want no include warning", errs)
 	}
 
@@ -1469,7 +1598,7 @@ func TestSearchIncludeWarningStaysQuietWhenFilesWereSearched(t *testing.T) {
 	if code != 1 {
 		t.Errorf("code = %d, want 1 (no hits)", code)
 	}
-	if strings.Contains(errs, "-include") {
+	if strings.Contains(errs, "--include") {
 		t.Errorf("stderr = %q, want no include warning", errs)
 	}
 }
@@ -1484,19 +1613,19 @@ func TestSearchHintsRegexOnMetacharacterMiss(t *testing.T) {
 	if code != 1 {
 		t.Errorf("code = %d, want 1 (no hits)", code)
 	}
-	if !strings.Contains(errs, "-regex") {
+	if !strings.Contains(errs, "--regex") {
 		t.Errorf("stderr = %q, want the -regex hint", errs)
 	}
 
 	// A plain literal with no metacharacters stays quiet: it really is absent.
 	_, errs, code = run(t, "search", "-q", "absent")
-	if code != 1 || strings.Contains(errs, "-regex") {
+	if code != 1 || strings.Contains(errs, "--regex") {
 		t.Errorf("plain miss: code %d, stderr %q, want no hint", code, errs)
 	}
 
 	// A regex that matches prints no hint.
 	_, errs, code = run(t, "search", "-q", "func", "-regex")
-	if code != 0 || strings.Contains(errs, "-regex") {
+	if code != 0 || strings.Contains(errs, "--regex") {
 		t.Errorf("-regex hit: code %d, stderr %q, want no hint", code, errs)
 	}
 }
@@ -2245,10 +2374,11 @@ func TestVerbHelpNamesTheOptionalPath(t *testing.T) {
 // No editor at all must fail with a message naming the fix, not a stack trace.
 func TestCLIWithNoEditorRunning(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv(SocketEnv, "")
 	os.Unsetenv("RAJ_SOCKET")
 	os.Unsetenv("RAJ_CONTROL_ADDR")
 	_, errs, code := run(t, "buffers")
-	if code == 0 || !strings.Contains(errs, "--control") {
+	if code == 0 || !strings.Contains(errs, "no running raj found") {
 		t.Errorf("code %d, stderr %q", code, errs)
 	}
 }
@@ -2267,11 +2397,46 @@ func TestIndexAll(t *testing.T) {
 
 func TestLocatePrecedence(t *testing.T) {
 	t.Setenv("RAJ_SOCKET", "/from/env.sock")
+	t.Setenv(SocketEnv, "")
 	if got, _ := Locate("/explicit.sock", ""); got != "/explicit.sock" {
 		t.Errorf("got %q, want the explicit path", got)
 	}
 	if got, _ := Locate("", ""); got != "/from/env.sock" {
 		t.Errorf("got %q, want the environment", got)
+	}
+	t.Setenv(SocketEnv, "/from/control-socket.sock")
+	if got, _ := Locate("", ""); got != "/from/control-socket.sock" {
+		t.Errorf("got %q, want %s to win over RAJ_SOCKET", got, SocketEnv)
+	}
+}
+
+// A client that was given no address and has no address environment falls
+// through to discovery and reaches the socket that is listening, rather than a
+// hard-coded default.
+func TestLocateDiscoversWithNoAddress(t *testing.T) {
+	scan, err := os.MkdirTemp("", "raj-locate-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(scan) })
+	dir := filepath.Join(scan, "raj")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ed := newFakeEditorAt(t, filepath.Join(dir, "live.sock"), map[string]string{"/w/a.go": "x\n"})
+	// newFakeEditorAt pins XDG_RUNTIME_DIR at its own temp dir; discovery must
+	// scan where the live socket is, so pin it back.
+	t.Setenv("XDG_RUNTIME_DIR", scan)
+	os.Unsetenv("RAJ_SOCKET")
+	t.Setenv(AddrEnv, "")
+	t.Setenv(SocketEnv, "")
+
+	got, err := Locate("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != ed.srv.Path() {
+		t.Errorf("Locate discovered %q, want the live socket %q", got, ed.srv.Path())
 	}
 }
 
@@ -2816,7 +2981,7 @@ func TestRegisterPrintsTheKey(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("register exited %d: %s", code, errs)
 	}
-	if !strings.Contains(out, "key: raj-") || !strings.Contains(out, "-as raj-") {
+	if !strings.Contains(out, "key: raj-") || !strings.Contains(out, "--as raj-") {
 		t.Errorf("register = %q, want the key and the -as line", out)
 	}
 	if strings.Contains(errs, "RAJ_IDENTITY") {
@@ -3214,6 +3379,8 @@ func TestDiscoverReapsDeadSockets(t *testing.T) {
 	// newFakeEditorAt points XDG_RUNTIME_DIR at its own temp dir; that would
 	// send discovery elsewhere, so pin it back where the fixtures live.
 	t.Setenv("XDG_RUNTIME_DIR", scan)
+	// A SocketEnv override would send DefaultPath (and so discovery) elsewhere.
+	t.Setenv(SocketEnv, "")
 
 	found := Discover()
 	if _, err := os.Stat(dead); !os.IsNotExist(err) {
@@ -3299,7 +3466,7 @@ func TestCLIApplyHunksRefusesMixedFlags(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("code = %d, want 2 (usage); stdout %q, stderr %q", code, out, errs)
 	}
-	if !strings.Contains(errs, "-hunks") || !strings.Contains(errs, "-start") {
+	if !strings.Contains(errs, "--hunks") || !strings.Contains(errs, "--start") {
 		t.Errorf("stderr = %q, want both flags named", errs)
 	}
 	if ed.docs["/w/a.go"] != "x\n" {
@@ -3414,7 +3581,7 @@ func TestCLIRejectAllSkipsSetsWithNothingLeft(t *testing.T) {
 func TestCLIAllAndGroupAreAlternatives(t *testing.T) {
 	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
 	_, errs, code := run(t, "accept", "/w/a.go", "-all", "-group", "3")
-	if code != 2 || !strings.Contains(errs, "-all and -group are alternatives") {
+	if code != 2 || !strings.Contains(errs, "--all and --group are alternatives") {
 		t.Errorf("code %d, stderr %q", code, errs)
 	}
 }
@@ -4080,7 +4247,46 @@ func TestCLIUsageListsReloadAndForce(t *testing.T) {
 	if !strings.Contains(usage, "reload") {
 		t.Errorf("usage does not list reload:\n%s", usage)
 	}
-	if !strings.Contains(usage, "-force") {
+	if !strings.Contains(usage, "--force") {
 		t.Errorf("usage does not list -force:\n%s", usage)
+	}
+}
+
+// PrintFlagUsage is the one printer behind the editor, daemon and ctl help: a
+// single-character flag keeps one dash, a bool shows no value placeholder, and
+// a value flag shows the placeholder flag.UnquoteUsage derives. The default
+// rendering is the existing flagDefaultText, pinned here for the quoted string
+// and the non-zero bool.
+func TestPrintFlagUsageSpellingAndPlaceholders(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.Bool("q", false, "quiet")
+	fs.Bool("force", false, "force the operation")
+	fs.Bool("wrap", true, "wrap long lines")
+	fs.String("name", "", "a name")
+	fs.String("config", "x", "a config file")
+	fs.Uint64("group", 0, "the change set id")
+
+	var b strings.Builder
+	PrintFlagUsage(&b, fs)
+	text := b.String()
+	for _, want := range []string{
+		"  -q\n    \tquiet\n",
+		"  --force\n    \tforce the operation\n",
+		"  --wrap\n    \twrap long lines (default true)\n",
+		"  --name string\n    \ta name\n",
+		"  --config string\n    \ta config file (default \"x\")\n",
+		"  --group uint\n    \tthe change set id\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("usage missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "--q") {
+		t.Errorf("single-character flag printed with two dashes:\n%s", text)
+	}
+	for _, placeholder := range []string{"--force bool", "--wrap bool"} {
+		if strings.Contains(text, placeholder) {
+			t.Errorf("bool flag printed a value placeholder (%s):\n%s", placeholder, text)
+		}
 	}
 }

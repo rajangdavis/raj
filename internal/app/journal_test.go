@@ -315,7 +315,7 @@ func TestJournalRestoresAuthorTable(t *testing.T) {
 	a.RestoreSession()
 
 	sock := controlSock(t, "c-restore.sock")
-	if err := a.StartControl(sock, false); err != nil {
+	if err := a.StartControl(sock); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(a.StopControl)

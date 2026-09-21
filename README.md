@@ -28,8 +28,9 @@ the generated-file details are in Setup below.
 
 ### Drive it from an agent
 
-Start the editor with a control socket so another process can read and edit the
-open buffers:
+Control is opt-in. A plain `raj` serves nothing; pass `--control-addr` to
+serve a Unix socket plus that TCP address, so another process can read and edit
+the open buffers:
 
     $ ./raj --control-addr tcp://0.0.0.0:7391   # also prints a token
 
@@ -37,7 +38,7 @@ Agents and scripts use `raj ctl`:
 
     $ raj ctl buffers                    # what is open
     $ raj ctl read internal/app/app.go   # read a buffer (or a closed file)
-    $ raj ctl apply file.go -base N ...  # land an edit as a proposal
+    $ raj ctl apply file.go --base N ...  # land an edit as a proposal
     $ raj ctl save file.go
 
 An agent's edits land as attributed **proposals**: tinted in the buffer, and
@@ -59,8 +60,8 @@ The chords are in `raj --keys`. On a phone, review lives in the action drawer.
 
 raj can host a workspace for other screens to attach to and render themselves:
 
-    # host: the editor you use (it has a control socket), or a headless daemon
-    $ ./raj --control-addr tcp://0.0.0.0:7391
+    # host: an editor started with a control listener, or a headless daemon
+    $ ./raj --control-addr tcp://127.0.0.1:7391
 
     # client: another terminal; --phone selects the phone profile
     $ raj --phone     # discovers the local socket
@@ -185,10 +186,26 @@ file a formatter rewrote still lands you where you were reading.
 
 Buffer contents are still not persisted across a crash; see Sessions above.
 
+## One-file editing as `$EDITOR`
+
+`raj --standalone FILE` is a throwaway single-file editor: no workspace, no
+session and no control listener. It roots at the file's own directory without
+walking up to an enclosing repository, so a commit message edited from inside a
+checkout does not adopt the checkout as its workspace. The sidebar is hidden for
+the run, and quitting exits. It takes exactly one file argument — a directory or
+an empty argument is refused — and cannot be combined with `--daemon`,
+`--attach` or `--phone`.
+
+Configure it as the editor git and other tools launch:
+
+    $ git config --global core.editor 'raj --standalone'
+
 ## Control socket
 
-`raj --control` listens on a Unix socket so another process can read and edit
-the open buffers. This is instead of an agent pane: the driver is a separate
+An editor serves a control socket only when asked: `--control-addr` or
+`--daemon` turns it on, and the socket is where another process can read and
+edit the open buffers. This is instead of an agent pane: the driver is a
+separate
 process that can be restarted, replaced or written in another language, and a
 crash in it is not a crash in the thing holding your unsaved work.
 
@@ -197,9 +214,9 @@ unencoded and a frame is still readable in a dump. Ops: `ping`, `buffers`,
 `open`, `text`, `version`, `apply`, `save`, `search`, `exec`, `groups`,
 `accept`, `reject`, `claim`, `delete`, `rename`, `proposals`, `diff`,
 `review`, `lsp`, `hello`, `cancel`, `recv`, `snapshot`, `watch`. The path defaults to
-`$XDG_RUNTIME_DIR/raj/<pid>.sock` and is printed on stderr at startup;
-`--control-socket PATH` puts it somewhere you choose. `raj ctl` is the
-command-line client.
+`$XDG_RUNTIME_DIR/raj/<pid>.sock` and is printed on stderr at startup.
+`RAJ_CONTROL_SOCKET` puts it somewhere you choose; both the server bind and a
+discovering client read it. `raj ctl` is the command-line client.
 
 `recv` is the one op that goes the other way. The protocol has no push, so it
 is an ordinary request that parks until the user has something to say, and
@@ -207,7 +224,7 @@ is an ordinary request that parks until the user has something to say, and
 rather than to a connection, so one sent while a driver was restarting is
 delivered when it comes back.
 
-`raj ctl run -prog BYTES` sends a *program* instead: a byte string of opcodes,
+`raj ctl run --prog BYTES` sends a *program* instead: a byte string of opcodes,
 run in order in one frame. Arguments are ops below `0x80` and verbs at or above
 it, so a reader that predates an opcode still knows from the byte whether to
 skip it or refuse the program — an argument it does not know costs precision, a
@@ -219,7 +236,7 @@ anywhere: no byte of it is ever zero. SysEx buys that with 7-bit data, because
 MIDI reserves the high bit for status; here it is bought with a bias, so every
 length and number is a varint of the value plus one and full eight-bit payloads
 are kept. That is what lets a whole program travel as an ordinary command-line
-argument — argv carries every byte except zero — so `-prog` takes the bytes
+argument — argv carries every byte except zero — so `--prog` takes the bytes
 themselves, with `@FILE` and `-` for a file or stdin.
 
 Varints replaced fixed-width lengths to get this, giving up the symmetry with
@@ -240,13 +257,21 @@ set rejected and it leaves the agreed composition, but the text stays in the
 document under the rejected tint; `raj ctl clear` is the hard purge, reversing
 the set out of the document and dropping the decision, after which the same
 text can be proposed again. So redoing work that came back rejected is
-`reject`, `clear`, then `apply` once more. `raj ctl open -create` is the way to
+`reject`, `clear`, then `apply` once more. `raj ctl open --create` is the way to
 name a path that is not on disk yet: without it `open` reaches only a buffer or
 file that already exists, and a path that is neither is refused as a typo
 rather than made into an empty buffer for a misspelled name to become later.
 
-Off unless asked for. Authorisation is the socket's file mode, so anything
-running as you can drive the editor — the same trust boundary as your shell.
+Authorisation is the socket's file mode, so anything running as you can drive
+the editor — the same trust boundary as your shell. The TCP listener below is
+additive.
+
+A daemon serves the same loopback port, `tcp://127.0.0.1:7391`, alongside its
+own per-process socket, and an editor serves that port too once
+`--control-addr` asks for it. Two on one machine collide: the second fails to
+bind the port rather than taking another, because the address a client was told
+is the address it must reach — pass `--control-addr tcp://127.0.0.1:<other>` to
+run a second.
 
 ### Over TCP, for a driver in a container
 
@@ -258,7 +283,12 @@ let it run commands. A Unix socket cannot bridge that: it is a filesystem
 object, and bind-mounting one does not forward it.
 
 ```
-$ raj --control-addr tcp://0.0.0.0:7391
+$ raj --control-addr tcp://127.0.0.1:7391  # socket plus the named port
+raj: control /run/user/1000/raj/4821.sock
+raj: control tcp://127.0.0.1:7391
+raj: RAJ_CONTROL_TOKEN=3f9c...
+
+$ raj --control-addr tcp://0.0.0.0:7391  # widen the port to the network
 raj: control /run/user/1000/raj/4821.sock
 raj: control tcp://0.0.0.0:7391
 raj: RAJ_CONTROL_TOKEN=3f9c...
@@ -293,10 +323,10 @@ for it — and `RAJ_ROOT_MAP=/workspace=/Users/you/src/proj` overrides that for 
 mount layout the inference gets wrong. Nothing is ever inferred over a Unix
 socket: reaching one is proof the filesystem is shared.
 
-`exec` is refused over TCP unless `--control-exec` is passed. The command would
-run in the editor's process, on the host, outside the container that was the
-reason for the container — an agent that wants to run tests should run them
-with its own shell, in its own sandbox.
+`exec` is refused over TCP. The command would run in the editor's process, on
+the host, outside the container that was the reason for the container — an
+agent that wants to run tests should run them with its own shell, in its own
+sandbox.
 
 ## Attached clients
 
@@ -403,9 +433,9 @@ $ go build ./cmd/raj
 
 On macOS, use Go 1.24 or newer. Older toolchains omit `LC_UUID` when linking
 internally, and macOS identifies a binary by that UUID when it remembers a
-granted permission — so on macOS 15 and later the local-network access the
-`--control-addr` listener needs is asked for again every launch and never
-sticks. The symptom looks like a networking bug rather than a build one, which
+granted permission — so on macOS 15 and later the local-network access a
+non-loopback `--control-addr` listener needs is asked for again every launch
+and never sticks. The symptom looks like a networking bug rather than a build one, which
 is what makes it worth stating here. `dwarfdump -u ./raj` should print a UUID;
 if it prints nothing, the toolchain is too old. Building with
 `-ldflags="-linkmode=external"` works around it on any version, and
