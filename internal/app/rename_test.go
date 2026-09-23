@@ -60,7 +60,7 @@ func TestRenameCapabilityGate(t *testing.T) {
 // happens to have gopls installed.
 func TestRenameWithoutAServerIsHarmless(t *testing.T) {
 	h := newHarness(t, "package main\n")
-	path := filepath.Join(h.root, "notes.txt")
+	path := filepath.Join(h.primaryRoot(), "notes.txt")
 	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -145,8 +145,8 @@ func TestRenameCollectsANameThroughThePrompt(t *testing.T) {
 // replacement of each file's identifier.
 func TestRenameAppliesWorkspaceEditAcrossOpenBuffers(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	main := filepath.Join(h.root, "main.go")
-	helper := filepath.Join(h.root, "pkg", "helper.go")
+	main := filepath.Join(h.primaryRoot(), "main.go")
+	helper := filepath.Join(h.primaryRoot(), "pkg", "helper.go")
 	h.OpenFile(main)
 	h.OpenFile(helper)
 	mainText, _ := os.ReadFile(main)
@@ -179,8 +179,8 @@ func TestRenameAppliesWorkspaceEditAcrossOpenBuffers(t *testing.T) {
 // the rename rather than being skipped silently.
 func TestRenameAppliesToAnUnopenedFileAsAWhole(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	main := filepath.Join(h.root, "main.go")
-	helper := filepath.Join(h.root, "pkg", "helper.go")
+	main := filepath.Join(h.primaryRoot(), "main.go")
+	helper := filepath.Join(h.primaryRoot(), "pkg", "helper.go")
 	h.OpenFile(main) // helper stays unopened
 	mainText, _ := os.ReadFile(main)
 	helperText, _ := os.ReadFile(helper)
@@ -218,12 +218,12 @@ func TestRenameAppliesToAnUnopenedFileAsAWhole(t *testing.T) {
 // untouched, because a half-renamed symbol is worse than an unrenamed one.
 func TestRenameRefusesWholeWhenATargetCannotBeLoaded(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	main := filepath.Join(h.root, "main.go")
+	main := filepath.Join(h.primaryRoot(), "main.go")
 	h.OpenFile(main)
 	mainText, _ := os.ReadFile(main)
 	before := h.Pane().File.Text()
 
-	missing := filepath.Join(h.root, "pkg", "missing.go")
+	missing := filepath.Join(h.primaryRoot(), "pkg", "missing.go")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerRename, text: "pin", edit: &lsp.WorkspaceEdit{
 		Docs: []lsp.DocumentEdits{

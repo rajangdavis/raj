@@ -23,6 +23,10 @@ import (
 type clientConn interface {
 	Do(control.Request) (control.Response, error)
 	ResolveRoots(string) (control.Mapper, error)
+	// Roots is the workspace root set the daemon last reported, nil for a
+	// server that does not send one. The client adopts it as its visible
+	// workspace once the handshake succeeds.
+	Roots() []string
 	Close() error
 }
 
@@ -126,6 +130,36 @@ func markFromFile(f *editor.File) bufferMark {
 	return m
 }
 
+// helloRequest is the hello every client connection sends: the watch and the
+// decision connections join the same durable human identity, so text the
+// client writes is attributed to the person at the remote keyboard rather than
+// to a fresh agent. The identity is derived from the client view key, so two
+// clients of one workspace stay separate people.
+func (a *App) helloRequest() control.Request {
+	key := a.attachKey
+	if key == "" {
+		key = "attach"
+	}
+	return control.Request{Op: "hello", Identity: "client:" + key, Name: key,
+		Kind: string(control.KindHuman)}
+}
+
+// joinClient says hello on a freshly dialed connection, binding it to the
+// client's durable human identity before any document verb runs. A failure is
+// returned so the caller can close the connection and report the status; the
+// daemon-side registry then makes host.isAgent false for this author, which is
+// what lands a local edit as accepted text rather than a proposal.
+func (a *App) joinClient(c clientConn) error {
+	res, err := c.Do(a.helloRequest())
+	if err != nil {
+		return err
+	}
+	if !res.OK {
+		return errors.New(res.Err)
+	}
+	return nil
+}
+
 // StartClient connects to the daemon this app was launched to attach to, loads
 // its open documents as tabs, enters Review and arms a watch. It runs before
 // Run; the connection and the buffer marks then belong to the watch goroutine,
@@ -139,7 +173,7 @@ func (a *App) StartClient() {
 	a.clientDown = true
 	a.clientMu.Unlock()
 
-	addr, err := control.Locate(a.attachAddr, a.root)
+	addr, err := control.Locate(a.attachAddr, a.primaryRoot())
 	if err != nil {
 		a.status = "attach: " + err.Error()
 		return
@@ -149,7 +183,12 @@ func (a *App) StartClient() {
 		a.status = "attach: " + err.Error()
 		return
 	}
-	if _, err := c.ResolveRoots(a.root); err != nil {
+	if err := a.joinClient(c); err != nil {
+		c.Close()
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if _, err := c.ResolveRoots(a.primaryRoot()); err != nil {
 		c.Close()
 		a.status = "attach: " + err.Error()
 		return
@@ -165,9 +204,19 @@ func (a *App) StartClient() {
 		a.status = "attach: " + res.Err
 		return
 	}
+	// The daemon's workspace is what the client shows: adopt its root set for
+	// the explorer, search, ls and containment. The store was opened in the
+	// constructor against the view roots and stays there — the daemon owns the
+	// workspace's state database and two processes must not open it. A reply
+	// with no set (an old server, or a transport that does not carry one)
+	// leaves the launch-root workspace in place.
+	if roots := c.Roots(); len(roots) > 0 {
+		a.adoptVisibleRoots(roots)
+	}
 	vers := make(map[string]bufferMark, len(res.Buffers))
 	a.clientMirrored = make(map[string]bool, len(res.Buffers))
 	a.clientClosed = make(map[string]bufferMark)
+	a.clientEdits = make(map[string]*clientEdit)
 	// The daemon facts for every buffer, keyed by path, seed the marks below.
 	// A saved-view path is not necessarily a daemon tab, so an absent entry is
 	// the zero buffer: its review facts start at zero and the first wake
@@ -246,15 +295,23 @@ func (a *App) StartClient() {
 	}
 	a.saveClientView()
 	// A second connection carries decisions, so the event thread never waits on
-	// the parked watch for the client lock. It is a separate author, which is
-	// why clear claims the path on this connection before it clears.
+	// the parked watch for the client lock. It hellos the same durable human
+	// identity as the watch, so a decision and a forwarded edit share one
+	// author; clear still claims the path on this connection before it clears,
+	// because the write gate is per author, not per connection.
 	decide, err := dialControl(addr)
 	if err != nil {
 		c.Close()
 		a.status = "attach: " + err.Error()
 		return
 	}
-	if _, err := decide.ResolveRoots(a.root); err != nil {
+	if err := a.joinClient(decide); err != nil {
+		decide.Close()
+		c.Close()
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if _, err := decide.ResolveRoots(a.primaryRoot()); err != nil {
 		decide.Close()
 		c.Close()
 		a.status = "attach: " + err.Error()
@@ -516,7 +573,7 @@ func (a *App) reconnectClient(vers map[string]bufferMark) (clientConn, uint64, b
 // dialClient opens one control connection and completes the root handshake,
 // with the explicit address when one was given and discovery otherwise.
 func (a *App) dialClient() (clientConn, error) {
-	addr, err := control.Locate(a.attachAddr, a.root)
+	addr, err := control.Locate(a.attachAddr, a.primaryRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +581,11 @@ func (a *App) dialClient() (clientConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.ResolveRoots(a.root); err != nil {
+	if err := a.joinClient(c); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if _, err := c.ResolveRoots(a.primaryRoot()); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -541,6 +602,22 @@ func (a *App) resyncClient(c clientConn, vers map[string]bufferMark) (uint64, bo
 	if err != nil || !res.OK {
 		return 0, false
 	}
+	// A daemon that came back serving a different workspace must re-root the
+	// client before the view is re-derived, or the explorer, search and
+	// containment keep describing roots that are no longer there. Adoption
+	// mutates event-thread state (the explorer, search and picker panes), so
+	// the watch goroutine only queues the set and drainClient adopts it on the
+	// event thread.
+	roots := res.Roots
+	if len(roots) == 0 {
+		roots = c.Roots()
+	}
+	if len(roots) > 0 {
+		a.clientMu.Lock()
+		a.clientRoots = append([]string(nil), roots...)
+		a.clientMu.Unlock()
+		a.host.Post(ui.Wake{})
+	}
 	for path := range vers {
 		delete(vers, path)
 	}
@@ -548,6 +625,20 @@ func (a *App) resyncClient(c clientConn, vers map[string]bufferMark) (uint64, bo
 		return 0, false
 	}
 	return res.Gen, true
+}
+
+// sameRootSet reports whether two root lists name the same roots in the same
+// order.
+func sameRootSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // publishClient swaps in a connection pair and closes the old ones. The
@@ -618,11 +709,23 @@ func (a *App) drainClient() {
 	a.clientMu.Lock()
 	files := a.clientFiles
 	a.clientFiles = nil
+	roots := a.clientRoots
+	a.clientRoots = nil
 	lost := a.clientLost
 	a.clientLost = ""
+	note := a.clientNote
+	a.clientNote = ""
+	refetch := a.clientRefetch
+	a.clientRefetch = nil
 	a.clientMu.Unlock()
 	if lost != "" {
 		a.status = lost
+	}
+	if note != "" {
+		a.status = note
+	}
+	if len(roots) > 0 && !sameRootSet(a.visible.All(), roots) {
+		a.adoptVisibleRoots(roots)
 	}
 	adopted := false
 	for _, cf := range files {
@@ -630,6 +733,16 @@ func (a *App) drainClient() {
 			adopted = true
 		}
 		a.installClientFile(cf)
+	}
+	// A refused forward leaves local text the daemon never saw; restore the pane
+	// from the daemon now that the queued snapshot decisions have settled.
+	for _, path := range refetch {
+		for _, p := range a.Tabs.All() {
+			if p.File.Path == path {
+				a.refetchClient(p)
+				break
+			}
+		}
 	}
 	if adopted {
 		// New membership — an adopted proposal or a newly mirrored daemon tab —
@@ -678,6 +791,13 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	if a.clientTabSnoozedFile(cf.path, cf.file) {
 		return nil
 	}
+	// A pane with an unforwarded local edit must not be replaced by a daemon
+	// snapshot: the watch would clobber text the daemon has not seen. The
+	// forward clears the mark (or re-fetches on refusal), after which the next
+	// snapshot installs.
+	if a.clientEditBusy(cf.path) {
+		return nil
+	}
 	for _, p := range a.Tabs.All() {
 		if p.File.Path == cf.path {
 			a.applyClientFile(p, cf.file)
@@ -695,6 +815,7 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	p.Hints = a.InlayHints
 	p.SetDisplay(a.displayPolicy())
 	a.Tabs.Add(p)
+	a.recordClientSynced(cf.path, cf.file)
 	if prev != nil {
 		// A buffer opened on the daemon after the attach is announced by
 		// adding the tab, not by stealing the tab the user is reading.
@@ -733,11 +854,316 @@ func (a *App) applyClientFile(p *editor.Pane, f *editor.File) {
 		top = 0
 	}
 	p.Viewport.Top = top
+	// The pane now shows this snapshot, so it is the daemon text a later local
+	// edit will be diffed against. Recording it here covers both the install
+	// path and a decision's read-back, so every replacement resets the base.
+	a.recordClientSynced(p.File.Path, f)
 	// Deliberately no FollowCursor: this is a background refresh of a document
 	// the viewer may have scrolled away from. The top adjustment above already
 	// keeps the same rows under the cursor, and following would instead drag
 	// the viewport back to the cursor, which is what makes scrolling a
 	// refreshed tab feel impossible until it is reopened.
+}
+
+// clientEdit is the daemon state one owned pane's local copy was synced from, so
+// a local edit can be forwarded as an apply against that version. synced is the
+// text the version describes; pending is the newest local text seen; dirty
+// marks an unforwarded change and running marks an active forward loop, so the
+// event thread never starts a second one for the same path.
+type clientEdit struct {
+	version uint64
+	synced  string
+	pending string
+	dirty   bool
+	running bool
+}
+
+// clientForwardDebounce is how long a burst of typing settles before the edit
+// is forwarded, so a fast run of keystrokes becomes one apply rather than one
+// per key. It is a var so a test can shorten it.
+var clientForwardDebounce = 40 * time.Millisecond
+
+// recordClientSynced records the daemon version and text a pane was installed
+// from. It is a no-op for a busy path: a snapshot is not authoritative while a
+// local edit is still being forwarded, and a successful forward records its own
+// adopted version instead.
+func (a *App) recordClientSynced(path string, f *editor.File) {
+	if path == "" || f == nil {
+		return
+	}
+	a.clientMu.Lock()
+	defer a.clientMu.Unlock()
+	if a.clientEditDirtyLocked(path) {
+		return
+	}
+	if a.clientEdits == nil {
+		a.clientEdits = map[string]*clientEdit{}
+	}
+	a.clientEdits[path] = &clientEdit{version: uint64(f.Session().Version()), synced: f.Text()}
+}
+
+func (a *App) clientEditBusyLocked(path string) bool {
+	e, ok := a.clientEdits[path]
+	return ok && (e.dirty || e.running)
+}
+
+// clientEditDirtyLocked reports an unforwarded local edit, ignoring a forward
+// that is merely in flight. A refused forward clears dirty before its loop
+// exits, so the refetch it queued is not blocked by the still-running flag.
+func (a *App) clientEditDirtyLocked(path string) bool {
+	e, ok := a.clientEdits[path]
+	return ok && e.dirty
+}
+
+// clientEditBusy reports whether a path has an unforwarded local edit or one in
+// flight. The install path uses it to leave a dirty pane alone.
+func (a *App) clientEditBusy(path string) bool {
+	a.clientMu.Lock()
+	defer a.clientMu.Unlock()
+	return a.clientEditBusyLocked(path)
+}
+
+// clientEditDirty reports an unforwarded local edit, ignoring a forward that is
+// only in flight.
+func (a *App) clientEditDirty(path string) bool {
+	a.clientMu.Lock()
+	defer a.clientMu.Unlock()
+	return a.clientEditDirtyLocked(path)
+}
+
+// scanClientEdits sweeps every owned client tab for text that differs from the
+// daemon text it was synced from and schedules one forward per changed path. It
+// runs on the event thread, so the pane text it reads is stable; the forward
+// itself is off-thread and coalesced by the per-path running flag.
+func (a *App) scanClientEdits() {
+	if !a.attach {
+		return
+	}
+	a.clientMu.Lock()
+	var started []string
+	for _, p := range a.Tabs.All() {
+		path := p.File.Path
+		e, ok := a.clientEdits[path]
+		if !ok || e.running {
+			continue
+		}
+		if len(p.File.Session().Pending()) > 0 && a.clientNote == "" {
+			a.clientNote = "agent proposals here"
+		}
+		cur := p.File.Text()
+		if cur == e.synced && !e.dirty {
+			continue
+		}
+		e.pending = cur
+		e.dirty = true
+		e.running = true
+		started = append(started, path)
+	}
+	a.clientMu.Unlock()
+	for _, path := range started {
+		path := path
+		safe.Go(func() { a.forwardClientEdit(path) })
+	}
+}
+
+// forwardClientEdit is the off-thread forward loop for one path. It debounces,
+// then repeatedly diffs the synced daemon text against the newest local text and
+// sends one apply against the version the local copy came from. The daemon's
+// own rebase is the merge: nothing is merged locally. An edit made while an
+// apply is in flight is forwarded by the next turn of the loop.
+func (a *App) forwardClientEdit(path string) {
+	for {
+		time.Sleep(clientForwardDebounce)
+		a.clientMu.Lock()
+		e, ok := a.clientEdits[path]
+		if !ok {
+			a.clientMu.Unlock()
+			return
+		}
+		if !e.dirty {
+			e.running = false
+			a.clientMu.Unlock()
+			return
+		}
+		base, synced, cur := e.version, e.synced, e.pending
+		a.clientMu.Unlock()
+
+		newVersion, ok := a.forwardApply(path, base, synced, cur)
+
+		a.clientMu.Lock()
+		if e2, still := a.clientEdits[path]; still && e2 == e {
+			if ok {
+				e.version, e.synced = newVersion, cur
+				if e.pending == cur {
+					e.dirty = false
+				}
+			} else {
+				// The daemon kept its text; the refetch queued by forwardApply
+				// restores the pane, so stop retrying this path.
+				e.synced, e.dirty = cur, false
+			}
+		}
+		a.clientMu.Unlock()
+	}
+}
+
+// forwardApply sends one apply on the decision connection for a single local
+// edit, expressed as the changed middle between the synced text and the local
+// text. It claims the path first (learning any agent overlap) and reads the
+// version so the write gate is satisfied, then applies against the tracked base.
+// The daemon rebases; a success returns the new version.
+func (a *App) forwardApply(path string, base uint64, synced, cur string) (uint64, bool) {
+	c := a.decideClient()
+	if c == nil {
+		a.warnClientEdit(path, "attach: not connected to a daemon")
+		return 0, false
+	}
+	if claim, err := c.Do(control.Request{Op: "claim", Paths: []string{path}, ClaimAdd: true}); err == nil && claim.OK {
+		a.noteClaimOverlap(c, path, claim.ClaimOverlaps)
+	}
+	if _, err := c.Do(control.Request{Op: "version", Path: path}); err != nil {
+		a.warnClientEdit(path, "attach: "+err.Error())
+		return 0, false
+	}
+	start, endOld, endNew := editMiddle(synced, cur)
+	res, err := c.Do(control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: start, End: endOld, Text: cur[start:endNew]}}})
+	if err != nil {
+		a.warnClientEdit(path, "attach: "+err.Error())
+		return 0, false
+	}
+	if !res.OK {
+		a.warnClientEdit(path, "changed elsewhere; your edit was not placed")
+		return 0, false
+	}
+	return res.Version, true
+}
+
+// flushClientEdit forwards any pending local edit for a pane synchronously,
+// before a save. It runs on the event thread, where a client save already waits
+// on the decision connection, so blocking for the round trip costs no more than
+// the save itself.
+func (a *App) flushClientEdit(p *editor.Pane) {
+	if p == nil || p.File.Path == "" {
+		return
+	}
+	path := p.File.Path
+	a.clientMu.Lock()
+	e, ok := a.clientEdits[path]
+	if !ok || !e.dirty {
+		a.clientMu.Unlock()
+		return
+	}
+	cur := p.File.Text()
+	base, synced := e.version, e.synced
+	if cur == synced {
+		e.dirty = false
+		a.clientMu.Unlock()
+		return
+	}
+	a.clientMu.Unlock()
+
+	newVersion, ok := a.forwardApply(path, base, synced, cur)
+
+	a.clientMu.Lock()
+	if e2, still := a.clientEdits[path]; still && e2 == e {
+		if ok {
+			e.version, e.synced = newVersion, cur
+			if e.pending == cur {
+				e.dirty = false
+			}
+		} else {
+			e.synced, e.dirty = cur, false
+		}
+	}
+	a.clientMu.Unlock()
+}
+
+// editMiddle returns the common prefix and the two suffix cut points of old and
+// cur, so the single changed span is old[start:endOld] replaced by
+// cur[start:endNew]. Equal strings yield an empty span, which drops out as a
+// no-op apply.
+func editMiddle(old, cur string) (start, endOld, endNew int) {
+	n := len(old)
+	if len(cur) < n {
+		n = len(cur)
+	}
+	for start < n && old[start] == cur[start] {
+		start++
+	}
+	endOld, endNew = len(old), len(cur)
+	for endOld > start && endNew > start && old[endOld-1] == cur[endNew-1] {
+		endOld--
+		endNew--
+	}
+	return start, endOld, endNew
+}
+
+// noteClaimOverlap records an agent that shares a claimed path as a short
+// status note. It asks the daemon's who list for the kinds rather than inferring
+// one from the author id, because a second human also writes above the agent
+// base.
+func (a *App) noteClaimOverlap(c clientConn, path string, overlaps []control.ClaimOverlap) {
+	if len(overlaps) == 0 {
+		return
+	}
+	who, err := c.Do(control.Request{Op: "who"})
+	if err != nil || !who.OK {
+		return
+	}
+	kinds := make(map[uint8]control.Kind, len(who.Participants))
+	for _, p := range who.Participants {
+		kinds[p.ID] = p.Kind
+	}
+	for _, o := range overlaps {
+		if kinds[o.Author] != control.KindAgent {
+			continue
+		}
+		name := o.Identity
+		if name == "" {
+			name = "an agent"
+		}
+		a.noteClient(agentOverlapNote(name, path))
+		return
+	}
+}
+
+// agentOverlapNote is the short status for an agent that shares a claimed file.
+func agentOverlapNote(name, path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		path = path[i+1:]
+	}
+	return "agent " + name + " has claimed " + path
+}
+
+// noteClient queues a one-line status for the event thread.
+func (a *App) noteClient(note string) {
+	a.clientMu.Lock()
+	a.clientNote = note
+	a.clientMu.Unlock()
+	a.host.Post(ui.Wake{})
+}
+
+// warnClientEdit queues a forward refusal as the status and asks the event
+// thread to refresh the pane from the daemon, so local text the daemon never
+// saw does not survive the refusal.
+func (a *App) warnClientEdit(path, note string) {
+	a.clientMu.Lock()
+	a.clientNote = note
+	if path != "" {
+		seen := false
+		for _, p := range a.clientRefetch {
+			if p == path {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			a.clientRefetch = append(a.clientRefetch, path)
+		}
+	}
+	a.clientMu.Unlock()
+	a.host.Post(ui.Wake{})
 }
 
 // removeClientTab closes the tab for a path the daemon no longer lists as open.
@@ -1142,6 +1568,15 @@ func (a *App) clearRemote(p *editor.Pane, group uint64) {
 // is the decision path read-back, so the tab shows the daemon state a decision
 // produced rather than a local mutation the next wake would overwrite.
 func (a *App) refetchClient(p *editor.Pane) bool {
+	if p == nil {
+		return false
+	}
+	if a.clientEditDirty(p.File.Path) {
+		// An unforwarded local edit would be lost by the replacement; the next
+		// watch install refreshes the pane once it is clean.
+		a.status = "attach: local edit pending; refresh skipped"
+		return false
+	}
 	c := a.decideClient()
 	if c == nil {
 		a.status = "attach: not connected to a daemon"

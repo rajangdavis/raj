@@ -358,6 +358,9 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 		// only overrides what it needs to: the tint and the highlight keep
 		// the token's foreground, so agent-written code is still
 		// syntax-coloured and a highlighted occurrence still says what it is.
+		// The two green tints are the exception: the syntax palette is chosen
+		// for the terminal background, and the comment grey all but vanishes
+		// on the green, so a tint reassigns the foreground below.
 		if st, ok := syntax.StyleAt(semantic, shift+offs[i]); ok {
 			style = st
 		} else if st, ok := syntax.StyleAt(tokens, shift+offs[i]); ok {
@@ -365,6 +368,14 @@ func (p *Pane) drawLine(s *ui.Screen, x, y, w, line, lo, hi int, sel [][2]int, h
 		}
 		if bg, ok := tints[offs[i]]; ok {
 			style = style.On(bg)
+			if bg == th.ProposedAdd || bg == th.AgentTint {
+				// Both agent tints are dark enough that the comment grey all
+				// but disappears on them. Keep the tint, but pair it with
+				// the black or white foreground that reads against it, so
+				// commented-out code stays legible whether the change is
+				// still proposed or already accepted.
+				style = style.With(ui.LegibleOn(bg))
+			}
 		}
 		if write, ok := highlightAt(highlights, shift+offs[i]); ok {
 			// The emphasis layers over the token: a background keeps the

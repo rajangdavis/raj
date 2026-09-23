@@ -45,7 +45,14 @@ const (
 
 // NewPane opens the tree at root, focused on the tree rather than the toggle:
 // the toggle is drawn first now, but it is not what you came to the pane for.
-func NewPane(root string) *Pane { return &Pane{Tree: NewTree(root), spot: spotTree} }
+func NewPane(root string) *Pane { return NewPaneRoots([]string{root}) }
+
+// NewPaneRoots opens the tree on a workspace root set: one top-level node per
+// root, each expanding and refreshing independently. A single root is the old
+// pane exactly.
+func NewPaneRoots(roots []string) *Pane {
+	return &Pane{Tree: NewTreeRoots(roots), spot: spotTree}
+}
 
 // Focus restores the pane to wherever focus was when it was last left, so
 // returning after opening a file does not lose your place in the tree.

@@ -13,8 +13,8 @@ func TestNoticeReachesTheStatusLine(t *testing.T) {
 }
 
 // It must not shout over something the App already had to say. A bad pattern
-// in .raj/hidden is about the workspace in front of the user; a stale config is
-// about their terminal, and it can wait.
+// in the workspace hide file is about the workspace in front of the user; a
+// stale config is about their terminal, and it can wait.
 func TestNoticeYieldsToAnExistingStatus(t *testing.T) {
 	h := newHarness(t, "")
 	h.status = "ignoring 1 bad pattern"

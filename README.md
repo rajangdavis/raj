@@ -101,7 +101,8 @@ internal/tabs        open/close/reopen/switch. One layout function serves both
                      tab other than the one drawn under it.
 internal/explorer    lazy tree, git-status filter.
 internal/hidden      which files and folders the tree, search and picker skip.
-                     gitignore-shaped patterns; defaults plus .raj/hidden.
+                     gitignore-shaped patterns; defaults plus a user file and a
+                     per-workspace file.
 internal/search      literal/regex engine over the tree and the open buffers,
                      grouped collapsible results. Literal
                      queries bypass regexp for bytes.Index; case-insensitive ones
@@ -402,12 +403,15 @@ The defaults hide version-control metadata and dependency caches — `.git/`,
 `node_modules/`, `vendor/`, `__pycache__/` and friends — and nothing else.
 Dotfiles are visible: `.gitlab-ci.yml` and `.github/` are files you edit.
 
-To change it, write patterns to `.raj/hidden` in the workspace, or
-`~/.config/raj/hidden` for every workspace. Defaults first, then the user file,
-then the workspace one; the last pattern that matches decides.
+To change it, write patterns to `~/.config/raj/hidden` for every workspace, or
+to the workspace's own file at
+`$XDG_CONFIG_HOME/raj/workspaces/<workspace>/hidden` (`$XDG_CONFIG_HOME`
+defaults to `~/.config`). The workspace file is keyed by the workspace's roots,
+so one workspace has one file rather than one per root. Defaults first, then the
+user file, then the workspace one; the last pattern that matches decides.
 
 ```
-# .raj/hidden
+# ~/.config/raj/hidden
 dist/            # a directory, anywhere in the tree
 *.log            # a glob, matched against the name
 /target/         # anchored at the workspace root

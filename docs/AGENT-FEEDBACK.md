@@ -2786,3 +2786,896 @@ and `--no-restore`) are discriminating against their fixtures.
 single-dash form is absent, nor the `--daemon` hiddenness, nor the missing
 header; and the `Restart` `--no-restore` forwarding has no direct test
 (`TestRestartForwardsRecordedControl` passes false).
+
+## Between-wave review — workspace roots as a set (Wave 2, 2026-09-21)
+
+Read-only pass over the landed, inert Wave 2 (`internal/workspace.Roots`, the
+`session.StateDir` delegation, `App.root` -> `App.roots`/`primaryRoot()`).
+`proposals` was empty and every buffer read `saved` with 0 pending / 0 moved,
+so there was nothing to dispose; the wave was enumerated from the brief and the
+tree, since the container has no git checkout. Per-file `raj ctl lsp
+diagnostics` read `ok` on both new files and every changed production file
+under `internal/workspace`, `internal/session` and `internal/app`; a clean
+per-file reading is not a package check, so the host `make check` stays the
+gate.
+
+Inertness, verified as a reader:
+
+- **The state key is unchanged.** `sha256("/Users/rajandavis/Desktop/projects/raj")`
+  is `89862ebb3e8c...` (openssl, in this container), so `StateKey` returns
+  `raj-raj-89862ebb` and `session.StateDir` still builds
+  `<stateHome>/raj/workspaces/<key>`. `session.StateDir` delegates to
+  `ws.StateKey`, and the local `stateKey`/`slug` are gone from
+  `internal/session`.
+- **`TestStateKeyMatchesSessionStateDir` is a tautology.** Both sides are
+  `workspace.StateKey` (`session.StateDir` calls it), so the test cannot fail
+  for a wrong key algorithm; it only pins that StateDir's last path component
+  is `StateKey`. `TestStateKeyGolden` is the real algorithm pin.
+- **The single root is preserved.** `ws.New` canonicalises with `filepath.Abs`
+  (identity for an already-absolute clean path), and production's `resolve()`
+  always yields one, so `primaryRoot()` equals the old field. The
+  construction-time consumers (`explorer.NewPane`, `search.NewPane`,
+  `newServers`, `migrateState`, `picker.New`) still receive the constructor's
+  `root` parameter directly rather than `primaryRoot()`; equal in production,
+  a latent split only if a relative root ever reached the constructor.
+- **No `a.root`/`h.root`/`h2.root` reads remain** under `internal/app`
+  (case-sensitive regex; the case-insensitive default had listed unrelated
+  `s.root`/`Tree.Root`/`Control.Response.Root`).
+- **The multi-root surface is unwired**, as intended: `Roots.Contains`/`Names`/
+  `All`/`Len` have no production caller (`All`, `Names` and `Contains` are
+  test-only; `Primary` is the only production method), `control.ResolveRoots`
+  still takes one string, and no parse/state/visibility path was added.
+
+Friction found while reviewing (actionable ones filed in TODO.md):
+
+- **`search` is case-insensitive by default, and the skill says it is not.**
+  `raj ctl search -q PRIMARYROOT` returns `primaryRoot` hits with no flag;
+  `--case` is what makes it case-sensitive. The skill's "literal and
+  case-sensitive unless `--regex` or `--case`" is backwards, and cost this pass
+  a re-run to trust a reconciliation search.
+- **`SearchMatch`'s doc comment contradicts its fields.** It says
+  `ByteStart..ByteEnd` bound the match "within" the line; the fields are file
+  offsets (their own comments and a live hit say so) while `Text` is the whole
+  line trimmed of trailing space, so a `Text` slice at `ByteStart` is off by
+  `LineStart`. Folded into the existing "name the search hit's offsets" item.
+- **`edit --old ... --all` is an unbounded substring replace.** A rename like
+  `.root` -> `.primaryRoot()` with `--all` would also rewrite
+  `snapshotSearcher.root` and `servers.root`; `--all` has no word boundary.
+- **`groups` with no path fails** (`no open buffer for that path`) while
+  `proposals` answers workspace-wide. Already tracked as the `groups`/
+  `proposals` scope split, so not re-filed.
+- **`claim A B` replaces the working set; it does not add.** Already tracked
+  twice (TODO "Tests and workflow" and "Claim surface"); this pass merged the
+  duplicate.
+
+Resolved candidates (not re-filed):
+
+- **A missing parent directory is not a dead end any more.** `saveNamed`
+  routes through `ensureParent` (`internal/app/app.go`), which offers to create
+  the directory, covered by `TestSaveNamedOffersToCreateAMissingDirectory` and
+  `TestSaveNamedDecliningReportsNotSaved` and recorded in COMPLETED.md. The
+  residual question is whether `open --create` should refuse or warn up-front
+  instead of deferring to the save dialog — a UX choice.
+- **`NativeHost` never closes its `events` channel.** The `Host` interface
+  comment says the channel closes when the host shuts down and `FakeHost`/
+  `HeadlessHost` do close it; `NativeHost.Close` closes `done` and stops the
+  reader but leaves `events` open. Filed.
+- **`daemon.log` grows unbounded.** `Runner.logWriter` opens it append-only
+  and never rotates; `logTail` scoping fixed the wrong-run output, not growth.
+  Filed.
+
+Verb surface: the `ls` verb enumerated `internal/workspace` (both files
+present); `groups` no-path and `diff` needing a path are the only rough edges,
+and the first is already tracked.
+
+Not compile-verified: the wave and its tests were read, not run; the host
+`make check` is the gate.
+
+## Between-wave review — daemon discovery and workspace labels (Wave 3a, 2026-09-22)
+
+Read-only pass over the landed, saved Wave 3a. `proposals` was empty and every
+open buffer read `saved` with 0 pending / 0 moved, so there was nothing to
+dispose; the wave was enumerated from the brief and the tree, since the
+container has no git checkout. Per-file `raj ctl lsp diagnostics` read `ok` on
+`internal/daemon/daemon.go`, `internal/daemon/daemon_test.go`,
+`internal/session/session.go`, `internal/session/session_test.go` and
+`cmd/raj/main.go`; a clean per-file reading is not a package check (no
+`go vet`, no whole-package compile), so the host `make check` stays the gate.
+Everything below is read from source, not run.
+
+Behaviour, verified as a reader:
+
+- **`FindWorkspace` resolves an explicit label only.** It scans `List()` and
+  matches `e.Workspace == name`, never `e.Label()`, so a derived display name
+  is not addressable; two explicit matches are an error rather than a coin
+  toss. `Entry.Label()` has no caller outside the daemon table sort and the
+  `LABEL` column.
+- **`resolveTarget` is the stop/status/restart front door.** A label with a
+  `[dir]` is refused before any lookup, an unknown label is refused, and a
+  match resolves to `primaryRoot(e)`. `claimWorkspace` (start, and restart with
+  a `dir`) refuses a label another running daemon carries, allows the label's
+  own root, and allows the empty label.
+- **Restart label carry-over is real, not just documented.** `restartCLI`
+  reads the running record's `Workspace` through `Status()` when `--workspace`
+  is absent, restarts, then `SetWorkspace` writes that label onto the new
+  record; with `--workspace NAME` the name overrides. Ordering is safe: the
+  carry is read before `Stop`, and the label is written after `Start` waits for
+  the new record's readiness.
+- **Stale cleanup and ordering.** `listDir` removes `daemon.json` and
+  `daemon.pid` for a dead pid and skips the entry; a missing directory (and the
+  empty state home) is `nil`/empty; the sort is `Label()` then `primaryRoot`.
+  `sort.Slice` is not a stable sort, but ties on `(label, primaryRoot)` are
+  unreachable because a root maps to one state key, so the ordering is
+  deterministic.
+- **Single-root behaviour is otherwise unchanged.** `Record` only adds `Roots`
+  when the caller supplied none; `Start`/`Stop`/`Status` are untouched;
+  `cmd/raj/main.go` still calls `daemon.Record(root, rec)` with no `Roots`, so
+  the stamp happens at the record layer.
+
+Test integrity (read-only):
+
+- `TestFindWorkspaceIgnoresUnlabelledDaemon` builds the exact state it asserts:
+  `stateRoot` points `XDG_STATE_HOME` at a temp dir, `Record` writes
+  `<stateHome>/raj/workspaces/<key>/daemon.json` (where `List()` scans) with
+  `PID: os.Getpid()` (alive) and `Workspace: ""`, then
+  `FindWorkspace(filepath.Base(root))` must miss. It would fail if
+  `FindWorkspace` used `Label()`.
+- `TestFindWorkspaceRefusesAmbiguousLabel` seeds two explicit `"dup"` labels
+  under one state home and asserts an error, not a pick.
+- `TestWorkspaceLabelRoundTripsThroughSetWorkspace` preserves pid/socket/tcp/
+  token/roots across `SetWorkspace` and resolves through `FindWorkspace`; the
+  fields are compared one by one because `Roots` makes `State` non-comparable.
+- `TestEntryLabelFallsBackToRootBase` is display-only, and the explicit-only
+  rule is pinned by the ignore test above.
+- `TestListDirSkipsDeadAndRemovesFiles`, `TestListDirSortsByLabelThenRoot`,
+  `TestClaimWorkspaceRefusesRunningLabel` and
+  `TestStopWorkspaceResolvesThroughLabel` are discriminating against their
+  fixtures.
+- Gap: `restartCLI`'s carry-over/override and `startCLI`'s `--workspace`
+  labelling have no test. The logic sits in the CLI functions, which expose no
+  `Ops`/`Runner` seam, so a test needs a real spawn; the pure piece
+  (carry-versus-override) should move into a helper like `resolveTarget`.
+  Filed in TODO.md.
+- Gap: `list --json` with no daemons marshals a nil `[]Entry` to `null`, a
+  shape a script must special-case. Filed in TODO.md.
+- Observation, not filed: `TestListCLIRendersRunningDaemon` asserts the value
+  kinds but not the five column headers, and `TestListDirSortsByLabelThenRoot`'s
+  comment says "stable" where `sort.Slice` is not; neither can fail today.
+
+Friction (raw, deduped):
+
+- **The container image predates this wave.** `/usr/local/bin/raj` answers
+  `raj daemon list` with `unknown command "list"` and its usage lacks
+  `list`/`ps`/`--workspace`, so the CLI the skill documents is newer than the
+  binary in the container. The host editor may be rebuilt, but the container
+  image that bakes in `raj` was not, which is the §3 rebuild boundary; a driver
+  can neither exercise nor trust `raj daemon` here until it is. No `raj ctl`
+  verb changed this wave, so the socket surface is unaffected.
+- **Shell quoting around an apostrophe** in an `edit --old`/`apply --text` body
+  is already recorded in this file (the `$'...'` apostrophe note); the same
+  class recurred and cost a re-apply. Not re-filed.
+- **A large insertion with literal tabs reached for `apply --text-file -`
+  rather than `apply --hunks`.** The hunks form is JSON Lines with `\t`
+  escapes; a body typed with literal tabs is shell-fragile. A skill line
+  pointing large or newline/tab-bearing bodies at `--text-file -` would save
+  the detour; recorded as an instance of the existing quoting note, not a new
+  bug.
+
+Not compile-verified: the wave and its tests were read, not run; the host
+`make check` is the gate.
+
+## Between-wave review — workspace roots on the wire, attach adoption (Wave 3c, 2026-09-22)
+
+Read-only pass over the landed, saved Wave 3c. `proposals` was empty and every buffer read saved with 0 pending / 0 moved, so there was nothing to dispose; the wave was enumerated from the brief and the tree, since the container has no git checkout. Per-file `raj ctl lsp diagnostics` read `ok` on every changed production and test file (`internal/control/{header,wire,control,host,header_test,host_test,wire_test}.go`, `internal/app/{app,client,control,ls,headless,deletion,journal,persist,session,client_test,client_reconnect_test,multiroots_test}.go`, `internal/explorer/{tree,pane}.go`, `internal/search/pane.go`, `internal/workspace/workspace.go`, `cmd/raj/main.go`); a clean per-file reading is not a package check, so the host `make check` stays the gate.
+
+Wire, verified as a reader:
+
+- **`hRoots` (0x62) matches an existing list field's encoding exactly.** Encode is `var w prog.Writer; for _, r := range h.Roots { w.Str(r) }; Op8{hRoots, w.Done()}` and decode is `NewReader` + `More()` + `r.Str()` + `recordsOK(r, "roots")`, the same shape as `hClaims`/`hArgv`/`hPaths`. It is emitted only when `len(h.Roots) > 0`, and the code is an argument (<0x80), so `prog.Decode(b, nil)` keeps an unknown opcode and `decodeHeader`'s case-less switch drops it: a peer that does not know the field skips it. Truncation is guarded by `recordsOK` (`errBadFrame: truncated roots record`) rather than silently ending the list early.
+- **`Root` still carries the primary.** `Dispatch` sets both `Root: g.Root()` and `Roots: g.roots()`; the real host's `Root()`/`Roots()` read `visible.Primary()`/`visible.All()`, so they agree in production, and a host whose set's first differs from `Root()` still reports `Root` unchanged (the `memHost` fixture exercises exactly that).
+- **Both skew directions are safe.** New server/old client: the old client ignores 0x62 and keeps its own root. Old server/new client: no field, so `res.Roots` is nil, `setRoots` is not called, and `StartClient` keeps the launch root. The field is a header argument, not a verb, so it cannot make an old client refuse the frame.
+- **Fallback is absence, not `[""]`.** `Guard.roots()` returns the host set when non-empty, else `[]string{Root()}` when `Root() != ""`, else nil.
+
+Visible vs view, and attach, verified as a reader:
+
+- `a.visible.All()` is the only reader in the explorer/search rebuild, `ls` (`Len`/`Primary`/`All`), `host.Root()`/`host.Roots()`, `rootFor`, `pathInRoot`, `snapshotSearcher.roots` and the headless containment check; `a.roots` is the only reader in `session.StateDirForRoots`/`LoadForRoots`/`DecodeForRoots`, `journalDir`/`trashDir`, `persistTick`, `deletion.go` and `primaryRoot()`. The store is opened in the constructor at `session.StateDirForRoots(wsRoots.All())` before any adoption, so it is never the daemon's state dir.
+- `StartClient` adopts only after `res.OK` from the `buffers` handshake, and only when `c.Roots()` is non-empty, so an old server keeps the launch root. `ws.New` ignores empty input and rejects nesting; `adoptVisibleRoots` ignores either, so a reply with no set cannot root the explorer at nothing.
+- A daemon root absent locally is left as spelled by `localise` (`rebase` returns a path outside the mapped tree unchanged), then adopted; `explorer.children` returns nil on a `ReadDir` error, so the root row has no children rather than a failure. `TestAttachAdoptsDaemonRoots` uses real temp dirs, so this is the path it drives.
+
+Known limitations — all real, all filed in TODO.md:
+
+- The picker (`picker.New(root)`) and the LSP servers (`newServers(root)`) are built from the constructor's launch root, not `primaryRoot()`/`visible`; adoption does not re-root them.
+- `resyncClient` re-derives tabs and re-runs adoption of pending buffers but never calls `adoptVisibleRoots`, so a reconnect does not re-adopt a changed daemon set.
+- `Client.Roots()` is sticky: `setRoots` is only called for a non-empty reply, so a later reply that names no set leaves the last learned set in place. It also records editor-spelled roots from ResolveRoots's remote `ping`, which runs before the mapper is installed (`localise` returns early with `paths` inactive), so an intervening `Roots()` read would see the daemon spelling; `StartClient` is safe only because the `buffers` reply re-localises them first.
+- The hidden policy is loaded from the primary/launch root by `explorer.NewTreeRoots`, `search.NewPaneRoots` and `picker.New`, while `host.Ls` loads the rules of the directory's own root; a `.raj/hidden` in a second root governs `ls` but not the tree or search (the search pane comment already names this as deferred).
+
+Test integrity (read-only; nothing was run):
+
+- `TestPingReplyCarriesRoots` is discriminating: `Dispatch` sets `Roots` from `g.roots()`, and without that line `res.Roots` is nil against a two-root fixture. It also asserts `Root == h.root` while the set's first element is a different temp dir, so "primary stays primary" is pinned.
+- `TestPingRootsEmptyWithoutARoot` passes for the *missing-wiring* bug as well as the `[""]` bug: a `Dispatch` that never set `Roots` also reports `len == 0`. It is a real guard for `roots()` returning `[]string{""}` (which would make `len == 1`), but it is not a regression test for the wave. A discriminating fixture would send the no-root ping through `EncodeResponse`/`DecodeResponse` and assert the encoded header does not contain `hRoots`; `TestResponseCarriesRoots` already covers the wire-absence half.
+- `TestResponseCarriesRoots` is discriminating for `EncodeResponse`/`DecodeResponse` dropping the field (the decode would be nil) and pins the sparse half (`Root` without `Roots` decodes to nil).
+- `TestHeaderRoundTrip` asserts the two-element `Roots` slice element-by-element, and `TestEveryHeaderFieldRoundTrips` is the reflective guard: `fullHeader` now sets `Roots`, so a missing encode line makes `got.Roots` zero against a non-zero `filled.Roots`.
+- `TestAttachAdoptsDaemonRoots` is discriminating (without the `adoptVisibleRoots` call `visible` stays the launch root) and asserts all four surfaces: `visible`, `Explorer.Tree.Roots`, `Search.Roots`, containment. `scriptedAttach` drives the real `StartClient` over `scriptedConn.Roots()`.
+- `TestAttachViewStoreStaysKeyedByLaunchRoots` builds and checks real on-disk state (the launch state dir's `state.db` exists, the daemon's does not), so it catches an adoption that reopened the store under `visible`; it does not fail against the pre-wave tree, where no adoption exists — it is a guard on the new adoption path, not a baseline regression.
+- `TestAttachOldServerKeepsLaunchRoots` pins the observable end-to-end behaviour, but it would still pass with either single guard removed (`StartClient`'s `len > 0` or `adoptVisibleRoots`'s `Len()==0`), because each covers the empty case; it only fails if both accept an empty set.
+- `TestVisibleRootsEqualViewRootsForANormalEditor` is discriminating: an unset `visible` (zero `ws.Roots`) fails `Len`/`Primary` against the constructor root, and it pins `Explorer.Tree.Roots` and `host.Roots()`.
+- The updated `TestDispatchLs` is discriminating for the follow-up: `memHost.Ls` records the resolved path, and the old guard rewrite to `Root()` would make `h.lastLs.Path` non-empty. The out-of-root refusal is exercised too. The `cli_test.go` comment above the `ls -hidden` assertion ("with no path it names the workspace root") still reads loosely next to an assertion that the wire path is empty; harmless, not filed.
+
+Repo sweep for the old empty-`ls` contract: `Guard.Ls` passes `""` through, `host.Ls` (`internal/app/ls.go`) turns `""` into `visible.Primary()` only in the single-root branch and into `rootEntries()` when several roots, `canonicalPath` returns `""` unchanged, `memHost.Ls` records what it is given, `TestDispatchLs` asserts the empty path, `TestLsNoPathListsRootsAndDisambiguatesSameName` and `TestSingleRootVisibilityUnchanged` assert the new behaviour, and `TestCLILs` asserts the wire path is empty. No production code or other test still rewrites an empty `ls` path to `Root()`.
+
+Deferred 3b-3 candidates: the missing-path warn/skip is now superseded by design — `Guard.Claim` deliberately keeps a path not on disk (a forward claim) and warns only on a non-`IsNotExist` stat error, so `CLAIM-SPEC.md` §3 ("warned per-path and skipped") and §10's open `open --create` parent question no longer describe the code; filed as a spec-reconciliation item, with the forward-claim choice flagged for the user. Per-root `.raj/hidden` is real and filed. The `open --create` parent itself is answered at save by `ensureParent`, so no separate item.
+
+Friction (raw, deduped):
+
+- **`search --json` reports `line` as a 1-based line number while `line_start`/`line_end` are byte offsets.** A `jq` projection that reads `.line_start` as the line and `.line` as the offset is easy to write, and was written in this pass before the raw object was inspected. Folded into the existing "name the search hit's offsets" TODO item, not new.
+- **`search -q` is case-insensitive without `--case`.** Already recorded in the Wave 2 block; the same pass hit it again. Not re-filed.
+- **`read --json` on several paths returns `{"files":[...]}` while a single path returns the flat record.** A batch projection written as `.[]` silently yields the object's values; the shape split cost this pass a re-read. Already the "Multi-target read: `--json` shape differs" item, not re-filed.
+- **`read --json` carries no `bytes`, so appending to a doc needs a separate `version` call.** The single read record is `author`/`spans`/`text`/`version`; the length comes from `version --json`. Same family as the existing "read --json does not echo the span" item, noted not filed.
+- **`/tmp/opencode` is root-owned and not writable by the sandbox user (`oc`).** The skill names it as the sanctioned scratch dir, but a heredoc there fails with `Permission denied`; scratch went to `/tmp` instead. Worth fixing the container permissions or the skill text.
+
+Not compile-verified: the wave and its tests were read, not run; the host `make check` is the gate.
+
+## Between-wave review — one language server per (root, language) (Wave 4, 2026-09-22)
+
+Read-only pass over the landed, saved Wave 4 (`internal/app/lsp.go`, `app.go`, `lsp_test.go`, `document_symbol_test.go`). `proposals` was empty and every buffer read saved (0 pending / 0 moved), so there was nothing to dispose. The container has no git checkout, so the changed-file set is the brief's list plus a tree sweep for the new symbols, not an independent diff; that gap is the existing TODO item ("A saved wave has no enumerable diff for the review pass"). `raj ctl lsp diagnostics` read `ok` on all four changed files and on the fourteen other `internal/app` readers of the server table (`diagnostics.go`, `control.go`, `semantic.go`, `folding.go`, `format.go`, `willsave.go`, `codelens.go`, `codeaction.go`, `rename.go`, `documentlink.go`, `jump.go`, `inlay.go`, `menu.go`, `headless.go`). A clean per-file reading is not a package check, so the host `make check` stays the gate.
+
+Keying — verified as a reader:
+
+- `serverKey{root, lang}` is the only key: `for_` inserts `serverKey{root: s.rootFor(path), lang: id}`, and `running`/`live` index the same shape. No lookup, insert or delete keys on `lang` alone; the only direct `byID` indexes outside those three are tests. The two drain loops (`drainDiagnostics`, `drainServerMessages`) iterate the map values and are key-agnostic, so they are correct by construction. Every feature entry point (`closeDoc` via `running`; `syncDirtyPane`/`lspSaved`/`documentSymbols`/`resolveSelectedCompletion`/`maybeRequestHighlight`/`folding`/`semantic`/`format`/`willsave` via `live`; codeaction/codelens/documentlink/jump/inlay/rename and the `control.go` LSP verbs via `for_`) passes a path and lets the resolver choose the root. No reader was left on a language-only key.
+
+Resolution:
+
+- `servers.rootFor` and `App.rootFor` use the identical component-wise rule (`filepath.Rel`, rejecting `..` and `..<sep>`; `workspace.inside` is a third copy), so `/a/bc` is not inside `/a/b`. Roots cannot overlap (`workspace.New` rejects nesting), so at most one matches and the returned root is unique. The fallback is the only rule difference: outside every root `servers.rootFor` returns `roots[0]` (the old single-root behaviour) while `App.rootFor` returns `""` (the copy-path "outside the workspace" case). The two disagree on the *set* under attach: `App.rootFor` reads `visible` (daemon roots) while `servers.rootFor` reads the constructor's launch roots, so a path under a daemon-only root or a launch-only root resolves differently — the already-filed attach item. A benign divergence: `servers.rootFor("")` returns the primary while `App.rootFor("")` returns `""`; every server caller guards an empty path (empty language id) before resolving. `docPath` still joins a relative path against the primary.
+
+Lifecycle — verified as a reader:
+
+- `for_` builds `lsp.Server{Dir: root}` and `start` handshakes `lsp.URI(ls.root)`, so the process's cwd and `rootUri` are the path's own root; `clientCapabilities` sends one `rootUri` per connection, now correct per root.
+- `running`/`live` only index; they never call `for_`, never search PATH, and resolve the caller's own path's root.
+- `stopAll` copies every `byID` value under the lock, clears the map, then stops each, so it reaches every root.
+- `WarmServers` dedupes languages, then steers the first file of each language per distinct root through `for_`; a second file of the same language and root shares the entry.
+- Single root: every path resolves to the one root, the key is unique per language, `Dir`/`rootUri` are that root, so behaviour is the old one.
+
+Test integrity (read-only; nothing was run):
+
+- `TestServerRootFollowsTheFilePath` is discriminating: it drives the real constructor (`newRootsHarness`) and `for_` with `stubGopls` (which exits before the handshake, so `for_` records the entry synchronously) and asserts the entry is keyed by root2 with `Dir` and `root` both root2. Under the single-root key the root2 key does not exist. No race on the assertion: `for_` inserts before returning and the goroutine does not touch the map.
+- `TestServersArePerRootForRunningAndLive` is discriminating and reaches live state: `stubHandshakeGopls` answers initialize and stays alive, `waitLiveServers` polls `live` to a deadline, and the test asserts two distinct servers with their own `Dir`, that `running` returns each path's own server, and that the table holds two. A single `byID["go"]` makes `lsA == lsB` and `byID == 1`.
+- `TestStopAllStopsEveryRoot` reaches live state the same way and checks the table empties and each server refuses a later `Start` with `ErrClosed`. It is weaker than its name: it never asserts the two live servers are distinct, so a regression that reused one server would still pass (both lookups return the same pointer, `stopAll` stops it, both `Start` calls return `ErrClosed`). Not vacuous today (the fixture does create two), but the minimal strengthening is `if live[0] == live[1] { t.Fatal }` plus `len(byID) == 2` before stopping. Filed in TODO.md.
+- `TestWarmServersStartsOnePerLanguagePerRoot` is discriminating: `stubGopls` plus three open files (two under rootA, one under rootB) make `WarmServers` produce two entries; the single-root key produces one. It asserts `Dir` per root. The fixture builds the state: `newRootsHarness` has nothing open, so the only panes are the three it opens, and the second rootA file is written before it is opened.
+- `TestWarmServersSingleRootIsOneServerPerLanguage` pins the regression half (one root, two files, one server with that root's `Dir`); it does not fail against the pre-wave tree by itself — the single-root result is the same — it guards the new resolver on the single-root path.
+- The updated call sites are all correct: `lsp_test.go`/`document_symbol_test.go` build their injected keys with `serverKey{root: h.servers.rootFor(...), lang: lsp.LanguageID(...)}`, and every `newServers(...)` in the tests passes `[]string{"/w"}`. `TestServerSelection`'s empty-path case still returns before resolving a root.
+
+Residuals — verified, not refuted:
+
+- Attach's `servers` stays launch-rooted (`newServers(wsRoots.All())` in the constructor; `adoptVisibleRoots` never rebuilds it). Already in TODO.md ("never re-rooted on attach").
+- `docPath` joins a relative path against `a.primaryRoot()`; pre-existing, and no caller hands a relative pane path.
+- The "single-root client" comment in `clientCapabilities` is still accurate per connection: each server is sent exactly one `rootUri` and no `workspaceFolders`.
+
+Friction (raw, deduped):
+
+- **`exec` is refused over TCP** (as designed), so this pass could not run `git status` on the host to enumerate the wave's changed files even though the editor and its repo are on the host; the container's `/work` is empty. The saved-wave diff gap in TODO.md is the exact pain, hit again.
+- **Multi-path `lsp diagnostics` still prints one unframed `{"status":"ok"}` per operand** with no path, and a cold gopls prints `starting language server…` per path as non-JSON. Already filed (two items), re-observed.
+- The 5-second `waitLiveServers` deadline (a `t.Fatalf`, not a hang) is the right shape for an asynchronous start; worth copying for other live-server tests.
+
+Not compile-verified: the wave and its tests were read, not run; the host `make check` is the gate.
+
+## Tool-use baseline (2026-09-22)
+
+First pass of the efficiency loop over the tool ledger
+(`~/.local/share/opencode/raj-tool-ledger.jsonl`): 39 sessions, 6,222 recorded
+calls, an average of about 160 per session — so over 100 calls is the norm, not
+the exception. The count of sessions is not the problem; the call mix is.
+
+- `search` 2,949 (25%) and `read` 2,591 (22%) are nearly half of all calls. The
+  batching forms exist and are barely used: `search --context` 149 (5% of
+  searches), and the multi-target `read A B C` form is not measured as adopted.
+- `edit` 890 against `apply` 169, of which `apply --hunks` is 8 (5%). The
+  multi-hunk door is not the default, so a several-hunk change costs several
+  round trips.
+- `lsp` 408: multi-path batching is blocked because the `--json` form emits one
+  unframed object per operand with no path.
+- `claim` 210: the replace-by-default set semantics drive re-claims and refused
+  applies.
+- `version` 105: forced by `read --json` omitting `bytes`/`lines`, so a driver
+  that just read the text makes a second call before appending.
+- Tools: `bash` 6,038 (91%), `task` 106, `webfetch` 37, `skill` 31. Some 119
+  `cat` and 31 `grep` calls run outside `raj ctl`; workspace files read that way
+  are a rule gap, container-only files are fine.
+
+The between-wave review pass now reports this mix per wave (duty 6 in
+`docs/REVIEW-AGENT.md`). Surface fixes that remove the reason for the extra
+call, in priority order: `read --json` carries `bytes`/`lines`; multi-path
+`lsp diagnostics --json` is one framed array keyed by path; `claim` warns
+before replacing a non-empty set. Discipline (skill and every brief):
+`search --context`, `read A B C`, `apply --hunks`, `dump`/`patch`. Measure
+calls per wave before and after; the aim is to roughly halve.
+
+## Between-wave review: read size and framed diagnostics (2026-09-22)
+
+First duty-6 pass. The two efficiency waves and the workflow scaffolding that
+added the duty were reconciled on a settled tree: `proposals` empty, `status`
+clean no dirty or pending buffer, nothing superseded. Source read:
+`internal/control/{host.go,cli.go,cli_test.go,host_test.go}`. The three repo
+docs carry the additions -- `docs/REVIEW-AGENT.md` duty 6, the
+`docs/AGENT-FEEDBACK.md` baseline block, `docs/RECURSIVE-RAJ.md` section 10 --
+and they agree on the ledger path and the thresholds. One multi-path
+`lsp diagnostics` call over the four Go files returned `ok` for each once gopls
+started. Not compile-verified: the change and its tests were read and driven
+over the socket, not built; the host `make check` is the gate.
+
+### Verified live
+
+- `read --json docs/TODO.md` returns `bytes` 36274 / `lines` 544 with the keys
+  `author/bytes/lines/spans/text/version`; `version --json` returns the same
+  36274/544. A `--lines 1,1` span read still reports the whole file
+  (36274/544, `text` 7 bytes).
+- A multi read of `docs/TODO.md` and `docs/COMPLETED.md` gives each entry its
+  own `path/bytes/lines`; `COMPLETED.md` reports the post-edit 178319/2365 that
+  `version` reports too.
+- `lsp diagnostics A B --json` is one document with `files[]`, each entry
+  headed by its own `path`; a cold start put `"status":"starting"` and the
+  `starting language server...` detail inside the entry, so stdout stayed pure
+  JSON. A missing operand appeared as `{"path":...,"status":"error","detail":
+  "no open buffer..."}`, the same refusal on stderr, exit 1; an all-ok sweep
+  exits 0. Single-path `--json` stayed a bare object (`["status"]`), and the
+  plain sweep printed `==> path <==` per operand.
+
+### Judgements
+
+- The multi-target span split -- a shared span reports each entry's contributed
+  bytes/lines, not the whole file's -- is acceptable, not a TODO: `bytes` is
+  also what splits the concatenated body, so it must stay contributed, and the
+  whole-file size an append needs is one single-target read or `version` away.
+  The code comment states the split.
+- One gap, filed as a TODO: a multi-path entry whose answer parses but is
+  statusless (an old server's `{}`) is emitted with `path` only and exits 1,
+  where the single-path form refuses with "the editor did not report a
+  diagnostics status; rebuild it to match this ctl".
+
+### Tool use (baseline: 39 sessions, 6222 calls, ~160 each)
+
+| session | calls | verb mix | batching |
+|---|---|---|---|
+| B1 `ses_f388269e2ffeaS502dXqI6QNxo` | 144 | search 93, read 30, edit 12, lsp 7, reg/claim/buffers 1 | `--context` 93/93, `read A B C` 0/30, `apply --hunks` 0 (no applies), multi-path lsp 1/7 |
+| B2 `ses_f381b280cffeiHPXdkIGWYQohP` | 83 | search 32, read 30, edit 10, lsp 4, groups 3, diff 3, version 2, revert 2, reg/claim/buffers/help 1 | `--context` 27/29, `read A B C` 0/30, `apply --hunks` 0 (no applies), multi-path lsp 3/4 |
+
+- B1 is over the ~100 flag (144) though under the ~160 baseline; B2 is clear
+  (83).
+- `search --context` is the success story: 100% and 93%. Across the ledger,
+  excluding this review, it is now 249 of 3075 searches (~8%), up from 149
+  (5%) at the baseline -- the count is approximate because one shell command
+  can hold several invocations.
+- `read A B C` was 0/30 in both. The cause is the surface, not discipline: a
+  batch read shares one span, and every read here was a different region of a
+  different file. Per-target spans would be the fix if the form is wanted.
+- `apply --hunks` 0 is not a discipline flag on these two: neither made an
+  apply at all (12 and 10 `edit` calls, each a single block). It is flat
+  globally (9 vs 8 at the baseline), so the multi-hunk door is still not the
+  default.
+- Multi-path `lsp diagnostics`: B1 used it once (the form did not exist in its
+  running editor yet); B2 used it 3/4. Each sweep folds N single-path calls into
+  one -- B2's three two-path sweeps saved three round trips.
+- Claim only what is visible: B1 used `read --json` 30 times and `version` 0
+  times, where the baseline's 114 `version` calls were the read-then-size
+  pattern this change removes -- consistent with the fix, not proof of a
+  wave-wide cut. Both sessions were efficiency-aware, so their rates are not
+  the baseline's.
+
+### Test integrity
+
+- B1 CLI tests would fail without the CLI keys (absent -> 0); the multi-target
+  test discriminates `lines` only, since a multi-read already carried `bytes`
+  for splitting. The host tests use `memHost.Buffers` (+1 lines) and fail on the
+  default zero. Non-vacuous.
+- B2 framed/attributes/cold-start/plain tests would fail before the change
+  (bare objects make `json.Unmarshal` of the stream fail, or the headers are
+  absent). `TestCLILSPDiagnosticsSinglePathJSONUnchanged` passes before and after
+  and does not discriminate the new code, but it guards the dispatch from
+  wrapping a single path (a plausible wrong implementation); likewise
+  `TestCLILSPDiagnosticsSweepsMultiplePaths` passes both ways. Both are guards,
+  not vacuous.
+- Fake seams mirror the real host: `lspJSONByPath`/`lspErrByPath` are read in
+  the fake's `lspprep` case, the op the real `connection.lsp` submits to the
+  host, so an err stands in for a real refusal; `fakeLineCount` matches
+  `view.Index`/`File.Lines`; `fakeLineSpan` mirrors the host line translation.
+  One wrinkle: the fake's `buffers` case computes `Lines` without the `+1` its
+  `version` case uses, so the two disagree; inert here but a latent fixture
+  inconsistency.
+
+## Between-wave review: per-target read spans and repeatable search (2026-09-22)
+
+Wave `internal/control/{cli.go,cli_test.go}`: `read --at` per-target line spans
+and repeatable `search -q`. Reconciled on the settled tree: `proposals` empty,
+every buffer saved, nothing superseded, and the new symbols (`atSpanFlag`,
+`searchPatternFlag`, `readTargets`, `readSpan`, `addLineSpan`) appear only in
+the two changed files. The wave's file list is the brief's assertion; the
+container has no repo and `exec` is refused over TCP, so it could not be
+checked with git.
+
+**The new surface could not be exercised live: the container's
+`/usr/local/bin/raj` predates the wave.** It rejects `--at` ("flag provided but
+not defined: -at") and its `-q` is a plain string, so a repeated `-q` is
+last-pattern-wins with no label (a discriminating `-q alpha -q gamma` search
+returned only the gamma hit). The host daemon and the CLI change were built
+together, but the container image that carries `raj ctl` was not rebuilt, so
+every verdict below is read-only on the source and tests. Rebuild the container
+image before the next wave can use `--at` or a repeated `-q`; until then the
+running client is the old surface (section 3, "the container image has to match
+the build"). The multi-path `text` wire path itself is fine: `raj ctl read A B`
+already works against the running daemon.
+
+### Verified (read-only)
+
+- `atSpanFlag.Set` splits on the last `=` and refuses a missing `=`, a
+  non-positive or unordered span, or a non-numeric one by name;
+  `parseAtSpan`/`ctlAtoi` take digits only. `readTargets` reads a positional
+  path named by `--at` once at its span (a repeated positional still reads
+  once), an unnamed positional whole or at the global span, then appends the
+  `--at` paths with no positional. `readSpan` is comparable, so `readMany`
+  groups identical spans into one `c.Do` each; a single target keeps the flat
+  shape, and `addLineSpan` echoes `line_start`/`line_end` only for a line span
+  (a byte span keeps its old keys).
+- `searchPatternFlag.patterns()` keeps the single empty-pattern default;
+  `doSearch` copies one `SearchQuery` per pattern and calls `DoStream` once
+  each, labels only when `multi`, folds `matched` across patterns, prints the
+  include warning once and a metacharacter hint per pattern. The whole-JSON
+  path keeps the exact `SearchMatch` shape for one pattern and adds `pattern`
+  per match only for several; single-pattern plain and `-jsonl` output is
+  unchanged. The transport is as briefed: K distinct spans -> K `c.Do`, P
+  patterns -> P `DoStream`, all inside one CLI call (the N round trips are
+  filed, not fixed).
+
+### Judgements
+
+- The last-`=` split is acceptable, and recorded rather than filed. It only
+  misparses silently when the text after the final `=` is exactly `LO,HI` (a
+  file literally named `out=1,2`): `--at out=1,2` reads `out` lines 1..2. Every
+  other `=`-bearing path is addressed by writing the span after the final `=`,
+  and a bad trailing segment refuses by name rather than reading whole.
+- Grouping identical spans into one wire call is a pure round-trip saving and
+  is invisible in the output, so no test pins it: a regression to one call per
+  target would pass every test. The fixture's multi-target `text` branch now
+  applies the shared span, mirroring `host.readPaths`, but the only multi-path
+  group any test exercises is the whole-file `read A B`; no test carries a
+  group of two paths with a non-whole span. The fake records each dispatch, so
+  a call-count assertion would close it.
+- A multi-pattern `-json` reply's `files` count sums per pattern, so one file
+  matched by two patterns is counted twice. New multi-only shape; acceptable,
+  worth stating in the skill if it is documented there.
+
+### Test integrity
+
+- Every `--at` test fails against the old client: the flag is undefined, so the
+  CLI exits 2 and the code/name assertions fail (`TestCLIReadAtMalformed` also
+  fails its "names the entry" check, because a flag error does not carry the
+  value). `TestCLIReadAtPerTargetSpans` and
+  `TestCLIReadAtDeduplicatesAndKeepsOthersWhole` assert per-target text a
+  single shared span could not produce, plus the dedupe (two files, not three)
+  and the no-span key on the unnamed path.
+- `TestCLIReadAtPathWithEquals` fails if the split were on the first `=`
+  (`/w/a` + `b.go=1,2` -> refusal), so it discriminates the last-`=` rule.
+  `TestCLIReadJSONEchoesLineSpan` fails without `addLineSpan`, and its byte-span
+  half fails if a byte span grew `line_start`.
+- The `search` tests fail without the change: old `-q` is last-wins, so
+  `TestSearchMultipleQueries` loses the `alpha` hit and its label,
+  `TestSearchMultipleQueriesExit`'s matching case (`alpha`,`zzz`) returns 1
+  instead of 0, and `TestSearchMultipleQueriesFlagsAndHint` gets no hint. That
+  last test's all-miss half (`yyy`,`zzz`) passes under the old behaviour too,
+  but the test as a whole is not vacuous and the matching half discriminates.
+- Fixture: `fakeLineSpan` mirrors the host line translation, and the fake
+  `text` branch splits the concatenation by each contributed `Bytes`, which is
+  what `readMany` reassembles on. No test passes for the bug it names.
+
+### Tool use (baseline: 39 sessions, 6222 calls, ~160 each)
+
+The implementation session is `ses_f37d77739ffe3WiAooe3KEEeyY` (identity
+`raj-c84704a5`: `register` once, one `claim` for both files): **104 bash calls**,
+over the previous review's B2 (83) and just over the ~100 flag, under the ~160
+baseline and B1 (144). Its 150 `raj ctl` verb occurrences: `search` 63, `read`
+62, `ls` 5, `edit` 5, `lsp` 4, `apply` 3, `groups` 2, and
+register/claim/buffers/list/status/help 1 each. Batching: `search --context`
+34 of 40 search calls (85%), multi-path `lsp diagnostics` 4 of 4, `read A B`
+3 of 49 reads, `apply --hunks` 0 of 3 (single-block applies). Across the ledger
+`search --context` is 387 (from 149 at the baseline), `apply --hunks` 14 (from
+8), `raj ctl search` 2,536 (from 2,949) and `read` 2,811.
+
+- The session is efficiency-aware, so its rates are not the baseline's. The
+  per-target-span fix could not show up as `read A B` adoption here because the
+  agent's client was the old binary: it wrote the feature with `apply` and test
+  text, not by driving `--at`.
+- The N-round-trip cost the user flagged is invisible to a call count: a
+  `read --at` over K spans is one tool call and K `c.Do`. That is why it is
+  filed as a surface fix (a single `run --prog` frame), not a discipline note.
+
+Not compile-verified: the source and tests were read, and the changed surface
+could not be driven (the container client predates it); the host `make check`
+is the gate.
+
+## Between-wave review: attach by workspace label (2026-09-22)
+
+Wave `cmd/raj/main.go`, `internal/app/settings.go`, `cmd/raj/main_test.go`:
+attach to a daemon by `--workspace` label. Settled-tree check: `proposals`
+empty, `groups` empty, all three buffers `saved`, nothing superseded. All
+three files answered `ok` in one multi-path `lsp diagnostics` call. The
+implementation session is `ses_f3571c68affeYVQifLZGHMVKiM` (identity
+`raj-b9b217db`); the orchestrator session is `ses_f358446f4ffeOEm6Frv330LTXx`
+(`raj-3b26589b`), which ran the live `raj --workspace nope` refusals.
+
+### Raw findings (implementation subagent)
+
+- **`/tmp/opencode` is root-owned and not writable in the container.** The
+  agent probed it (`ls -ld /tmp/opencode; touch /tmp/opencode/probe`) and fell
+  back to `/tmp/raj-w1` for its hunk files and test text; this review confirmed
+  the dir is `root:root 0755`. The scratch dir the workflow pre-approves is
+  unusable by the agents it is for — fix its ownership/mode, or stop naming it.
+- **`read --json` returns whole-file `text`/`bytes`/`lines` but no per-line
+  byte index.** Every structural `apply` offset cost an extra `search --json`
+  round trip; the session built its hunks from hardcoded offsets (23688, 23817,
+  24007) it had to locate separately. Promoted to TODO: echo a line-start
+  offset array with the text, so a read is an offset source on its own.
+
+### Other observations (review, low)
+
+- `State.Workspace`'s doc comment (`internal/daemon/daemon.go:41-42`) says an
+  empty label means the daemon is "shown by its primary root", but the CLI's
+  LABEL column now uses `displayLabel()`, which shows `-` and is pinned by
+  `TestListCLIShowsDashForUnlabelled`. The comment contradicts the code;
+  update it to say `-`. Recorded, not fixed (source is settled).
+- `Entry.Label()` now has no production caller — `displayLabel()` took the
+  LABEL column and the sort — and is kept alive only by tests. Retire it, or
+  say why the derived name stays as a public helper.
+- `TestAttachWorkspace`'s "finder error passes through" case asserts only that
+  an error came back, and so does the "label not found" case, so a regression
+  that turned the finder's ambiguity error into "no running daemon labelled"
+  would still pass. Give the table a `wantErrContains` and assert the
+  ambiguity text. The socket-over-TCP, `--control-addr`, positional-argument
+  and no-address cases do discriminate.
+
+### Tool use
+
+- implementation `ses_f3571c68affeYVQifLZGHMVKiM`: **29 calls** (28 bash), verb
+  occurrences from the recorded (sometimes truncated) commands: `read` 7,
+  `search` 7, `goto` 3, `lsp` 2, and register/claim/apply/edit 1 each.
+  Batching: `read` multi-target 0 of 7 (whole-file `--json` reads),
+  `search --context` 2 of 7 (29%), `apply --hunks` 1 of 1 (`cmd/raj/main.go`)
+  plus `edit --old-file/--new-file` for the `run` prologue, multi-path `lsp` 0
+  of 2 (per-file).
+- orchestrator `ses_f358446f4ffeOEm6Frv330LTXx`: **93 calls** (86 bash) — under
+  the ~100 flag but close; `read` 45, `search` 24, `open` 4, `goto` 4,
+  register 3, `buffers` 3, version 2, and whoami/proposals/lsp/groups/diff 1
+  each. Batching: `search --context` 0 of 24 (0%), multi-path
+  `lsp diagnostics` 1 of 1 — the framed three-file sweep.
+- Global ledger (cumulative, not wave-scoped): 7,398 before-rows, 7,187 bash;
+  `search` 2,511 (`--context` 391, 16%), `read` 2,615 (multi-target ~129, 5%),
+  `apply` 210 (`--hunks` 12, 6%), `lsp` 428 (multi-path 124, 29%).
+- Flag: the orchestrator never used `search --context` (0 of 24); every
+  batching form but multi-path `lsp` is far under a quarter globally.
+  Multi-path `lsp diagnostics` does emit framed output (`==> path <==`, and a
+  `{"files":[...]}` document with `--json`); encourage it.
+- Ledger caveat: the recorded `cmd` is truncated for long commands, so any verb
+  that follows a heredoc (most `edit`/`apply` with `--old-file`/`--hunks`) is
+  invisible to the verb-mix query — this review's six `edit` calls show as 2,
+  and the implementation session's apply/edit pair as one each. Count calls
+  (one ledger row per call) rather than verbs when the two disagree.
+
+## Between-wave review — Wave 2 (2026-09-22)
+
+- **The host gate failed on a fixture that did not build the state it asserted.**
+  `TestRootsClearsOnSetLessReply` pinged the fake editor and asserted
+  `Client.Roots()` became non-empty, but `fakeEditor.run`'s `ping`/`buffers`
+  replies carried only `Root` while the shipped `Dispatch` sets `Roots`
+  (`internal/control/host.go`). The test was right; the fixture was the bug.
+  Fixed the fixture to mirror Dispatch. *A fixture hand-copied from the wire
+  drifts from it.*
+- **Event-thread state was mutated from the watch goroutine.**
+  `resyncClient` called `readoptVisibleRoots` -> `adoptVisibleRoots`, which
+  rebuilds `a.visible`, `a.Explorer`, `a.Search` and wires the search pane,
+  while `syncClient` correctly queues `clientFile`s for `drainClient`. Fixed by
+  queueing the root set and adopting in `drainClient`; `go test` without
+  `-race` did not catch it.
+- **`apply --hunks` adoption is 0 across the six most recent sessions.** The
+  multi-hunk form is never used; edits go through single `edit --old/--new` or
+  repeated single `apply`. A multi-hunk edit is one call and one re-read.
+- **`search --context` and multi-target `read` are under a quarter in several
+  sessions** (0/31, 9/39, 1/27 and 4/59 reads); the sessions that lean on them
+  (23/35, 16/20, 51/52) show the payoff is real.
+- **`raj ctl groups --pending` with no path prints nothing** on a connection
+  with no active buffer (exit 0), so it reads as "no sets" rather than "no
+  buffer". Name the missing buffer or default to the workspace.
+- Tool use: two recent sessions exceed ~100 calls (126 and 129), one of them
+  the orchestrator; `search --context` is used in under a quarter of searches
+  in four of the six most recent sessions.
+
+## Between-wave review — an attached client is a normal editor (Wave 3, 2026-09-22)
+
+Read-only pass over the landed, saved Wave 3. `proposals` and `groups` were empty
+and every buffer read saved (0 pending / 0 moved), so there was nothing to
+dispose; the wave was enumerated from the brief and the tree, since the container
+has no git checkout. `raj ctl lsp diagnostics` read `ok` on all seven changed
+production files and all five changed test files, and on every `_test.go` in
+`internal/control` (16) and `internal/app` (64), run as multi-path sweeps because
+a test-only compile error in a file the sweep does not name is invisible. A clean
+per-file reading is not a package check, so the host `make check` stays the gate.
+No test was run.
+
+Verified as a reader:
+
+- **The write-gate boundary is three-way and pinned in one place.**
+  `Guard.Apply` admits `IsAgent || IsProvisional || writesAsHuman`, where
+  `writesAsHuman` is a registry lookup (`Participants.Get(id).Kind == KindHuman`)
+  excluding `AuthorOriginal` and `LocalHuman`; `Guard.Patch` keeps the old
+  agent-only check. `TestApplyAllowsAJoinedHuman` builds each state: a durable
+  `KindHuman` row writes and the buffer changes; `LocalHuman` is refused with no
+  buffer change (before the claim check, so no claim is needed); an agent writes;
+  a reserved (anonymous) id writes.
+- **`Request.Kind` crosses sparsely and absent means agent.** `hKind` (0x63) is
+  emitted by `str(hKind, h.Kind)`, which skips the empty string, so an old peer
+  sends no field and `decodeHeader` leaves `Kind` zero; `hello` maps only
+  `string(KindHuman)` to `KindHuman` and everything else to `KindAgent`.
+  `TestHelloOverTheSocketDeclaresAHuman` asserts a unix-socket hello joins as a
+  human and `TestHelloOverTCPDowngradesAHuman` asserts a TCP one joins as an
+  agent while a second hello with no `Kind` is; the field is also covered by
+  `TestEveryHeaderFieldRoundTrips` (`fullHeader` sets `Kind: "human"`), so a
+  missing encode line fails `make check`.
+- **The forward path satisfies claim and read on the decide connection.**
+  `forwardApply` sends `claim` (path), then `version` (which `Guard.Version` turns
+  into `markRead`), then `apply` with `Base` from the tracked sync; all three go
+  on `a.decideClient()`, which `joinClient` has helloed as the same durable
+  `client:<key>` human as the watch. The server's `if req.Author == 0 { req.Author
+  = author }` attributes the apply to that human, whose registry row is
+  `KindHuman`, so `host.isAgent` is false and `host.Apply` does not `ProposeGroup`.
+  `TestClientLocalEditForwardsOneApply` records the apply, checks the base equals
+  the synced version and the hunk is the changed middle; `recordingConn` emulates
+  claim/version/apply, so it pins the request shape, not the daemon's acceptance.
+- **A dirty pane is not clobbered by a watch install.** `installClientFile` calls
+  `clientEditBusy` and returns nil; `TestClientWatchSkipsDirtyPane` sets dirty,
+  asserts the pane text is unchanged, clears dirty and asserts the snapshot
+  installs.
+- **The two rewritten Review tests still test something.**
+  `TestClientRefusesTypingInReview` and `TestClientRefusesEveryEditGestureInReview`
+  assert the mode precondition, then that each gesture leaves the text unchanged
+  and sets a `read-only` status; the second covers typing, paste, cut, undo and
+  redo. They pin the invariant the wave had to preserve; their status assertion
+  keeps them from passing on a refusal for the wrong reason.
+
+Flagged:
+
+- **[high, fixed as a proposal] Reload re-opened on an attached client.**
+  `readOnly()` used to be `mode == Review || attach`, so `keys.Reload` refused a
+  client in both modes; the wave narrowed `readOnly()` to Review only and left the
+  branch with a comment promising the client refusal. In Edit mode a client could
+  run `File.Reload`, which reads *this machine's* disk, replace the daemon
+  snapshot, and let the idle `scanClientEdits` forward the difference as an
+  `apply` — a disk revert of a daemon edit. Fix proposed:
+  `if a.attach || a.readOnly()` in the `keys.Reload` branch with an
+  attach-specific status (`internal/app/app.go`). Not run, not accepted.
+- **[low] Comment drift from the same narrowing.** The `paste` doc-comment and
+  the decide-connection comment still read as if a client were always refused and
+  the decide connection a separate author; both were corrected as proposals.
+  Sweep the other `readOnly()` callers (`format.go`, `rename.go`, `codeaction.go`,
+  `inlay.go`): they now reach a snapshot buffer whose edits forward only when the
+  path has a `clientEdits` entry, so a headlessly loaded rename target has no
+  forward path.
+- **[low] A forwarded human edit can still land over an agent's proposal.**
+  `host.Apply` treats the human like any `ApplyDiff` writer (advisory lease), so a
+  client that types over an agent's Proposed run lands and supersedes it with a
+  warning; the local keyboard path is stricter (`EditLeased`; see
+  INVESTIGATIONS.md "The human typing path stays strict..."). Escalated below.
+- **[low] `who`'s connected flag can flap with two connections on one identity.**
+  watch and decide both `Join` `client:<key>`, and `Registry.Leave(id)` marks the
+  single row disconnected when *either* connection ends, so the row can read
+  `connected:false` while the other connection is live. Nothing gates on
+  `Connected`, so it is cosmetic; a connection refcount is the fix if it matters.
+- **[info] `TestClientLocalEditForwardsOneApply` is named "exactly one apply" but
+  asserts only the last recorded apply**, so it would not fail if a second were
+  sent; a `len(conn.applied)` check would match the name.
+
+Ledger (the file has no wave tag; the running orchestrator session accumulates
+across waves, and the extraction counts `raj ctl` substrings in the review's own
+recipe commands and multi-verb shell loops, so these are upper bounds):
+
+- implementation session `ses_f35157443ffeaeyAPTjpeVilCA`: ~171 `raj ctl`-bearing
+  bash calls (over the ~100 flag), read 59, search 51 (`--context` 32, ~63%),
+  edit 44, lsp 10 (multi-path 9), claim 3, version 2, goto 2, buffers 2,
+  whoami/register 1 each. `apply --hunks` 0 of 44 edit/apply calls (0%): the work
+  was 44 string edits, not multi-hunk applies.
+- orchestrator session `ses_f358446f4ffeOEm6Frv330LTXx`: ~138 calls, read 66,
+  search 38 (`--context` 0, 0%), buffers 11, open 8, goto 8, register 5,
+  proposals 5, lsp 4 (multi-path 4), whoami/groups 3 each, version/diff 2 each,
+  claim/clear/who 1 each. `search --context` 0 of 38 is the discipline flag.
+- review session `ses_f34fb5d9fffeaJ84trz1AGc2fX`: the ledger attributes 161
+  `raj ctl`-bearing calls, far more than this pass issued (subagent rows appear
+  to share a session with other activity), so it is reported for completeness
+  only. On the commands it can see: read 73, search 65 (`--context` 35, ~54%),
+  lsp 9 (multi-path 9), edit 6, claim 1, ls 2. Self-flag: the two `app.go`
+  hunks went out as two `edit` calls rather than one `apply --hunks` (0/6).
+- Global (cumulative): `apply --hunks` and multi-target `read` remain the
+  low-adoption forms.
+
+Escalated to the user — the `Guard.Apply` human admission:
+
+- Any token holder (the same token every agent uses) can now hello with `Kind:
+  "human"` and have its hunks land as accepted text rather than a proposal: no
+  `ProposeGroup`, so no accept gesture, and the text is in the agreed composition
+  and saveable. Before this wave a durable non-local author was refused, and an
+  agent could not declare itself a person. Trade: a second human editing the
+  workspace is the point (the user's `--name`/`--phone` decision), but admission
+  is self-declared over a shared token, so it is a review-gate bypass for anyone
+  who can already connect. If the token already decides who may connect, the code
+  is right; if the review gate must hold against a rogue client, the daemon needs
+  to mint or confirm the human identity out of band instead of trusting `hello`.
+  The `Patch` asymmetry (human admitted to Apply, refused for Patch) is deliberate
+  and tested, not a second decision.
+- Smaller: should an attached human typing over an agent's Proposed run keep the
+  agent's advisory-lease behaviour, or take the local human's strict refusal
+  (`EditLeased`)? The current code does the former.
+
+Friction (raw, deduped):
+
+- **The brief named a test file that does not exist**
+  (`internal/control/control_test.go`; the control tests are
+  `host_test.go`/`tcp_test.go`/`header_test.go`/`wire_test.go`). A review that
+  trusted the brief's list would have diagnosed a refused path and could have
+  called the package unchecked. Folded into "A saved wave has no enumerable diff
+  for the review pass"; briefs should name readable files or the wave should
+  enumerate from the tree.
+- **One file at two `--at` spans collapses.** `read --at a.go=1,2 --at
+  a.go=20,21` returns only the last span (cross-file `--at` returns the framed
+  `{"files":[...]}` correctly), so two disjoint spans of one file need two calls.
+  A per-span same-path form, or a note in the skill, would close it.
+- **The ledger is not wave-scoped.** Every review reports the orchestrator
+  session accumulating across waves, so "calls per wave" is approximate; a wave
+  or task id on the row would make duty 6 exact.
+
+## Between-wave review — socket gate, phone drawer reset, hidden config to XDG (Wave 3 hardening + Wave 4, 2026-09-22)
+
+The host gate failed once and resumed this pass: `TestHiddenConfigMigrationFailureIsNotFatal`
+(`internal/app/session_test.go`). State at entry: no pending proposals, every
+buffer saved. A stale working-set claim on `internal/app/session_test.go` left by
+the gone `w4-hidden` author did not block a new claim. No set was superseded or
+wedged, so nothing needed disposal.
+
+### The failing gate
+
+- **The test's absence assertion, not the migration, was wrong.** `if _, err := os.Stat(dst); !os.IsNotExist(err)` treats any stat error that is not `IsNotExist` as "the destination exists". The fixture puts a regular file where the `workspaces/` directory belongs, so `stat(dst)` returns `ENOTDIR` on POSIX (macOS and Linux alike); `os.IsNotExist(ENOTDIR)` is false and `errors.Is(err, fs.ErrNotExist)` is not it either, so the test failed though nothing was written. Fixed as a proposal: assert `err == nil` (`internal/app/session_test.go:384`), so any stat error means "no destination" and a real write (stat succeeds) still fails. The fixture and the migration are untouched. Modelled on the sibling `TestStateDirFailureDoesNotStopStartup`, which has the same fixture shape and the honest `if _, err := os.Stat(legacy); err != nil` assertion.
+- Verified as a reader: `migrateHiddenConfig` reaches `MkdirAll` and returns its error before `WriteFile`, so a failed run cannot write; the test's doc comment ("A migration that cannot write its destination is not fatal") stays true.
+
+### Fixed as proposals (integration fallout in free regions)
+
+- `internal/app/session_test.go:384` — the gate fix above.
+- `internal/session/session.go:86,154` — the `StateDir`/`Dir` docs still said `.raj` keeps the workspace config (`.raj/hidden`); now the one-shot migrations are named as the only readers.
+- `internal/app/settings.go:139` — "exactly as `.raj/hidden` reports a bad pattern" → "the workspace hide file".
+- `README.md:104,405,410` — the Configuration section still told users to write `.raj/hidden` in the workspace; it now names `~/.config/raj/hidden` and the XDG workspace file keyed by the root set.
+- `docs/COMPLETED.md`, `docs/AGENT-FEEDBACK.md` — the Wave 3 entry named the removed `TestHelloDeclaresAHuman`; now `TestHelloOverTheSocketDeclaresAHuman`/`TestHelloOverTCPDowngradesAHuman`.
+
+### Verified as a reader (nothing run; no Go toolchain)
+
+- **The XDG keying is per root set and reads in the right order.** `WorkspaceFile` is `configDir()/raj/workspaces/<workspace.StateKey(roots)>/hidden`; `Load` appends the user file then the workspace file over the defaults. `StateKey` sorts and cleans the set, so order does not change the key and two directories do not share one; `TestWorkspaceKeyIsolatesWorkspaces` seeds A and asserts B cannot see it.
+- **Every surface loads the whole set.** `explorer.NewPaneRoots` reaches `NewTreeRoots`, which loads `hidden.Load(canonicalRoots(roots))`; `picker.NewRoots`, `search.NewPaneRoots` and `ls` all load the full root set, so the retired per-root `.raj/hidden` divergence cannot recur. In production every caller passes `wsRoots.All()`, which `workspace.New` has already made absolute, deduped and non-nested.
+- **The migration runs before any pane builds rules.** `migrateHiddenConfig` is called at `internal/app/app.go:602`; the `&App{...}` that constructs the explorer, search and picker is built later in the same function.
+- **No surface reads `<root>/.raj/hidden` any more.** The only production reader is `migrateHiddenConfig` (`internal/app/session.go:276`); the `.raj/` default hides the whole directory and no rule un-hides `.raj/hidden` (`TestRajesOwnStateIsHidden`).
+- **A fresh launch writes nothing into the project.** The store opens under `session.StateDirForRoots` and the config under XDG; `TestFreshLaunchLeavesProjectClean` asserts no `<root>/.raj` after open and save.
+- **The drawer reset is per-pane and discriminating.** `drawerSelPane` re-resolves `drawerOpenWant()` on the first frame after the active pane changes under an open drawer; `TestPhoneDrawerSelectionResetsOnTabSwitch` moves the selection off the review default, switches to a second pending tab whose panel carries the same buttons, and asserts the default is re-selected, so a clamp cannot mask the reset. `TestClientPhoneDrawerRefusedDecisionKeepsSelection` pins that a refused decision leaves the selection put.
+- **The socket gate test is discriminating.** `TestHelloOverTCPDowngradesAHuman` dials TCP, checks the requested human joins as an agent and an absent `Kind` does too; `TestHelloOverTheSocketDeclaresAHuman` asserts the fixture transport is `unix` before checking the human is not an agent, so it cannot pass by driving a port.
+
+### Escalation resolved
+
+- Wave 3 escalated that any token holder could `hello` with `Kind: "human"` and bypass the proposal gate over the shared token. This wave closes it: `hello` grants `KindHuman` only when `network == "unix"`, so a TCP caller is downgraded to an agent (`internal/control/control.go:1338`). The remaining hole the Wave 3 note named — a client that still believes it is human — is the promoted TODO item under "Client mode and attach".
+
+### Friction (raw, deduped)
+
+- **A failing test fixture built the fault with a non-directory ancestor and asserted `IsNotExist`.** `os.Stat` on a child of a file is `ENOTDIR`; the honest absence check is `err == nil`. The container has no Go toolchain, so this class of fixture bug is invisible until the host gate. The test-integrity rules should call out the `stat`-error shape.
+- **Brief quality: the hidden→XDG brief named the Go files and tests but not README.md**, whose Configuration section spelled `.raj/hidden` three times. A brief that moves a path should name the prose that spells the old path; the sweep fell to the review pass.
+- **An implementer could not amend its own pending draft.** `w4-hidden` found its own proposed set on `internal/hidden/hidden.go` unwanted and had to `reject --all --mine` then `clear --all --mine` before re-applying, re-reading the version after. There is no "replace my own set" surface; the only route is reject+clear+re-apply. Worth a verb (or `apply --replace`) if re-drafting recurs.
+- **The ledger is not wave- or agent-scoped.** Rows carry only `session`, so the wave's agents are found by grepping their command text for `--name`; a wave or task id on the row would make duty 6 exact. Already filed in the Wave 3 block.
+
+### Ledger (upper bounds; counts are `raj ctl`-bearing bash rows and substring matches)
+
+- `w4-hidden` session `ses_f34c0bc69ffe2nDGkOGWYyKwdv`: ~83 calls (under the ~100 flag). read 40, search 30, lsp 10, goto 7, edit 7, groups 3, clear 2, buffers 2, register/whoami/claim/apply/reject 1 each. Batching: multi-target read 33/40 (~83%), multi-path `lsp diagnostics` 10/10, `search --context` 8/30 (~27%), `apply --hunks` 1 of 8 edit/apply calls (~13%; the rest were single string edits).
+- `w4-drawer` session `ses_f34d11333fferxjYj1oyTyMi4q`: ~47 calls. read 22, search 14, apply 4, lsp 3, goto 3, version/register/claim 1 each. Batching: multi-target read 22/22, multi-path `lsp diagnostics` 3/3, `search --context` 9/14 (~64%), `apply --hunks` 2/4.
+- `w4-review` session `ses_f34a5f565ffeMbKGuBYgZDJ4cZ` (this pass): ~82 calls — self-flag on `search --context` 0/34 (0%); multi-target read 44/67 (~66%), multi-path `lsp diagnostics` 5/6, `apply --hunks` 0 (every edit was a single-hunk `edit`). The recipe counts the review's own recipe commands and multi-verb shell loops, so these are upper bounds.
+- Global: `apply --hunks` and `search --context` remain the low-adoption forms.
+
+## Between-wave review — proposal-tint contrast (Wave 5, 2026-09-22)
+
+State at entry: no pending proposals, every buffer saved (the wave had been
+accepted and saved). No set was superseded or wedged, so nothing needed
+disposal. The wave touched `internal/ui/style.go`, `internal/ui/contrast_test.go`,
+`internal/editor/render.go` and `internal/editor/proposals_test.go`; all of
+`internal/ui` and `internal/editor` read `ok` under `lsp diagnostics`.
+
+### Verified as a reader (nothing run; no Go toolchain)
+
+- **The WCAG math is right.** `linearChannel` uses the 0.03928 threshold and the
+  2.4 exponent; `Luminance` weights 0.2126/0.7152/0.0722; `ContrastRatio` is
+  `(Lhi+0.05)/(Llo+0.05)`, so black against white is exactly 21. `PaletteRGB` is
+  the standard xterm cube (`cubeLevel`: 0, then 55+40v) and grey ramp
+  (`8+10(n-232)`), and 0-15 plus `Default` stay unresolved by design. `LegibleOn`
+  breaks the tie to black and returns `Default` for an unknown background.
+- **The render override is scoped and layered.** In `drawLine` the tint branch
+  sets `style.On(bg)`, then for `th.ProposedAdd` and (after this pass)
+  `th.AgentTint` — one shared branch — `style.With(ui.LegibleOn(bg))`; the find,
+  selection, bracket and cursor layers below still replace or overlay the style
+  exactly as before. `authorTints` only ever emits those two colours, so nothing
+  else reaches the branch.
+- **The guard tests discriminate.** The proposed-comment fixture builds a real
+  `//` comment (`ClassAt == ClassComment`) whose syntax colour is `ui.Ansi(8)`.
+  The pre-check asks "would the unmodified style pass the final `ok && ratio >=
+  4.5` assertion"; for `Ansi(8)` `ContrastRatio` is `ok=false`, so the pre-check
+  passes and the final assertion fails without the override. The new
+  `TestRenderAgentCommentStaysLegible` is the same shape over `th.AgentTint`.
+  Both tints resolve (16-255) and `LegibleOn` picks white: `AgentTint`
+  (`Ansi(22)`, `(0,95,0)`) at 7.97 and `ProposedAdd` (`Ansi(28)`, `(0,135,0)`)
+  at 4.70, so the review green clears the 4.5 bar narrowly.
+- **No existing test pins a tint's syntax foreground.** Searched every
+  `AgentTint`/`ProposedAdd` use: the tint tests assert `Bg` only, and the only
+  `.Fg` assertions in `internal/editor` are the two new contrast tests, so
+  extending the override to `AgentTint` broke no fixture. `layered_test.go` is
+  about save/lease/index, not rendered layers.
+
+### Flagged (read-only; not changed)
+
+- **Medium: the syntax palette is entirely 0-15, so `ContrastRatio` can never
+  compute a syntax foreground against a tint.** Every `styleFor` case returns
+  `ui.Ansi(0..15)` — the terminal-owned half the resolver refuses — and the
+  comment is `Ansi(8)`. The fix works by *replacing* the foreground with a
+  resolvable 16-255 colour, not by measuring it, which is why both guard tests
+  read "unresolvable ⇒ fails the final check" rather than a computed ratio. A
+  test asserting a numeric sub-4.5 ratio on the original colour is impossible
+  with this palette; a later editor must not "fix" the guard into `r < 4.5`,
+  which the unresolvable colour would satisfy wrongly.
+- **Medium: `AgentTint` now overrides the foreground for all accepted agent
+  text, not only comments.** The hazard class is real, but the trade changes:
+  `ProposedAdd` is transient, while accepted agent text is long-lived, so
+  agent-written code loses its syntax colours to white-on-green for as long as
+  the text stays attributed. `drawLine`'s own comment said "the tint and the
+  highlight keep the token's foreground, so agent-written code is still
+  syntax-coloured"; this pass makes the two green tints the stated exception.
+  The user approved proceeding; recorded as the trade, not a defect.
+- **Low: `HighlightRead`/`HighlightWrite` carry the same keep-the-foreground
+  hazard.** Both are applied with `style.On(bg)` and are dark (`Ansi(236)`,
+  `Ansi(54)`), so a comment token on a highlighted occurrence can disappear the
+  way it did on the proposal green. Left unchanged and filed in TODO. Find
+  (`FindMatch`/`FindActive`), `Selection` and `Caret` replace the whole style
+  including the foreground, so their exposure is the terminal's default
+  foreground on those backgrounds — a theme question, not the syntax-grey one.
+
+### Changed (proposals, not accepted)
+
+- `internal/editor/render.go:369,372` — the tint override is one branch for
+  `th.ProposedAdd || th.AgentTint`; the stale "the review green is the
+  exception" line above now reads "the two green tints".
+- `internal/editor/proposals_test.go:180` — `TestRenderAgentCommentStaysLegible`
+  (accepted agent comment keeps `AgentTint` and clears 4.5).
+- `docs/COMPLETED.md` — the contrast-fix entry; `docs/TODO.md` — retired the
+  "The proposal tint is hard to read" item and filed the highlight-foreground
+  item; this block.
+
+### Ledger (upper bounds; counts are `raj ctl`-bearing bash rows)
+
+- `w5-contrast` session `ses_f349484c1ffetv1XczgIsovqCj`: ~55 tool calls (55
+  distinct bash `callID`s), under the ~100 flag. Verb mix: read 15, search 14,
+  lsp 5, goto 4, apply 4, buffers 2, register/open/edit/claim 1 each. Batching:
+  multi-target read 15/15 (100%), multi-path `lsp diagnostics` 5/5 (100%),
+  `search --context` 6/14 (~43%), `apply --hunks` 3/4 (75%). The best adoption
+  any wave has reported; no low-adoption flag.
+- `w5-review` session `ses_f3472c58fffeVWzUinILJF5h4Q` (this pass): ~52 tool
+  calls as of this block's write, under the ~100 flag. Verb mix: read 15,
+  search 13, lsp 6, edit 4, claim 2, register/whoami/status/proposals/groups/
+  buffers/version/apply/--help 1 each. Batching: multi-target read 11/11,
+  multi-path `lsp diagnostics` 4/4, `apply --hunks` 0 (all single-hunk `edit`s),
+  `search --context` 1/6 — self-flag on `search --context`, but the searches
+  were tree/symbol discovery and enumeration, not hit-then-read.
+- The orchestrator session (`ses_f358446f4ffeOEm6Frv330LTXx`) is cumulative
+  across every wave (~346 bash rows) and not wave-scoped, so duty 6 stays
+  approximate for it; already filed in the Wave 3 and Wave 4 blocks.
+
+### Friction (raw, deduped)
+
+- **The ledger's row shape is inconsistent, and the documented recipe
+  over-counts.** A call's invocation and result are two rows; some invocation
+  rows carry `cmd` with no `phase`, others carry `phase:"after"` with no `cmd`.
+  `select(.phase != "after")` counted 78 rows for `w5-contrast` against 55
+  distinct `callID`s. Counting distinct `callID`s is the honest call count;
+  normalise the row shape or note the recipe's bias.
+- **`version` takes one path only.** Getting bytes+version for the three doc
+  files took three calls; a multi-path `version` (or just the multi-path
+  `read --json` already in use) would batch it. Small surface gap.

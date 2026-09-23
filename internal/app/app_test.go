@@ -65,6 +65,21 @@ func newHarnessSize(t *testing.T, content string, cols, rows int) *harness {
 	return &harness{App: a, host: host}
 }
 
+// TestPrimaryRootIsTheConstructorRoot pins that routing the single root through
+// workspace.Roots preserves its value: the constructor stores exactly the root
+// it was given and primaryRoot hands it back, so every reader that moved to
+// primaryRoot sees what the old root field held.
+func TestPrimaryRootIsTheConstructorRoot(t *testing.T) {
+	root := t.TempDir()
+	host := ui.NewFakeHost(80, 24)
+	defer host.Close()
+	a := New(host, root, 2)
+	defer a.CloseState()
+	if got := a.primaryRoot(); got != root {
+		t.Errorf("primaryRoot() = %q, want the constructor root %q", got, root)
+	}
+}
+
 // newOptionsHarness is newHarness launched with explicit Options, so a test
 // exercises the real profile resolution rather than poking the App fields.
 func newOptionsHarness(t *testing.T, content string, o Options) *harness {
@@ -337,7 +352,7 @@ func TestOpenSurfacesMixedEndingWarning(t *testing.T) {
 // dead before the wave. Modelled on TestOpenSurfacesMixedEndingWarning.
 func TestOpenSurfacesIndentAndEncodingWarnings(t *testing.T) {
 	h := newHarness(t, "content")
-	path := filepath.Join(h.root, "Makefile")
+	path := filepath.Join(h.primaryRoot(), "Makefile")
 	if err := os.WriteFile(path, []byte(".PHONY: b\r\nbuild:\r\n  go build\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +373,7 @@ func TestOpenSurfacesIndentAndEncodingWarnings(t *testing.T) {
 // TestOpenSurfacesMixedEndingWarning, the open path this one must match.
 func TestAnnounceSurfacesFileWarning(t *testing.T) {
 	h := newHarness(t, "base\n")
-	path := filepath.Join(h.root, "mixed.txt")
+	path := filepath.Join(h.primaryRoot(), "mixed.txt")
 	if err := os.WriteFile(path, []byte("a\r\nb\nc\r\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +629,7 @@ func TestHeadlessStatErrorKeepsCache(t *testing.T) {
 // with no raj action to trigger a refresh.
 func TestSyncFileTreePicksUpANewFile(t *testing.T) {
 	h := newHarness(t, "package main\n")
-	added := filepath.Join(h.root, "added.go")
+	added := filepath.Join(h.primaryRoot(), "added.go")
 	if err := os.WriteFile(added, []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

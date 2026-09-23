@@ -54,7 +54,8 @@ type Query struct {
 	// the picker so all three agree on what exists. It sits beside Include and
 	// Exclude because it is the same kind of thing — a filter over the walk —
 	// differing only in that the user sets it once in a file rather than per
-	// search. Nil means the built-in defaults.
+	// search. Nil means the workspace configuration loaded for the root set,
+	// the same rules the sidebar uses.
 	Hidden *hidden.Rules
 
 	// Context is how many full lines before and after each hit the engine
@@ -228,7 +229,22 @@ func RunStreamVersioned(ctx context.Context, root string, q Query, open Docs,
 	return runStream(ctx, root, q, open, versions, emit)
 }
 
+// RunStreamRoots is RunStreamVersioned for a workspace root set: every root is
+// walked, in the order supplied, and emits as each file completes. Ordering is
+// deterministic: roots in caller-supplied order, and within a root the lexical
+// walk the single-root form has always used; documents with no file behind them
+// follow every root, sorted by path. A single root is byte-for-byte runStream.
+func RunStreamRoots(ctx context.Context, roots []string, q Query, open Docs,
+	versions DocVersions, emit func([]Match)) Result {
+	return runStreamRoots(ctx, roots, q, open, versions, emit)
+}
+
 func runStream(ctx context.Context, root string, q Query, open Docs,
+	versions DocVersions, emit func([]Match)) Result {
+	return runStreamRoots(ctx, []string{root}, q, open, versions, emit)
+}
+
+func runStreamRoots(ctx context.Context, roots []string, q Query, open Docs,
 	versions DocVersions, emit func([]Match)) Result {
 	var res Result
 	// sent tracks how much of res.Matches the callback has seen, so each file
@@ -256,14 +272,15 @@ func runStream(ctx context.Context, root string, q Query, open Docs,
 		m = newMatcher(q, re)
 	}
 	inc, exc := globs(q.Include), globs(q.Exclude)
+	// hide is the walk's visibility policy for the whole set. There is one
+	// config per workspace, keyed by the root set (hidden.WorkspaceFile), so a
+	// search run directly loads it once rather than pretending each root has
+	// its own. The pane hands its own configured rules down instead.
 	hide := q.Hidden
 	if hide == nil {
-		// Load rather than Default: a search run through the pane arrives with
-		// the workspace's rules attached, and one run directly must not answer
-		// differently from the same search in the sidebar. Two stats against a
-		// whole-tree walk is not a cost worth a stale answer.
-		hide = hidden.Load(root)
+		hide = hidden.Load(roots)
 	}
+
 	// One scan buffer for the whole walk. Allocating 64 KB per file made the
 	// buffer, not the matching, the dominant cost of a search.
 	buf := make([]byte, 0, 64*1024)
@@ -273,58 +290,69 @@ func runStream(ctx context.Context, root string, q Query, open Docs,
 	// the set that has no file behind it yet.
 	pending := make(map[string]bool, len(open))
 	for path := range open {
-		if eligible(root, path, inc, exc, hide) {
-			pending[path] = true
+		for _, root := range roots {
+			if eligible(root, path, inc, exc, hide) {
+				pending[path] = true
+				break
+			}
 		}
 	}
 
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if path != root && hide.HiddenPath(root, path, true) {
-				return filepath.SkipDir
+	walk := func(root string, hide *hidden.Rules) {
+		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
 			}
+			name := d.Name()
+			if d.IsDir() {
+				if path != root && hide.HiddenPath(root, path, true) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				return nil
+			}
+			if hide.HiddenPath(root, path, false) || !matches(rel, inc, true) || matches(rel, exc, false) {
+				return nil
+			}
+			// Before Info() and before the open: the whole point is to skip the
+			// syscalls, so a check placed after either of them saves nothing.
+			if skipBinary(name) {
+				return nil
+			}
+			if info, err := d.Info(); err != nil || info.Size() > MaxFileSize {
+				return nil
+			}
+			// One non-blocking check per file. At tens of nanoseconds against an
+			// open and a read, this is free, and it bounds abandoned work at one
+			// file rather than one repository.
+			select {
+			case <-ctx.Done():
+				res.Stopped = true
+				return filepath.SkipAll
+			default:
+			}
+			if len(res.Matches) >= MaxMatches {
+				res.Capped = true
+				return filepath.SkipAll
+			}
+			res.Considered++
+			delete(pending, path)
+			record(path, scanOne(path, open, versions, m, &buf, ctxLines, &res), &res)
+			flush()
 			return nil
+		})
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
 		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return nil
+		walk(root, hide)
+		if res.Stopped || res.Capped {
+			return res
 		}
-		if hide.HiddenPath(root, path, false) || !matches(rel, inc, true) || matches(rel, exc, false) {
-			return nil
-		}
-		// Before Info() and before the open: the whole point is to skip the
-		// syscalls, so a check placed after either of them saves nothing.
-		if skipBinary(name) {
-			return nil
-		}
-		if info, err := d.Info(); err != nil || info.Size() > MaxFileSize {
-			return nil
-		}
-		// One non-blocking check per file. At tens of nanoseconds against an
-		// open and a read, this is free, and it bounds abandoned work at one
-		// file rather than one repository.
-		select {
-		case <-ctx.Done():
-			res.Stopped = true
-			return filepath.SkipAll
-		default:
-		}
-		if len(res.Matches) >= MaxMatches {
-			res.Capped = true
-			return filepath.SkipAll
-		}
-		res.Considered++
-		delete(pending, path)
-		record(path, scanOne(path, open, versions, m, &buf, ctxLines, &res), &res)
-		flush()
-		return nil
-	})
-	if res.Stopped || res.Capped {
-		return res
 	}
 	// Documents with nothing on disk behind them, in a stable order: the walk
 	// is lexical, and a result list that reshuffles between identical searches

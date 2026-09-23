@@ -26,7 +26,7 @@ func query(h *harness, text string) {
 // End to end: type into a buffer, search for it without saving, find it.
 func TestSearchFindsUnsavedText(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 	h.typeText("marmoset")
 	if !h.Pane().File.Dirty() {
@@ -48,7 +48,7 @@ func TestSearchDoesNotReportDeletedText(t *testing.T) {
 		t.Fatalf("setup: disk results = %v, want one match to delete", got)
 	}
 
-	h.OpenFile(filepath.Join(h.root, "pkg/other.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "pkg/other.go"))
 	h.drain()
 	h.press("super+a") // select all
 	h.press("backspace")
@@ -68,7 +68,7 @@ func TestSearchDoesNotReportDeletedText(t *testing.T) {
 // a double count or a miss would show up.
 func TestSavingDoesNotChangeResults(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 	h.typeText("marmoset")
 
@@ -93,7 +93,7 @@ func TestSavingDoesNotChangeResults(t *testing.T) {
 // the walk rather than layering on it.
 func TestSearchStillReadsTheDisk(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	if err := os.WriteFile(filepath.Join(h.root, "fresh.go"), []byte("var marmoset = 1\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(h.primaryRoot(), "fresh.go"), []byte("var marmoset = 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	query(h, "marmoset")

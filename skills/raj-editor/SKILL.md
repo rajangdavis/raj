@@ -183,6 +183,11 @@ must stay inside the workspace.
 
 Exit is non-zero when there are no matches, as with grep.
 
+`-q` repeats: `raj ctl search -q alpha -q gamma` searches both patterns in one
+call, labels each hit with the pattern that matched it (only when more than one
+was given, so a single `-q` is byte-for-byte unchanged), applies every flag to
+every pattern, and exits 0 if any pattern matched, 1 if none.
+
 A pattern with no `/` matches the basename as well as the relative path, like
 `grep --include`: `--include '*_test.go'` finds test files at any depth and
 `--include 'search.go'` finds that file wherever it sits, while a pattern
@@ -215,6 +220,14 @@ one of them, so a sweep of the files you are about to touch is one round trip
 rather than three. A path that fails fails the whole call and marks none of them
 read. `--annotated` still takes a single path, because the state runs are
 relative to one buffer's text.
+
+`--at PATH=LO,HI` gives one path its own 1-based inclusive line span and
+repeats: `raj ctl read --at a.go=1,2 --at b.go=3,4` batches different regions
+of different files in one call, with `-json` echoing `line_start`/`line_end`
+per target. A positional path named by `--at` is read once at that span, an
+unnamed positional reads whole, and `--at` wins over a shared
+`--start`/`--end`/`--lines` for the path it names. The split is on the last
+`=`, so a path containing `=` is still addressable; a bad span refuses by name.
 
 If you only need coordinates and not the whole document — appending, say —
 `raj ctl version` is enough and satisfies that check too.
@@ -904,8 +917,11 @@ skills file does not send an agent back to a shell tool for something
   `byte_end` from `search --json` (see "Byte offsets, not string offsets").
 - **Reading a line range.** `raj ctl read --lines A,B` (1-based inclusive; a
   bare `A` reads to the end) is live. Use it instead of `sed -n` / `head | tail`.
-- **Counting bytes or lines.** `raj ctl version --json` returns `bytes` and
-  `lines` alongside the version. Use it instead of `wc`.
+- **Counting bytes or lines.** `raj ctl read --json` returns the whole file's
+  `bytes` and `lines` alongside its `text`, and `raj ctl version --json` returns
+  them alongside the version. Take them from the read you already made instead
+  of a second call; use `version` when the size is all you need. Either replaces
+  `wc`.
 - **Editor-side scratch.** `raj ctl dump <path> [--start --end]` snapshots a span
   and `raj ctl patch <path> --dump <id> --text-file -` takes the edited text back
   and lets the editor diff and rebase it — the agent never re-derives offsets.

@@ -17,7 +17,7 @@ func TestConfirmReturnsAnOpenablePath(t *testing.T) {
 	p.Handle(keys.None, "app.go")
 	got := p.Handle(keys.Confirm, "")
 
-	want := filepath.Join(p.Root, "internal/app/app.go")
+	want := filepath.Join(p.Roots[0], "internal/app/app.go")
 	if got != want {
 		t.Errorf("chose %q, want %q", got, want)
 	}

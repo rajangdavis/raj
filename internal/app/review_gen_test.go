@@ -65,7 +65,7 @@ func TestReviewGenerationMovesOnADecision(t *testing.T) {
 // edit happens.
 func TestReviewGenerationMovesOnRemovals(t *testing.T) {
 	h := newHarness(t, reviewFixture)
-	path := filepath.Join(h.root, "ghost.go") // unopened: the file proposal raises no gate
+	path := filepath.Join(h.primaryRoot(), "ghost.go") // unopened: the file proposal raises no gate
 
 	beforeDelete := h.reviewGeneration()
 	if err := h.App.ProposeDeletion(path, uint8(piecetable.Agent)); err != nil {
@@ -111,7 +111,7 @@ func TestReviewGenerationStableWhenIdle(t *testing.T) {
 	}
 
 	for _, name := range []string{"a.go", "b.go"} {
-		if err := h.App.ProposeDeletion(filepath.Join(h.root, name), uint8(piecetable.Agent)); err != nil {
+		if err := h.App.ProposeDeletion(filepath.Join(h.primaryRoot(), name), uint8(piecetable.Agent)); err != nil {
 			t.Fatal(err)
 		}
 	}

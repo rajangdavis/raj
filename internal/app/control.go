@@ -293,7 +293,14 @@ type host struct{ a *App }
 
 func hostOf(a *App) control.BufferHost { return host{a} }
 
-func (h host) Root() string { return h.a.root }
+func (h host) Root() string { return h.a.visible.Primary() }
+
+// Roots is the whole visible workspace root set. The Guard validates a path
+// against every root when the host exposes this, and falls back to Root for a
+// host that does not. Root stays for the readers that still need exactly one.
+// Both read the visible set, so an attach client validates against the daemon's
+// workspace rather than the directory it was launched in.
+func (h host) Roots() []string { return h.a.visible.All() }
 
 // isAgent asks the registry rather than comparing the id to a constant, so a
 // second human's text is not mistaken for an agent's.
@@ -354,7 +361,7 @@ func (h host) canonicalPath(path string) string {
 		return ""
 	}
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(h.a.root, path)
+		path = filepath.Join(h.a.visible.Primary(), path)
 	}
 	return filepath.Clean(path)
 }
@@ -1318,14 +1325,15 @@ func (h host) Snapshot() control.Searcher {
 			docs[p.File.Path] = p.File.Text()
 		}
 	}
-	return snapshotSearcher{root: h.a.root, docs: docs, versions: versions}
+	return snapshotSearcher{roots: h.a.visible.All(), docs: docs, versions: versions}
 }
 
 // snapshotSearcher walks off the event thread against the copy it was handed,
 // so the editor stays responsive for the seconds a search takes and a cancel
-// can be serviced while it runs.
+// can be serviced while it runs. It carries the whole root set, so a hit in any
+// root surfaces.
 type snapshotSearcher struct {
-	root     string
+	roots    []string
 	docs     search.Docs
 	versions search.DocVersions
 }
@@ -1337,27 +1345,34 @@ func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
 	return s.runSearch(ctx, q, nil, emit)
 }
 
-// walkRoot resolves a query's -path against the workspace root. A relative
-// path is joined to the root; an absolute one is taken as given. Either way it
-// must stay inside the workspace, the same rule the Guard applies to exec's
-// -dir: the walk is refused rather than allowed to read outside the tree. The
-// Guard validates the query before it reaches here, so this check is the
-// backstop for a Searcher driven directly.
-func (s snapshotSearcher) walkRoot(path string) (string, error) {
-	root := filepath.Clean(s.root)
+// walkRoots resolves a query's -path against the workspace root set. With no
+// path every root is walked, in supplied order. A relative path is joined to
+// the primary root; an absolute one is taken as given. Either way it must stay
+// inside some root, the same rule the Guard applies to exec's -dir: a walk is
+// refused rather than allowed to read outside the tree. The Guard validates the
+// query before it reaches here, so this check is the backstop for a Searcher
+// driven directly.
+func (s snapshotSearcher) walkRoots(path string) ([]string, error) {
 	if path == "" {
-		return root, nil
+		return s.roots, nil
+	}
+	primary := ""
+	if len(s.roots) > 0 {
+		primary = s.roots[0]
 	}
 	dir := path
 	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(root, dir)
+		dir = filepath.Join(primary, dir)
 	}
 	dir = filepath.Clean(dir)
-	rel, err := filepath.Rel(root, dir)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("search path %q is outside the workspace %s", path, root)
+	for _, root := range s.roots {
+		rel, err := filepath.Rel(filepath.Clean(root), dir)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return []string{dir}, nil
 	}
-	return dir, nil
+	return nil, fmt.Errorf("search path %q is outside the workspace", path)
 }
 
 // Groups lists a buffer's change sets.

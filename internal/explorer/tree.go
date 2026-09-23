@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -27,7 +28,11 @@ type Entry struct {
 // Only expanded directories are read, so opening raj in a repository with a
 // hundred thousand files costs one readdir of the root rather than a full walk.
 type Tree struct {
+	// Root is the primary root, kept for the single-root readers and identical
+	// to Roots[0] when there is one. Roots is the whole set in supplied order;
+	// with more than one, each is drawn as a top-level row.
 	Root     string
+	Roots    []string
 	expanded map[string]bool
 	entries  []Entry
 	// expandAll names the directories whose whole subtree the current
@@ -56,31 +61,133 @@ type Tree struct {
 	Hidden *hidden.Rules
 }
 
-// NewTree opens a directory.
-func NewTree(root string) *Tree {
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		abs = root
+// NewTree opens a directory. It is NewTreeRoots for a single root, so the
+// one-root callers and tests keep the old behaviour exactly: the root itself is
+// not a row and its children start at depth zero.
+func NewTree(root string) *Tree { return NewTreeRoots([]string{root}) }
+
+// NewTreeRoots opens a set of roots. With one root the tree is exactly what it
+// always was. With several, each root is a top-level directory row and each
+// expands and refreshes independently; a root row is labelled by its base name
+// when that name is unique in the set, and by its absolute path when two roots
+// share one, so two directories called "app" cannot be silently merged.
+func NewTreeRoots(roots []string) *Tree {
+	abs := canonicalRoots(roots)
+	if len(abs) == 0 {
+		// No workspace root: keep the old NewTree("") reading, which listed
+		// the process directory, rather than an empty tree.
+		if cwd, err := filepath.Abs(""); err == nil {
+			abs = []string{cwd}
+		}
+	}
+	primary := ""
+	if len(abs) > 0 {
+		primary = abs[0]
 	}
 	t := &Tree{
-		Root:      abs,
-		expanded:  map[string]bool{abs: true},
+		Root:      primary,
+		Roots:     abs,
+		expanded:  map[string]bool{},
 		expandAll: map[string]bool{},
 		session:   map[string]bool{},
 		Hidden:    hidden.Load(abs),
+	}
+	for _, r := range abs {
+		t.expanded[r] = true
 	}
 	t.Refresh()
 	return t
 }
 
+// canonicalRoots makes each non-empty root absolute and cleaned, drops exact
+// duplicates keeping the first, and removes one root nested inside another (the
+// outer one already reaches the inner one, so drawing both would double it).
+func canonicalRoots(roots []string) []string {
+	var out []string
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		abs, err := filepath.Abs(r)
+		if err != nil {
+			abs = filepath.Clean(r)
+		}
+		if slices.Contains(out, abs) {
+			continue
+		}
+		nested := false
+		for _, prev := range out {
+			if abs == prev || strings.HasPrefix(abs, prev+string(filepath.Separator)) ||
+				strings.HasPrefix(prev, abs+string(filepath.Separator)) {
+				nested = true
+				break
+			}
+		}
+		if nested {
+			continue
+		}
+		out = append(out, abs)
+	}
+	return out
+}
+
+// isRoot reports whether path is one of the tree's root directories.
+func (t *Tree) isRoot(path string) bool { return slices.Contains(t.Roots, path) }
+
+// rootOf returns the root containing path: the deepest one, though roots are
+// not nested, so it is simply the one that holds it. The primary is the
+// fallback for a path no root contains.
+func (t *Tree) rootOf(path string) string {
+	best := ""
+	for _, r := range t.Roots {
+		if path == r || strings.HasPrefix(path, r+string(filepath.Separator)) {
+			if len(r) > len(best) {
+				best = r
+			}
+		}
+	}
+	if best == "" {
+		return t.Root
+	}
+	return best
+}
+
+// rootLabel is the row label for root i: its base name when that name is unique
+// in the set, and its absolute path when it collides with another root.
+func (t *Tree) rootLabel(i int) string {
+	name := filepath.Base(t.Roots[i])
+	for j, r := range t.Roots {
+		if j != i && filepath.Base(r) == name {
+			return t.Roots[i]
+		}
+	}
+	return name
+}
+
 func (t *Tree) Entries() []Entry { return t.entries }
 
-// Rel is a path relative to the tree root, for display. An unrelated path is
-// returned as-is rather than as a chain of "..", which would be longer than the
-// absolute path it is trying to shorten.
+// Rel is a path relative to the root that contains it, for display. An
+// unrelated path is returned as-is rather than as a chain of "..", which would
+// be longer than the absolute path it is trying to shorten. For a root row
+// itself the label is returned, so the path line names the root rather than
+// reading ".". With one root this is exactly the old relative spelling.
 func (t *Tree) Rel(path string) string {
 	if path == "" {
 		return ""
+	}
+	if len(t.Roots) > 1 {
+		for i, r := range t.Roots {
+			if path == r {
+				return t.rootLabel(i)
+			}
+		}
+		for _, r := range t.Roots {
+			rel, err := filepath.Rel(r, path)
+			if err == nil && !strings.HasPrefix(rel, "..") {
+				return rel
+			}
+		}
+		return path
 	}
 	rel, err := filepath.Rel(t.Root, path)
 	if err != nil || strings.HasPrefix(rel, "..") {
@@ -178,11 +285,13 @@ func (t *Tree) allExpanded(path string) bool {
 }
 
 // ExpandedDirs lists the open directories, for a session to remember. Sorted so
-// a session file does not churn between saves that changed nothing.
+// a session file does not churn between saves that changed nothing. The roots
+// are always open -- they are drawn as themselves, not as a directory inside
+// one -- so they are left out.
 func (t *Tree) ExpandedDirs() []string {
 	out := make([]string, 0, len(t.expanded))
 	for p, open := range t.expanded {
-		if open && p != t.Root {
+		if open && !t.isRoot(p) {
 			out = append(out, p)
 		}
 	}
@@ -192,23 +301,47 @@ func (t *Tree) ExpandedDirs() []string {
 
 // Expand opens a directory without toggling, so restoring a session cannot
 // close something by replaying a path twice. Parents are opened too: a child
-// marked open under a closed parent would never be reached by the walk.
+// marked open under a closed parent would never be reached by the walk. The
+// walk stops at the root that contains path, so a session path under the second
+// root opens the second root rather than walking up to the primary.
 func (t *Tree) Expand(path string) {
-	for p := filepath.Clean(path); len(p) >= len(t.Root); p = filepath.Dir(p) {
+	root := t.rootOf(filepath.Clean(path))
+	for p := filepath.Clean(path); len(p) >= len(root); p = filepath.Dir(p) {
 		t.expanded[p] = true
-		if p == t.Root || filepath.Dir(p) == p {
+		if p == root || filepath.Dir(p) == p {
 			break
 		}
+	}
+	if root != "" {
+		t.expanded[root] = true
 	}
 }
 
 // Refresh rebuilds the visible entries, re-reading git status when filtering.
+// With one root this is exactly the old walk from the root. With several, each
+// root is emitted as a top-level row and its subtree walked beneath it when
+// open, so the roots expand and refresh independently.
 func (t *Tree) Refresh() {
 	if t.ChangedOnly {
-		t.changed = gitChanged(t.Root)
+		t.changed = map[string]bool{}
+		for _, r := range t.Roots {
+			for p := range gitChanged(r) {
+				t.changed[p] = true
+			}
+		}
 	}
 	t.entries = t.entries[:0]
-	t.walk(t.Root, 0, t.expandAll[t.Root])
+	if len(t.Roots) <= 1 {
+		t.walk(t.Root, 0, t.expandAll[t.Root])
+	} else {
+		for i, root := range t.Roots {
+			open := t.expanded[root]
+			t.entries = append(t.entries, Entry{Path: root, Name: t.rootLabel(i), Depth: 0, Dir: true, Open: open})
+			if open {
+				t.walk(root, 1, t.expandAll[root])
+			}
+		}
+	}
 	t.expandAll = map[string]bool{}
 	t.sig = t.signature()
 }
@@ -229,8 +362,13 @@ func (t *Tree) children(dir string) []os.DirEntry {
 		return items[i].Name() < items[j].Name()
 	})
 	kept := items[:0]
+	// The workspace's hidden policy is one config keyed by the whole root set,
+	// so it is loaded once in NewTreeRoots. The path is still made relative to
+	// the root the directory lives under, so a rule rooted at the top of one
+	// root is matched against that root's tree.
+	root := t.rootOf(dir)
 	for _, it := range items {
-		if t.Hidden.HiddenPath(t.Root, filepath.Join(dir, it.Name()), it.IsDir()) {
+		if t.Hidden.HiddenPath(root, filepath.Join(dir, it.Name()), it.IsDir()) {
 			continue
 		}
 		kept = append(kept, it)
@@ -296,7 +434,17 @@ func (t *Tree) signature() uint64 {
 			h.Write([]byte{'f'})
 		}
 	}
-	walk(t.Root)
+	if len(t.Roots) <= 1 {
+		walk(t.Root)
+	} else {
+		for _, root := range t.Roots {
+			io.WriteString(h, root)
+			h.Write([]byte{0, 'd'})
+			if t.expanded[root] {
+				walk(root)
+			}
+		}
+	}
 	return h.Sum64()
 }
 

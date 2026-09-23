@@ -32,6 +32,7 @@ import (
 	"raj/internal/timing"
 	"raj/internal/ui"
 	"raj/internal/widget"
+	ws "raj/internal/workspace"
 )
 
 // App is one raj instance.
@@ -209,7 +210,17 @@ type App struct {
 	// the buffers it names.
 	pendingWrite *pendingWrite
 
-	root string
+	// roots holds the workspace roots in caller-supplied order. This wave
+	// routes the editor's single root through it so a later wave can add
+	// more without touching every reader; for one root the value is exactly
+	// what the old root string held. See primaryRoot.
+	roots ws.Roots
+	// visible is the workspace the explorer, search, ls and path containment
+	// render. It starts equal to roots — the view roots — and an attach
+	// replaces it with the daemon's set once the handshake reports one. The
+	// store, journal and session stay keyed by roots: an attached client shows
+	// the daemon's workspace but owns its view state beside the local store.
+	visible ws.Roots
 	// state is the workspace SQLite store, nil when it could not be opened or
 	// there is no workspace root. Every read and write is nil-safe: without it
 	// persistence degrades to the session file, or to nothing.
@@ -277,6 +288,11 @@ type App struct {
 	// second copy of the arithmetic.
 	drawerOpen bool
 	drawerSel  int
+	// drawerSelPane is the active pane drawerSel was resolved for. The
+	// selection is per-tab: drawPhoneDrawer re-selects the open default when
+	// the active pane changes under an open drawer. It is left alone while
+	// the pane stands, so a refused decision keeps the selection where it was.
+	drawerSelPane *editor.Pane
 	// drawerWant is the action whose button the drawer should select on the
 	// next frame. It is resolved against the drawn, mode/pending-filtered cells
 	// then, so a jump survives the panel being rebuilt when a decision empties
@@ -417,6 +433,25 @@ type App struct {
 	clientMu    sync.Mutex
 	clientFiles []clientFile
 	clientLost  string
+	// clientEdits tracks, per owned client path, the daemon version and text a
+	// pane's local copy was synced from, plus the dirty/running state of a
+	// local edit being forwarded. Guarded by clientMu: the event thread updates
+	// it as the user types and installs snapshots, while a forward goroutine
+	// reads the captured pair and writes back the version it adopted.
+	clientEdits map[string]*clientEdit
+	// clientNote is a one-line status the forward path wants shown on the event
+	// thread — a forward refusal, or an agent claim overlap — queued under
+	// clientMu and drained with the install batch.
+	clientNote string
+	// clientRefetch names paths whose forward was refused and whose pane must
+	// be restored from the daemon on the event thread, so local text the daemon
+	// never saw does not survive.
+	clientRefetch []string
+	// clientRoots is a root set the watch goroutine wants the event thread to
+	// adopt after a reconnect. Adoption mutates the explorer, search and picker
+	// panes, which belong to the event thread, so the watch queues the set here
+	// with a Wake instead of calling adoptVisibleRoots off-thread.
+	clientRoots []string
 	// clientDown is the connection dot state: true once the watch transport
 	// fails, false while it is healthy. Guarded by clientMu because the watch
 	// goroutine sets it and the frame reads it.
@@ -475,17 +510,66 @@ type App struct {
 // New builds an application rooted at a directory. It applies no explicit flag
 // overrides, so a stored setting still beats its tabWidth argument; main uses
 // NewWithOptions to say which command-line flags the user actually typed.
+// primaryRoot is the single root the editor was born with: the first workspace
+// root in caller-supplied order, or "" when there is no workspace root. It
+// is the fallback for the save-as and completion prompts; the explorer, search, session and
+// language servers take the whole set (the servers key by root). For one root
+// it is the old root field exactly.
+func (a *App) primaryRoot() string { return a.roots.Primary() }
+
+// rootFor returns the workspace root that contains path, or "" when none does.
+// Roots are not nested, so at most one root can match; the check is
+// component-wise so /a/b is not read as inside /a/bc.
+func (a *App) rootFor(path string) string {
+	return a.visible.RootFor(path)
+}
+
+// promptRoot is the workspace root a prompt should start in: the root that
+// contains the active file, so a save-as, completion or create under the second
+// root starts there, and the primary root when there is no active file or it
+// lies outside every root. For one root it is the primary root exactly.
+func (a *App) promptRoot() string {
+	if p := a.Tabs.Active(); p != nil && p.File != nil {
+		if root := a.rootFor(p.File.Path); root != "" {
+			return root
+		}
+	}
+	return a.primaryRoot()
+}
+
 func New(host ui.Host, root string, tabWidth int) *App {
 	return NewWithOptions(host, root, Options{TabWidth: tabWidth})
 }
 
-// NewWithOptions builds an application, resolving the effective settings
-// before anything is constructed. A workspace value beats a user value, both
-// beat built-in defaults, and an explicit flag — a *Set field on Options —
-// beats them all. The tab width is decided here because tabs.New bakes it into
-// the tab set, so a later override could not reach it.
+// NewWithOptions builds an application rooted at one directory. It is
+// NewWithRoots for a single root, so every existing caller and test is
+// untouched.
 func NewWithOptions(host ui.Host, root string, o Options) *App {
+	return NewWithRoots(host, []string{root}, o)
+}
+
+// NewWithRoots builds an application rooted at a set of workspace roots,
+// resolving the effective settings before anything is constructed. A workspace
+// value beats a user value, both beat built-in defaults, and an explicit flag —
+// a *Set field on Options — beats them all. The tab width is decided here
+// because tabs.New bakes it into the tab set, so a later override could not
+// reach it.
+//
+// The store is keyed by the whole set, so the editor and the daemon that serve
+// the same roots share one state directory, and the explorer, search, session
+// and their state paths all take the set. The language servers take the set
+// too, one per (root, language), so a file under any root is served from that
+// root. For one root everything is byte-for-byte what it has always been.
+func NewWithRoots(host ui.Host, roots []string, o Options) *App {
 	cols, rows := host.Size()
+	// ws.New cannot fail for one non-empty path; if it somehow does (an
+	// unabsolvable path), fall back to the zero Roots, which is the same "no
+	// workspace root" state the old empty root string represented.
+	wsRoots, err := ws.New(roots...)
+	if err != nil {
+		wsRoots = ws.Roots{}
+	}
+	root := wsRoots.Primary()
 	// The store opens before the tab set because settings decide the tab
 	// width; it is also where the session and positions live. State lives in
 	// the XDG state dir, outside the workspace, so a failed migration or an
@@ -495,12 +579,13 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 	var state *store.Store
 	var stateErr error
 	var migErr error
+	var hidErr error
 	if root != "" && !o.Standalone {
-		if dir := session.StateDir(root); dir != "" {
+		if dir := session.StateDirForRoots(wsRoots.All()); dir != "" {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				stateErr = err
 			} else {
-				migErr = migrateState(root)
+				migErr = migrateState(wsRoots.All())
 				if s, err := store.Open(filepath.Join(dir, "state.db")); err != nil {
 					stateErr = err
 				} else {
@@ -508,6 +593,13 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 				}
 			}
 		}
+	}
+	// The workspace's hidden configuration moved out of the project into XDG,
+	// so a workspace still holding the legacy .raj/hidden gets a copy at the
+	// workspace file before any pane loads its rules. It runs whether or not
+	// the store could open: it is configuration, not state.
+	if root != "" {
+		hidErr = migrateHiddenConfig(wsRoots.All())
 	}
 	user, workspace := settingScopes(state)
 	res, bad := resolveSettings(defaultSettings(o.TabWidth), user, workspace)
@@ -540,19 +632,20 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 		screen:         ui.NewScreen(cols, rows),
 		Tabs:           tabs.New(res.TabWidth),
 		tabWidth:       res.TabWidth,
-		Explorer:       explorer.NewPane(root),
-		Search:         search.NewPane(root),
+		Explorer:       explorer.NewPaneRoots(wsRoots.All()),
+		Search:         search.NewPaneRoots(wsRoots.All()),
 		Problems:       problems.New(),
 		settingsPane:   newSettingsPane(),
 		completeCache:  complete.NewCache(),
-		servers:        newServers(root),
+		servers:        newServers(wsRoots.All()),
 		diags:          newDiagnostics(),
 		inlays:         newInlayStore(),
 		lenses:         newLensStore(),
 		semantics:      newSemanticStore(),
-		Picker:         picker.New(root),
+		Picker:         picker.NewRoots(wsRoots.All()),
 		Prompt:         prompt.New(),
-		root:           root,
+		roots:          wsRoots,
+		visible:        wsRoots,
 		state:          state,
 		journalWritten: make(map[string]journalStamp),
 		settings:       res,
@@ -601,12 +694,13 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 	if tabWidthExplicit(o, user, workspace) {
 		a.Tabs.SetTabWidth(res.TabWidth)
 	}
-	// A bad line in .raj/hidden is skipped rather than fatal, but silently
-	// skipped is how a typo becomes "raj ignores my config". The status line is
-	// the only place it can be said at startup.
+	// A bad line in the workspace hide file is skipped rather than fatal, but
+	// silently skipped is how a typo becomes "raj ignores my config". The
+	// status line is the only place it can be said at startup, and it names the
+	// workspace file the patterns came from.
 	if badHidden := a.Explorer.Tree.Hidden.Bad; len(badHidden) > 0 {
 		a.status = fmt.Sprintf("%s: ignoring %d bad pattern(s): %s",
-			hidden.File, len(badHidden), strings.Join(badHidden, ", "))
+			hidden.WorkspaceFile(wsRoots.All()), len(badHidden), strings.Join(badHidden, ", "))
 	}
 	// A store that failed to open, and a setting whose value will not parse,
 	// are the same kind of problem: the editor runs, but a typo that would
@@ -626,23 +720,41 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 		}
 		a.status += "state migration: " + migErr.Error()
 	}
+	// A legacy hide file that would not copy is the same kind of problem: the
+	// editor runs against whatever configuration it could read, and the failure
+	// is said once rather than being fatal.
+	if hidErr != nil {
+		if a.status != "" {
+			a.status += "; "
+		}
+		a.status += "config migration: " + hidErr.Error()
+	}
 	if len(bad) > 0 {
 		if a.status != "" {
 			a.status += "; "
 		}
 		a.status += fmt.Sprintf("settings: ignoring %d bad value(s): %s", len(bad), strings.Join(bad, ", "))
 	}
+	a.wireSearchPane(a.Search)
+	return a
+}
+
+// wireSearchPane applies the wiring a freshly built search pane needs: a wake
+// when a search finishes, and the dirty buffers so a search covers unsaved work
+// as well as disk. The constructor and an attach that adopts the daemon's roots
+// both build a pane and both wire it here, so the two cannot drift.
+func (a *App) wireSearchPane(p *search.Pane) {
 	// A finished search used to wait for the 150 ms tick, because the result is
 	// installed on the event thread and nothing woke that thread. Posting a
 	// Wake closes the gap for typing pauses, and it is the seam the agent pane
 	// needs for exactly the same reason.
-	a.Search.Notify = func() { host.Post(ui.Wake{}) }
+	p.Notify = func() { a.host.Post(ui.Wake{}) }
 	// Search the buffers, not only the disk. Only dirty ones: a saved buffer
 	// and its file are the same bytes, so snapshotting it would copy a
 	// document to search it exactly as reading it would have. An unnamed
 	// buffer has no path to key on and is skipped — it is the one tab a search
 	// cannot reach, for the same reason session restore cannot bring it back.
-	a.Search.Buffers = func() search.Docs {
+	p.Buffers = func() search.Docs {
 		var open search.Docs
 		for _, p := range a.Tabs.All() {
 			if p.File.Path == "" || !p.File.ViewDirty() {
@@ -655,7 +767,32 @@ func NewWithOptions(host ui.Host, root string, o Options) *App {
 		}
 		return open
 	}
-	return a
+}
+
+// adoptVisibleRoots replaces the visible workspace with roots and rebuilds the
+// explorer, search and file picker over it. The view roots are untouched: the store was
+// opened at the constructor's roots in NewWithRoots and stays keyed by them,
+// because the daemon owns the workspace's state database and two processes must
+// not open it. It is what an attach does with the daemon's root set: the client
+// shows the daemon's workspace while its saved view lives beside its own store.
+// A set that cannot be canonicalised (empty, or two nested roots) is ignored,
+// leaving the launch-root workspace in place.
+func (a *App) adoptVisibleRoots(roots []string) bool {
+	vr, err := ws.New(roots...)
+	if err != nil || vr.Len() == 0 {
+		return false
+	}
+	a.visible = vr
+	a.Explorer = explorer.NewPaneRoots(vr.All())
+	a.Explorer.Tall = a.phone
+	a.Search = search.NewPaneRoots(vr.All())
+	a.wireSearchPane(a.Search)
+	// The file picker indexes the visible workspace too, so an attached client
+	// reaches the daemon's second root through cmd+p. Tall is the one field
+	// the constructor set on the picker, so it is re-applied here.
+	a.Picker = picker.NewRoots(vr.All())
+	a.Picker.Tall = a.phone
+	return true
 }
 
 // syncTheme adopts the terminal's measured background once the OSC query has
@@ -1651,6 +1788,10 @@ func (a *App) Handle(e ui.Event) {
 		// Clients parked on watch are woken here, once per change, rather
 		// than at every mutation site.
 		a.controlTick()
+		// Local edits an attached client typed are forwarded on the idle tick
+		// too, so a mutator that does not pass through handleEditor still
+		// reaches the daemon.
+		a.scanClientEdits()
 	case ui.Quit:
 		a.quit = true
 	}
@@ -1812,9 +1953,14 @@ func (a *App) handleGlobal(action keys.Action) bool {
 	case keys.Reload:
 		// Reload replaces the buffer from disk. Refused in Review, and in a
 		// client where the disk is not the daemon: it is not an edit, but it
-		// would discard the proposals being reviewed.
-		if a.readOnly() {
-			a.status = a.readOnlyNote()
+		// would replace the daemon snapshot with a stale local copy, and the
+		// forward would then carry that revert back to the daemon.
+		if a.attach || a.readOnly() {
+			if a.attach {
+				a.status = "attach: the daemon buffer is the file; reload is not available"
+			} else {
+				a.status = a.readOnlyNote()
+			}
 			return true
 		}
 		a.reloadActive()
@@ -2052,6 +2198,13 @@ func (a *App) handleSidebar(action keys.Action, text string) {
 }
 
 func (a *App) handleEditor(action keys.Action, text string) {
+	if a.attach {
+		// Every keystroke that can change text funnels through here, so the
+		// local-edit scan runs on the way out of every branch, not only the
+		// literal-text one. It coalesces: the forward itself runs off-thread
+		// after a debounce, and the idle tick is the second net.
+		defer a.scanClientEdits()
+	}
 	p := a.Tabs.Active()
 	if p != nil && p.Find.Open {
 		// Enter arrives as the literal newline in the editor scope: the keymap
@@ -2174,9 +2327,9 @@ func (a *App) paste(text string) {
 		return
 	}
 	if a.focus == FocusEditor {
-		// Paste is an edit, refused in Review mode and in a client with the
-		// same note a typed character gets. Fields and dialogs are not the
-		// document.
+		// Paste is an edit, refused in Review mode with the same note a typed
+		// character gets; outside Review in a client it is a local edit that
+		// forwards, like typing. Fields and dialogs are not the document.
 		if a.readOnly() {
 			a.status = a.readOnlyNote()
 			return
@@ -2525,6 +2678,10 @@ func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 	// refusal (pending proposals, disk conflict) is the status rather than a
 	// local write the next wake would overwrite.
 	if a.attach {
+		// A local edit still inside the forward debounce would otherwise be
+		// saved after it, so flush the pending forward first; the save then
+		// sees the daemon text this client just placed.
+		a.flushClientEdit(p)
 		a.saveRemote(p, then)
 		return
 	}
@@ -2557,7 +2714,7 @@ func (a *App) saveNamed(p *editor.Pane, then func(saved bool)) {
 
 // saveAs asks where an unnamed buffer should go, starting at the workspace root.
 func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
-	a.saveAsIn(p, a.root, then)
+	a.saveAsIn(p, a.promptRoot(), then)
 }
 
 // saveAsIn is saveAs with the folder the prompt starts in named by the caller.
@@ -2567,12 +2724,12 @@ func (a *App) saveAs(p *editor.Pane, then func(saved bool)) {
 // process's working directory — which is wherever raj happened to be launched
 // from and is not what "notes.md" means to someone looking at this tree. The
 // explorer's New File item passes the folder the menu was opened in; every other
-// caller passes the workspace root through saveAs, so ordinary save-as is
+// caller passes the active file's root through saveAs, so ordinary save-as is
 // unchanged. It is a seed hook, not a second save path: the prompt, the
 // overwrite question, the missing-parent offer and the write are all shared.
 func (a *App) saveAsIn(p *editor.Pane, dir string, then func(saved bool)) {
 	if dir == "" {
-		dir = a.root
+		dir = a.promptRoot()
 	}
 	a.askPath("Save as", dir+string(filepath.Separator), func(answer string, ok bool) {
 		if !ok || answer == "" {
@@ -2582,7 +2739,7 @@ func (a *App) saveAsIn(p *editor.Pane, dir string, then func(saved bool)) {
 		}
 		path := answer
 		if !filepath.IsAbs(path) {
-			path = filepath.Join(a.root, path)
+			path = filepath.Join(a.promptRoot(), path)
 		}
 		// Stat rather than trusting the name: the picker and the tree both
 		// show what is already there, but a typed path does not, and silently
@@ -2609,9 +2766,10 @@ func (a *App) saveAsIn(p *editor.Pane, dir string, then func(saved bool)) {
 // wants it.
 //
 // A buffer with no path has nothing to copy, so it is refused in words rather
-// than putting an empty string on the clipboard. A path outside the root —
-// save-as permits one — has no relative spelling, so the absolute path is
-// copied and the status line says which fallback happened.
+// than putting an empty string on the clipboard. A path is spelled relative to
+// the root that contains it, so a file under the second root is still short; a
+// path outside every root — save-as permits one — has no relative spelling, so
+// the absolute path is copied and the status line says which fallback happened.
 func (a *App) copyRelativePath() {
 	p := a.Tabs.Active()
 	if p == nil || p.File.Path == "" {
@@ -2619,8 +2777,8 @@ func (a *App) copyRelativePath() {
 		return
 	}
 	path := p.File.Path
-	if underDir(a.root, path) {
-		if rel, err := filepath.Rel(a.root, path); err == nil {
+	if root := a.rootFor(path); root != "" {
+		if rel, err := filepath.Rel(root, path); err == nil {
 			a.copyPath(rel)
 			return
 		}
@@ -2750,8 +2908,10 @@ func (a *App) ensureParent(path string, then func(saved bool), cont func()) {
 	// The relative form, because the absolute one is usually too long for the
 	// dialog and the part that matters is what is new.
 	shown := dir
-	if rel, err := filepath.Rel(a.root, dir); err == nil && !strings.HasPrefix(rel, "..") {
-		shown = rel
+	if root := a.rootFor(dir); root != "" {
+		if rel, err := filepath.Rel(root, dir); err == nil && !strings.HasPrefix(rel, "..") {
+			shown = rel
+		}
 	}
 	a.confirm("Create directory", shown+" does not exist. Create it?",
 		[]string{prompt.Create, prompt.Cancel}, func(ans string, ok bool) {
@@ -2999,7 +3159,7 @@ func (a *App) completePath(text string) string {
 	dir, base := filepath.Split(text)
 	abs := dir
 	if !filepath.IsAbs(abs) {
-		abs = filepath.Join(a.root, dir)
+		abs = filepath.Join(a.promptRoot(), dir)
 	}
 	entries, err := os.ReadDir(abs)
 	if err != nil {
@@ -3043,7 +3203,7 @@ func (a *App) pathCandidates(text string) []prompt.Candidate {
 	dir, base := filepath.Split(text)
 	abs := dir
 	if !filepath.IsAbs(abs) {
-		abs = filepath.Join(a.root, dir)
+		abs = filepath.Join(a.promptRoot(), dir)
 	}
 	entries, err := os.ReadDir(abs)
 	if err != nil {

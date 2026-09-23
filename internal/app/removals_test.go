@@ -131,7 +131,7 @@ func TestPendingDirRemovalWithdrawRetracts(t *testing.T) {
 // file deletion recorded before a dir-removal is the one the key raises.
 func TestReopenRemovalPresentsTheOldestFirst(t *testing.T) {
 	h := newHarness(t, "hello\n")
-	other := filepath.Join(h.root, "other.go")
+	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

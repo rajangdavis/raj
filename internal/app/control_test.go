@@ -141,7 +141,7 @@ func TestControlPathSpellingsResolveAlike(t *testing.T) {
 	h := controlHarness(t, "alpha\nbeta\n")
 	c := h.dial(t)
 	abs := h.Tabs.Active().File.Path
-	rel, err := filepath.Rel(h.root, abs)
+	rel, err := filepath.Rel(h.primaryRoot(), abs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +773,7 @@ func TestControlMkdirCreatesDirectories(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("mkdir = %+v", res)
 	}
-	dir := filepath.Join(h.root, "newpkg", "inner")
+	dir := filepath.Join(h.primaryRoot(), "newpkg", "inner")
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		t.Fatalf("mkdir did not create %s: stat = %v, %v", dir, st, err)
 	}
@@ -785,7 +785,7 @@ func TestControlMkdirCreatesDirectories(t *testing.T) {
 	}
 
 	// Out of root is a refusal, and nothing is created.
-	outside := filepath.Join(h.root, "..", "escaped")
+	outside := filepath.Join(h.primaryRoot(), "..", "escaped")
 	res = c.do(h, control.Request{Op: "mkdir", Path: outside})
 	if res.OK || !strings.Contains(res.Err, "not under") {
 		t.Fatalf("mkdir outside the root = %+v, want a refusal naming the root", res)
@@ -865,7 +865,7 @@ func TestControlRmdirProposesWithoutRemoving(t *testing.T) {
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 
-	dir := filepath.Join(h.root, "pkg")
+	dir := filepath.Join(h.primaryRoot(), "pkg")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

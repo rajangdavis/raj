@@ -43,7 +43,7 @@ func linkAnswer(h *harness, line, col int, links ...lsp.DocumentLink) lspAnswer 
 // the user gets a status line and no file.
 func TestFollowLinkOpensAFileTarget(t *testing.T) {
 	h := newHarness(t, "see other.go here\n")
-	other := filepath.Join(h.root, "other.go")
+	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("package other\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

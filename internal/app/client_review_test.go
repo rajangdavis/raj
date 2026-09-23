@@ -179,43 +179,45 @@ func TestClientRefusedDecisionSurfacesHostError(t *testing.T) {
 	}
 }
 
-// A client buffer refuses document edits in every mode. Leaving Review with
-// the real toggle must not create a local change the next wake would discard,
-// and the refusal must say so rather than silently dropping the key.
-func TestClientRefusesTypingOutsideReview(t *testing.T) {
-	ch := newClientHarness(t)
-	ch.cli.drain()
-	p := ch.cli.Tabs.Active()
-	want := p.File.Text()
-	// Leave Review: the ordinary editor would now accept typing.
-	ch.cli.toggleReview()
-	if ch.cli.mode != ModeEdit {
-		t.Fatalf("mode = %v, want Edit after the toggle", ch.cli.mode)
-	}
-	ch.cli.typeText("Z")
-
-	if p.File.Text() != want {
-		t.Errorf("client mode allowed an edit: %q", p.File.Text())
-	}
-	if !strings.Contains(ch.cli.status, "read-only") {
-		t.Errorf("status = %q, want a read-only note", ch.cli.status)
-	}
-}
-
-// The read-only gate is shared, not just the typing path: Paste, Cut,
-// undo/redo and the find bar replace all are refused in client mode too, each
-// with the note. Without the shared readOnly check these reach the pane and
-// change the snapshot copy.
-func TestClientRefusesEveryEditGesture(t *testing.T) {
+// Review is read-only over the client's snapshot copy too: typing is refused
+// with the note, so a review pass cannot become an accidental edit the next
+// watch wake would discard. Leaving Review is the client's edit path, pinned by
+// TestAttachedClientEditsOutsideReview.
+func TestClientRefusesTypingInReview(t *testing.T) {
 	ch := newClientHarness(t)
 	ch.cli.drain()
 	p := ch.cli.Tabs.Active()
 	if p == nil {
 		t.Fatal("client attached with no tab")
 	}
-	ch.cli.toggleReview()
-	if ch.cli.mode != ModeEdit {
-		t.Fatalf("mode = %v, want Edit after the toggle", ch.cli.mode)
+	if ch.cli.mode != ModeReview {
+		t.Fatalf("mode = %v, want Review", ch.cli.mode)
+	}
+	want := p.File.Text()
+	ch.cli.focusEditor()
+	ch.cli.typeText("Z")
+
+	if p.File.Text() != want {
+		t.Errorf("Review allowed an edit: %q", p.File.Text())
+	}
+	if !strings.Contains(ch.cli.status, "read-only") {
+		t.Errorf("status = %q, want a read-only note", ch.cli.status)
+	}
+}
+
+// The read-only gate is shared, not just the typing path: Paste, Cut and
+// undo/redo are refused in Review too, each with the note. Without the shared
+// readOnly check these reach the snapshot copy. Outside Review the same
+// gestures are the client's own edits and are forwarded to the daemon.
+func TestClientRefusesEveryEditGestureInReview(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	if ch.cli.mode != ModeReview {
+		t.Fatalf("mode = %v, want Review", ch.cli.mode)
 	}
 
 	gestures := []struct {
@@ -227,10 +229,6 @@ func TestClientRefusesEveryEditGesture(t *testing.T) {
 		{"cut", func() { ch.cli.handleKeyAction(keys.Cut) }},
 		{"undo", func() { ch.cli.handleKeyAction(keys.Undo) }},
 		{"redo", func() { ch.cli.handleKeyAction(keys.Redo) }},
-		{"find replace all", func() {
-			ch.cli.handleKeyAction(keys.FindInFile)
-			ch.cli.handleKeyAction(keys.LineBelow)
-		}},
 	}
 	for _, g := range gestures {
 		t.Run(g.name, func(t *testing.T) {
@@ -238,7 +236,7 @@ func TestClientRefusesEveryEditGesture(t *testing.T) {
 			ch.cli.status = ""
 			g.run()
 			if got := p.File.Text(); got != before {
-				t.Errorf("client mode allowed %s: %q", g.name, got)
+				t.Errorf("Review allowed %s: %q", g.name, got)
 			}
 			if !strings.Contains(ch.cli.status, "read-only") {
 				t.Errorf("%s status = %q, want a read-only note", g.name, ch.cli.status)

@@ -16,7 +16,10 @@ import (
 // the rules can be tested without a terminal, an event loop or a socket — the
 // document puts the transport last precisely so this is possible.
 type memHost struct {
-	root   string
+	root string
+	// roots is the workspace root set when the test wants one; nil falls back
+	// to root alone, which is every existing test.
+	roots  []string
 	docs   map[string]string
 	vers   map[string]uint64
 	opens  []string
@@ -128,6 +131,10 @@ func newMemHost(root string, docs map[string]string) *memHost {
 }
 
 func (h *memHost) Root() string { return h.root }
+
+// Roots is the whole workspace root set, when a test sets one; a nil set makes
+// the Guard fall back to Root, exactly as a host that predates the method does.
+func (h *memHost) Roots() []string { return h.roots }
 
 func (h *memHost) Buffers() []Buffer {
 	var out []Buffer
@@ -889,6 +896,88 @@ func TestApplyAllowsAReservedAuthor(t *testing.T) {
 	}
 }
 
+// A durable joined human that is not the local keyboard row is admitted by
+// Apply: an attached client hellos as a second person, and its span edit lands
+// as that person's own accepted text rather than a proposal. The local human
+// row stays refused, because a socket able to claim it would be
+// indistinguishable from the person at the keyboard. The agent and reserved
+// (anonymous) cases keep their existing allowance, so the three-way boundary is
+// pinned in one place.
+func TestApplyAllowsAJoinedHuman(t *testing.T) {
+	// A durable human other than LocalHuman writes.
+	g, h := guarded(t)
+	reg := NewRegistry()
+	g.Participants = reg
+	human, err := reg.Join("client:desk", "desk", KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if human == LocalHuman {
+		t.Fatalf("fixture: the joined human reused the local row %d", LocalHuman)
+	}
+	path := filepath.Join(h.root, "a.go")
+	g.setClaims(human, []string{path})
+	if _, _, _, err := g.Read(path, human, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := g.Apply(path, human, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err != nil {
+		t.Fatalf("a joined human's write was refused: %v", err)
+	}
+	if h.docs[path] != "x world\n" {
+		t.Errorf("buffer = %q, want the human write applied", h.docs[path])
+	}
+	// Patch is the whole-text snapshot path an agent owns, not the span edit an
+	// attached human sends, so it keeps refusing a person.
+	if _, _, _, err := g.Patch(path, human, 1, "rewritten\n"); err == nil {
+		t.Error("Patch admitted a joined human")
+	}
+
+	// The local keyboard row is still not claimable over a socket, registry or
+	// not: admitting it would let a connection make its text look typed. The
+	// refusal happens before the claim check, so no claim is set here.
+	g2, h2 := guarded(t)
+	g2.Participants = reg
+	path2 := filepath.Join(h2.root, "a.go")
+	if _, _, _, err := g2.Apply(path2, LocalHuman, 1, []Hunk{{Start: 0, End: 5, Text: "x"}}); err == nil {
+		t.Error("the local human row was writable over the socket")
+	}
+	if h2.docs[path2] != "hello world\n" {
+		t.Errorf("a refused local-human write changed the buffer: %q", h2.docs[path2])
+	}
+
+	// An agent keeps the write, as before.
+	g3, h3 := guarded(t)
+	g3.Participants = reg
+	agent, err := reg.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path3 := filepath.Join(h3.root, "a.go")
+	g3.setClaims(agent, []string{path3})
+	if _, _, _, err := g3.Read(path3, agent, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := g3.Apply(path3, agent, 1, []Hunk{{Start: 0, End: 5, Text: "y"}}); err != nil {
+		t.Errorf("an agent was refused: %v", err)
+	}
+
+	// A reserved (anonymous) connection keeps its existing allowance too.
+	g4, h4 := guarded(t)
+	g4.Participants = reg
+	id, err := reg.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path4 := filepath.Join(h4.root, "a.go")
+	g4.setClaims(id, []string{path4})
+	if _, _, _, err := g4.Read(path4, id, -1, -1, 0, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := g4.Apply(path4, id, 1, []Hunk{{Start: 0, End: 5, Text: "z"}}); err != nil {
+		t.Errorf("a reserved author was refused: %v", err)
+	}
+}
+
 // Read-before-write is per writer, not per connection or per app. Keying the
 // read set by path alone let one participant's read authorise another's blind
 // write to the same buffer, inheriting coordinates that writer never saw.
@@ -953,6 +1042,44 @@ func TestGuardRejectsMalformedSpans(t *testing.T) {
 		if _, _, _, err := g.Apply(path, FirstAgent, 1, []Hunk{hk}); err == nil {
 			t.Errorf("%+v was allowed", hk)
 		}
+	}
+}
+
+// A ping reply carries the whole workspace root set, not just the primary, so
+// an attach client can adopt the daemon's workspace. The failure mode this
+// pins: the reply carried only Root, and `raj --attach` rendered the directory
+// the client was launched in.
+func TestPingReplyCarriesRoots(t *testing.T) {
+	g, h := guarded(t)
+	a, b := t.TempDir(), t.TempDir()
+	h.roots = []string{a, b}
+	res := Dispatch(g, Request{Op: "ping"})
+	if !res.OK {
+		t.Fatalf("ping = %+v", res)
+	}
+	if res.Root != h.root {
+		t.Errorf("ping Root = %q, want the primary %q", res.Root, h.root)
+	}
+	if len(res.Roots) != 2 || res.Roots[0] != a || res.Roots[1] != b {
+		t.Errorf("ping Roots = %q, want %q", res.Roots, []string{a, b})
+	}
+
+	// A host with no set reports the primary alone, so a reader of Root is
+	// unaffected and a client adopting the set gets the one root it has.
+	h.roots = nil
+	res = Dispatch(g, Request{Op: "ping"})
+	if len(res.Roots) != 1 || res.Roots[0] != h.root {
+		t.Errorf("ping Roots with no set = %q, want [%s]", res.Roots, h.root)
+	}
+}
+
+// A workspace with no root reports no root set, not the empty string: absence
+// means absent, so a client reads it as "the server named no workspace" and
+// keeps its own.
+func TestPingRootsEmptyWithoutARoot(t *testing.T) {
+	g := NewGuard(newMemHost("", map[string]string{}))
+	if res := Dispatch(g, Request{Op: "ping"}); len(res.Roots) != 0 {
+		t.Errorf("ping Roots = %q, want none", res.Roots)
 	}
 }
 
@@ -1040,6 +1167,68 @@ func TestDispatchReadsByLines(t *testing.T) {
 	late := 99
 	if res := Dispatch(g, Request{Op: "text", Path: path, LineStart: &late}); !res.OK || res.Text() != "" {
 		t.Fatalf("line 99 = %q, want empty", res.Text())
+	}
+}
+
+// A read reply carries the same bytes and lines a version reply does, over the
+// whole file even when the returned text is a span, so a driver that just read
+// does not make a second call for the file length.
+//
+// Precondition: a.go is the memHost default "hello world\n" (12 bytes, 2 lines).
+func TestDispatchReadCarriesWholeFileSize(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+
+	whole := Dispatch(g, Request{Op: "text", Path: path, Author: FirstAgent})
+	if !whole.OK || whole.Text() != "hello world\n" {
+		t.Fatalf("whole read = %+v", whole)
+	}
+	ver := Dispatch(g, Request{Op: "version", Path: path})
+	if !ver.OK {
+		t.Fatalf("version = %+v", ver)
+	}
+	if whole.Bytes != ver.Bytes || whole.Lines != ver.Lines {
+		t.Errorf("read bytes/lines = %d/%d, version = %d/%d",
+			whole.Bytes, whole.Lines, ver.Bytes, ver.Lines)
+	}
+	if whole.Bytes != len(h.docs[path]) || whole.Lines != strings.Count(h.docs[path], "\n")+1 {
+		t.Errorf("read bytes/lines = %d/%d, want %d/%d",
+			whole.Bytes, whole.Lines, len(h.docs[path]), strings.Count(h.docs[path], "\n")+1)
+	}
+
+	// A span read keeps the whole file numbers even though the text is a
+	// window; a regression would report the length of the window instead.
+	start, end := 6, 11
+	span := Dispatch(g, Request{Op: "text", Path: path, Author: FirstAgent, Start: &start, End: &end})
+	if !span.OK || span.Text() != "world" {
+		t.Fatalf("span read = %+v", span)
+	}
+	if span.Bytes != len(h.docs[path]) || span.Lines != strings.Count(h.docs[path], "\n")+1 {
+		t.Errorf("span bytes/lines = %d/%d, want the whole file %d/%d",
+			span.Bytes, span.Lines, len(h.docs[path]), strings.Count(h.docs[path], "\n")+1)
+	}
+}
+
+// Every target of a multi-target read reports its own file byte length and line
+// count, so a batch read is one call for text and size together.
+//
+// Precondition: two whole-file reads of different sizes.
+func TestDispatchReadMultipleCarriesPerFileSize(t *testing.T) {
+	g, h := guarded(t)
+	a := filepath.Join(h.root, "a.go")
+	b := filepath.Join(h.root, "b.go")
+	h.docs[b], h.vers[b] = "second file\n\n// two\n", 7
+
+	res := Dispatch(g, Request{Op: "text", Author: FirstAgent, Paths: []string{a, b}})
+	if !res.OK || len(res.Buffers) != 2 {
+		t.Fatalf("multi read = %+v", res)
+	}
+	for i, p := range []string{a, b} {
+		want := h.docs[p]
+		if got := res.Buffers[i]; got.Path != p || got.Bytes != len(want) || got.Lines != strings.Count(want, "\n")+1 {
+			t.Errorf("buffer %d = %+v, want %s bytes %d lines %d",
+				i, got, p, len(want), strings.Count(want, "\n")+1)
+		}
 	}
 }
 
@@ -3172,9 +3361,11 @@ func TestDispatchLs(t *testing.T) {
 		t.Errorf("entries = %+v, want the host's canned list", res.Entries)
 	}
 
-	// An empty path names the workspace root, and -hidden rides along.
-	if res := Dispatch(g, Request{Op: "ls", Hidden: true}); !res.OK || h.lastLs.Path != h.root || !h.lastLs.Hidden {
-		t.Errorf("ls -hidden = %+v, last = %+v; want the root and the flag", res, h.lastLs)
+	// An empty path names the workspace itself: the guard passes it through and
+	// the host decides whether that is one root's children or one row per root.
+	// The -hidden switch rides along either way.
+	if res := Dispatch(g, Request{Op: "ls", Hidden: true}); !res.OK || h.lastLs.Path != "" || !h.lastLs.Hidden {
+		t.Errorf("ls -hidden = %+v, last = %+v; want an empty path and the flag", res, h.lastLs)
 	}
 
 	// A path outside the workspace is refused, the same as every other verb.

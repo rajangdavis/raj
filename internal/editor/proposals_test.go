@@ -2,8 +2,10 @@ package editor
 
 import (
 	"testing"
+	"time"
 
 	"raj/internal/piecetable"
+	"raj/internal/syntax"
 	"raj/internal/ui"
 )
 
@@ -114,6 +116,101 @@ func TestRenderTintsProposedText(t *testing.T) {
 	}
 	if bg := s.At(gut+0, 0).Style.Bg; bg == th.AgentTint || bg == th.ProposedAdd {
 		t.Errorf("user text bg = %v, want untinted", bg)
+	}
+}
+
+// waitSyntax settles the highlighter after an edit, so a test that asserts on a
+// token's colour reads the lexer pass rather than an empty span list.
+func waitSyntax(t *testing.T, p *Pane) {
+	t.Helper()
+	p.File.RefreshSyntax()
+	for i := 0; i < 200 && !p.File.Syntax.Ready(); i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !p.File.Syntax.Ready() {
+		t.Skip("the syntax pass did not finish")
+	}
+}
+
+// A proposed span that carries commented-out code must stay legible: the review
+// green is kept, but the comment grey all but vanishes on it, so the renderer
+// pairs the green with the black or white foreground that reads against it.
+func TestRenderProposedCommentStaysLegible(t *testing.T) {
+	const comment = "// stale := 1"
+	p := newTestPane("code\n")
+	propose(t, p, piecetable.Hunk{Start: 0, End: len("code"), Text: comment})
+
+	// The fixture is only meaningful if the lexer really calls the proposed
+	// text a comment; without that the contrast check could pass on code.
+	waitSyntax(t, p)
+	spans := p.File.Syntax.Line(0)
+	if cl := syntax.ClassAt(spans, 0); cl != syntax.ClassComment {
+		t.Fatalf("proposed text is class %v, want a comment; spans %+v", cl, spans)
+	}
+	commentStyle, ok := syntax.StyleAt(spans, 0)
+	if !ok {
+		t.Fatal("no syntax style on the proposed comment")
+	}
+
+	s := ui.NewScreen(40, 10)
+	th := DefaultTheme()
+	// The colour the lexer hands a comment is the one the report complained
+	// about; if it were already legible on the green the check below would pass
+	// without showing the fix.
+	if r, ok := ui.ContrastRatio(commentStyle.Fg, th.ProposedAdd); ok && r >= 4.5 {
+		t.Fatalf("fixture comment fg %v already contrasts %.2f; the test cannot show the fix", commentStyle.Fg, r)
+	}
+
+	p.Render(s, 0, 0, 40, 10, th)
+
+	cell := s.At(p.GutterWidth(), 0)
+	if cell.Style.Bg != th.ProposedAdd {
+		t.Fatalf("proposed comment bg = %v, want the review green %v", cell.Style.Bg, th.ProposedAdd)
+	}
+	ratio, ok := ui.ContrastRatio(cell.Style.Fg, th.ProposedAdd)
+	if !ok || ratio < 4.5 {
+		t.Errorf("proposed comment fg = %v, contrast %.2f (ok=%v), want >= 4.5 against %v",
+			cell.Style.Fg, ratio, ok, th.ProposedAdd)
+	}
+}
+
+// Accepted agent text carries the attribution tint rather than the review
+// green, and it has the same hazard: a commented-out line all but vanishes on
+// the tint, so an accepted span pairs the tint with a legible foreground too.
+func TestRenderAgentCommentStaysLegible(t *testing.T) {
+	const comment = "// stale := 1"
+	p := newTestPane("code\n")
+	id := propose(t, p, piecetable.Hunk{Start: 0, End: len("code"), Text: comment})
+	p.File.Session().AcceptGroup(id)
+
+	waitSyntax(t, p)
+	spans := p.File.Syntax.Line(0)
+	if cl := syntax.ClassAt(spans, 0); cl != syntax.ClassComment {
+		t.Fatalf("accepted text is class %v, want a comment; spans %+v", cl, spans)
+	}
+	commentStyle, ok := syntax.StyleAt(spans, 0)
+	if !ok {
+		t.Fatal("no syntax style on the accepted comment")
+	}
+
+	s := ui.NewScreen(40, 10)
+	th := DefaultTheme()
+	// The unmodified comment colour must not already satisfy the check below,
+	// or the test could pass without showing the fix.
+	if r, ok := ui.ContrastRatio(commentStyle.Fg, th.AgentTint); ok && r >= 4.5 {
+		t.Fatalf("fixture comment fg %v already contrasts %.2f; the test cannot show the fix", commentStyle.Fg, r)
+	}
+
+	p.Render(s, 0, 0, 40, 10, th)
+
+	cell := s.At(p.GutterWidth(), 0)
+	if cell.Style.Bg != th.AgentTint {
+		t.Fatalf("accepted comment bg = %v, want the attribution tint %v", cell.Style.Bg, th.AgentTint)
+	}
+	ratio, ok := ui.ContrastRatio(cell.Style.Fg, th.AgentTint)
+	if !ok || ratio < 4.5 {
+		t.Errorf("accepted comment fg = %v, contrast %.2f (ok=%v), want >= 4.5 against %v",
+			cell.Style.Fg, ratio, ok, th.AgentTint)
 	}
 }
 

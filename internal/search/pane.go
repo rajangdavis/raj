@@ -19,7 +19,11 @@ import (
 // Shift+tab walks back but stops at the query field — once focus is in the
 // editor, tab indents, and returning is a chord.
 type Pane struct {
+	// Root is the primary root, kept for the single-root callers and equal to
+	// Roots[0] with one root. Roots is the whole set the pane searches, in
+	// supplied order.
 	Root   string
+	Roots  []string
 	Result Result
 
 	// resultGen is the generation Result is showing, so apply can tell an
@@ -300,13 +304,36 @@ const (
 	spotCount
 )
 
-// NewPane returns a search pane rooted at a directory.
-func NewPane(root string) *Pane {
-	p := &Pane{Root: root, collapsed: map[string]bool{}, Hidden: hidden.Load(root)}
+// NewPane returns a search pane rooted at a directory. It is NewPaneRoots for
+// a single root, so the one-root callers and tests are unchanged.
+func NewPane(root string) *Pane { return NewPaneRoots([]string{root}) }
+
+// NewPaneRoots returns a search pane over a workspace root set. Every root is
+// walked by each search; a single root is the old pane exactly. The hidden
+// policy is one config per root set (hidden.WorkspaceFile), loaded from the
+// whole set.
+func NewPaneRoots(roots []string) *Pane {
+	p := &Pane{Roots: append([]string(nil), roots...), collapsed: map[string]bool{}}
+	if len(p.Roots) > 0 {
+		p.Root = p.Roots[0]
+	}
+	p.Hidden = hidden.Load(p.Roots)
 	p.query = widget.Input{Label: "Search"}
 	p.include = widget.Input{Label: "files to include"}
 	p.exclude = widget.Input{Label: "files to exclude"}
 	return p
+}
+
+// roots is the set a search walks: the explicit set, or the single Root when
+// the pane was built the old way.
+func (p *Pane) roots() []string {
+	if len(p.Roots) > 0 {
+		return p.Roots
+	}
+	if p.Root != "" {
+		return []string{p.Root}
+	}
+	return nil
 }
 
 // Focus restores the pane to wherever focus was when it was last left.
@@ -508,19 +535,19 @@ func (p *Pane) run() {
 	// The snapshot is taken here, on the event thread, and handed to the
 	// worker by value. Taking it inside the worker would read a piece table
 	// concurrently with the keystrokes that are still editing it.
-	q, root, fn := p.q, p.Root, p.searcher(p.snapshot(), gen)
+	q, roots, fn := p.q, p.roots(), p.searcher(p.snapshot(), gen)
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.inflight++
-	p.timer = time.AfterFunc(p.debounce(), func() { p.work(ctx, gen, root, q, fn) })
+	p.timer = time.AfterFunc(p.debounce(), func() { p.work(ctx, gen, roots, q, fn) })
 	p.mu.Unlock()
 }
 
 // work runs one search off the event thread and parks the result if it is still
 // the one being waited for.
-func (p *Pane) work(ctx context.Context, gen int, root string, q Query, fn func(context.Context, string, Query) Result) {
+func (p *Pane) work(ctx context.Context, gen int, roots []string, q Query, fn func(context.Context, []string, Query) Result) {
 	start := time.Now()
-	res := fn(ctx, root, q)
+	res := fn(ctx, roots, q)
 	elapsed := time.Since(start)
 
 	p.mu.Lock()
@@ -638,15 +665,25 @@ func (p *Pane) snapshot() Docs {
 // keeps the substitution seam a test uses at three arguments rather than five:
 // a test that replaces the search entirely has no disk to disagree with, and
 // no walk to report from.
-func (p *Pane) searcher(open Docs, gen int) func(context.Context, string, Query) Result {
+func (p *Pane) searcher(open Docs, gen int) func(context.Context, []string, Query) Result {
 	if p.search != nil {
-		return p.search
+		// The substitution seam is single-root by signature: a test that
+		// replaces the walk has no disk to disagree with. It is handed the
+		// primary so the three-argument fakes keep working; the production
+		// branch below walks every root.
+		return func(ctx context.Context, roots []string, q Query) Result {
+			root := ""
+			if len(roots) > 0 {
+				root = roots[0]
+			}
+			return p.search(ctx, root, q)
+		}
 	}
-	return func(ctx context.Context, root string, q Query) Result {
+	return func(ctx context.Context, roots []string, q Query) Result {
 		if q.Hidden == nil {
 			q.Hidden = p.Hidden
 		}
-		return RunStream(ctx, root, q, open, func(batch []Match) {
+		return RunStreamRoots(ctx, roots, q, open, nil, func(batch []Match) {
 			p.deliver(gen, batch)
 		})
 	}
@@ -966,7 +1003,7 @@ func (p *Pane) renderResults(s *ui.Screen, x, y, w, h int, th widget.Theme, focu
 				count = fmt.Sprintf("(%d of %d)", r.Count, r.Total)
 			}
 			label = marker + fmt.Sprintf("%s %s",
-				widget.TruncateLeft(relative(p.Root, r.Path), w-10-len(count)), count)
+				widget.TruncateLeft(relativeAny(p.roots(), r.Path), w-10-len(count)), count)
 		} else {
 			indent = 4
 			label = fmt.Sprintf("%d: %s", r.Match.Line, trimIndent(r.Match.Text))

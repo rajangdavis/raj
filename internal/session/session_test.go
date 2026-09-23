@@ -118,6 +118,39 @@ func TestStateDirDistinguishesSameNamedRoots(t *testing.T) {
 	}
 }
 
+// StateDirForRoots with one root is byte-for-byte StateDir: the key is delegated
+// to workspace.StateKey, whose golden pins the historical key, so one root's
+// state directory is unchanged by the set form.
+func TestStateDirForRootsSingleRootMatchesStateDir(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	root := workspace(t)
+	if got, want := StateDirForRoots([]string{root}), StateDir(root); got != want {
+		t.Errorf("StateDirForRoots([%s]) = %q, want StateDir %q", root, got, want)
+	}
+}
+
+// The key covers the whole set: neither member alone names the same directory,
+// and order does not matter because the roots are sorted into the key.
+func TestStateDirForRootsKeyedByTheWholeSet(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	a := workspace(t, "a")
+	b := workspace(t, "b")
+
+	both := StateDirForRoots([]string{a, b})
+	if both == "" {
+		t.Fatal("no state dir for a two-root set")
+	}
+	if both == StateDir(a) || both == StateDir(b) {
+		t.Errorf("set key %q collides with a member", both)
+	}
+	if swapped := StateDirForRoots([]string{b, a}); swapped != both {
+		t.Errorf("order changed the state dir: %q then %q", both, swapped)
+	}
+	if got := StateDirForRoots(nil); got != "" {
+		t.Errorf("no roots should mean no state dir, got %q", got)
+	}
+}
+
 // A session is a hint. Every one of these used to be a way to fail at startup
 // over a scratch file, which is a much worse outcome than a lost scroll.
 func TestLoadIsNeverFatal(t *testing.T) {
@@ -337,5 +370,60 @@ func TestSidebarRoundTrip(t *testing.T) {
 		if got.Sidebar == nil || *got.Sidebar != *tc.in {
 			t.Errorf("%s: sidebar did not round-trip", tc.name)
 		}
+	}
+}
+
+// WorkspacesDir is the parent every workspace state dir sits under, and it is
+// what daemon discovery walks. It follows the same state home as StateDir, and
+// is empty when there is none, so a caller builds no relative path.
+func TestWorkspacesDir(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	root := workspace(t)
+
+	want := filepath.Join(stateHome, "raj", "workspaces")
+	if got := WorkspacesDir(); got != want {
+		t.Errorf("WorkspacesDir = %q, want %q", got, want)
+	}
+	if dir := StateDir(root); filepath.Dir(dir) != WorkspacesDir() {
+		t.Errorf("StateDir = %q, not under WorkspacesDir %q", dir, WorkspacesDir())
+	}
+}
+
+// With no state home there is nowhere to list workspaces from, so the directory
+// is empty rather than a relative path.
+func TestWorkspacesDirWithoutStateHome(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+	if got := WorkspacesDir(); got != "" {
+		t.Errorf("WorkspacesDir without a state home = %q, want empty", got)
+	}
+}
+
+// DecodeForRoots is the set form of Decode: a tab under the second root is
+// kept, and one matching no root is dropped, because a session is a hint about
+// this set of roots and nothing else. With only the first root in the set the
+// second root's tab is dropped too, so the set really is the boundary.
+func TestDecodeForRootsKeepsAnyRootAndDropsTheRest(t *testing.T) {
+	a := workspace(t, "a.go")
+	b := workspace(t, "b.go")
+	pathA := filepath.Join(a, "a.go")
+	pathB := filepath.Join(b, "b.go")
+	outside := filepath.Join(t.TempDir(), "elsewhere.go")
+	if err := os.WriteFile(outside, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	blob, err := Encode(State{Tabs: []Tab{{Path: pathA}, {Path: pathB}, {Path: outside}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := DecodeForRoots(blob, []string{a, b})
+	if len(got.Tabs) != 2 || got.Tabs[0].Path != pathA || got.Tabs[1].Path != pathB {
+		t.Errorf("tabs = %+v, want both roots and no outside path", got.Tabs)
+	}
+	one := DecodeForRoots(blob, []string{a})
+	if len(one.Tabs) != 1 || one.Tabs[0].Path != pathA {
+		t.Errorf("single-root decode = %+v, want only %s", one.Tabs, pathA)
 	}
 }

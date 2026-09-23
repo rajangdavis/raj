@@ -46,7 +46,7 @@ type journalStamp struct {
 // debounced and only when the buffer has moved since its last write. It runs on
 // the idle tick, where the encode cannot land on a keystroke.
 func (a *App) persistTick(now time.Time) {
-	if a.attach || a.root == "" || a.NoRestore || a.state == nil {
+	if a.attach || a.roots.Len() == 0 || a.NoRestore || a.state == nil {
 		return
 	}
 	if !a.journalPersisted.IsZero() && now.Sub(a.journalPersisted) < JournalPersistInterval {

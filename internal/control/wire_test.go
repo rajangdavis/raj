@@ -428,6 +428,37 @@ func TestServerAssignsAnAuthorPerConnection(t *testing.T) {
 	}
 }
 
+// Roots ride in the header on a ping or buffers reply; the failure mode is
+// EncodeResponse or DecodeResponse dropping the field, which compiles and
+// silently hands an attach client no workspace to adopt.
+func TestResponseCarriesRoots(t *testing.T) {
+	want := []string{"/w", "/w/pkg"}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Root: "/w", Roots: want})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Roots) != len(want) {
+		t.Fatalf("roots = %q, want %q", got.Roots, want)
+	}
+	for i := range want {
+		if got.Roots[i] != want[i] {
+			t.Errorf("root %d = %q, want %q", i, got.Roots[i], want[i])
+		}
+	}
+
+	// Sparse: a reply that names no set decodes to none, so an old server and
+	// a workspace with no root are the same thing to a reader.
+	h, body = EncodeResponse(Response{ID: 9, OK: true, Final: true, Root: "/w"})
+	got, err = DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Roots != nil {
+		t.Errorf("roots = %q, want none", got.Roots)
+	}
+}
+
 // Messages ride in the header rather than the body, so the one thing that can
 // go wrong is EncodeResponse or DecodeResponse forgetting the field — which
 // costs nothing at compile time and delivers an empty recv at runtime.

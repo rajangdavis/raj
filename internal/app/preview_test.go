@@ -91,7 +91,7 @@ func TestExplorerEnterCommitsThePreview(t *testing.T) {
 // drops it while keeping one tab.
 func TestPreviewFileAdoptsAHeadlessPane(t *testing.T) {
 	h := newWorkspace(t, 120, 20)
-	target := filepath.Join(h.root, "main.go")
+	target := filepath.Join(h.primaryRoot(), "main.go")
 	p, err := h.loadHeadless(target)
 	if err != nil {
 		t.Fatalf("loadHeadless: %v", err)
@@ -111,7 +111,7 @@ func TestPreviewFileAdoptsAHeadlessPane(t *testing.T) {
 	}
 
 	// The next preview takes the slot; the adopted pane must be dropped.
-	h.previewFile(filepath.Join(h.root, "README.md"))
+	h.previewFile(filepath.Join(h.primaryRoot(), "README.md"))
 	if h.Tabs.Count() != 1 {
 		t.Fatalf("a second preview left %d tabs, want 1", h.Tabs.Count())
 	}

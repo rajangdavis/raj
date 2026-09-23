@@ -51,6 +51,15 @@ type Client struct {
 	// caller that forgot one would send an unmapped path that the editor
 	// refuses for a reason unrelated to what went wrong.
 	paths Mapper
+	// roots is the workspace root set the peer last reported, learned from
+	// every reply (ping and buffers carry one; any other op clears it) and
+	// translated into this process's spelling. An attach client adopts it as
+	// its visible workspace, so the tree and search show the daemon's roots
+	// rather than the directory the client was launched in; the app keeps its
+	// own copy, so a cleared cache does not unset the view. rootsMu guards it:
+	// the watch goroutine reads replies while the caller may ask for the set.
+	roots   []string
+	rootsMu sync.Mutex
 	// readTimeout replaces answerBudget for this connection when non-zero.
 	// It is a test seam: production leaves it zero, so the shipped wait is the
 	// const, while a test can prove a silent peer is caught in milliseconds.
@@ -170,6 +179,40 @@ func (c *Client) SetMapper(m Mapper) { c.paths = m }
 // Mapper is the translation in force, for a caller that wants to report it.
 func (c *Client) Mapper() Mapper { return c.paths }
 
+// Roots is the workspace root set the peer last reported, in this process's
+// spelling and primary-first order. It is nil before any reply has carried one
+// and nil again after a reply that names none, which is what an old server
+// always sends: a caller reads nil as "the current peer named no set" and keeps
+// its own root. The record is per-reply rather than sticky so it cannot claim a
+// workspace the current peer never reported; the attached app holds its own
+// adopted copy through adoptVisibleRoots, so this cache going empty is safe.
+func (c *Client) Roots() []string {
+	c.rootsMu.Lock()
+	defer c.rootsMu.Unlock()
+	if len(c.roots) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.roots))
+	copy(out, c.roots)
+	return out
+}
+
+// setRoots records the set a reply named, or clears the record when the reply
+// names none. A set-less frame is a statement that the current peer has no set
+// to report, not an omission to paper over: keeping an older set would let
+// Roots name a workspace this peer never sent. The attached app keeps its own
+// adopted copy (adoptVisibleRoots), so clearing here cannot unset the visible
+// workspace.
+func (c *Client) setRoots(roots []string) {
+	c.rootsMu.Lock()
+	if len(roots) == 0 {
+		c.roots = nil
+	} else {
+		c.roots = append(c.roots[:0], roots...)
+	}
+	c.rootsMu.Unlock()
+}
+
 // ResolveRoots settles how paths should be translated for this connection, and
 // returns the mapping it chose.
 //
@@ -180,9 +223,10 @@ func (c *Client) Mapper() Mapper { return c.paths }
 // a shared filesystem is how `raj ctl read /Users/x/proj/a.go`, run from the
 // home directory above it, becomes a path with the project name in it twice.
 //
-// Over TCP it asks the editor for its root and checks whether that path exists
-// here. If it does, nothing is rewritten. If it does not, this process is
-// somewhere else — a container — and its own workspace root stands in.
+// Over TCP it asks the editor for its root set and checks whether any root
+// exists here. If one does, nothing is rewritten. If none does, this process is
+// somewhere else — a container — and its own workspace root stands in for the
+// one editor root that can be inferred; a second mount needs RAJ_ROOT_MAP.
 //
 // One round trip, on a connection that is about to make several anyway.
 func (c *Client) ResolveRoots(cwd string) (Mapper, error) {
@@ -201,7 +245,13 @@ func (c *Client) ResolveRoots(cwd string) (Mapper, error) {
 	if err != nil {
 		return Mapper{}, err
 	}
-	c.paths = inferMapper(cwd, res.Root)
+	// The whole set when the server sends one, so a multi-root daemon is mapped
+	// root by root; an older server sends only Root and is the one-root case.
+	roots := res.Roots
+	if len(roots) == 0 && res.Root != "" {
+		roots = []string{res.Root}
+	}
+	c.paths = inferMapper(cwd, roots)
 	return c.paths, nil
 }
 
@@ -373,7 +423,13 @@ func (c *Client) collectAll(id int, onBatch func([]SearchMatch),
 			c.author.Store(uint32(res.Author))
 		}
 		c.localise(&res)
+		// Every reply is authoritative about the set the peer names now: a
+		// frame with no set clears the record rather than leaving a stale one,
+		// and the attached app keeps its own adopted copy (adoptVisibleRoots)
+		// so clearing the wire cache never unsets the visible workspace.
+		c.setRoots(res.Roots)
 		if res.ID != id {
+
 			// A cancel's own acknowledgement, or a reply to something else.
 			// Ignore rather than fail: ids are how frames are matched.
 			continue
@@ -407,7 +463,15 @@ func (c *Client) localise(res *Response) {
 		return
 	}
 	res.Root = c.paths.FromEditor(res.Root)
+	// Each root is rebased too, so an attach client adopts the daemon's roots
+	// in its own spelling and containment works across a container boundary. A
+	// daemon root with no local counterpart is left as the daemon spelled it
+	// rather than dropped: the client renders it best-effort.
+	for i := range res.Roots {
+		res.Roots[i] = c.paths.FromEditor(res.Roots[i])
+	}
 	if res.SnapshotPath != "" {
+
 		res.SnapshotPath = c.paths.FromEditor(res.SnapshotPath)
 	}
 	for i := range res.Buffers {
@@ -490,14 +554,22 @@ func (c *Client) localise(res *Response) {
 	res.Err = c.localiseErr(res.Err)
 }
 
-// localiseErr rewrites the editor root wherever it appears as a whole path
+// localiseErr rewrites each editor root wherever it appears as a whole path
 // prefix in a message, leaving every other byte of the prose intact. Only call
-// it with an active mapper: it assumes Editor and Local are distinct.
+// it with an active mapper: it assumes every pair's sides are distinct.
 func (c *Client) localiseErr(s string) string {
-	root := c.paths.Editor
-	if root == "" {
-		return s
+	for _, p := range c.paths.pairs {
+		if p.Editor == "" || p.Local == "" || p.Editor == p.Local {
+			continue
+		}
+		s = replaceRootPrefix(s, p.Editor, p.Local)
 	}
+	return s
+}
+
+// replaceRootPrefix rewrites root in s to repl wherever root stands as a whole
+// path prefix, leaving every other byte alone.
+func replaceRootPrefix(s, root, repl string) string {
 	var b strings.Builder
 	for {
 		i := strings.Index(s, root)
@@ -511,7 +583,7 @@ func (c *Client) localiseErr(s string) string {
 		// that cannot extend a path name; anything else means the root is only
 		// a character prefix of a longer sibling name.
 		if end == len(s) || s[end] == '/' || !pathByte(s[end]) {
-			b.WriteString(c.paths.Local)
+			b.WriteString(repl)
 		} else {
 			b.WriteString(s[i:end])
 		}

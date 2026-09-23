@@ -89,7 +89,7 @@ func TestQuitSavesAllDirtyTabs(t *testing.T) {
 	first := h.Pane().File.Path
 	h.typeText("A")
 
-	second := filepath.Join(h.root, "second.go")
+	second := filepath.Join(h.primaryRoot(), "second.go")
 	if err := os.WriteFile(second, []byte("two"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestQuitChainsIntoSaveAsAndCancellingAbortsTheQuit(t *testing.T) {
 	if !h.quit {
 		t.Fatal("did not quit after a successful save")
 	}
-	data, err := os.ReadFile(filepath.Join(h.root, "kept.txt"))
+	data, err := os.ReadFile(filepath.Join(h.primaryRoot(), "kept.txt"))
 	if err != nil {
 		t.Fatalf("file not written: %v", err)
 	}

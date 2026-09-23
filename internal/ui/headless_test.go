@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -67,4 +68,45 @@ func TestNewHeadlessHostSize(t *testing.T) {
 	if cols, rows := h.Size(); cols != HeadlessCols || rows != HeadlessRows {
 		t.Errorf("Size = %d,%d, want %d,%d", cols, rows, HeadlessCols, HeadlessRows)
 	}
+}
+
+// Post after Close must be dropped, not panic on the closed events channel: the
+// Host contract says Post is safe from any goroutine, including one that races
+// a shutdown.
+func TestHeadlessHostPostAfterCloseIsDropped(t *testing.T) {
+	h := newHeadlessHost(80, 24, time.Hour)
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	h.Post(Wake{}) // must not panic on the closed channel
+	if _, ok := <-h.Events(); ok {
+		t.Error("an event posted after Close was delivered")
+	}
+}
+
+// A Post from a background goroutine racing Close must not panic either: emit
+// and Close serialise on the same mutex, so a send cannot land on the closed
+// channel. Run under -race, this also pins the send/close ordering.
+func TestHeadlessHostPostRacesClose(t *testing.T) {
+	h := newHeadlessHost(80, 24, time.Hour)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					h.Post(Wake{})
+				}
+			}
+		})
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	close(stop)
+	wg.Wait()
 }

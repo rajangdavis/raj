@@ -22,14 +22,28 @@ import (
 // directory is os.ReadDir's error, so ls of a file is refused rather than read
 // as an empty directory.
 func (h host) Ls(path string, all bool) ([]control.Entry, error) {
+	if path == "" {
+		// No path names the workspace itself. One root means its immediate
+		// children, exactly as before; several means one top-level entry per
+		// root, in supplied order, so every root is visible and none is
+		// mistaken for the primary's contents.
+		if h.a.visible.Len() > 1 {
+			return h.rootEntries(), nil
+		}
+		path = h.a.visible.Primary()
+	}
 	dir := h.canonicalPath(path)
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 	// all is the -hidden switch: Everything() hides nothing, where the loaded
-	// rules are the defaults plus the user's and workspace's configuration.
-	rules := hidden.Load(h.a.root)
+	// rules are the defaults plus the user's and the workspace's configuration.
+	// The workspace config is one file per root set (hidden.WorkspaceFile), so
+	// it is loaded from the whole set; root still names the root the directory
+	// lives under, for making paths relative to it.
+	root := h.a.rootFor(dir)
+	rules := hidden.Load(h.a.visible.All())
 	if all {
 		rules = hidden.Everything()
 	}
@@ -38,7 +52,7 @@ func (h host) Ls(path string, all bool) ([]control.Entry, error) {
 		name := d.Name()
 		full := filepath.Join(dir, name)
 		isDir := d.IsDir()
-		if rules.HiddenPath(h.a.root, full, isDir) {
+		if rules.HiddenPath(root, full, isDir) {
 			continue
 		}
 		e := control.Entry{Name: name, Path: full, Dir: isDir}
@@ -59,6 +73,27 @@ func (h host) Ls(path string, all bool) ([]control.Entry, error) {
 	return out, nil
 }
 
+// rootEntries lists the workspace roots as directory entries, one per root in
+// supplied order (the primary first). A root is named by its base name when
+// that name is unique in the set, and by its absolute path when two roots share
+// one, so two directories called "app" stay distinguishable rather than being
+// merged or silently renamed.
+func (h host) rootEntries() []control.Entry {
+	roots := h.a.visible.All()
+	out := make([]control.Entry, 0, len(roots))
+	for i, r := range roots {
+		name := filepath.Base(r)
+		for j, other := range roots {
+			if j != i && filepath.Base(other) == name {
+				name = r
+				break
+			}
+		}
+		out = append(out, control.Entry{Name: name, Path: r, Dir: true})
+	}
+	return out
+}
+
 // SearchHidden is the -hidden switch's walk: it reaches .git, node_modules and
 // vendor where the default refuses to descend, by running the same walk as
 // Search with the hidden policy dropped. The control layer's guardedSearcher
@@ -77,11 +112,11 @@ func (s snapshotSearcher) SearchHidden(ctx context.Context, q control.SearchQuer
 // what stops them drifting apart.
 func (s snapshotSearcher) runSearch(ctx context.Context, q control.SearchQuery,
 	rules *hidden.Rules, emit func([]control.SearchMatch)) (int, int, bool, []control.TruncatedFile, error) {
-	root, err := s.walkRoot(q.Path)
+	roots, err := s.walkRoots(q.Path)
 	if err != nil {
 		return 0, 0, false, nil, err
 	}
-	res := search.RunStreamVersioned(ctx, root, search.Query{
+	res := search.RunStreamRoots(ctx, roots, search.Query{
 		Text: q.Text, Include: q.Include, Exclude: q.Exclude,
 		Regex: q.Regex, Case: q.Case, Word: q.Word,
 		Hidden: rules, Context: q.Context,

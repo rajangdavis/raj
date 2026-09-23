@@ -81,8 +81,13 @@ type CodeAction struct {
 
 // Picker is the floating quick-open overlay.
 type Picker struct {
-	Root string
-	Open bool
+	// Roots is the workspace root set the picker indexes, in supplied order.
+	// Every row shows its path relative to the root it was found under, and
+	// choosing it resolves back to that same root, so a file under the second
+	// root opens as itself rather than under the first. NewRoots copies the
+	// slice.
+	Roots []string
+	Open  bool
 	// Tall draws each result row two screen rows high, for a touch surface.
 	// The hit test divides by the same row height, so a tap anywhere in a row
 	// chooses what is drawn there.
@@ -131,7 +136,11 @@ type Position struct{ Line, Col int }
 // against; line is where choosing it goes and is zero for a file, and action
 // is the command a Commands row runs.
 type entry struct {
-	label  string
+	label string
+	// root is the workspace root label is relative to, so choosing the row
+	// resolves back to the root it was found under. It is empty for the modes
+	// whose rows name their own path or hold one file.
+	root   string
 	line   int
 	col    int
 	action keys.Action
@@ -150,11 +159,30 @@ type scored struct {
 	hits  []int // byte offsets in the label that matched, for highlighting
 }
 
-// New builds a picker rooted at a directory.
+// New builds a picker rooted at one directory. It is NewRoots for a single
+// root, so every existing caller and test is untouched.
 func New(root string) *Picker {
-	p := &Picker{Root: root, Hidden: hidden.Load(root)}
+	return NewRoots([]string{root})
+}
+
+// NewRoots builds a picker over a set of workspace roots. The index walks every
+// root and holds each path relative to the root it was found under, so the
+// quick-open list covers the whole workspace rather than the primary root
+// alone. The hidden policy is one config per root set (hidden.WorkspaceFile),
+// loaded from the whole set rather than a single root.
+func NewRoots(roots []string) *Picker {
+	p := &Picker{Roots: append([]string(nil), roots...), Hidden: hidden.Load(roots)}
 	p.input = widget.Input{Label: "Go to file"}
 	return p
+}
+
+// primaryRoot is the first root in supplied order, or "" when there is none. It
+// is the root the hidden policy is loaded from, matching the single-root picker.
+func primaryRoot(roots []string) string {
+	if len(roots) == 0 {
+		return ""
+	}
+	return roots[0]
 }
 
 // Show opens the file finder, reindexing so files created since last time
@@ -277,19 +305,32 @@ func (p *Picker) Hide() { p.Open = false }
 
 // Resolve turns an indexed path into one a caller can open.
 //
-// The index holds paths relative to Root because that is what the list shows
-// and what the fuzzy score ranks: an absolute prefix is the same bytes on every
-// entry, so it only dilutes the score and eats the width. But a relative path
-// handed to a caller is resolved against the process working directory, not
-// against the workspace — so `raj ~/code/thing` run from anywhere else opened a
-// blank buffer named after the file that was picked, silently, and saving it
-// would have written a new file next to wherever the shell happened to be. The
-// two representations both have to exist; the seam between them is here.
+// The index holds each path relative to the root it was found under because
+// that is what the list shows and what the fuzzy score ranks: an absolute
+// prefix is the same bytes on every entry, so it only dilutes the score and
+// eats the width. But a relative path handed to a caller is resolved against
+// the process working directory, not against the workspace — so
+// `raj ~/code/thing` run from anywhere else opened a blank buffer named after
+// the file that was picked, silently, and saving it would have written a new
+// file next to wherever the shell happened to be. The two representations both
+// have to exist; the seam between them is here.
+//
+// A label that is in the index resolves against the root it was found under;
+// one that is not (a symbol path, or a caller's own label) falls back to the
+// primary root, which is the single-root answer unchanged.
 func (p *Picker) Resolve(rel string) string {
-	if rel == "" || p.Root == "" || filepath.IsAbs(rel) {
+	if rel == "" || filepath.IsAbs(rel) {
 		return rel
 	}
-	return filepath.Join(p.Root, rel)
+	for _, it := range p.items {
+		if it.label == rel && it.root != "" {
+			return filepath.Join(it.root, rel)
+		}
+	}
+	if root := primaryRoot(p.Roots); root != "" {
+		return filepath.Join(root, rel)
+	}
+	return rel
 }
 
 // rowHeight is how many screen rows one result occupies. The renderer and
@@ -310,9 +351,9 @@ func (p *Picker) Query() string { return p.input.Text }
 // Results is how many files match the query.
 func (p *Picker) Results() int { return len(p.shown) }
 
-// Files returns the indexed paths, relative to the root, in walk order. It is
+// Files returns the indexed paths, relative to their own root, in walk order. It is
 // the index itself rather than the filtered rows, so a caller can ask what the
-// picker can reach without going through a query.
+// picker can reach without going through a query, across every root.
 func (p *Picker) Files() []string {
 	out := make([]string, 0, len(p.items))
 	for _, it := range p.items {
@@ -395,7 +436,7 @@ func (p *Picker) PositionFor(chosen string) (Position, bool) {
 
 // pasteCandidates lists the forms of a pasted payload to try, most specific
 // first, without duplicates.
-func pasteCandidates(text, root string) []string {
+func pasteCandidates(text string, roots []string) []string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil
@@ -417,9 +458,17 @@ func pasteCandidates(text, root string) []string {
 	add(bare)
 	bare = strings.TrimPrefix(bare, "./")
 	add(bare)
-	if root != "" && filepath.IsAbs(bare) {
-		if rel, err := filepath.Rel(root, bare); err == nil && !strings.HasPrefix(rel, "..") {
-			add(rel)
+	if filepath.IsAbs(bare) {
+		// Roots are not nested, so at most one contains the path. Try each in
+		// supplied order and stop at the first that does.
+		for _, root := range roots {
+			if root == "" {
+				continue
+			}
+			if rel, err := filepath.Rel(root, bare); err == nil && !strings.HasPrefix(rel, "..") {
+				add(rel)
+				break
+			}
 		}
 	}
 	add(filepath.Base(bare))
@@ -511,33 +560,41 @@ func (p *Picker) choose(s scored) string {
 		p.pos, p.path = Position{Line: s.line}, p.file
 		return p.file
 	}
+	if s.root != "" {
+		return filepath.Join(s.root, s.label)
+	}
 	return p.Resolve(s.label)
 }
 
 func (p *Picker) index() {
 	p.items = p.items[:0]
-	filepath.WalkDir(p.Root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	for _, root := range p.Roots {
+		if len(p.items) >= MaxFiles {
+			break
 		}
-		if d.IsDir() {
-			if path != p.Root && p.Hidden.HiddenPath(p.Root, path, true) {
-				return filepath.SkipDir
+		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if path != root && p.Hidden.HiddenPath(root, path, true) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if p.Hidden.HiddenPath(root, path, false) {
+				return nil
+			}
+			if len(p.items) >= MaxFiles {
+				return filepath.SkipAll
+			}
+			rel, err := filepath.Rel(root, path)
+			if err == nil {
+				p.items = append(p.items, entry{label: rel, root: root})
 			}
 			return nil
-		}
-		if p.Hidden.HiddenPath(p.Root, path, false) {
-			return nil
-		}
-		if len(p.items) >= MaxFiles {
-			return filepath.SkipAll
-		}
-		rel, err := filepath.Rel(p.Root, path)
-		if err == nil {
-			p.items = append(p.items, entry{label: rel})
-		}
-		return nil
-	})
+		})
+	}
 }
 
 // filter rescores every row against the query. An empty query lists everything,
@@ -569,7 +626,7 @@ func (p *Picker) filter() {
 	// field is full and the list is empty, which reads as the paste having
 	// been ignored. Narrowing here works whichever way the bytes arrived.
 	_, line, col := splitPosition(q)
-	for _, cand := range pasteCandidates(q, p.Root) {
+	for _, cand := range pasteCandidates(q, p.Roots) {
 		if cand == q {
 			continue // already tried, and it is what we fall back to
 		}

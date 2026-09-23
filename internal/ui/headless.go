@@ -39,6 +39,8 @@ type HeadlessHost struct {
 
 	done    chan struct{}
 	stopped chan struct{}
+	mu      sync.Mutex
+	closed  bool
 	once    sync.Once
 }
 
@@ -82,7 +84,15 @@ func (h *HeadlessHost) tick(every time.Duration) {
 // emit posts an event without blocking the producer. The application loop is
 // the only consumer, and a full channel means it is busy; dropping a tick or a
 // wake costs at most one cadence of latency, and the next tick is coming.
+//
+// A post that races Close — a worker notifying a loop that is already gone —
+// is dropped rather than sent on the closed channel.
 func (h *HeadlessHost) emit(e Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
 	select {
 	case h.events <- e:
 	default:
@@ -115,7 +125,10 @@ func (h *HeadlessHost) Close() error {
 	h.once.Do(func() {
 		close(h.done)
 		<-h.stopped
+		h.mu.Lock()
+		h.closed = true
 		close(h.events)
+		h.mu.Unlock()
 	})
 	return nil
 }

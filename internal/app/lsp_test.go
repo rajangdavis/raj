@@ -3,10 +3,12 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"raj/internal/control"
 	"raj/internal/editor"
@@ -297,7 +299,7 @@ func TestDefinitionNotFound(t *testing.T) {
 // A language with no configured server is not an error, and neither is a file
 // type with no language at all.
 func TestServerSelection(t *testing.T) {
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	for _, path := range []string{"/w/notes.txt", "/w/Makefile", "/w/a.unknown", ""} {
 		ls, st := s.for_(path, nil)
 		if ls != nil || st != serverNone {
@@ -317,7 +319,7 @@ func TestMarkdownFileResolvesToRemark(t *testing.T) {
 	// started for real, and for_ still resolves the language. serverNone would
 	// mean no command was configured at all.
 	t.Setenv("PATH", "")
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	_, st := s.for_("/w/notes.md", nil)
 	if st == serverNone {
 		t.Fatal("a markdown file was reported as having no server configured")
@@ -605,7 +607,7 @@ func TestClientCapabilitiesAdvertiseInlayHints(t *testing.T) {
 
 // Stopping is safe with nothing started, and safe twice.
 func TestStopAllIsSafe(t *testing.T) {
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	s.stopAll()
 	s.stopAll()
 }
@@ -645,7 +647,7 @@ func TestMissingBinaryIsNamed(t *testing.T) {
 // symptom: the message said "no language server for this file" on a .go file,
 // which is the one thing that was not true.
 func TestGoFileIsNeverCalledUnsupported(t *testing.T) {
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	_, st := s.for_("/w/main.go", nil)
 	if st == serverNone {
 		t.Fatal("a Go file was reported as having no server configured")
@@ -660,7 +662,7 @@ func TestGoFileIsNeverCalledUnsupported(t *testing.T) {
 // names nothing the server can open.
 func TestDocumentPathsAreAbsolute(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 
 	if got := h.docPath(h.Pane()); !filepath.IsAbs(got) {
@@ -1090,10 +1092,10 @@ func TestSyncDirtyDocsNeverStartsAServer(t *testing.T) {
 	// The states a start leaves behind while the handshake is in flight or
 	// after a crash: an entry with no sync, and one whose sync has no live
 	// connection. Neither may be treated as live.
-	id := lsp.LanguageID(h.Pane().File.Path)
-	h.servers.byID[id] = &langServer{srv: &lsp.Server{}}
+	key := serverKey{root: h.servers.rootFor(h.Pane().File.Path), lang: lsp.LanguageID(h.Pane().File.Path)}
+	h.servers.byID[key] = &langServer{srv: &lsp.Server{}}
 	h.syncDirtyDocs()
-	h.servers.byID[id] = &langServer{srv: &lsp.Server{}, sync: lsp.NewSync(nil, lsp.SyncFull)}
+	h.servers.byID[key] = &langServer{srv: &lsp.Server{}, sync: lsp.NewSync(nil, lsp.SyncFull)}
 	h.syncDirtyDocs()
 }
 
@@ -1163,15 +1165,15 @@ func TestSaveAsWarmsTheLanguageServer(t *testing.T) {
 	if n := len(h.servers.byID); n != 1 {
 		t.Fatalf("the save-as registered %d server(s), want the go server started", n)
 	}
-	if _, ok := h.servers.byID["go"]; !ok {
+	if _, ok := h.servers.byID[serverKey{root: h.servers.rootFor(renamed), lang: "go"}]; !ok {
 		t.Errorf("servers = %v, want the go server for the renamed .go file", h.servers.byID)
 	}
 }
 
 // openLanguages is the distinct language ids of the open panes, in the order
-// they are first seen. WarmServers starts one server per language, so a nil
-// pane, an unnamed buffer and a file type with no language must not appear in
-// the list, and two files of one language must appear once.
+// they are first seen. WarmServers turns each into one server per distinct
+// root, so a nil pane, an unnamed buffer and a file type with no language must
+// not appear in the list, and two files of one language must appear once.
 func TestOpenLanguages(t *testing.T) {
 	pane := func(path string) *editor.Pane {
 		return &editor.Pane{File: &editor.File{Path: path}}
@@ -1209,7 +1211,7 @@ func TestOpenLanguages(t *testing.T) {
 // the pure helper above is where the language selection is pinned, and this
 // covers the empty case that must be a no-op.
 func TestWarmServersWithNoPanesStartsNothing(t *testing.T) {
-	a := &App{Tabs: tabs.New(2), servers: newServers("/w")}
+	a := &App{Tabs: tabs.New(2), servers: newServers([]string{"/w"})}
 	a.WarmServers()
 	if n := len(a.servers.byID); n != 0 {
 		t.Fatalf("WarmServers registered %d server(s) with no panes", n)
@@ -1467,7 +1469,7 @@ func TestResolvedCompletionDocumentationApplies(t *testing.T) {
 // server is an addition, not a replacement, so an untouched install keeps
 // gopls and a file type with no built-in and no override has none.
 func TestLSPCommandFallsBackToBuiltIn(t *testing.T) {
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	argv, ok := s.argvFor("go")
 	if !ok || len(argv) != 1 || argv[0] != "gopls" {
 		t.Errorf("argvFor(go) = %q, %v; want the built-in gopls", argv, ok)
@@ -1483,7 +1485,7 @@ func TestLSPCommandFallsBackToBuiltIn(t *testing.T) {
 // without starting anything.
 func TestLSPCommandOverrideReachesFor(t *testing.T) {
 	t.Setenv("PATH", "")
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	s.resolveCommand = func(id string) ([]string, bool) {
 		if id == "java" {
 			return []string{"jdtls", "--stdio"}, true
@@ -1503,12 +1505,194 @@ func TestLSPCommandOverrideReachesFor(t *testing.T) {
 // reaches the spawn attempt.
 func TestLSPCommandDisabledReportsNone(t *testing.T) {
 	t.Setenv("PATH", "")
-	s := newServers("/w")
+	s := newServers([]string{"/w"})
 	s.resolveCommand = func(id string) ([]string, bool) { return nil, false }
 	if _, st := s.for_("/w/a.py", nil); st != serverNone {
 		t.Errorf("state = %d, want serverNone for a disabled server", st)
 	}
 	if n := len(s.byID); n != 0 {
 		t.Errorf("a disabled server registered %d entry(ies), want none", n)
+	}
+}
+
+// stubHandshakeGopls puts a fake gopls on PATH that completes the initialize
+// handshake and then stays alive, so for_ reaches the live state a real server
+// would and running/live can be observed. stubGopls exits before the handshake,
+// which is enough to read the registration but not liveness.
+func stubHandshakeGopls(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	body := `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}`
+	script := "#!/bin/sh\n" +
+		"body='" + body + "'\n" +
+		"printf 'Content-Length: %d\\r\\n\\r\\n%s' \"${#body}\" \"$body\"\n" +
+		"cat >/dev/null\n"
+	if err := os.WriteFile(filepath.Join(dir, "gopls"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// waitLiveServers waits for the handshakes for_ started to finish and returns
+// the server running for each path. A bounded poll is the only way to observe
+// the asynchronous start; the deadline fails the test rather than hanging it if
+// the stub never answers.
+func waitLiveServers(t *testing.T, h *harness, paths ...string) []*langServer {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out := make([]*langServer, len(paths))
+		ready := true
+		for i, p := range paths {
+			out[i] = h.servers.live(p)
+			if out[i] == nil {
+				ready = false
+			}
+		}
+		if ready {
+			return out
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("language server handshake did not complete: %v", out)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A file under the second root is served by a server started in that root. The
+// failure this pins: servers held one workspace root, so a file under root2 was
+// answered by a server whose working directory and workspace URI were root1's.
+func TestServerRootFollowsTheFilePath(t *testing.T) {
+	stubGopls(t)
+	h, _, rootB := newRootsHarness(t)
+	path := filepath.Join(rootB, "b.go")
+	if _, st := h.servers.for_(path, func() {}); st != serverStarting {
+		t.Fatalf("for_(%s) state = %d, want serverStarting", path, st)
+	}
+	ls := h.servers.byID[serverKey{root: rootB, lang: "go"}]
+	if ls == nil {
+		t.Fatalf("no server keyed by root2; servers = %v", h.servers.byID)
+	}
+	if ls.srv.Dir != rootB {
+		t.Errorf("server Dir = %q, want root2 %q", ls.srv.Dir, rootB)
+	}
+	if ls.root != rootB {
+		t.Errorf("server root = %q, want root2 %q", ls.root, rootB)
+	}
+}
+
+// Two roots with a Go file each get two Go servers, and running/live find the
+// one for their own root. The failure this pins: a single byID["go"] handed the
+// file under root2 root1's server, so root2's diagnostics, hints and hovers
+// were answered from the wrong workspace.
+func TestServersArePerRootForRunningAndLive(t *testing.T) {
+	stubHandshakeGopls(t)
+	h, rootA, rootB := newRootsHarness(t)
+	t.Cleanup(h.servers.stopAll)
+	pathA := filepath.Join(rootA, "a.go")
+	pathB := filepath.Join(rootB, "b.go")
+	h.servers.for_(pathA, func() {})
+	h.servers.for_(pathB, func() {})
+
+	live := waitLiveServers(t, h, pathA, pathB)
+	lsA, lsB := live[0], live[1]
+	if lsA == lsB {
+		t.Fatal("one server was reused for two roots")
+	}
+	if lsA.srv.Dir != rootA {
+		t.Errorf("root1 server Dir = %q, want %q", lsA.srv.Dir, rootA)
+	}
+	if lsB.srv.Dir != rootB {
+		t.Errorf("root2 server Dir = %q, want %q", lsB.srv.Dir, rootB)
+	}
+	if got := h.servers.running(pathA); got != lsA {
+		t.Errorf("running(root1) = %p, want root1's server %p", got, lsA)
+	}
+	if got := h.servers.running(pathB); got != lsB {
+		t.Errorf("running(root2) = %p, want root2's server %p", got, lsB)
+	}
+	if n := len(h.servers.byID); n != 2 {
+		t.Errorf("registered %d servers, want one per (root, language)", n)
+	}
+}
+
+// stopAll reaches every root's server, not just the primary's. The failure this
+// pins: quitting stopped the root1 server and left root2's subprocess running.
+func TestStopAllStopsEveryRoot(t *testing.T) {
+	stubHandshakeGopls(t)
+	h, rootA, rootB := newRootsHarness(t)
+	t.Cleanup(h.servers.stopAll)
+	pathA := filepath.Join(rootA, "a.go")
+	pathB := filepath.Join(rootB, "b.go")
+	h.servers.for_(pathA, func() {})
+	h.servers.for_(pathB, func() {})
+
+	live := waitLiveServers(t, h, pathA, pathB)
+	h.servers.stopAll()
+
+	if n := len(h.servers.byID); n != 0 {
+		t.Errorf("stopAll left %d entr(ies) in the table", n)
+	}
+	for i, ls := range live {
+		// A stopped server refuses a further start, which is the observable
+		// half of "this process is not coming back".
+		if _, err := ls.srv.Start(context.Background(), "file:///x", nil); !errors.Is(err, lsp.ErrClosed) {
+			t.Errorf("server %d started after stopAll: err = %v, want ErrClosed", i, err)
+		}
+	}
+}
+
+// WarmServers starts one server per (language, root). A two-root launch with a
+// Go file in each must start two Go servers, while a second Go file under the
+// same root shares the first. The failure this pins: the warm path took any one
+// path of the language, so only the primary root got a server.
+func TestWarmServersStartsOnePerLanguagePerRoot(t *testing.T) {
+	stubGopls(t)
+	h, rootA, rootB := newRootsHarness(t)
+	extra := filepath.Join(rootA, "a2.go")
+	if err := os.WriteFile(extra, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(filepath.Join(rootA, "a.go"))
+	h.OpenFile(extra)
+	h.OpenFile(filepath.Join(rootB, "b.go"))
+
+	h.WarmServers()
+
+	if n := len(h.servers.byID); n != 2 {
+		t.Fatalf("WarmServers registered %d servers, want one per (language, root); servers = %v", n, h.servers.byID)
+	}
+	for _, root := range []string{rootA, rootB} {
+		ls := h.servers.byID[serverKey{root: root, lang: "go"}]
+		if ls == nil {
+			t.Errorf("no Go server for root %q", root)
+			continue
+		}
+		if ls.srv.Dir != root {
+			t.Errorf("server for %q has Dir %q, want its own root", root, ls.srv.Dir)
+		}
+	}
+}
+
+// One root keeps the old behaviour exactly: one server per language, with that
+// root as the working directory, however many files of the language are open.
+func TestWarmServersSingleRootIsOneServerPerLanguage(t *testing.T) {
+	stubGopls(t)
+	h := newWorkspace(t, 120, 30)
+	root := h.primaryRoot()
+	h.OpenFile(filepath.Join(root, "main.go"))
+	h.OpenFile(filepath.Join(root, "pkg", "helper.go"))
+
+	h.WarmServers()
+
+	if n := len(h.servers.byID); n != 1 {
+		t.Fatalf("WarmServers registered %d servers for one root, want 1", n)
+	}
+	ls := h.servers.byID[serverKey{root: root, lang: "go"}]
+	if ls == nil {
+		t.Fatalf("servers = %v, want the go server keyed by the one root", h.servers.byID)
+	}
+	if ls.srv.Dir != root {
+		t.Errorf("server Dir = %q, want the one root %q", ls.srv.Dir, root)
 	}
 }

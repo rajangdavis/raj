@@ -1,11 +1,16 @@
 package app
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"raj/internal/control"
+	"raj/internal/editor"
+	"raj/internal/session"
 	"raj/internal/ui"
 )
 
@@ -264,5 +269,352 @@ func TestClientDotOnNarrowBar(t *testing.T) {
 	ch.cli.Draw()
 	if top := ch.cli.host.Last().Row(ch.cli.drawerHandle.y); !strings.Contains(top, "hi") {
 		t.Errorf("status row = %q, want the status", top)
+	}
+}
+
+// sameStrings reports whether two root lists are equal in order.
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// scriptedAttach starts an app attached through a scripted daemon connection
+// that reports roots (nil for an old server), so a test can drive the attach
+// handshake without a real server. launch is the client's own root.
+func scriptedAttach(t *testing.T, launch string, roots []string) *App {
+	t.Helper()
+	conn := newScriptedConn(1, nil, nil)
+	conn.roots = roots
+	setClientDial(t, func(string) (clientConn, error) { return conn, nil })
+	host := ui.NewFakeHost(120, 30)
+	t.Cleanup(func() { host.Close() })
+	a := NewWithOptions(host, launch, Options{Attach: true, AttachAddr: "scripted"})
+	t.Cleanup(a.CloseClient)
+	a.StartClient()
+	return a
+}
+
+// An attach adopts the daemon's workspace: the explorer, search and containment
+// render the daemon's roots, not the directory the client was launched in. The
+// failure mode this pins: the client showed its launch directory's tree while
+// attached to a daemon serving two other roots.
+func TestAttachAdoptsDaemonRoots(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	launch := t.TempDir()
+	a := scriptedAttach(t, launch, []string{rootA, rootB})
+
+	if got := a.visible.All(); !sameStrings(got, []string{rootA, rootB}) {
+		t.Errorf("visible roots = %q, want the daemon's %q", got, []string{rootA, rootB})
+	}
+	if got := a.Explorer.Tree.Roots; !sameStrings(got, []string{rootA, rootB}) {
+		t.Errorf("explorer roots = %q, want the daemon's %q", got, []string{rootA, rootB})
+	}
+	if got := a.Search.Roots; !sameStrings(got, []string{rootA, rootB}) {
+		t.Errorf("search roots = %q, want the daemon's %q", got, []string{rootA, rootB})
+	}
+	// The view roots — the store key — are still the client's launch root.
+	if got := a.roots.All(); !sameStrings(got, []string{launch}) {
+		t.Errorf("view roots = %q, want the launch root %q", got, launch)
+	}
+	if !a.visible.Contains(filepath.Join(rootB, "b.go")) {
+		t.Error("a daemon root is not contained by the visible workspace")
+	}
+}
+
+// The view store stays put: the client's saved tabs are keyed by the roots it
+// was launched with, not the daemon's. The failure mode this pins: moving the
+// store under the daemon's state dir would have two processes open one SQLite
+// database.
+func TestAttachViewStoreStaysKeyedByLaunchRoots(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	launch := t.TempDir()
+	scriptedAttach(t, launch, []string{rootA, rootB})
+
+	launchDir := session.StateDirForRoots([]string{launch})
+	daemonDir := session.StateDirForRoots([]string{rootA, rootB})
+	if launchDir == daemonDir {
+		t.Fatal("fixture: the launch and daemon state dirs collide")
+	}
+	if _, err := os.Stat(filepath.Join(launchDir, "state.db")); err != nil {
+		t.Errorf("the store is not at the launch-root state dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(daemonDir, "state.db")); err == nil {
+		t.Error("the client opened the daemon's state database")
+	}
+}
+
+// An old server reports only Root and no root set, so the client keeps the
+// launch-root workspace exactly as before. The failure mode: adopting an empty
+// set would root the explorer at nothing.
+func TestAttachOldServerKeepsLaunchRoots(t *testing.T) {
+	launch := t.TempDir()
+	a := scriptedAttach(t, launch, nil)
+
+	if got := a.visible.All(); !sameStrings(got, []string{launch}) {
+		t.Errorf("visible roots = %q, want the launch root %q", got, launch)
+	}
+	if got := a.Explorer.Tree.Roots; !sameStrings(got, []string{launch}) {
+		t.Errorf("explorer roots = %q, want the launch root %q", got, launch)
+	}
+}
+
+// recordingConn is the decision connection a forwarded local edit talks to. It
+// records the verbs, answers a claim with any scripted overlap and a who list,
+// and advances the version on apply, so a test can assert the span, the base and
+// the adopted version without a real daemon.
+type recordingConn struct {
+	mu       sync.Mutex
+	applied  []control.Request
+	version  uint64
+	overlaps []control.ClaimOverlap
+	who      []control.Participant
+}
+
+func (r *recordingConn) Do(req control.Request) (control.Response, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch req.Op {
+	case "claim":
+		return control.Response{OK: true, ClaimOverlaps: r.overlaps}, nil
+	case "who":
+		return control.Response{OK: true, Participants: r.who}, nil
+	case "version":
+		return control.Response{OK: true, Version: r.version}, nil
+	case "apply":
+		r.applied = append(r.applied, req)
+		r.version++
+		return control.Response{OK: true, Version: r.version}, nil
+	default:
+		return control.Response{OK: true}, nil
+	}
+}
+
+func (r *recordingConn) ResolveRoots(string) (control.Mapper, error) { return control.Mapper{}, nil }
+func (r *recordingConn) Roots() []string                             { return nil }
+func (r *recordingConn) Close() error                                { return nil }
+
+func (r *recordingConn) lastApply() (control.Request, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.applied) == 0 {
+		return control.Request{}, false
+	}
+	return r.applied[len(r.applied)-1], true
+}
+
+// useDecide swaps the client's decision connection for a scripted one, so a
+// forward a test triggers does not reach the real daemon.
+func useDecide(t *testing.T, ch *clientHarness, c clientConn) {
+	t.Helper()
+	ch.cli.clientConnMu.Lock()
+	old := ch.cli.clientDecide
+	ch.cli.clientDecide = c
+	ch.cli.clientConnMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
+// fastClientForward shortens the forward debounce for one test. It is restored
+// on cleanup, after the test has waited for forwarding to settle.
+func fastClientForward(t *testing.T) {
+	t.Helper()
+	prev := clientForwardDebounce
+	clientForwardDebounce = time.Millisecond
+	t.Cleanup(func() { clientForwardDebounce = prev })
+}
+
+// waitClientIdle blocks until no forward is pending or running for path, so a
+// test does not tear down the host under a live forward goroutine.
+func waitClientIdle(t *testing.T, a *App, path string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		if !a.clientEditBusy(path) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("forwarding did not settle")
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Review is the only read-only state: a client that leaves it is a normal
+// editor, so a typed rune lands locally (and is forwarded) instead of being
+// refused. The precondition is asserted before the action so a passing test
+// cannot be the wrong mode.
+func TestAttachedClientEditsOutsideReview(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	fastClientForward(t)
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	path := p.File.Path
+	useDecide(t, ch, &recordingConn{})
+
+	if ch.cli.mode != ModeReview {
+		t.Fatalf("mode = %v, want Review", ch.cli.mode)
+	}
+	ch.cli.focusEditor()
+	before := p.File.Text()
+	ch.cli.typeText("x")
+	if p.File.Text() != before {
+		t.Errorf("Review accepted an edit: %q", p.File.Text())
+	}
+	if ch.cli.status == "" {
+		t.Error("a Review refusal set no status")
+	}
+
+	ch.cli.mode = ModeEdit
+	ch.cli.focusEditor()
+	p.Cursors.Set(0, 0)
+	ch.cli.typeText("x")
+	if !strings.Contains(p.File.Text(), "x") {
+		t.Errorf("an editable client refused a typed rune: %q", p.File.Text())
+	}
+	waitClientIdle(t, ch.cli.App, path)
+}
+
+// A local edit forwards exactly one apply on the decision connection, against
+// the version the pane was synced from and with the changed span alone. The
+// reply's version is adopted as the new base so the next edit rebases on it.
+func TestClientLocalEditForwardsOneApply(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	fastClientForward(t)
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	path := p.File.Path
+
+	ch.cli.clientMu.Lock()
+	base := ch.cli.clientEdits[path].version
+	ch.cli.clientMu.Unlock()
+
+	conn := &recordingConn{version: base}
+	useDecide(t, ch, conn)
+
+	ch.cli.mode = ModeEdit
+	ch.cli.focusEditor()
+	p.Cursors.Set(0, 0)
+	ch.cli.typeText("X")
+
+	deadline := time.After(3 * time.Second)
+	var req control.Request
+	for {
+		if r, ok := conn.lastApply(); ok {
+			req = r
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("no apply was forwarded for the local edit")
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if req.Base == nil || *req.Base != base {
+		t.Errorf("apply base = %v, want %d", req.Base, base)
+	}
+	if len(req.Hunks) != 1 {
+		t.Fatalf("hunks = %+v, want one", req.Hunks)
+	}
+	if h := req.Hunks[0]; h.Start != 0 || h.End != 0 || h.Text != "X" {
+		t.Errorf("hunk = %+v, want an insert of X at 0", h)
+	}
+	// Wait for the adopted version, which the forward records off-thread.
+	deadline = time.After(3 * time.Second)
+	for {
+		ch.cli.clientMu.Lock()
+		got := ch.cli.clientEdits[path].version
+		ch.cli.clientMu.Unlock()
+		if got > base {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("adopted version = %d, want past the base %d", got, base)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waitClientIdle(t, ch.cli.App, path)
+}
+
+// A watch snapshot must not replace a pane whose local edit has not been
+// acknowledged; once the edit is forwarded and the pane is clean the same
+// snapshot installs.
+func TestClientWatchSkipsDirtyPane(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	path := p.File.Path
+	before := p.File.Text()
+
+	ch.cli.clientMu.Lock()
+	ch.cli.clientEdits[path].dirty = true
+	ch.cli.clientMu.Unlock()
+
+	if got := ch.cli.installClientFile(clientFile{path: path, file: editor.NewFile(path, "replaced\n", 4)}); got != nil {
+		t.Error("a dirty pane was replaced by a daemon snapshot")
+	}
+	if p.File.Text() != before {
+		t.Errorf("dirty pane text = %q, want unchanged", p.File.Text())
+	}
+
+	ch.cli.clientMu.Lock()
+	ch.cli.clientEdits[path].dirty = false
+	ch.cli.clientMu.Unlock()
+
+	if got := ch.cli.installClientFile(clientFile{path: path, file: editor.NewFile(path, "replaced\n", 4)}); got == nil {
+		t.Error("a clean pane was not replaced by the daemon snapshot")
+	}
+	if p.File.Text() != "replaced\n" {
+		t.Errorf("clean pane text = %q, want the snapshot text", p.File.Text())
+	}
+}
+
+// A claim overlap with another writer who is an agent becomes the short status
+// warning. The kind comes from the who list, not the author id, so a second
+// human above the agent base is not misreported.
+func TestClientClaimOverlapNotesAnAgent(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	path := p.File.Path
+
+	conn := &recordingConn{
+		overlaps: []control.ClaimOverlap{{Path: path, Identity: "claude", Author: 9}},
+		who:      []control.Participant{{ID: 9, Identity: "claude", Name: "claude", Kind: control.KindAgent}},
+	}
+	useDecide(t, ch, conn)
+
+	text := p.File.Text()
+	ch.cli.forwardApply(path, 1, text, text)
+
+	ch.cli.clientMu.Lock()
+	note := ch.cli.clientNote
+	ch.cli.clientMu.Unlock()
+	if !strings.Contains(note, "agent claude has claimed") {
+		t.Errorf("note = %q, want the agent overlap warning", note)
 	}
 }

@@ -728,7 +728,7 @@ func move(h *harness, col, row int) {
 // notesPane points the harness at a file type with no language server, so an
 // idle tick in a tooltip test cannot start a real one.
 func notesPane(h *harness) {
-	h.Pane().File.Path = h.root + "/notes.txt"
+	h.Pane().File.Path = h.primaryRoot() + "/notes.txt"
 	h.Draw()
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"raj/internal/hidden"
 	"raj/internal/session"
 	"raj/internal/store"
 	"raj/internal/ui"
@@ -19,7 +20,7 @@ import (
 func storedSession(t *testing.T, a *App) session.State {
 	t.Helper()
 	if a.state == nil {
-		return session.Load(a.root)
+		return session.Load(a.primaryRoot())
 	}
 	blob, ok, err := a.state.Session()
 	if err != nil {
@@ -28,7 +29,7 @@ func storedSession(t *testing.T, a *App) session.State {
 	if !ok {
 		return session.State{}
 	}
-	return session.Decode(blob, a.root)
+	return session.Decode(blob, a.primaryRoot())
 }
 
 // The whole point, end to end: leave a workspace somewhere, come back, land
@@ -163,8 +164,10 @@ func TestLegacySessionJSONMigratesToTheStore(t *testing.T) {
 
 // The workspace's state lives in the XDG state dir now, so the first run of a
 // build that keeps it there moves the legacy .raj database and op logs across.
-// .raj/hidden is workspace config, not state, and stays put.
+// .raj/hidden is workspace config, not state: migrateState leaves it alone, and
+// the separate config migration copies it to XDG while leaving it in place.
 func TestLegacyStateMovesToStateDir(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	root := t.TempDir()
 	legacy := session.Dir(root)
 	if err := os.MkdirAll(filepath.Join(legacy, "logs"), 0o755); err != nil {
@@ -198,7 +201,7 @@ func TestLegacyStateMovesToStateDir(t *testing.T) {
 		}
 	}
 	if got, err := os.ReadFile(filepath.Join(legacy, "hidden")); err != nil || string(got) != "dist/\n" {
-		t.Errorf(".raj/hidden was touched: %q, err=%v", got, err)
+		t.Errorf("the legacy .raj/hidden was touched: %q, err=%v", got, err)
 	}
 }
 
@@ -217,7 +220,7 @@ func TestMigrateStateMovesDatabaseSidecars(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := migrateState(root); err != nil {
+	if err := migrateState([]string{root}); err != nil {
 		t.Fatalf("migrateState: %v", err)
 	}
 	stateDir := session.StateDir(root)
@@ -242,7 +245,7 @@ func TestMigrateStateLeavesOrphanSidecar(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(legacy, "state.db-wal"), []byte("orphan"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := migrateState(root); err != nil {
+	if err := migrateState([]string{root}); err != nil {
 		t.Fatalf("migrateState: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(session.StateDir(root), "state.db-wal")); !os.IsNotExist(err) {
@@ -286,6 +289,127 @@ func TestStateDirFailureDoesNotStopStartup(t *testing.T) {
 	}
 	if _, err := os.Stat(legacy); err != nil {
 		t.Errorf("a failed state setup moved the legacy database anyway: %v", err)
+	}
+}
+
+// The workspace hide file moved out of the project into XDG, so the first run
+// of a build that reads it there copies a legacy .raj/hidden into the workspace
+// file and leaves the legacy file where it was.
+func TestLegacyHiddenConfigMovesToXDG(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	root := t.TempDir()
+	legacy := filepath.Join(session.Dir(root), "hidden")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("dist/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateHiddenConfig([]string{root}); err != nil {
+		t.Fatalf("migrateHiddenConfig: %v", err)
+	}
+
+	dst := hidden.WorkspaceFile([]string{root})
+	if dst == "" {
+		t.Fatal("WorkspaceFile returned nothing")
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "dist/\n" {
+		t.Errorf("workspace file = %q, err=%v; want the copied config", got, err)
+	}
+	if got, err := os.ReadFile(legacy); err != nil || string(got) != "dist/\n" {
+		t.Errorf("legacy file was touched: %q, err=%v", got, err)
+	}
+}
+
+// A destination that already exists is never overwritten by a stale legacy
+// file: the workspace file the user is actually using wins.
+func TestLegacyHiddenConfigDoesNotOverwrite(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	root := t.TempDir()
+	legacy := filepath.Join(session.Dir(root), "hidden")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("legacy/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := hidden.WorkspaceFile([]string{root})
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("current/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateHiddenConfig([]string{root}); err != nil {
+		t.Fatalf("migrateHiddenConfig: %v", err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "current/\n" {
+		t.Errorf("workspace file = %q, err=%v; want it unchanged", got, err)
+	}
+}
+
+// A migration that cannot write its destination is not fatal: the editor still
+// starts, against whatever configuration it could read.
+func TestHiddenConfigMigrationFailureIsNotFatal(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	root := t.TempDir()
+	legacy := filepath.Join(session.Dir(root), "hidden")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("dist/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A regular file where the workspaces directory belongs makes MkdirAll
+	// fail, standing in for an unwritable config home.
+	if err := os.MkdirAll(filepath.Join(cfg, "raj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "raj", "workspaces"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	host := ui.NewFakeHost(80, 24)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, root, 2)
+	t.Cleanup(a.CloseState)
+	if a == nil {
+		t.Fatal("New returned nil")
+	}
+	if _, err := os.Stat(hidden.WorkspaceFile([]string{root})); err == nil {
+		t.Error("a failed config migration wrote a destination anyway")
+	}
+}
+
+// A fresh launch over a clean project must not create .raj in it: the workspace
+// config and the state both live outside the project now.
+func TestFreshLaunchLeavesProjectClean(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	root := t.TempDir()
+	f := filepath.Join(root, "a.go")
+	if err := os.WriteFile(f, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	host := ui.NewFakeHost(80, 24)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, root, 2)
+	t.Cleanup(a.CloseState)
+	a.OpenFile(f)
+	if err := a.SaveSession(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, ".raj")); !os.IsNotExist(err) {
+		t.Errorf("a fresh launch created .raj in the project: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(session.StateDir(root), "state.db")); err != nil {
+		t.Errorf("the saved state is not under the XDG state dir: %v", err)
 	}
 }
 

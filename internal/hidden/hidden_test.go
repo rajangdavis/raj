@@ -27,12 +27,12 @@ func TestDefaults(t *testing.T) {
 		// never asks, having skipped .git whole; a caller holding a path asks
 		// per component, and the ".git" component above answers.
 		{".git/config", false, false},
-		// .raj's scratch is the same kind of thing, but the directory itself
-		// is walked: only its scratch entries are hidden, so .raj/hidden (the
-		// user's configuration) stays reachable.
-		{".raj", true, false},
-		{".raj/logs", true, true},
-		{".raj/trash", true, true},
+		// .raj is hidden whole now: the workspace configuration it used to
+		// hold lives in XDG, so nothing inside it is repository content. An
+		// entry under it is judged as one entry and does not match the .raj
+		// rule; a walk never asks, having skipped .raj.
+		{".raj", true, true},
+		{".raj/logs", true, false},
 		{".raj/hidden", false, false},
 		{"node_modules", true, true},
 		{"vendor", true, true},
@@ -56,27 +56,25 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-// The editor's own state — the journal, trash and session under .raj — is
-// scratch, not repository content, so the defaults hide those entries. The .raj
-// directory itself is walked, because .raj/hidden is the user's own
-// configuration file and must stay reachable from the editor it configures.
+// .raj is the editor's scratch, and the workspace configuration that used to
+// live at .raj/hidden now lives outside the project, so the whole directory is
+// hidden. Nothing un-hides .raj/hidden: the legacy path is not special-cased.
 func TestRajesOwnStateIsHidden(t *testing.T) {
 	isolate(t)
 	r := Default()
-	if r.Hidden(".raj", true) {
-		t.Fatal(".raj itself is hidden, cutting off .raj/hidden")
+	if !r.Hidden(".raj", true) {
+		t.Fatal(".raj is not hidden")
 	}
-	if !r.Hidden(".raj/logs", true) || !r.Hidden(".raj/trash", true) || !r.Hidden(".raj/session", false) {
-		t.Error("a .raj scratch entry is not hidden")
-	}
-	if r.Hidden(".raj/hidden", false) {
-		t.Error(".raj/hidden is hidden, so the config file is unreachable")
+	for _, p := range r.Patterns() {
+		if strings.HasPrefix(p, "!") && strings.Contains(p, ".raj") {
+			t.Errorf("default un-hides %q; .raj must be hidden whole", p)
+		}
 	}
 	// Hidden judges one entry at a time, so a path into the directory is
 	// reached only by asking about each component in turn — which is what
 	// search's eligible does for a buffer the walk never visited. One of them
 	// has to answer, or the path is not hidden at all.
-	under := []string{".raj", "trash", "dead.go"}
+	under := []string{".raj", "hidden"}
 	hidden := false
 	for i := range under {
 		if r.Hidden(strings.Join(under[:i+1], "/"), i < len(under)-1) {
@@ -91,18 +89,6 @@ func TestRajesOwnStateIsHidden(t *testing.T) {
 	if !r.Hidden(".git", true) || !r.Hidden("node_modules", true) ||
 		r.Hidden(".github", true) || r.Hidden(".gitlab-ci.yml", false) {
 		t.Error("the other defaults changed")
-	}
-	// The user's hide-file lives inside the directory that is now hidden, and
-	// Load reads it by path rather than through a walk, so it still applies.
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".raj"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".raj", "hidden"), []byte("dist/\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if loaded := Load(dir); !loaded.Hidden("dist", true) {
-		t.Error("the workspace hide-file was not read once .raj was hidden")
 	}
 }
 
@@ -163,13 +149,21 @@ func TestBadPatternsAreReportedNotFatal(t *testing.T) {
 func TestLoadReadsWorkspaceFile(t *testing.T) {
 	isolate(t)
 	root := t.TempDir()
-	if r := Load(root); r.Hidden("dist", true) {
+	if r := Load([]string{root}); r.Hidden("dist", true) {
 		t.Fatal("dist hidden before any configuration said so")
 	}
-	os.MkdirAll(filepath.Join(root, ".raj"), 0o755)
-	os.WriteFile(filepath.Join(root, ".raj", "hidden"), []byte("# mine\ndist/\n!vendor/\n"), 0o644)
+	path := WorkspaceFile([]string{root})
+	if path == "" {
+		t.Fatal("WorkspaceFile returned nothing under a temp XDG_CONFIG_HOME")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("# mine\ndist/\n!vendor/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	r := Load(root)
+	r := Load([]string{root})
 	if !r.Hidden("dist", true) {
 		t.Error("workspace pattern not applied")
 	}
@@ -179,12 +173,15 @@ func TestLoadReadsWorkspaceFile(t *testing.T) {
 	if !r.Hidden(".git", true) {
 		t.Error("defaults were replaced rather than extended")
 	}
+	if !r.Hidden(".raj", true) {
+		t.Error("the .raj default went missing")
+	}
 	if len(r.Sources) != 1 {
 		t.Errorf("Sources = %v, want the one workspace file", r.Sources)
 	}
 }
 
-// The workspace file is read after the user's, so a repository can disagree with
+// The workspace file is read after the user's, so a workspace can disagree with
 // a personal preference.
 func TestWorkspaceOverridesUserConfig(t *testing.T) {
 	cfg := t.TempDir()
@@ -193,19 +190,57 @@ func TestWorkspaceOverridesUserConfig(t *testing.T) {
 	os.WriteFile(filepath.Join(cfg, "raj", "hidden"), []byte("*.log\n"), 0o644)
 
 	root := t.TempDir()
-	if !Load(root).Hidden("a.log", false) {
+	if !Load([]string{root}).Hidden("a.log", false) {
 		t.Fatal("user configuration not read")
 	}
-	os.MkdirAll(filepath.Join(root, ".raj"), 0o755)
-	os.WriteFile(filepath.Join(root, ".raj", "hidden"), []byte("!*.log\n"), 0o644)
-	if Load(root).Hidden("a.log", false) {
+	path := WorkspaceFile([]string{root})
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte("!*.log\n"), 0o644)
+	if Load([]string{root}).Hidden("a.log", false) {
 		t.Error("workspace did not override the user configuration")
+	}
+}
+
+// The workspace file is keyed by the whole root set, so two workspaces do not
+// share one configuration.
+func TestWorkspaceKeyIsolatesWorkspaces(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	a, b := t.TempDir(), t.TempDir()
+	if WorkspaceFile([]string{a}) == WorkspaceFile([]string{b}) {
+		t.Fatal("two root sets share one workspace file")
+	}
+	path := WorkspaceFile([]string{a})
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("only-a/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !Load([]string{a}).Hidden("only-a", true) {
+		t.Error("A's configuration was not read for A")
+	}
+	if Load([]string{b}).Hidden("only-a", true) {
+		t.Error("A's configuration leaked into B")
+	}
+}
+
+// With no XDG_CONFIG_HOME and no home there is nowhere to key a workspace
+// config, and no root is no workspace at all.
+func TestWorkspaceFileNeedsAHome(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	if got := WorkspaceFile([]string{t.TempDir()}); got != "" {
+		t.Errorf("WorkspaceFile = %q, want empty with no home", got)
+	}
+	if got := WorkspaceFile(nil); got != "" {
+		t.Errorf("WorkspaceFile(nil) = %q, want empty with no root", got)
 	}
 }
 
 func TestMissingConfigIsNotAnError(t *testing.T) {
 	isolate(t)
-	r := Load(filepath.Join(t.TempDir(), "nope"))
+	r := Load([]string{filepath.Join(t.TempDir(), "nope")})
 	if !r.Hidden(".git", true) || len(r.Sources) != 0 {
 		t.Error("a missing configuration file did not fall back to the defaults")
 	}

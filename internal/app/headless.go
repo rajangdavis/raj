@@ -3,8 +3,6 @@ package app
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"raj/internal/editor"
 )
@@ -229,13 +227,11 @@ func (a *App) evictHeadless() {
 	}
 }
 
-// pathInRoot reports whether path is inside the workspace root, the same
+// pathInRoot reports whether path is inside some workspace root, the same
 // boundary the Guard enforces. loadHeadless checks it before reading bytes as
 // the lexical backstop; the Guard's resolved check in canonical is the gate and
-// runs before Resolve.
+// runs before Resolve. A path under any root is in the workspace, so the second
+// root reaches the same loader the primary does.
 func (a *App) pathInRoot(path string) bool {
-	root := filepath.Clean(a.root)
-	clean := filepath.Clean(path)
-	rel, err := filepath.Rel(root, clean)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return a.visible.Contains(path)
 }

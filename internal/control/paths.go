@@ -36,46 +36,106 @@ import (
 //
 // RAJ_ROOT_MAP overrides both, for the mount layout that inference gets wrong.
 
-// RootMapEnv is `local=editor`: the path this process sees, then the path the
-// editor sees. Explicit, and it wins over anything inferred.
+// RootMapEnv is one or more `local=editor` pairs separated by commas: the path
+// this process sees, then the path the editor sees. Explicit, and it wins over
+// anything inferred.
 const RootMapEnv = "RAJ_ROOT_MAP"
 
-// Mapper rewrites absolute paths between two views of one tree. The zero value
-// rewrites nothing, which is the shared-filesystem case and the common one.
+// Pair is one translation between two views of the same tree. Local is the path
+// this process sees, Editor the path the editor sees; both are absolute roots.
+type Pair struct {
+	Local  string
+	Editor string
+}
+
+// Mapper rewrites absolute paths between one or more pairs of views of a tree.
+// The zero value rewrites nothing, which is the shared-filesystem case and the
+// common one. A container with two bind mounts is two pairs: each path is
+// rewritten by the pair whose from-side contains it, and a path outside every
+// pair is left alone.
 type Mapper struct {
-	Local  string // this process's view, e.g. /workspace
-	Editor string // the editor's view, e.g. /Users/rajan/src/raj
+	pairs []Pair
+}
+
+// NewMapper builds a mapper from pairs. A pair with an empty side, or with both
+// sides equal, rewrites nothing and is dropped, so the zero value and a no-op
+// mapping are the same thing. Roots are cleaned so a caller's spelling cannot
+// make two spellings of one root look like two pairs.
+func NewMapper(pairs ...Pair) Mapper {
+	m := Mapper{}
+	for _, p := range pairs {
+		if p.Local == "" || p.Editor == "" || filepath.Clean(p.Local) == filepath.Clean(p.Editor) {
+			continue
+		}
+		m.pairs = append(m.pairs, Pair{Local: filepath.Clean(p.Local), Editor: filepath.Clean(p.Editor)})
+	}
+	return m
 }
 
 // Active reports whether this mapper does anything.
 func (m Mapper) Active() bool {
-	return m.Local != "" && m.Editor != "" && m.Local != m.Editor
+	for _, p := range m.pairs {
+		if p.Local != "" && p.Editor != "" && p.Local != p.Editor {
+			return true
+		}
+	}
+	return false
 }
 
-func (m Mapper) String() string { return m.Local + "=" + m.Editor }
+// String renders the pairs the way RAJ_ROOT_MAP spells them, joined by commas.
+func (m Mapper) String() string {
+	parts := make([]string, 0, len(m.pairs))
+	for _, p := range m.pairs {
+		parts = append(parts, p.Local+"="+p.Editor)
+	}
+	return strings.Join(parts, ",")
+}
 
 // ToEditor rewrites a path this process can see into the editor's coordinates.
-// A relative or empty path is left alone: the editor resolves those itself, and
-// "" specifically means "the buffer the user is looking at".
-func (m Mapper) ToEditor(p string) string { return rebase(p, m.Local, m.Editor, m.Active()) }
+// The pair whose local side contains the path component-wise wins. A relative
+// or empty path is left alone: the editor resolves those itself, and ""
+// specifically means "the buffer the user is looking at".
+func (m Mapper) ToEditor(p string) string { return m.rebase(p, true) }
 
 // FromEditor rewrites a path the editor reported back into this process's.
-func (m Mapper) FromEditor(p string) string { return rebase(p, m.Editor, m.Local, m.Active()) }
+func (m Mapper) FromEditor(p string) string { return m.rebase(p, false) }
 
-func rebase(p, from, to string, active bool) string {
-	if !active || p == "" || !filepath.IsAbs(p) {
+// rebase applies the first pair whose from-side contains p; a path outside
+// every pair is returned unchanged rather than guessed at.
+func (m Mapper) rebase(p string, toEditor bool) string {
+	if p == "" || !filepath.IsAbs(p) {
 		return p
 	}
-	if p == from {
-		return to
+	for _, pr := range m.pairs {
+		from, to := pr.Local, pr.Editor
+		if !toEditor {
+			from, to = pr.Editor, pr.Local
+		}
+		if from == "" || to == "" || from == to {
+			continue
+		}
+		if out, ok := rebaseOne(p, from, to); ok {
+			return out
+		}
 	}
-	if rest, ok := strings.CutPrefix(p, ensureSlash(from)); ok {
-		return filepath.Join(to, rest)
-	}
-	// Outside the mapped tree. Left alone rather than guessed at: the editor
+	// Outside every mapped tree. Left alone rather than guessed at: the editor
 	// refuses paths outside its root anyway, so a wrong rewrite would turn a
 	// clear "not under the workspace" into a confusing one.
 	return p
+}
+
+// rebaseOne rewrites p from root from to root to, reporting whether p was under
+// from. Containment is by path component, not string prefix, so /workspace/a
+// does not swallow /workspace-other/a.
+func rebaseOne(p, from, to string) (string, bool) {
+	if p == from {
+		return to, true
+	}
+	rest, ok := strings.CutPrefix(p, ensureSlash(from))
+	if !ok {
+		return p, false
+	}
+	return filepath.Join(to, rest), true
 }
 
 func ensureSlash(p string) string {
@@ -85,23 +145,29 @@ func ensureSlash(p string) string {
 	return p + "/"
 }
 
-// MapperFromEnv reads RAJ_ROOT_MAP. A malformed value is an error rather than
-// an ignored setting: silently not mapping is the failure that looks like the
-// editor having the wrong files open.
+// MapperFromEnv reads RAJ_ROOT_MAP as one or more comma-separated `local=editor`
+// pairs. Whitespace around a pair and around its `=` is tolerated. A malformed
+// value is an error rather than an ignored setting: silently not mapping is the
+// failure that looks like the editor having the wrong files open.
 func MapperFromEnv() (Mapper, error) {
 	v := os.Getenv(RootMapEnv)
 	if v == "" {
 		return Mapper{}, nil
 	}
-	local, editor, ok := strings.Cut(v, "=")
-	if !ok || local == "" || editor == "" {
-		return Mapper{}, fmt.Errorf("%s must be local=editor, e.g. /workspace=/Users/you/src/proj; got %q",
-			RootMapEnv, v)
+	var pairs []Pair
+	for _, entry := range strings.Split(v, ",") {
+		local, editor, ok := strings.Cut(entry, "=")
+		local, editor = strings.TrimSpace(local), strings.TrimSpace(editor)
+		if !ok || local == "" || editor == "" {
+			return Mapper{}, fmt.Errorf("%s must be local=editor[,local=editor...], e.g. /workspace=/Users/you/src/proj; got %q",
+				RootMapEnv, strings.TrimSpace(entry))
+		}
+		if !filepath.IsAbs(local) || !filepath.IsAbs(editor) {
+			return Mapper{}, fmt.Errorf("%s wants absolute paths; got %q", RootMapEnv, strings.TrimSpace(entry))
+		}
+		pairs = append(pairs, Pair{Local: filepath.Clean(local), Editor: filepath.Clean(editor)})
 	}
-	if !filepath.IsAbs(local) || !filepath.IsAbs(editor) {
-		return Mapper{}, fmt.Errorf("%s wants two absolute paths; got %q", RootMapEnv, v)
-	}
-	return Mapper{Local: filepath.Clean(local), Editor: filepath.Clean(editor)}, nil
+	return NewMapper(pairs...), nil
 }
 
 // WorkspaceRoot is the repository containing dir, or dir itself. It mirrors
@@ -123,23 +189,68 @@ func WorkspaceRoot(dir string) string {
 	}
 }
 
-// inferMapper decides whether paths need translating.
+// inferMapper decides whether paths need translating for a daemon that named
+// editorRoots as its workspace.
 //
-// editorRoot is what the editor reported. The test is whether it exists here:
-// a path that resolves on this filesystem is one both ends mean the same thing
-// by, and anything else is a boundary. Deliberately not "are the strings
-// different" — an agent run from a parent directory sees a different root and
-// shares a filesystem, and rewriting there would corrupt every path it sends.
-func inferMapper(cwd, editorRoot string) Mapper {
-	if editorRoot == "" || cwd == "" {
+// The test is whether any editor root exists here: a path that resolves on this
+// filesystem is one both ends mean the same thing by, and anything else is a
+// boundary. Deliberately not "are the strings different" — an agent run from a
+// parent directory sees a different root and shares a filesystem, and rewriting
+// there would corrupt every path it sends.
+//
+// At a boundary only one mount can be inferred: the editor root that contains
+// cwd, else the first, is paired with this process's workspace root, and every
+// other editor root is left alone (an identity mapping). A second mount needs an
+// explicit RAJ_ROOT_MAP entry naming both sides, because nothing on this side
+// can tell which local directory stands for which editor root.
+func inferMapper(cwd string, editorRoots []string) Mapper {
+	if cwd == "" || len(editorRoots) == 0 {
 		return Mapper{}
 	}
-	if _, err := os.Stat(editorRoot); err == nil {
-		return Mapper{}
+	for _, r := range editorRoots {
+		if r == "" {
+			continue
+		}
+		if _, err := os.Stat(r); err == nil {
+			return Mapper{}
+		}
 	}
 	local := WorkspaceRoot(cwd)
-	if local == "" || local == editorRoot {
+	if local == "" {
 		return Mapper{}
 	}
-	return Mapper{Local: local, Editor: editorRoot}
+	chosen := -1
+	for i, r := range editorRoots {
+		if r == "" {
+			continue
+		}
+		if chosen < 0 {
+			chosen = i
+		}
+		if pathWithin(r, cwd) {
+			chosen = i
+			break
+		}
+	}
+	if chosen < 0 || editorRoots[chosen] == local {
+		return Mapper{}
+	}
+	return NewMapper(Pair{Local: local, Editor: editorRoots[chosen]})
+}
+
+// pathWithin reports whether child is parent itself or sits under it, by path
+// component rather than string prefix.
+func pathWithin(parent, child string) bool {
+	if parent == "" || child == "" {
+		return false
+	}
+	parent, child = filepath.Clean(parent), filepath.Clean(child)
+	if parent == child {
+		return true
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

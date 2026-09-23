@@ -180,10 +180,10 @@ func (a *App) promptDeletion(p *editor.Pane, d control.Deletion) {
 // trashDir is where RAJ_TRASH=1 sends a removed file: a trash/ directory in
 // the workspace's XDG state dir, alongside the store and the op logs.
 func (a *App) trashDir() string {
-	if a.root == "" {
+	if a.roots.Len() == 0 {
 		return ""
 	}
-	return filepath.Join(session.StateDir(a.root), "trash")
+	return filepath.Join(session.StateDirForRoots(a.roots.All()), "trash")
 }
 
 // moveToTrash moves path into the workspace trash under a timestamped name

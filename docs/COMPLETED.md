@@ -661,7 +661,7 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 - [x] **Clipping is by display column, not by byte**, since the disclosure
   marker is multi-byte and a byte clip would cut it in half.
 
-- [x] **`.raj/` is hidden by default (2026-09-16).** `internal/hidden` defaults hide `.raj/*` (journal, trash, session) while leaving `.raj/hidden`, the user config, visible; `hidden_test.go` covers both, so the tree, search and picker stop showing the editor scratch.
+- [x] **`.raj/` is hidden by default (2026-09-16).** `internal/hidden` defaults hide `.raj/*` (journal, trash, session) while leaving `.raj/hidden`, the user config, visible; `hidden_test.go` covers both, so the tree, search and picker stop showing the editor scratch. Superseded 2026-09-22: the workspace config moved to XDG and `.raj` is hidden whole.
 
 - [x] **Arrowing the explorer previews in one reusable tab (2026-09-17).**
   A clean preview is replaced in place and a dirty one is promoted, Enter
@@ -2294,3 +2294,105 @@ proxies accept/reject/clear back to the daemon, refetching the result.
 
 - [x] **Long options print with two dashes (2026-09-20).** `control.PrintFlagUsage` is the one printer behind the editor, daemon and ctl help: it spells every long flag `--name` with its placeholder and a non-zero default, and the ctl usage and error strings name long options `--`; parsing still accepts the single-dash long form.
 - [x] **The daemon forwards `--no-restore` (2026-09-20).** `flagsFirst` keeps `--flag value`, `--flag=value` and the lone `[dir]` (moved after the flags) and refuses a bare token that names a flag with `unknown argument "no-restore"; did you mean --no-restore?`; `--no-restore` is registered on `start`/`restart` and carried through `controlForward`/`Restart`.
+
+## Workspace roots as a set, inert (2026-09-21)
+
+- [x] **Workspace roots became a set behind one reader.** `internal/workspace`
+  holds `Roots` (`New` canonicalises, dedupes and rejects nesting; `Primary`,
+  `All`, `Len`, `Names`, `Contains`, `StateKey`), `session.StateDir` delegates
+  its key to `workspace.StateKey`, and `App.root` is `App.roots ws.Roots` with
+  `primaryRoot()` for every single-root reader. One root in, byte-identical
+  behaviour out: the golden key `raj-raj-89862ebb` is unchanged and
+  `Contains`/`Names`/`All`/`Len` have no production caller yet. Pinned by
+  `internal/workspace/workspace_test.go` (`TestStateKeyGolden`,
+  `TestStateKeyOrderIndependent`, `TestNew*`) and
+  `TestPrimaryRootIsTheConstructorRoot`.
+
+## Daemon discovery and workspace labels (Wave 3a, 2026-09-22)
+
+- [x] **`raj daemon list`/`ps` (2026-09-22).** `session.WorkspacesDir()` is the
+  one parent every daemon record lives under and `daemon.List()`/`ListDir()`
+  walk it: a record whose pid is dead is dropped with `daemon.json` and
+  `daemon.pid` removed, a missing directory is an empty list, and entries are
+  sorted by display label then primary root. The CLI renders
+  LABEL/ROOTS/PID/ADDRESS/STATUS, refuses a positional `[dir]`, and `--json`
+  carries the same entries.
+- [x] **`--workspace NAME` labels and targets a daemon (2026-09-22).** The
+  decision is an explicit, docker-compose-style nickname: `FindWorkspace`
+  matches the recorded `Workspace` field only, never the display fallback, and
+  a label two running daemons carry is an ambiguity error. `start` claims a
+  label before spawning (refusing one a different running daemon already
+  carries) and stamps it after readiness; `stop`/`status` resolve a label to
+  the daemon's recorded root and refuse a label combined with a directory;
+  `restart --workspace` overrides the label and without it carries the running
+  daemon's label across. `State.Roots` and `Record` stamp the root, and
+  `cmd/raj/main.go` is untouched.
+
+## Workspace roots on the wire; attach adopts the daemon workspace (Wave 3c, 2026-09-22)
+
+- [x] **The root set rides the wire and attach adopts it (2026-09-22).** `hRoots` (0x62) carries a reply's whole workspace root set as a flat length-prefixed string list, emitted only when non-empty; `Root` stays the primary so a reader that does not know the field is unaffected. `Header.Roots`/`Response.Roots`, `EncodeResponse`/`DecodeResponse` and the reflective `TestEveryHeaderFieldRoundTrips` guard carry it; `ping`/`buffers` set it from `Guard.roots()` (the host's `Roots()` when it exposes one, else `Root()`, else nil). `Client` rebases each root through the mapper, records the last set and exposes `Roots()`, and `StartClient` adopts the daemon's set only after a successful `buffers` handshake. Pinned by `TestPingReplyCarriesRoots`, `TestPingRootsEmptyWithoutARoot`, `TestResponseCarriesRoots`, `TestHeaderRoundTrip` and `TestEveryHeaderFieldRoundTrips`.
+- [x] **Visible roots are split from view roots (2026-09-22).** `App.visible` drives the explorer, search, `ls`, containment, `host.Roots()` and `rootFor`/`pathInRoot`; `App.roots` (the constructor's) stays the store, `attachKey`, journal, trash, session, `persistTick` and `primaryRoot()`. `adoptVisibleRoots` rebuilds Explorer/Search from the daemon's set (ignoring an empty or nested one), so an attach renders the daemon's workspace while its view state lives beside its own store. A non-attach editor has `visible == roots` and single-root behaviour is byte-for-byte unchanged. Pinned by `TestAttachAdoptsDaemonRoots`, `TestAttachViewStoreStaysKeyedByLaunchRoots`, `TestAttachOldServerKeepsLaunchRoots` and `TestVisibleRootsEqualViewRootsForANormalEditor`.
+- [x] **`ls` with no path is passed through to the host (follow-up, 2026-09-22).** `TestDispatchLs` was updated to the contract the earlier `Guard.Ls` change made: an empty `ls` path reaches the host, which decides one root's children versus one top-level row per root, rather than being rewritten to `Root()`. `TestCLILs` already asserts the wire path is empty.
+
+## Attach by workspace label (2026-09-22)
+
+- [x] **`raj --attach --workspace NAME` attaches to a labelled daemon (2026-09-22).** `--workspace` resolves the label with `daemon.FindWorkspace` and builds the client over the daemon's recorded `Roots` (the new `app.Options.Roots`), so an attach from any directory renders the daemon's workspace instead of the launch directory. The Unix socket is preferred over TCP (it needs no token) and TCP is the fallback; the roots copy and every refusal live in the pure `attachWorkspace` helper. An explicit `--control-addr` is mutually exclusive with `--workspace`, a positional file or directory is refused, and a missing or ambiguous label, a daemon with no roots and a daemon with no address each refuse by name. The private `workspace` helper was renamed `workspaceRoot` for the flag variable. Pinned by `TestWorkspaceFlagRegistered` and `TestAttachWorkspace` (`cmd/raj/main_test.go`).
+
+## One language server per (root, language) (Wave 4, 2026-09-22)
+
+- [x] **Language servers key by (root, language) (2026-09-22).** `servers.byID` is `map[serverKey]*langServer` with `serverKey{root, lang}`; `servers.roots []string` and `langServer.root` replace the single root, and `newServers(roots)` copies the set. `servers.rootFor(path)` resolves a path's root with the component-wise containment rule and falls back to the primary root for a path outside every root, so a two-root launch gets one server per (language, root) while a single root is byte-identical: one server per language, with that root as the process `Dir` and the handshake `rootUri`. `for_` starts the server in the path's root, `running`/`live` resolve the path's root before indexing, `stopAll` stops every root, and `WarmServers` starts one per (language, root). Pinned by `TestServerRootFollowsTheFilePath`, `TestServersArePerRootForRunningAndLive`, `TestStopAllStopsEveryRoot`, `TestWarmServersStartsOnePerLanguagePerRoot` and `TestWarmServersSingleRootIsOneServerPerLanguage`.
+
+## Efficiency: read size and framed diagnostics (2026-09-22)
+
+- [x] **`read --json` carries `bytes`/`lines` (2026-09-22).** A single-target
+  read fills both from `Guard.readSize`, which reads the buffer list exactly as
+  `version` does, so a driver that just read the text no longer makes a second
+  `version` call to size an append; a `--start/--end` or `--lines` span still
+  reports the whole file, while a multi-target entry reports the bytes and lines
+  it contributed (which is also what splits the concatenated body). Pinned by
+  `TestCLIReadJSONCarriesFileSize`, `TestCLIReadJSONSpanReportsWholeFile`,
+  `TestCLIReadManyJSONCarriesPerFileSizes`, `TestCLIReadJSONKeepsExistingKeys`
+  (`internal/control/cli_test.go`) and `TestDispatchReadCarriesWholeFileSize`,
+  `TestDispatchReadMultipleCarriesPerFileSize` (`internal/control/host_test.go`).
+- [x] **Multi-path `lsp diagnostics --json` is one framed document
+  (2026-09-22).** Two or more paths go to `lspDiagnostics`, which pairs one
+  `c.Do` per operand and emits `{"files":[{"path", ...single-path object...}]}`;
+  a path with no answer still appears with an `error` status and the refusal as
+  detail, plain output heads each answer with `==> path <==`, and the exit is 1
+  iff some entry is non-ok. Single-path `--json` stays a bare object. Verified
+  live: a four-path cold sweep answered one document with the `starting...`
+  detail inside the entry, and a retry returned `ok` for all four. Pinned by
+  `TestCLILSPDiagnosticsBatchJSONIsFramed`,
+  `TestCLILSPDiagnosticsBatchAttributesEachPath`,
+  `TestCLILSPDiagnosticsBatchColdStartStaysJSON`,
+  `TestCLILSPDiagnosticsSinglePathJSONUnchanged`,
+  `TestCLILSPDiagnosticsPlainNamesEachPath` (`internal/control/cli_test.go`).
+
+## Per-target read spans and repeatable search (2026-09-22)
+
+- [x] **`read --at PATH=LO,HI` gives each target its own line span (2026-09-22).** `read` takes repeated `--at` entries, each a 1-based inclusive line span for one path, split on the last `=` so a path containing `=` stays addressable; a positional path named by `--at` is read once at that span, an unnamed positional reads whole or at the shared `--start`/`--end`/`--lines`, and `--at` wins for the path it names. Targets sharing an identical span travel in one wire call (one `c.Do` per distinct span inside the one CLI call); a single target keeps the old flat shape and `--json` echoes `line_start`/`line_end` per target. Pinned by `TestCLIReadAtPerTargetSpans`, `TestCLIReadAtPathWithEquals`, `TestCLIReadAtMalformed`, `TestCLIReadAtDeduplicatesAndKeepsOthersWhole` and `TestCLIReadJSONEchoesLineSpan` (`internal/control/cli_test.go`).
+- [x] **`search -q` is repeatable (2026-09-22).** Several `-q` flags search every pattern in one CLI call (one `DoStream` per pattern); each hit is labelled with its pattern only when more than one was given, so a single-pattern run is byte-for-byte unchanged. `--case`/`--regex`/`--word`/`--include`/`--exclude`/`--context`/`--path`/`--hidden` apply to every pattern, the exit is 0 if any pattern matched and 1 if none, and the regex-metacharacter hint names the pattern that missed. Pinned by `TestSearchMultipleQueries`, `TestSearchMultipleQueriesExit` and `TestSearchMultipleQueriesFlagsAndHint` (`internal/control/cli_test.go`).
+
+## Wave 2 review — roots adoption, one containment home (2026-09-22)
+
+- [x] **The root-containment rule has one home (2026-09-22).** `workspace.Roots.RootFor` is the single component-wise containment rule (`Contains` delegates to it), and both resolvers call it: `App.rootFor` (`internal/app/app.go`) and `servers.rootFor` (`internal/app/lsp.go`, primary-root fallback for a path outside every root). The three hand-written `filepath.Rel` copies are gone. *A boundary rule with three copies is a boundary that would disagree with itself.*
+- [x] **A reconnect re-adopts a changed daemon root set on the event thread (2026-09-22).** `resyncClient` no longer calls `adoptVisibleRoots` off the event thread; it queues the peer's root set under `clientMu` with a `ui.Wake`, and `drainClient` compares with `sameRootSet` and adopts on the event thread, so `a.visible`, the explorer, search and picker are never mutated from the watch goroutine. `readoptVisibleRoots` is removed; `TestClientReconnectAdoptsChangedRoots` drives the drain. *Reconnect means re-sync, workspace included.*
+- [x] **`Client.Roots()` is per-reply, not sticky (2026-09-22).** `setRoots` clears the record on a set-less reply, so a later reply cannot name a workspace the current peer never reported; the attached app keeps its own adopted copy. Pinned by `TestRootsClearsOnSetLessReply`, whose fake now mirrors `Dispatch` and reports `Roots` on `ping` and `buffers`. *A cached fact says when it is stale.*
+- [x] **The multi-root picker and the multi-pair mapper (2026-09-22).** `picker.NewRoots` indexes every visible root and `adoptVisibleRoots` rebuilds it on attach, so cmd+p reaches a daemon's second root; `Mapper` rewrites a path through the pair whose from-side contains it and `RAJ_ROOT_MAP` accepts several `local=editor` pairs.
+
+## An attached client is a normal editor (Wave 3, 2026-09-22)
+
+- [x] **A client joins as a durable human and its edits forward (2026-09-22).** `hello` takes `Request.Kind` (`hKind` 0x63, absent meaning agent), so an attached client joins the daemon as a second `KindHuman` participant rather than another agent; `Guard.Apply` admits a durable joined human other than `LocalHuman` (`writesAsHuman`) while `Patch` stays agent-only, and `host.Apply` already skips `ProposeGroup` for a non-agent so the text lands as that person's own accepted edit. Outside Review `readOnly()` is Review only, and a client tab's local text is diffed against the daemon snapshot it was synced from (`editMiddle`), debounced, then sent as one `apply` on the decide connection after `claim` and `version` satisfy the write gate; the daemon's rebase is the merge, an agent claim overlap becomes a status note, an unplaceable edit warns and re-fetches, Review stays read-only, and a watch install leaves a dirty pane alone. Pinned by `TestHelloOverTheSocketDeclaresAHuman`/`TestHelloOverTCPDowngradesAHuman`, `TestApplyAllowsAJoinedHuman`, `TestAttachedClientEditsOutsideReview`, `TestClientLocalEditForwardsOneApply`, `TestClientWatchSkipsDirtyPane`, `TestClientClaimOverlapNotesAnAgent` and the rewritten `TestClientRefusesTypingInReview`/`TestClientRefusesEveryEditGestureInReview`.
+
+## Wave 3 review — an attached client is a normal editor (2026-09-22)
+
+- [x] **Reload is refused on an attached client again (2026-09-22).** `readOnly()` no longer includes `attach`, so the `keys.Reload` branch lost the client refusal its own comment promised: in Edit mode a client could run `File.Reload`, replace the daemon snapshot with this machine's disk copy and let the idle scan forward the revert back to the daemon. The branch now refuses `a.attach` as well, with an attach-specific status, so the wave's one disk-reading gesture cannot undo a daemon edit. *A mode change must not quietly re-open a path that writes behind the daemon.*
+
+## Hidden config to XDG + phone drawer reset (Wave 4, 2026-09-22)
+
+- [x] **A phone tab switch re-selects the drawer's open default (2026-09-22).** The drawer selection is per-pane (`drawerSelPane`): the first frame after the active pane changes under an open drawer re-runs `drawerOpenWant()` instead of carrying the previous tab's index, and a refused decision leaves the pane unchanged so its place is kept. Pinned by `TestPhoneDrawerSelectionResetsOnTabSwitch` (`internal/app/render_test.go`) and `TestClientPhoneDrawerRefusedDecisionKeepsSelection` (`internal/app/client_review_test.go`). *A tab switch is a new drawer context.*
+- [x] **The workspace hide config lives in XDG, keyed by the root set (2026-09-22).** `hidden.WorkspaceFile(roots)` is `$XDG_CONFIG_HOME/raj/workspaces/<workspace.StateKey>/hidden`; `Load` reads the user file first and the workspace file second, `.raj/` is hidden whole with no `.raj/hidden` special case, and `migrateHiddenConfig` copies a legacy `.raj/hidden` best-effort without overwriting, so a fresh launch creates no `.raj`. Pinned by `TestLegacyHiddenConfigMovesToXDG`, `TestLegacyHiddenConfigDoesNotOverwrite`, `TestWorkspaceKeyIsolatesWorkspaces` and `TestFreshLaunchLeavesProjectClean` (`internal/hidden`, `internal/app`). *Config and state leave the checkout.*
+
+## Proposal-tint contrast (Wave 5, 2026-09-22)
+
+- [x] **Proposed and accepted agent spans keep a legible foreground (2026-09-22).** `ui.PaletteRGB`/`Luminance`/`ContrastRatio`/`LegibleOn` resolve the xterm-256 colours raj names itself (indices 16-255; 0-15 stay terminal-owned and unresolved) and choose black or near-white by WCAG contrast; `drawLine` pairs a `th.ProposedAdd` or `th.AgentTint` background with `ui.LegibleOn(bg)` instead of the syntax foreground, keeping the tint background so the comment grey no longer vanishes on the review or attribution green. Pinned by `internal/ui/contrast_test.go` and `TestRenderProposedCommentStaysLegible`/`TestRenderAgentCommentStaysLegible` (`internal/editor/proposals_test.go`).

@@ -1300,3 +1300,60 @@ func TestPhoneDrawerTapAndEscOpenOnNextInReview(t *testing.T) {
 		t.Errorf("esc open selected %v, want next", got)
 	}
 }
+
+// A tab switch is a new drawer context: the next frame re-selects the open
+// default instead of carrying the previous tab's index. The phone flow that
+// reported it decided the last set on one tab and moved to save and close with
+// the drawer still open; the next tab then opened on clear.
+func TestPhoneDrawerSelectionResetsOnTabSwitch(t *testing.T) {
+	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	first := h.Pane()
+
+	// A second tab with its own pending set, prepared before the drawer opens.
+	dir := filepath.Dir(first.File.Path)
+	second := filepath.Join(dir, "second.go")
+	if err := os.WriteFile(second, []byte("package second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(second)
+	secondPane := h.Pane()
+	propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "// y\n"})
+
+	// Back to the first tab and into Review with the drawer open on next.
+	if !h.Tabs.Focus(first) {
+		t.Fatal("setup: could not focus the first tab")
+	}
+	h.press("super+r")
+	openPhoneDrawer(h)
+
+	if !h.phone {
+		t.Fatal("the harness is not the phone profile")
+	}
+	if !h.drawerOpen {
+		t.Fatal("setup: the drawer did not open")
+	}
+	if h.activePending() == 0 {
+		t.Fatal("setup: the first tab has no pending set")
+	}
+	offDefault := drawerSelIndex(t, h, keys.ClearRejected)
+	if got := h.drawerPanel[h.drawerSel].action; got != keys.NextProposed {
+		t.Fatalf("setup: selection = %v, want the review default next", got)
+	}
+
+	// Move off the default, then switch to the other pending tab. Both panels
+	// carry every button, so without the per-pane reset the stale clear index
+	// survives the switch and no clamp moves it.
+	h.drawerSel = offDefault
+	if !h.Tabs.Focus(secondPane) {
+		t.Fatal("could not focus the second tab")
+	}
+	h.Draw()
+
+	if got := h.drawerPanel[h.drawerSel].action; got != keys.NextProposed {
+		t.Errorf("after a tab switch selection = %v, want the default next", got)
+	}
+	if !h.drawerOpen {
+		t.Error("the tab switch closed the drawer")
+	}
+}

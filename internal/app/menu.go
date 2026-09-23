@@ -379,7 +379,7 @@ func (a *App) renamePath(path string) {
 // prompt closes the scratch buffer rather than leaving an untitled tab.
 func (a *App) newFileAt(dir string) {
 	if dir == "" || dir == "." {
-		dir = a.root
+		dir = a.promptRoot()
 	}
 	a.newFile()
 	p := a.Tabs.Active()
@@ -413,7 +413,7 @@ func (a *App) closeNewPane(p *editor.Pane) {
 // same entry point `raj ctl mkdir` uses, so the tree refresh happens there.
 func (a *App) newFolderAt(dir string) {
 	if dir == "" || dir == "." {
-		dir = a.root
+		dir = a.promptRoot()
 	}
 	a.askPath("New folder", dir+string(filepath.Separator), func(answer string, ok bool) {
 		if !ok || strings.TrimSpace(answer) == "" {
@@ -421,7 +421,7 @@ func (a *App) newFolderAt(dir string) {
 		}
 		path := answer
 		if !filepath.IsAbs(path) {
-			path = filepath.Join(a.root, path)
+			path = filepath.Join(a.promptRoot(), path)
 		}
 		if !a.pathInRoot(path) {
 			a.status = "new folder must be inside the workspace"
@@ -477,7 +477,10 @@ func (a *App) revealPath(path string) {
 	a.sidebar = SidebarExplorer
 	a.focus = FocusSidebar
 	a.Explorer.Focus()
-	root := filepath.Clean(a.Explorer.Tree.Root)
+	root := filepath.Clean(a.rootFor(path))
+	if root == "." || root == "" {
+		root = filepath.Clean(a.Explorer.Tree.Root)
+	}
 	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
 		if a.pathInRoot(dir) {
 			a.Explorer.Tree.Expand(dir)

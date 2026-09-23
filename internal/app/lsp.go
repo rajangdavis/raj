@@ -15,6 +15,7 @@ import (
 	"raj/internal/picker"
 	"raj/internal/piecetable"
 	"raj/internal/ui"
+	ws "raj/internal/workspace"
 
 	"raj/internal/safe"
 )
@@ -26,7 +27,17 @@ import (
 // or confused produces no answer and no interruption — never a stall, never an
 // error the user has to dismiss, never a modal waiting on a subprocess.
 
-// servers is the language servers for this workspace, one per language.
+// serverKey identifies one server in the table: the workspace root it
+// serves and the language it speaks. Two roots with a Go file each are two
+// entries, so a lookup that ignored the root would hand one root's files to
+// the other's server.
+type serverKey struct {
+	root string
+	lang string
+}
+
+// servers is the language servers for this workspace, one per language per
+// root.
 //
 // A server starts on the first request that needs one: most sessions never ask
 // for a hover, and paying gopls's startup on every launch to serve the sessions
@@ -35,10 +46,15 @@ import (
 // for the languages of the files already open at launch — a launch with a Go
 // file pays gopls's startup up front, in exchange for diagnostics and the
 // first request not waiting on a cold handshake.
+//
+// A server is per (root, language), not per language: the handshake names one
+// workspace root, so a file under a second root needs its own server with that
+// root's URI and working directory. For a single root there is one server per
+// language, exactly as before.
 type servers struct {
-	root string
-	mu   sync.Mutex
-	byID map[string]*langServer
+	roots ws.Roots
+	mu    sync.Mutex
+	byID  map[serverKey]*langServer
 
 	// highlightReq is the last document-highlight request — path, document
 	// version and caret — and highlightGen its cancellation generation. They
@@ -64,6 +80,10 @@ type servers struct {
 }
 
 type langServer struct {
+	// root is the workspace root this server was started for. It is the
+	// process's working directory and the workspace URI in the handshake, so
+	// two servers for one language do not answer for each other's files.
+	root string
 	srv  *lsp.Server
 	sync *lsp.Sync
 	caps lsp.InitializeResult
@@ -120,8 +140,18 @@ func serverInitOptions(languageID string) any {
 	}
 }
 
-func newServers(root string) *servers {
-	return &servers{root: root, byID: map[string]*langServer{}}
+// newServers builds the server table for a workspace root set. The roots are
+// canonicalised and copied into a ws.Roots, so a later change to the caller's
+// slice cannot move a server's root out from under a running handshake and the
+// root-for-path rule has one home.
+func newServers(roots []string) *servers {
+	wsRoots, err := ws.New(roots...)
+	if err != nil {
+		// Any set the rest of the app accepted is already valid; a caller
+		// handing one that is not gets no roots rather than an unusable one.
+		wsRoots = ws.Roots{}
+	}
+	return &servers{roots: wsRoots, byID: map[serverKey]*langServer{}}
 }
 
 // lspCommand resolves the command line for a language id, layering the stored
@@ -215,8 +245,9 @@ func scopeSetting(user, workspace map[string]string, key string) (string, bool) 
 }
 
 // openLanguages is the distinct language ids of a set of panes, in first-seen
-// order. WarmServers starts one server per language rather than per pane: two
-// Go files share a server, and a blank buffer or a file type with no language
+// order. WarmServers starts one server per (language, root) rather than per
+// pane: two Go files under one root share a server, a Go file under a second
+// root gets its own, and a blank buffer or a file type with no language
 // contributes nothing to start. It is pure so the ordering and the skipping can
 // be tested without touching PATH or spawning a process.
 func openLanguages(panes []*editor.Pane) []string {
@@ -236,25 +267,35 @@ func openLanguages(panes []*editor.Pane) []string {
 	return langs
 }
 
-// WarmServers starts a server for every language among the files already open,
-// so the first hover, diagnostic or completion does not wait on a cold
-// handshake. It is called once from main after the session is restored and any
-// file named on the command line is open. It must not be called from App.Run or
-// RestoreSession: tests run those, and a warm start there would spawn gopls
-// inside a test process.
+// WarmServers starts a server for every (language, root) among the files
+// already open, so the first hover, diagnostic or completion does not wait on
+// a cold handshake. It is called once from main after the session is restored
+// and any file named on the command line is open. It must not be called from
+// App.Run or RestoreSession: tests run those, and a warm start there would
+// spawn gopls inside a test process.
+//
+// One server per language is not enough once there are several roots: the
+// handshake names the root, so a Go file under each of two roots needs two
+// servers. Within a language the first file of each distinct root starts it; a
+// second file of the same language and root shares it.
 //
 // for_ starts asynchronously and returns at once, so this does not block; a
 // language with no entry in command is skipped, and no panes is a no-op.
 func (a *App) WarmServers() {
 	panes := append(append([]*editor.Pane{}, a.Tabs.All()...), a.headless...)
 	for _, id := range openLanguages(panes) {
-		// Any one path of the language will do: a server is keyed on the
-		// language, and the handshake takes the workspace root, not the file.
+		seen := map[string]bool{}
 		for _, p := range panes {
-			if p != nil && p.File != nil && lsp.LanguageID(p.File.Path) == id {
-				a.servers.for_(a.docPath(p), func() { a.host.Post(ui.Wake{}) })
-				break
+			if p == nil || p.File == nil || lsp.LanguageID(p.File.Path) != id {
+				continue
 			}
+			path := a.docPath(p)
+			root := a.servers.rootFor(path)
+			if seen[root] {
+				continue
+			}
+			seen[root] = true
+			a.servers.for_(path, func() { a.host.Post(ui.Wake{}) })
 		}
 	}
 }
@@ -275,40 +316,64 @@ const (
 	serverGaveUp                        // it kept failing and will not be retried
 )
 
-// running returns the server already handling a path's language, without
-// starting one. Closing a document must not spawn a language server: the tab is
-// going away, there is nothing left to ask about it, and for_ would start one
-// only to be told immediately to forget the only file it had been given.
+// rootFor returns the workspace root that contains path, falling back to the
+// primary root when none does.
+//
+// Roots are not nested, so at most one can contain a path, and the check is
+// component-wise — /a/b is not read as inside /a/bc — which is the same
+// containment the rest of the app uses. The fallback keeps a file outside
+// every root on the primary root's server, which is where the single-root code
+// always put it, so one root behaves exactly as before.
+func (s *servers) rootFor(path string) string {
+	if root := s.roots.RootFor(path); root != "" {
+		return root
+	}
+	return s.roots.Primary()
+}
+
+// running returns the server already handling a path's language under the
+// path's root, without starting one. Closing a document must not spawn a
+// language server: the tab is going away, there is nothing left to ask about
+// it, and for_ would start one only to be told immediately to forget the only
+// file it had been given.
+//
+// The lookup resolves the path's root first: a server keyed on the language
+// alone would answer for another root's identically-typed file.
 func (s *servers) running(path string) *langServer {
 	id := lsp.LanguageID(path)
 	if id == "" {
 		return nil
 	}
+	key := serverKey{root: s.rootFor(path), lang: id}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ls := s.byID[id]
+	ls := s.byID[key]
 	if ls == nil || ls.sync == nil {
 		return nil
 	}
 	return ls
 }
 
-// live returns the server already running for the language of a path, without
-// starting one and without checking whether the binary is on PATH. It is the
-// liveness test in state with the two things state adds for its callers removed
-// -- the PATH search and the reason there is no server -- for a caller that only
-// needs to know whether a server is already there. The idle sync walks every
-// open pane on every tick, and a PATH search per pane per tick is the cost this
-// avoids: a path whose server was never started has no entry to find, so
-// nothing is lost.
+// live returns the server already running for the language of a path under
+// the path's root, without starting one and without checking whether the binary
+// is on PATH. It is the liveness test in state with the two things state adds
+// for its callers removed -- the PATH search and the reason there is no server
+// -- for a caller that only needs to know whether a server is already there.
+// The idle sync walks every open pane on every tick, and a PATH search per pane
+// per tick is the cost this avoids: a path whose server was never started has
+// no entry to find, so nothing is lost.
+//
+// The root is resolved first, like running: a Go file under root2 must find
+// root2's gopls and not root1's.
 func (s *servers) live(path string) *langServer {
 	id := lsp.LanguageID(path)
 	if id == "" {
 		return nil
 	}
+	key := serverKey{root: s.rootFor(path), lang: id}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ls := s.byID[id]
+	ls := s.byID[key]
 	if ls == nil || ls.srv == nil || ls.sync == nil {
 		return nil
 	}
@@ -322,6 +387,10 @@ func (s *servers) live(path string) *langServer {
 // should run at all. A settings override installed by App wins over the
 // built-in command map; with no resolver, the built-ins are the whole answer.
 // A nil or empty argv is no server.
+//
+// The command line is a property of the language, not of a root: the
+// lsp.<lang>.command/args overrides are global, so two roots for one language
+// run the same argv in two different working directories.
 func (s *servers) argvFor(id string) ([]string, bool) {
 	if s.resolveCommand != nil {
 		return s.resolveCommand(id)
@@ -333,8 +402,8 @@ func (s *servers) argvFor(id string) ([]string, bool) {
 	return argv, true
 }
 
-// for_ returns the server for a path's language, starting it if needed, along
-// with why it is or is not available.
+// for_ returns the server for a path's language under the path's root,
+// starting it if needed, along with why it is or is not available.
 func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 	id := lsp.LanguageID(path)
 	if id == "" {
@@ -350,12 +419,17 @@ func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 	if _, err := exec.LookPath(argv[0]); err != nil {
 		return nil, serverMissing
 	}
+	// The root is part of the key: the handshake takes a workspace root, so a
+	// file under root2 must be answered by a server started in root2 even when
+	// a server for the same language already runs for root1.
+	root := s.rootFor(path)
+	key := serverKey{root: root, lang: id}
 
 	s.mu.Lock()
-	ls := s.byID[id]
+	ls := s.byID[key]
 	if ls == nil {
-		ls = &langServer{srv: &lsp.Server{
-			Command: argv[0], Args: argv[1:], Dir: s.root, Notify: notify,
+		ls = &langServer{root: root, srv: &lsp.Server{
+			Command: argv[0], Args: argv[1:], Dir: root, Notify: notify,
 			Options: serverInitOptions(id),
 		}}
 		// The server answers requests through this, including the
@@ -363,7 +437,7 @@ func (s *servers) for_(path string, notify func()) (*langServer, serverState) {
 		// before the first Start so a registration cannot arrive before the
 		// map it writes exists.
 		ls.srv.Handler = ls.handleServerRequest
-		s.byID[id] = ls
+		s.byID[key] = ls
 	}
 	starting := ls.starting
 	live := ls.srv.Conn() != nil && ls.sync != nil
@@ -417,7 +491,7 @@ func (s *servers) start(ls *langServer, id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	res, err := ls.srv.Start(ctx, lsp.URI(s.root), clientCapabilities())
+	res, err := ls.srv.Start(ctx, lsp.URI(ls.root), clientCapabilities())
 	s.mu.Lock()
 	ls.starting = false
 	if err == nil && res != nil {
@@ -427,16 +501,16 @@ func (s *servers) start(ls *langServer, id string) {
 	s.mu.Unlock()
 }
 
-// stopAll shuts every server down. Called when the editor quits, because an
-// editor that leaves language servers running is a bug people find in their
-// process list rather than in the editor.
+// stopAll shuts every server down, across every root. Called when the editor
+// quits, because an editor that leaves language servers running is a bug people
+// find in their process list rather than in the editor.
 func (s *servers) stopAll() {
 	s.mu.Lock()
 	all := make([]*langServer, 0, len(s.byID))
 	for _, ls := range s.byID {
 		all = append(all, ls)
 	}
-	s.byID = map[string]*langServer{}
+	s.byID = map[serverKey]*langServer{}
 	s.mu.Unlock()
 	for _, ls := range all {
 		ls.srv.Stop()
@@ -693,9 +767,9 @@ type applyEditResult struct {
 
 // registerCapabilities records the methods from a client/registerCapability
 // notification. The documentSelector is deliberately not filtered: the
-// registration is stored per language server, which is already the per-language
-// granularity the capability gate works at, so a registration is seen by the
-// server for the language it was made against.
+// registration is stored on the one server that sent it, which is already the
+// (root, language) granularity the capability gate works at, so a registration
+// is seen by the server it was made against and no other.
 func (ls *langServer) registerCapabilities(params json.RawMessage) {
 	var p struct {
 		Registrations []struct {
@@ -1006,7 +1080,7 @@ func (a *App) docPath(p *editor.Pane) string {
 	if filepath.IsAbs(p.File.Path) {
 		return p.File.Path
 	}
-	return filepath.Join(a.root, p.File.Path)
+	return filepath.Join(a.primaryRoot(), p.File.Path)
 }
 
 // An answer is parked where the event thread already looks and a Wake is
@@ -1700,7 +1774,11 @@ func (a *App) applyWorkspaceSymbols(r lspAnswer) {
 		if len(rows) >= maxWorkspaceSymbols {
 			break
 		}
-		row := picker.Reference{Label: symbolRowLabel(a.root, s), Path: s.Location.Path}
+		symRoot := a.rootFor(s.Location.Path)
+		if symRoot == "" {
+			symRoot = a.primaryRoot()
+		}
+		row := picker.Reference{Label: symbolRowLabel(symRoot, s), Path: s.Location.Path}
 		if s.HasRange {
 			row.Line = s.Location.Range.Start.Line + 1
 			row.Col = s.Location.Range.Start.Character + 1

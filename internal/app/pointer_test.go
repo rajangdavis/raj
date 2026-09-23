@@ -110,7 +110,7 @@ func TestMotionAfterReleaseDoesNothing(t *testing.T) {
 // make the next pointer movement extend a selection nobody is holding.
 func TestReleaseOutsideTheEditorEndsTheDrag(t *testing.T) {
 	h := newWorkspace(t, 160, 30)
-	h.OpenFile(h.root + "/main.go")
+	h.OpenFile(h.primaryRoot() + "/main.go")
 	h.drain()
 	ox, oy := editorOrigin(h)
 
@@ -213,7 +213,7 @@ func TestModifierClickAddsACursor(t *testing.T) {
 // went rather than to whatever had focus before.
 func TestClickFocusesTheEditor(t *testing.T) {
 	h := newWorkspace(t, 160, 30)
-	h.OpenFile(h.root + "/main.go")
+	h.OpenFile(h.primaryRoot() + "/main.go")
 	h.drain()
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	if h.Focused() != FocusSidebar {

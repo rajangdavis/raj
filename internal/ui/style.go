@@ -1,6 +1,9 @@
 package ui
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // Color is packed into one comparable scalar so a Cell stays small and frame
 // diffing is a plain equality test.
@@ -40,6 +43,97 @@ func (c Color) RGB() (r, g, b uint8, ok bool) {
 		return 0, 0, 0, false
 	}
 	return uint8(c >> 16), uint8(c >> 8), uint8(c), true
+}
+
+// The xterm 256-colour palette's upper entries are defined by a formula every
+// terminal implements, so the colours raj names itself can be resolved without
+// asking the terminal. Indices 0-15 are the exception: those are the user's
+// configured colours, so a resolver reports them unknown rather than guessing
+// a value the terminal may have redefined.
+//
+// PaletteRGB returns the components of a palette index. ok is false for 0-15.
+func PaletteRGB(n uint8) (r, g, b uint8, ok bool) {
+	if n < 16 {
+		return 0, 0, 0, false
+	}
+	if n < 232 {
+		c := int(n) - 16
+		return cubeLevel(c / 36), cubeLevel(c / 6 % 6), cubeLevel(c % 6), true
+	}
+	v := uint8(8 + 10*(int(n)-232))
+	return v, v, v, true
+}
+
+// cubeLevel maps one axis of the 6x6x6 colour cube to its component: 0, then
+// 95 upward in steps of 40, the levels the xterm palette specifies.
+func cubeLevel(v int) uint8 {
+	if v == 0 {
+		return 0
+	}
+	return uint8(55 + 40*v)
+}
+
+// resolveRGB turns a Color into components whichever representation it uses: a
+// direct colour through RGB, a palette index through PaletteRGB. ok is false
+// when the actual value is only known to the terminal.
+func resolveRGB(c Color) (r, g, b uint8, ok bool) {
+	if r, g, b, ok := c.RGB(); ok {
+		return r, g, b, true
+	}
+	if c < 0 || c > 255 {
+		return 0, 0, 0, false
+	}
+	return PaletteRGB(uint8(c))
+}
+
+// Luminance is the WCAG relative luminance of a colour, from 0 for black to 1
+// for white. ok is false when the RGB is unknown: a palette index 0-15 or
+// Default, whose actual colour only the terminal knows.
+func Luminance(c Color) (float64, bool) {
+	r, g, b, ok := resolveRGB(c)
+	if !ok {
+		return 0, false
+	}
+	return 0.2126*linearChannel(r) + 0.7152*linearChannel(g) + 0.0722*linearChannel(b), true
+}
+
+func linearChannel(v uint8) float64 {
+	c := float64(v) / 255
+	if c <= 0.03928 {
+		return c / 12.92
+	}
+	return math.Pow((c+0.055)/1.055, 2.4)
+}
+
+// ContrastRatio is the WCAG contrast ratio between two colours: 1 for two
+// identical colours and 21 for black against white. ok is false when either
+// colour's RGB is unknown.
+func ContrastRatio(a, b Color) (float64, bool) {
+	la, oka := Luminance(a)
+	lb, okb := Luminance(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05), true
+}
+
+// LegibleOn picks a foreground that reads on bg: black or near-white, whichever
+// has the higher contrast. Default is returned when bg's RGB is unknown, so the
+// terminal chooses rather than a guess being made for it.
+func LegibleOn(bg Color) Color {
+	if _, _, _, ok := resolveRGB(bg); !ok {
+		return Default
+	}
+	black, white := Ansi(16), Ansi(231)
+	cb, _ := ContrastRatio(black, bg)
+	cw, _ := ContrastRatio(white, bg)
+	if cb >= cw {
+		return black
+	}
+	return white
 }
 
 // sgrParams renders the colour as SGR parameters. fg selects 3x/9x vs 4x/10x.

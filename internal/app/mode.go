@@ -113,20 +113,16 @@ func (a *App) reviewRefuses(action keys.Action, text string) bool {
 	return true
 }
 
-// readOnly reports whether the document may not be edited: Review mode holds
-// it read-only, or the app is a client and the daemon owns the text. The two
-// share every edit gate so a client that leaves Review cannot type a local
-// change the next watch wake would discard.
-func (a *App) readOnly() bool { return a.mode == ModeReview || a.attach }
+// readOnly reports whether the document may not be edited. Review mode is the
+// only read-only state now: an attached client is a normal editor whose local
+// edits are forwarded to the daemon as the human's own accepted text, so
+// leaving Review is what makes it editable rather than a mode that changes
+// nothing.
+func (a *App) readOnly() bool { return a.mode == ModeReview }
 
-// readOnlyNote is the status line refusal. A client cannot leave the state by
-// toggling Review, so it gets a note that says who owns the document.
-func (a *App) readOnlyNote() string {
-	if a.attach {
-		return "read-only: this document belongs to the daemon"
-	}
-	return reviewReadOnlyNote()
-}
+// readOnlyNote is the status line refusal. Review is the only read-only state,
+// so it names the chord that leaves it.
+func (a *App) readOnlyNote() string { return reviewReadOnlyNote() }
 
 // reviewReadOnlyNote is the status line refusal. It names the chord that
 // leaves Review mode, read from the binding table rather than assuming cmd+r.

@@ -59,7 +59,7 @@ func TestDeletionProposalForOpenFileRaisesPrompt(t *testing.T) {
 // shown, not on a timer.
 func TestDeletionPromptWaitsForOpen(t *testing.T) {
 	h := newHarness(t, "one\n")
-	other := filepath.Join(h.root, "other.go")
+	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestRemoveForeverRefusedWithPendingSet(t *testing.T) {
 // The gate returns when the path is focused again after the focus moved away.
 func TestDeletionPromptReturnsOnNextFocus(t *testing.T) {
 	h := newHarness(t, "one\n")
-	other := filepath.Join(h.root, "other.go")
+	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestRemoveForeverTrashesWhenEnabled(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("file still at the original path after a trashing removal (err=%v)", err)
 	}
-	trash := filepath.Join(session.StateDir(h.root), "trash")
+	trash := filepath.Join(session.StateDir(h.primaryRoot()), "trash")
 	entries, err := os.ReadDir(trash)
 	if err != nil {
 		t.Fatalf("reading trash dir %s: %v", trash, err)
@@ -307,7 +307,7 @@ func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
 			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				t.Errorf("file still on disk after Remove forever (err=%v)", err)
 			}
-			trash := filepath.Join(session.StateDir(h.root), "trash")
+			trash := filepath.Join(session.StateDir(h.primaryRoot()), "trash")
 			if entries, err := os.ReadDir(trash); err == nil {
 				t.Errorf("trash dir exists with %d entr(ies) for RAJ_TRASH=%q; want none", len(entries), val)
 			} else if !os.IsNotExist(err) {

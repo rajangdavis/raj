@@ -136,6 +136,8 @@ const (
 	hSnapshotJSON     = 0x5f // snapshot: the encoded piecetable session a client renders from
 	hEncodingJSON     = 0x60 // snapshot: the file encoding, as JSON
 	hSnapshotPath     = 0x61 // snapshot: the buffer's own path
+	hRoots            = 0x62 // a reply's whole workspace root set, primary first
+	hKind             = 0x63 // hello: the participant kind, absent meaning agent
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -281,6 +283,7 @@ func encodeHeader(h Header) []byte {
 	num(hGroup, int(h.Group))
 	str(hIdentity, h.Identity)
 	str(hName, h.Name)
+	str(hKind, h.Kind)
 	str(hDir, h.Dir)
 	num(hExit, h.Exit)
 	num(hStream, int(h.Stream))
@@ -291,6 +294,14 @@ func encodeHeader(h Header) []byte {
 	flag(hCreated, h.Created)
 	str(hErr, h.Err)
 	str(hRoot, h.Root)
+	if len(h.Roots) > 0 {
+		var w prog.Writer
+		for _, r := range h.Roots {
+			w.Str(r)
+		}
+		ops = append(ops, Op8{hRoots, w.Done()})
+	}
+
 	num(hPID, h.PID)
 	num(hVersion, int(h.Version))
 	num(hBytes, h.Bytes)
@@ -837,6 +848,8 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Identity = string(op.Payload)
 		case hName:
 			h.Name = string(op.Payload)
+		case hKind:
+			h.Kind = string(op.Payload)
 		case hDir:
 			h.Dir = string(op.Payload)
 		case hExit:
@@ -857,6 +870,15 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Err = string(op.Payload)
 		case hRoot:
 			h.Root = string(op.Payload)
+		case hRoots:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Roots = append(h.Roots, r.Str())
+			}
+			if err := recordsOK(r, "roots"); err != nil {
+				return Header{}, err
+			}
+
 		case hPID:
 			h.PID = prog.ReadNumber(op.Payload)
 		case hVersion:

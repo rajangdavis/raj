@@ -99,7 +99,7 @@ func TestGotoSymbolCancelLeavesTheCursor(t *testing.T) {
 // looks like a file with no declarations in it.
 func TestGotoSymbolOnAnUnsupportedFile(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
-	notes := filepath.Join(h.root, "notes.txt")
+	notes := filepath.Join(h.primaryRoot(), "notes.txt")
 	if err := os.WriteFile(notes, []byte("func not_go() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

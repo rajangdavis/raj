@@ -790,6 +790,15 @@ func (a *App) drawPhoneDrawer(cols int, l Layout) {
 
 	style := ui.DefaultStyle.Plus(ui.Reverse)
 	if a.drawerOpen {
+		// The selection belongs to the pane it was resolved for. A tab switch
+		// is a new context, so the next frame re-selects the drawer open
+		// default instead of carrying the previous tab index. The pane is
+		// unchanged by a decision, so a refused one leaves the selection put.
+		if p := a.Tabs.Active(); p != a.drawerSelPane {
+			a.drawerSelPane = p
+			a.drawerSel = 0
+			a.drawerWant = a.drawerOpenWant()
+		}
 		// The selection indexes the drawn cells, so a mode change or a short
 		// screen that drops a cell can never leave it naming a button that is
 		// not on screen.

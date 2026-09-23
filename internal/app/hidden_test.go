@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"raj/internal/explorer"
+	"raj/internal/hidden"
 	"raj/internal/picker"
 	"raj/internal/search"
 )
@@ -78,8 +79,8 @@ func visibleSearch(t *testing.T, root string) []string {
 
 func fixtureWorkspace(t *testing.T, files map[string]string) string {
 	t.Helper()
-	// Point the user-level configuration at an empty directory: the answer
-	// under test is the defaults plus the workspace, not the developer's own
+	// Point the user-level configuration at an empty tree: the answer under
+	// test is the defaults plus the workspace file, not the developer's own
 	// ~/.config/raj/hidden.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	root := t.TempDir()
@@ -148,19 +149,20 @@ func TestDotfilesAreVisibleByDefault(t *testing.T) {
 // policy rather than three copies of it.
 func TestWorkspaceConfigAppliesEverywhere(t *testing.T) {
 	root := fixtureWorkspace(t, workspaceFiles)
-	os.MkdirAll(filepath.Join(root, ".raj"), 0o755)
-	os.WriteFile(filepath.Join(root, ".raj", "hidden"),
-		// The comment carries the fixture's token so this file counts as
-		// visible for the search the same way it does for the other two.
-		[]byte("# token\nbuild/\n!vendor/\n.gitignore\n"), 0o644)
+	path := hidden.WorkspaceFile([]string{root})
+	if path == "" {
+		t.Fatal("WorkspaceFile returned nothing under a temp XDG_CONFIG_HOME")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("build/\n!vendor/\n.gitignore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	// .raj/hidden lists itself among the visible files on purpose: it is a
-	// file the user wrote and will want to edit, and a configuration file you
-	// cannot open from the editor it configures is a trap.
 	want := []string{
 		".github/workflows/c.yml",
 		".gitlab-ci.yml",
-		".raj/hidden",
 		"README.md",
 		"src/main.go",
 		"vendor/lib/v.go",

@@ -15,6 +15,9 @@
 //	raj ctl <cmd>             read and edit a running raj's buffers
 //	raj --attach              attach to a running raj and render its workspace locally
 //	raj --phone               attach as a client with the phone profile
+//	raj --attach --workspace NAME
+//	                          attach to the running daemon labelled NAME, from
+//	                          any directory on this machine
 //	raj --daemon              run headless and serve the control socket; a
 //	                          hidden alias for `daemon run`
 //	raj daemon start          serve the workspace headless in the background
@@ -50,6 +53,7 @@ import (
 	"raj/internal/probe"
 	"raj/internal/termconf"
 	"raj/internal/ui"
+	ws "raj/internal/workspace"
 
 	"raj/internal/safe"
 )
@@ -81,6 +85,7 @@ var (
 	name      = flag.String("name", "", "with --attach: name this client saved tab view, so clients keep separate views")
 	ctrlAlias = flag.Bool("ctrl-aliases", false, "add ctrl+<key> aliases for super+<key> bindings (implied by --phone)")
 	kkpFlags  = flag.Int("kkp", 0, "with --probe: KKP flags to push (0 = raj's own)")
+	workspace = flag.String("workspace", "", "with --attach or --phone: attach to the running daemon labelled NAME (same host)")
 )
 
 // editorUsage writes the flag reference the help path prints. Go's default help
@@ -180,7 +185,7 @@ func main() {
 	// left at its default is not a decision, and treating it as one would make
 	// every setting unreachable behind the command line defaults; flag.Visit
 	// visits exactly the flags that were set.
-	var tabSet, tabsSet, wrapSet, ctrlAliasesSet, ctlAddrSet bool
+	var tabSet, tabsSet, wrapSet, ctrlAliasesSet, ctlAddrSet, workspaceSet bool
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "tab":
@@ -193,6 +198,8 @@ func main() {
 			ctrlAliasesSet = true
 		case "control-addr":
 			ctlAddrSet = true
+		case "workspace":
+			workspaceSet = true
 		}
 	})
 	// Control is opt-in. A daemon serves the Unix socket and the default TCP
@@ -208,6 +215,17 @@ func main() {
 	// user actually typed names the daemon a client dials, and an unset flag
 	// leaves the client to discover the local socket.
 	attachAddr := clientAddr(*ctlAddr, ctlAddrSet)
+	// --workspace names a running daemon to attach to from any directory: the
+	// label resolves to the daemon's roots and control address, so the client
+	// builds over the daemon's workspace rather than the launch directory.
+	var attachRoots []string
+	if workspaceSet {
+		roots, addr, err := attachWorkspace(*workspace, clientMode, ctlAddrSet, flag.Args(), daemon.FindWorkspace)
+		if err != nil {
+			fail(err)
+		}
+		attachRoots, attachAddr = roots, addr
+	}
 	// --phone implies the ctrl aliases unless --ctrl-aliases was passed
 	// explicitly: a phone has no super key, but a keyboard attached to one might,
 	// and the explicit flag is how that choice is made. NewWithOptions resolves
@@ -222,13 +240,14 @@ func main() {
 		NoRestore:      *noRestore,
 		Attach:         clientMode,
 		AttachAddr:     attachAddr,
+		Roots:          attachRoots,
 		Name:           *name,
 		Phone:          *phone,
 		CtrlAliases:    *ctrlAlias,
 		CtrlAliasesSet: ctrlAliasesSet,
 		Standalone:     *standaloneFlag,
 	}
-	if err := run(flag.Arg(0), opts, ctlAddrs, daemonMode); err != nil {
+	if err := run(flag.Args(), opts, ctlAddrs, daemonMode); err != nil {
 		fail(err)
 	}
 }
@@ -295,6 +314,46 @@ func clientAddr(addr string, set bool) string {
 	return addr
 }
 
+// attachWorkspace resolves --workspace to the roots and dial address of the
+// running daemon labelled name. It is the whole decision, taken before any App
+// exists: the refusals, the label lookup, and the address choice. find is
+// injected (main passes daemon.FindWorkspace) so the matrix is unit-testable
+// without a live daemon.
+//
+// The Unix socket is preferred over TCP: it needs no token, while a TCP-only
+// daemon relies on RAJ_CONTROL_TOKEN. The roots are a copy, primary first.
+func attachWorkspace(name string, clientMode, ctlAddrSet bool, args []string,
+	find func(string) (daemon.Entry, bool, error)) (roots []string, addr string, err error) {
+	if !clientMode {
+		return nil, "", errors.New("--workspace needs --attach or --phone")
+	}
+	if ctlAddrSet {
+		return nil, "", errors.New("--workspace and --control-addr are mutually exclusive")
+	}
+	if len(args) > 0 {
+		return nil, "", errors.New("--workspace cannot be combined with a file or directory argument")
+	}
+	e, found, err := find(name)
+	if err != nil {
+		return nil, "", err
+	}
+	if !found {
+		return nil, "", fmt.Errorf("no running daemon labelled %q; see `raj daemon list`", name)
+	}
+	if len(e.Roots) == 0 {
+		return nil, "", fmt.Errorf("daemon %q has no workspace roots", name)
+	}
+	switch {
+	case e.Socket != "":
+		addr = e.Socket
+	case e.TCP != "":
+		addr = e.TCP
+	default:
+		return nil, "", fmt.Errorf("daemon %q has no control address", name)
+	}
+	return append([]string(nil), e.Roots...), addr, nil
+}
+
 // runHost builds the host a run drives. --daemon is headless: no terminal, no
 // raw mode, frames discarded, and the idle tick as its only input, because a
 // daemon is driven over the control socket. The ordinary path is the native
@@ -340,10 +399,16 @@ func signalShutdown(daemon bool, ch chan os.Signal, shutdown func(), exit func(i
 	}
 }
 
-func run(path string, opts app.Options, ctlAddrs []string, headless bool) error {
-	root, path, err := resolve(path, opts.Standalone)
-	if err != nil {
-		return err
+func run(args []string, opts app.Options, ctlAddrs []string, headless bool) error {
+	// An attach that named a workspace already resolved its roots: the client
+	// builds over the daemon's workspace, so there is no argument to interpret.
+	roots, path := opts.Roots, ""
+	if len(roots) == 0 {
+		var err error
+		roots, path, err = resolve(args, opts.Standalone)
+		if err != nil {
+			return err
+		}
 	}
 
 	host, err := runHost(headless, os.Stdin, os.Stdout)
@@ -370,10 +435,10 @@ func run(path string, opts app.Options, ctlAddrs []string, headless bool) error 
 		// The daemon record outlives the run: Clear is registered before the
 		// session save and store close, so it runs after them and a reader
 		// never sees the record vanish ahead of the final save.
-		defer daemon.Clear(root)
+		defer daemon.Clear(roots)
 	}
 
-	a := app.NewWithOptions(host, root, opts)
+	a := app.NewWithRoots(host, roots, opts)
 	// The ctrl-alias builder refuses to overwrite an existing ctrl binding, so
 	// a phone loses the actions whose ctrl key is already taken. Say how many:
 	// silently missing is how a chord looks broken rather than unavailable.
@@ -435,7 +500,7 @@ func run(path string, opts app.Options, ctlAddrs []string, headless bool) error 
 				}
 			}
 			rec.Token = a.ControlToken()
-			if err := daemon.Record(root, rec); err != nil {
+			if err := daemon.Record(roots, rec); err != nil {
 				fmt.Fprintln(os.Stderr, "raj: daemon record:", err)
 			}
 		}
@@ -473,48 +538,74 @@ func run(path string, opts app.Options, ctlAddrs []string, headless bool) error 
 	return a.Run()
 }
 
-// resolve splits the argument into a workspace root and a file to open.
+// resolve splits the arguments into a workspace root set and at most one file
+// to open. A regular file is the file; every other argument is a root
+// directory. With no directory named the root set is the file's repository, or
+// the working directory when there is no file. The roots are canonicalised and
+// validated by workspace.New, so a nesting argument is an error.
 //
-// standalone is --standalone: the file's own directory is the root, with no
-// walk up to a repository, because a throwaway editor must not adopt the
+// standalone is --standalone: the file's own directory is the single root, with
+// no walk up to a repository, because a throwaway editor must not adopt the
 // project around a file. It requires exactly one file and refuses a directory.
-func resolve(arg string, standalone bool) (root, file string, err error) {
+func resolve(args []string, standalone bool) (roots []string, file string, err error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	if standalone {
+		if len(args) != 1 || args[0] == "" {
+			return nil, "", errors.New("--standalone needs exactly one file argument")
+		}
+		abs, err := filepath.Abs(args[0])
+		if err != nil {
+			return nil, "", err
+		}
+		if info, err := os.Stat(abs); err == nil && info.IsDir() {
+			return nil, "", fmt.Errorf("--standalone needs a file, not a directory: %s", args[0])
+		}
+		return []string{filepath.Dir(abs)}, abs, nil
+	}
+	var dirs []string
+	for _, arg := range args {
 		if arg == "" {
-			return "", "", errors.New("--standalone needs exactly one file argument")
+			continue
 		}
 		abs, err := filepath.Abs(arg)
 		if err != nil {
-			return "", "", err
+			return nil, "", err
 		}
-		if info, err := os.Stat(abs); err == nil && info.IsDir() {
-			return "", "", fmt.Errorf("--standalone needs a file, not a directory: %s", arg)
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			if file != "" {
+				return nil, "", fmt.Errorf("cannot open two files at once: %s and %s", file, abs)
+			}
+			file = abs
+			continue
 		}
-		return filepath.Dir(abs), abs, nil
+		dirs = append(dirs, abs)
 	}
-	if arg == "" {
-		return workspace(cwd), "", nil
+	if len(dirs) == 0 {
+		if file != "" {
+			dirs = append(dirs, filepath.Dir(file))
+		} else {
+			dirs = append(dirs, cwd)
+		}
 	}
-	abs, err := filepath.Abs(arg)
+	// Every directory roots at the repository the editor would choose, and
+	// workspace.New rejects a set that nests one root inside another.
+	for i, d := range dirs {
+		dirs[i] = workspaceRoot(d)
+	}
+	rs, err := ws.New(dirs...)
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
-	if info, err := os.Stat(abs); err == nil && info.IsDir() {
-		return workspace(abs), "", nil
-	}
-	// A file argument roots the workspace at the file's own project, not at
-	// wherever the shell happened to be.
-	return workspace(filepath.Dir(abs)), abs, nil
+	return rs.All(), file, nil
 }
 
-// workspace walks up to the nearest enclosing repository, falling back to the
+// workspaceRoot walks up to the nearest enclosing repository, falling back to the
 // directory itself. Editing one file in a project should still give you the
 // project to search and explore.
-func workspace(dir string) string {
+func workspaceRoot(dir string) string {
 	for d := dir; ; {
 		if info, err := os.Stat(filepath.Join(d, ".git")); err == nil && info != nil {
 			return d

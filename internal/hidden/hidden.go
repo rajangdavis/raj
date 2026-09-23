@@ -23,25 +23,27 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"raj/internal/workspace"
 )
 
-// File is the per-workspace configuration, relative to the workspace root.
-const File = ".raj/hidden"
+// File is the workspace configuration's file name: one file per workspace,
+// under WorkspaceFile's directory, and the same leaf in the user-level raj
+// config directory.
+const File = "hidden"
 
 // defaults are the patterns applied before any configuration is read.
 //
-// Three kinds of thing are here: raj's own state under .raj — the journal,
-// trash and session, which are the editor's scratch rather than the
-// repository's; version-control metadata, which is not source and is
-// enormous; and dependency or cache directories that are machine-generated.
-// Notably absent is the blanket dotfile rule: a dotfile at the root of a
-// repository is usually configuration someone maintains by hand.
+// Three kinds of thing are here: raj's own scratch under .raj — the journal,
+// trash and session — which is the editor's rather than the repository's;
+// version-control metadata, which is not source and is enormous; and
+// dependency or cache directories that are machine-generated. Notably absent
+// is the blanket dotfile rule: a dotfile at the root of a repository is
+// usually configuration someone maintains by hand.
 var defaults = []string{
-	// The scratch under .raj — journal logs, trash, session — but not
-	// .raj/hidden, the user's own configuration file, which stays visible so
-	// the file that configures the editor can be opened from it.
-	".raj/*",
-	"!.raj/hidden",
+	// Raj's scratch, now that the workspace configuration has moved to XDG.
+	// Hidden whole: nothing inside .raj is repository content any more.
+	".raj/",
 	".git/",
 	".hg/",
 	".svn/",
@@ -97,10 +99,12 @@ func Everything() *Rules { return &Rules{} }
 func Parse(text string) *Rules { return parse(strings.Join(defaults, "\n")+"\n"+text, nil) }
 
 // Load returns the defaults, then any user-level configuration, then the
-// workspace's own — each appended, so the more specific file wins.
-func Load(root string) *Rules {
+// workspace's own — each appended, so the more specific file wins. The
+// workspace file is keyed by the whole root set, so a workspace has one config
+// rather than one per root.
+func Load(roots []string) *Rules {
 	r := parse(strings.Join(defaults, "\n"), nil)
-	for _, p := range configPaths(root) {
+	for _, p := range configPaths(roots) {
 		data, err := os.ReadFile(p)
 		if err != nil {
 			continue
@@ -111,22 +115,52 @@ func Load(root string) *Rules {
 	return r
 }
 
+// WorkspaceFile is the path of a workspace's own configuration: one file per
+// root set, keyed by workspace.StateKey and kept beside the workspace's state
+// in XDG rather than inside the project, so a checkout stays clean and two
+// projects cannot collide. Empty when there is no home to put it under, or no
+// root to key on.
+func WorkspaceFile(roots []string) string {
+	dir := configDir()
+	if dir == "" || !hasRoot(roots) {
+		return ""
+	}
+	return filepath.Join(dir, "raj", "workspaces", workspace.StateKey(roots), File)
+}
+
 // configPaths lists the files Load reads, least specific first.
-func configPaths(root string) []string {
+func configPaths(roots []string) []string {
 	var out []string
-	dir := os.Getenv("XDG_CONFIG_HOME")
-	if dir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			dir = filepath.Join(home, ".config")
-		}
+	if dir := configDir(); dir != "" {
+		out = append(out, filepath.Join(dir, "raj", File))
 	}
-	if dir != "" {
-		out = append(out, filepath.Join(dir, "raj", "hidden"))
-	}
-	if root != "" {
-		out = append(out, filepath.Join(root, filepath.FromSlash(File)))
+	if p := WorkspaceFile(roots); p != "" {
+		out = append(out, p)
 	}
 	return out
+}
+
+// configDir is XDG_CONFIG_HOME, or $HOME/.config, or "" when neither is known.
+func configDir() string {
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config")
+}
+
+// hasRoot reports whether the set names at least one root. A set of empty
+// strings is the no-workspace state, which has no workspace config.
+func hasRoot(roots []string) bool {
+	for _, r := range roots {
+		if strings.TrimSpace(r) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func parse(text string, onto *Rules) *Rules {

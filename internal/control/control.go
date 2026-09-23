@@ -168,6 +168,11 @@ type Request struct {
 	// connections; Name is for display.
 	Identity string
 	Name     string
+	// Kind is what a hello joins as. Empty means an agent, which is the
+	// pre-existing wire default; "human" joins KindHuman, so an attached
+	// client can be the second person at the workspace rather than another
+	// agent.
+	Kind string
 	// Group addresses a change set for accept, reject and clear.
 	Group uint64
 	// DumpID addresses a snapshot for patch: the id a prior dump returned.
@@ -719,11 +724,18 @@ type Proposal struct {
 // Response is one line out. Err is a string rather than a code because the
 // consumer is a human at a socket at least as often as it is a program.
 type Response struct {
-	ID      int
-	OK      bool
-	Err     string
-	Root    string
-	PID     int
+	ID   int
+	OK   bool
+	Err  string
+	Root string
+	// Roots is the whole workspace root set, primary first, on a ping or
+	// buffers reply. It is sparse: a server that does not know the field sends
+	// none, and a client reads absence as "no set" and keeps its own root. It
+	// is what an attach client adopts as its visible workspace, so the tree
+	// and search show the daemon's roots rather than the launch directory.
+	Roots []string
+	PID   int
+
 	Buffers []Buffer
 	Matches []SearchMatch
 	Files   int
@@ -1315,7 +1327,18 @@ func (s *Server) serve(conn net.Conn, network string) {
 					Participants: s.Participants.List()})
 				continue
 			}
-			id, err := s.Participants.Join(identity, req.Name, KindAgent)
+			// The control token is shared with agents in a container, so a TCP
+			// caller could otherwise self-declare human and bypass the proposal
+			// gate. The token proves the caller reached the editor, not that it
+			// is the person at the keyboard: only the local Unix socket is the
+			// human's own connection. Anywhere else a requested human is
+			// downgraded to an agent, which still connects and works — just
+			// proposal-only.
+			kind := KindAgent
+			if req.Kind == string(KindHuman) && network == "unix" {
+				kind = KindHuman
+			}
+			id, err := s.Participants.Join(identity, req.Name, kind)
 			if err != nil {
 				c.send(Response{ID: req.ID, Err: err.Error(), Final: true})
 				continue

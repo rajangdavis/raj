@@ -56,8 +56,8 @@ func (h *harness) openSidebar(chord string, want Sidebar) {
 
 // explorerSelect moves the tree selection onto the entry whose base name is
 // name. Tests address the tree by what it shows rather than by an index: the
-// visible .raj directory is one more entry at the top, so a fixed number of
-// down presses no longer lands where it used to.
+// set of visible entries is not fixed, so a fixed number of down presses would
+// be brittle.
 func explorerSelect(t *testing.T, h *harness, name string) {
 	t.Helper()
 	for i, e := range h.Explorer.Tree.Entries() {
@@ -91,8 +91,8 @@ func TestExplorerExpandsDirectory(t *testing.T) {
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	before := len(h.Explorer.Tree.Entries())
 
-	// Select pkg/ by name: the tree lists .raj first, and expanding that
-	// reveals nothing because every child under .raj/* is hidden.
+	// Select pkg/ by name rather than by index: the tree's entry order is not
+	// fixed.
 	explorerSelect(t, h, "pkg")
 	h.press("enter")
 	if got := len(h.Explorer.Tree.Entries()); got <= before {
@@ -1184,7 +1184,7 @@ func TestPasteIntoPicker(t *testing.T) {
 func TestPasteIntoPickerNarrowsAPath(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
-	h.Handle(ui.Paste{Text: filepath.Join(h.root, "main.go") + ":12:4\n"})
+	h.Handle(ui.Paste{Text: filepath.Join(h.primaryRoot(), "main.go") + ":12:4\n"})
 	h.drain()
 	if h.Picker.Results() == 0 {
 		t.Fatalf("pasted path matched nothing; query = %q", h.Picker.Query())
@@ -1200,7 +1200,7 @@ func TestPasteIntoPickerNarrowsAPath(t *testing.T) {
 func TestPasteIntoPickerOpensAtThePosition(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
-	h.Handle(ui.Paste{Text: filepath.Join(h.root, "pkg/helper.go") + ":3:6\n"})
+	h.Handle(ui.Paste{Text: filepath.Join(h.primaryRoot(), "pkg/helper.go") + ":3:6\n"})
 	h.drain()
 	h.press("enter")
 

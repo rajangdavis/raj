@@ -155,7 +155,13 @@ func (a *App) locationRows(locs []lsp.Location) []picker.Reference {
 	rows := make([]picker.Reference, 0, len(locs))
 	for _, loc := range locs {
 		rel := loc.Path
-		if relPath, err := filepath.Rel(a.root, loc.Path); err == nil {
+		// The location can lie outside every root; fall back to the primary
+		// root, which is where the single-root code spelled it.
+		root := a.rootFor(loc.Path)
+		if root == "" {
+			root = a.primaryRoot()
+		}
+		if relPath, err := filepath.Rel(root, loc.Path); err == nil {
 			rel = relPath
 		}
 		line := loc.Range.Start.Line + 1

@@ -79,6 +79,13 @@ type fakeEditor struct {
 	// lspJSON is the canned answer an lsp request returns, verbatim, so a test
 	// can drive the CLI's diagnostics handling without a language server.
 	lspJSON string
+	// lspJSONByPath is the per-path canned diagnostics answer, so a multi-path
+	// sweep can be driven with a distinct status per file. A map with no entry
+	// for a path falls back to lspJSON.
+	lspJSONByPath map[string]string
+	// lspErrByPath makes an lsp request for a path fail, standing in for a file
+	// the host cannot load; the path must still appear in a batch answer.
+	lspErrByPath map[string]string
 	// lastLSP records the lspprep request, so a CLI test can assert that the
 	// inlay-hints mode and its -lines range reached the wire.
 	lastLSP Request
@@ -232,7 +239,13 @@ func (f *fakeEditor) run(req Request) Response {
 		return Response{OK: true, Searcher: f}
 	case "ping":
 		f.authors = append(f.authors, req.Author)
-		return Response{OK: true, Root: "/w", PID: 1}
+		return Response{OK: true, Root: "/w", Roots: []string{"/w"}, PID: 1}
+	case "version":
+		text, ok := f.docs[path]
+		if !ok {
+			return Response{Err: "no open buffer for " + path}
+		}
+		return Response{OK: true, Version: f.vers[path], Bytes: len(text), Lines: fakeLineCount(text)}
 	case "buffers":
 		var bufs []Buffer
 		for p, text := range f.docs {
@@ -246,7 +259,7 @@ func (f *fakeEditor) run(req Request) Response {
 				Moved:    f.moved[p]})
 
 		}
-		return Response{OK: true, Root: "/w", Buffers: bufs}
+		return Response{OK: true, Root: "/w", Roots: []string{"/w"}, Buffers: bufs}
 	case "text":
 		if len(req.Paths) > 0 {
 			// The multi-target form, mirroring the real Dispatch: one span per
@@ -260,12 +273,37 @@ func (f *fakeEditor) run(req Request) Response {
 				if !ok {
 					return Response{Err: "no open buffer for " + p}
 				}
-				res.Spans = append(res.Spans, Span{Text: text, Author: FirstAgent})
-				res.Buffers = append(res.Buffers, Buffer{Path: p, Version: f.vers[p], Bytes: len(text)})
-				if req.Annotated {
-					states = append(states, fmt.Sprintf(`{"off":%d,"len":%d,"group":0,"state":"accepted"}`, off, len(text)))
+				// The request span selects the same range in every target,
+				// mirroring the real Dispatch's shared span.
+				out := text
+				switch {
+				case req.LineStart != nil:
+					out = fakeLineSpan(text, *req.LineStart, req.LineEnd)
+				case req.Start != nil:
+					start, end := *req.Start, len(text)
+					if req.End != nil {
+						end = *req.End
+					}
+					if start < 0 {
+						start = 0
+					}
+					if start > len(text) {
+						start = len(text)
+					}
+					if end > len(text) {
+						end = len(text)
+					}
+					if end < start {
+						end = start
+					}
+					out = text[start:end]
 				}
-				off += len(text)
+				res.Spans = append(res.Spans, Span{Text: out, Author: FirstAgent})
+				res.Buffers = append(res.Buffers, Buffer{Path: p, Version: f.vers[p], Bytes: len(out), Lines: fakeLineCount(out)})
+				if req.Annotated {
+					states = append(states, fmt.Sprintf(`{"off":%d,"len":%d,"group":0,"state":"accepted"}`, off, len(out)))
+				}
+				off += len(out)
 			}
 			if len(states) > 0 {
 				res.StatesJSON = "[" + strings.Join(states, ",") + "]"
@@ -283,7 +321,10 @@ func (f *fakeEditor) run(req Request) Response {
 		if req.End != nil {
 			end = *req.End
 		}
-		if start < 0 {
+		if req.LineStart != nil {
+			text = fakeLineSpan(text, *req.LineStart, req.LineEnd)
+			start, end = 0, len(text)
+		} else if start < 0 {
 			start, end = 0, len(text)
 		} else {
 			if end < 0 || end > len(text) {
@@ -293,7 +334,8 @@ func (f *fakeEditor) run(req Request) Response {
 				start = len(text)
 			}
 		}
-		res := Response{OK: true, Spans: []Span{{Text: text[start:end], Author: FirstAgent}}, Version: f.vers[path]}
+		res := Response{OK: true, Bytes: len(f.docs[path]), Lines: fakeLineCount(f.docs[path]),
+			Spans: []Span{{Text: text[start:end], Author: FirstAgent}}, Version: f.vers[path]}
 		if req.Annotated {
 			res.StatesJSON = fmt.Sprintf(`[{"off":0,"len":%d,"group":0,"state":"accepted"}]`, end-start)
 		}
@@ -464,7 +506,14 @@ func (f *fakeEditor) run(req Request) Response {
 		return Response{OK: true, Remains: req.Discard && f.remains}
 	case "lspprep":
 		f.lastLSP = req
-		return Response{OK: true, LSP: fakeLSP{json: f.lspJSON}}
+		if msg, ok := f.lspErrByPath[req.Path]; ok {
+			return Response{Err: msg}
+		}
+		j := f.lspJSON
+		if v, ok := f.lspJSONByPath[req.Path]; ok {
+			j = v
+		}
+		return Response{OK: true, LSP: fakeLSP{json: j}}
 	case "claim":
 		f.lastClaim = req
 		switch {
@@ -521,6 +570,35 @@ func (f *fakeEditor) run(req Request) Response {
 type fakeLSP struct{ json string }
 
 func (f fakeLSP) Run(context.Context) ([]byte, error) { return []byte(f.json), nil }
+
+// fakeLineCount is the number of lines a version reply reports: one per newline
+// plus the final (possibly empty) line, matching view.Index and File.Lines.
+func fakeLineCount(text string) int { return strings.Count(text, "\n") + 1 }
+
+// fakeLineSpan is a 1-based inclusive line range, mirroring the host's own
+// translation: a missing end reads to the end and a start past the document
+// lands on the final empty line.
+func fakeLineSpan(text string, first int, last *int) string {
+	starts := []int{0}
+	for i := 0; i < len(text); i++ {
+		if text[i] == '\n' {
+			starts = append(starts, i+1)
+		}
+	}
+	lines := len(starts)
+	start := first - 1
+	if start < 0 {
+		start = 0
+	}
+	if start >= lines {
+		start = lines - 1
+	}
+	end := len(text)
+	if last != nil && *last > 0 && *last < lines {
+		end = starts[*last]
+	}
+	return text[starts[start]:end]
+}
 
 func run(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
@@ -757,6 +835,165 @@ func TestCLIReadAnnotated(t *testing.T) {
 	}
 	if !strings.Contains(out, `"states"`) || !strings.Contains(out, `"accepted"`) {
 		t.Errorf("annotated json = %q, want states", out)
+	}
+}
+
+// read --json carries the whole-file byte length and line count, the same
+// numbers version --json reports, so a driver that just read the text does not
+// make a second call for the length before appending.
+//
+// Precondition: /w/a.go holds the 23-byte, 4-line text "package a\n\nfunc
+// f() {}\n", and the read is whole-file.
+func TestCLIReadJSONCarriesFileSize(t *testing.T) {
+	const text = "package a\n\nfunc f() {}\n"
+	newFakeEditor(t, map[string]string{"/w/a.go": text})
+
+	out, errs, code := run(t, "read", "-json", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("read -json code %d: %s", code, errs)
+	}
+	var got struct {
+		Text    string `json:"text"`
+		Version uint64 `json:"version"`
+		Author  uint8  `json:"author"`
+		Spans   []any  `json:"spans"`
+		Bytes   int    `json:"bytes"`
+		Lines   int    `json:"lines"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, out)
+	}
+	if got.Text != text {
+		t.Fatalf("text = %q, want %q", got.Text, text)
+	}
+	if got.Bytes != len(text) || got.Lines != fakeLineCount(text) {
+		t.Errorf("read bytes/lines = %d/%d, want %d/%d",
+			got.Bytes, got.Lines, len(text), fakeLineCount(text))
+	}
+
+	// The same file through version --json: the two must agree, or the read
+	// still needs the second call this change removes.
+	vout, verrs, vcode := run(t, "version", "-json", "/w/a.go")
+	if vcode != 0 {
+		t.Fatalf("version -json code %d: %s", vcode, verrs)
+	}
+	var ver struct {
+		Version uint64 `json:"version"`
+		Bytes   int    `json:"bytes"`
+		Lines   int    `json:"lines"`
+	}
+	if err := json.Unmarshal([]byte(vout), &ver); err != nil {
+		t.Fatalf("version -json is not parseable: %v (%q)", err, vout)
+	}
+	if got.Version != ver.Version || got.Bytes != ver.Bytes || got.Lines != ver.Lines {
+		t.Errorf("read %d/%d/%d != version %d/%d/%d",
+			got.Version, got.Bytes, got.Lines, ver.Version, ver.Bytes, ver.Lines)
+	}
+}
+
+// A span read still reports the whole-file bytes and lines, not the returned
+// span: the append use case needs the file length even when the text is a
+// window. A regression that reported the returned text length would show bytes
+// 6 and lines 1 here.
+//
+// Precondition: /w/a.go is the 23-byte, 4-line text above; the byte span
+// [11,17) is "func f" and the line range 3,3 is "func f() {}\n".
+func TestCLIReadJSONSpanReportsWholeFile(t *testing.T) {
+	const text = "package a\n\nfunc f() {}\n"
+	newFakeEditor(t, map[string]string{"/w/a.go": text})
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"bytes", []string{"read", "-json", "-start", "11", "-end", "17", "/w/a.go"}, "func f"},
+		{"lines", []string{"read", "-json", "-lines", "3,3", "/w/a.go"}, "func f() {}\n"},
+	} {
+		out, errs, code := run(t, tc.args...)
+		if code != 0 {
+			t.Fatalf("%s: code %d: %s", tc.name, code, errs)
+		}
+		var got struct {
+			Text  string `json:"text"`
+			Bytes int    `json:"bytes"`
+			Lines int    `json:"lines"`
+		}
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("%s: %v (%q)", tc.name, err, out)
+		}
+		if got.Text != tc.want {
+			t.Errorf("%s: text = %q, want %q", tc.name, got.Text, tc.want)
+		}
+		if got.Bytes != len(text) || got.Lines != fakeLineCount(text) {
+			t.Errorf("%s: bytes/lines = %d/%d, want the whole file %d/%d",
+				tc.name, got.Bytes, got.Lines, len(text), fakeLineCount(text))
+		}
+	}
+}
+
+// A multi-target read carries per-file bytes and lines, each file its own, so a
+// batch read is one call for both text and size.
+//
+// Precondition: two whole-file reads of different sizes, so a shared value
+// could not pass for both.
+func TestCLIReadManyJSONCarriesPerFileSizes(t *testing.T) {
+	docs := map[string]string{
+		"/w/a.go": "package a\n",
+		"/w/b.go": "package b\n\n// two\n",
+	}
+	newFakeEditor(t, docs)
+
+	out, errs, code := run(t, "read", "-json", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("multi read -json code %d: %s", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path  string `json:"path"`
+			Text  string `json:"text"`
+			Bytes int    `json:"bytes"`
+			Lines int    `json:"lines"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("multi read -json is not parseable: %v (%q)", err, out)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want two entries", got.Files)
+	}
+	for _, f := range got.Files {
+		text, ok := docs[f.Path]
+		if !ok {
+			t.Fatalf("unexpected file %q in %+v", f.Path, got.Files)
+		}
+		if f.Text != text {
+			t.Errorf("%s text = %q, want %q", f.Path, f.Text, text)
+		}
+		if f.Bytes != len(text) || f.Lines != fakeLineCount(text) {
+			t.Errorf("%s bytes/lines = %d/%d, want %d/%d",
+				f.Path, f.Bytes, f.Lines, len(text), fakeLineCount(text))
+		}
+	}
+}
+
+// The added bytes/lines keys are additive: author, spans, text and version are
+// still there, so a driver written against the old shape keeps reading it.
+func TestCLIReadJSONKeepsExistingKeys(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	out, errs, code := run(t, "read", "-json", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("read -json code %d: %s", code, errs)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &keys); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, out)
+	}
+	for _, k := range []string{"author", "spans", "text", "version", "bytes", "lines"} {
+		if _, ok := keys[k]; !ok {
+			t.Errorf("read -json is missing %q: %s", k, out)
+		}
 	}
 }
 
@@ -2634,7 +2871,7 @@ func TestSearchPathIsRootMapped(t *testing.T) {
 // path-like Old or New is not rewritten along with the Group path beside it.
 func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 	var c Client
-	c.SetMapper(Mapper{Local: "/workspace", Editor: "/Users/rajan/src/raj"})
+	c.SetMapper(NewMapper(Pair{Local: "/workspace", Editor: "/Users/rajan/src/raj"}))
 
 	res := Response{
 		Root:      "/Users/rajan/src/raj",
@@ -2695,7 +2932,7 @@ func TestLocaliseRewritesNestedAndProsePaths(t *testing.T) {
 // path inside the mapped tree, and rewriting it would corrupt the message.
 func TestLocaliseErrLeavesNonBoundaryAlone(t *testing.T) {
 	var c Client
-	c.SetMapper(Mapper{Local: "/workspace", Editor: "/Users/rajan/src/raj"})
+	c.SetMapper(NewMapper(Pair{Local: "/workspace", Editor: "/Users/rajan/src/raj"}))
 	res := Response{Err: "no open buffer for /Users/rajan/src/rajx/a.go"}
 	c.localise(&res)
 	if res.Err != "no open buffer for /Users/rajan/src/rajx/a.go" {
@@ -4236,6 +4473,158 @@ func TestCLILSPDiagnosticsSweepsMultiplePaths(t *testing.T) {
 	}
 }
 
+// A multi-path -json sweep is one framed document, not one bare object per
+// operand. Each entry names the path it answers, so a reader can attribute a
+// status without counting lines; before this the output was N objects with no
+// path and json.Unmarshal of the whole stream failed on trailing data.
+func TestCLILSPDiagnosticsBatchJSONIsFramed(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.lspJSONByPath = map[string]string{
+		"/w/a.go": `{"status":"ok"}`,
+		"/w/b.go": `{"status":"ok"}`,
+	}
+	out, errs, code := run(t, "lsp", "diagnostics", "/w/a.go", "/w/b.go", "-json")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path   string `json:"path"`
+			Status string `json:"status"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("batch -json is not one document: %v (%q)", err, out)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want one entry per operand", got.Files)
+	}
+	for i, want := range []string{"/w/a.go", "/w/b.go"} {
+		if got.Files[i].Path != want || got.Files[i].Status != "ok" {
+			t.Errorf("file %d = %+v, want path %q status ok", i, got.Files[i], want)
+		}
+	}
+}
+
+// An operand the editor never answered still gets an entry, and a status stays
+// with the path that produced it: asking b first and leaving a unanswered must
+// not shift b's status onto a's entry, which a positional reader of the old
+// per-operand lines would do.
+func TestCLILSPDiagnosticsBatchAttributesEachPath(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.lspJSONByPath = map[string]string{
+		"/w/b.go": `{"status":"starting","detail":"starting language server..."}`,
+	}
+	ed.lspErrByPath = map[string]string{"/w/a.go": "no open buffer for /w/a.go"}
+	out, errs, code := run(t, "lsp", "diagnostics", "/w/b.go", "/w/a.go", "-json")
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 for a refused and a starting path; stderr %q", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path   string `json:"path"`
+			Status string `json:"status"`
+			Detail string `json:"detail"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("batch -json = %q: %v", out, err)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want two entries", got.Files)
+	}
+	if got.Files[0].Path != "/w/b.go" || got.Files[0].Status != "starting" {
+		t.Errorf("entry 0 = %+v, want b starting", got.Files[0])
+	}
+	if got.Files[1].Path != "/w/a.go" || got.Files[1].Status != "error" {
+		t.Errorf("entry 1 = %+v, want a with an error status", got.Files[1])
+	}
+	if !strings.Contains(got.Files[1].Detail, "no open buffer") {
+		t.Errorf("detail = %q, want the refusal", got.Files[1].Detail)
+	}
+	if !strings.Contains(errs, "no open buffer") {
+		t.Errorf("stderr = %q, want the refusal named there too", errs)
+	}
+}
+
+// A cold start must not corrupt a -json sweep. The message is folded into the
+// entry's status and detail rather than interleaved as a bare line, so stdout
+// stays one document; before this a bare object per path left the whole stream
+// unparseable.
+func TestCLILSPDiagnosticsBatchColdStartStaysJSON(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.lspJSONByPath = map[string]string{
+		"/w/a.go": `{"status":"starting","detail":"starting language server..."}`,
+		"/w/b.go": `{"status":"ok"}`,
+	}
+	out, _, code := run(t, "lsp", "diagnostics", "/w/a.go", "/w/b.go", "-json")
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 while a server is starting", code)
+	}
+	var got struct {
+		Files []struct {
+			Path   string `json:"path"`
+			Status string `json:"status"`
+			Detail string `json:"detail"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("cold-start -json is not one document: %v (%q)", err, out)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want two entries", got.Files)
+	}
+	if got.Files[0].Status != "starting" || !strings.Contains(got.Files[0].Detail, "starting language server") {
+		t.Errorf("first entry = %+v, want the starting message in its status", got.Files[0])
+	}
+	if got.Files[1].Status != "ok" {
+		t.Errorf("second status = %q, want ok", got.Files[1].Status)
+	}
+}
+
+// Single-path -json keeps its bare object: no files wrapper is introduced, so
+// a driver written against the one-file shape keeps reading it.
+func TestCLILSPDiagnosticsSinglePathJSONUnchanged(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.lspJSON = `{"status":"ok","diagnostics":[{"line":1,"message":"boom"}]}`
+	out, errs, code := run(t, "lsp", "diagnostics", "/w/a.go", "-json")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	var one LSPResult
+	if err := json.Unmarshal([]byte(out), &one); err != nil {
+		t.Fatalf("single-path -json = %q: %v", out, err)
+	}
+	if one.Status != "ok" || len(one.Diags) != 1 || one.Diags[0].Message != "boom" {
+		t.Errorf("single-path result = %+v", one)
+	}
+	if strings.Contains(out, `"files"`) {
+		t.Errorf("single-path -json grew a files wrapper: %q", out)
+	}
+}
+
+// The plain sweep is still human-readable and now names each path above its
+// own status, so two files' answers do not run together unlabelled.
+func TestCLILSPDiagnosticsPlainNamesEachPath(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.lspJSONByPath = map[string]string{
+		"/w/a.go": `{"status":"ok"}`,
+		"/w/b.go": `{"status":"ok"}`,
+	}
+	out, errs, code := run(t, "lsp", "diagnostics", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	for _, want := range []string{"==> /w/a.go <==", "==> /w/b.go <=="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plain sweep is missing %q: %q", want, out)
+		}
+	}
+	if got := strings.Count(out, `"status": "ok"`); got != 2 {
+		t.Errorf("plain sweep statuses = %d, want one per path (out %q)", got, out)
+	}
+}
+
 // The CLI usage lists the reload verb and the save force flag, so a driver
 // reading the help can find both.
 func TestCLIUsageListsReloadAndForce(t *testing.T) {
@@ -4288,5 +4677,310 @@ func TestPrintFlagUsageSpellingAndPlaceholders(t *testing.T) {
 		if strings.Contains(text, placeholder) {
 			t.Errorf("bool flag printed a value placeholder (%s):\n%s", placeholder, text)
 		}
+	}
+}
+
+// --at gives each path its own line span, so one read invocation batches
+// different regions of different files. Each -json entry echoes the span it
+// read, so a driver re-derives offsets without a second call.
+//
+// Precondition: /w/a.go is four lines and /w/b.go is five, so a shared span
+// could not produce both texts; --at /w/a.go=1,2 /w/b.go=3,4 selects
+// different regions.
+func TestCLIReadAtPerTargetSpans(t *testing.T) {
+	newFakeEditor(t, map[string]string{
+		"/w/a.go": "a one\na two\na three\n",
+		"/w/b.go": "b one\nb two\nb three\nb four\n",
+	})
+
+	out, errs, code := run(t, "read", "-json", "--at", "/w/a.go=1,2", "--at", "/w/b.go=3,4")
+	if code != 0 {
+		t.Fatalf("read --at: code %d: %s", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path      string `json:"path"`
+			Text      string `json:"text"`
+			LineStart int    `json:"line_start"`
+			LineEnd   int    `json:"line_end"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("read --at -json is not parseable: %v (%q)", err, out)
+	}
+	type want struct {
+		path, text string
+		lo, hi     int
+	}
+	wants := []want{
+		{"/w/a.go", "a one\na two\n", 1, 2},
+		{"/w/b.go", "b three\nb four\n", 3, 4},
+	}
+	if len(got.Files) != len(wants) {
+		t.Fatalf("files = %+v, want %d entries", got.Files, len(wants))
+	}
+	for i, w := range wants {
+		f := got.Files[i]
+		if f.Path != w.path || f.Text != w.text || f.LineStart != w.lo || f.LineEnd != w.hi {
+			t.Errorf("files[%d] = %+v, want %+v", i, f, w)
+		}
+	}
+
+	// The plain form keeps the per-target framing, each target its own text.
+	pout, perrs, pcode := run(t, "read", "--at", "/w/a.go=1,2", "--at", "/w/b.go=3,4")
+	if pcode != 0 {
+		t.Fatalf("plain read --at: code %d: %s", pcode, perrs)
+	}
+	if !strings.Contains(pout, "==> /w/a.go <==\na one\na two\n") ||
+		!strings.Contains(pout, "==> /w/b.go <==\nb three\nb four\n") {
+		t.Errorf("plain read --at = %q", pout)
+	}
+}
+
+// The --at split is on the last "=", so a path that itself contains "=" is
+// still addressable; the span is what follows the final "=".
+func TestCLIReadAtPathWithEquals(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a=b.go": "x\ny\nz\n"})
+
+	out, errs, code := run(t, "read", "-json", "--at", "/w/a=b.go=1,2")
+	if code != 0 {
+		t.Fatalf("read --at with = in path: code %d: %s", code, errs)
+	}
+	var got struct {
+		Text      string `json:"text"`
+		LineStart int    `json:"line_start"`
+		LineEnd   int    `json:"line_end"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, out)
+	}
+	if got.Text != "x\ny\n" || got.LineStart != 1 || got.LineEnd != 2 {
+		t.Errorf("read = %+v, want text %q lines 1..2", got, "x\ny\n")
+	}
+}
+
+// A malformed --at is refused by name, not silently ignored or read whole.
+func TestCLIReadAtMalformed(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "one\ntwo\nthree\n"})
+
+	for _, bad := range []string{"/w/a.go=1", "/w/a.go=0,2", "/w/a.go=2,1", "/w/a.go=x,2", "/w/a.go"} {
+		out, errs, code := run(t, "read", "--at", bad)
+		if code != 2 {
+			t.Errorf("--at %q: code = %d, want 2 (usage); stdout %q", bad, code, out)
+		}
+		if !strings.Contains(errs, bad) {
+			t.Errorf("--at %q: stderr %q does not name the entry", bad, errs)
+		}
+	}
+}
+
+// A positional path named by --at is read once at that span, and a positional
+// path without --at still reads whole — in one invocation.
+//
+// Precondition: /w/a.go has three content lines, so the 2,2 span is "a two"
+// and the whole-file read of /w/b.go is longer than its own file.
+func TestCLIReadAtDeduplicatesAndKeepsOthersWhole(t *testing.T) {
+	newFakeEditor(t, map[string]string{
+		"/w/a.go": "a one\na two\na three\n",
+		"/w/b.go": "b one\nb two\n",
+	})
+
+	out, errs, code := run(t, "read", "-json", "--at", "/w/a.go=2,2", "/w/a.go", "/w/b.go")
+	if code != 0 {
+		t.Fatalf("read: code %d: %s", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path      string `json:"path"`
+			Text      string `json:"text"`
+			LineStart *int   `json:"line_start"`
+			LineEnd   *int   `json:"line_end"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, out)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want 2 (the named path read once)", got.Files)
+	}
+	if got.Files[0].Path != "/w/a.go" || got.Files[0].Text != "a two\n" ||
+		got.Files[0].LineStart == nil || *got.Files[0].LineStart != 2 ||
+		got.Files[0].LineEnd == nil || *got.Files[0].LineEnd != 2 {
+		t.Errorf("files[0] = %+v, want /w/a.go at 2,2", got.Files[0])
+	}
+	if got.Files[1].Path != "/w/b.go" || got.Files[1].Text != "b one\nb two\n" ||
+		got.Files[1].LineStart != nil {
+		t.Errorf("files[1] = %+v, want /w/b.go whole with no line span", got.Files[1])
+	}
+
+	// The same path named once positionally and once by --at is still one
+	// target: the single-target plain output is the span text alone.
+	sout, serrs, scode := run(t, "read", "--at", "/w/a.go=2,2", "/w/a.go")
+	if scode != 0 {
+		t.Fatalf("single read --at: code %d: %s", scode, serrs)
+	}
+	if sout != "a two\n" {
+		t.Errorf("single read --at = %q, want the span text once", sout)
+	}
+
+	// --at wins for the path it names without erroring, and a path it does
+	// not name still reads at the global span.
+	gout, gerrs, gcode := run(t, "read", "-json", "-lines", "1,1", "--at", "/w/a.go=3,3", "/w/a.go", "/w/b.go")
+	if gcode != 0 {
+		t.Fatalf("read --at with global --lines: code %d: %s", gcode, gerrs)
+	}
+	var mixed struct {
+		Files []struct {
+			Path string `json:"path"`
+			Text string `json:"text"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(gout), &mixed); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, gout)
+	}
+	if len(mixed.Files) != 2 || mixed.Files[0].Text != "a three\n" || mixed.Files[1].Text != "b one\n" {
+		t.Errorf("mixed spans = %+v, want --at to win for a.go and --lines for b.go", mixed.Files)
+	}
+}
+
+// The single-target -json now echoes the line span it read, closing the gap
+// where the driver had to re-derive it. A byte span keeps the shape it had.
+//
+// Precondition: /w/a.go is the 23-byte text "package a\n\nfunc f() {}\n"; the
+// line range 3,3 is "func f() {}\n" and the byte span [11,17) is "func f".
+func TestCLIReadJSONEchoesLineSpan(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
+
+	out, errs, code := run(t, "read", "-json", "-lines", "3,3", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("read -json -lines: code %d: %s", code, errs)
+	}
+	var span struct {
+		Text      string `json:"text"`
+		LineStart *int   `json:"line_start"`
+		LineEnd   *int   `json:"line_end"`
+	}
+	if err := json.Unmarshal([]byte(out), &span); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, out)
+	}
+	if span.Text != "func f() {}\n" || span.LineStart == nil || *span.LineStart != 3 ||
+		span.LineEnd == nil || *span.LineEnd != 3 {
+		t.Errorf("read -lines 3,3 = %+v, want text and span 3..3", span)
+	}
+
+	// A byte span carries no line span, as before.
+	bout, berrs, bcode := run(t, "read", "-json", "-start", "11", "-end", "17", "/w/a.go")
+	if bcode != 0 {
+		t.Fatalf("read -json -start: code %d: %s", bcode, berrs)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(bout), &keys); err != nil {
+		t.Fatalf("read -json is not parseable: %v (%q)", err, bout)
+	}
+	if _, ok := keys["line_start"]; ok {
+		t.Errorf("a byte span grew a line_start: %s", bout)
+	}
+}
+
+// -q repeats: one search call searches several patterns and labels each hit
+// with the pattern that matched it. A single -q is byte-for-byte what it was.
+//
+// Precondition: /w/a.go holds "alpha\nbeta\ngamma\n", so alpha is line 1 and
+// gamma line 3; today a repeated -q would carry only the last pattern.
+func TestSearchMultipleQueries(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "alpha\nbeta\ngamma\n"})
+
+	out, errs, code := run(t, "search", "-q", "alpha", "-q", "gamma")
+	if code != 0 {
+		t.Fatalf("search two patterns: code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "alpha\t/w/a.go:1:0:alpha") ||
+		!strings.Contains(out, "gamma\t/w/a.go:3:0:gamma") {
+		t.Errorf("search two patterns = %q, want both hits labelled with their pattern", out)
+	}
+
+	// A single pattern is unchanged: no pattern prefix, exact bytes.
+	sout, serrs, scode := run(t, "search", "-q", "alpha")
+	if scode != 0 {
+		t.Fatalf("single search: code %d: %s", scode, serrs)
+	}
+	if sout != "/w/a.go:1:0:alpha\n" {
+		t.Errorf("single search = %q, want the unprefixed line", sout)
+	}
+
+	// The context header names the pattern when several were given.
+	cout, cerrs, ccode := run(t, "search", "-q", "alpha", "-q", "gamma", "-context", "1")
+	if ccode != 0 {
+		t.Fatalf("search -context: code %d: %s", ccode, cerrs)
+	}
+	if !strings.Contains(cout, "alpha\t/w/a.go:1:0 version 1") ||
+		!strings.Contains(cout, "gamma\t/w/a.go:3:0 version 1") {
+		t.Errorf("multi -context = %q, want the pattern named in each block header", cout)
+	}
+
+	// The whole-JSON form carries the pattern on each match when several were
+	// given, and no pattern key for a single one.
+	jout, jerrs, jcode := run(t, "search", "-q", "alpha", "-q", "gamma", "-json")
+	if jcode != 0 {
+		t.Fatalf("search -json: code %d: %s", jcode, jerrs)
+	}
+	var multi struct {
+		Matches []struct {
+			Text    string `json:"text"`
+			Pattern string `json:"pattern"`
+		} `json:"matches"`
+	}
+	if err := json.Unmarshal([]byte(jout), &multi); err != nil {
+		t.Fatalf("search -json is not parseable: %v (%q)", err, jout)
+	}
+	if len(multi.Matches) != 2 || multi.Matches[0].Pattern != "alpha" || multi.Matches[1].Pattern != "gamma" {
+		t.Errorf("multi -json matches = %+v, want the pattern on each", multi.Matches)
+	}
+	sjout, sjerrs, sjcode := run(t, "search", "-q", "alpha", "-json")
+	if sjcode != 0 {
+		t.Fatalf("single search -json: code %d: %s", sjcode, sjerrs)
+	}
+	if strings.Contains(sjout, `"pattern"`) {
+		t.Errorf("single -json grew a pattern key: %s", sjout)
+	}
+}
+
+// Several patterns share one exit code: any match is 0, none is non-zero.
+func TestSearchMultipleQueriesExit(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "alpha\n"})
+
+	if _, _, code := run(t, "search", "-q", "alpha", "-q", "zzz"); code != 0 {
+		t.Errorf("one pattern matched: code = %d, want 0", code)
+	}
+	if _, _, code := run(t, "search", "-q", "yyy", "-q", "zzz"); code != 1 {
+		t.Errorf("no pattern matched: code = %d, want 1", code)
+	}
+}
+
+// The flags reach every pattern, and the metacharacter hint speaks only for
+// the pattern that missed.
+func TestSearchMultipleQueriesFlagsAndHint(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "alpha\nbeta\n"})
+
+	// -case applies to both patterns: alpha matches, BETA is the wrong case.
+	out, errs, code := run(t, "search", "-q", "alpha", "-q", "BETA", "-case")
+	if code != 0 {
+		t.Fatalf("search -case: code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "alpha\t/w/a.go:1:0:alpha") || strings.Contains(out, "BETA") {
+		t.Errorf("search -case = %q, want only the exact-case hit", out)
+	}
+
+	// One pattern with regex metacharacters and no hit gets the hint; the
+	// plain no-hit pattern beside it does not.
+	_, errs, code = run(t, "search", "-q", "func (", "-q", "absent")
+	if code != 1 {
+		t.Fatalf("no hits: code = %d, want 1", code)
+	}
+	if n := strings.Count(errs, "--regex"); n != 1 {
+		t.Errorf("stderr = %q, want exactly one --regex hint", errs)
+	}
+	if !strings.Contains(errs, `"func ("`) {
+		t.Errorf("stderr = %q, want the hint to name the metacharacter pattern", errs)
 	}
 }

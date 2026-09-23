@@ -75,8 +75,8 @@ func TestCanAnswerDocumentSymbols(t *testing.T) {
 // open no overlay at all.
 func TestGotoSymbolFallsBackToTheScannerWithoutALiveServer(t *testing.T) {
 	h := newHarness(t, goSrc)
-	id := lsp.LanguageID(h.Pane().File.Path)
-	h.servers.byID[id] = &langServer{
+	key := serverKey{root: h.servers.rootFor(h.Pane().File.Path), lang: lsp.LanguageID(h.Pane().File.Path)}
+	h.servers.byID[key] = &langServer{
 		srv:  &lsp.Server{},
 		sync: lsp.NewSync(nil, lsp.SyncFull),
 		caps: lsp.InitializeResult{Capabilities: lsp.ServerCapabilities{

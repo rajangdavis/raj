@@ -435,7 +435,7 @@ func TestUnixAllowsExecInsideAProgram(t *testing.T) {
 // ---------- path translation ----------
 
 func TestMapperRewritesInsideTheTreeOnly(t *testing.T) {
-	m := Mapper{Local: "/workspace", Editor: "/Users/rajan/src/raj"}
+	m := NewMapper(Pair{Local: "/workspace", Editor: "/Users/rajan/src/raj"})
 	for _, c := range []struct{ local, editor string }{
 		{"/workspace/internal/app.go", "/Users/rajan/src/raj/internal/app.go"},
 		{"/workspace", "/Users/rajan/src/raj"},
@@ -469,7 +469,7 @@ func TestMapperZeroValueRewritesNothing(t *testing.T) {
 func TestMapperFromEnv(t *testing.T) {
 	t.Setenv(RootMapEnv, "/workspace=/Users/rajan/src/raj")
 	m, err := MapperFromEnv()
-	if err != nil || m.Local != "/workspace" || m.Editor != "/Users/rajan/src/raj" {
+	if err != nil || m.String() != "/workspace=/Users/rajan/src/raj" {
 		t.Fatalf("got %+v, %v", m, err)
 	}
 	// A value that does not parse is an error, not an ignored setting: silently
@@ -486,15 +486,15 @@ func TestInferMapper(t *testing.T) {
 	local := t.TempDir()
 	// A root that exists here means one filesystem, so nothing is rewritten —
 	// this is the case that made inference dangerous on a Unix socket.
-	if m := inferMapper(local, local); m.Active() {
+	if m := inferMapper(local, []string{local}); m.Active() {
 		t.Errorf("mapped across a shared filesystem: %+v", m)
 	}
-	if m := inferMapper(local, filepath.Dir(local)); m.Active() {
+	if m := inferMapper(local, []string{filepath.Dir(local)}); m.Active() {
 		t.Errorf("mapped onto an existing parent: %+v", m)
 	}
 	// A root that does not exist here is the other side of a boundary.
-	m := inferMapper(local, "/Users/rajan/src/raj")
-	if !m.Active() || m.Local != local || m.Editor != "/Users/rajan/src/raj" {
+	m := inferMapper(local, []string{"/Users/rajan/src/raj"})
+	if !m.Active() || len(m.pairs) != 1 || m.pairs[0] != (Pair{Local: local, Editor: "/Users/rajan/src/raj"}) {
 		t.Errorf("got %+v", m)
 	}
 }
@@ -537,7 +537,7 @@ func TestPathsAreTranslatedOverTCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !m.Active() || m.Local != local || m.Editor != "/w" {
+	if !m.Active() || len(m.pairs) != 1 || m.pairs[0] != (Pair{Local: local, Editor: "/w"}) {
 		t.Fatalf("inferred %+v", m)
 	}
 
@@ -583,7 +583,7 @@ func TestExplicitRootMapWins(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if m, err := c.ResolveRoots("/somewhere/else"); err != nil || m.Local != "/mnt/code" {
+	if m, err := c.ResolveRoots("/somewhere/else"); err != nil || len(m.pairs) != 1 || m.pairs[0].Local != "/mnt/code" {
 		t.Fatalf("got %+v, %v", m, err)
 	}
 	res, err := c.Do(Request{Op: "text", Path: "/mnt/code/a.go"})
@@ -635,6 +635,68 @@ func TestTokenSurvivesTheWire(t *testing.T) {
 	}
 	if got.Token != "s3cret" {
 		t.Errorf("token %q", got.Token)
+	}
+}
+
+// hello can declare a human, but only over the local socket. The control
+// token is shared with agents in a container, so over TCP a caller could
+// otherwise self-declare human and bypass the proposal gate: the token
+// proves the caller reached the editor, not that it is the person at the
+// keyboard. A TCP human request is downgraded to an agent — it still
+// connects and works, just proposal-only.
+func TestHelloOverTCPDowngradesAHuman(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+
+	human, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer human.Close()
+	res, err := human.Do(Request{Op: "hello", Identity: "client:desk", Name: "desk", Kind: string(KindHuman)})
+	if err != nil || !res.OK {
+		t.Fatalf("human hello: res=%+v err=%v", res, err)
+	}
+	if id := human.Author(); id == 0 || !ed.srv.Participants.IsAgent(id) {
+		t.Errorf("a human request over TCP bound author %d, want an agent", id)
+	}
+
+	agent, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	res, err = agent.Do(Request{Op: "hello", Identity: "harness-1", Name: "claude"})
+	if err != nil || !res.OK {
+		t.Fatalf("agent hello: res=%+v err=%v", res, err)
+	}
+	if id := agent.Author(); !ed.srv.Participants.IsAgent(id) {
+		t.Errorf("absent kind bound author %d, which does not read as an agent", id)
+	}
+}
+
+// Over the local socket the human is the person at the keyboard: the
+// filesystem authorises the connection, so a requested human joins as one and
+// its edits land accepted rather than proposed. The fixture is a control
+// socket, and the transport is confirmed unix so the test cannot pass by
+// accidentally driving a port instead.
+func TestHelloOverTheSocketDeclaresAHuman(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	if network, _ := ParseAddr(ed.srv.Path()); network != "unix" {
+		t.Fatalf("fixture transport %q, want unix", network)
+	}
+
+	human, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer human.Close()
+	res, err := human.Do(Request{Op: "hello", Identity: "client:desk", Name: "desk", Kind: string(KindHuman)})
+	if err != nil || !res.OK {
+		t.Fatalf("human hello: res=%+v err=%v", res, err)
+	}
+	if id := human.Author(); id == 0 || ed.srv.Participants.IsAgent(id) {
+		t.Errorf("human hello over the socket bound author %d, which reads as an agent", id)
 	}
 }
 

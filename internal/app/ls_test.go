@@ -31,7 +31,7 @@ func TestLsListsVisibleChildren(t *testing.T) {
 	// test measures the defaults and not the developer's own ~/.config.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	h := newHarness(t, "hello\n")
-	dir := filepath.Join(h.root, "lsdir")
+	dir := filepath.Join(h.primaryRoot(), "lsdir")
 	mkLsFile(t, dir, "sub/b.go", "package sub\n")
 	mkLsFile(t, dir, ".dot", "secret\n")
 	mkLsFile(t, dir, "plain.txt", "plain\n")
@@ -85,11 +85,11 @@ func TestLsListsVisibleChildren(t *testing.T) {
 // directory.
 func TestLsRefusesNonDirectory(t *testing.T) {
 	h := newHarness(t, "hello\n")
-	file := mkLsFile(t, h.root, "plain.txt", "plain\n")
+	file := mkLsFile(t, h.primaryRoot(), "plain.txt", "plain\n")
 	if _, err := (host{h.App}).Ls(file, false); err == nil {
 		t.Error("ls of a file succeeded")
 	}
-	if _, err := (host{h.App}).Ls(filepath.Join(h.root, "nope"), false); err == nil {
+	if _, err := (host{h.App}).Ls(filepath.Join(h.primaryRoot(), "nope"), false); err == nil {
 		t.Error("ls of a missing path succeeded")
 	}
 }
@@ -103,8 +103,8 @@ func TestSearchHiddenReachesHiddenDirectories(t *testing.T) {
 	// defaults rather than by whatever the developer configured.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	h := newHarness(t, "hello\n")
-	mkLsFile(t, h.root, "node_modules/dep/i.js", "zqxhidden\n")
-	mkLsFile(t, h.root, "src/main.go", "zqxhidden\n")
+	mkLsFile(t, h.primaryRoot(), "node_modules/dep/i.js", "zqxhidden\n")
+	mkLsFile(t, h.primaryRoot(), "src/main.go", "zqxhidden\n")
 
 	// Go through the guard, as the control path does: the include-hidden
 	// dispatch lives in guardedSearcher.Search (host.go), and the host's own
@@ -137,7 +137,7 @@ func TestLsMarksSymlinkWithoutFollowing(t *testing.T) {
 	// Isolate the hidden policy the way the sibling does.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	h := newHarness(t, "hello\n")
-	dir := filepath.Join(h.root, "lsdir")
+	dir := filepath.Join(h.primaryRoot(), "lsdir")
 	real := filepath.Join(dir, "realdir")
 	if err := os.MkdirAll(real, 0o755); err != nil {
 		t.Fatal(err)

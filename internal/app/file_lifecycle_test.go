@@ -64,7 +64,7 @@ func TestSaveAsWritesToTheChosenPath(t *testing.T) {
 	if !h.Prompt.Open {
 		t.Fatal("saving an unnamed buffer did not ask for a path")
 	}
-	if want := h.root + string(filepath.Separator); h.Prompt.Text() != want {
+	if want := h.primaryRoot() + string(filepath.Separator); h.Prompt.Text() != want {
 		t.Errorf("field seeded with %q, want %q", h.Prompt.Text(), want)
 	}
 
@@ -74,7 +74,7 @@ func TestSaveAsWritesToTheChosenPath(t *testing.T) {
 	if h.Prompt.Open {
 		t.Fatal("dialog still open after confirming")
 	}
-	path := filepath.Join(h.root, "notes.md")
+	path := filepath.Join(h.primaryRoot(), "notes.md")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("file not written: %v", err)
@@ -106,7 +106,7 @@ func TestSaveAsCancelledWritesNothing(t *testing.T) {
 	if h.Prompt.Open {
 		t.Fatal("escape did not dismiss the dialog")
 	}
-	if _, err := os.Stat(filepath.Join(h.root, "gone.md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(h.primaryRoot(), "gone.md")); !os.IsNotExist(err) {
 		t.Errorf("file was written despite cancelling (err=%v)", err)
 	}
 	if h.Pane().File.Path != "" {
@@ -116,7 +116,7 @@ func TestSaveAsCancelledWritesNothing(t *testing.T) {
 
 func TestSaveAsRelativePathResolvesAgainstTheRoot(t *testing.T) {
 	h := newHarness(t, "")
-	if err := os.Mkdir(filepath.Join(h.root, "sub"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(h.primaryRoot(), "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	h.press("super+n")
@@ -127,7 +127,7 @@ func TestSaveAsRelativePathResolvesAgainstTheRoot(t *testing.T) {
 	h.typeText("sub/deep.txt")
 	h.press("enter")
 
-	if _, err := os.ReadFile(filepath.Join(h.root, "sub", "deep.txt")); err != nil {
+	if _, err := os.ReadFile(filepath.Join(h.primaryRoot(), "sub", "deep.txt")); err != nil {
 		t.Fatalf("relative path did not resolve against the root: %v", err)
 	}
 }
@@ -144,7 +144,7 @@ func TestSaveAsOverExistingFileAsksFirst(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, "")
-			victim := filepath.Join(h.root, "victim.txt")
+			victim := filepath.Join(h.primaryRoot(), "victim.txt")
 			if err := os.WriteFile(victim, []byte("old"), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -275,7 +275,7 @@ func TestCloseDirtyUnnamedBufferChainsIntoSaveAs(t *testing.T) {
 	if h.Prompt.Open {
 		t.Fatal("dialog still open")
 	}
-	data, err := os.ReadFile(filepath.Join(h.root, "kept.txt"))
+	data, err := os.ReadFile(filepath.Join(h.primaryRoot(), "kept.txt"))
 	if err != nil {
 		t.Fatalf("file not written: %v", err)
 	}

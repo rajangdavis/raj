@@ -27,8 +27,6 @@ workflow), then works the Now list.
   hashes decoded text, so a CRLF-to-LF, BOM or charset change passes the guard
   and the log re-encodes the old shape; the smallest fix is a byte digest on
   `Base`. *External byte-level changes survive restore.*
-- **The proposal tint is hard to read** (user-reported). Pick a higher-contrast
-  index, or add a high-contrast mode. *Review is legible.*
 - **A workspace-wide `lsp diagnostics` sweep before the host gate.** Per-file
   checks read `ok` while cross-file references are broken (7 files in the LSP
   review); make an `--all` sweep over the changed files the standard pre-gate
@@ -83,7 +81,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   and the attachment model (loaded vs announced, headless read).
 
 ### Editor and LSP
-
 - **In-file find & replace is the next wave.** The find bar is live; the
   replace half, its chords and its undo story are the intended next step.
   *The next wave has its item on the list.*
@@ -158,11 +155,24 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   call while a shared `--lines` clamps per file; decide clamp or refuse.
 - `Buffer.Bytes` means document length in a `buffers` reply and contributed
   bytes in a multi-read; document it.
-- `readMany`'s `annotated` parameter is always false; drop it.
-- `read --lines` carries no byte offsets; a byte-span read is still wanted, and a
-  `--start`/`--end` or `--lines` `read --json` reply does not echo the span it read
-  (the keys are `author`/`spans`/`text`/`version`). Echo `start`/`end` (or
-  `bytes`) so a driver re-derives offsets without a second call.
+- `read --json` now echoes a line span as `line_start`/`line_end`, so a driver
+  re-derives the line range it asked for without a second call; a byte-span
+  read (`--start`/`--end`) still echoes no `start`/`end`. Echo the byte span
+  too, so every span read is self-describing.
+- **`read --json` gives no per-line byte index, so a line-addressed `apply`
+  needs a second `search --json` (2026-09-22).** A whole-file read returns
+  `text` with `bytes`/`lines` but no byte offset for each line, so a driver
+  editing at a line it just read must search for the line to get a `byte_start`
+  (or do the shift arithmetic the skill forbids). Echo a line-start offset
+  array (or one byte offset per line) with the text, so a read is an offset
+  source on its own. *A read should be enough to edit where it read.*
+- **The per-target `read --at` and multi-`-q` `search` transports are N client
+  calls inside one CLI call (2026-09-22).** `read --at` groups targets by
+  identical span but still issues one `c.Do` per distinct span, and
+  `search -q A -q B` issues one `DoStream` per pattern, so a batched tool call
+  is still N round trips. Convert both to a single `run --prog` frame;
+  `knownOps`/`verbNames` already carry `OpRead`/`OpSearch` with `OpSpan`/
+  `OpQuery`. *One tool call should be one round trip.*
 - `run --prog` payload paths are unmapped (`Client.toEditor` maps the field verbs
   only).
 - `braceTally` counts markdown fences as code; a per-language "is this source"
@@ -239,14 +249,42 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   is captured (`Snapshot.Compacted`) and restored, but every snapshot test seeds
   a fresh session; a compaction-origin round trip is unpinned. *The subtle path
   is the one that breaks silently.*
-- **Client review mode only changes chrome.** `readOnly()` is
-  `mode == Review || attach`, so a client that leaves Review is still refused
-  edits. Decide whether the Review toggle should do anything in a client, or
-  whether the client is simply always read-only and the mode is display only.
-  *The toggle either changes behaviour or it should not be offered.*
+- **A client's local undo resets on a re-sync.** Undo in an attached client is
+  client-local; the forward is a debounced apply, and a watch install replaces
+  the pane's journal, so cmd+z after a refresh cannot reverse the edit it just
+  forwarded. Decide whether undo is mirrored across the wire or the pane marks
+  the reset. *A gesture that silently stops working is worse than one not
+  offered.*
+- **A forwarded edit's conflict has no surface.** A local edit the daemon
+  cannot place warns on the status line and re-fetches, discarding the local
+  text with no diff and no retry. The editor deliberately has no conflict UI
+  (`REVIEW-AGENT.md`), so decide the smallest honest surface: keep the refused
+  text visible, or name the group that moved. *A refusal the user cannot
+  inspect loses work.*
+- **Multi-mutator coverage is thin.** The human-write path is pinned one test
+  per branch (forward span/base, dirty-pane skip, claim overlap), but nothing
+  drives a second attached human, or a human and a fast agent on one buffer,
+  so the interaction the feature exists for is untested end to end. *The
+  multi-writer case is the reason the feature exists.*
+- **`Guard.Patch` still refuses a joined human.** The wave admitted a durable
+  human to `Guard.Apply` but left `Patch` agent-only because a snapshot is an
+  agent tool. Revisit only if a human path ever wants patch; no test drives a
+  human patch today. *A refusal should be a decision, not an oversight.*
+- **A TCP attach client does not read back its granted kind, so it forwards edits that can only be proposals.** `hello` downgrades a human request over anything but the unix socket to an agent (`internal/control/control.go`), but the client still forwards its local edits as the person; `host.Apply` admits the agent text as a proposal, so an edit the client believes it accepted lands pending for review. Read the granted kind back from the hello reply (the participant row for the client author) and keep the client read-only when it is not `KindHuman`, or label the forward as a proposal. *A client must not offer an edit the daemon will not land.*
+- **The LSP servers are not re-rooted on attach.** `adoptVisibleRoots` rebuilds the explorer, search and picker over the daemon set, but `newServers` is only called from the constructor (`internal/app/app.go`), so a client whose daemon primary differs starts servers against a workspace it is not showing. Decide whether adoption re-resolves the servers or LSP stays launch-rooted by design. *A client should not offer a workspace it does not render.*
 
 ### UI, terminals and rough edges
 
+- **The document-highlight backgrounds keep the syntax foreground, so a
+  comment on a highlighted occurrence can vanish (2026-09-22).**
+  `HighlightRead` (`ui.Ansi(236)`) and `HighlightWrite` (`ui.Ansi(54)`) are
+  applied with `style.On(bg)`, which preserves the token foreground; the
+  comment grey (`ui.Ansi(8)`) all but disappears on the read grey just as it
+  did on the proposal green. The `ui.LegibleOn(bg)` pairing the tints now use
+  would fix it, but a highlight that recolours the token is a different look
+  from one that emphasises it, and the two highlight colours might change
+  instead — decide. *A mark that hides the token it marks is not an emphasis.*
+- **The legible tint foreground drops syntax colour on accepted agent text (2026-09-22, user).** The proposed/agent tints now force `ui.LegibleOn(bg)`; the review green reads well, but accepted agent text loses syntax colour and reads worse. Decide: keep it on both, gate the override to comment-class tokens, or choose a tint foreground that stays legible. *The proposal fix should not make accepted text uglier.*
 - The smoke suite is Linux and macOS only, and only Linux is proven.
 - Smoke scenarios wait on 400 ms of wall clock; a control-socket "queue
   drained?" answer would replace the sleeps.
@@ -260,6 +298,8 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   tool).
 
 ### Tests and workflow
+- **The control fake `ping`/`buffers` replies drift from the shipped `Dispatch` (2026-09-22).** `fakeEditor.run` hand-writes the reply literals, so when `Dispatch` learned `Roots` the fake did not and `TestRootsClearsOnSetLessReply` failed the host gate. Build the fake `ping`/`buffers` replies from one helper (or the same reply constructor) so a new header field cannot land in `Dispatch` alone. *A fixture hand-copied from the wire drifts from it.*
+- **`TestStopAllStopsEveryRoot` does not assert its two servers are distinct.** A fixture that reused one server for both roots would still pass (both `live` lookups return the same pointer, `stopAll` stops it, both `Start` calls return `ErrClosed`), so the test pins "the servers we saw are stopped", not "every root was stopped". Assert `live[0] != live[1]` and `len(h.servers.byID) == 2` before stopping. *A regression test that a reused server passes is half a test.*
 
 - **Pin the first Draw's erase.** `TestResizeInvalidates` now drives a real size
   change through `FakeHost.SetSize`, and `TestLayoutChangeRepaints` the
@@ -291,8 +331,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   final against the tick.
 - The container `raj` can lag the editor; rework the release/rebuild step or
   make an empty `srcVersion` detectable.
-- A `claim` without `--add` silently replaces the set; warn when it replaces a
-  non-empty set.
 - The standing between-wave reconciler needs a thin wrapper so the pass is
   invoked rather than remembered.
 - A saved buffer can still carry proposed sets after a rebuild and restart;
@@ -314,10 +352,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   invalid sets a save would drop (`Session.UnsavedProposed`) or drop the field
   and the mark component. *A wire fact with no producer is a comparison that
   cannot fail.*
-- **Multi-path `lsp diagnostics --json` loses the path (2026-09-20).** A batch
-  prints one bare `{"status":"ok"}` per operand with no path, so a reader can
-  only attribute a status by position; carry the path on each entry (or return a
-  JSON list keyed by path). *A batch answer names each thing it answers for.*
 - **`TestClientViewReadsLegacyClosedPaths` is vacuous (2026-09-20).** A failed
   legacy parse and a legacy mark both re-add the same daemon tab, so the test
   passes without the `closedMarks.UnmarshalJSON` legacy branch it names; seed a
@@ -325,10 +359,36 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   test.*
 
 - Name the search hit's offsets so a row cannot be mistaken for a byte range:
-  `line` is a line number while `line_start`/`line_end` are byte offsets.
+  `line` is a line number while `line_start`/`line_end` are byte offsets; the
+  `SearchMatch` doc comment also says `ByteStart..ByteEnd` bound the match
+  "within" the line while the fields are file offsets and `text` is the whole
+  line, so the comment contradicts its own fields.
 - State or fix the scope split between `groups` (one buffer) and `proposals`
   (whole workspace), so `groups --mine` with no focused buffer does not read as
   "no sets".
+- **`NativeHost` never closes its `events` channel (2026-09-21).** The `Host`
+  interface says the channel closes when the host shuts down, and `FakeHost`/
+  `HeadlessHost` close it, but `NativeHost.Close` does not, so a `range` over
+  `Events()` would hang and the contract comment is false. Close it, or correct
+  the comment and say why the terminal host differs. *A channel contract only
+  two of three hosts honour is not a contract.*
+- **`daemon.log` grows without bound (2026-09-21).** `Runner.logWriter`
+  (`internal/daemon/daemon.go`) opens the workspace log append-only and never
+  closes or rotates it; `logTail` scoping fixed the wrong-run output, not the
+  growth. Cap or rotate it, or state why an append-only log is acceptable.
+- **`edit --old ... --all` is an unbounded substring replace (2026-09-21).**
+  It replaces every occurrence, including one inside a larger identifier — a
+  rename of `.root` to `.primaryRoot()` would also rewrite
+  `snapshotSearcher.root` and `servers.root` — so it can corrupt a different
+  identifier silently. Warn or refuse when an occurrence is flanked by
+  identifier bytes, or make `--word` the default with `--all`. *An identifier
+  rename is not a substring replacement.*
+- **The skill says `search` is case-sensitive by default; the editor is not
+  (2026-09-21).** `raj ctl search -q PRIMARYROOT` matches `primaryRoot` with no
+  flag and `--case` is what makes it case-sensitive, so the skill text
+  "literal and case-sensitive unless `--regex` or `--case`" is backwards.
+  Correct the skill (or the default) so a case-sensitive search is what a
+  driver gets.
 - **DECIDED (user, 2026-09-17): keep the linewise paste text-suffix
   rule.** `PasteClip` keeps keying on `strings.HasSuffix(Text, "\n")`, so a
   characterwise selection ending exactly after a newline still pastes below
@@ -384,14 +444,23 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   rejected query (`search -q 'zzq[unlikely'` prints the hint and exits 1).
   Reword to offer both readings (pass `--regex` if you meant a regex; otherwise
   the literal matched nothing) and keep the nonzero exit for "no matches" only.
-- **`read --json` omits `bytes`/`lines`.** `version --json` returns them and
-  `read --json` does not, so a driver that just read the text makes a second
-  call for the count. Add them to the read reply or state the split.
-- **`lsp diagnostics`' multi-path reply is not machine-readable.** A cold start
-  prints `starting language server…` per path (non-JSON) and the `--json` form
-  emits one unframed JSON object per file instead of one array, so a driver must
-  split lines and has no status for a path that never answered. Frame the batch
-  as one array and carry the cold-start state in `status` or on stderr only.
+- **`edit --old` that matches nothing gives no nearest-line hint (2026-09-22).**
+  The refusal says the text does not appear and to copy it exactly; it does not
+  say where the closest match is, so a block off by one line costs a re-read to
+  locate the seam. Name the nearest line, or the longest matching prefix, in the
+  refusal. *A failed match should show where the text diverges.*
+- **`search --include` and `--path` are two doors with different rules
+  (2026-09-22).** `--include` is a comma-separated glob list (a bare `cli.go`
+  matches by basename, two files) while `--path` is documented as a directory
+  but also accepts a file and searches just it. The usage hint says to use
+  `--include` or `--path` without saying which is for one file. Document the
+  split, or make `--path` accept a file explicitly and say so.
+- **A multi-path `lsp diagnostics` entry for a statusless answer carries no
+  status (2026-09-22).** An old server's `{}` parses, so the entry is emitted
+  with `path` only (`status`/`detail` are `omitempty`) and exit 1, where the
+  single-path form refuses with a rebuild-to-match-ctl version-skew message.
+  Give a parsed-but-statusless entry the same `lspStatusError` status and
+  detail, so every entry in the batch answers with a status.
 
 ### Flag usage printing
 
@@ -406,10 +475,13 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   `control.PrintFlagUsage`, so `raj --help` opens on the flag list with no
   `usage: raj [options] [file|dir]` line where the default printed
   `Usage of <path>:`. Decide whether to add one. Escalated 2026-09-20 (UX).
-- **`--q` prints with two dashes.** `PrintFlagUsage` prints every flag as
-  `--name`, so `raj ctl search -h` says `--q string` while the hand-written
-  usage says `search -q PATTERN` and the convention keeps single-letter shorts
-  on one dash. Print a one-letter flag with one dash and assert it.
+- **A custom `flag.Value` prints the placeholder `value` in `-h` (2026-09-22).**
+  `-q` and `--at` became `flag.Value`s, and `flag.UnquoteUsage` names an
+  unknown Value type `value`, so `raj ctl read -h` says `--at value` and
+  `search -h` says `-q value` where the hand-written usage says `PATH=LO,HI`
+  and `PATTERN`. (A one-letter name already prints with one dash, so the old
+  `--q` note is retired.) Put a backquoted placeholder in the usage string,
+  or special-case `PrintFlagUsage`, and assert it.
 - **Backquoted words in a usage string leak into the placeholder.**
   `flag.UnquoteUsage` treats a backquoted word as the value name, so
   `raj ctl apply -h` prints `--group groups` and `--dump dump` where the value
@@ -429,16 +501,28 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   until it re-claims; both a subagent and this review pass paid a retry for it.
   Warn when a replace would drop a non-empty set, or make `--add` the default
   with an explicit `--replace`. Escalated 2026-09-20.
+- **CLAIM-SPEC still describes the missing-path warn/skip the code deliberately dropped.** `docs/CLAIM-SPEC.md` §3 says a path that is neither on disk nor an open buffer is "warned per-path and skipped", and §10 leaves the `open --create` missing-parent case open, but `Guard.Claim` now keeps a not-on-disk path as a forward claim (it warns only on a non-`IsNotExist` stat error) and `saveNamed`/`ensureParent` answers the parent at save time. Reconcile the spec with the forward-claim choice, or restore the warn. *A spec that contradicts the code is a decision lost.*
+
+### Daemon list and labels
+
+- **`daemon list --json` emits `null` when no daemon runs.** `json.MarshalIndent`
+  of a nil `[]Entry` is `null`, so a script must special-case the empty list;
+  marshal `[]Entry{}` (or render `[]`) instead. *An empty list is `[]`, not
+  `null`.*
+- **Decided (2026-09-22): `--workspace` and an explicit `--control-addr` are
+  mutually exclusive.** The label already names the daemon and its address, so
+  a typed address is a second, contradictory source; the Unix socket is
+  preferred over TCP because it needs no token. The attach itself is done — see
+  COMPLETED.md. *An attach names the workspace, not the port.*
+- **`restartCLI`'s label carry-over has no test.** The carry-versus-override
+  decision lives in the CLI function, which has no `Ops`/`Runner` seam and can
+  only be driven by a real spawn, so `restart --workspace` and the label
+  carried across a plain `restart` are unpinned; extract the decision into a
+  pure helper (as `resolveTarget` is) and test it. *A carried label is a
+  decision; pin it.*
 
 ## Direction (documented, not scheduled)
 
-- **`.raj` is visible in the explorer from the first run (escalated,
-  2026-09-17).** The store opens eagerly, so it creates `<root>/.raj` before
-  anything is saved and the directory appears in the tree (its scratch entries
-  are hidden by the defaults, but the directory itself is walked so
-  `.raj/hidden` stays reachable). Decide: hide `.raj` and lose tree access to
-  `.raj/hidden`, or move the store to XDG keyed by workspace. Do not decide
-  from the review.
 - **An explicit tab width now overrides a file's detected indentation
   (escalated, 2026-09-17).** Previously `--tab` was only a fallback; an explicit
   width (flag or stored `tab_width`) now pins both the display advance and the

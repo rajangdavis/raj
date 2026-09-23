@@ -140,7 +140,7 @@ func TestMenuRenameOpensNamePrompt(t *testing.T) {
 // proposal; this pins both halves: recorded, and still on disk.
 func TestMenuDeleteProposesBeforeApproval(t *testing.T) {
 	h := newWorkspace(t, 120, 24)
-	path := filepath.Join(h.root, "README.md")
+	path := filepath.Join(h.primaryRoot(), "README.md")
 	h.OpenFile(path)
 	h.drain()
 	h.openSidebar("shift+super+e", SidebarExplorer)
@@ -178,7 +178,7 @@ func TestMenuLeftClickRunsRow(t *testing.T) {
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
 
-	want := filepath.Join(h.root, "README.md")
+	want := filepath.Join(h.primaryRoot(), "README.md")
 	col, row := explorerCell(t, h, "README.md")
 	rightClick(h, col, row)
 	menuClick(t, h, "Copy Path")
@@ -214,7 +214,7 @@ func TestMenuEscapeCloses(t *testing.T) {
 // click would fall through to the editor and move the caret.
 func TestMenuOutsideClickIsSwallowed(t *testing.T) {
 	h := newWorkspace(t, 160, 24)
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -289,7 +289,7 @@ func TestOpenMenuKeyOpensForFocus(t *testing.T) {
 	}
 
 	h2 := newWorkspace(t, 120, 24)
-	h2.OpenFile(filepath.Join(h2.root, "main.go"))
+	h2.OpenFile(filepath.Join(h2.primaryRoot(), "main.go"))
 	h2.drain()
 	h2.dispatch(keys.OpenMenu, "")
 	h2.drain()
@@ -349,7 +349,7 @@ func TestMenuNewFileOpensASeededSaveAsPrompt(t *testing.T) {
 	if got := h.Prompt.Title(); got != "Save as" {
 		t.Errorf("prompt title = %q, want Save as", got)
 	}
-	want := h.root + string(filepath.Separator)
+	want := h.primaryRoot() + string(filepath.Separator)
 	if got := h.Prompt.Text(); got != want {
 		t.Errorf("seed = %q, want the menu's folder %q", got, want)
 	}
@@ -365,7 +365,7 @@ func TestMenuNewFileOpensASeededSaveAsPrompt(t *testing.T) {
 		t.Errorf("field = %q, want tab to complete README.md", got)
 	}
 	// Nothing reaches disk until the save runs.
-	fresh := filepath.Join(h.root, "notes.md")
+	fresh := filepath.Join(h.primaryRoot(), "notes.md")
 	setPromptText(h, fresh)
 	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
 		t.Errorf("a file existed before the save completed (err=%v)", err)
@@ -384,7 +384,7 @@ func TestMenuNewFileCompletesThroughSaveAs(t *testing.T) {
 	rightClick(h, col, row)
 	menuClick(t, h, "New File")
 
-	path := filepath.Join(h.root, "notes.md")
+	path := filepath.Join(h.primaryRoot(), "notes.md")
 	setPromptText(h, path)
 	h.press("enter")
 
@@ -411,7 +411,7 @@ func TestMenuNewFileOffersToCreateAMissingParent(t *testing.T) {
 	rightClick(h, col, row)
 	menuClick(t, h, "New File")
 
-	path := filepath.Join(h.root, "new", "deep", "notes.md")
+	path := filepath.Join(h.primaryRoot(), "new", "deep", "notes.md")
 	setPromptText(h, path)
 	h.press("enter")
 	if !h.Prompt.Open {
@@ -441,7 +441,7 @@ func TestMenuNewFileCancelLeavesNoFileOrTab(t *testing.T) {
 	}
 	// Name a file, then back out: the answer that would have created it is
 	// never given.
-	cancelled := filepath.Join(h.root, "cancelled.md")
+	cancelled := filepath.Join(h.primaryRoot(), "cancelled.md")
 	setPromptText(h, cancelled)
 	h.press("esc")
 

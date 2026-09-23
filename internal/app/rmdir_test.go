@@ -28,7 +28,7 @@ func proposeDirRemoval(t *testing.T, h *harness, dir string) {
 // a real subtree to list. It returns the directory path.
 func mkTree(t *testing.T, h *harness) string {
 	t.Helper()
-	dir := filepath.Join(h.root, "pkg")
+	dir := filepath.Join(h.primaryRoot(), "pkg")
 	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestRemoveForeverTrashesDir(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("directory still at the original path after a trashing removal (err=%v)", err)
 	}
-	trash := filepath.Join(session.StateDir(h.root), "trash")
+	trash := filepath.Join(session.StateDir(h.primaryRoot()), "trash")
 	entries, err := os.ReadDir(trash)
 	if err != nil {
 		t.Fatalf("reading trash dir %s: %v", trash, err)

@@ -73,7 +73,7 @@ func (a *App) journalTick(now time.Time) {
 	if a.attach {
 		return
 	}
-	if !journalEnabled() || a.root == "" || a.NoRestore {
+	if !journalEnabled() || a.roots.Len() == 0 || a.NoRestore {
 		return
 	}
 	if !a.journalSaved.IsZero() && now.Sub(a.journalSaved) < JournalInterval {
@@ -88,10 +88,10 @@ func (a *App) journalTick(now time.Time) {
 // journalDir is the directory the per-buffer logs live under, inside the
 // workspace's XDG state dir alongside the store and the trash.
 func (a *App) journalDir() string {
-	if a.root == "" {
+	if a.roots.Len() == 0 {
 		return ""
 	}
-	return filepath.Join(session.StateDir(a.root), "logs")
+	return filepath.Join(session.StateDirForRoots(a.roots.All()), "logs")
 }
 
 // journalName is the log file for a buffer path. A short digest makes it unique
@@ -138,7 +138,7 @@ func (a *App) archiveLog(logPath string) string {
 // It creates the log on the first call, when the buffer is dirty. A buffer that
 // is clean and has no log is left alone, so browsing files writes nothing.
 func (a *App) appendJournal(p *editor.Pane) {
-	if !journalEnabled() || a.root == "" || a.NoRestore || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
+	if !journalEnabled() || a.roots.Len() == 0 || a.NoRestore || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
 		return
 	}
 	tap := a.journals[p.File.Path]
@@ -224,7 +224,7 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 		a.status = "journal: " + err.Error()
 		return nil
 	}
-	w, err := journal.Create(logPath, journal.Header{Root: a.root, Identity: a.localIdentity()})
+	w, err := journal.Create(logPath, journal.Header{Root: a.primaryRoot(), Identity: a.localIdentity()})
 	if err != nil {
 		a.status = "journal: " + err.Error()
 		return nil
@@ -395,7 +395,7 @@ func (t *logTap) matches(sess *piecetable.Session) bool {
 // additive: the origin base stays, because history is kept, and restore accepts
 // a log whose disk matches either.
 func (a *App) recordWritten(p *editor.Pane) {
-	if !journalEnabled() || a.root == "" || a.NoRestore || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
+	if !journalEnabled() || a.roots.Len() == 0 || a.NoRestore || p == nil || p.File.Path == "" || isGitPath(p.File.Path) {
 		return
 	}
 	a.appendJournal(p)
@@ -485,7 +485,7 @@ func (a *App) closeJournals() {
 // from RestoreSession and replaces the clean File a tab was opened with when a
 // log for that path matches its base.
 func (a *App) restoreJournals() {
-	if !journalEnabled() || a.root == "" || a.NoRestore {
+	if !journalEnabled() || a.roots.Len() == 0 || a.NoRestore {
 		return
 	}
 	entries, err := os.ReadDir(a.journalDir())

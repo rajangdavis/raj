@@ -80,7 +80,7 @@ func TestWheelRoutesByPosition(t *testing.T) {
 	// padding the fixture with files no other test wants.
 	h := newWorkspace(t, 160, 6)
 	h.openSidebar("shift+super+e", SidebarExplorer)
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 	if h.Focused() != FocusEditor {
 		t.Fatal("setup: expected editor focus")
@@ -114,7 +114,7 @@ func TestWheelRoutesByPosition(t *testing.T) {
 // everything, so scrolling the pane behind it would scroll something invisible.
 func TestWheelOverAnOpenPickerScrollsThePicker(t *testing.T) {
 	h := newWorkspace(t, 160, 30)
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 	h.press("super+p")
 	if !h.Picker.Open {

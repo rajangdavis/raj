@@ -137,8 +137,13 @@ type Header struct {
 	Group    uint64
 	Identity string
 	Name     string
-	Argv     []string
-	Dir      string
+	// Kind is what a hello joins as: absent (the zero value) means an agent,
+	// which is what every pre-existing caller sends; "human" joins KindHuman.
+	// It is a byte string, like Identity and Name, and crosses sparsely, so a
+	// peer that does not know it omits it and keeps the agent default.
+	Kind string
+	Argv []string
+	Dir  string
 
 	// DumpID rides both directions: a patch names the snapshot a prior dump
 	// returned, and a dump's reply carries the id it just minted. Hash is the
@@ -278,7 +283,13 @@ type Header struct {
 	Created bool
 	Err     string
 	Root    string
-	PID     int
+	// Roots is the whole workspace root set, primary first. Root stays the
+	// primary so a reader that does not know this field is unaffected; a host
+	// with no set sends none, which reads the same as the single Root it
+	// already carries.
+	Roots []string
+	PID   int
+
 	Version uint64
 	Bytes   int
 	Lines   int
@@ -474,7 +485,7 @@ func ReadFrame(r io.Reader) (Frame, error) {
 func EncodeRequest(req Request) (Header, []byte) {
 	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
-		Identity: req.Identity, Name: req.Name, Group: req.Group, Line: req.Line, Col: req.Col,
+		Identity: req.Identity, Name: req.Name, Kind: req.Kind, Group: req.Group, Line: req.Line, Col: req.Col,
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
 		Annotated: req.Annotated, Create: req.Create, Discard: req.Discard,
 		Paths: req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
@@ -516,7 +527,7 @@ func DecodeRequest(f Frame) (Request, error) {
 	req := Request{ID: f.Header.ID, Op: f.Header.Op, Path: f.Header.Path, NewPath: f.Header.NewPath,
 		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
-		Identity: f.Header.Identity, Name: f.Header.Name, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
+		Identity: f.Header.Identity, Name: f.Header.Name, Kind: f.Header.Kind, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
 		Start: f.Header.Start, End: f.Header.End,
 		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
@@ -558,7 +569,7 @@ func DecodeRequest(f Frame) (Request, error) {
 // carries authorship in the shape the store holds it.
 func EncodeResponse(res Response) (Header, []byte) {
 	h := Header{ID: res.ID, OK: res.OK, Remains: res.Remains, Created: res.Created,
-		Err: res.Err, Root: res.Root, PID: res.PID,
+		Err: res.Err, Root: res.Root, Roots: res.Roots, PID: res.PID,
 		Version: res.Version, Bytes: res.Bytes, Lines: res.Lines,
 		Found: res.Found, FindStart: res.FindStart, FindEnd: res.FindEnd, FindCount: res.FindCount,
 		Buffers: res.Buffers, Conflicts: res.Conflicts, Warnings: res.Warnings,
@@ -600,7 +611,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 
 func DecodeResponse(f Frame) (Response, error) {
 	res := Response{ID: f.Header.ID, OK: f.Header.OK, Remains: f.Header.Remains,
-		Created: f.Header.Created, Err: f.Header.Err, Root: f.Header.Root,
+		Created: f.Header.Created, Err: f.Header.Err, Root: f.Header.Root, Roots: f.Header.Roots,
 		PID: f.Header.PID, Version: f.Header.Version,
 		Bytes: f.Header.Bytes, Lines: f.Header.Lines,
 		Found: f.Header.Found, FindStart: f.Header.FindStart,

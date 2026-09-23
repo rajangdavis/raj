@@ -18,12 +18,13 @@ func fullHeader() Header {
 	base := uint64(41)
 	return Header{
 		ID: 7, Op: "apply", Path: "/w/main.go", NewPath: "/w/renamed.go", Author: 3, Token: "t0ken",
-		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent",
+		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent", Kind: "human",
 		Argv: []string{"go", "test", "./..."}, Dir: "/w",
 		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true, Hidden: true, Context: 2},
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
 		Root: "/w", PID: 4242, Version: 70000, Bytes: 12345, Lines: 678, Files: 12, Capped: true,
+		Roots:      []string{"/w", "/w/pkg"},
 		Considered: 34,
 		Found:      true, FindStart: 1234, FindEnd: 1239, FindCount: 7,
 		Dirty:        []DirtyBuffer{{Path: "/w/a.go", AgentOnly: true}, {Path: "/w/b.go"}},
@@ -131,6 +132,9 @@ func TestHeaderRoundTrip(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
 		}
+	}
+	if len(got.Roots) != 2 || got.Roots[0] != want.Roots[0] || got.Roots[1] != want.Roots[1] {
+		t.Errorf("roots = %q, want %q", got.Roots, want.Roots)
 	}
 	if len(got.Argv) != 3 || got.Argv[2] != "./..." {
 		t.Errorf("argv = %q", got.Argv)

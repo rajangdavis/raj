@@ -54,6 +54,24 @@ for the user to review.
    one-line entry in `docs/COMPLETED.md`.
 5. Report a ledger: verified / changed (`file:line`) / flagged with severity and
    the exact fix / escalated to the user.
+6. **Review the wave's tool use.** Read the per-session call counts from the
+   tool ledger and report them with the ledger: total calls per session, the
+   `raj ctl` verb mix, and batching adoption (`search --context`,
+   `read A B C`, `apply --hunks`, multi-path `lsp diagnostics`). Flag a session
+   over ~100 calls and any batching form used in under about a quarter of the
+   calls it applies to. The recipe:
+
+       L=${RAJ_TOOL_LEDGER:-$HOME/.local/share/opencode/raj-tool-ledger.jsonl}
+       jq -r 'select(.phase != "after") | .session' "$L" | sort | uniq -c | sort -rn
+       jq -r 'select(.tool=="bash" and .cmd) | .cmd' "$L" \
+         | grep -oE 'raj ctl [a-z_-]+' | sort | uniq -c | sort -rn
+       cmds=$(jq -r 'select(.tool=="bash" and .cmd) | .cmd' "$L")
+       echo "search --context: $(echo "$cmds" | grep -c 'search.*--context')"
+       echo "apply --hunks:    $(echo "$cmds" | grep -c 'apply.*--hunks')"
+
+   Record the numbers in the wave's feedback block. When a batching form has a
+   low adoption rate because the form is hard to use, that is an actionable
+   `TODO` (a surface fix), not only a discipline note.
 
 ## Verification discipline
 

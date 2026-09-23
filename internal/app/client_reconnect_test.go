@@ -18,8 +18,11 @@ type scriptedConn struct {
 	gen     uint64
 	buffers []control.Buffer
 	snaps   map[string]control.Response
-	done    chan struct{}
-	closed  atomic.Bool
+	// roots is the workspace root set this scripted daemon reports, so a test
+	// can drive the attach adoption path without a real server.
+	roots  []string
+	done   chan struct{}
+	closed atomic.Bool
 }
 
 func newScriptedConn(gen uint64, buffers []control.Buffer, snaps map[string]control.Response) *scriptedConn {
@@ -44,6 +47,8 @@ func (s *scriptedConn) Do(req control.Request) (control.Response, error) {
 }
 
 func (s *scriptedConn) ResolveRoots(string) (control.Mapper, error) { return control.Mapper{}, nil }
+
+func (s *scriptedConn) Roots() []string { return s.roots }
 
 func (s *scriptedConn) Close() error {
 	if s.closed.CompareAndSwap(false, true) {
@@ -199,5 +204,61 @@ func TestCloseClientStopsReconnect(t *testing.T) {
 	time.Sleep(2 * clientRetryMin)
 	if got := calls.Load(); got != stopped {
 		t.Errorf("the retry loop kept dialing after CloseClient: %d -> %d", stopped, got)
+	}
+}
+
+// A reconnect re-adopts a daemon that comes back with a different root set, so
+// the explorer, search and containment follow the peer actually there instead
+// of rendering the workspace from before the restart.
+func TestClientReconnectAdoptsChangedRoots(t *testing.T) {
+	rootA, rootB, rootC := t.TempDir(), t.TempDir(), t.TempDir()
+	launch := t.TempDir()
+
+	first := newScriptedConn(1, nil, nil)
+	first.roots = []string{rootA}
+	setClientDial(t, func(string) (clientConn, error) { return first, nil })
+	fh := ui.NewFakeHost(120, 30)
+	t.Cleanup(func() { fh.Close() })
+	a := NewWithOptions(fh, launch, Options{Attach: true, AttachAddr: "scripted"})
+	t.Cleanup(a.CloseClient)
+	a.StartClient()
+	if got := a.visible.All(); !sameStrings(got, []string{rootA}) {
+		t.Fatalf("attach visible roots = %q, want %q", got, []string{rootA})
+	}
+	h := &harness{App: a, host: fh}
+
+	second := newScriptedConn(2, nil, nil)
+	second.roots = []string{rootB, rootC}
+	setClientDial(t, func(string) (clientConn, error) { return second, nil })
+
+	// Drop the live watch so the loop reconnects to the daemon that reports a
+	// different root set.
+	a.clientConnMu.Lock()
+	c := a.client
+	a.clientConnMu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
+
+	// The reconnect queues the daemon root set for the event thread rather
+	// than adopting it on the watch goroutine, so the drain that installs
+	// queued client work is what makes the adoption visible. Drive it before
+	// reading the visible workspace.
+	deadline := time.After(3 * time.Second)
+	for {
+		h.drain()
+		if sameStrings(a.visible.All(), []string{rootB, rootC}) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("the reconnect never re-adopted the daemon roots; visible = %q", a.visible.All())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	h.drain()
+	if got := (host{a}).Roots(); !sameStrings(got, []string{rootB, rootC}) {
+		t.Errorf("host roots = %q, want the reconnected daemon's %q", got, []string{rootB, rootC})
 	}
 }

@@ -204,9 +204,9 @@ func TestCompletionStaysCorrectAcrossEdits(t *testing.T) {
 // ever opened.
 func TestCompletionForgetsClosedBuffers(t *testing.T) {
 	h := newWorkspace(t, 120, 30)
-	h.OpenFile(filepath.Join(h.root, "pkg/helper.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "pkg/helper.go"))
 	h.drain()
-	h.OpenFile(filepath.Join(h.root, "main.go"))
+	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
 
 	h.Pane().DocEnd(false)

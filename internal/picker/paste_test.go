@@ -3,6 +3,7 @@ package picker
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -33,7 +34,7 @@ func tree(t *testing.T, files ...string) *Picker {
 // the list while the field still shows what was pasted.
 func TestPasteNarrowsUntilItMatches(t *testing.T) {
 	p := tree(t, "internal/app/app.go", "cmd/raj/main.go")
-	root := p.Root
+	root := p.Roots[0]
 
 	cases := []struct {
 		name  string
@@ -120,7 +121,7 @@ func TestSplitPosition(t *testing.T) {
 // compiler was pointing.
 func TestPasteKeepsThePosition(t *testing.T) {
 	p := tree(t, "internal/app/app.go")
-	p.Paste(filepath.Join(p.Root, "internal/app/app.go") + ":464:12")
+	p.Paste(filepath.Join(p.Roots[0], "internal/app/app.go") + ":464:12")
 
 	pos, ok := p.PositionFor(filepath.FromSlash("internal/app/app.go"))
 	if !ok {
@@ -212,7 +213,7 @@ func TestTheQueryIsNeverRewritten(t *testing.T) {
 	for _, q := range []string{
 		"app.go:464:12",
 		"internal/app/app.go:464",
-		filepath.Join(p.Root, "internal/app/app.go") + ":464:12",
+		filepath.Join(p.Roots[0], "internal/app/app.go") + ":464:12",
 		"./internal/app/app.go",
 	} {
 		p.Show()
@@ -257,5 +258,46 @@ func TestALiteralMatchIsNeverNarrowed(t *testing.T) {
 	}
 	if _, ok := p.PositionFor(p.Top()); ok {
 		t.Error("a literal match should carry no position")
+	}
+}
+
+// A picker over several roots indexes every one, and choosing a row resolves
+// against the root it was found under rather than the first. The failure this
+// pins: a single Root indexed only the primary root, so the second root's files
+// were unreachable from cmd+p and a chosen label resolved to the wrong tree.
+func TestMultiRootIndexAndResolve(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	for _, d := range []string{rootA, rootB} {
+		if err := os.MkdirAll(filepath.Join(d, "pkg"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// The same relative path under both roots: resolution must pick the
+		// root the entry came from, not blindly the first.
+		if err := os.WriteFile(filepath.Join(d, "pkg", "same.go"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rootB, "b.go"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewRoots([]string{rootA, rootB})
+	p.Show()
+
+	if got := p.Files(); !slices.Contains(got, filepath.FromSlash("b.go")) {
+		t.Fatalf("the second root's b.go is not indexed: %v", got)
+	}
+	p.Handle(keys.None, "b.go")
+	if got, want := p.Handle(keys.Confirm, ""), filepath.Join(rootB, "b.go"); got != want {
+		t.Errorf("chose %q, want the second root's %q", got, want)
+	}
+
+	// A label shared by both roots still resolves under the root of the entry
+	// that was chosen; with equal scores that is the first in walk order.
+	p.Show()
+	p.Handle(keys.None, "pkg/same.go")
+	if got, want := p.Handle(keys.Confirm, ""), filepath.Join(rootA, "pkg", "same.go"); got != want {
+		t.Errorf("shared label chose %q, want the first root's %q", got, want)
 	}
 }

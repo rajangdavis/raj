@@ -68,6 +68,12 @@ type Options struct {
 	// attach keeps, so a laptop client and a phone keep separate views of the
 	// same workspace. Empty falls back to the profile (phone, else attach).
 	Name string
+
+	// Roots, when non-empty, are pre-resolved workspace roots for an
+	// --workspace attach: main has already resolved the daemon label to the
+	// roots it serves, so the app builds over those rather than resolving the
+	// command-line arguments. Empty means resolve from the arguments as usual.
+	Roots []string
 }
 
 // clientViewKey names the saved client view an attach keeps. An explicit name
@@ -130,7 +136,8 @@ func defaultSettings(tabWidth int) ResolvedSettings {
 // A value that will not parse is ignored rather than zeroed: a bad tab_width
 // must not collapse the width to zero, and a bad wrap must not read as false.
 // The ignored keys are returned as "scope/key" in a stable order so the status
-// line can mention them once, exactly as .raj/hidden reports a bad pattern.
+// line can mention them once, exactly as the workspace hide file reports a bad
+// pattern.
 func resolveSettings(def ResolvedSettings, user, workspace map[string]string) (ResolvedSettings, []string) {
 	out := def
 	var bad []string

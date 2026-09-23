@@ -374,3 +374,23 @@ next, and a wave whose reports go unread is the loop left open.
 - docs/COMPLETED.md — done and verified.
 - plugins/raj-gate.ts — identity absorption (see section 2).
 - skills/raj-editor/SKILL.md — the verb reference and field notes.
+
+## 10. The tool-use budget
+
+Agents average well over a hundred calls per session; the count is the thing to
+drive down, and the ledger is where it is measured
+(`~/.local/share/opencode/raj-tool-ledger.jsonl`; recipe in
+`docs/REVIEW-AGENT.md` duty 6).
+
+- Every implementation brief requires the subagent to report its own call count
+  and its batching adoption: `search --context` instead of search-then-read,
+  `read A B C`, `apply --hunks` for several hunks, `dump`/`patch` for a
+  structural rewrite.
+- Every between-wave review reports the wave's per-session call counts, the
+  `raj ctl` verb mix, and the adoption of each batching form. Flag any session
+  over ~100 calls and any form used in under a quarter of the calls it applies
+  to.
+- A low adoption rate caused by a form that is hard to use is a `TODO` surface
+  fix (for example `read --json` missing `bytes`, or multi-path `lsp
+  diagnostics` emitting unframed JSON), not only a discipline note.
+- Measure calls per wave before and after each fix; the aim is to roughly halve.

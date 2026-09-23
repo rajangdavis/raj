@@ -51,7 +51,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   list                       running editors and their workspaces
   buffers                    files open in the editor; a headless buffer has no tab
   status                     is the workspace ready for a gate? names dirty or pending buffers; exit 1 when not
-  read [path]...             one or more buffer views, loaded on demand; --annotated prints a run line per change set after the text; --start/--end/--lines for a span, shared by every target, and an out-of-range byte span refuses the call rather than clamping
+  read [path]...             one or more buffer views, loaded on demand; --annotated prints a run line per change set after the text; --start/--end/--lines for a span, shared by every target, --at PATH=LO,HI for a per-path line span, and an out-of-range byte span refuses the call rather than clamping
   open <path>                show a file: load it and focus a tab; --create makes a buffer for a path not on disk; prints opened or created
   ls [path]                  list a directory's immediate children; a trailing / marks a directory, --hidden includes hidden entries
   mkdir <dir>                create a directory, and any missing parents, under the workspace root
@@ -79,7 +79,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   revert [path] [--author N] discard your own pieces; the inverse of attribution
   diff [path]                pending change sets as old→new text, for review
   review [path]              enter review mode and list pending change sets; --json lists without entering
-  search -q PATTERN          search the workspace, unsaved edits included; --hidden includes hidden paths; --context N adds N lines either side of each hit
+  search -q PATTERN          search the workspace, unsaved edits included; --hidden includes hidden paths; --context N adds N lines either side of each hit; -q repeats, and every pattern is searched in one call
   search -q PATTERN --path DIR
                              search only DIR, under the workspace root
   version [path]             the version a later apply bases on
@@ -221,7 +221,10 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	identity := fs.String("as", "", "identity to write as; the same one reconnecting keeps its author id")
 	name := fs.String("name", "", "display name for this participant")
 	dir := fs.String("dir", "", "exec: directory to run in, inside the workspace")
-	query := fs.String("q", "", "search: the pattern")
+	var query searchPatternFlag
+	fs.Var(&query, "q", "search: the pattern; repeatable, one pattern per -q, any pattern may match")
+	var atSpans atSpanFlag
+	fs.Var(&atSpans, "at", "read: PATH=LO,HI, a 1-based inclusive line span for that path; repeatable")
 	include := fs.String("include", "", "search: comma-separated globs to search")
 	exclude := fs.String("exclude", "", "search: comma-separated globs to skip")
 	searchPath := fs.String("path", "", "search: limit the walk to a directory under the workspace root; the scope itself is searched even when hidden")
@@ -344,7 +347,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	case "status":
 		return status(c, stdout, stderr, *asJSON)
 	case "read":
-		return read(c, fs.Args(), *start, *end, *lines, *annotated, stdout, stderr, *asJSON)
+		return read(c, fs.Args(), &atSpans, *start, *end, *lines, *annotated, stdout, stderr, *asJSON)
 	case "open":
 		if path == "" {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
@@ -635,9 +638,9 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "raj ctl search: --context cannot be negative")
 			return 2
 		}
-		return doSearch(c, SearchQuery{Text: *query, Include: *include, Exclude: *exclude,
+		return doSearch(c, SearchQuery{Include: *include, Exclude: *exclude,
 			Path: *searchPath, Hidden: *hiddenFlag, Context: *context,
-			Regex: *regex, Case: *matchCase, Word: *word}, *jsonl, *asJSON, stdout, stderr)
+			Regex: *regex, Case: *matchCase, Word: *word}, query.patterns(), *jsonl, *asJSON, stdout, stderr)
 	case "version":
 		res, err := c.Do(Request{Op: "version", Path: path})
 		if code := fail(stderr, res, err); code != 0 {
@@ -664,13 +667,11 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			if len(paths) == 0 {
 				paths = []string{""} // the buffer in front, as with one path
 			}
-			code := 0
-			for _, p := range paths {
-				if got := doLSP(c, "diagnostics", p, "", *lines, "", stdout, stderr, *asJSON); got != 0 {
-					code = got
-				}
+			if len(paths) == 1 {
+				// One path keeps the single-path shape exactly, JSON included.
+				return doLSP(c, "diagnostics", paths[0], "", *lines, "", stdout, stderr, *asJSON)
 			}
-			return code
+			return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
 		}
 		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, fs.Arg(3), stdout, stderr, *asJSON)
 	case "apply":
@@ -1545,91 +1546,192 @@ func mineProposals(props []Proposal, author uint8) []Proposal {
 	return kept
 }
 
+// searchPatternFlag accumulates -q. One search call may carry several
+// patterns, and every hit names the one that matched it; a single -q behaves
+// exactly as the plain string flag it replaced.
+type searchPatternFlag struct{ vals []string }
+
+func (s *searchPatternFlag) String() string { return strings.Join(s.vals, ",") }
+
+func (s *searchPatternFlag) Set(v string) error {
+	s.vals = append(s.vals, v)
+	return nil
+}
+
+// patterns is the accumulated list, or one empty pattern when -q was never
+// given, so a bare search is the empty search it always was.
+func (s *searchPatternFlag) patterns() []string {
+	if len(s.vals) == 0 {
+		return []string{""}
+	}
+	return s.vals
+}
+
 // doSearch prints hits in the grep format every tool already parses:
 // path:line:col:text. The overlay means a hit can be in a buffer the user has
 // not saved, which is the point — an agent that grepped the filesystem would
 // see stale text and edit against it.
-func doSearch(c *Client, q SearchQuery, jsonl, asJSON bool, stdout, stderr io.Writer) int {
+//
+// One -q is one pattern and the output is byte-for-byte what it always was.
+// Several -q flags search every pattern in one CLI call: the engine's query
+// carries one pattern, so this is several walks behind one command, and each
+// hit is labelled with the pattern that matched it.
+func doSearch(c *Client, base SearchQuery, patterns []string, jsonl, asJSON bool, stdout, stderr io.Writer) int {
+	multi := len(patterns) > 1
 	// Print as they arrive rather than at the end. A walk over a large tree
 	// takes seconds, and a caller — a person at a terminal or an agent reading
 	// a pipe — should not wait for the last file to see the first hit.
 	// Ctrl+C closes the connection, which cancels the walk in the editor.
-	n := 0
-	stream := func(batch []SearchMatch) {
-		if jsonl {
-			// NDJSON: one object per line, as each hit arrives.
-			enc := json.NewEncoder(stdout)
+	stream := func(pattern string) func([]SearchMatch) {
+		return func(batch []SearchMatch) {
+			if jsonl {
+				// NDJSON: one object per line, as each hit arrives.
+				enc := json.NewEncoder(stdout)
+				for _, m := range batch {
+					obj := map[string]any{
+						"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
+						"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "line_start": m.LineStart, "line_end": m.LineEnd,
+						"version": m.Version, "text": m.Text,
+					}
+					// Context is absent, not empty, when the flag was not given:
+					// the key must not appear for a plain -jsonl, whose bytes are
+					// unchanged from before the option existed.
+					if m.Context != "" {
+						obj["context"] = m.Context
+					}
+					// The pattern rides only when several were given, so a
+					// single-pattern -jsonl is unchanged.
+					if multi {
+						obj["pattern"] = pattern
+					}
+					enc.Encode(obj)
+				}
+				return
+			}
+			if asJSON {
+				return // JSON is emitted whole, so it stays parseable
+			}
 			for _, m := range batch {
-				obj := map[string]any{
-					"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
-					"byte_start": m.ByteStart, "byte_end": m.ByteEnd, "line_start": m.LineStart, "line_end": m.LineEnd,
-					"version": m.Version, "text": m.Text,
+				// The pattern is prefixed only when several were given, so a
+				// single-pattern hit line is unchanged.
+				label := ""
+				if multi {
+					label = pattern + "\t"
 				}
-				// Context is absent, not empty, when the flag was not given:
-				// the key must not appear for a plain -jsonl, whose bytes are
-				// unchanged from before the option existed.
 				if m.Context != "" {
-					obj["context"] = m.Context
+					// The context block already contains the hit line, so the
+					// header names where the hit is and the block shows it in
+					// place, with the version the hit was found at.
+					fmt.Fprintf(stdout, "%s%s:%d:%d version %d\n%s\n", label, m.Path, m.Line, m.Col, m.Version, m.Context)
+				} else {
+					fmt.Fprintf(stdout, "%s%s:%d:%d:%s\n", label, m.Path, m.Line, m.Col, m.Text)
 				}
-				enc.Encode(obj)
-				n++
 			}
-			return
-		}
-		if asJSON {
-			return // JSON is emitted whole, so it stays parseable
-		}
-		for _, m := range batch {
-			if m.Context != "" {
-				// The context block already contains the hit line, so the
-				// header names where the hit is and the block shows it in
-				// place, with the version the hit was found at.
-				fmt.Fprintf(stdout, "%s:%d:%d version %d\n%s\n", m.Path, m.Line, m.Col, m.Version, m.Context)
-			} else {
-				fmt.Fprintf(stdout, "%s:%d:%d:%s\n", m.Path, m.Line, m.Col, m.Text)
-			}
-			n++
 		}
 	}
-	res, err := c.DoStream(Request{Op: "search", Query: &q}, stream)
-	if code := fail(stderr, res, err); code != 0 {
-		return code
+	// Every pattern's answer is folded into one command's: the totals are
+	// summed, and a hit for any pattern is a match for the call.
+	var (
+		all       []SearchMatch
+		labels    []string
+		matched   bool
+		files     int
+		capped    bool
+		truncated []TruncatedFile
+		include   bool
+		hints     []string
+	)
+	for _, pattern := range patterns {
+		q := base
+		q.Text = pattern
+		res, err := c.DoStream(Request{Op: "search", Query: &q}, stream(pattern))
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		all = append(all, res.Matches...)
+		for range res.Matches {
+			labels = append(labels, pattern)
+		}
+		if len(res.Matches) > 0 {
+			matched = true
+		}
+		files += res.Files
+		capped = capped || res.Capped
+		truncated = append(truncated, res.Truncated...)
+		// An -include that admits no file is almost always a mistyped glob,
+		// and its output is indistinguishable from "no matches" without this,
+		// so the warning is kept — once, however many patterns were given.
+		if q.Include != "" && res.Considered == 0 {
+			include = true
+		}
+		// The metacharacter hint names its own pattern: one pattern's miss
+		// must not speak for another.
+		if !q.Regex && res.Considered > 0 && len(res.Matches) == 0 && hasRegexMeta(pattern) {
+			hints = append(hints, pattern)
+		}
 	}
-	// An -include that admits no file is almost always a mistyped glob, and
-	// its output is indistinguishable from "no matches" without this — but
-	// the two call for opposite fixes, so say which one happened.
-	if q.Include != "" && res.Considered == 0 {
+	if include {
 		fmt.Fprintln(stderr, "search: warning: --include pattern(s) matched no files")
 	}
-	// A literal search that finds nothing but whose pattern carries regex
-	// syntax is usually a regex typed without -regex: the engine treats the
-	// metacharacters as text and matches nothing. Say so once, and only when
-	// files really were searched, so it cannot fire on a genuinely empty walk.
-	if !q.Regex && res.Considered > 0 && len(res.Matches) == 0 && hasRegexMeta(q.Text) {
-		fmt.Fprintf(stderr, "search: no matches; %q contains regex metacharacters — retry with --regex\n", q.Text)
+	for _, pattern := range hints {
+		fmt.Fprintf(stderr, "search: no matches; %q contains regex metacharacters — retry with --regex\n", pattern)
 	}
 	if !jsonl && asJSON {
-		return emit(stdout, map[string]any{
-			"matches": res.Matches, "files": res.Files, "capped": res.Capped,
-			"truncated": res.Truncated})
+		if !multi {
+			// One pattern keeps the exact whole-JSON shape, SearchMatch and
+			// all, so its bytes are unchanged.
+			return emit(stdout, map[string]any{
+				"matches": all, "files": files, "capped": capped,
+				"truncated": truncated})
+		}
+		matches := make([]map[string]any, 0, len(all))
+		for i, m := range all {
+			matches = append(matches, searchMatchJSON(m, labels[i]))
+		}
+		code := emit(stdout, map[string]any{
+			"matches": matches, "files": files, "capped": capped,
+			"truncated": truncated})
+		if !matched {
+			return 1
+		}
+		return code
 	}
-	if res.Capped {
+	if capped {
 		fmt.Fprintln(stderr, "note: results were capped; narrow the query with --include")
 	}
 	// A per-file cap is not the global one: a file with more matches than the
 	// limit reports the limit and leaves capped false, so without this it is
 	// indistinguishable from a file holding exactly the limit. Name the files,
 	// rather than a count the caller has to go and resolve.
-	if n := len(res.Truncated); n > 0 {
+	if n := len(truncated); n > 0 {
 		fmt.Fprintf(stderr, "note: %d file(s) hold more matches than the per-file limit shows:\n", n)
-		for _, f := range res.Truncated {
+		for _, f := range truncated {
 			fmt.Fprintf(stderr, "  %s (%d of %d)\n", f.Path, f.Shown, f.Total)
 		}
 	}
-	if len(res.Matches) == 0 {
+	if !matched {
 		return 1 // no hits is a non-zero exit, as grep has always had it
 	}
 	return 0
+}
+
+// searchMatchJSON is one hit as JSON with the pattern that matched it, for a
+// multi-pattern -json reply. A single pattern marshals SearchMatch itself, so
+// its bytes stay exactly as they were.
+func searchMatchJSON(m SearchMatch, pattern string) map[string]any {
+	obj := map[string]any{
+		"path": m.Path, "line": m.Line, "col": m.Col, "len": m.Len,
+		"byte_start": m.ByteStart, "byte_end": m.ByteEnd,
+		"line_start": m.LineStart, "line_end": m.LineEnd,
+		"version": m.Version, "text": m.Text,
+	}
+	if m.Context != "" {
+		obj["context"] = m.Context
+	}
+	if pattern != "" {
+		obj["pattern"] = pattern
+	}
+	return obj
 }
 
 // hasRegexMeta reports whether a literal search pattern carries characters a
@@ -2108,6 +2210,74 @@ func doLSP(c *Client, mode, path, pos, lines, query string, stdout, stderr io.Wr
 	return emit(stdout, out)
 }
 
+// lspStatusError names a diagnostics entry the CLI could not obtain, so a
+// batch answer still carries a status for every operand rather than dropping
+// the ones the editor refused. It is not one of the editor's own statuses:
+// there was no reading at all, and the entry's detail says why.
+const lspStatusError = "error"
+
+// lspFileResult is one operand's entry in a multi-path diagnostics answer. The
+// LSPResult is embedded, so the JSON keys are exactly the single-path reply's
+// keys with `path` added: a reader that already parses one file's diagnostics
+// parses an entry unchanged, and every entry names the path it answers.
+type lspFileResult struct {
+	Path string `json:"path"`
+	LSPResult
+}
+
+// lspDiagnostics answers a diagnostics request that named two or more paths as
+// one framed JSON document, {"files":[...]}, the framing `read --json` uses
+// for several targets. Each path is asked on its own, so every answer is
+// paired with the operand that produced it rather than attributed by position.
+//
+// A path with no answer still appears, with an error status and the refusal as
+// its detail, so no operand is silently dropped. The exit code is what the
+// per-path sweep already gave: a non-ok status or a refusal on any file fails
+// the call, while a clean sweep is zero. The plain form prints each path's own
+// object under an `==> path <==` header, so two files' answers do not run
+// together.
+func lspDiagnostics(c *Client, paths []string, stdout, stderr io.Writer, asJSON bool) int {
+	files := make([]lspFileResult, 0, len(paths))
+	code := 0
+	for _, p := range paths {
+		res, err := c.Do(Request{Op: "lsp", Path: p, LSPMode: "diagnostics"})
+		var out LSPResult
+		if uerr := json.Unmarshal([]byte(res.LSPJSON), &out); uerr != nil {
+			// No answer this build can read: keep the operand and say why.
+			if ferr := fail(stderr, res, err); ferr != 0 {
+				code = ferr
+			} else {
+				code = 1
+			}
+			detail := res.Err
+			if detail == "" && err != nil {
+				detail = err.Error()
+			}
+			out = LSPResult{Status: lspStatusError, Detail: firstOf(detail,
+				"the editor did not report a diagnostics status; rebuild it to match this ctl")}
+		} else if out.Status != LSPStatusOK {
+			code = 1
+		}
+		files = append(files, lspFileResult{Path: p, LSPResult: out})
+	}
+	if asJSON {
+		if emit(stdout, map[string]any{"files": files}) != 0 {
+			return 1
+		}
+		return code
+	}
+	for i, f := range files {
+		if i > 0 {
+			fmt.Fprintln(stdout)
+		}
+		fmt.Fprintf(stdout, "==> %s <==\n", f.Path)
+		if emit(stdout, f) != 0 {
+			return 1
+		}
+	}
+	return code
+}
+
 // lspQuery carries a workspace/symbol query on the request's generic Query
 // field. An empty query is nil rather than an empty SearchQuery, so the field
 // is absent on the wire exactly when there is nothing to say; the server's
@@ -2507,7 +2677,197 @@ func braceTally(path, text string) BraceTally {
 	return t
 }
 
-func read(c *Client, paths []string, start, end int, lines string, annotated bool, stdout, stderr io.Writer, asJSON bool) int {
+// atSpan is one --at entry: a path and the 1-based inclusive line span to
+// read from it.
+type atSpan struct {
+	path       string
+	start, end int
+}
+
+// atSpanFlag accumulates --at PATH=LO,HI entries. The value splits on the
+// last "=", so a path that contains "=" stays addressable; what follows must
+// be LO,HI with positive, ordered line numbers, and a bad entry is refused by
+// name.
+type atSpanFlag struct {
+	entries []atSpan
+	index   map[string]int
+}
+
+func (a *atSpanFlag) String() string { return "" }
+
+func (a *atSpanFlag) Set(v string) error {
+	i := strings.LastIndexByte(v, '=')
+	if i <= 0 {
+		return fmt.Errorf("--at %q: want PATH=LO,HI with a positive line span", v)
+	}
+	start, end, ok := parseAtSpan(v[i+1:])
+	if !ok {
+		return fmt.Errorf("--at %q: want PATH=LO,HI with positive line numbers, LO <= HI", v)
+	}
+	path := v[:i]
+	if a.index == nil {
+		a.index = map[string]int{}
+	}
+	if at, seen := a.index[path]; seen {
+		a.entries[at] = atSpan{path: path, start: start, end: end}
+		return nil
+	}
+	a.index[path] = len(a.entries)
+	a.entries = append(a.entries, atSpan{path: path, start: start, end: end})
+	return nil
+}
+
+// lookup returns the span an --at entry gave a path.
+func (a *atSpanFlag) lookup(path string) (atSpan, bool) {
+	i, ok := a.index[path]
+	if !ok {
+		return atSpan{}, false
+	}
+	return a.entries[i], true
+}
+
+// parseAtSpan parses "LO,HI": both positive, LO <= HI.
+func parseAtSpan(s string) (start, end int, ok bool) {
+	lo, hi, found := strings.Cut(s, ",")
+	if !found {
+		return 0, 0, false
+	}
+	start, ok1 := ctlAtoi(strings.TrimSpace(lo))
+	end, ok2 := ctlAtoi(strings.TrimSpace(hi))
+	if !ok1 || !ok2 || start < 1 || end < start {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// readTarget is one path to read and the span to read from it. A nil
+// lineStart means no line span (a whole-file read or a byte span); lineEnd
+// nil reads from lineStart to the end of the file.
+type readTarget struct {
+	path      string
+	lineStart *int
+	lineEnd   *int
+	start     *int
+	end       *int
+}
+
+// readSpan is a target's resolved span. It is comparable, so targets sharing
+// one travel in a single wire call.
+type readSpan struct {
+	kind       byte // 'l' line, 'b' byte, 0 whole file
+	start, end int
+}
+
+func (t readTarget) span() readSpan {
+	if t.lineStart != nil {
+		end := 0
+		if t.lineEnd != nil {
+			end = *t.lineEnd
+		}
+		return readSpan{kind: 'l', start: *t.lineStart, end: end}
+	}
+	if t.start != nil || t.end != nil {
+		start, end := -1, -1
+		if t.start != nil {
+			start = *t.start
+		}
+		if t.end != nil {
+			end = *t.end
+		}
+		return readSpan{kind: 'b', start: start, end: end}
+	}
+	return readSpan{}
+}
+
+func (s readSpan) lineStartPtr() *int {
+	if s.kind != 'l' {
+		return nil
+	}
+	start := s.start
+	return &start
+}
+
+func (s readSpan) lineEndPtr() *int {
+	if s.kind != 'l' || s.end <= 0 {
+		return nil
+	}
+	end := s.end
+	return &end
+}
+
+func (s readSpan) byteStartPtr() *int {
+	if s.kind != 'b' || s.start < 0 {
+		return nil
+	}
+	start := s.start
+	return &start
+}
+
+func (s readSpan) byteEndPtr() *int {
+	if s.kind != 'b' || s.end < 0 {
+		return nil
+	}
+	end := s.end
+	return &end
+}
+
+// addLineSpan echoes the line span a target read on its JSON object, so a
+// driver re-derives offsets without a second call. Only a line span is
+// echoed; a byte span keeps the shape it always had.
+func addLineSpan(out map[string]any, t readTarget) {
+	if t.lineStart == nil {
+		return
+	}
+	out["line_start"] = *t.lineStart
+	if t.lineEnd != nil {
+		out["line_end"] = *t.lineEnd
+	}
+}
+
+// readTargets resolves the operands and --at entries into the ordered list of
+// targets to read. A positional path named by --at reads once, at that span;
+// a positional path without one reads whole, or at the global --start/--end/
+// --lines span when given. An --at path with no positional operand is
+// appended in --at order.
+func readTargets(paths []string, at *atSpanFlag, lsp, lep, sp, ep *int) []readTarget {
+	if at == nil || len(at.entries) == 0 {
+		if len(paths) == 0 {
+			return []readTarget{{start: sp, end: ep, lineStart: lsp, lineEnd: lep}}
+		}
+		out := make([]readTarget, 0, len(paths))
+		for _, p := range paths {
+			out = append(out, readTarget{path: p, start: sp, end: ep, lineStart: lsp, lineEnd: lep})
+		}
+		return out
+	}
+	var out []readTarget
+	named := make(map[string]bool, len(at.entries))
+	for _, p := range paths {
+		if a, ok := at.lookup(p); ok {
+			if named[p] {
+				continue // named positionally more than once: still one read
+			}
+			named[p] = true
+			lo, hi := a.start, a.end
+			out = append(out, readTarget{path: p, lineStart: &lo, lineEnd: &hi})
+			continue
+		}
+		out = append(out, readTarget{path: p, start: sp, end: ep, lineStart: lsp, lineEnd: lep})
+	}
+	for _, a := range at.entries {
+		if named[a.path] {
+			continue
+		}
+		named[a.path] = true
+		lo, hi := a.start, a.end
+		out = append(out, readTarget{path: a.path, lineStart: &lo, lineEnd: &hi})
+	}
+	return out
+}
+
+// read answers one invocation: a single target keeps the single-target shape,
+// and several targets are read together.
+func read(c *Client, paths []string, at *atSpanFlag, start, end int, lines string, annotated bool, stdout, stderr io.Writer, asJSON bool) int {
 	var sp, ep *int
 	if start >= 0 {
 		sp = &start
@@ -2517,27 +2877,36 @@ func read(c *Client, paths []string, start, end int, lines string, annotated boo
 	}
 	var lsp, lep *int
 	if a, b, hasEnd, ok := ctlLines(lines); ok {
-		lsp, lep = &a, nil
+		lsp = &a
 		if hasEnd {
 			lep = &b
 		}
 	}
-	if len(paths) > 1 {
-		if annotated {
-			// The state runs are relative to one buffer's text, and the plain
-			// form prints them after that text; there is no per-file shape for
-			// them yet, so a single target is still the annotated read.
-			fmt.Fprintln(stderr, "raj ctl read: --annotated takes one path")
-			return 2
+	targets := readTargets(paths, at, lsp, lep, sp, ep)
+	if len(targets) > 1 && annotated {
+		// The state runs are relative to one buffer's text, and the plain
+		// form prints them after that text; there is no per-file shape for
+		// them yet, so a single target is still the annotated read.
+		fmt.Fprintln(stderr, "raj ctl read: --annotated takes one path")
+		return 2
+	}
+	if len(targets) <= 1 {
+		path := ""
+		var t readTarget
+		if len(targets) == 1 {
+			t = targets[0]
+			path = t.path
 		}
-		return readMany(c, paths, sp, ep, lsp, lep, annotated, stdout, stderr, asJSON)
+		return readOne(c, path, t, annotated, stdout, stderr, asJSON)
 	}
-	path := ""
-	if len(paths) == 1 {
-		path = paths[0]
-	}
-	res, err := c.Do(Request{Op: "text", Path: path, Start: sp, End: ep,
-		LineStart: lsp, LineEnd: lep, Annotated: annotated})
+	return readMany(c, targets, stdout, stderr, asJSON)
+}
+
+// readOne is the single-target read. Its -json carries the line span too, so
+// the span a caller asked for is not something it has to re-derive.
+func readOne(c *Client, path string, t readTarget, annotated bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "text", Path: path, Start: t.start, End: t.end,
+		LineStart: t.lineStart, LineEnd: t.lineEnd, Annotated: annotated})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -2555,6 +2924,10 @@ func read(c *Client, paths []string, start, end int, lines string, annotated boo
 		out := map[string]any{
 			"text": res.Text(), "version": res.Version,
 			"author": c.Author(), "spans": spans,
+			// The whole file's size, not the returned span's: a driver that
+			// read the text needs the file length to append, and these are
+			// the same numbers `version --json` reports.
+			"bytes": res.Bytes, "lines": res.Lines,
 		}
 		// An annotated read carries the state of every run in the returned
 		// text, relative to that text. It rides as raw JSON so the run list
@@ -2562,6 +2935,7 @@ func read(c *Client, paths []string, start, end int, lines string, annotated boo
 		if res.StatesJSON != "" {
 			out["states"] = json.RawMessage(res.StatesJSON)
 		}
+		addLineSpan(out, t)
 		return emit(stdout, out)
 	}
 	text := res.Text()
@@ -2586,40 +2960,88 @@ func read(c *Client, paths []string, start, end int, lines string, annotated boo
 	return 0
 }
 
-// readMany prints the answer to a read that named several targets. The wire
-// reuses the buffers and spans shapes, so the per-file split is the running
-// sum of each buffer's byte length; a file is printed as its text under an
-// `==> path <==` header, the convention head and tail use, which keeps two
-// files' bytes from running together. -json emits one object per file.
-func readMany(c *Client, paths []string, sp, ep, lsp, lep *int, annotated bool,
-	stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "text", Paths: paths, Start: sp, End: ep,
-		LineStart: lsp, LineEnd: lep, Annotated: annotated})
-	if code := fail(stderr, res, err); code != 0 {
-		return code
+// readMany prints the answer to a read that named several targets. Targets
+// that share a span travel in one wire call, so only a per-path --at costs a
+// call per distinct span; the results are reassembled in operand order. A
+// file prints as its text under an `==> path <==` header, and -json emits one
+// object per file with the span it read.
+func readMany(c *Client, targets []readTarget, stdout, stderr io.Writer, asJSON bool) int {
+	type group struct {
+		span readSpan
+		idx  []int
 	}
-	all := res.Text()
-	files := make([]map[string]any, 0, len(res.Buffers))
-	off := 0
-	for _, b := range res.Buffers {
-		end := off + b.Bytes
-		if end > len(all) {
-			end = len(all)
+	var groups []*group
+	bySpan := make(map[readSpan]*group, len(targets))
+	for i, t := range targets {
+		s := t.span()
+		g := bySpan[s]
+		if g == nil {
+			g = &group{span: s}
+			bySpan[s] = g
+			groups = append(groups, g)
 		}
-		files = append(files, map[string]any{
-			"path": b.Path, "text": all[off:end], "version": b.Version,
-		})
-		off = end
+		g.idx = append(g.idx, i)
 	}
-	if len(files) == 0 {
-		// A server that does not know the multi-target form answered with a
-		// single target's text. Print it rather than nothing, and let the
-		// version-skew warning name the mismatch.
-		if asJSON {
-			return emit(stdout, map[string]any{"text": all, "version": res.Version})
+	texts := make([]string, len(targets))
+	metas := make([]Buffer, len(targets))
+	got := make([]bool, len(targets))
+	for _, g := range groups {
+		paths := make([]string, len(g.idx))
+		for k, i := range g.idx {
+			paths[k] = targets[i].path
 		}
-		io.WriteString(stdout, all)
-		return 0
+		res, err := c.Do(Request{Op: "text", Paths: paths,
+			Start: g.span.byteStartPtr(), End: g.span.byteEndPtr(),
+			LineStart: g.span.lineStartPtr(), LineEnd: g.span.lineEndPtr()})
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		all := res.Text()
+		if len(res.Buffers) == 0 {
+			// A server that does not know the multi-target form answered
+			// with a single target's text. Keep the old fallback for the
+			// whole-batch case, and a one-target group's text otherwise.
+			if len(g.idx) > 1 {
+				if asJSON {
+					return emit(stdout, map[string]any{
+						"text": all, "version": res.Version,
+						"bytes": res.Bytes, "lines": res.Lines,
+					})
+				}
+				io.WriteString(stdout, all)
+				return 0
+			}
+			i := g.idx[0]
+			texts[i], got[i] = all, true
+			metas[i] = Buffer{Path: targets[i].path, Version: res.Version, Bytes: len(all), Lines: res.Lines}
+			continue
+		}
+		off := 0
+		for k, b := range res.Buffers {
+			if k >= len(g.idx) {
+				break
+			}
+			end := off + b.Bytes
+			if end > len(all) {
+				end = len(all)
+			}
+			i := g.idx[k]
+			texts[i], metas[i], got[i] = all[off:end], b, true
+			off = end
+		}
+	}
+	files := make([]map[string]any, 0, len(targets))
+	for i, t := range targets {
+		if !got[i] {
+			continue
+		}
+		m := metas[i]
+		f := map[string]any{
+			"path": m.Path, "text": texts[i], "version": m.Version,
+			"bytes": m.Bytes, "lines": m.Lines,
+		}
+		addLineSpan(f, t)
+		files = append(files, f)
 	}
 	if asJSON {
 		return emit(stdout, map[string]any{"files": files})

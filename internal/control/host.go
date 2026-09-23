@@ -398,11 +398,27 @@ func (g *Guard) inRoot(path string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("%w: a path must be absolute", ErrOutsideoot)
 	}
-	root := filepath.Clean(g.Host.Root())
 	clean := filepath.Clean(path)
-	rel, err := filepath.Rel(root, clean)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("%w: %s is not under %s", ErrOutsideoot, clean, root)
+	for _, root := range g.roots() {
+		rel, err := filepath.Rel(filepath.Clean(root), clean)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s is not under %s", ErrOutsideoot, clean, g.Host.Root())
+}
+
+// roots is the workspace root set when the host exposes one, and the single
+// Root otherwise. Everything is validated against every root, so a path under
+// the second root is in the workspace exactly as a path under the primary is.
+func (g *Guard) roots() []string {
+	if m, ok := g.Host.(interface{ Roots() []string }); ok {
+		if r := m.Roots(); len(r) > 0 {
+			return r
+		}
+	}
+	if r := g.Host.Root(); r != "" {
+		return []string{r}
 	}
 	return nil
 }
@@ -434,15 +450,17 @@ func (g *Guard) inRootResolved(path string) error {
 		// and the lexical check above is the whole gate.
 		return nil
 	}
-	root := filepath.Clean(g.Host.Root())
-	if r, rerr := filepath.EvalSymlinks(root); rerr == nil {
-		root = r
+	for _, root := range g.roots() {
+		root = filepath.Clean(root)
+		if r, rerr := filepath.EvalSymlinks(root); rerr == nil {
+			root = r
+		}
+		rel, err := filepath.Rel(root, resolved)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil
+		}
 	}
-	rel, err := filepath.Rel(root, resolved)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("%w: %s resolves to %s, outside %s", ErrOutsideoot, path, resolved, root)
-	}
-	return nil
+	return fmt.Errorf("%w: %s resolves to %s, outside %s", ErrOutsideoot, path, resolved, g.Host.Root())
 }
 
 // resolveExistingPrefix resolves path's symlinks as far as it exists and
@@ -730,12 +748,17 @@ func (g *Guard) Rmdirs() []DirRemoval {
 // Ls lists a directory's immediate children. It is a read, ungated like
 // Deletions, but the path still has to resolve inside the workspace: ls is not
 // a way to read the filesystem outside the tree. An empty path names the
-// workspace root, which is the verb's default. claimPath is the canonicaliser
-// rather than canonical, because the latter goes through Host.Resolve and a
-// directory is not a buffer to load; the same split Rmdir uses.
+// workspace itself, which is the verb's default: the host answers with one
+// root's children, or a top-level entry per root when there are several. For an
+// explicit path claimPath is the canonicaliser rather than canonical, because
+// the latter goes through Host.Resolve and a directory is not a buffer to load;
+// the same split Rmdir uses.
 func (g *Guard) Ls(path string, all bool) ([]Entry, error) {
 	if path == "" {
-		path = g.Host.Root()
+		// Empty names the workspace, and the host is what knows whether that
+		// is one root's children or a row per root. It also validates its
+		// own default, so nothing is read outside a root.
+		return g.Host.Ls("", all)
 	}
 	name, err := g.claimPath(path)
 	if err != nil {
@@ -851,6 +874,24 @@ func (g *Guard) Read(path string, author uint8, start, end, lineStart, lineEnd i
 	return spans, states, v, err
 }
 
+// readSize is the whole-buffer byte length and line count a read reply carries,
+// so a driver that just read the text does not make a second version call for
+// the file length. The values come from the buffer list exactly as the version
+// verb reads them; a name not in the list reports the zero the version verb
+// would.
+func (g *Guard) readSize(path string) (int, int) {
+	name, err := g.canonical(path)
+	if err != nil {
+		return 0, 0
+	}
+	for _, b := range g.Buffers() {
+		if b.Path == name {
+			return b.Bytes, b.Lines
+		}
+	}
+	return 0, 0
+}
+
 func (g *Guard) DocSnapshot(path string) ([]byte, uint64, []byte, string, error) {
 	name, err := g.canonical(path)
 	if err != nil {
@@ -939,10 +980,11 @@ func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uin
 }
 
 func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, []GroupOverlap, error) {
-	// A socket may not write as the file-as-loaded, and may not write as a
-	// human — attribution is what the tint, the per-author undo stacks and the
-	// exec staleness split all read, so a connection able to claim a person
-	// would make its text indistinguishable from something typed.
+	// A socket may not write as the file-as-loaded. It may write as an agent,
+	// as an undeclared (provisional) connection, or as a durable joined human
+	// other than the local one: an attached client joins as a second human, and
+	// its text is the person's own accepted edit rather than a proposal,
+	// while the local keyboard row stays unclaimable by a socket.
 	//
 	// A registry lookup rather than `author >= 2`: once a second person can
 	// edit the same workspace, the id number cannot say what kind of writer it
@@ -952,8 +994,9 @@ func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uin
 		return 0, nil, nil, fmt.Errorf("author %d is the file as loaded, not a writer", author)
 	}
 	if g.Participants != nil {
-		if !g.Participants.IsAgent(author) && !g.Participants.IsProvisional(author) {
-			return 0, nil, nil, fmt.Errorf("author %d is not an agent", author)
+		if !g.Participants.IsAgent(author) && !g.Participants.IsProvisional(author) &&
+			!g.writesAsHuman(author) {
+			return 0, nil, nil, fmt.Errorf("author %d is not an agent or a joined human", author)
 		}
 	} else if author < FirstAgent {
 		return 0, nil, nil, fmt.Errorf("author %d is not an agent id", author)
@@ -975,6 +1018,18 @@ func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uin
 		}
 	}
 	return g.Host.Apply(name, author, base, hunks)
+}
+
+// writesAsHuman reports whether id is a durable joined human other than the
+// local keyboard row. An attached client hellos as a second human, and its
+// writes are that person's own accepted text; the local row is excluded so a
+// socket cannot claim to be the person at the keyboard.
+func (g *Guard) writesAsHuman(id uint8) bool {
+	if g.Participants == nil || id == AuthorOriginal || id == LocalHuman {
+		return false
+	}
+	p, ok := g.Participants.Get(id)
+	return ok && p.Kind == KindHuman
 }
 
 // escapingGlob reports a glob that reaches outside the workspace. The document
@@ -1400,16 +1455,22 @@ func readPaths(g *Guard, req Request, start, end, lineStart, lineEnd int) Respon
 			// corruption), so the caller needs to know which file to fix.
 			return Response{Err: name + ": " + err.Error()}
 		}
-		n := 0
+		// A target's byte length and line count are the text it contributed,
+		// which for a whole-file read is the file's own size and lines. The
+		// byte length is also what splits the concatenated body back into
+		// files, so it stays the contributed length. The line count follows
+		// view.Index: one per newline plus the final (possibly empty) line.
+		n, lines := 0, 1
 		for _, sp := range spans {
 			n += len(sp.Text)
+			lines += strings.Count(sp.Text, "\n")
 		}
 		for _, r := range st {
 			r.Off += off
 			states = append(states, r)
 		}
 		res.Spans = append(res.Spans, spans...)
-		res.Buffers = append(res.Buffers, Buffer{Path: name, Version: v, Bytes: n})
+		res.Buffers = append(res.Buffers, Buffer{Path: name, Version: v, Bytes: n, Lines: lines})
 		names = append(names, name)
 		off += n
 	}
@@ -1435,9 +1496,10 @@ func readPaths(g *Guard, req Request, start, end, lineStart, lineEnd int) Respon
 func Dispatch(g *Guard, req Request) Response {
 	switch req.Op {
 	case "ping":
-		return Response{OK: true, Root: g.Root()}
+		return Response{OK: true, Root: g.Root(), Roots: g.roots()}
 	case "buffers":
-		return Response{OK: true, Root: g.Root(), Buffers: g.Buffers()}
+		return Response{OK: true, Root: g.Root(), Roots: g.roots(), Buffers: g.Buffers()}
+
 	case "open":
 		if req.Path == "" {
 			return Response{Err: "open needs a path"}
@@ -1547,6 +1609,11 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: err.Error()}
 		}
 		res := Response{OK: true, Spans: spans, Version: v}
+		// The whole file's size, not the returned span's: a driver that read
+		// the text needs the file length to append, and carrying it here is
+		// what removes the second version call. The numbers come from the
+		// buffer list exactly as the version verb reads them.
+		res.Bytes, res.Lines = g.readSize(req.Path)
 		if len(states) > 0 {
 			data, err := json.Marshal(states)
 			if err != nil {

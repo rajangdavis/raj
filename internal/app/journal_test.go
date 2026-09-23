@@ -155,7 +155,7 @@ func TestJournalRestoreSkipsChangedFile(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -224,7 +224,7 @@ func TestJournalRestoreAfterSaveUsesWrittenHash(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -257,7 +257,7 @@ func TestJournalRestoreSkipsExternalEditAfterSave(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -310,7 +310,7 @@ func TestJournalRestoresAuthorTable(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -362,7 +362,7 @@ func TestJournalArchivesMismatchedLogAndStartsFreshBase(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -425,7 +425,7 @@ func TestJournalSaveThenRestoreIsClean(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -459,7 +459,7 @@ func TestJournalGateOffLeavesLogsAlone(t *testing.T) {
 	t.Setenv(JournalEnv, "")
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -536,7 +536,7 @@ func TestJournalRestoreDropsCleanLeftover(t *testing.T) {
 	// nothing and the log stands on its own.
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -563,7 +563,7 @@ func TestJournalRestoreKeepsUnsavedLog(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -600,7 +600,7 @@ func TestJournalStaleLogIsArchivedAndCaptureResumes(t *testing.T) {
 	// the log recorded, so startTap must not reuse the log.
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.OpenFile(p.File.Path)
 
@@ -686,7 +686,7 @@ func TestJournalRestoredLogIsReusedNotArchived(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -761,7 +761,7 @@ func TestJournalRestoreRebuildsTheDisplayProjection(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -818,7 +818,7 @@ func TestJournalRestoreReencodesSavedEncoding(t *testing.T) {
 
 			host := ui.NewFakeHost(120, 12)
 			t.Cleanup(func() { host.Close() })
-			a := New(host, h.root, 2)
+			a := New(host, h.primaryRoot(), 2)
 			defer a.closeJournals()
 			a.RestoreSession()
 
@@ -885,7 +885,7 @@ func TestJournalRestoreReplaysUnsavedEditAfterSave(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -926,7 +926,7 @@ func TestJournalRestoreWithoutEncodingKeepsDefault(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
@@ -991,7 +991,7 @@ func TestJournalRestoreRecoversPreTailEncoding(t *testing.T) {
 
 	host := ui.NewFakeHost(120, 12)
 	t.Cleanup(func() { host.Close() })
-	a := New(host, h.root, 2)
+	a := New(host, h.primaryRoot(), 2)
 	defer a.closeJournals()
 	a.RestoreSession()
 
