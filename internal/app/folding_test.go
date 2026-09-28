@@ -25,6 +25,7 @@ func (h *harness) installFolding(ranges ...lsp.FoldingRange) {
 // The guard keeps the idle tick from asking the server the same question every
 // 150 ms: only a moved path or version makes a new request worth making.
 func TestFoldWantedGuard(t *testing.T) {
+	t.Parallel()
 	if !foldWanted(foldRequest{}, "/w/a.go", 1) {
 		t.Fatal("a fresh guard did not want the ranges")
 	}
@@ -44,6 +45,7 @@ func TestFoldWantedGuard(t *testing.T) {
 // unset so the next tick tries again, rather than spawning a process for a
 // decoration. Without the live lookup this would call for_ and start one.
 func TestMaybeRequestFoldingNeverStartsAServer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc\n")
 	h.maybeRequestFolding(h.Pane())
 	if h.servers.foldReq != (foldRequest{}) {
@@ -61,6 +63,7 @@ func TestMaybeRequestFoldingNeverStartsAServer(t *testing.T) {
 // and a present-and-false provider means no. Without this read the feature
 // would ask a method the server answers method-not-found.
 func TestFoldingCapabilityGate(t *testing.T) {
+	t.Parallel()
 	const want = "language server does not support folding ranges"
 	if got := foldingGap(lsp.ServerCapabilities{}); got != want {
 		t.Errorf("absent provider: %q", got)
@@ -79,6 +82,7 @@ func TestFoldingCapabilityGate(t *testing.T) {
 // hidden. A range with no body, or one past the document, is dropped rather
 // than folding a line that is not there.
 func TestEditorFoldsConvertsLines(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc\nd\ne\n")
 	f := h.Pane().File
 	folds := editorFolds(f, []lsp.FoldingRange{{StartLine: 1, EndLine: 3}})
@@ -107,6 +111,7 @@ func TestEditorFoldsConvertsLines(t *testing.T) {
 // the range at the caret so the display hides its body. Without the install the
 // decoded ranges never reach a pane and nothing folds.
 func TestFoldingAnswerInstallsAndToggles(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc\nd\ne\n")
 	h.installFolding(lsp.FoldingRange{StartLine: 1, EndLine: 3})
 	if got := h.Pane().FoldCount(); got != 1 {
@@ -135,6 +140,7 @@ func TestFoldingAnswerInstallsAndToggles(t *testing.T) {
 // onto lines the edit moved. Without the version check the stale ranges would
 // hide the wrong region.
 func TestStaleFoldingAnswerIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc\nd\ne\n")
 	h.servers.foldGen++
 	h.park(lspAnswer{
@@ -153,6 +159,7 @@ func TestStaleFoldingAnswerIsDropped(t *testing.T) {
 // The toggle with no range under the caret says so rather than doing nothing
 // silently, which is the difference between "no fold here" and a dead chord.
 func TestToggleFoldNamesTheMiss(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.toggleFold()
 	if !strings.Contains(h.Status(), "no fold at the cursor") {

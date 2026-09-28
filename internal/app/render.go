@@ -7,6 +7,7 @@ import (
 
 	"raj/internal/editor"
 	"raj/internal/keys"
+	"raj/internal/piecetable"
 	"raj/internal/timing"
 	"raj/internal/ui"
 )
@@ -73,6 +74,7 @@ func (a *App) Draw() {
 		a.drawEditor(l)
 		a.drawDiagnosticMarks(l)
 		a.drawProposalMarks(l)
+		a.drawInvalidMarks(l)
 	}
 	if a.phone {
 		// The phone profile keeps one bottom row for the action drawer, in Edit
@@ -281,49 +283,89 @@ func (a *App) drawProposalMarks(l Layout) {
 	}
 }
 
+// drawInvalidMarks marks a superseded change set in Review mode only. An
+// invalid set has no live hunk for the proposal gutter to mark -- that is what
+// invalid means -- so the dim stale marker sits on the set's address: the live
+// run of the set that consumed it, which InvalidBy names, or the restored run
+// the Annotated view keeps after a rejected collider put it back. Edit mode
+// leaves the buffer unannotated: the mark is a review fact, not an editing one.
+func (a *App) drawInvalidMarks(l Layout) {
+	if a.mode != ModeReview {
+		return
+	}
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	invalid := map[uint64]bool{}
+	for _, g := range p.File.Session().Groups() {
+		if g.State == piecetable.Proposed && g.Invalid {
+			invalid[g.ID] = true
+		}
+	}
+	if len(invalid) == 0 {
+		return
+	}
+	top, rows := l.TopY, l.Rows
+	if n := p.Find.Rows(); n > 0 {
+		top, rows = top+n, rows-n
+		if rows < 1 {
+			rows = 1
+		}
+	}
+	first := p.Viewport.Top
+	// The stale marker is a dimmed gutter cell: '~' says the set is no longer
+	// live enough to decide, and the dim attribute keeps it from reading as the
+	// bright proposal initial. One mark per covered line, and each set drawn
+	// once: the collider's live run when it has one, else the restored run.
+	stale := a.theme.Gutter.Plus(ui.Dim)
+	drawn := map[uint64]bool{}
+	draw := func(id uint64, start, end int) {
+		if drawn[id] {
+			return
+		}
+		last := p.File.LineOf(start)
+		if end > start {
+			last = p.File.LineOf(end - 1)
+		}
+		for line := p.File.LineOf(start); line <= last; line++ {
+			row := p.DispOfDocLine(line)
+			if row < first || row >= first+rows {
+				continue
+			}
+			a.screen.SetString(l.EditorX, top+(row-first), "~", stale, 1)
+		}
+		drawn[id] = true
+	}
+	for _, g := range p.File.Session().Groups() {
+		if invalid[g.ID] && g.InvalidBy != nil {
+			draw(g.ID, g.InvalidBy.Start, g.InvalidBy.End)
+		}
+	}
+	for _, r := range p.File.Session().Project(piecetable.Annotated).States() {
+		if invalid[r.Group] && r.Len > 0 {
+			draw(r.Group, r.Off, r.Off+r.Len)
+		}
+	}
+}
+
 func (a *App) drawCompletion(l Layout) {
 	p := a.Tabs.Active()
 	if p == nil {
 		return
 	}
 	x, top, w, rows := a.textArea(l, p)
-	// The completion popup anchors on the display row and column of the word
-	// (showCompletion calls DispPos), so its top is the viewport top unchanged.
-	//
-	// The hover panel still pins its anchor in session coordinates — hover()
-	// captures it from File.LineCol — and places itself at (anchorLine -
-	// topLine) rows below the editor origin. A fold between the viewport top
-	// and the anchor shifts the anchor display row without moving its session
-	// line by the same amount, so sessionTopFor hands back the top in that
-	// same session coordinate; with no fold it is Viewport.Top exactly. When
-	// hover() is moved onto DispPos like showCompletion, this becomes a plain
-	// p.Viewport.Top and the helper goes.
-	hoverLine, hoverCol := a.Hover.Anchor()
-	// The hover panel first, so a completion popup that overlaps it is drawn
-	// on top. Completion is what you are doing; hover is what you were
+	// Both floating overlays anchor in display coordinates — showCompletion
+	// captures the word with DispPos, hover() and the pointer tooltip capture
+	// their anchor the same way — so each maps with the viewport top
+	// unchanged, and a fold above the anchor cannot leave the box a row off.
+	// The hover panel is drawn first, so a completion popup that overlaps it is
+	// drawn on top. Completion is what you are doing; hover is what you were
 	// reading, and the one being typed into should not be buried.
-	a.Hover.Render(a.screen, x, top, w, rows, sessionTopFor(p, hoverLine, hoverCol), a.wth)
+	a.Hover.Render(a.screen, x, top, w, rows, p.Viewport.Top, a.wth)
 	if a.Complete.Open {
 		a.Complete.Render(a.screen, x, top, w, rows, p.Viewport.Top, a.wth)
 	}
-}
-
-// sessionTopFor maps the pane viewport top into the session coordinate a
-// session-anchored floating overlay expects, so (anchorLine - sessionTopFor)
-// is the anchor display row minus the viewport display top.
-//
-// The anchor byte is resolved through DispPos — which handles a mid-line fold,
-// not just a whole-line one — and the offset between the anchor session line
-// and its display row is added back to the viewport top. It is an exact
-// inverse only while the anchor is a session coordinate; see the caller for
-// why hover is the only such overlay left.
-func sessionTopFor(p *editor.Pane, anchorLine, anchorCol int) int {
-	if anchorLine < 0 {
-		return p.Viewport.Top
-	}
-	off := p.File.LineStart(anchorLine) + anchorCol
-	anchorRow, _ := p.DispPos(off)
-	return anchorLine - anchorRow + p.Viewport.Top
 }
 
 // textArea is the editor's text region, excluding the gutter and the find bar.
@@ -434,6 +476,12 @@ func (a *App) drawStatus(cols, y int) {
 	}
 	if note := a.pendingRemovalNote(); note != "" {
 		left += "  " + note
+	}
+	// The agent-working segment is persistent: it names who is working and
+	// how many other-author sets await a decision, and is omitted when there
+	// is neither.
+	if seg := a.activitySegment(); seg != "" {
+		left += "  " + seg
 	}
 	// A transient message outranks the diagnostic on the cursor's line: the
 	// status is something raj just did and the diagnostic is always there, so
@@ -669,14 +717,22 @@ func (a *App) drawerKey(action keys.Action) bool {
 	return true
 }
 
-// drawerOpenWant is the button the drawer opens onto: next when a review is
-// under way (Review mode with something pending), else the first general
-// button, which is files. The target is named by action and resolved against
-// the drawn panel, so it survives the mode/pending button set and a short
-// screen. It is the open default only; the post-decision jumps are separate.
+// drawerOpenWant is the button the drawer opens onto: exit when no tab is
+// left; next when a review is under way (Review mode with something pending);
+// close when the active file has nothing to review, because leaving it is the
+// next move on a phone; else the first general button, which is files. The
+// target is named by action and resolved against the drawn panel, so it
+// survives the mode/pending button set and a short screen. It is the open
+// default only; the post-decision jumps are separate.
 func (a *App) drawerOpenWant() keys.Action {
+	if a.Tabs.Count() == 0 {
+		return keys.Quit
+	}
 	if a.mode == ModeReview && a.activePending() > 0 {
 		return keys.NextProposed
+	}
+	if !a.hasPendingChanges() {
+		return keys.CloseTab
 	}
 	return drawerGeneralButtons[0].action // files
 }
@@ -849,7 +905,13 @@ func (a *App) drawPhoneDrawer(cols int, l Layout) {
 			a.statusAt = time.Now()
 		}
 		a.screen.SetString(0, handle.y, " "+a.status, style, cols)
+	} else if text := a.phoneActivityText(); text != "" {
+		// The review bar is persistent while work is pending, unlike the
+		// transient status it shares the strip with, so the phone sees the
+		// count and the agent without waiting for a flash.
+		a.screen.SetString(0, handle.y, " "+text, style, cols)
 	}
+
 	// Bottom row, left to right: the client connection dot (attached clients
 	// only), the tab count, and the [actions] label right-aligned. Precedence
 	// when the strip is narrow: the dot is pinned at column 0, the label keeps

@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -57,7 +58,7 @@ func TestConfirmMessageIsReadWhole(t *testing.T) {
 // A review row holding an absolute path wraps rather than truncating, so the
 // whole path is on screen. The old code cut it mid-word at the inner width.
 func TestReviewRowShowsWholePath(t *testing.T) {
-	path := "/Users/rajandavis/Desktop/projects/raj/internal/app/deletion.go"
+	path := filepath.Join(t.TempDir(), "internal", "app", "deletion.go")
 	p := New()
 	p.Review("Remove directory", "agent 2 proposed removing pkg.",
 		[]string{path}, []string{"Ignore for now", "Remove forever"}, nil, nil)
@@ -91,7 +92,7 @@ func TestReviewRowShowsWholePath(t *testing.T) {
 // A press on any line of a wrapped row selects that row, so a long path is not
 // a bigger pointer target than a short one.
 func TestClickAtSelectsWrappedRow(t *testing.T) {
-	path := "/Users/rajandavis/Desktop/projects/raj/internal/app/deletion.go"
+	path := filepath.Join(t.TempDir(), "internal", "app", "deletion.go")
 	moved := -1
 	p := New()
 	p.Review("Remove directory", "agent 2 proposed removing pkg.",
@@ -121,7 +122,7 @@ func TestClickAtSelectsWrappedRow(t *testing.T) {
 func TestReviewListingFitsShortScreen(t *testing.T) {
 	paths := make([]string, 6)
 	for i := range paths {
-		paths[i] = "/Users/rajandavis/Desktop/projects/raj/internal/app/deletion.go"
+		paths[i] = filepath.Join(t.TempDir(), "internal", "app", "deletion.go")
 	}
 	p := New()
 	p.Review("Remove directory", "agent 2 proposed removing pkg.", paths,

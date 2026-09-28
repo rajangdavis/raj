@@ -12,3 +12,6 @@ func setProcessGroup(cmd *exec.Cmd) {}
 
 // killProcessGroup has no group to signal without process groups.
 func killProcessGroup(cmd *exec.Cmd) {}
+
+// processGroupID has no group to report without process groups.
+func processGroupID(cmd *exec.Cmd) int { return 0 }

@@ -69,7 +69,8 @@ func attachClientAtRoot(t *testing.T, srv *harness, o Options, cols, rows int, r
 
 // newClientHarness starts a local editor, gives it a proposed change set, and
 // attaches a second app to it. The proposal is what makes the client frame
-// prove it carried the daemon review state, not only the agreed text.
+// prove it carried the daemon review state, not only the agreed text; it is
+// also unsaved work, so the active tab is mirrored by the mirror predicate.
 func newClientHarness(t *testing.T) *clientHarness {
 	t.Helper()
 	srv := controlHarness(t, "hello\nworld\n")

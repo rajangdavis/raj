@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+
 	"testing"
 	"time"
 
@@ -357,6 +359,18 @@ func TestTCPRefusesExec(t *testing.T) {
 	}
 	if res.Err == "" {
 		t.Fatal("exec was allowed over TCP")
+	}
+	// The projected flag rides the same op, so it must hit the same refusal
+	// rather than opening a second path to running on the editor's machine.
+	res, err = c.DoExec(Request{Op: "exec", ExecProjected: true, Argv: []string{"true"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Err == "" {
+		t.Fatal("projected exec was allowed over TCP")
+	}
+	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "your own shell") {
+		t.Errorf("projected refusal %q does not say why, or where to run it", res.Err)
 	}
 	if !strings.Contains(res.Err, "sandbox") || !strings.Contains(res.Err, "your own shell") {
 		t.Errorf("refusal %q does not say why, or where to run it", res.Err)
@@ -770,5 +784,749 @@ func TestRevertRefusesAForeignAuthor(t *testing.T) {
 	}
 	if !strings.Contains(res.Err, "revert discards only your own pieces") {
 		t.Fatalf("a foreign-author revert was not refused: err=%q", res.Err)
+	}
+}
+
+// Save is the user's gesture, so a frame must not be able to claim the human's
+// id. The serve loop only stamps a zero author, so a raw client can send
+// Author: LocalHuman; connection.one compares the claimed id with the
+// connection's real one and refuses the imposture with the same wording
+// Guard.Save uses. Precondition: a TCP connection the socket gate has already
+// bound as an agent (TestHelloOverTCPDowngradesAHuman), carrying a save that
+// names LocalHuman. Without the check in connection.one the request reaches
+// the event thread and the fake records the save, so both the refusal
+// assertion and the empty save log fail.
+func TestSaveRefusesAClaimedHumanAuthor(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "save", Path: "/w/a.go", Author: LocalHuman})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if res.OK || res.Err == "" {
+		t.Fatalf("a save claiming the human's id was admitted: %+v", res)
+	}
+	if res.Err != errSaveNotHuman {
+		t.Errorf("refusal = %q, want the one save wording %q", res.Err, errSaveNotHuman)
+	}
+	if len(ed.saves) != 0 {
+		t.Errorf("the spoofed save reached the event thread: %+v", ed.saves)
+	}
+}
+
+// A program is the other way a claimed author can ride a save: Requests(prog,
+// req.Author) builds each sub-request from the outer frame (or an author op),
+// and a batch never passes the serve loop. connection.one runs the
+// authenticity check on every sub-request, so a save inside a program is
+// refused the same as a direct one. Preconditions: an agent connection, and a
+// program whose save carries LocalHuman, either as the outer prog's author or
+// via an author op. Without the check the sub-save reaches the event thread
+// and the fake records it.
+func TestSaveSpoofInsideAProgramIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ops   []prog.Op
+		outer uint8
+	}{
+		{
+			name:  "outer frame claims the human",
+			ops:   []prog.Op{{Code: prog.OpPath, Payload: []byte("/w/a.go")}, {Code: prog.OpSave}},
+			outer: LocalHuman,
+		},
+		{
+			name: "author op claims the human",
+			ops: []prog.Op{
+				{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+				{Code: prog.OpAuthor, Payload: []byte{LocalHuman}},
+				{Code: prog.OpSave},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+			t.Setenv(TokenEnv, ed.srv.Token())
+			c, err := Dial(ed.srv.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+
+			res, err := c.Do(Request{Op: "prog", Program: prog.Encode(tc.ops), Author: tc.outer})
+			if err != nil {
+				t.Fatalf("prog: %v", err)
+			}
+			if res.OK || res.Err == "" {
+				t.Fatalf("a save claiming the human's id inside a program was admitted: %+v", res)
+			}
+			if res.Err != errSaveNotHuman {
+				t.Errorf("refusal = %q, want the one save wording %q", res.Err, errSaveNotHuman)
+			}
+			if len(ed.saves) != 0 {
+				t.Errorf("the spoofed save reached the event thread: %+v", ed.saves)
+			}
+		})
+	}
+}
+
+// A save with no author field is stamped from the connection, so the
+// authenticity check compares it against itself and admits it; Guard.Save
+// decides by kind (TestSaveRefusesNonHumans pins that a durable joined human
+// is admitted and an agent refused). This drives the real serve loop and
+// connection.one and would fail if the new check compared against anything but
+// the connection's own id. Precondition: a Unix-socket connection helloed as a
+// durable human (TestHelloOverTheSocketDeclaresAHuman) and a save with no
+// Author. The event thread records the connection's own id, not LocalHuman.
+func TestSaveWithNoAuthorIsStampedFromTheConnection(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	if network, _ := ParseAddr(ed.srv.Path()); network != "unix" {
+		t.Fatalf("fixture transport %q, want unix", network)
+	}
+
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	hi, err := c.Do(Request{Op: "hello", Identity: "client:desk", Name: "desk",
+		Kind: string(KindHuman)})
+	if err != nil || !hi.OK {
+		t.Fatalf("hello as human: res=%+v err=%v", hi, err)
+	}
+	human := c.Author()
+	if human == 0 || human == LocalHuman || ed.srv.Participants.IsAgent(human) {
+		t.Fatalf("the human hello bound author %d, want a durable human", human)
+	}
+
+	res, err := c.Do(Request{Op: "save", Path: "/w/a.go"})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("an ordinary human save was refused: %+v", res)
+	}
+	if len(ed.saves) != 1 {
+		t.Fatalf("saves = %d, want the one save at the event thread", len(ed.saves))
+	}
+	if got := ed.saves[0].Author; got != human {
+		t.Errorf("save author = %d, want the connection's own %d", got, human)
+	}
+}
+
+// An approve is the user's answer, so a frame must not be able to claim the
+// human's id for it any more than for a save. The serve loop only stamps a zero
+// author, so a raw client can send Author: LocalHuman; connection.one compares
+// the claimed id with the connection's real one and refuses. Precondition: a
+// TCP connection the socket gate has already bound as an agent, carrying a
+// delete that both claims LocalHuman and sets Approve. Without the check the
+// request reaches the event thread and the fake records the delete, so both the
+// refusal assertion and the empty log fail.
+func TestDeleteApproveRefusesAClaimedHumanAuthor(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "delete", Path: "/w/a.go", Author: LocalHuman, Approve: true})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if res.OK || res.Err == "" {
+		t.Fatalf("a delete approve claiming the human's id was admitted: %+v", res)
+	}
+	if res.Err != errApproveDeletionNotHuman {
+		t.Errorf("refusal = %q, want the removal-gate wording %q", res.Err, errApproveDeletionNotHuman)
+	}
+	if ed.lastDelete.Op != "" {
+		t.Errorf("the spoofed approve reached the event thread: %+v", ed.lastDelete)
+	}
+}
+
+// The dir-removal variant carries its own wording and the same chokepoint.
+func TestRmdirApproveRefusesAClaimedHumanAuthor(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "rmdir", Path: "/w/pkg", Author: LocalHuman, Approve: true})
+	if err != nil {
+		t.Fatalf("rmdir: %v", err)
+	}
+	if res.OK || res.Err == "" {
+		t.Fatalf("an rmdir approve claiming the human's id was admitted: %+v", res)
+	}
+	if res.Err != errApproveDirNotHuman {
+		t.Errorf("refusal = %q, want the dir removal-gate wording %q", res.Err, errApproveDirNotHuman)
+	}
+	if ed.lastRmdir.Op != "" {
+		t.Errorf("the spoofed dir approve reached the event thread: %+v", ed.lastRmdir)
+	}
+}
+
+// A withdraw runs as the connection's own writer, so a frame must not name a
+// peer's id to retract their proposal: the host's owner check trusts the
+// claimed author, and before this check in connection.one any connection could
+// retract another writer's pending removal. Precondition: a TCP connection the
+// socket gate has already bound as an agent, carrying a delete or rmdir with
+// Withdraw set and Author set to another writer's id. Without the check the
+// request reaches the event thread and the fake records it, so both the
+// refusal assertion and the empty log fail.
+func TestDeleteWithdrawRefusesAClaimedAuthor(t *testing.T) {
+	for _, tc := range []struct{ op, path string }{
+		{"delete", "/w/a.go"},
+		{"rmdir", "/w/pkg"},
+	} {
+		t.Run(tc.op, func(t *testing.T) {
+			ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+			t.Setenv(TokenEnv, ed.srv.Token())
+			c, err := Dial(ed.srv.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+
+			res, err := c.Do(Request{Op: tc.op, Path: tc.path, Author: FirstAgent + 7, Withdraw: true})
+			if err != nil {
+				t.Fatalf("%s: %v", tc.op, err)
+			}
+			if res.OK || res.Err == "" {
+				t.Fatalf("a %s withdraw claiming another author was admitted: %+v", tc.op, res)
+			}
+			if res.Err != errWithdrawSpoof {
+				t.Errorf("refusal = %q, want the withdraw wording %q", res.Err, errWithdrawSpoof)
+			}
+			if ed.lastDelete.Op != "" || ed.lastRmdir.Op != "" {
+				t.Errorf("the spoofed withdraw reached the event thread: delete=%+v rmdir=%+v",
+					ed.lastDelete, ed.lastRmdir)
+			}
+
+			// With no claimed author the frame is stamped from the connection
+			// and admitted, so the check refuses only the imposture.
+			ok, err := c.Do(Request{Op: tc.op, Path: tc.path, Withdraw: true})
+			if err != nil {
+				t.Fatalf("%s (no author): %v", tc.op, err)
+			}
+			if !ok.OK {
+				t.Fatalf("a %s withdraw with no claimed author was refused: %+v", tc.op, ok)
+			}
+			if got := ok.Author; got != c.Author() {
+				t.Errorf("withdraw author = %d, want the connection's own %d", got, c.Author())
+			}
+		})
+	}
+}
+
+// Every verb acts as its connection. The author a frame carries is a claim, not
+// the connection, so connection.one refuses a request that names another writer
+// before any handler sees it. save, revert, approve and withdraw keep their own
+// contract wordings (pinned in their tests); these are the write and decision
+// verbs that used to trust req.Author, and errAuthorSpoof is their one refusal.
+func TestWriteAndDecisionVerbsRefuseAClaimedAuthor(t *testing.T) {
+	for _, op := range []string{"apply", "accept", "reject", "patch"} {
+		t.Run(op, func(t *testing.T) {
+			ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+			t.Setenv(TokenEnv, ed.srv.Token())
+			c, err := Dial(ed.srv.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+
+			res, err := c.Do(Request{Op: op, Path: "/w/a.go", Group: 4, Author: FirstAgent + 7})
+			if err != nil {
+				t.Fatalf("%s: %v", op, err)
+			}
+			if res.OK || res.Err != errAuthorSpoof {
+				t.Fatalf("%s claiming another author = %+v, want %q", op, res, errAuthorSpoof)
+			}
+			if len(ed.decisions) != 0 {
+				t.Errorf("the spoofed %s reached the handler: %+v", op, ed.decisions)
+			}
+			if got := ed.docs["/w/a.go"]; got != "x\n" {
+				t.Errorf("the spoofed %s touched the buffer: %q", op, got)
+			}
+		})
+	}
+}
+
+// A program sub-request is the other way a claimed author rides a verb: the
+// outer prog frame names the author and Requests stamps it onto every verb. A
+// batch never passes the serve loop's checks, so connection.one refuses each
+// sub-request that names another writer.
+func TestProgramSubRequestRefusesAClaimedAuthor(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ops   []prog.Op
+		outer uint8
+	}{
+		{
+			name:  "outer frame claims the human",
+			ops:   []prog.Op{{Code: prog.OpPath, Payload: []byte("/w/a.go")}, {Code: prog.OpApply}},
+			outer: LocalHuman,
+		},
+		{
+			name: "author op claims the human",
+			ops: []prog.Op{
+				{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+				{Code: prog.OpAuthor, Payload: []byte{LocalHuman}},
+				{Code: prog.OpApply},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+			t.Setenv(TokenEnv, ed.srv.Token())
+			c, err := Dial(ed.srv.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+
+			res, err := c.Do(Request{Op: "prog", Program: prog.Encode(tc.ops), Author: tc.outer})
+			if err != nil {
+				t.Fatalf("prog: %v", err)
+			}
+			if res.OK || res.Err != errAuthorSpoof {
+				t.Fatalf("an apply claiming the human inside a program = %+v, want %q", res, errAuthorSpoof)
+			}
+			if got := ed.docs["/w/a.go"]; got != "x\n" {
+				t.Errorf("the spoofed sub-request touched the buffer: %q", got)
+			}
+		})
+	}
+}
+
+// A request that names no author is stamped from the connection by the serve
+// loop and runs as it; the chokepoint refuses only a positive other claim.
+func TestRequestWithNoAuthorRunsAsTheConnection(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ver, err := c.Do(Request{Op: "version", Path: "/w/a.go"})
+	if err != nil || !ver.OK {
+		t.Fatalf("version: %v %+v", err, ver)
+	}
+	base := ver.Version
+	res, err := c.Do(Request{Op: "apply", Path: "/w/a.go", Base: &base,
+		Hunks: []Hunk{{Start: 0, End: 0, Text: "y"}}})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("an apply with no author was refused: %+v", res)
+	}
+	if got := ed.docs["/w/a.go"]; got != "yx\n" {
+		t.Errorf("apply landed as %q, want the edit made by the connection", got)
+	}
+}
+
+// Accept is the person's decision; reject is not. An agent that accepts is
+// refused with the same humanAuthor predicate save uses, while an agent may
+// still reject its own set and a peer's.
+func TestDispatchAcceptIsTheUsersDecision(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	reg := NewRegistry()
+	g.Participants = reg
+	agent, err := reg.Join("raj-aaaa0001", "alpha", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	human, err := reg.Join("client:desk", "desk", KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.groups = []Group{{ID: 4, Path: path, State: "proposed", Author: agent}}
+	res := Dispatch(g, Request{Op: "accept", Path: path, Group: 4, Author: agent})
+	if res.OK || res.Err != errAcceptNotHuman {
+		t.Fatalf("an agent's accept = %+v, want %q", res, errAcceptNotHuman)
+	}
+	if h.groups[0].State != "proposed" {
+		t.Errorf("a refused accept moved the set to %q", h.groups[0].State)
+	}
+
+	// The local keyboard row is the person, so its accept lands the set.
+	if res := Dispatch(g, Request{Op: "accept", Path: path, Group: 4, Author: LocalHuman}); !res.OK {
+		t.Fatalf("the local human's accept was refused: %+v", res)
+	}
+	if h.groups[0].State != "accepted" {
+		t.Errorf("the accepted set is %q, want accepted", h.groups[0].State)
+	}
+
+	// A durable joined human (an attached client) accepts as its own person.
+	h.groups[0].State = "proposed"
+	if res := Dispatch(g, Request{Op: "accept", Path: path, Group: 4, Author: human}); !res.OK {
+		t.Fatalf("a joined human's accept was refused: %+v", res)
+	}
+	if h.groups[0].State != "accepted" {
+		t.Errorf("the joined human's accepted set is %q, want accepted", h.groups[0].State)
+	}
+}
+
+func TestDispatchRejectStaysOpenToAgents(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	reg := NewRegistry()
+	g.Participants = reg
+	agent, err := reg.Join("raj-aaaa0001", "alpha", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := reg.Join("raj-bbbb0002", "beta", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reject backs an agent's own set out and a peer's alike: it leaves the
+	// text pending, so it is not the human's accept decision.
+	h.groups = []Group{
+		{ID: 4, Path: path, State: "proposed", Author: agent},
+		{ID: 5, Path: path, State: "proposed", Author: peer},
+	}
+	for _, group := range []uint64{4, 5} {
+		res := Dispatch(g, Request{Op: "reject", Path: path, Group: group, Author: agent})
+		if !res.OK {
+			t.Fatalf("an agent's reject of set %d was refused: %+v", group, res)
+		}
+	}
+	for _, grp := range h.groups {
+		if grp.State != "rejected" {
+			t.Errorf("group %d state = %q, want rejected", grp.ID, grp.State)
+		}
+	}
+}
+
+// The Unix socket is the local human's trust boundary: the user's own
+// `raj ctl accept` from a shell arrives there undeclared and must accept as
+// the person, while a connection that registered as an agent keeps its own
+// identity (and the Guard then refuses its accept). Without the rewrite an
+// undeclared local accept reaches the host as a provisional agent id and the
+// human-only accept gate refuses the user's own command.
+func TestUnixUndeclaredAcceptRunsAsTheLocalHuman(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	lastAccept := func() Request {
+		t.Helper()
+		ed.mu.Lock()
+		defer ed.mu.Unlock()
+		if len(ed.decisions) == 0 {
+			t.Fatal("no accept reached the editor")
+		}
+		return ed.decisions[len(ed.decisions)-1]
+	}
+
+	anon, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer anon.Close()
+	if _, err := anon.Do(Request{Op: "accept", Path: "/w/a.go", Group: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastAccept().Author; got != LocalHuman {
+		t.Errorf("undeclared unix accept ran as author %d, want the local human %d", got, LocalHuman)
+	}
+
+	agent, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	if hi, err := agent.Do(Request{Op: "hello", Identity: "raj-local-agent"}); err != nil || !hi.OK {
+		t.Fatalf("hello: %v %+v", err, hi)
+	}
+	if _, err := agent.Do(Request{Op: "accept", Path: "/w/a.go", Group: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastAccept().Author; got != agent.Author() || got == LocalHuman {
+		t.Errorf("a registered agent's unix accept ran as author %d, want its own %d", got, agent.Author())
+	}
+
+}
+
+// A program sub-request whose OpAuthor is zero is stamped with the
+// connection's own author, like a direct frame: zero is AuthorOriginal, and a
+// verb run as it would write text that reads as the file's own. Precondition:
+// a TCP agent sending a program that names author 0 before an accept. Without
+// the stamp in connection.one the accept reaches the editor as author 0.
+func TestProgramZeroAuthorIsStampedFromTheConnection(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ops := []prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpGroup, Payload: prog.Number(1)},
+		{Code: prog.OpAuthor, Payload: []byte{0}},
+		{Code: prog.OpAccept},
+	}
+	if _, err := c.Do(Request{Op: "prog", Program: prog.Encode(ops)}); err != nil {
+		t.Fatalf("prog: %v", err)
+	}
+	ed.mu.Lock()
+	defer ed.mu.Unlock()
+	if len(ed.decisions) == 0 {
+		t.Fatal("the program's accept never reached the editor")
+	}
+	if got := ed.decisions[len(ed.decisions)-1].Author; got == 0 || got != c.Author() {
+		t.Errorf("program accept ran as author %d, want the connection's %d", got, c.Author())
+	}
+}
+
+// A connection that says hello twice under the same identity — the CLI's
+// bind-first hello, then recv's or register's own — must still leave the
+// participant disconnected when it closes. Registry counts connections, so an
+// unbalanced second Join kept finished agents listed as connected forever,
+// which `who --live`, `send --to all` and raj-cycle's "wait for the agents to
+// come back" all read.
+func TestRepeatHelloOnOneConnectionDoesNotLeakPresence(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if hi, err := c.Do(Request{Op: "hello", Identity: "raj-twice", Name: "twice"}); err != nil || !hi.OK {
+			t.Fatalf("hello %d: %v %+v", i, err, hi)
+		}
+	}
+	id := c.Author()
+	if p, _ := ed.srv.Participants.Get(id); !p.Connected {
+		t.Fatal("not connected after hello")
+	}
+	c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if p, _ := ed.srv.Participants.Get(id); !p.Connected {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a closed connection that said hello twice still reads as connected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The derived state across a real socket: a recent request reads working, and
+// a parked recv after activeWindow with no other request reads listening. The
+// clock is injected so the window moves without a sleep.
+func TestDerivedListeningOverASocket(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	var clock int64
+	ed.srv.Participants.now = func() time.Time { return time.Unix(0, atomic.LoadInt64(&clock)) }
+
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := c.Do(Request{Op: "hello", Identity: "raj-worker", Name: "claude"}); err != nil || !res.OK {
+		t.Fatalf("hello: %v %+v", err, res)
+	}
+	id := c.Author()
+
+	// A recent request keeps the participant working.
+	if res, err := c.Do(Request{Op: "ping"}); err != nil || !res.OK {
+		t.Fatalf("ping: %v %+v", err, res)
+	}
+	if got := rosterState(t, ed.srv, id); got != StateWorking {
+		t.Fatalf("recent request = %q, want working", got)
+	}
+
+	// Park a recv, then move the clock past activeWindow. With no later request
+	// the parked recv alone reads listening.
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Do(Request{Op: "recv"})
+		done <- err
+	}()
+	waitListening(t, ed.srv, id)
+	atomic.StoreInt64(&clock, int64(activeWindow+time.Second))
+	if got := rosterState(t, ed.srv, id); got != StateListening {
+		t.Fatalf("parked recv = %q, want listening", got)
+	}
+
+	c.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the client did not end the parked recv")
+	}
+}
+
+// rosterState returns id's derived+declared state, or fails.
+func rosterState(t *testing.T, s *Server, id uint8) string {
+	t.Helper()
+	for _, p := range s.Roster() {
+		if p.ID == id {
+			return p.State
+		}
+	}
+	t.Fatalf("participant %d missing from the roster", id)
+	return ""
+}
+
+// waitListening waits until a recv is parked for id, which is the fact the
+// derived listening state reads.
+func waitListening(t *testing.T, s *Server, id uint8) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.Participants.mu.Lock()
+		n := s.Participants.listening[id]
+		s.Participants.mu.Unlock()
+		if n > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("recv never parked for participant %d", id)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Guard.Land accepts the task's pending sets in every buffer and saves each
+// buffer whose pending sets all belong to that task; a buffer that also holds
+// another task's pending set is held, not saved, and its task's sets are still
+// accepted. The report names each outcome, so a buffer a save refused for
+// another reason is never silent.
+func TestDispatchLandAcceptsByTaskAndReports(t *testing.T) {
+	g, h := guarded(t)
+	h.docs["/w/b.go"] = "b\n"
+	h.vers["/w/b.go"] = 1
+	h.groupsByPath = map[string][]Group{
+		"/w/a.go": {{ID: 1, Path: "/w/a.go", State: "proposed", Task: "task-1", Author: 2}},
+		"/w/b.go": {
+			{ID: 2, Path: "/w/b.go", State: "proposed", Task: "task-1", Author: 2},
+			{ID: 3, Path: "/w/b.go", State: "proposed", Task: "task-2", Author: 2},
+		},
+	}
+	res := Dispatch(g, Request{Op: "land", LandTask: "task-1", Author: LocalHuman})
+	if !res.OK {
+		t.Fatalf("land: %+v", res)
+	}
+	byPath := map[string]LandFile{}
+	for _, f := range res.Land {
+		byPath[f.Path] = f
+	}
+	if f := byPath["/w/a.go"]; !f.Saved || f.Sets != 1 {
+		t.Errorf("a.go = %+v, want one set saved", f)
+	}
+	if f := byPath["/w/b.go"]; !f.Held || f.Saved || f.Sets != 1 {
+		t.Errorf("b.go = %+v, want one set accepted and held", f)
+	}
+	if h.groupsByPath["/w/a.go"][0].State != "accepted" {
+		t.Errorf("a.go task-1 set was not accepted")
+	}
+	if h.groupsByPath["/w/b.go"][0].State != "accepted" {
+		t.Errorf("b.go task-1 set was not accepted even though the buffer is held")
+	}
+	if h.groupsByPath["/w/b.go"][1].State != "proposed" {
+		t.Errorf("the foreign task-2 set moved")
+	}
+	if h.saves != 1 {
+		t.Errorf("saves = %d, want only the fully landed buffer", h.saves)
+	}
+}
+
+// A buffer whose pending sets are all the task's is saved, but a save the
+// editor refuses for another reason is named in the report rather than
+// silently skipped: the sets are still accepted, and the caller learns why the
+// buffer did not reach disk.
+func TestDispatchLandNamesARefusedSave(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+	h.groupsByPath = map[string][]Group{
+		path: {{ID: 1, Path: path, State: "proposed", Task: "task-1", Author: 2}},
+	}
+	h.saveErr = map[string]string{path: "disk changed"}
+	res := Dispatch(g, Request{Op: "land", LandTask: "task-1", Author: LocalHuman})
+	if !res.OK {
+		t.Fatalf("land: %+v", res)
+	}
+	if len(res.Land) != 1 {
+		t.Fatalf("land report = %+v, want one buffer", res.Land)
+	}
+	f := res.Land[0]
+	if f.Saved || f.Held || f.Err != "disk changed" {
+		t.Errorf("report = %+v, want the refused save named and not saved", f)
+	}
+	if h.groupsByPath[path][0].State != "accepted" {
+		t.Errorf("the refused save did not leave the sets accepted")
+	}
+}
+
+// A wave whose overlaps form a merge is a non-linear dependency: a set inherits
+// from two others, so no order can be derived. The land reports it rather than
+// guessing one; the merge is group 3.
+func TestDispatchLandReportsANonLinearDependency(t *testing.T) {
+	g, h := guarded(t)
+	h.groupsByPath = map[string][]Group{
+		"/w/a.go": {
+			{ID: 1, Path: "/w/a.go", State: "proposed", Task: "task-1", Author: 2,
+				Overlaps: &GroupOverlaps{Sets: []GroupOverlap{{Group: 3, Author: 2}}}},
+			{ID: 2, Path: "/w/a.go", State: "proposed", Task: "task-1", Author: 2,
+				Overlaps: &GroupOverlaps{Sets: []GroupOverlap{{Group: 3, Author: 2}}}},
+			{ID: 3, Path: "/w/a.go", State: "proposed", Task: "task-1", Author: 2,
+				Overlaps: &GroupOverlaps{Sets: []GroupOverlap{{Group: 1, Author: 2}, {Group: 2, Author: 2}}}},
+		},
+	}
+	res := Dispatch(g, Request{Op: "land", LandTask: "task-1", Author: LocalHuman})
+	if !res.OK {
+		t.Fatalf("land: %+v", res)
+	}
+	if !strings.Contains(res.HookJSON, "non-linear") {
+		t.Errorf("land export = %q, want a non-linear dependency report", res.HookJSON)
+	}
+}
+
+// land is the human's own gesture -- accept by task and save -- so an agent
+// connection that asks for it is refused before any set is accepted or any
+// buffer saved, with the same humanAuthor predicate save uses.
+func TestLandRefusesAnAgentOverTCP(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	ed.policyMem.docs = map[string]string{"/w/a.go": "x\n"}
+	ed.policyMem.vers = map[string]uint64{"/w/a.go": 1}
+	ed.policyMem.groupsByPath = map[string][]Group{
+		"/w/a.go": {{ID: 1, Path: "/w/a.go", State: "proposed", Task: "task-1", Author: 2}},
+	}
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "land", LandTask: "task-1"})
+	if err != nil {
+		t.Fatalf("land: %v", err)
+	}
+	if res.OK || res.Err != errLandNotHuman {
+		t.Fatalf("an agent's land = %+v, want %q", res, errLandNotHuman)
+	}
+	if ed.policyMem.groupsByPath["/w/a.go"][0].State != "proposed" {
+		t.Errorf("the refused land accepted a set")
+	}
+	if ed.policyMem.saves != 0 {
+		t.Errorf("the refused land reached the host: %d save(s)", ed.policyMem.saves)
 	}
 }

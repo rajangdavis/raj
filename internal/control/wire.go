@@ -76,13 +76,10 @@ type Header struct {
 	// that does not know the verb omits it and a peer that does reads it.
 	NewPath string
 
-	// Author identifies the writer. 0 means unset; the editor assigns one per
-	// connection. Only revert compares it to the connection's real author and
-	// refuses a mismatch — dropping a peer's pieces is the user's decision, not
-	// a driver's. A few verbs (patch, delete and rmdir -withdraw) compare it to
-	// a stored record's owner, but every one of them trusts the field for
-	// attribution, so naming a peer is still attributed as that peer; that is a
-	// known gap (TODO.md).
+	// Author identifies the writer. 0 means unset; the editor stamps the
+	// connection's own. A non-zero value that is not the connection's real
+	// author is refused at connection.one for every verb that acts as it, so a
+	// frame cannot decide or attribute another writer's work (Wave 1.1).
 	Author uint8
 
 	// Token is the shared secret a TCP client presents. It rides in the header
@@ -142,8 +139,33 @@ type Header struct {
 	// It is a byte string, like Identity and Name, and crosses sparsely, so a
 	// peer that does not know it omits it and keeps the agent default.
 	Kind string
-	Argv []string
-	Dir  string
+	// Task is the work a participant's writes belong to. It rides hello and is
+	// stored on the participant row; absent means none, which is the local
+	// human and every connection that registered no task.
+	Task string
+	// LandTask is a land request's task: the change sets to accept and, where
+	// nothing of another task remains pending, save. It is separate from Task
+	// because a land selects work the caller may not have authored.
+	LandTask string
+	// State, StateOn and StateNote are the `state` verb's declared value and
+	// its optional counterpart and note. State is empty on a read.
+	State     string
+	StateOn   string
+	StateNote string
+
+	// To and Message are a send's recipient and text. Header strings like
+	// Name, for the reason Messages are: a note to a peer is text someone
+	// wrote, and legible in a frame dump.
+	To      string
+	Message string
+	Argv    []string
+	Dir     string
+
+	// ExecProjected runs exec against a materialised projection of the live
+	// buffers instead of the worktree. It crosses as a presence flag like
+	// Create, so a peer that does not know it omits it and keeps the ordinary
+	// worktree run.
+	ExecProjected bool
 
 	// DumpID rides both directions: a patch names the snapshot a prior dump
 	// returned, and a dump's reply carries the id it just minted. Hash is the
@@ -197,6 +219,10 @@ type Header struct {
 	// Create, so a peer that does not know it omits it and keeps the
 	// proposing default.
 	Withdraw bool
+	// Approve carries out a pending removal for delete and rmdir: it is the
+	// human answer to a proposal. It crosses as a presence flag like Withdraw,
+	// so a peer that does not know it omits it and keeps the proposing default.
+	Approve bool
 	// Hidden is ls's include-hidden switch, the -hidden flag. It crosses as a
 	// presence flag like Withdraw, so a peer that does not know it omits it
 	// and keeps the filtered default.
@@ -207,6 +233,36 @@ type Header struct {
 	// text by construction, valid UTF-8, not document bytes.
 	LSPMode string
 	LSPJSON string
+
+	// GitMode, GitRev and GitCount are a git request's mode, revision and log
+	// cap; GitJSON is a git reply's JSON-encoded result. Like the lsp pair,
+	// they are text by construction and need no body.
+	GitMode  string
+	GitRev   string
+	GitCount int
+	GitJSON  string
+
+	// HookMode, HookName and HookJSON are the hook verb's request fields: the
+	// mode, the name show/run/rm/enable/disable address, and a put's HookRow as
+	// JSON. HookJSON also carries list and show's answer back. Like the git
+	// fields, they are text by construction and need no body.
+	HookMode string
+	HookName string
+	HookJSON string
+	// HookRunID names a run for cancel and is stamped on a run's final frame;
+	// HookRevision, HookHead, HookDirty, HookDurationMS and HookTruncated are
+	// the rest of that stamp. HookOff is the workspace panic switch, and
+	// HookLogJSON and HookPSJSON carry the run log and the in-flight list as
+	// JSON arrays. They are text by construction like the fields above.
+	HookRunID      uint64
+	HookRevision   uint64
+	HookHead       string
+	HookDirty      string
+	HookDurationMS int64
+	HookTruncated  bool
+	HookOff        bool
+	HookLogJSON    string
+	HookPSJSON     string
 
 	// DiffJSON carries a diff's answer as one JSON string, the same escape
 	// hatch LSPJSON uses: the nested group-and-hunk structure has no
@@ -228,9 +284,13 @@ type Header struct {
 
 	// Exit, Dirty and Stats are exec's answers. Stream marks an output frame:
 	// 1 stdout, 2 stderr, with the bytes in the body.
-	Exit         int
-	Dirty        []DirtyBuffer
-	Stats        ExecStats
+	Exit  int
+	Dirty []DirtyBuffer
+	Stats ExecStats
+	// RetryAfterMS is a refused hook run's retry hint in milliseconds; absent
+	// (zero) means the refusal carries no duration. It rides the same frame as
+	// the Err that names the reason.
+	RetryAfterMS int
 	Participants []Participant
 	Groups       []Group
 	// Claims, ClaimWarnings and ClaimOverlaps are the claim verb's answer:
@@ -253,10 +313,19 @@ type Header struct {
 	// pending change sets, file deletions and dir-removals. Sparse like the
 	// lists above: an empty one is not sent.
 	Proposals []Proposal
+	// Reveals is the watch answer list of user-initiated reveals: paths the
+	// agent asked to surface, each with the byte span to place the caret at
+	// (-1,-1 for the whole file). Sparse like the lists above, so a peer that
+	// does not know the field reads none.
+	Reveals []Reveal
 	// Entries is ls's answer: the immediate children of the directory the
 	// request named, sorted by name. Sparse like the lists above: an empty
 	// directory sends none.
 	Entries []Entry
+	// Land is a land gesture's per-buffer outcome, one record per buffer that
+	// held the task's pending sets. Sparse like the lists above: a response
+	// that is not a land sends none.
+	Land []LandFile
 
 	// Messages is what a parked recv answers with. They stay in the header
 	// rather than moving to the body: a message is text a person typed into a
@@ -485,15 +554,26 @@ func ReadFrame(r io.Reader) (Frame, error) {
 func EncodeRequest(req Request) (Header, []byte) {
 	h := Header{ID: req.ID, Op: req.Op, Author: req.Author, Base: req.Base, Token: req.Token,
 		Query: req.Query, Cancel: req.Cancel, Argv: req.Argv, Dir: req.Dir,
-		Identity: req.Identity, Name: req.Name, Kind: req.Kind, Group: req.Group, Line: req.Line, Col: req.Col,
+		Identity: req.Identity, Name: req.Name, Kind: req.Kind, Task: req.Task,
+		LandTask: req.LandTask,
+		To:       req.To, Message: req.Message,
+		State: req.State, StateOn: req.StateOn, StateNote: req.StateNote,
+
+		Group: req.Group, Line: req.Line, Col: req.Col,
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
+		GitMode: req.GitMode, GitRev: req.GitRev, GitCount: req.GitCount,
+		HookMode: req.HookMode, HookName: req.HookName, HookJSON: req.HookJSON,
 		Annotated: req.Annotated, Create: req.Create, Discard: req.Discard,
-		Paths: req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
-		Withdraw: req.Withdraw, Hidden: req.Hidden, Gen: req.Gen, Force: req.Force,
+		ExecProjected: req.ExecProjected,
+		Paths:         req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
+		Withdraw: req.Withdraw, Approve: req.Approve, Hidden: req.Hidden, Gen: req.Gen, Force: req.Force,
 		// Path belongs in the literal, not below: the patch and prog early
 		// returns run before anything set afterwards, and a patch that
 		// arrives pathless lands on the active tab instead of its file.
 		Path: req.Path, NewPath: req.NewPath}
+	// HookRunID is the one hook request field the literal does not carry:
+	// cancel names a run by it.
+	h.HookRunID = req.HookRunID
 	if req.Start != nil {
 		h.Start = req.Start
 	}
@@ -527,13 +607,21 @@ func DecodeRequest(f Frame) (Request, error) {
 	req := Request{ID: f.Header.ID, Op: f.Header.Op, Path: f.Header.Path, NewPath: f.Header.NewPath,
 		Author: f.Header.Author, Base: f.Header.Base, Query: f.Header.Query, Token: f.Header.Token,
 		Cancel: f.Header.Cancel, Argv: f.Header.Argv, Dir: f.Header.Dir,
-		Identity: f.Header.Identity, Name: f.Header.Name, Kind: f.Header.Kind, Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
+		Identity: f.Header.Identity, Name: f.Header.Name, Kind: f.Header.Kind,
+		Task: f.Header.Task, LandTask: f.Header.LandTask, To: f.Header.To, Message: f.Header.Message,
+		State: f.Header.State, StateOn: f.Header.StateOn, StateNote: f.Header.StateNote,
+
+		Group: f.Header.Group, Line: f.Header.Line, Col: f.Header.Col,
 		Start: f.Header.Start, End: f.Header.End,
 		LineStart: f.Header.LineStart, LineEnd: f.Header.LineEnd,
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
+		GitMode: f.Header.GitMode, GitRev: f.Header.GitRev, GitCount: f.Header.GitCount,
+		HookMode: f.Header.HookMode, HookName: f.Header.HookName, HookJSON: f.Header.HookJSON,
 		Annotated: f.Header.Annotated, Create: f.Header.Create, Discard: f.Header.Discard,
-		Paths: f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear,
-		Withdraw: f.Header.Withdraw, Hidden: f.Header.Hidden, Gen: f.Header.Gen, Force: f.Header.Force}
+		ExecProjected: f.Header.ExecProjected,
+		Paths:         f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear,
+		Withdraw: f.Header.Withdraw, Approve: f.Header.Approve, Hidden: f.Header.Hidden, Gen: f.Header.Gen, Force: f.Header.Force}
+	req.HookRunID = f.Header.HookRunID
 
 	if f.Header.Op == "prog" {
 		// The program is the body, whole — and it is claimed here rather than
@@ -575,18 +663,35 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Buffers: res.Buffers, Conflicts: res.Conflicts, Warnings: res.Warnings,
 		Files: res.Files, Considered: res.Considered, Capped: res.Capped,
 		Truncated: res.Truncated, Final: res.Final, Author: res.Author,
-		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream,
+		Exit: res.Exit, Dirty: res.Dirty, Stats: res.Stats, Stream: res.Stream, RetryAfterMS: res.RetryAfterMS,
 		Participants: res.Participants, Groups: res.Groups, Messages: res.Messages,
 		DumpID: res.DumpID, Hash: res.Hash, LSPJSON: res.LSPJSON, DiffJSON: res.DiffJSON,
+		GitJSON:    res.GitJSON,
+		HookJSON:   res.HookJSON,
 		StatesJSON: res.StatesJSON, Gen: res.Gen,
 		SnapshotJSON: res.SnapshotJSON, EncodingJSON: res.EncodingJSON, SnapshotPath: res.SnapshotPath,
 		Claims: res.Claims, ClaimWarnings: res.ClaimWarnings, ClaimOverlaps: res.ClaimOverlaps,
 		Deletions:   res.Deletions,
 		DirRemovals: res.DirRemovals,
 		Proposals:   res.Proposals,
+		Reveals:     res.Reveals,
 		Entries:     res.Entries,
+		Land:        res.Land,
 
 		Token: res.Token, SrcVersion: res.SrcVersion, Identity: res.Identity}
+	// The hook run stamp and in-memory state are assigned here rather than in
+	// the literal, so the existing literal keeps its alignment and the new
+	// fields read as one group.
+	h.HookName = res.HookName
+	h.HookRunID = res.HookRunID
+	h.HookRevision = res.HookRevision
+	h.HookHead = res.HookHead
+	h.HookDirty = res.HookDirty
+	h.HookDurationMS = res.HookDurationMS
+	h.HookTruncated = res.HookTruncated
+	h.HookOff = res.HookOff
+	h.HookLogJSON = res.HookLogJSON
+	h.HookPSJSON = res.HookPSJSON
 	var body []byte
 	if res.Stream != 0 {
 		// Command output is bytes off a pipe: whatever the process wrote, not
@@ -620,10 +725,12 @@ func DecodeResponse(f Frame) (Response, error) {
 		Files: f.Header.Files, Considered: f.Header.Considered, Capped: f.Header.Capped,
 		Truncated: f.Header.Truncated, Final: f.Header.Final,
 		Author: f.Header.Author, Exit: f.Header.Exit, Dirty: f.Header.Dirty,
-		Stats: f.Header.Stats, Stream: f.Header.Stream,
+		Stats: f.Header.Stats, Stream: f.Header.Stream, RetryAfterMS: f.Header.RetryAfterMS,
 		Participants: f.Header.Participants, Groups: f.Header.Groups,
 		Messages: f.Header.Messages, DumpID: f.Header.DumpID, Hash: f.Header.Hash,
 		LSPJSON: f.Header.LSPJSON, DiffJSON: f.Header.DiffJSON,
+		GitJSON:    f.Header.GitJSON,
+		HookJSON:   f.Header.HookJSON,
 		StatesJSON: f.Header.StatesJSON, Gen: f.Header.Gen,
 		SnapshotJSON: f.Header.SnapshotJSON, EncodingJSON: f.Header.EncodingJSON,
 		SnapshotPath: f.Header.SnapshotPath,
@@ -631,10 +738,22 @@ func DecodeResponse(f Frame) (Response, error) {
 		ClaimOverlaps: f.Header.ClaimOverlaps,
 		Deletions:     f.Header.Deletions,
 		DirRemovals:   f.Header.DirRemovals,
+		Reveals:       f.Header.Reveals,
 		Proposals:     f.Header.Proposals,
 		Entries:       f.Header.Entries,
+		Land:          f.Header.Land,
 
 		Token: f.Header.Token, SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
+	res.HookName = f.Header.HookName
+	res.HookRunID = f.Header.HookRunID
+	res.HookRevision = f.Header.HookRevision
+	res.HookHead = f.Header.HookHead
+	res.HookDirty = f.Header.HookDirty
+	res.HookDurationMS = f.Header.HookDurationMS
+	res.HookTruncated = f.Header.HookTruncated
+	res.HookOff = f.Header.HookOff
+	res.HookLogJSON = f.Header.HookLogJSON
+	res.HookPSJSON = f.Header.HookPSJSON
 	lengths := make([]int, 0, 2*len(f.Header.Matches)+len(f.Header.Spans)+1)
 	if f.Header.Stream != 0 {
 		lengths = append(lengths, f.Header.OutLen)

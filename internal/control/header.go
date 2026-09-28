@@ -69,7 +69,26 @@ const (
 	hGen        = 0x1a // watch: the generation the client last saw
 	hForce      = 0x1b // save: overwrite a file that changed on disk
 
+	// hExecProjected runs exec against a materialised projection of the live
+	// buffers instead of the worktree. It is a presence flag like Create.
+	hExecProjected = 0x1c
+
+	// hLandTask is a land request's task: the change sets to accept and,
+	// where nothing of another task remains pending, save. It is separate
+	// from hTask, which names the work a participant's own writes belong to.
+	hLandTask = 0x1d
+
+	// hTasks carries the task a writer's changes belong to: the participant's
+	// current work and the task each change set was opened under. It is one
+	// sparse field of its own, a sequence of {index, kind, task} records where
+	// kind 0 is a participant and 1 a group, emitted only for records that
+	// have a task. A reader that does not know the field skips it whole rather
+	// than reading a task as the next record's id. It takes the first of the
+	// last two free argument codes below 0x80, leaving 0x1f for a later field.
+	hTasks = 0x1e
+
 	// response fields
+
 	hExit             = 0x20
 	hDirty            = 0x21
 	hStats            = 0x22
@@ -138,6 +157,45 @@ const (
 	hSnapshotPath     = 0x61 // snapshot: the buffer's own path
 	hRoots            = 0x62 // a reply's whole workspace root set, primary first
 	hKind             = 0x63 // hello: the participant kind, absent meaning agent
+	hGitMode          = 0x64 // git: status, diff, show, numstat or log
+	hGitRev           = 0x65 // git: the revision show/diff/numstat read; absent means HEAD
+	hGitCount         = 0x66 // git: the most log entries to list
+	hGitJSON          = 0x67 // git: the JSON-encoded result
+	hTask             = 0x68 // hello: the task this participant's writes belong to; absent means none
+	hHookMode         = 0x69 // hook: list, show, run, put, rm, enable or disable
+	hHookName         = 0x6a // hook: the name show/run/rm/enable/disable address
+	hHookJSON         = 0x6b // hook or intent payload: a put's HookRow JSON, a list/show answer, or an intent Command/Result
+	hRetryAfterMS     = 0x6c // hook run refusal: milliseconds until a retry is allowed
+	hReveals          = 0x6d // watch: user-initiated reveals to surface on every client
+
+	// hApprove carries out a pending delete or rmdir removal: the human answer
+	// to a proposal, beside Withdraw. It is a presence flag like Withdraw.
+	hApprove = 0x6e
+
+	hTo      = 0x6f // send: the recipient, by author id, identity, name or "all"
+	hMessage = 0x70 // send: the text for the recipient's mailbox
+
+	// Hook run stamp and in-memory state.
+	hHookRunID        = 0x71 // hook: a run id, on cancel and the final frame
+	hHookRevision     = 0x72 // hook: the projection revision a run was admitted at
+	hHookHead         = 0x73 // hook: the HEAD sha a run saw
+	hHookDirty        = 0x74 // hook: the dirty-set digest a run saw
+	hHookDurationMS   = 0x75 // hook: how long the run took, in milliseconds
+	hHookTruncated    = 0x76 // hook: the run output hit the cap and was cut
+	hHookOff          = 0x77 // hook: the workspace panic switch is engaged
+	hHookLogJSON      = 0x78 // hook: the in-memory run log as JSON
+	hHookPSJSON       = 0x79 // hook: the in-flight run list as JSON
+	hState            = 0x7a // state: the declared working state to set; empty reads the caller's own
+	hStateOn          = 0x7b // state: the declared state's counterpart, the user or a participant key
+	hStateNote        = 0x7c // state: the declared state's free-text note
+	hParticipantState = 0x7d // roster: sparse per-participant state, one {id, state, declared, since_ms, note, on} each
+	hLand             = 0x7e // land: sparse per-buffer outcome, one {path, sets, saved, held, error} record each
+
+	// hMessageFrom is a sparse field parallel to hMessages: one {key, name}
+	// record per message, carrying each sender's durable reply target so a
+	// message replayed after its sender has gone is still addressable. A
+	// reader that does not know the field skips it whole.
+	hMessageFrom = 0x7f
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -175,6 +233,12 @@ var verbCodes = map[string]byte{
 	"token":  42,
 	"ls":     43,
 	"watch":  44,
+	"git":    45,
+	"hook":   46,
+	"reveal": 47,
+	"state":  48,
+	"land":   49,
+	"intent": 50,
 }
 
 var verbNamesByCode = func() map[byte]string {
@@ -187,6 +251,16 @@ var verbNamesByCode = func() map[byte]string {
 
 var kindCodes = map[string]byte{string(KindHuman): 1, string(KindAgent): 2}
 var stateCodes = map[string]byte{"proposed": 1, "accepted": 2, "rejected": 3}
+
+// workCodes is the working-state vocabulary as codes. Like the participant
+// kind and the change-set state it is a closed set, so it travels as a number;
+// an empty state is code zero, which nameFor reads back as empty.
+var workCodes = map[string]byte{
+	StateListening: 1, StateWorking: 2, StateWaiting: 3, StateStale: 4,
+	StateGone: 5, StateIdle: 6, StateBlocked: 7, StateReview: 8,
+}
+
+var workNamesByCode = invert(workCodes)
 
 var kindNamesByCode = invert(kindCodes)
 var stateNamesByCode = invert(stateCodes)
@@ -259,9 +333,11 @@ func encodeHeader(h Header) []byte {
 	flag(hCreate, h.Create)
 	flag(hDiscard, h.Discard)
 	flag(hForce, h.Force)
+	flag(hExecProjected, h.ExecProjected)
 	flag(hClaimAdd, h.ClaimAdd)
 	flag(hClaimClear, h.ClaimClear)
 	flag(hWithdraw, h.Withdraw)
+	flag(hApprove, h.Approve)
 	flag(hHidden, h.Hidden)
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
@@ -284,6 +360,14 @@ func encodeHeader(h Header) []byte {
 	str(hIdentity, h.Identity)
 	str(hName, h.Name)
 	str(hKind, h.Kind)
+	str(hTask, h.Task)
+	str(hLandTask, h.LandTask)
+	str(hState, h.State)
+	str(hStateOn, h.StateOn)
+	str(hStateNote, h.StateNote)
+
+	str(hTo, h.To)
+	str(hMessage, h.Message)
 	str(hDir, h.Dir)
 	num(hExit, h.Exit)
 	num(hStream, int(h.Stream))
@@ -321,6 +405,23 @@ func encodeHeader(h Header) []byte {
 	str(hSnapshotPath, h.SnapshotPath)
 	str(hLSPMode, h.LSPMode)
 	str(hLSPJSON, h.LSPJSON)
+	str(hGitMode, h.GitMode)
+	str(hGitRev, h.GitRev)
+	num(hGitCount, h.GitCount)
+	str(hGitJSON, h.GitJSON)
+	str(hHookMode, h.HookMode)
+	str(hHookName, h.HookName)
+	str(hHookJSON, h.HookJSON)
+	num(hRetryAfterMS, h.RetryAfterMS)
+	num(hHookRunID, int(h.HookRunID))
+	num(hHookRevision, int(h.HookRevision))
+	str(hHookHead, h.HookHead)
+	str(hHookDirty, h.HookDirty)
+	num(hHookDurationMS, int(h.HookDurationMS))
+	flag(hHookTruncated, h.HookTruncated)
+	flag(hHookOff, h.HookOff)
+	str(hHookLogJSON, h.HookLogJSON)
+	str(hHookPSJSON, h.HookPSJSON)
 	str(hDiffJSON, h.DiffJSON)
 	str(hStatesJSON, h.StatesJSON)
 	str(hSrcVersion, h.SrcVersion)
@@ -384,9 +485,21 @@ func encodeHeader(h Header) []byte {
 				w.Str(string(p.Kind))
 			}
 		}
-		ops = append(ops, Op8{hParticipants, w.Done()})
+		ops = append(ops, Op8{hParticipants, w.Done()}) // The working state rides in a field of its own rather than inside the
+		// hParticipants record: records are positional, so an older reader
+		// would read a state code as the next record's id. Every participant
+		// gets a record, so a reader that knows the field reads state for all
+		// of them and one that does not skips it whole.
+		var sts prog.Writer
+		for _, p := range h.Participants {
+			st, _ := code(workCodes, p.State)
+			decl, _ := code(workCodes, p.Declared)
+			sts.Num(int(p.ID)).Num(int(st)).Num(int(decl)).Num(int(p.SinceMS)).Str(p.Note).Str(p.On)
+		}
+		ops = append(ops, Op8{hParticipantState, sts.Done()})
 	}
 	if len(h.Groups) > 0 {
+
 		var w prog.Writer
 		for _, g := range h.Groups {
 			state, ok := code(stateCodes, g.State)
@@ -400,6 +513,7 @@ func encodeHeader(h Header) []byte {
 		ops = append(ops, Op8{hGroups, w.Done()})
 
 		// Overlap lists ride in their own sparse field, keyed to the groups by
+
 		// position: one count per group, then that many {group, author, start,
 		// end} records. A count is written for every group so the order matches
 		// hGroups, and the field is emitted only when some set overlaps, so a
@@ -450,12 +564,63 @@ func encodeHeader(h Header) []byte {
 			ops = append(ops, Op8{hGroupInvalid, invs.Done()})
 		}
 	}
+	// The task each writer's changes belong to rides in a sparse field of its
+	// own: a sequence of {index, kind, task} records, kind 0 a participant and
+	// 1 a group, emitted only for records that carry a task. A header with
+	// none is byte-for-byte what it always was, and a reader that does not
+	// know the field skips it whole.
+	{
+		var w prog.Writer
+		any := false
+		for _, p := range h.Participants {
+			any = any || p.Task != ""
+		}
+		for _, g := range h.Groups {
+			any = any || g.Task != ""
+		}
+		if any {
+			for i, p := range h.Participants {
+				if p.Task != "" {
+					w.Num(i).Num(0).Str(p.Task)
+				}
+			}
+			for i, g := range h.Groups {
+				if g.Task != "" {
+					w.Num(i).Num(1).Str(g.Task)
+				}
+			}
+			ops = append(ops, Op8{hTasks, w.Done()})
+		}
+	}
 	if len(h.Messages) > 0 {
 		var w prog.Writer
 		for _, m := range h.Messages {
 			w.Num(int(m.From)).Str(m.Text)
 		}
 		ops = append(ops, Op8{hMessages, w.Done()})
+
+		// The sender's reply target rides in its own sparse field, one record
+		// per message, so a reader that knows only hMessages skips it whole and
+		// still reads the text from the participant list.
+		var froms prog.Writer
+		var anyFrom bool
+		for _, m := range h.Messages {
+			froms.Str(m.FromKey).Str(m.FromName)
+			if m.FromKey != "" || m.FromName != "" {
+				anyFrom = true
+			}
+		}
+		if anyFrom {
+			ops = append(ops, Op8{hMessageFrom, froms.Done()})
+		}
+	}
+
+	if len(h.Land) > 0 {
+		var w prog.Writer
+		for _, f := range h.Land {
+			w.Str(f.Path).Num(f.Sets).Bool(f.Saved).Bool(f.Held).Str(f.Err)
+		}
+		ops = append(ops, Op8{hLand, w.Done()})
 	}
 	if len(h.Claims) > 0 {
 		var w prog.Writer
@@ -498,6 +663,13 @@ func encodeHeader(h Header) []byte {
 			w.Str(p.Kind).Str(p.Path).Num(int(p.Author)).Num(int(p.Group)).Num(p.Start).Num(p.End)
 		}
 		ops = append(ops, Op8{hProposals, w.Done()})
+	}
+	if len(h.Reveals) > 0 {
+		var w prog.Writer
+		for _, r := range h.Reveals {
+			w.Str(r.Path).Num(r.Start).Num(r.End)
+		}
+		ops = append(ops, Op8{hReveals, w.Done()})
 	}
 	if len(h.Entries) > 0 {
 		var w prog.Writer
@@ -781,9 +953,21 @@ func decodeHeader(b []byte) (Header, error) {
 	// Invalid flags and their colliders arrive the same way, a flag then (when
 	// set) four numbers per group, merged after every op.
 	var groupInvalid []invalidCollider
+	// Message reply targets arrive the same sparse way, one {key, name} per
+	// message, merged after every op like the fields above.
+	var messageFroms []messageFrom
+
 	// Headless buffer paths arrive the same sparse way: one path per buffer
 	// with no tab, marked on the matching buffers after every op is read.
-	var headless []string
+	var headless []string // Participant working states arrive in their own sparse field, one record
+	// per participant, collected and merged after every op like the headless
+	// paths above.
+	var participantStates []participantState
+	// Task records arrive in a sparse field of their own, {index, kind, task}
+	// each, so they are collected and applied after every op like the fields
+	// above.
+	participantTasks := map[int]string{}
+	groupTasks := map[int]string{}
 	for _, op := range ops {
 		switch op.Code {
 		case hID:
@@ -831,12 +1015,16 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Discard = true
 		case hForce:
 			h.Force = true
+		case hExecProjected:
+			h.ExecProjected = true
 		case hClaimAdd:
 			h.ClaimAdd = true
 		case hClaimClear:
 			h.ClaimClear = true
 		case hWithdraw:
 			h.Withdraw = true
+		case hApprove:
+			h.Approve = true
 		case hHidden:
 			h.Hidden = true
 
@@ -848,6 +1036,21 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Identity = string(op.Payload)
 		case hName:
 			h.Name = string(op.Payload)
+		case hTask:
+			h.Task = string(op.Payload)
+		case hLandTask:
+			h.LandTask = string(op.Payload)
+		case hState:
+			h.State = string(op.Payload)
+		case hStateOn:
+			h.StateOn = string(op.Payload)
+		case hStateNote:
+			h.StateNote = string(op.Payload)
+
+		case hTo:
+			h.To = string(op.Payload)
+		case hMessage:
+			h.Message = string(op.Payload)
 		case hKind:
 			h.Kind = string(op.Payload)
 		case hDir:
@@ -917,6 +1120,40 @@ func decodeHeader(b []byte) (Header, error) {
 			h.LSPMode = string(op.Payload)
 		case hLSPJSON:
 			h.LSPJSON = string(op.Payload)
+		case hGitMode:
+			h.GitMode = string(op.Payload)
+		case hGitRev:
+			h.GitRev = string(op.Payload)
+		case hGitCount:
+			h.GitCount = prog.ReadNumber(op.Payload)
+		case hGitJSON:
+			h.GitJSON = string(op.Payload)
+		case hHookMode:
+			h.HookMode = string(op.Payload)
+		case hHookName:
+			h.HookName = string(op.Payload)
+		case hHookJSON:
+			h.HookJSON = string(op.Payload)
+		case hRetryAfterMS:
+			h.RetryAfterMS = prog.ReadNumber(op.Payload)
+		case hHookRunID:
+			h.HookRunID = uint64(prog.ReadNumber(op.Payload))
+		case hHookRevision:
+			h.HookRevision = uint64(prog.ReadNumber(op.Payload))
+		case hHookHead:
+			h.HookHead = string(op.Payload)
+		case hHookDirty:
+			h.HookDirty = string(op.Payload)
+		case hHookDurationMS:
+			h.HookDurationMS = int64(prog.ReadNumber(op.Payload))
+		case hHookTruncated:
+			h.HookTruncated = true
+		case hHookOff:
+			h.HookOff = true
+		case hHookLogJSON:
+			h.HookLogJSON = string(op.Payload)
+		case hHookPSJSON:
+			h.HookPSJSON = string(op.Payload)
 		case hDiffJSON:
 			h.DiffJSON = string(op.Payload)
 		case hStatesJSON:
@@ -992,6 +1229,35 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "participants"); err != nil {
 				return Header{}, err
 			}
+		case hParticipantState:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				participantStates = append(participantStates, participantState{
+					id:       uint8(r.Num()),
+					state:    nameFor(workNamesByCode, r.Num()),
+					declared: nameFor(workNamesByCode, r.Num()),
+					sinceMS:  int64(r.Num()),
+					note:     r.Str(),
+					on:       r.Str(),
+				})
+			}
+			if err := recordsOK(r, "participant state"); err != nil {
+				return Header{}, err
+			}
+		case hTasks:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				index, kind := r.Num(), r.Num()
+				task := r.Str()
+				if kind == 0 {
+					participantTasks[index] = task
+				} else {
+					groupTasks[index] = task
+				}
+			}
+			if err := recordsOK(r, "tasks"); err != nil {
+				return Header{}, err
+			}
 		case hGroups:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -1061,6 +1327,14 @@ func decodeHeader(b []byte) (Header, error) {
 			if err := recordsOK(r, "messages"); err != nil {
 				return Header{}, err
 			}
+		case hMessageFrom:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				messageFroms = append(messageFroms, messageFrom{key: r.Str(), name: r.Str()})
+			}
+			if err := recordsOK(r, "message from"); err != nil {
+				return Header{}, err
+			}
 		case hClaims:
 			r := prog.NewReader(op.Payload)
 			for r.More() {
@@ -1112,6 +1386,23 @@ func decodeHeader(b []byte) (Header, error) {
 					Group: uint64(r.Num()), Start: r.Num(), End: r.Num()})
 			}
 			if err := recordsOK(r, "proposals"); err != nil {
+				return Header{}, err
+			}
+		case hLand:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Land = append(h.Land, LandFile{Path: r.Str(), Sets: r.Num(),
+					Saved: r.Bool(), Held: r.Bool(), Err: r.Str()})
+			}
+			if err := recordsOK(r, "land"); err != nil {
+				return Header{}, err
+			}
+		case hReveals:
+			r := prog.NewReader(op.Payload)
+			for r.More() {
+				h.Reveals = append(h.Reveals, Reveal{Path: r.Str(), Start: r.Num(), End: r.Num()})
+			}
+			if err := recordsOK(r, "reveals"); err != nil {
 				return Header{}, err
 			}
 		case hEntries:
@@ -1250,6 +1541,18 @@ func decodeHeader(b []byte) (Header, error) {
 			}
 		}
 	}
+	for _, ps := range participantStates {
+		for i := range h.Participants {
+			if h.Participants[i].ID == ps.id {
+				h.Participants[i].State = ps.state
+				h.Participants[i].Declared = ps.declared
+				h.Participants[i].SinceMS = ps.sinceMS
+				h.Participants[i].Note = ps.note
+				h.Participants[i].On = ps.on
+				break
+			}
+		}
+	}
 	for _, st := range states {
 		for i := range h.Buffers {
 			if h.Buffers[i].Path == st.path {
@@ -1317,6 +1620,22 @@ func decodeHeader(b []byte) (Header, error) {
 			h.Groups[i].InvalidBy = ic.by
 		}
 	}
+	for i, task := range participantTasks {
+		if i < len(h.Participants) {
+			h.Participants[i].Task = task
+		}
+	}
+	for i, task := range groupTasks {
+		if i < len(h.Groups) {
+			h.Groups[i].Task = task
+		}
+	}
+
+	for i, mf := range messageFroms {
+		if i < len(h.Messages) {
+			h.Messages[i].FromKey, h.Messages[i].FromName = mf.key, mf.name
+		}
+	}
 	return h, nil
 }
 
@@ -1326,12 +1645,32 @@ type conflictLease struct {
 	author, start, end int
 }
 
+// messageFrom is one message's durable reply target as it crosses the wire,
+// carried in the sparse hMessageFrom field rather than inside its positional
+// hMessages record.
+type messageFrom struct {
+	key  string
+	name string
+}
+
 // invalidCollider is one group's Invalid flag and, when set, the live set that
 // consumed it, carried in the sparse hGroupInvalid field: a flag then four
 // numbers, the collider's group zero when no single collider can be named.
 type invalidCollider struct {
 	invalid bool
 	by      *GroupOverlap
+}
+
+// participantState is one participant's working state as it crosses the wire,
+// carried in the sparse hParticipantState field rather than inside its
+// positional hParticipants record.
+type participantState struct {
+	id       uint8
+	state    string
+	declared string
+	sinceMS  int64
+	note     string
+	on       string
 }
 
 // bufferState is one buffer's pending and moved counts as they cross the wire,

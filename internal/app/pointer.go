@@ -278,13 +278,14 @@ func (a *App) pointerHint(l Layout, col, row int) {
 		return // the same hint still under a pointer that has not left it
 	}
 	a.hideHint()
-	// Anchor at the hint's own line and starting column, where the box
-	// belongs: the caret is not on the hint and never can be.
-	_, hcol := p.File.LineCol(p.File.LineStart(line) + h.Off)
+	// Anchor at the hint's own display row and column, where the box belongs:
+	// the caret is not on the hint and never can be, and a fold above it
+	// shifts the row the box must hang from.
+	hline, hcol := p.DispPos(p.File.LineStart(line) + h.Off)
 	a.hintHover = hintHover{
 		path:    a.docPath(p),
 		version: int(p.File.Session().Version()),
-		line:    line,
+		line:    hline,
 		col:     hcol,
 		text:    h.Tooltip,
 		at:      time.Now(),

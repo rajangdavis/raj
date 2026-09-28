@@ -1,0 +1,54 @@
+FROM node:22-slim
+
+ENV OC_UID=501
+ENV OC_GID=20
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates ripgrep jq \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code@latest
+
+RUN (getent group ${OC_GID} || groupadd -g ${OC_GID} ocgrp) \
+ && useradd -m -u ${OC_UID} -g ${OC_GID} -s /bin/bash oc
+
+RUN mkdir -p \
+      /home/oc/.local/state \
+      /home/oc/.cache \
+      /home/oc/.claude \
+      /opt/raj \
+      /work \
+      /tmp/opencode
+
+# Paths are relative to the REPO (the docker build context): build with
+# `docker build -f harness/Dockerfile.claude .` from the repo root.
+COPY bin/raj-linux /usr/local/bin/raj
+
+# The plugin bundles the raj-editor skill, the raj/review agents, and a
+# PreToolUse hook that denies an agent's `raj ctl save`. Claude Code loads a
+# plugin by directory with --plugin-dir, which the entrypoint passes — no
+# install step, no marketplace.
+#
+# It lives under /opt, not ~/.claude: `cc` mounts ~/.claude from the host so
+# sessions and the login persist, and anything the image put there would be
+# hidden by the mount (or, with a named volume, frozen at its first run). The
+# repo's skill is copied over the plugin's copy so a rebuild always ships the
+# current one.
+COPY harness/claude/ /opt/raj/claude-plugin/
+COPY skills/raj-editor/SKILL.md /opt/raj/claude-plugin/skills/raj-editor/SKILL.md
+
+RUN chmod 0755 /usr/local/bin/raj \
+ && chmod 0755 /opt/raj/claude-plugin/scripts/raj-guard.sh \
+ && chmod 0755 /opt/raj/claude-plugin/scripts/claude-waker.sh \
+ && chown -R ${OC_UID}:${OC_GID} /home/oc /work \
+ && chmod 0755 /tmp/opencode
+
+USER oc
+ENV HOME=/home/oc
+ENV XDG_STATE_HOME=/home/oc/.local/state
+ENV XDG_CACHE_HOME=/home/oc/.cache
+ENV RAJ_CONTROL_ADDR=tcp://host.docker.internal:7391
+WORKDIR /work
+
+# Load the plugin for every session: --plugin-dir takes the plugin root.
+ENTRYPOINT ["claude", "--plugin-dir", "/opt/raj/claude-plugin"]

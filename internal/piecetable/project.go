@@ -6,11 +6,15 @@
 // composition is a deterministic function of that one journal and of the
 // change sets' states — never a second document with offsets of its own.
 //
-// The contract is defined for journals in which no included edit's span
-// intersects the interior of an excluded edit's inserted span; the editor will
-// enforce that disjointness with read-only leases in a later phase. Such
-// overlapping journals must not panic here, but their composition is not
-// specified.
+// An included edit's span may still intersect the interior of an excluded
+// edit's inserted span: the agent diff path treats a Proposed run as advisory,
+// and a set can be rejected after an accepted edit has already touched its
+// run, so the read-only leases the typing path uses cannot make the journals
+// disjoint. Such an overlap does not leave the composition undefined. When an
+// included edit has partially consumed an excluded inserted run, the run's
+// newline bytes are kept as structural separators and only its remaining bytes
+// are removed, so dropping the excluded run cannot fuse the accepted text
+// around it. An intact run is still removed whole.
 package piecetable
 
 import "sort"
@@ -112,7 +116,27 @@ type DerivedProject struct {
 // A reversal never contributes bytes of its own, and a dead edit's effect is
 // already neutralised by its reverser in the view, so neither is touched — that
 // is what keeps a dropped deletion from widening a later included edit's Del.
+//
+// The private project carries the public entry points; Project admits every
+// proposed set, ProjectWithProposed narrows to a member set.
+
+// ProjectWithProposed derives the composition of the session under
+// AcceptedAndProposed, narrowed to the proposed sets whose ids are in
+// proposed. A proposed set absent from proposed is excluded exactly as a
+// Rejected one is, while every accepted edit stays. It is the intention
+// projection's composition: origin + accepted + the member proposed sets only,
+// so a non-member proposal sharing a file cannot leak into the tree.
+func (s *Session) ProjectWithProposed(proposed map[uint64]bool) DerivedProject {
+	return s.project(AcceptedAndProposed, proposed)
+}
+
+// Project derives the composition of the session under p. See project, the
+// one implementation every public entry point shares.
 func (s *Session) Project(p Policy) DerivedProject {
+	return s.project(p, nil)
+}
+
+func (s *Session) project(p Policy, proposed map[uint64]bool) DerivedProject {
 	if !s.HasDecisions() {
 		return s.projectNoDecisions(p)
 	}
@@ -148,13 +172,22 @@ func (s *Session) Project(p Policy) DerivedProject {
 	// reader saw, and the bytes would be gone before the human could decide.
 	// Deferring it keeps the planned range visible and leasable until accept.
 	deferred := s.deferredDeletions(p)
+	// Invalid sets are Proposed and stale at once: no live member projects into
+	// the present, so the policy excludes the set from the edit and agreed
+	// compositions. Annotated is the review view and keeps the set, reporting
+	// its invalid state through Groups. Invalid is derived, never stored, so it
+	// is recomputed here and clears when the colliding edit goes away.
+	var invalid map[uint64]bool
+	if p != Annotated {
+		invalid = s.invalidGroups()
+	}
 	var hidden []hiddenRun
 	for i := len(s.journal) - 1; i >= 0; i-- {
 		o := s.journal[i]
 		if o.Kind != KindEdit || !s.live(o.Seq) {
 			continue
 		}
-		if s.included(o, p) && !deferred[o.Group] {
+		if s.included(o, p, invalid, proposed) && !deferred[o.Group] {
 			continue
 		}
 		at, removed, kept, dropped := s.unapplyRemoveIns(comp, prov, o.Ins, o.Group)
@@ -195,14 +228,43 @@ func (s *Session) Project(p Policy) DerivedProject {
 // unapplyRemoveIns drops every piece of comp that sits inside a store range the
 // excluded edit inserted -- or inside a compacted origin of its group, for a
 // span an earlier compaction folded -- and reports the document offset of the
-// first piece it dropped, or -1 when none of the edit's inserted bytes survive.
-// Filtering in place is safe because the range reads each element before the
-// write cursor can reach it. kept mirrors the surviving comp.pieces and dropped
-// records the session bytes the removal hides, one entry per piece removed,
-// including the number of newlines among them.
+// first piece it touched, or -1 when none of the edit's inserted bytes survive.
+//
+// An included edit can have consumed part of the inserted run: its span
+// intersected the run's interior, so the run is no longer the whole unit the
+// view held and the surviving fragment is all that is left of it. Dropping that
+// fragment whole can remove a newline the accepted text on either side needs,
+// fusing two lines; when the run was partially consumed its newline bytes are
+// kept as structural separators and only the rest is hidden. An intact run --
+// nothing consumed it -- is hidden whole, because a rejected insertion's
+// newlines belong to it as much as its text does.
+//
+// Filtering in place is safe on the intact path because the range reads each
+// element before the write cursor can reach it. The partial path can split one
+// piece into several, which can grow the slice, so it builds fresh ones. kept
+// mirrors the surviving comp.pieces and dropped records the session bytes the
+// removal hides, one entry per hidden run, including the number of newlines
+// among them.
 func (s *Session) unapplyRemoveIns(comp *Naive, prov []projOrigin, ins []PieceRec, group uint64) (at int, removed bool, kept []projOrigin, dropped []hiddenRun) {
 	if len(ins) == 0 {
 		return -1, false, prov, nil
+	}
+	// A byte of the run missing from comp was consumed by an included edit.
+	// Newer excluded edits have already been un-applied, and their reversals
+	// put back any of the run they deleted, so a short run is exactly the
+	// overlap that makes the newlines structural.
+	insLen := 0
+	for _, r := range ins {
+		insLen += r.Length
+	}
+	owned := 0
+	for _, piece := range comp.pieces {
+		if insOwns(ins, piece) || s.compactedOwns(group, piece) {
+			owned += piece.Length
+		}
+	}
+	if owned < insLen {
+		return s.unapplyRemoveInsKeepNewlines(comp, prov, ins, group)
 	}
 	at, removed = -1, false
 	out := comp.pieces[:0]
@@ -225,6 +287,56 @@ func (s *Session) unapplyRemoveIns(comp *Naive, prov []projOrigin, ins []PieceRe
 		out = append(out, piece)
 		kept = append(kept, prov[k])
 		off += piece.Length
+	}
+	comp.pieces = out
+	return at, removed, kept, dropped
+}
+
+// unapplyRemoveInsKeepNewlines is unapplyRemoveIns when an included edit has
+// partially consumed the excluded run. It keeps the run's newline bytes as
+// composition pieces -- separators the accepted text around the hole was
+// written against -- and hides every other surviving byte. at is the
+// composition offset of the run's first surviving byte, so a restored deletion
+// still anchors to the hole the run leaves.
+func (s *Session) unapplyRemoveInsKeepNewlines(comp *Naive, prov []projOrigin, ins []PieceRec, group uint64) (at int, removed bool, kept []projOrigin, dropped []hiddenRun) {
+	at = -1
+	out := make([]PieceRec, 0, len(comp.pieces))
+	kept = make([]projOrigin, 0, len(prov))
+	off := 0
+	for k, piece := range comp.pieces {
+		if !insOwns(ins, piece) && !s.compactedOwns(group, piece) {
+			out = append(out, piece)
+			kept = append(kept, prov[k])
+			off += piece.Length
+			continue
+		}
+		pr := prov[k]
+		if at < 0 {
+			at = off
+		}
+		removed = true
+		b := comp.store.Slice(Author(piece.Buf), piece.Start, piece.Length)
+		for i := 0; i < len(b); {
+			keep := b[i] == '\n'
+			j := i + 1
+			for j < len(b) && (b[j] == '\n') == keep {
+				j++
+			}
+			if keep {
+				out = append(out, PieceRec{Buf: piece.Buf, Start: piece.Start + i, Length: j - i})
+				p := pr
+				if p.doc >= 0 {
+					p.doc += i
+				}
+				kept = append(kept, p)
+				off += j - i
+			} else if pr.doc >= 0 {
+				dropped = append(dropped, hiddenRun{
+					doc: pr.doc + i, length: j - i, group: pr.group, state: pr.state,
+				})
+			}
+			i = j
+		}
 	}
 	comp.pieces = out
 	return at, removed, kept, dropped
@@ -378,22 +490,60 @@ func (s *Session) projectNoDecisions(p Policy) DerivedProject {
 	return d
 }
 
+// invalidGroups is Groups' Invalid flag as a set of ids: the still-Proposed
+// sets whose every live member has been moved past what a rebase can carry,
+// so no hunk of the set survives. Project consults it to keep such a set out
+// of the agreed and edit compositions, exactly as Pending already drops it.
+// Invalid is derived from the journal and the decisions on every call, never
+// stored, so the set clears once the colliding edit goes away -- which is why
+// every projection recomputes it rather than threading it through the journal.
+func (s *Session) invalidGroups() map[uint64]bool {
+	var out map[uint64]bool
+	for _, g := range s.Groups() {
+		if !g.Invalid {
+			continue
+		}
+		if out == nil {
+			out = map[uint64]bool{}
+		}
+		out[g.ID] = true
+	}
+	return out
+}
+
 // included reports whether o's own bytes belong in the composition: ordinary
 // edits only — a reversal never contributes content, and whether the edit it
 // reverses is present is decided by live — still in effect, and in a change
 // set the policy admits. live is the session's final liveness, so an undone
 // edit is excluded from the first frame it would have appeared in and its
 // bytes never need removing.
-func (s *Session) included(o Op, p Policy) bool {
+//
+// invalid names the still-Proposed sets no live member projects into the
+// present (invalidGroups' answer). A set there is excluded from the agreed and
+// edit compositions just as a Rejected one is, so the stale bytes an excluded
+// collider restores do not reappear; Annotated is the review view and keeps
+// every set, invalid or not. proposed narrows AcceptedAndProposed to a member
+// set: nil admits every proposed set, and a proposed set absent from proposed
+// is excluded exactly as a Rejected one is. Callers pass the set computed once
+// per projection rather than have this walk the journal per op.
+func (s *Session) included(o Op, p Policy, invalid map[uint64]bool, proposed map[uint64]bool) bool {
 	if o.Kind != KindEdit || !s.live(o.Seq) {
 		return false
 	}
 	switch p {
 	case AcceptedOnly:
-		return s.GroupState(o.Group) == Accepted
+		return !invalid[o.Group] && s.GroupState(o.Group) == Accepted
 	case AcceptedAndProposed:
+		if invalid[o.Group] {
+			return false
+		}
 		st := s.GroupState(o.Group)
-		return st == Accepted || st == Proposed
+		if st == Accepted {
+			return true
+		}
+		// Project narrows to a member set by passing proposed; Project itself
+		// passes nil, which admits every proposed set.
+		return st == Proposed && (proposed == nil || proposed[o.Group])
 	case Annotated:
 		return true
 	default:

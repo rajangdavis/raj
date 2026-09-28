@@ -75,6 +75,29 @@ const (
 	sevHint    = 4
 )
 
+// goplsNoPackagePrefix is the message gopls publishes when it cannot
+// associate an open document with a package. It is the only signal there is:
+// the protocol has no code or tag for "unassociated", and gopls is the only
+// server that reports this today. Matching is a narrow prefix rather than a
+// substring, so a message-shape change in gopls fails safe — the publish then
+// reads as ok again and the diagnostic text is still in the list — instead of
+// misreading another server's diagnostics as unassociated.
+const goplsNoPackagePrefix = "No packages found for open file "
+
+// hasNoPackageDiagnostic reports whether a published list carries gopls's "no
+// package for this open file" diagnostic. Such a list is not a reading of the
+// document: the server answered, but it never associated the text with a
+// package, so an otherwise empty list is the absence of a check rather than a
+// clean bill of health. This is the one place the rule lives.
+func hasNoPackageDiagnostic(items []lsp.Diagnostic) bool {
+	for _, it := range items {
+		if strings.HasPrefix(it.Message, goplsNoPackagePrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // set replaces the diagnostics for a document with a publish that carried no
 // version.
 func (d *diagnostics) set(path string, items []lsp.Diagnostic) {
@@ -212,7 +235,9 @@ func (d *diagnostics) status(path string, syncedVersion, bufVersion int) (string
 // current text and the buffer has no edits. gopls omits the version for a file
 // at version 0, and "version 0" is both the on-disk copy and an unedited
 // buffer, so reading its on-disk analysis as clean for an edited buffer is the
-// false ok this exists to prevent.
+// false ok this exists to prevent. The sequence rule is applied first, so a
+// stale versionless publish never reaches the unassociated verdict and only a
+// fresh publish can report a list the server had no package for.
 func (d *diagnostics) freshnessLocked(path string, syncedVersion, bufVersion int) (status, detail string) {
 	published := d.publishedPaths[path]
 	var pubVersion *int
@@ -220,23 +245,21 @@ func (d *diagnostics) freshnessLocked(path string, syncedVersion, bufVersion int
 		vv := *v
 		pubVersion = &vv
 	}
-	status, detail = diagnosticsStatus(published, pubVersion, syncedVersion, bufVersion)
-	if status != control.LSPStatusOK {
-		return status, detail
+	// A versionless publish is a reading only of an unedited buffer, and only
+	// if it arrived after the sync. gopls omits the version for a file at
+	// version 0 — both the on-disk copy and an unedited buffer — so a buffer
+	// with edits (version > 0) can never be answered by one: the server has
+	// not republished for the text just sent. Treating its on-disk set as
+	// clean is the false ok this rule exists to prevent. Resolving it before
+	// diagnosticsStatus keeps the precedence: a stale versionless publish
+	// outranks the unassociated verdict, so only a fresh publish can report
+	// unassociated.
+	if published && pubVersion == nil &&
+		(d.publishSeq[path] <= d.syncSeq[path] || bufVersion != 0) {
+		return control.LSPStatusStale,
+			"the language server's last publish carried no version and does not describe the current text"
 	}
-	if pubVersion == nil {
-		// A versionless publish is a reading only of an unedited buffer, and
-		// only if it arrived after the sync. gopls omits the version for a
-		// file at version 0 — both the on-disk copy and an unedited buffer —
-		// so a buffer with edits (version > 0) can never be answered by one:
-		// the server has not republished for the text just sent. Treating its
-		// on-disk set as clean is the false ok this rule exists to prevent.
-		if d.publishSeq[path] <= d.syncSeq[path] || bufVersion != 0 {
-			return control.LSPStatusStale,
-				"the language server's last publish carried no version and does not describe the current text"
-		}
-	}
-	return status, detail
+	return diagnosticsStatus(path, published, pubVersion, syncedVersion, bufVersion, d.byPath[path])
 }
 
 // waitFor blocks until the next publish for path, or until ctx is done. It

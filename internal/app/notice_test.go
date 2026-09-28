@@ -5,6 +5,7 @@ import "testing"
 // A notice is for something the App cannot know about — a stale terminal
 // config — so it must reach the status line at startup.
 func TestNoticeReachesTheStatusLine(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.Notice("configs are out of date")
 	if got := h.Status(); got != "configs are out of date" {
@@ -16,6 +17,7 @@ func TestNoticeReachesTheStatusLine(t *testing.T) {
 // in the workspace hide file is about the workspace in front of the user; a
 // stale config is about their terminal, and it can wait.
 func TestNoticeYieldsToAnExistingStatus(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.status = "ignoring 1 bad pattern"
 	h.Notice("configs are out of date")

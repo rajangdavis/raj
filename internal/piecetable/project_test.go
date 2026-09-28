@@ -449,11 +449,18 @@ func foldProjectOracle(orig string, s *Session, p Policy) projOracle {
 	}
 
 	deferred := s.deferredDeletions(p)
+	// Invalid sets are excluded from the agreed and edit compositions, the
+	// same recomputed-flag exclusion Project makes. Annotated is the review
+	// view and keeps every set, so it asks for no set.
+	var invalid map[uint64]bool
+	if p != Annotated {
+		invalid = s.invalidGroups()
+	}
 	included := func(o Op) bool {
 		if o.Kind != KindEdit || !isLive(o.Seq) {
 			return false
 		}
-		if deferred[o.Group] {
+		if deferred[o.Group] || invalid[o.Group] {
 			return false
 		}
 		switch p {
@@ -537,6 +544,16 @@ func foldProjectOracle(orig string, s *Session, p Policy) projOracle {
 		if o.Kind != KindEdit || !isLive(o.Seq) || included(o) {
 			continue
 		}
+		// Whether an included edit consumed part of this run decides whether
+		// its newlines are structural: a partially consumed run keeps them, the
+		// same rule Project's unapplyRemoveInsKeepNewlines applies.
+		owned := 0
+		for k := range comp {
+			if srcIn(o.Ins, csrc[k]) {
+				owned++
+			}
+		}
+		partial := owned < o.InsLen()
 		at := -1
 		out := comp[:0]
 		outs := csrc[:0]
@@ -545,7 +562,9 @@ func foldProjectOracle(orig string, s *Session, p Policy) projOracle {
 				if at < 0 {
 					at = len(out)
 				}
-				continue
+				if !(partial && comp[k] == '\n') {
+					continue
+				}
 			}
 			out = append(out, comp[k])
 			outs = append(outs, csrc[k])
@@ -659,9 +678,11 @@ func oracleRuns(groups []uint64, s *Session) []StateRun {
 // journal.
 //
 // Where the journal contains an included edit whose span intersects the
-// interior of an excluded edit's inserted span, the contract does not define
-// the composition; the oracle detects that in its own terms and the test then
-// asserts only that nothing panicked and the lengths still agree.
+// interior of an excluded edit's inserted span, the composition is defined:
+// the excluded run's newlines survive as structural separators, and the oracle
+// folds that same rule (unapplyRemoveInsKeepNewlines). The overlap flag is a
+// witness that the case was reached, not a reason to skip it; the text and
+// state comparisons below run for it like any other journal.
 func FuzzProjectAgainstOracle(f *testing.F) {
 	// One program per op kind, plus ones that mix decisions with reversals.
 	f.Add([]byte{0, 1, 5, 0, 0, 2, 2, 0, 1, 1, 4, 0, 3, 0, 5, 1})
@@ -742,12 +763,10 @@ func FuzzProjectAgainstOracle(f *testing.F) {
 				if proj.Len() != len(orc.text) {
 					t.Fatalf("%v: Len %d, oracle %d\nlog=%v", p, proj.Len(), len(orc.text), log)
 				}
-				if orc.overlap {
-					continue // the contract does not define the composition here
-				}
 				checkSegments(t, s, p)
 				if got := proj.Text(); got != orc.text {
-					t.Fatalf("%v: composition %q, oracle %q\nlog=%v", p, got, orc.text, log)
+					t.Fatalf("%v: composition %q, oracle %q (overlap %v)\nlog=%v",
+						p, got, orc.text, orc.overlap, log)
 				}
 				if p == Annotated {
 					want := oracleRuns(orc.groups, s)
@@ -1112,4 +1131,43 @@ func TestProjectSegmentsHiddenLines(t *testing.T) {
 		t.Fatalf("hidden run = %+v, want Len 9 with 3 newlines", hide)
 	}
 	checkSegments(t, s, AcceptedOnly)
+}
+
+// A rejected inserted run whose interior an accepted edit consumed used to be
+// removed whole from the agreed composition, dropping the newline at the end of
+// the run and fusing the accepted text on either side -- the ")	hHookMode"
+// and "str(a)	str(b)" incidents, where a line's leading tab ended up inside
+// the previous line. The projection now keeps that newline: the accepted edit
+// consumed part of the run, so the separator is structural and survives, and
+// only the run's remaining content is hidden. Without the fix the composition
+// below is "H\nT\nbar\nbazZ\n".
+func TestProjectKeepsAnOverlappedRejectedRunsSeparator(t *testing.T) {
+	// Base is three lines. A inserts "foo\n" before Z and is later rejected;
+	// B, accepted, replaces A's "foo" with the two lines "bar\nbaz".
+	s := NewSession(NewNaive("H\nT\nZ\n"))
+	s.Begin()
+	s.Insert(Agent, 4, "foo\n")
+	s.End()
+	rejected := s.LastGroup()
+	s.Begin()
+	s.Delete(User, 4, 3) // consumes A's "foo": B's span enters A's inserted run
+	s.Insert(User, 4, "bar\nbaz")
+	s.End()
+	if !s.RejectGroup(rejected) {
+		t.Fatal("the inserted set did not reject")
+	}
+
+	// The view holds "H\nT\nbar\nbaz\nZ\n": A's "foo" is gone and its newline
+	// remains. The agreed composition must keep that newline rather than
+	// fusing B's "baz" onto Z, which is what dropping the whole run did.
+	got := s.Project(AcceptedOnly).Text()
+	want := "H\nT\nbar\nbaz\nZ\n"
+	if got != want {
+		t.Fatalf("agreed composition %q, want %q", got, want)
+	}
+	if edit := s.Project(AcceptedAndProposed).Text(); edit != want {
+		t.Fatalf("edit composition %q, want %q", edit, want)
+	}
+	checkSegments(t, s, AcceptedOnly)
+	checkSegments(t, s, AcceptedAndProposed)
 }

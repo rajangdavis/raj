@@ -40,3 +40,13 @@ func killProcessGroup(cmd *exec.Cmd) {
 	}
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
+
+// processGroupID reports the process group the started command leads. Because
+// setProcessGroup made it a leader, its pid is its pgid; a command that has not
+// started has neither.
+func processGroupID(cmd *exec.Cmd) int {
+	if cmd.Process == nil {
+		return 0
+	}
+	return cmd.Process.Pid
+}

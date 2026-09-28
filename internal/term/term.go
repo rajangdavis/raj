@@ -57,6 +57,13 @@ const (
 	altOn  = "\x1b[?1049h"
 	altOff = "\x1b[?1049l"
 
+	// clear is ED 2 (erase the visible screen), ED 3 (erase the scrollback,
+	// ignored where unsupported) and CUP home. Leave sends it before altOff,
+	// so a terminal that does not restore the alternate screen does not keep
+	// raj's last frame; one that does discards the clear with the alt screen
+	// and restores the shell's own screen untouched.
+	clear = "\x1b[2J\x1b[3J\x1b[H"
+
 	// Mouse reporting: button, drag and bare-motion events (1002 and 1003) in
 	// the SGR encoding (1006).
 	//
@@ -148,6 +155,7 @@ func (t *Terminal) Leave() {
 	fmt.Fprint(t.out, focusOff)
 	fmt.Fprint(t.out, kkpPop)
 	fmt.Fprint(t.out, showCursor)
+	fmt.Fprint(t.out, clear)
 	fmt.Fprint(t.out, altOff)
 	t.profile.leave(t.out)
 	if t.saved != "" {

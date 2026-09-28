@@ -35,6 +35,7 @@ func (h *harness) installHighlight(version, caret int, hs ...lsp.DocumentHighlig
 // voice, and a present-and-false provider means no. Without this read the idle
 // tick would ask a method the server answers method-not-found.
 func TestHighlightCapabilityGate(t *testing.T) {
+	t.Parallel()
 	const want = "language server does not support document highlights"
 	if got := highlightGap(lsp.ServerCapabilities{}); got != want {
 		t.Errorf("absent provider: %q", got)
@@ -51,6 +52,7 @@ func TestHighlightCapabilityGate(t *testing.T) {
 // the text has not moved, and a still caret does not. Without the caret in the
 // key the highlight would follow an edit but never the cursor.
 func TestHighlightWantedGuard(t *testing.T) {
+	t.Parallel()
 	last := highlightReq{path: "/w/a.go", version: 1, caret: 5}
 	if highlightWanted(last, "/w/a.go", 1, 5) {
 		t.Error("the same path, version and caret were requested again")
@@ -70,6 +72,7 @@ func TestHighlightWantedGuard(t *testing.T) {
 // flag: without the kind mapping a write would paint like a read, and without
 // the line mapping the renderer would have nothing to consult.
 func TestHighlightRunsConvert(t *testing.T) {
+	t.Parallel()
 	doc := lsp.NewDocument("aa bb\ncc\n")
 	got := highlightRuns(doc, []lsp.DocumentHighlight{
 		dhl(0, 0, 0, 2, lsp.HighlightRead),
@@ -91,6 +94,7 @@ func TestHighlightRunsConvert(t *testing.T) {
 // because a server may report one occurrence spanning the newline and losing it
 // would look like the server never answered.
 func TestHighlightRunsSplitAcrossLines(t *testing.T) {
+	t.Parallel()
 	doc := lsp.NewDocument("ab\ncd\n")
 	got := highlightRuns(doc, []lsp.DocumentHighlight{dhl(0, 1, 1, 1, lsp.HighlightText)})
 	if len(got[0]) != 1 || got[0][0] != (editor.HighlightRun{Start: 1, End: 3}) {
@@ -105,6 +109,7 @@ func TestHighlightRunsSplitAcrossLines(t *testing.T) {
 // stale answer for older text must not paint, and neither must one for a caret
 // the user has left: both are an emphasis on the wrong bytes.
 func TestStaleHighlightAnswerIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	version := int(h.Pane().File.Session().Version())
 	caret := h.Pane().Cursors.Primary().Head
@@ -124,6 +129,7 @@ func TestStaleHighlightAnswerIsDropped(t *testing.T) {
 // version so the same frame drops it. Without the version pin the emphasis
 // would survive on moved bytes until the next server answer.
 func TestHighlightInstallAndEditInvalidates(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	version := int(h.Pane().File.Session().Version())
 	caret := h.Pane().Cursors.Primary().Head
@@ -145,6 +151,7 @@ func TestHighlightInstallAndEditInvalidates(t *testing.T) {
 // The server's "no occurrences" answer clears the overlay rather than leaving
 // the previous one up: a nil set is an answer, not silence.
 func TestHighlightEmptyAnswerClearsOverlay(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	version := int(h.Pane().File.Session().Version())
 	caret := h.Pane().Cursors.Primary().Head

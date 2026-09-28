@@ -25,6 +25,7 @@ func query(h *harness, text string) {
 
 // End to end: type into a buffer, search for it without saving, find it.
 func TestSearchFindsUnsavedText(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
@@ -42,6 +43,7 @@ func TestSearchFindsUnsavedText(t *testing.T) {
 // And the other direction: text deleted but not yet saved must stop matching,
 // or the pane sends you to a line that no longer says that.
 func TestSearchDoesNotReportDeletedText(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	query(h, "unrelated")
 	if got := results(h); len(got) != 1 {
@@ -67,6 +69,7 @@ func TestSearchDoesNotReportDeletedText(t *testing.T) {
 // a search reports — the snapshot dropping out from under it is the seam where
 // a double count or a miss would show up.
 func TestSavingDoesNotChangeResults(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
@@ -92,6 +95,7 @@ func TestSavingDoesNotChangeResults(t *testing.T) {
 // which is the case a buffer overlay could plausibly have broken by replacing
 // the walk rather than layering on it.
 func TestSearchStillReadsTheDisk(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	if err := os.WriteFile(filepath.Join(h.primaryRoot(), "fresh.go"), []byte("var marmoset = 1\n"), 0o644); err != nil {
 		t.Fatal(err)

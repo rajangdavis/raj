@@ -13,6 +13,7 @@ import (
 // unguarded made the guard a property of the chord rather than of the buffer.
 
 func TestQuitWithNothingDirtyExitsImmediately(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "untouched")
 	h.press("ctrl+c")
 
@@ -25,6 +26,7 @@ func TestQuitWithNothingDirtyExitsImmediately(t *testing.T) {
 }
 
 func TestQuitWithADirtyTabAsks(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		answer   []string
@@ -67,6 +69,7 @@ func TestQuitWithADirtyTabAsks(t *testing.T) {
 // One dirty file is named; several are counted, because a list of names does
 // not fit and a bare count withholds the only useful detail when there is one.
 func TestQuitMessageNamesOneAndCountsMany(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base")
 	h.typeText("x")
 	h.press("ctrl+c")
@@ -85,6 +88,7 @@ func TestQuitMessageNamesOneAndCountsMany(t *testing.T) {
 
 // Save must reach every dirty tab, not only the focused one.
 func TestQuitSavesAllDirtyTabs(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one")
 	first := h.Pane().File.Path
 	h.typeText("A")
@@ -118,6 +122,7 @@ func TestQuitSavesAllDirtyTabs(t *testing.T) {
 // cancels the quit — exiting anyway would discard the work the answer asked to
 // keep.
 func TestQuitChainsIntoSaveAsAndCancellingAbortsTheQuit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("super+n")
 	h.typeText("precious")
@@ -157,6 +162,7 @@ func TestQuitChainsIntoSaveAsAndCancellingAbortsTheQuit(t *testing.T) {
 // ctrl+c is what people press when they want out now. A dialog that answers it
 // by asking the same question again is a wedge, so the second press forces it.
 func TestSecondQuitForcesTheExit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base")
 	h.typeText("edited")
 	h.press("ctrl+c")
@@ -172,6 +178,7 @@ func TestSecondQuitForcesTheExit(t *testing.T) {
 
 // Cancelling must leave the session able to ask again, rather than latching.
 func TestQuitCanBeAskedAgainAfterCancelling(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base")
 	h.typeText("edited")
 	h.press("ctrl+c")

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"raj/internal/intent"
 	"raj/internal/prog"
 )
 
@@ -26,9 +27,16 @@ type memHost struct {
 	reads  []bool
 	dirty  []DirtyBuffer
 	groups []Group
-	diffs  []DiffGroup
-	snaps  map[uint64]snapEntry
-	seq    uint64
+	// groupsByPath overrides groups for one buffer, so a workspace-wide walk
+	// such as land can be driven with each buffer answering for itself; an
+	// absent path falls back to the single global groups fixture.
+	groupsByPath map[string][]Group
+	diffs        []DiffGroup
+	snaps        map[uint64]snapEntry
+	seq          uint64
+	// lastIntent is the payload the last intent dispatch handed the host, so a
+	// test can assert the server-stamped owner.
+	lastIntent string
 
 	// unsaved marks a buffer dirty or holding a pending change set, which is
 	// what plain Close refuses and CloseDiscard drops. disk stands in for the
@@ -37,6 +45,10 @@ type memHost struct {
 	unsaved map[string]bool
 	disk    map[string]string
 	saves   int
+	// saveErr makes Save refuse a named buffer, standing in for a save the
+	// editor declined for a reason other than pending sets, such as a disk
+	// that changed underneath it.
+	saveErr map[string]string
 	// mkdirs records every directory Mkdir was asked to create. memHost has no
 	// filesystem, so this is what the guard tests assert: the resolved path
 	// arrived, and a refused one never did.
@@ -51,6 +63,11 @@ type memHost struct {
 	// dirRemovals is memHost's pending dir-removal set, the rmdir analogue of
 	// deletions, keyed by directory path.
 	dirRemovals map[string]DirRemoval
+	// approvals and dirApprovals record every human-gated carry-through the
+	// Guard passed down, so a Dispatch test can prove an agent approve never
+	// reached the host and a human one did.
+	approvals    []string
+	dirApprovals []string
 	// entries is the canned ls answer, and lastLs records the request the Guard
 	// passed down, so Dispatch tests can assert the resolved path and the
 	// -hidden flag without a filesystem.
@@ -94,6 +111,21 @@ type memHost struct {
 	// wedge with the live set that overlaps, the refusal the real host gives.
 	reverts     []revertCall
 	revertBlock Conflict
+	// reveals records every Reveal the Guard passed down, so a Dispatch test
+	// can assert the canonical path and span arrived without an editor behind
+	// it. A bad span never reaches it because the Guard refuses first.
+	reveals []revealCall
+
+	// projection is the canned map Projection hands back. The fake returns a copy
+	// of it for either policy: which policy maps to which composition is the app
+	// host's job, not the fake's.
+	projection map[string][]byte
+
+	// hooks is the canned stored-hook set the hook verb reads and writes,
+	// kept sorted by name like the real store. PutHook and DeleteHook mutate
+	// it so a Dispatch test can drive list/show/put/rm/enable/disable through
+	// the shipped handler rather than a second one.
+	hooks []HookRow
 }
 
 // revertCall is one memHost.Revert: the canonical path and the author the Guard
@@ -101,6 +133,13 @@ type memHost struct {
 type revertCall struct {
 	path   string
 	author uint8
+}
+
+// revealCall is one memHost.Reveal: the canonical path and byte span the Guard
+// resolved, recorded so a Dispatch test can assert the pair that crossed.
+type revealCall struct {
+	path       string
+	start, end int
 }
 
 // renameCall is one memHost.Rename: the canonical old and new the Guard
@@ -135,6 +174,16 @@ func (h *memHost) Root() string { return h.root }
 // Roots is the whole workspace root set, when a test sets one; a nil set makes
 // the Guard fall back to Root, exactly as a host that predates the method does.
 func (h *memHost) Roots() []string { return h.roots }
+
+// Projection returns a copy of the canned map, so a test can set it and both
+// policies read the same snapshot.
+func (h *memHost) Projection(_ ProjectionPolicy) map[string][]byte {
+	out := make(map[string][]byte, len(h.projection))
+	for k, v := range h.projection {
+		out[k] = v
+	}
+	return out
+}
 
 func (h *memHost) Buffers() []Buffer {
 	var out []Buffer
@@ -274,7 +323,7 @@ func (h *memHost) Version(path string, author uint8) (uint64, error) {
 	return h.vers[path], nil
 }
 
-func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, []GroupOverlap, error) {
+func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk, task string) (uint64, []Conflict, []GroupOverlap, error) {
 	t, ok := h.docs[path]
 	if !ok {
 		return 0, nil, nil, ErrNoBuffer
@@ -295,6 +344,9 @@ func (h *memHost) Apply(path string, author uint8, base uint64, hunks []Hunk) (u
 }
 
 func (h *memHost) Save(path string, force bool) (uint64, error) {
+	if msg, ok := h.saveErr[path]; ok {
+		return 0, fmt.Errorf("%s", msg)
+	}
 	h.saves++
 	h.disk[path] = h.docs[path]
 	return h.vers[path], nil
@@ -336,7 +388,7 @@ func (h *memHost) Dump(path string, start, end int, author uint8) (uint64, uint6
 	return h.seq, h.vers[path], t[start:end], "", nil
 }
 
-func (h *memHost) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, []GroupOverlap, error) {
+func (h *memHost) Patch(path string, author uint8, id uint64, newText string, task string) (uint64, []Conflict, []GroupOverlap, error) {
 	snap, ok := h.snaps[id]
 	if !ok || snap.author != author {
 		return 0, nil, nil, fmt.Errorf("no snapshot %d for this writer", id)
@@ -370,6 +422,17 @@ func (h *memHost) Goto(path string, line, col int) error {
 	if _, ok := h.docs[path]; !ok {
 		return ErrNoBuffer
 	}
+	return nil
+}
+
+// Reveal records the path and span the Guard passed down. Like Goto it can be
+// wrong only about whether the buffer exists, which is the state memHost keeps;
+// the span rule itself belongs to the Guard.
+func (h *memHost) Reveal(path string, start, end int) error {
+	if _, ok := h.docs[path]; !ok {
+		return ErrNoBuffer
+	}
+	h.reveals = append(h.reveals, revealCall{path: path, start: start, end: end})
 	return nil
 }
 
@@ -472,6 +535,78 @@ func (h *memHost) DirRemovals() []DirRemoval {
 		out = append(out, d)
 	}
 	return out
+}
+
+// ApproveDeletion and ApproveDirRemoval are memHost's half of the human-gated
+// carry-through. memHost has no filesystem, so they drop the pending entry and
+// record the path, standing in for the app's removeDeleted and
+// removeDirDeleted. A path with no pending proposal is refused by name, exactly
+// as the app does, so Dispatch tests can pin the refusal.
+func (h *memHost) ApproveDeletion(path string) error {
+	if _, ok := h.deletions[path]; !ok {
+		return fmt.Errorf("no pending deletion for %s", path)
+	}
+	delete(h.deletions, path)
+	h.approvals = append(h.approvals, path)
+	return nil
+}
+
+func (h *memHost) ApproveDirRemoval(path string) error {
+	if _, ok := h.dirRemovals[path]; !ok {
+		return fmt.Errorf("no pending dir-removal for %s", path)
+	}
+	delete(h.dirRemovals, path)
+	h.dirApprovals = append(h.dirApprovals, path)
+	return nil
+}
+
+// Hooks is the canned hook set, a copy so a caller cannot mutate it.
+func (h *memHost) Hooks() ([]HookRow, error) {
+	return append([]HookRow(nil), h.hooks...), nil
+}
+
+// PutHook upserts a row, keeping the set sorted by name like the store. It
+// does not validate: Dispatch is the validating path, and the app host is
+// tested separately for its own validation.
+func (h *memHost) PutHook(row HookRow) error {
+	for i := range h.hooks {
+		if h.hooks[i].Name == row.Name {
+			h.hooks[i] = row
+			return nil
+		}
+		if h.hooks[i].Name > row.Name {
+			h.hooks = append(h.hooks, HookRow{})
+			copy(h.hooks[i+1:], h.hooks[i:])
+			h.hooks[i] = row
+			return nil
+		}
+	}
+	h.hooks = append(h.hooks, row)
+	return nil
+}
+
+// DeleteHook removes a row; an absent name is a no-op.
+func (h *memHost) DeleteHook(name string) error {
+	for i := range h.hooks {
+		if h.hooks[i].Name != name {
+			continue
+		}
+		h.hooks = append(h.hooks[:i], h.hooks[i+1:]...)
+		return nil
+	}
+	return nil
+}
+
+// SetHookEnabled flips a stored row's flag, refusing a name that is absent.
+func (h *memHost) SetHookEnabled(name string, enabled bool) error {
+	for i := range h.hooks {
+		if h.hooks[i].Name != name {
+			continue
+		}
+		h.hooks[i].Enabled = enabled
+		return nil
+	}
+	return fmt.Errorf("no such hook %q", name)
 }
 
 // Ls is memHost's half of the ls verb: it records the request the Guard
@@ -978,6 +1113,140 @@ func TestApplyAllowsAJoinedHuman(t *testing.T) {
 	}
 }
 
+// Save is the user's gesture, not a writer's. The local keyboard row and a
+// durable joined human (an attached client) may write; an agent, an undeclared
+// connection and the file-as-loaded are refused, so a proposal cannot write
+// itself out. The refusal names the user's save as the remedy, because the
+// edit is not lost.
+func TestSaveIsTheUsersAction(t *testing.T) {
+	path := filepath.Join("/w", "a.go")
+
+	// An agent is refused, and the host is never asked to write.
+	g, h := guarded(t)
+	reg := NewRegistry()
+	g.Participants = reg
+	agent, err := reg.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := Dispatch(g, Request{Op: "save", Path: path, Author: agent})
+	if res.OK {
+		t.Fatalf("an agent's save was admitted: %+v", res)
+	}
+	if !strings.Contains(res.Err, "save is the user's action") {
+		t.Errorf("refusal = %q, want the human-only save message", res.Err)
+	}
+	if h.saves != 0 {
+		t.Errorf("the refused save reached the host %d time(s)", h.saves)
+	}
+	if h.disk[path] != h.docs[path] {
+		t.Errorf("disk = %q, want it unwritten (%q)", h.disk[path], h.docs[path])
+	}
+
+	// A provisional (undeclared) connection is an agent too.
+	g2, h2 := guarded(t)
+	reg2 := NewRegistry()
+	g2.Participants = reg2
+	id, err := reg2.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g2, Request{Op: "save", Path: path, Author: id}); res.OK {
+		t.Errorf("an undeclared connection saved: %+v", res)
+	}
+	if h2.saves != 0 {
+		t.Errorf("the refused provisional save reached the host %d time(s)", h2.saves)
+	}
+
+	// The file-as-loaded is not a person.
+	if res := Dispatch(g, Request{Op: "save", Path: path, Author: AuthorOriginal}); res.OK {
+		t.Errorf("the file-as-loaded saved: %+v", res)
+	}
+
+	// The local keyboard row is the person, and its save reaches the host.
+	g3, h3 := guarded(t)
+	g3.Participants = NewRegistry()
+	if res := Dispatch(g3, Request{Op: "save", Path: path, Author: LocalHuman}); !res.OK {
+		t.Fatalf("the local human's save was refused: %+v", res)
+	}
+	if h3.saves != 1 || h3.disk[path] != h3.docs[path] {
+		t.Errorf("local save: saves = %d, disk = %q", h3.saves, h3.disk[path])
+	}
+
+	// A durable joined human (an attached client) saves as its own person.
+	g4, h4 := guarded(t)
+	reg4 := NewRegistry()
+	g4.Participants = reg4
+	human, err := reg4.Join("client:desk", "desk", KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if human == LocalHuman {
+		t.Fatalf("fixture: the joined human reused the local row %d", LocalHuman)
+	}
+	if res := Dispatch(g4, Request{Op: "save", Path: path, Author: human}); !res.OK {
+		t.Fatalf("a joined human's save was refused: %+v", res)
+	}
+	if h4.saves != 1 {
+		t.Errorf("joined-human saves = %d, want 1", h4.saves)
+	}
+}
+
+// A Guard with no registry still refuses an agent by id and allows the local
+// keyboard row: the id rule the write gate falls back to, so a hand-built
+// Guard is not a way round the human-only save.
+func TestSaveWithoutARegistryFallsBackToTheIDRule(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join("/w", "a.go")
+	for _, author := range []uint8{AuthorOriginal, FirstAgent, FirstAgent + 1} {
+		if res := Dispatch(g, Request{Op: "save", Path: path, Author: author}); res.OK {
+			t.Errorf("author %d saved with no registry: %+v", author, res)
+		}
+	}
+	if h.saves != 0 {
+		t.Fatalf("a refused save reached the host %d time(s)", h.saves)
+	}
+	if res := Dispatch(g, Request{Op: "save", Path: path, Author: LocalHuman}); !res.OK {
+		t.Fatalf("the local human's save was refused with no registry: %+v", res)
+	}
+	if h.saves != 1 {
+		t.Errorf("saves = %d, want the one local save", h.saves)
+	}
+}
+
+// The refusal writes nothing and clears nothing: the edit stays in the buffer
+// at its version, and the host is never asked to save. An agent that hits this
+// must stop, not retry.
+func TestSaveRefusalLeavesTheBufferIntact(t *testing.T) {
+	g, h := guarded(t)
+	reg := NewRegistry()
+	g.Participants = reg
+	agent, err := reg.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join("/w", "a.go")
+	before := h.docs[path]
+	vers := h.vers[path]
+	h.unsaved[path] = true
+	if res := Dispatch(g, Request{Op: "save", Path: path, Author: agent}); res.OK {
+		t.Fatalf("an agent's save was admitted: %+v", res)
+	}
+	if h.saves != 0 {
+		t.Errorf("the refused save wrote %d time(s)", h.saves)
+	}
+	if h.disk[path] != before {
+		t.Errorf("disk = %q, want the pre-save bytes %q", h.disk[path], before)
+	}
+	if h.docs[path] != before || h.vers[path] != vers {
+		t.Errorf("buffer = %q v%d, want it untouched at %q v%d",
+			h.docs[path], h.vers[path], before, vers)
+	}
+	if !h.unsaved[path] {
+		t.Error("the refused save cleared the buffer's unsaved state")
+	}
+}
+
 // Read-before-write is per writer, not per connection or per app. Keying the
 // read set by path alone let one participant's read authorise another's blind
 // write to the same buffer, inheriting coordinates that writer never saw.
@@ -1138,6 +1407,45 @@ func TestDispatchVerbs(t *testing.T) {
 	}
 	if u := Dispatch(g, Request{Op: "frobnicate"}); u.OK || !strings.Contains(u.Err, "unknown op") {
 		t.Errorf("unknown op = %+v", u)
+	}
+}
+
+// reveal reaches the host with the byte span the request carried, and a span
+// no clamp can save is refused before the host is asked. It is the caret-move
+// sibling of goto, so the buffer-existence rule is the same.
+func TestDispatchReveal(t *testing.T) {
+	g, h := guarded(t)
+	path := filepath.Join(h.root, "a.go")
+
+	s, e := 2, 5
+	if r := Dispatch(g, Request{Op: "reveal", Path: path, Start: &s, End: &e}); !r.OK {
+		t.Fatalf("reveal = %+v", r)
+	}
+	if len(h.reveals) != 1 || h.reveals[0] != (revealCall{path: path, start: 2, end: 5}) {
+		t.Fatalf("reveals = %+v, want the resolved path and span", h.reveals)
+	}
+
+	// Both -1 is the whole file, carried as stated so the host can tell it
+	// from a one-sided default.
+	neg := -1
+	if r := Dispatch(g, Request{Op: "reveal", Path: path, Start: &neg, End: &neg}); !r.OK {
+		t.Fatalf("whole-file reveal = %+v", r)
+	}
+	if len(h.reveals) != 2 || h.reveals[1] != (revealCall{path: path, start: -1, end: -1}) {
+		t.Fatalf("whole-file reveal = %+v", h.reveals)
+	}
+
+	// A lone -1 and a reversed span are refused, and the host is not asked.
+	before := len(h.reveals)
+	if r := Dispatch(g, Request{Op: "reveal", Path: path, Start: &neg, End: &e}); r.OK {
+		t.Errorf("one-sided -1 was accepted: %+v", r)
+	}
+	s2, e2 := 5, 2
+	if r := Dispatch(g, Request{Op: "reveal", Path: path, Start: &s2, End: &e2}); r.OK {
+		t.Errorf("reversed span was accepted: %+v", r)
+	}
+	if len(h.reveals) != before {
+		t.Errorf("a refused span reached the host: %+v", h.reveals[before:])
 	}
 }
 
@@ -1420,7 +1728,19 @@ func (h *memHost) LSPFormat(path string, lineStart, lineEnd int) (LSPCaller, err
 
 func (h *memHost) Dirty() []DirtyBuffer { return h.dirty }
 
-func (h *memHost) Groups(path string) ([]Group, error) { return h.groups, nil }
+func (h *memHost) Groups(path string) ([]Group, error) {
+	if g, ok := h.groupsByPath[path]; ok {
+		return g, nil
+	}
+	return h.groups, nil
+}
+
+// Intent answers the intent verb from fixture data; the real workflow is
+// exercised in internal/intent and internal/app.
+func (h *memHost) Intent(payload string) (string, error) {
+	h.lastIntent = payload
+	return "", fmt.Errorf("intent: not implemented in the memory host")
+}
 
 // Diff mirrors Groups: a memory host has no journal to rebase, so the pending
 // diffs are fixture data rather than a walk. The real host's walk is
@@ -1449,14 +1769,18 @@ func (h *memHost) Review(path string, listOnly bool) ([]Group, error) {
 }
 
 func (h *memHost) Decide(path string, group uint64, accept bool) error {
-	for i := range h.groups {
-		if h.groups[i].ID != group {
+	groups := h.groups
+	if g, ok := h.groupsByPath[path]; ok {
+		groups = g
+	}
+	for i := range groups {
+		if groups[i].ID != group {
 			continue
 		}
 		if accept {
-			h.groups[i].State = "accepted"
+			groups[i].State = "accepted"
 		} else {
-			h.groups[i].State = "rejected"
+			groups[i].State = "rejected"
 		}
 		return nil
 	}
@@ -1685,7 +2009,7 @@ func TestDispatchGroups(t *testing.T) {
 	if !res.OK || len(res.Groups) != 1 || res.Groups[0].ID != 7 {
 		t.Fatalf("groups = %+v", res)
 	}
-	if res := Dispatch(g, Request{Op: "accept", Path: path, Group: 7}); !res.OK {
+	if res := Dispatch(g, Request{Op: "accept", Path: path, Group: 7, Author: LocalHuman}); !res.OK {
 		t.Fatalf("accept = %+v", res)
 	}
 	if h.groups[0].State != "accepted" {
@@ -3622,5 +3946,221 @@ func TestDispatchReadMultipleFailureDoesNotMarkEarlierTargets(t *testing.T) {
 	// refuse the write even though the first target read cleanly.
 	if _, _, _, err := g.Apply(a, FirstAgent, 1, []Hunk{{Start: 0, End: 0, Text: "x"}}); err == nil {
 		t.Error("apply to a target whose text never arrived was allowed")
+	}
+}
+
+// Carrying out a pending deletion is the user's action, like a save: an agent's
+// approve is refused with the removal-gate wording and the host is never asked,
+// while the local keyboard row and a durable joined human are admitted. Without
+// the human gate in Guard.ApproveDeletion the agent's approve would reach the
+// host and clear the proposal.
+func TestApproveDeletionIsTheUsersAction(t *testing.T) {
+	path := filepath.Join("/w", "a.go")
+
+	// An agent is refused, and the host is never asked to carry it out.
+	g, h := guarded(t)
+	reg := NewRegistry()
+	g.Participants = reg
+	agent, err := reg.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ProposeDeletion(path, agent); err != nil {
+		t.Fatal(err)
+	}
+	res := Dispatch(g, Request{Op: "delete", Path: path, Author: agent, Approve: true})
+	if res.OK {
+		t.Fatalf("an agent's approve was admitted: %+v", res)
+	}
+	if !strings.Contains(res.Err, "removing a file is the user's action") {
+		t.Errorf("refusal = %q, want the removal-gate wording", res.Err)
+	}
+	if len(h.approvals) != 0 {
+		t.Errorf("the refused approve reached the host: %v", h.approvals)
+	}
+	if _, ok := h.deletions[path]; !ok {
+		t.Errorf("the refused approve cleared the pending proposal")
+	}
+
+	// A provisional (undeclared) connection is an agent too.
+	g2, h2 := guarded(t)
+	reg2 := NewRegistry()
+	g2.Participants = reg2
+	id, err := reg2.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.ProposeDeletion(path, id); err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g2, Request{Op: "delete", Path: path, Author: id, Approve: true}); res.OK {
+		t.Errorf("an undeclared connection approved a removal: %+v", res)
+	}
+
+	// The file-as-loaded is not a person.
+	g3, h3 := guarded(t)
+	if err := h3.ProposeDeletion(path, AuthorOriginal); err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g3, Request{Op: "delete", Path: path, Author: AuthorOriginal, Approve: true}); res.OK {
+		t.Errorf("the file-as-loaded approved a removal: %+v", res)
+	}
+
+	// The local keyboard row is the person, and its approve reaches the host.
+	g4, h4 := guarded(t)
+	g4.Participants = NewRegistry()
+	if err := h4.ProposeDeletion(path, LocalHuman); err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g4, Request{Op: "delete", Path: path, Author: LocalHuman, Approve: true}); !res.OK {
+		t.Fatalf("the local human's approve was refused: %+v", res)
+	}
+	if len(h4.approvals) != 1 || h4.approvals[0] != path {
+		t.Errorf("local approve reached the host as %v, want [%s]", h4.approvals, path)
+	}
+	if _, ok := h4.deletions[path]; ok {
+		t.Errorf("the host carried out the removal but the pending entry survived")
+	}
+
+	// A durable joined human (an attached client) approves as its own person.
+	g5, h5 := guarded(t)
+	reg5 := NewRegistry()
+	g5.Participants = reg5
+	human, err := reg5.Join("client:desk", "desk", KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if human == LocalHuman {
+		t.Fatalf("fixture: the joined human reused the local row %d", LocalHuman)
+	}
+	if err := h5.ProposeDeletion(path, human); err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g5, Request{Op: "delete", Path: path, Author: human, Approve: true}); !res.OK {
+		t.Fatalf("a joined human's approve was refused: %+v", res)
+	}
+	if len(h5.approvals) != 1 {
+		t.Errorf("joined-human approvals = %v, want one", h5.approvals)
+	}
+}
+
+// ApproveDirRemoval is the rmdir half of the same human gate: an agent is
+// refused in the directory wording and the host is not asked, while the local
+// keyboard row is admitted.
+func TestApproveDirRemovalIsTheUsersAction(t *testing.T) {
+	dir := filepath.Join("/w", "pkg")
+
+	g, h := guarded(t)
+	reg := NewRegistry()
+	g.Participants = reg
+	agent, err := reg.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ProposeDirRemoval(dir, agent); err != nil {
+		t.Fatal(err)
+	}
+	res := Dispatch(g, Request{Op: "rmdir", Path: dir, Author: agent, Approve: true})
+	if res.OK {
+		t.Fatalf("an agent's dir approve was admitted: %+v", res)
+	}
+	if !strings.Contains(res.Err, "removing a directory is the user's action") {
+		t.Errorf("refusal = %q, want the dir removal-gate wording", res.Err)
+	}
+	if len(h.dirApprovals) != 0 {
+		t.Errorf("the refused dir approve reached the host: %v", h.dirApprovals)
+	}
+
+	g2, h2 := guarded(t)
+	g2.Participants = NewRegistry()
+	if err := h2.ProposeDirRemoval(dir, LocalHuman); err != nil {
+		t.Fatal(err)
+	}
+	if res := Dispatch(g2, Request{Op: "rmdir", Path: dir, Author: LocalHuman, Approve: true}); !res.OK {
+		t.Fatalf("the local human's dir approve was refused: %+v", res)
+	}
+	if len(h2.dirApprovals) != 1 || h2.dirApprovals[0] != dir {
+		t.Errorf("local dir approve reached the host as %v, want [%s]", h2.dirApprovals, dir)
+	}
+}
+
+// An approve for a path with no pending proposal is refused by name, so a
+// mis-spelled or already-carried-out removal cannot silently remove a file.
+func TestApproveRefusesAMissingProposal(t *testing.T) {
+	g, _ := guarded(t)
+	g.Participants = NewRegistry()
+	res := Dispatch(g, Request{Op: "delete", Path: "/w/a.go", Author: LocalHuman, Approve: true})
+	if res.OK || !strings.Contains(res.Err, "no pending deletion for") {
+		t.Fatalf("approving a not-pending deletion = %+v, want a naming refusal", res)
+	}
+	g2, _ := guarded(t)
+	g2.Participants = NewRegistry()
+	res = Dispatch(g2, Request{Op: "rmdir", Path: "/w/pkg", Author: LocalHuman, Approve: true})
+	if res.OK || !strings.Contains(res.Err, "no pending dir-removal for") {
+		t.Fatalf("approving a not-pending dir-removal = %+v, want a naming refusal", res)
+	}
+}
+
+// Approve and Withdraw name opposite answers to one removal, so the pair is
+// refused and changes nothing.
+func TestApproveAndWithdrawConflict(t *testing.T) {
+	g, h := guarded(t)
+	g.Participants = NewRegistry()
+	if err := h.ProposeDeletion("/w/a.go", LocalHuman); err != nil {
+		t.Fatal(err)
+	}
+	res := Dispatch(g, Request{Op: "delete", Path: "/w/a.go", Author: LocalHuman, Approve: true, Withdraw: true})
+	if res.OK || !strings.Contains(res.Err, "opposite answers") {
+		t.Fatalf("approve plus withdraw = %+v, want a conflict refusal", res)
+	}
+	if len(h.approvals) != 0 || len(h.deletions) != 1 {
+		t.Errorf("the conflicting request changed state: approvals=%v deletions=%v", h.approvals, h.deletions)
+	}
+
+	g2, h2 := guarded(t)
+	g2.Participants = NewRegistry()
+	if err := h2.ProposeDirRemoval("/w/pkg", LocalHuman); err != nil {
+		t.Fatal(err)
+	}
+	res = Dispatch(g2, Request{Op: "rmdir", Path: "/w/pkg", Author: LocalHuman, Approve: true, Withdraw: true})
+	if res.OK || !strings.Contains(res.Err, "opposite answers") {
+		t.Fatalf("rmdir approve plus withdraw = %+v, want a conflict refusal", res)
+	}
+}
+
+// TestDispatchIntentStampsOwnerAndGatesPublish is item 1: the intent op is
+// behind an explicit admission policy, the owner is stamped from the
+// connection on the server so a payload cannot name another writer, and
+// publish is refused for an agent while the object-writing modes pass.
+func TestDispatchIntentStampsOwnerAndGatesPublish(t *testing.T) {
+	h := newMemHost("/w", nil)
+	g := NewGuard(h)
+	g.Participants = NewRegistry()
+	agent, err := g.Participants.Join("agent-key", "agent-name", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"new","name":"i","owner":"99"}`, Author: agent})
+	if res.OK || !strings.Contains(res.Err, "not implemented") {
+		t.Fatalf("agent new = %+v, want it admitted to the host", res)
+	}
+	var cmd intent.Command
+	if err := json.Unmarshal([]byte(h.lastIntent), &cmd); err != nil {
+		t.Fatalf("host payload %q: %v", h.lastIntent, err)
+	}
+	if want := fmt.Sprintf("%d", agent); cmd.Owner != want {
+		t.Errorf("owner = %q, want the connection's own author %s (server-stamped)", cmd.Owner, want)
+	}
+
+	res = Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"publish"}`, Author: agent})
+	if res.OK || res.Err != errIntentPublishNotHuman {
+		t.Fatalf("agent publish = %+v, want %q", res, errIntentPublishNotHuman)
+	}
+	// A human reaches the host, which answers not-implemented, proving the gate
+	// let the outward mode through to the workflow.
+	res = Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"publish"}`, Author: LocalHuman})
+	if res.OK || !strings.Contains(res.Err, "not implemented") {
+		t.Fatalf("human publish = %+v, want it admitted to the host", res)
 	}
 }

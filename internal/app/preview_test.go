@@ -25,6 +25,7 @@ func explorerFile(t *testing.T, h *harness) string {
 // focus rule, or with OpenFile on arrow, focus jumps out of the tree and the
 // user cannot keep scrolling.
 func TestExplorerArrowPreviewsWithoutLeavingTheSidebar(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 
@@ -66,6 +67,7 @@ func TestExplorerArrowPreviewsWithoutLeavingTheSidebar(t *testing.T) {
 // and leaves one ordinary tab. Without the promotion the tab stays marked as a
 // preview and the next arrow could overwrite it.
 func TestExplorerEnterCommitsThePreview(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	file := explorerFile(t, h)
@@ -90,6 +92,7 @@ func TestExplorerEnterCommitsThePreview(t *testing.T) {
 // show a duplicate tab, and the next preview replaces the adopted pane and
 // drops it while keeping one tab.
 func TestPreviewFileAdoptsAHeadlessPane(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	target := filepath.Join(h.primaryRoot(), "main.go")
 	p, err := h.loadHeadless(target)
@@ -124,6 +127,7 @@ func TestPreviewFileAdoptsAHeadlessPane(t *testing.T) {
 // leave the tab bar untouched. Without the SelectedPath directory rule the app
 // would try to load a directory path.
 func TestExplorerArrowOverDirectoriesDoesNotPreview(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	for i := 0; i < 10; i++ {

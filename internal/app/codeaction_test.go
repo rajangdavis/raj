@@ -13,6 +13,7 @@ import (
 // the picker mode and the choose route the answer would decode, list nothing,
 // and no edit would ever land.
 func TestChooseCodeActionAppliesItsEdit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	path := h.Pane().File.Path
 	h.lspGen = 1
@@ -44,6 +45,7 @@ func TestChooseCodeActionAppliesItsEdit(t *testing.T) {
 // than silently return; the wire form of the command is pinned in the lsp
 // package's ExecuteCommand test.
 func TestChooseCommandCodeActionWithoutAServerIsHarmless(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerCodeAction, actions: []lsp.CodeAction{{
@@ -65,6 +67,7 @@ func TestChooseCommandCodeActionWithoutAServerIsHarmless(t *testing.T) {
 // attempt still must not change the buffer and must say why, rather than
 // reporting a success that applied nothing.
 func TestChooseResolveOnlyCodeActionWithoutAServerIsHarmless(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.Pane().File.Path = "/w/notes.txt" // no configured server: deterministic
 	h.codeActionPath = h.docPath(h.Pane())
@@ -88,6 +91,7 @@ func TestChooseResolveOnlyCodeActionWithoutAServerIsHarmless(t *testing.T) {
 // path a direct edit action uses. Without the resolve route the parked answer
 // would be treated as a fresh list and no edit would land.
 func TestResolvedCodeActionAppliesItsEdit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	path := h.Pane().File.Path
 	h.lspGen = 1
@@ -119,6 +123,7 @@ func TestResolvedCodeActionAppliesItsEdit(t *testing.T) {
 // A resolve that answers with neither an edit nor a command is refused by name,
 // not reported as success. This is the silence the refusal exists to prevent.
 func TestResolvedCodeActionWithNothingUsableRefuses(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{
@@ -142,6 +147,7 @@ func TestResolvedCodeActionWithNothingUsableRefuses(t *testing.T) {
 // is support. The gate is separate from the provider itself so a server that
 // offers actions without completing them is refused before the request.
 func TestCodeActionResolveCapabilityGate(t *testing.T) {
+	t.Parallel()
 	const want = "needs a codeAction/resolve step the server does not support; nothing was applied"
 	if got := codeActionResolveGap(lsp.ServerCapabilities{}); got != want {
 		t.Errorf("absent provider: %q", got)
@@ -158,6 +164,7 @@ func TestCodeActionResolveCapabilityGate(t *testing.T) {
 // path, so the whole action is refused: applying its text edits and ignoring
 // the create would half-change the workspace.
 func TestChooseCodeActionRefusesResourceOps(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	path := h.Pane().File.Path
 	h.lspGen = 1
@@ -188,6 +195,7 @@ func TestChooseCodeActionRefusesResourceOps(t *testing.T) {
 // rather than applied at stale offsets. The answer's pinned versions are the
 // only signal the picker path has between the request and the choice.
 func TestChooseCodeActionRefusesWhenBufferMoved(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	path := h.Pane().File.Path
 	h.lspGen = 1
@@ -219,6 +227,7 @@ func TestChooseCodeActionRefusesWhenBufferMoved(t *testing.T) {
 // An empty answer is the normal "nothing applies here", and it must say so
 // rather than open an empty picker.
 func TestEmptyCodeActionAnswerSaysSo(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerCodeAction})
@@ -234,6 +243,7 @@ func TestEmptyCodeActionAnswerSaysSo(t *testing.T) {
 // A resolve-only row is marked, so the extra round trip on choosing it is
 // visible before the user commits to it.
 func TestCodeActionLabelMarksResolve(t *testing.T) {
+	t.Parallel()
 	label := codeActionLabel(lsp.CodeAction{
 		Title: "Extract function",
 		Kind:  "refactor.extract",
@@ -250,6 +260,7 @@ func TestCodeActionLabelMarksResolve(t *testing.T) {
 // the command path is gated separately on ExecuteCommandProvider, because a
 // server can offer actions without accepting commands.
 func TestCodeActionCapabilityGates(t *testing.T) {
+	t.Parallel()
 	const wantActions = "language server does not support code actions"
 	if got := codeActionGap(lsp.ServerCapabilities{}); got != wantActions {
 		t.Errorf("absent codeActionProvider: %q", got)
@@ -274,6 +285,7 @@ func TestCodeActionCapabilityGates(t *testing.T) {
 // Without the advertisement a server that respects the capability set returns
 // only Commands, and the edit results this feature is built around never come.
 func TestClientCapabilitiesAdvertiseCodeActionLiterals(t *testing.T) {
+	t.Parallel()
 	caps := clientCapabilities()
 	td, _ := caps["textDocument"].(map[string]any)
 	if td == nil {

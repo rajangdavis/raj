@@ -35,6 +35,7 @@ func propose(t *testing.T, h *harness, hunks ...piecetable.Hunk) uint64 {
 // ctrl+super+m on a proposed change accepts it: the mark clears, the text stays,
 // and the status line says what was decided.
 func TestAcceptProposedAtCaret(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(reviewAt+1, reviewAt+1) // inside the hunk
@@ -55,6 +56,7 @@ func TestAcceptProposedAtCaret(t *testing.T) {
 // agent wrote it, the set is marked Rejected, and the status says what was
 // decided. Rejecting is a decision, not an edit.
 func TestRejectProposedAtCaret(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(reviewAt+1, reviewAt+1)
@@ -87,6 +89,7 @@ func TestRejectProposedAtCaret(t *testing.T) {
 // With the caret off every change, the chord decides everything on screen
 // and says how much that was.
 func TestReviewFallsBackToAllVisible(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture+"second line\n")
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(len(reviewFixture)+1, len(reviewFixture)+1) // line 1, off the hunk (byte 12 is the newline, which line 0 owns)
@@ -109,6 +112,7 @@ func TestReviewFallsBackToAllVisible(t *testing.T) {
 // projection as it goes and unwinding newest-first rather than walking a list
 // that a reversal can invalidate.
 func TestReviewBulkRejectDecidesEveryVisibleSet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	first := propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "UNO"})
 	second := propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "TRES"})
@@ -133,6 +137,7 @@ func TestReviewBulkRejectDecidesEveryVisibleSet(t *testing.T) {
 // A caret on the line a hunk touches decides that hunk even when it is not
 // inside the span: line covering, not byte covering.
 func TestCaretOnTheLineIsEnough(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(0, 0) // start of the same line, outside the span
@@ -146,10 +151,56 @@ func TestCaretOnTheLineIsEnough(t *testing.T) {
 	}
 }
 
+// The clear chord disposes an invalid (superseded) set reached through the
+// live set that consumed it (InvalidBy), or a restored run Annotated keeps: the
+// set carries no pending mark, so the caret finds it through one of those. A
+// disposal is a state move, not an edit, and the status names the discard.
+func TestClearInvalidAtCaret(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewFixture)
+	p := h.Pane()
+	sess := p.File.Session()
+
+	base := sess.Version()
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, base, []piecetable.Hunk{{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew}})
+	p.File.End()
+	superseded := sess.LastGroup()
+	sess.MarkGroup(superseded, piecetable.Proposed)
+
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.User, sess.Version(), []piecetable.Hunk{{Start: 6, End: 12, Text: "port"}})
+	p.File.End()
+	invalid := false
+	for _, g := range sess.Groups() {
+		if g.ID == superseded && g.Invalid && g.InvalidBy != nil {
+			invalid = true
+		}
+	}
+	if !invalid {
+		t.Fatalf("setup: set %d is not invalid with a named collider", superseded)
+	}
+	before := p.File.Text()
+
+	p.Cursors.Set(0, 0)
+	h.drain()
+	h.press("ctrl+super+k")
+	if got := sess.GroupState(superseded); got != piecetable.Rejected {
+		t.Errorf("state after clear = %v, want Rejected", got)
+	}
+	if got := p.File.Text(); got != before {
+		t.Errorf("text after clear = %q, want it unchanged by a state-only disposal", got)
+	}
+	if !strings.Contains(h.Status(), "discarded invalid change set") {
+		t.Errorf("status = %q, want the invalid disposal named", h.Status())
+	}
+}
+
 // ctrl+super+k hard-purges the rejected set at the caret: the agent text
 // leaves the document and the decision goes with it. Clearing is the one
 // gesture that really edits, which is why it routes through File.
 func TestClearRejectedAtCaret(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.Pane().Cursors.Set(reviewAt+1, reviewAt+1)
@@ -173,6 +224,7 @@ func TestClearRejectedAtCaret(t *testing.T) {
 // NextProposed steps forward through the pending sets in document order and
 // wraps from the last back to the first, reporting where it landed.
 func TestNextProposedCyclesForwardAndWraps(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
@@ -198,6 +250,7 @@ func TestNextProposedCyclesForwardAndWraps(t *testing.T) {
 
 // PrevProposed is the same walk backwards, wrapping from the first to the last.
 func TestPrevProposedCyclesBackwardAndWraps(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
@@ -224,6 +277,7 @@ func TestPrevProposedCyclesBackwardAndWraps(t *testing.T) {
 // Stepping from a caret already inside a set moves to the neighbouring set
 // rather than staying put.
 func TestNextPrevFromInsideASet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
@@ -246,6 +300,7 @@ func TestNextPrevFromInsideASet(t *testing.T) {
 // The walk follows the file, not the journal: sets written bottom-up still
 // cycle top-down, so proposal 1 is always the first one in the document.
 func TestProposalCycleFollowsDocumentOrder(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
@@ -264,6 +319,7 @@ func TestProposalCycleFollowsDocumentOrder(t *testing.T) {
 // With nothing pending the cycle has nowhere to go and says so rather than
 // silently doing nothing.
 func TestProposalCycleWithoutProposals(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 
 	h.press("ctrl+super+.")
@@ -275,6 +331,7 @@ func TestProposalCycleWithoutProposals(t *testing.T) {
 // ctrl+alt+v lists the pending change sets in the picker, and choosing one
 // lands the caret on the line the change sits on.
 func TestReviewPickerJumpsToTheChange(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 
@@ -298,6 +355,7 @@ func TestReviewPickerJumpsToTheChange(t *testing.T) {
 // The gutter carries the review mark: the writer initial in the added colour
 // on every line a proposed change touches, gone once the change is decided.
 func TestProposalGutterMarks(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.drain()
@@ -323,6 +381,7 @@ func TestProposalGutterMarks(t *testing.T) {
 // The save gesture no longer accepts pending change sets sight-unseen: with a
 // proposal in the buffer, super+s opens a review listing instead of writing.
 func TestSaveWithPendingOpensReview(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 
@@ -350,6 +409,7 @@ func TestSaveWithPendingOpensReview(t *testing.T) {
 // Answering Save in the review accepts every pending set and writes, which is
 // the deliberate version of what the old all-or-nothing save did.
 func TestSaveReviewConfirmAcceptsAllAndSaves(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 
@@ -373,6 +433,7 @@ func TestSaveReviewConfirmAcceptsAllAndSaves(t *testing.T) {
 // Escape cancels the review: no save, no accept, and the buffer is exactly
 // where the user left it.
 func TestSaveReviewCancelChangesNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 
@@ -396,6 +457,7 @@ func TestSaveReviewCancelChangesNothing(t *testing.T) {
 // Stepping through the listing moves the caret to the set under it, so the
 // review is read where each change actually sits.
 func TestSaveReviewCyclesThroughTheSets(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
@@ -417,6 +479,7 @@ func TestSaveReviewCyclesThroughTheSets(t *testing.T) {
 
 // Nothing pending: the gesture stays a plain save, with no review.
 func TestSaveWithoutPendingSkipsReview(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	h.typeText("x")
 
@@ -467,6 +530,7 @@ func proposeBelowAFold(t *testing.T, h *harness) {
 // session line is: the viewport window is rows, and the fold above the set
 // moved the row.
 func TestProposalsVisibleProjectsBelowAFold(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, foldFixtureText())
 	proposeBelowAFold(t, h)
 	p := h.Pane()
@@ -498,6 +562,7 @@ func TestProposalsVisibleProjectsBelowAFold(t *testing.T) {
 // centres the viewport on the row that draws it, so the fold above the set does
 // not scroll to the wrong place.
 func TestCycleProposedJumpsToTheProjectedRow(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, foldFixtureText())
 	proposeBelowAFold(t, h)
 	p := h.Pane()
@@ -527,6 +592,7 @@ func TestCycleProposedJumpsToTheProjectedRow(t *testing.T) {
 // A proposal a fold hides has no row to land on, so the review walk skips it
 // rather than clamping onto the fold row it would otherwise share.
 func TestProposalInAFoldIsSkipped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "P\nQ\n"})
 	p := h.Pane()
@@ -555,6 +621,7 @@ func TestProposalInAFoldIsSkipped(t *testing.T) {
 // line on its own display row, so every conversion the review maps make is the
 // raw session coordinate and the review behaves as it did before folds existed.
 func TestReviewMapsAreIdentityWithoutDecisions(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	// Replace the whole line. The shared reviewAt/reviewOld hunk cuts "world"
 	// out of the middle of the line, and the projection then lays the before
@@ -602,6 +669,7 @@ func twoSets(t *testing.T, h *harness) (first, second uint64) {
 // one press per decision, and the status keeps both the decision and the
 // position. Without the advance the caret stays on the decided set.
 func TestAcceptProposedAdvancesToNext(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaa\nbbb\nccc\n")
 	first, second := twoSets(t, h)
 	p := h.Pane()
@@ -626,6 +694,7 @@ func TestAcceptProposedAdvancesToNext(t *testing.T) {
 // in view for a clear or a re-read. Without the accept-only rule the reject
 // would jump to the next set.
 func TestRejectProposedStaysPut(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaa\nbbb\nccc\n")
 	first, _ := twoSets(t, h)
 	p := h.Pane()
@@ -646,6 +715,7 @@ func TestRejectProposedStaysPut(t *testing.T) {
 // Deciding the last set wraps to the first, matching cycleProposed. Without
 // the advance the caret stays on the now-decided last set.
 func TestDecisionOnLastSetWraps(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaa\nbbb\nccc\n")
 	first, second := twoSets(t, h)
 	p := h.Pane()
@@ -669,6 +739,7 @@ func TestDecisionOnLastSetWraps(t *testing.T) {
 // With no set left to land on the caret stays put and the confirmation stands
 // alone: the ends wrap only when there is somewhere to wrap to.
 func TestDecisionOnOnlySetStops(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	p := h.Pane()

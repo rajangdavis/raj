@@ -51,6 +51,19 @@ type Conn struct {
 	nextID  int
 	pending map[int]chan *Message
 	closed  bool
+
+	// closeOnce makes Close idempotent. Two callers race there in real life: a
+	// failing handshake closes the connection, and quitting closes it again
+	// through Stop, and both paths reach the process reaper. Without the guard
+	// stop runs twice and cmd.Wait is called concurrently — a data race, and
+	// an unreaped process.
+	closeOnce sync.Once
+
+	// ShutdownGrace bounds how long Close waits for a reply to its shutdown
+	// request before it stops the server anyway. Zero means the default. A
+	// test sets it small, because a stub that answers initialize but not
+	// shutdown would otherwise pay the polite wait in full on every teardown.
+	ShutdownGrace time.Duration
 	// serverRequests holds requests the server originated. They are answered
 	// with a method-not-found error rather than ignored, because a server that
 	// waits forever for a reply it will never get is a server that stops
@@ -391,7 +404,16 @@ func (c *Conn) fail(err error) {
 // running after it quits is a bug people notice in their process list, not in
 // the editor.
 func (c *Conn) Close() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	c.closeOnce.Do(c.close)
+}
+
+// close is Close's body, run exactly once by closeOnce.
+func (c *Conn) close() {
+	grace := c.ShutdownGrace
+	if grace <= 0 {
+		grace = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	_ = c.Call(ctx, "shutdown", nil, nil)
 	_ = c.Notify("exit", nil)

@@ -22,6 +22,7 @@ func diag(line, sev int, msg string) lsp.Diagnostic {
 // A publish is the complete set for a document, so the newest replaces the
 // previous one whole. Merging would accumulate problems already fixed.
 func TestPublishReplacesRatherThanMerges(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	d.set("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "first"), diag(2, sevError, "second")})
 	d.set("/w/a.go", []lsp.Diagnostic{diag(5, sevError, "third")})
@@ -35,6 +36,7 @@ func TestPublishReplacesRatherThanMerges(t *testing.T) {
 // An empty publish is how a server says the problems are fixed. Ignoring it
 // would leave them on screen forever.
 func TestEmptyPublishClears(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	d.set("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "broken")})
 	d.set("/w/a.go", nil)
@@ -52,6 +54,7 @@ func TestEmptyPublishClears(t *testing.T) {
 // server has answered about: both return nothing, and the two must not read
 // the same to a caller checking for a clean file.
 func TestPublishMarksPathPublished(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	if d.published("/w/never.go") {
 		t.Error("an untouched path reported as published")
@@ -80,6 +83,7 @@ func TestPublishMarksPathPublished(t *testing.T) {
 // only real constructor for — must still answer published without panicking,
 // and must record a publish into a set that was never initialised.
 func TestPublishedOnHandBuiltStore(t *testing.T) {
+	t.Parallel()
 	d := &diagnostics{byPath: map[string][]lsp.Diagnostic{}}
 	if d.published("/w/a.go") {
 		t.Error("a hand-built store claimed a publish it never saw")
@@ -93,6 +97,7 @@ func TestPublishedOnHandBuiltStore(t *testing.T) {
 // A line with both a warning and an error is an error line. Showing the
 // warning because it was published first would under-report it.
 func TestMostSevereWins(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	d.set("/w/a.go", []lsp.Diagnostic{
 		diag(3, sevWarning, "warn"),
@@ -111,6 +116,7 @@ func TestMostSevereWins(t *testing.T) {
 // A missing severity is treated as an error: the protocol leaves it to the
 // client, and under-reporting a real problem is the worse mistake.
 func TestMissingSeverityIsAnError(t *testing.T) {
+	t.Parallel()
 	if severityRank(0) != severityRank(sevError) {
 		t.Error("an unspecified severity should rank as an error")
 	}
@@ -124,6 +130,7 @@ func TestMissingSeverityIsAnError(t *testing.T) {
 // Diagnostics are stored in file order so the list reads like the file, and a
 // warning early does not sort above an error late.
 func TestStoredInFileOrder(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	d.set("/w/a.go", []lsp.Diagnostic{
 		diag(200, sevError, "late error"),
@@ -141,6 +148,7 @@ func TestStoredInFileOrder(t *testing.T) {
 
 // Files are independent: a publish for one must not disturb another.
 func TestFilesAreIndependent(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	d.set("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "a")})
 	d.set("/w/b.go", []lsp.Diagnostic{diag(1, sevError, "b")})
@@ -152,6 +160,7 @@ func TestFilesAreIndependent(t *testing.T) {
 }
 
 func TestSummary(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	cases := []struct {
 		items []lsp.Diagnostic
@@ -175,6 +184,7 @@ func TestSummary(t *testing.T) {
 // a multi-line message from a type checker is common, and truncating at the
 // newline hides the part that says what to do about it.
 func TestStatusShowsTheDiagnosticUnderTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	path := h.docPath(h.Pane())
 	h.diags.set(path, []lsp.Diagnostic{
@@ -206,6 +216,7 @@ func TestStatusShowsTheDiagnosticUnderTheCursor(t *testing.T) {
 // A file with no diagnostics, and a pane with no path, report nothing rather
 // than panicking.
 func TestDiagnosticsDegenerateInputs(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	d.set("", nil)
 	d.clear("/w/never.go")
@@ -221,6 +232,7 @@ func TestDiagnosticsDegenerateInputs(t *testing.T) {
 
 // Draining is safe with no servers running, which is most of the time.
 func TestDrainWithNoServers(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "text\n")
 	h.drainDiagnostics()
 	h.drainDiagnostics()
@@ -232,6 +244,7 @@ func TestDrainWithNoServers(t *testing.T) {
 // replaces the remembered one rather than leaving the older version to look
 // current, and clear drops both together.
 func TestPublishVersionRoundTrips(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	v := 7
 	d.setVersion("/w/a.go", []lsp.Diagnostic{diag(1, sevError, "broken")}, &v)
@@ -259,6 +272,7 @@ func TestPublishVersionRoundTrips(t *testing.T) {
 // clean file whose version was dropped would compare as fresh forever, which is
 // the one reading a per-hunk compile gate must never accept by accident.
 func TestEmptyPublishRecordsItsVersion(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	v := 3
 	d.setVersion("/w/a.go", nil, &v)
@@ -273,9 +287,12 @@ func TestEmptyPublishRecordsItsVersion(t *testing.T) {
 
 // The freshness rule is the fix, so every branch is pinned without a server:
 // an unpublished path, a server that has not been told about the current text,
-// a publish that predates it, a fresh one, and a fresh one whose server sent no
-// version at all.
+// a publish that predates it, a fresh one, a fresh one whose server sent no
+// version at all, a fresh one that carries gopls's "no package" notice, and a
+// fresh one with ordinary diagnostics. The path is fixed because it only ever
+// names the file in the unassociated detail.
 func TestDiagnosticsStatus(t *testing.T) {
+	t.Parallel()
 	version := func(v int) *int { return &v }
 	cases := []struct {
 		name       string
@@ -283,17 +300,30 @@ func TestDiagnosticsStatus(t *testing.T) {
 		pubVersion *int
 		synced     int
 		buf        int
+		items      []lsp.Diagnostic
 		want       string
 	}{
-		{"unpublished", false, nil, 5, 5, control.LSPStatusUnpublished},
-		{"unsynced", true, version(5), 3, 5, control.LSPStatusStale},
-		{"version mismatch", true, version(4), 5, 5, control.LSPStatusStale},
-		{"fresh", true, version(5), 5, 5, control.LSPStatusOK},
-		{"no version fresh", true, nil, 5, 5, control.LSPStatusOK},
+		{"unpublished", false, nil, 5, 5, nil, control.LSPStatusUnpublished},
+		{"unsynced", true, version(5), 3, 5, nil, control.LSPStatusStale},
+		{"version mismatch", true, version(4), 5, 5, nil, control.LSPStatusStale},
+		{"fresh", true, version(5), 5, 5, nil, control.LSPStatusOK},
+		{"no version fresh", true, nil, 5, 5, nil, control.LSPStatusOK},
+		{
+			"unassociated package",
+			true, version(5), 5, 5,
+			[]lsp.Diagnostic{diag(2, sevWarning, goplsNoPackagePrefix+"/w/a.go")},
+			control.LSPStatusUnassociated,
+		},
+		{
+			"ordinary diagnostics stay ok",
+			true, version(5), 5, 5,
+			[]lsp.Diagnostic{diag(1, sevError, "undefined: foo")},
+			control.LSPStatusOK,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, detail := diagnosticsStatus(c.published, c.pubVersion, c.synced, c.buf)
+			got, detail := diagnosticsStatus("/w/a.go", c.published, c.pubVersion, c.synced, c.buf, c.items)
 			if got != c.want {
 				t.Errorf("status = %q, want %q", got, c.want)
 			}
@@ -310,9 +340,80 @@ func TestDiagnosticsStatus(t *testing.T) {
 	}
 }
 
+// A fresh publish whose list carries gopls's "no package for this open file"
+// notice is not a reading of the text: the server answered, but it never
+// associated the document with a package, so the status must be unassociated
+// rather than ok. Precondition: the publish is fresh — published, and its
+// version equals the synced and buffer versions — so the version rules pass
+// and only the item check can refuse it. Without the change this returns ok,
+// and a status-only sweep counts the file as clean.
+func TestDiagnosticsUnassociatedPackageIsNotAReading(t *testing.T) {
+	t.Parallel()
+	d := newDiagnostics()
+	const path = "/w/unassociated.go"
+	v := 5
+	notice := goplsNoPackagePrefix + path
+	d.setVersion(path, []lsp.Diagnostic{diag(2, sevWarning, notice)}, &v)
+
+	status, detail, items := d.reading(path, 5)
+	if status != control.LSPStatusUnassociated {
+		t.Fatalf("status = %q, want %q (detail %q)", status, control.LSPStatusUnassociated, detail)
+	}
+	if !strings.Contains(detail, path) {
+		t.Errorf("detail %q does not name the file", detail)
+	}
+	if len(items) != 1 || items[0].Message != notice {
+		t.Errorf("items = %v, want the published diagnostic kept in the list", items)
+	}
+
+	// The request path's own judgement must agree with the wait path's.
+	if status, _ := d.status(path, 5, 5); status != control.LSPStatusUnassociated {
+		t.Errorf("status = %q, want %q", status, control.LSPStatusUnassociated)
+	}
+}
+
+// Precedence: stale wins over unassociated. A versionless publish that
+// predates the sync is stale, not unassociated, even when its list carries the
+// "no package" notice. Precondition: the publish carries no version and the
+// store's publish sequence is at or before the sync sequence, so the sequence
+// rule fires. Without running that rule before the item check, an
+// implementation that inspected items first would report unassociated here.
+func TestDiagnosticsStaleVersionlessUnassociatedStaysStale(t *testing.T) {
+	t.Parallel()
+	d := newDiagnostics()
+	const path = "/w/stale.go"
+	d.setVersion(path, []lsp.Diagnostic{diag(2, sevWarning, goplsNoPackagePrefix+path)}, nil)
+	d.noteSynced(path)
+
+	if status, detail := d.status(path, 2, 2); status != control.LSPStatusStale {
+		t.Fatalf("status = %q (%s), want %q", status, detail, control.LSPStatusStale)
+	}
+}
+
+// The unassociated signal is gopls's message, matched by a narrow prefix so a
+// message-shape change fails safe. Precondition: none of the near-miss lists —
+// empty, an ordinary diagnostic, or the phrase not at the start — is the
+// notice, and only the leading-prefix message is.
+func TestNoPackageDiagnosticMatchesNarrowly(t *testing.T) {
+	t.Parallel()
+	if hasNoPackageDiagnostic(nil) {
+		t.Error("an empty list reported the no-package notice")
+	}
+	if hasNoPackageDiagnostic([]lsp.Diagnostic{diag(1, sevError, "undefined: foo")}) {
+		t.Error("an ordinary diagnostic reported the no-package notice")
+	}
+	if hasNoPackageDiagnostic([]lsp.Diagnostic{diag(1, sevInfo, "see No packages found for open file x")}) {
+		t.Error("the phrase mid-message reported the no-package notice")
+	}
+	if !hasNoPackageDiagnostic([]lsp.Diagnostic{diag(2, sevWarning, goplsNoPackagePrefix+"/w/a.go")}) {
+		t.Error("the gopls notice was not recognised")
+	}
+}
+
 // A caller waiting for a publish is released by the next setVersion for its
 // path, and the channel is cleared so a later publish has nobody to notify.
 func TestWaitForWakesOnPublish(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	got := make(chan bool, 1)
 	go func() {
@@ -352,6 +453,7 @@ func TestWaitForWakesOnPublish(t *testing.T) {
 // A wait with no publish gives up when its context is done, and does not leave
 // the dead waiter registered for a later publish to close.
 func TestWaitForGivesUpOnCancelledContext(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -372,6 +474,7 @@ func TestWaitForGivesUpOnCancelledContext(t *testing.T) {
 // becoming the reading a matching-version publish carries; a publish for any
 // other version stays stale.
 func TestReadingRecomputesAfterPublish(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	if status, _, _ := d.reading("/w/a.go", 5); status != control.LSPStatusUnpublished {
 		t.Fatalf("status before a publish = %q, want %q", status, control.LSPStatusUnpublished)
@@ -403,6 +506,7 @@ func TestReadingRecomputesAfterPublish(t *testing.T) {
 // the one exercised; a publish that beats the wait is taken by the pre-wait
 // read and still returns ok.
 func TestDiagnosticsRunReturnsThePublishedReading(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	c := lspCaller{
 		mode: "diagnostics", status: control.LSPStatusUnpublished,
@@ -440,6 +544,7 @@ func TestDiagnosticsRunReturnsThePublishedReading(t *testing.T) {
 // Modelled on TestDiagnosticsRunReturnsThePublishedReading — same caller, same
 // bounded wait — with the on-disk publish inserted before the sync.
 func TestDiagnosticsRejectsAPreSyncVersionlessPublish(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	const path = "/w/broken.go"
 
@@ -488,6 +593,7 @@ func TestDiagnosticsRejectsAPreSyncVersionlessPublish(t *testing.T) {
 // gopls publishes with no version for a file at version 0, which is exactly the
 // unedited buffer.
 func TestDiagnosticsReadsAPostSyncVersionlessPublishAsClean(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	const path = "/w/clean.go"
 	d.noteSynced(path)
@@ -501,6 +607,7 @@ func TestDiagnosticsReadsAPostSyncVersionlessPublishAsClean(t *testing.T) {
 // With no publish after the sync, the answer is honest rather than clean: the
 // caller's bounded wait gives up and reports the non-ok status, not an empty ok.
 func TestDiagnosticsWithoutAPostSyncPublishStaysStale(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	const path = "/w/quiet.go"
 	d.setVersion(path, nil, nil) // the on-disk clean set, before the sync
@@ -534,6 +641,7 @@ func TestDiagnosticsWithoutAPostSyncPublishStaysStale(t *testing.T) {
 // is the post-sync half of the on-disk race, where the sequence rule alone
 // would accept the publish because it landed after the sync.
 func TestDiagnosticsRejectsAPostSyncVersionlessPublishForAnEditedBuffer(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	const path = "/w/edited.go"
 	d.noteSynced(path)
@@ -549,6 +657,7 @@ func TestDiagnosticsRejectsAPostSyncVersionlessPublishForAnEditedBuffer(t *testi
 // cannot be what rejects the publish: an on-disk set that predates the sync is
 // stale even at version 0.
 func TestDiagnosticsRejectsAVersionlessPublishThatPredatesTheSync(t *testing.T) {
+	t.Parallel()
 	d := newDiagnostics()
 	const path = "/w/unchanged.go"
 	d.setVersion(path, nil, nil) // the on-disk clean set, before the sync

@@ -70,6 +70,7 @@ func newHarnessSize(t *testing.T, content string, cols, rows int) *harness {
 // it was given and primaryRoot hands it back, so every reader that moved to
 // primaryRoot sees what the old root field held.
 func TestPrimaryRootIsTheConstructorRoot(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	host := ui.NewFakeHost(80, 24)
 	defer host.Close()
@@ -125,6 +126,7 @@ func newPhoneHarnessSize(t *testing.T, content string, cols, rows int) *harness 
 // partner for it, so it never enters main's flag.Visit override logic and a
 // stored setting cannot turn it on.
 func TestPhoneProfilePlumbing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "x\n")
 	if h.App.phone || h.App.Tabs.Phone() || h.App.ctrlAliases {
 		t.Fatal("the default profile must not be phone and must not alias")
@@ -171,6 +173,7 @@ func TestPhoneProfilePlumbing(t *testing.T) {
 // ProfileFlags main uses and then builds the app, so a rule that only lived in
 // the pure function would still fail here.
 func TestPhoneAliasProfileMatrix(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name               string
 		phone, ctrl, cSet  bool
@@ -256,6 +259,7 @@ func (h *harness) typeText(s string) {
 func (h *harness) text() string { return h.Pane().File.Text() }
 
 func TestTypingInsertsText(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.typeText("hello")
 	if got := h.text(); got != "hello" {
@@ -267,6 +271,7 @@ func TestTypingInsertsText(t *testing.T) {
 }
 
 func TestCursorMovementAndEditing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc")
 	h.press("super+right") // line end
 	h.typeText("d")
@@ -282,6 +287,7 @@ func TestCursorMovementAndEditing(t *testing.T) {
 // The whole chain has to hold for a chord: Ghostty's byte sequence, the
 // decoder, the keymap, and the pane.
 func TestSelectAllAndReplace(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "throw this away")
 	h.press("super+a")
 	h.typeText("new")
@@ -291,6 +297,7 @@ func TestSelectAllAndReplace(t *testing.T) {
 }
 
 func TestUndoRedoThroughKeybindings(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base")
 	h.typeText("XY")
 	if got := h.text(); got != "XYbase" {
@@ -308,6 +315,7 @@ func TestUndoRedoThroughKeybindings(t *testing.T) {
 }
 
 func TestSaveWritesFile(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "content")
 	if !h.Pane().File.Dirty() {
 		// a freshly opened file is clean
@@ -335,6 +343,7 @@ func TestSaveWritesFile(t *testing.T) {
 // guard that the check stays silent when it has nothing to say. Modelled on
 // TestMixedEndingsWarn and TestSaveWritesFile.
 func TestOpenSurfacesMixedEndingWarning(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\r\nb\nc\r\n")
 	if got := h.Status(); !strings.Contains(got, "mixed line endings") {
 		t.Errorf("mixed-ending status = %q, want the encoding warning", got)
@@ -351,6 +360,7 @@ func TestOpenSurfacesMixedEndingWarning(t *testing.T) {
 // TestIndentWarning pins only the string; this pins the app wiring that was
 // dead before the wave. Modelled on TestOpenSurfacesMixedEndingWarning.
 func TestOpenSurfacesIndentAndEncodingWarnings(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "content")
 	path := filepath.Join(h.primaryRoot(), "Makefile")
 	if err := os.WriteFile(path, []byte(".PHONY: b\r\nbuild:\r\n  go build\n"), 0o644); err != nil {
@@ -372,6 +382,7 @@ func TestOpenSurfacesIndentAndEncodingWarnings(t *testing.T) {
 // mixed-ending file an agent revealed stayed silent. Modelled on
 // TestOpenSurfacesMixedEndingWarning, the open path this one must match.
 func TestAnnounceSurfacesFileWarning(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base\n")
 	path := filepath.Join(h.primaryRoot(), "mixed.txt")
 	if err := os.WriteFile(path, []byte("a\r\nb\nc\r\n"), 0o644); err != nil {
@@ -393,6 +404,7 @@ func TestAnnounceSurfacesFileWarning(t *testing.T) {
 // Vertical movement must remember the column it wanted, or arrowing down
 // through a short line and back up lands somewhere else.
 func TestGoalColumnSurvivesShortLines(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaaaaaaaaa\nbb\ncccccccccc")
 	h.press("super+right") // end of line 1, column 10
 	h.press("down", "down")
@@ -403,6 +415,7 @@ func TestGoalColumnSurvivesShortLines(t *testing.T) {
 }
 
 func TestMultiCursorTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree")
 	h.press("alt+super+down") // add a cursor on line 2
 	if n := h.Pane().Cursors.Count(); n != 2 {
@@ -415,6 +428,7 @@ func TestMultiCursorTyping(t *testing.T) {
 }
 
 func TestEscapeCollapsesCursors(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc")
 	h.press("alt+super+down", "alt+super+down")
 	if h.Pane().Cursors.Count() < 2 {
@@ -427,6 +441,7 @@ func TestEscapeCollapsesCursors(t *testing.T) {
 }
 
 func TestIndentAndOutdent(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "line")
 	h.press("tab")
 	// The harness file is test.go, and Go indents with tabs.
@@ -440,6 +455,7 @@ func TestIndentAndOutdent(t *testing.T) {
 }
 
 func TestPasteIsOneEdit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	before := h.Pane().File.Pieces()
 	h.Handle(ui.Paste{Text: strings.Repeat("pasted line\n", 100)})
@@ -454,6 +470,7 @@ func TestPasteIsOneEdit(t *testing.T) {
 
 // The status line reports the file, dirty state, and cursor position.
 func TestStatusLine(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc")
 	h.typeText("x")
 	frame := h.host.Text()
@@ -468,6 +485,7 @@ func TestStatusLine(t *testing.T) {
 
 // Rendering must not depend on document size: only visible lines are drawn.
 func TestRendersOnlyVisibleLines(t *testing.T) {
+	t.Parallel()
 	h := newHarnessSize(t, strings.Repeat("a line of text\n", 10000), 120, 12)
 	h.drain()
 	frame := h.host.Text()
@@ -481,6 +499,7 @@ func TestRendersOnlyVisibleLines(t *testing.T) {
 
 // Scrolling follows the cursor to the end of a long document.
 func TestScrollFollowsCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, strings.Repeat("x\n", 500))
 	h.press("super+down") // document end
 	if top := h.Pane().Viewport.Top; top < 400 {
@@ -495,6 +514,7 @@ func widgetTheme() widget.Theme { return widget.DefaultTheme() }
 // way out is the fastest way to make an editor feel broken. Asserted through
 // the real key path, since the failure was never in Cursors.Clear.
 func TestEscapeCollapsesMultiCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaa\nbbb\nccc\n")
 	h.press("alt+super+down", "alt+super+down")
 	if got := h.Pane().Cursors.Count(); got != 3 {
@@ -523,6 +543,7 @@ func (h *harness) handleKeyAction(a keys.Action) {
 // A headless buffer is cached, so the next lookup has to notice when the file
 // moved on disk rather than serving the snapshot it was first loaded from.
 func TestHeadlessReloadsWhenDiskChanges(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -565,6 +586,7 @@ func TestHeadlessReloadsWhenDiskChanges(t *testing.T) {
 // An unchanged file is not reloaded: the lookup reuses the cached pane and
 // document after one stat.
 func TestHeadlessUnchangedFileIsReused(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -595,6 +617,7 @@ func TestHeadlessUnchangedFileIsReused(t *testing.T) {
 
 // A failed stat or read keeps the cached copy rather than dropping the buffer.
 func TestHeadlessStatErrorKeepsCache(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -628,6 +651,7 @@ func TestHeadlessStatErrorKeepsCache(t *testing.T) {
 // A file created outside raj appears in the explorer once the idle scan runs,
 // with no raj action to trigger a refresh.
 func TestSyncFileTreePicksUpANewFile(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	added := filepath.Join(h.primaryRoot(), "added.go")
 	if err := os.WriteFile(added, []byte("package main\n"), 0o644); err != nil {
@@ -645,6 +669,7 @@ func TestSyncFileTreePicksUpANewFile(t *testing.T) {
 // Save-as lists what is already in the directory being typed into, so a name is
 // visible before enough of it has been typed to complete.
 func TestSaveAsListsDirectoryEntries(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	saveAsPrompt(t, h)
 
@@ -659,6 +684,7 @@ func TestSaveAsListsDirectoryEntries(t *testing.T) {
 // An arrow steps into the listing and enter takes the highlighted entry, so a
 // listed file resolves to its full path rather than the typed prefix.
 func TestSaveAsChoosingAListedFileUsesItsPath(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	saveAsPrompt(t, h)
 	h.typeText("README")
@@ -677,6 +703,7 @@ func TestSaveAsChoosingAListedFileUsesItsPath(t *testing.T) {
 // anchor on the display row rather than the session line, or the list sits a
 // row away from the word it completes.
 func TestCompletionAnchorsBelowAFold(t *testing.T) {
+	t.Parallel()
 	// The candidate "foobar" is what "foo" completes to: the word being typed
 	// is not offered as its own completion, so a buffer of "foo" alone would
 	// show an empty list and the anchor could not be observed.
@@ -713,6 +740,7 @@ func TestCompletionAnchorsBelowAFold(t *testing.T) {
 // the word the popup completes. Reading the session bytes would fold the hidden
 // "REJ" into the prefix and find nothing for the visible "bar".
 func TestCompletionPrefixIsTheRowTextBelowAMidLineFold(t *testing.T) {
+	t.Parallel()
 	// "barbaz" is what the on-screen "bar" completes to; the rejected "REJ"
 	// sits between "foo" and "bar" in the session and is folded away.
 	h := newHarness(t, "foobar\nbarbaz\n")
@@ -753,6 +781,7 @@ func TestCompletionPrefixIsTheRowTextBelowAMidLineFold(t *testing.T) {
 // A fold above the target shifts a jump too: the viewport must centre on the
 // display row, not the session line the target came in as.
 func TestJumpCentresOnTheDisplayRowBelowAFold(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, strings.Repeat("xxxxxxxx\n", 20))
 	p := h.Pane()
 	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
@@ -787,6 +816,7 @@ func TestJumpCentresOnTheDisplayRowBelowAFold(t *testing.T) {
 // A line a fold hides has no row to land on: the jump is skipped rather than
 // clamped onto the fold marker.
 func TestJumpSkipsALineInsideAFold(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha\nbravo\ncharlie\n")
 	p := h.Pane()
 	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
@@ -815,6 +845,7 @@ func TestJumpSkipsALineInsideAFold(t *testing.T) {
 // all funnel through. A fold-hidden target is skipped, and a visible one
 // centres on its display row while the caret stays on the session line.
 func TestOneJumpPathSkipsHiddenAndCentresVisible(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, strings.Repeat("xxxxxxxx\n", 20))
 	p := h.Pane()
 	id := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "HIDDEN-1\nHIDDEN-2\n"})
@@ -862,6 +893,7 @@ func TestOneJumpPathSkipsHiddenAndCentresVisible(t *testing.T) {
 // With no decisions the projection is the identity, so a jump and a completion
 // anchor land exactly where they did before the display map existed.
 func TestJumpAndCompletionAreIdentityWithoutDecisions(t *testing.T) {
+	t.Parallel()
 	// "foobar" gives the typed "foo" a completion; the word itself is not
 	// offered as its own candidate.
 	h := newHarness(t, "foobar alpha\nbravo\ncharlie\ndelta foo\n")
@@ -903,6 +935,7 @@ func TestJumpAndCompletionAreIdentityWithoutDecisions(t *testing.T) {
 // editor reports it unhandled; before the action was in Unbound this test had
 // nothing to walk, which is why listing and handling are checked together.
 func TestEveryUnboundActionIsHandled(t *testing.T) {
+	t.Parallel()
 	skip := map[keys.Action]bool{
 		keys.Quit:    true, // ends the session
 		keys.Suspend: true, // stops the process
@@ -926,6 +959,7 @@ func TestEveryUnboundActionIsHandled(t *testing.T) {
 // Without the label guard the row is "copy relative path  ", with the trailing
 // separator of the empty chord column, and this fails.
 func TestPaletteRendersChordlessCommandByName(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.press("shift+super+p")
 	h.typeText("copy relative path")
@@ -940,6 +974,7 @@ func TestPaletteRendersChordlessCommandByName(t *testing.T) {
 // Without the dispatch case the clipboard stays empty and the status is
 // "unhandled:", so both assertions fail.
 func TestCopyRelativePathCopiesRelativeSpelling(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.handleKeyAction(keys.CopyRelPath)
 	if got, want := h.host.Clipboard(), "test.go"; got != want {
@@ -957,6 +992,7 @@ func TestCopyRelativePathCopiesRelativeSpelling(t *testing.T) {
 // so the status assertion fails; the clipboard assertion holds either way and is
 // here to pin that nothing is written.
 func TestCopyRelativePathRefusesUnnamedBuffer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.Pane().File.Path = ""
 	h.handleKeyAction(keys.CopyRelPath)
@@ -975,6 +1011,7 @@ func TestCopyRelativePathRefusesUnnamedBuffer(t *testing.T) {
 // Without the dispatch case the clipboard stays empty, so the clipboard
 // assertion fails.
 func TestCopyRelativePathFallsBackOutsideTheRoot(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	outside := filepath.Join(t.TempDir(), "elsewhere.go")
 	h.Pane().File.Path = outside
@@ -993,6 +1030,7 @@ func TestCopyRelativePathFallsBackOutsideTheRoot(t *testing.T) {
 // a daemon had no host to construct; without the host wake the request would
 // time out pumping only ticks.
 func TestHeadlessHostServesControl(t *testing.T) {
+	t.Parallel()
 	h := ui.NewHeadlessHost()
 	t.Cleanup(func() { h.Close() })
 	dir := t.TempDir()
@@ -1053,9 +1091,15 @@ func TestHeadlessHostServesControl(t *testing.T) {
 // headless host there is nothing to close; without Run deferred save the
 // session would be lost on shutdown.
 func TestHeadlessShutdownSavesSession(t *testing.T) {
+	t.Parallel()
 	h := ui.NewHeadlessHost()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "a.go")
+	// A .txt buffer, not .go: no language server is configured for plain text
+	// (internal/app/lsp.go's command map has no text entry, and
+	// lsp.LanguageID(".txt") returns ""), so no idle tick can start one for
+	// this path however long the test runs. The determinism comes from the
+	// file type, not from closing the host before the first tick.
+	path := filepath.Join(dir, "a.txt")
 	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1065,8 +1109,7 @@ func TestHeadlessShutdownSavesSession(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() { done <- a.Run() }()
-	// Close at once: the graceful path, before any idle tick can start a
-	// language server. The ticker first tick is 150 ms away.
+	// Close at once: the graceful path on the closed event stream.
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1075,10 +1118,349 @@ func TestHeadlessShutdownSavesSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run = %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(15 * time.Second):
+		// A hang detector, not a latency assertion: the assertion is that Run
+		// returns after the host is closed, not that it returns within a
+		// second.
 		t.Fatal("Run did not return after the host closed")
 	}
 	if st := storedSession(t, a); len(st.Tabs) != 1 || st.Tabs[0].Path != path {
 		t.Errorf("session = %+v, want the open file saved on the graceful path", st.Tabs)
+	}
+}
+
+// proposeAs marks hunks as proposed under author, so a test can hold a change
+// set the user authored rather than an agent's.
+func proposeAs(t *testing.T, h *harness, author piecetable.Author, hunks ...piecetable.Hunk) uint64 {
+	t.Helper()
+	p := h.Pane()
+	p.File.Begin()
+	p.File.ApplyDiff(author, p.File.Session().Version(), hunks)
+	p.File.End()
+	id := p.File.Session().LastGroup()
+	p.File.ProposeGroup(id)
+	return id
+}
+
+// agentWorking names an agent, marks it working, and lands one proposed change
+// set, so the activity indicator and the save confirm have both a live agent
+// and an other-author pending set to read.
+func agentWorking(t *testing.T, h *harness, name string) {
+	t.Helper()
+	c := h.dial(t)
+	if hi := c.do(h, control.Request{Op: "hello", Identity: name, Name: name,
+		Kind: string(control.KindAgent)}); !hi.OK {
+		t.Fatalf("hello as %s: %+v", name, hi)
+	}
+	if r := c.do(h, control.Request{Op: "state", State: control.StateWorking}); !r.OK {
+		t.Fatalf("state working: %+v", r)
+	}
+	base := c.do(h, control.Request{Op: "text"}).Version
+	if r := c.do(h, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "// proposed\n"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+}
+
+// The desktop status segment names a working agent and the pending count, and
+// is omitted when neither is present.
+func TestActivitySegmentNamesWorkingAgentAndPending(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	agentWorking(t, h, "deepseek")
+
+	h.Handle(ui.Tick{})
+
+	if got := h.activitySegment(); got != "● deepseek working · pending 1" {
+		t.Errorf("activitySegment = %q, want the working agent and the pending set", got)
+	}
+}
+
+func TestActivitySegmentHidesWhenIdleAndEmpty(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	h.Handle(ui.Tick{})
+	if got := h.activitySegment(); got != "" {
+		t.Errorf("activitySegment = %q, want empty with no agent and nothing pending", got)
+	}
+	if got := h.phoneActivityText(); got != "" {
+		t.Errorf("phoneActivityText = %q, want empty with no agent and nothing pending", got)
+	}
+}
+
+// A save that would silently approve another writer's pending sets warns
+// first; the confirm's default answer is Save anyway and it proceeds.
+func TestSaveConfirmFiresForOtherAuthorPending(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	h.press("super+s")
+
+	if !h.Prompt.Open {
+		t.Fatal("super+s with an agent's pending set did not open the save confirm")
+	}
+	text := h.host.Text()
+	if !strings.Contains(text, "1 pending from author 2 — saving approves them.") {
+		t.Errorf("confirm = %q, want the author and count named", text)
+	}
+	if !strings.Contains(text, "Save anyway") || !strings.Contains(text, "Review") {
+		t.Errorf("confirm = %q, want Save anyway and Review", text)
+	}
+	data, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != reviewFixture {
+		t.Errorf("on disk = %q before the confirm was answered", string(data))
+	}
+}
+
+func TestSaveConfirmSaveAnywaySaves(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	h.press("super+s", "enter") // enter takes the default, Save anyway
+
+	if h.Prompt.Open {
+		t.Error("the confirm stayed open after it was answered")
+	}
+	if got := len(h.Pane().File.Session().Pending()); got != 0 {
+		t.Errorf("pending = %d after Save anyway, want none", got)
+	}
+	data, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello socket\n" {
+		t.Errorf("on disk = %q, want the accepted text saved", string(data))
+	}
+}
+
+// Answering Review on the save confirm opens Review mode instead of saving:
+// the set stays pending, nothing is written, and the review is where the save
+// would have approved unseen. Save anyway stays the default.
+func TestSaveConfirmReviewOptionOpensReview(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	h.press("super+s")
+
+	if !h.Prompt.Open {
+		t.Fatal("super+s with an agent's pending set did not open the save confirm")
+	}
+	if got := h.Prompt.Selected(); got != prompt.SaveAnyway {
+		t.Errorf("default answer = %q, want %q", got, prompt.SaveAnyway)
+	}
+	h.press("right")
+	if got := h.Prompt.Selected(); got != prompt.ReviewOption {
+		t.Fatalf("selected = %q, want %q", got, prompt.ReviewOption)
+	}
+	h.press("enter")
+
+	if h.Prompt.Open {
+		t.Error("the confirm stayed open after Review was answered")
+	}
+	if h.mode != ModeReview {
+		t.Errorf("mode = %v, want Review mode after answering Review", h.mode)
+	}
+	if got := len(h.Pane().File.Session().Pending()); got != 1 {
+		t.Errorf("pending = %d after Review, want the set still undecided", got)
+	}
+	data, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != reviewFixture {
+		t.Errorf("on disk = %q, want Review to have saved nothing", string(data))
+	}
+}
+
+// A foreign pending set seeded over the wire, with its author on the roster,
+// reaches the save confirm exactly as the attach e2e does: the confirm fires,
+// names the working author, and writes nothing while it waits.
+func TestSaveConfirmFiresForWireSeededForeignPending(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	agentWorking(t, h, "deepseek")
+	h.Handle(ui.Tick{})
+
+	h.press("super+s")
+
+	if !h.Prompt.Open {
+		t.Fatal("super+s with a wire-seeded foreign set did not open the save confirm")
+	}
+	text := h.host.Text()
+	if !strings.Contains(text, "1 pending from deepseek (working)") {
+		t.Errorf("confirm = %q, want the working author named", text)
+	}
+	if got := len(h.Pane().File.Session().Pending()); got != 1 {
+		t.Errorf("pending = %d while the confirm is open, want the set still there", got)
+	}
+	data, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello\n" {
+		t.Errorf("on disk = %q before the confirm was answered", string(data))
+	}
+
+	h.press("esc")
+
+	if h.Prompt.Open {
+		t.Error("the confirm stayed open after escape")
+	}
+	if got := len(h.Pane().File.Session().Pending()); got != 1 {
+		t.Errorf("pending = %d after cancelling, want the set still awaiting a decision", got)
+	}
+	data, err = os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello\n" {
+		t.Errorf("on disk = %q after cancelling, want nothing written", string(data))
+	}
+}
+
+// The user's own pending work does not warn: only another writer's set is what
+// a save approves unseen.
+func TestSaveConfirmSkipsTheUsersOwnPending(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewFixture)
+	proposeAs(t, h, piecetable.User, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	h.press("super+s")
+
+	if h.Prompt.Open {
+		t.Error("a save with only the user's own pending set opened a confirm")
+	}
+	if got := h.Status(); !strings.Contains(got, "saved") {
+		t.Errorf("status = %q, want the save to have gone through", got)
+	}
+}
+
+// A desktop attach is a human save path too: the daemon refusal is a status,
+// but the warning still belongs on the gesture that approves the work. The old
+// gate narrowed the confirm to the local editor and the phone, so a desktop
+// attached client saved with no warning; this pins the widening.
+func TestSaveConfirmFiresOnDesktopAttach(t *testing.T) {
+	ch := newClientHarness(t) // carries an agent's pending proposal
+	ch.cli.drain()
+
+	ch.cli.press("super+s")
+
+	if !ch.cli.Prompt.Open {
+		t.Fatal("a desktop attach save with an agent's pending set did not open the confirm")
+	}
+	if got := ch.cli.Prompt.Selected(); got != prompt.SaveAnyway {
+		t.Errorf("default answer = %q, want %q", got, prompt.SaveAnyway)
+	}
+}
+
+// A superseded set is not approvable work: a later edit has overwritten its
+// every member, so a save decides nothing and must not prompt about it.
+func TestSaveConfirmSkipsSupersededPending(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewFixture)
+	p := h.Pane()
+	sess := p.File.Session()
+
+	base := sess.Version()
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, base, []piecetable.Hunk{{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew}})
+	p.File.End()
+	superseded := sess.LastGroup()
+	sess.MarkGroup(superseded, piecetable.Proposed)
+
+	// The user replaces the whole agent run, so the set has no survivor.
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.User, sess.Version(), []piecetable.Hunk{{Start: 6, End: 12, Text: "port"}})
+	p.File.End()
+	invalid := false
+	for _, g := range sess.Groups() {
+		if g.ID == superseded && g.Invalid {
+			invalid = true
+		}
+	}
+	if !invalid {
+		t.Fatalf("setup: set %d is not superseded", superseded)
+	}
+
+	h.press("super+s")
+
+	if h.Prompt.Open {
+		t.Error("a save with only a superseded set opened a confirm")
+	}
+	if got := h.Status(); !strings.Contains(got, "saved") {
+		t.Errorf("status = %q, want the save to have gone through", got)
+	}
+}
+
+// The confirm warns but never guards. A screen too small to draw its box draws
+// nothing yet still takes the keyboard, so the save must skip the dialog rather
+// than leave the buffer unsaveable.
+func TestSaveConfirmFailsOpenWhenItCannotBeDrawn(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	// Shrink the screen below the dialog's minimum; the save gesture reads the
+	// size and must proceed instead of opening an invisible dialog.
+	h.screen.Resize(20, 5)
+	h.press("super+s")
+
+	if h.Prompt.Open {
+		t.Error("a confirm the screen cannot show opened anyway; it would swallow the save")
+	}
+	data, err := os.ReadFile(h.Pane().File.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello socket\n" {
+		t.Errorf("on disk = %q, want the save to have gone through", string(data))
+	}
+}
+
+// The phone review bar reads pending-first and names the working agent.
+func TestPhoneReviewBarShowsPendingAndAgent(t *testing.T) {
+	t.Parallel()
+	h := newPhoneHarnessSize(t, "hello\n", 100, 24)
+	if err := h.StartControl(controlSock(t, "p.sock")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.StopControl)
+	agentWorking(t, h, "deepseek")
+
+	h.Handle(ui.Tick{})
+
+	if got := h.phoneActivityText(); got != "pending 1 · deepseek working" {
+		t.Errorf("phoneActivityText = %q, want pending-first with the agent", got)
+	}
+	// Clear the transition flash so the persistent bar underneath is drawn.
+	h.status = ""
+	h.Draw()
+	if got := h.host.Text(); !strings.Contains(got, "pending 1 · deepseek working") {
+		t.Errorf("phone frame does not carry the review bar text:\n%s", got)
+	}
+}
+
+// The phone has no status bar, so a start is flashed through the transient
+// overlay the idle tick expires.
+func TestPhoneFlashesWhenAnAgentStartsWorking(t *testing.T) {
+	t.Parallel()
+	h := newPhoneHarnessSize(t, "hello\n", 100, 24)
+	if err := h.StartControl(controlSock(t, "p.sock")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(h.StopControl)
+	agentWorking(t, h, "deepseek")
+	h.status = ""
+
+	h.Handle(ui.Tick{})
+
+	if got := h.Status(); !strings.Contains(got, "deepseek working") {
+		t.Errorf("status = %q, want the start flash", got)
 	}
 }

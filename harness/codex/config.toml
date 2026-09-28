@@ -1,0 +1,20 @@
+# Codex CLI config for the raj container.
+#
+# Hooks are on (the default is true, pinned here so a future default flip does
+# not silently disable the guard). The guard denies `raj ctl save`; the editor
+# refuses it too, so this is the early half of the same law.
+
+[features]
+hooks = true
+
+# The approval policy and sandbox can stay permissive because the agent's file
+# surface is raj itself, not the filesystem: it has no checkout to damage.
+# Adjust if you later give Codex direct file tools.
+# approval_policy = "on-request"
+# sandbox_mode = "read-only"
+
+# Hooks live in ~/.codex/hooks.json (see the Dockerfile). Codex requires the
+# user to review and trust a non-managed hook once via `/hooks` before it runs;
+# for a headless container, deploy it as a managed hook instead (requirements.toml
+# with [features].hooks = true and allow_managed_hooks_only), which is trusted
+# by policy and needs no interactive review.

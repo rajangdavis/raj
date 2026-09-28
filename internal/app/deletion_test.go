@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"raj/internal/control"
 	"raj/internal/piecetable"
 	"raj/internal/session"
 	"raj/internal/ui"
@@ -34,6 +35,7 @@ func proposeDeletion(t *testing.T, h *harness) string {
 // A pending deletion for the file already on screen raises the gate at once,
 // and the clean buffer is offered both answers.
 func TestDeletionProposalForOpenFileRaisesPrompt(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	proposeDeletion(t, h)
 	if !h.Prompt.Open {
@@ -58,6 +60,7 @@ func TestDeletionProposalForOpenFileRaisesPrompt(t *testing.T) {
 // A path nobody has open waits for an open: the gate depends on the file being
 // shown, not on a timer.
 func TestDeletionPromptWaitsForOpen(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\n")
 	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
@@ -83,6 +86,7 @@ func TestDeletionPromptWaitsForOpen(t *testing.T) {
 // Ignore is the whole answer: the file keeps working and the proposal stays,
 // and the gate does not reappear until the focus moves.
 func TestIgnoreLeavesFileAndProposal(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	path := proposeDeletion(t, h)
 	if !h.Prompt.Open {
@@ -144,6 +148,7 @@ func TestRemoveForeverUnlinksAndDropsBuffer(t *testing.T) {
 // A dirty buffer offers only Ignore: there is no force path, and the file
 // survives even though the prompt was answered.
 func TestRemoveForeverRefusedWhenDirty(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	h.typeText("x")
 	path := proposeDeletion(t, h)
@@ -175,6 +180,7 @@ func TestRemoveForeverRefusedWhenDirty(t *testing.T) {
 // A buffer with a change set still awaiting a decision is not removable
 // either; the listing names the set rather than only counting it.
 func TestRemoveForeverRefusedWithPendingSet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	path := proposeDeletion(t, h)
@@ -200,6 +206,7 @@ func TestRemoveForeverRefusedWithPendingSet(t *testing.T) {
 
 // The gate returns when the path is focused again after the focus moved away.
 func TestDeletionPromptReturnsOnNextFocus(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\n")
 	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
@@ -243,6 +250,7 @@ func TestDeletionPromptReturnsOnNextFocus(t *testing.T) {
 // The safety predicate on a genuinely clean buffer is what makes the removal
 // path reachable at all.
 func TestDeletionSafeOnCleanBuffer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	if safe, why := deletionSafe(h.Pane()); !safe || why != "" {
 		t.Errorf("deletionSafe(clean) = %v, %q; want true and no reason", safe, why)
@@ -322,6 +330,7 @@ func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
 // rename fails and the helper must create the directory, copy the bytes and the
 // mode, then remove the source.
 func TestMoveOrCopyFallsBackToCopy(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.txt")
 	if err := os.WriteFile(src, []byte("payload"), 0o640); err != nil {
@@ -358,6 +367,7 @@ func TestMoveOrCopyFallsBackToCopy(t *testing.T) {
 // A move that cannot complete leaves the source exactly where it was, so the
 // caller keeping the file on error never loses bytes.
 func TestMoveOrCopyKeepsSourceOnFailure(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.txt")
 	if err := os.WriteFile(src, []byte("payload"), 0o644); err != nil {
@@ -374,5 +384,113 @@ func TestMoveOrCopyKeepsSourceOnFailure(t *testing.T) {
 	}
 	if b, err := os.ReadFile(src); err != nil || string(b) != "payload" {
 		t.Errorf("source lost after a failed move: %q, %v", b, err)
+	}
+}
+
+// The control approve is the human answer carried over the socket. It takes the
+// same removal path as the prompt Remove forever, so the file leaves disk, the
+// pending entry clears and the buffer closes.
+func TestApproveDeletionRemovesTheFile(t *testing.T) {
+	t.Setenv("RAJ_TRASH", "")
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+	if err := h.App.ApproveDeletion(path); err != nil {
+		t.Fatalf("ApproveDeletion: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still on disk after approve (err=%v)", err)
+	}
+	if got := h.Tabs.Count(); got != 0 {
+		t.Errorf("tab count = %d, want the buffer gone", got)
+	}
+	if got := h.Deletions(); len(got) != 0 {
+		t.Errorf("pending deletions after approve = %+v, want none", got)
+	}
+}
+
+// Approving a path with no pending proposal is refused by name, and nothing is
+// removed.
+func TestApproveDeletionRefusesANotPendingPath(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	path := h.Pane().File.Path
+	err := h.App.ApproveDeletion(path)
+	if err == nil || !strings.Contains(err.Error(), "no pending deletion") {
+		t.Fatalf("approve of a not-pending path = %v, want a naming refusal", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("the not-pending file was removed: %v", statErr)
+	}
+}
+
+// An agent may withdraw only its own pending deletion: another agent's proposal
+// survives the attempt. Precondition: a deletion proposed by one agent, a
+// withdraw naming a different agent. The human branch must not widen the gate
+// for agents, so a peer is still refused.
+func TestWithdrawDeletionRefusesAPeerAgent(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+
+	peer := uint8(piecetable.Agent + 1)
+	err := h.App.WithdrawDeletion(path, peer)
+	if err == nil || !strings.Contains(err.Error(), "not this writer") {
+		t.Fatalf("an agent withdrew a peer's deletion = %v, want the owner refusal", err)
+	}
+	if got := h.Deletions(); len(got) != 1 || got[0].Path != path {
+		t.Errorf("pending deletions = %+v, want the proposal kept", got)
+	}
+}
+
+// The proposer withdraws its own deletion: the entry clears and the file stays.
+// Precondition: one agent's proposal, withdrawn by that same agent. This is the
+// agent half of the rule; TestWithdrawDeletionAllowsAJoinedHuman is the human
+// half.
+func TestWithdrawDeletionByItsAgentClears(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+
+	owner := uint8(piecetable.Agent + 7)
+	if err := h.App.WithdrawDeletion(path, owner); err != nil {
+		t.Fatalf("WithdrawDeletion(owner): %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("withdraw removed the file: %v", err)
+	}
+	if got := h.Deletions(); len(got) != 0 {
+		t.Errorf("pending deletions = %+v, want none", got)
+	}
+}
+
+// A durable joined human (an attached client) may withdraw any pending removal,
+// including an agent's. Precondition: a seeded Registry with a KindHuman row
+// attached to the app's guard, and a deletion proposed by an agent. Without the
+// human branch the owner check compares the human's id with the agent's and the
+// proposal survives; the file must stay either way.
+func TestWithdrawDeletionAllowsAJoinedHuman(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	path := proposeDeletion(t, h)
+
+	reg := control.NewRegistry()
+	human, err := reg.Join("client:desk", "desk", control.KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if human == control.LocalHuman {
+		t.Fatalf("fixture: the joined human reused the local row %d", control.LocalHuman)
+	}
+	h.App.guard = control.NewGuard(hostOf(h.App))
+	h.App.guard.Participants = reg
+
+	if err := h.App.WithdrawDeletion(path, human); err != nil {
+		t.Fatalf("a joined human's withdraw was refused: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("withdraw removed the file: %v", err)
+	}
+	if got := h.Deletions(); len(got) != 0 {
+		t.Errorf("pending deletions = %+v, want none", got)
 	}
 }

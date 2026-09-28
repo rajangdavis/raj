@@ -1,0 +1,66 @@
+FROM node:22-slim
+
+ENV OC_UID=501
+ENV OC_GID=20
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates ripgrep jq \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex@latest
+
+RUN (getent group ${OC_GID} || groupadd -g ${OC_GID} ocgrp) \
+ && useradd -m -u ${OC_UID} -g ${OC_GID} -s /bin/bash oc
+
+RUN mkdir -p \
+      /home/oc/.codex \
+      /opt/raj/codex/hooks \
+      /home/oc/.local/state \
+      /home/oc/.cache \
+      /work \
+      /tmp/opencode
+
+# Paths are relative to the REPO (the docker build context): build with
+# `docker build -f harness/Dockerfile.codex .` from the repo root.
+COPY bin/raj-linux /usr/local/bin/raj
+
+# Codex has no skill directory: it reads AGENTS.md from the workspace and from
+# ~/.codex, and the guard is a PreToolUse hook in ~/.codex/hooks.json.
+#
+# AGENTS.md is generated, not kept: the Codex header plus the repo's skill with
+# its frontmatter stripped, so the reference cannot drift from what Claude and
+# opencode read. The guard and config live under /opt/raj/codex because `cx`
+# mounts the host's ~/.codex over CODEX_HOME; the entrypoint copies them in.
+COPY harness/codex/AGENTS.header.md /opt/raj/codex/AGENTS.header.md
+COPY skills/raj-editor/SKILL.md /opt/raj/codex/SKILL.md
+COPY harness/codex/config.toml /opt/raj/codex/config.toml
+COPY harness/codex/hooks.json /opt/raj/codex/hooks.json
+COPY harness/codex/hooks/raj-guard.sh /opt/raj/codex/hooks/raj-guard.sh
+COPY harness/codex/entrypoint.sh /usr/local/bin/raj-codex-entrypoint
+
+RUN { cat /opt/raj/codex/AGENTS.header.md; \
+      awk 'NR==1 && /^---$/ {fm=1; next} fm && /^---$/ {fm=0; next} !fm' /opt/raj/codex/SKILL.md; \
+    } > /work/AGENTS.md \
+ && chmod 0755 /usr/local/bin/raj /usr/local/bin/raj-codex-entrypoint \
+      /opt/raj/codex/hooks/raj-guard.sh \
+ && chown -R ${OC_UID}:${OC_GID} /home/oc /work \
+ && chmod 0755 /tmp/opencode
+
+USER oc
+ENV HOME=/home/oc
+ENV CODEX_HOME=/home/oc/.codex
+ENV XDG_STATE_HOME=/home/oc/.local/state
+ENV XDG_CACHE_HOME=/home/oc/.cache
+ENV RAJ_CONTROL_ADDR=tcp://host.docker.internal:7391
+WORKDIR /work
+
+# NOTE: Codex requires a non-managed hook to be reviewed and trusted once via
+# `/hooks` before it runs, and a headless container cannot do that
+# interactively. Two options:
+#   1. first run shell: `codex` then `/hooks` and trust raj-guard — one time;
+#   2. enterprise-managed hooks: drop a requirements.toml with
+#      [features] hooks = true, allow_managed_hooks_only = true and the same
+#      PreToolUse entry — trusted by policy, no review.
+# The editor refuses a non-human save regardless, so the guard being untrusted
+# for a first run is not a hole.
+ENTRYPOINT ["raj-codex-entrypoint"]

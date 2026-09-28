@@ -11,6 +11,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"raj/internal/git"
+	"raj/internal/hooks"
+	"raj/internal/intent"
 )
 
 // BufferHost is the vocabulary, with no transport in it.
@@ -60,6 +65,13 @@ type BufferHost interface {
 	// missing column the margin.
 	Goto(path string, line, col int) error
 
+	// Reveal puts a buffer in front of the user and every attached client,
+	// optionally at a byte span. start and end are byte offsets with both -1
+	// meaning the whole file; the Guard refuses any other negative or a
+	// reversed span. It loads a path that is not open, because a reveal is a
+	// request to look at something.
+	Reveal(path string, start, end int) error
+
 	// Close removes a buffer. One with unsaved changes is refused: a silent
 	// close is a silent data loss, and the editor's close-anyway prompt has no
 	// machine form.
@@ -94,10 +106,15 @@ type BufferHost interface {
 	// for the same path is a no-op.
 	ProposeDeletion(path string, author uint8) error
 
-	// WithdrawDeletion removes author's pending deletion for path. A path
-	// that is not pending is a no-op; one proposed by another writer is
-	// refused, so an agent cannot retract a peer's proposal.
+	// WithdrawDeletion retracts the pending deletion for path. A path that is
+	// not pending is a no-op; a human may retract any pending removal, while
+	// an agent may retract only its own.
 	WithdrawDeletion(path string, author uint8) error
+
+	// ApproveDeletion carries out the pending deletion for path: the human
+	// answer to a proposal, the same removal the prompt Remove forever runs.
+	// The Guard admits only a human here; the host performs the removal.
+	ApproveDeletion(path string) error
 
 	// Deletions lists the pending deletions.
 	Deletions() []Deletion
@@ -108,13 +125,35 @@ type BufferHost interface {
 	// so a second proposal for the same path is a no-op.
 	ProposeDirRemoval(path string, author uint8) error
 
-	// WithdrawDirRemoval removes author's pending dir-removal for path. A
-	// path that is not pending is a no-op; one proposed by another writer is
-	// refused, so an agent cannot retract a peer's proposal.
+	// WithdrawDirRemoval retracts the pending dir-removal for path. A path
+	// that is not pending is a no-op; a human may retract any pending removal,
+	// while an agent may retract only its own.
 	WithdrawDirRemoval(path string, author uint8) error
+
+	// ApproveDirRemoval carries out the pending dir-removal for path: the
+	// rmdir analogue of ApproveDeletion.
+	ApproveDirRemoval(path string) error
 
 	// DirRemovals lists the pending dir-removals.
 	DirRemovals() []DirRemoval
+
+	// Hooks lists every stored hook, sorted by name. It is empty-not-nil when
+	// there are none. Hooks are host state: list and show are reads, and the
+	// authoring methods below are refused on a TCP connection by the server.
+	Hooks() ([]HookRow, error)
+
+	// PutHook validates row with the hooks domain and stores it, replacing any
+	// row of the same name. An invalid row is refused before the store is
+	// touched.
+	PutHook(row HookRow) error
+
+	// DeleteHook removes the named hook. Deleting an absent name is not an
+	// error.
+	DeleteHook(name string) error
+
+	// SetHookEnabled flips the named hook's enabled flag. A name that is not
+	// stored is refused.
+	SetHookEnabled(name string, enabled bool) error
 
 	// Ls lists the immediate children of a directory, sorted by name.
 	// Directories are entries too, marked as such; Size is set only for a
@@ -126,6 +165,17 @@ type BufferHost interface {
 	// sets plus the pending file deletions and dir-removals. It is ungated,
 	// like Deletions: a driver may see what is waiting without a claim.
 	Proposals() []Proposal
+
+	// Projection composes the live buffers under policy, keyed by absolute
+	// editor path. Called on the event thread; the result is a snapshot.
+	Projection(policy ProjectionPolicy) map[string][]byte
+
+	// Intent answers an `intent` request: the JSON payload in, the JSON result
+	// out. It is the intention workflow — new, add, remove, list, show,
+	// materialise, export — and writes objects only. The op crosses TCP; the
+	// object writes move no ref and never touch the worktree or the user's
+	// index.
+	Intent(payload string) (string, error)
 
 	// Read returns the document as authored spans AND the version they were
 	// read at.
@@ -180,8 +230,10 @@ type BufferHost interface {
 	// Hunks are rejected independently; the conflicts say which. A hunk that
 	// lands over another writer's Proposed run is allowed -- the advisory
 	// lease -- and that set is named in warnings, so a clean apply, an apply
-	// that moved a draft, and a refusal stay distinguishable.
-	Apply(path string, author uint8, base uint64, hunks []Hunk) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
+	// that moved a draft, and a refusal stay distinguishable. task is the work
+	// the connection registered under and is recorded on the change set this
+	// call opens, so a manifest derives its rows without a caller naming one.
+	Apply(path string, author uint8, base uint64, hunks []Hunk, task string) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
 
 	// Save writes a buffer to disk. force answers the disk-changed prompt with
 	// Overwrite, writing over a file that changed since the write raj last
@@ -202,10 +254,11 @@ type BufferHost interface {
 	// Clear is the operation that reverses a rejected set out.
 	Decide(path string, group uint64, accept bool) error
 
-	// Clear hard-purges a rejected change set: the set's ops are reversed out
-	// of the document and the decision dropped, so the text and the mark both
-	// leave the view. Unlike Decide this really edits, so it can fail; the
-	// error names the group.
+	// Clear disposes a set no accept or reject can reach: a rejected set is
+	// reversed out of the document and its decision dropped, and an invalid
+	// Proposed set is marked rejected, which leaves the view with it. Unlike
+	// Decide this can fail on a wedged reversal; the error names the group and
+	// the blocking set.
 	Clear(path string, group uint64) error
 
 	// Revert discards a writer's own live pieces: every op the author wrote is
@@ -241,7 +294,8 @@ type BufferHost interface {
 	// author, or whose buffer has moved is refused rather than guessed at. A
 	// hunk that lands over another writer's Proposed run is allowed -- the
 	// advisory lease -- and that set is named in warnings, exactly as Apply.
-	Patch(path string, author uint8, id uint64, newText string) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
+	// task is recorded on the change set this call opens, as Apply's is.
+	Patch(path string, author uint8, id uint64, newText string, task string) (version uint64, conflicts []Conflict, warnings []GroupOverlap, err error)
 
 	// LSP prepares a language-server request for a 1-based line and column.
 	// Mode is hover, definition, completion or diagnostics. The returned
@@ -350,6 +404,18 @@ type Guard struct {
 	// without one falls back to the id-range rule.
 	Participants *Registry
 
+	// Git is the read-only git service the git verb runs against. Optional:
+	// nil builds one over the workspace root, so a test can inject a fake
+	// runner or a service aimed at a temp repository.
+	Git *git.Service
+
+	// HookGate is the server's shared hook run gate, pointed at here so the
+	// event-thread admission in dispatchHook can reach it. The Server owns it;
+	// this is the same ordering seam as Participants, also a pointer to
+	// server state. Optional: a Guard built by hand with no gate refuses a
+	// hook run rather than inventing a per-guard one.
+	HookGate *hookGate
+
 	// read records, per writer, which paths that writer has read, and at what
 	// version. Read-before-write is the check that stops a blind edit: offsets
 	// are meaningless except in the coordinates of a version somebody looked
@@ -362,7 +428,8 @@ type Guard struct {
 	// because both are per-writer state the Guard owns, and a claim is keyed
 	// the same way — by durable author, not by connection. It is in-memory and
 	// resets with the process. The write verbs enforce it through claimTarget,
-	// and save is deliberately not gated; the reads never consult it.
+	// and save is not claim-gated; it is identity-gated (see Save), because
+	// only the user's own gesture writes a proposal out. The reads never consult it.
 	mu     sync.Mutex
 	read   map[uint8]map[string]bool
 	claims map[uint8]map[string]bool
@@ -675,13 +742,16 @@ func (g *Guard) Rename(old, new string, author uint8) error {
 	return nil
 }
 
-// Delete proposes a pending deletion for a claimed path, or withdraws this
-// identity's proposal. It is claim-gated like a text write — the path must be
-// in the caller's claim set — because the claim is the record of what an agent
-// declared it would touch. It deliberately does NOT require read-before-write:
-// deleting is not a text write and no offset is at stake. The path is
-// canonicalised by claimPath, which checks it in-root without loading a buffer,
-// so proposing a deletion does not have to open the file it names.
+// Delete proposes a pending deletion for a claimed path, or withdraws a
+// proposal. A proposal is claim-gated like a text write — the path must be in
+// the caller's claim set — because the claim is the record of what an agent
+// declared it would touch. A withdraw is not claim-gated: the claim set belongs
+// to the agent that proposed, and the person retracting it need not hold one,
+// the same rule ApproveDeletion follows. It deliberately does NOT require
+// read-before-write: deleting is not a text write and no offset is at stake.
+// The path is canonicalised by claimPath, which checks it in-root without
+// loading a buffer, so proposing a deletion does not have to open the file it
+// names.
 func (g *Guard) Delete(path string, author uint8, withdraw bool) error {
 	if path == "" {
 		return errors.New("delete needs a path")
@@ -690,11 +760,11 @@ func (g *Guard) Delete(path string, author uint8, withdraw bool) error {
 	if err != nil {
 		return err
 	}
-	if err := g.claimCheck(author, name); err != nil {
-		return err
-	}
 	if withdraw {
 		return g.Host.WithdrawDeletion(name, author)
+	}
+	if err := g.claimCheck(author, name); err != nil {
+		return err
 	}
 	if err := g.checkOperandKind(name, false); err != nil {
 		return err
@@ -710,10 +780,11 @@ func (g *Guard) Deletions() []Deletion {
 	return out
 }
 
-// Rmdir proposes a pending dir-removal for a claimed directory, or withdraws
-// this identity's proposal. It is the rmdir analogue of Delete: the directory
-// itself is a claim entry (claim <dir> records it, per §11), so the gate is one
-// claimCheck on the dir. Like Delete it deliberately does NOT require
+// Rmdir proposes a pending dir-removal for a claimed directory, or withdraws a
+// proposal. It is the rmdir analogue of Delete: a proposal is claim-gated — the
+// directory itself is a claim entry (claim <dir> records it, per §11), so the
+// gate is one claimCheck on the dir — while a withdraw is not, for the same
+// reason Delete's is not. Like Delete it deliberately does NOT require
 // read-before-write: a dir-removal is not a text write and no offset is at
 // stake. The path is canonicalised by claimPath, which checks it in-root
 // without loading a buffer.
@@ -725,11 +796,11 @@ func (g *Guard) Rmdir(path string, author uint8, withdraw bool) error {
 	if err != nil {
 		return err
 	}
-	if err := g.claimCheck(author, name); err != nil {
-		return err
-	}
 	if withdraw {
 		return g.Host.WithdrawDirRemoval(name, author)
+	}
+	if err := g.claimCheck(author, name); err != nil {
+		return err
 	}
 	if err := g.checkOperandKind(name, true); err != nil {
 		return err
@@ -743,6 +814,57 @@ func (g *Guard) Rmdirs() []DirRemoval {
 	out := g.Host.DirRemovals()
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+// ApproveDeletion carries out the pending deletion for path. It is the human
+// answer to a proposal, so only the local keyboard row or a durable joined
+// human may ask; an agent, a provisional connection and the file-as-loaded are
+// refused in the same shape as Save. The path is canonicalised the way Delete
+// canonicalises it -- in-root, without loading a buffer -- but it is not
+// claim-gated: the claim set belongs to the agent that proposed, and the
+// person answering need not hold one.
+func (g *Guard) ApproveDeletion(path string, author uint8) error {
+	if path == "" {
+		return errors.New("approve needs a path")
+	}
+	if !g.humanAuthor(author) {
+		return errors.New(errApproveDeletionNotHuman)
+	}
+	name, err := g.claimPath(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.ApproveDeletion(name)
+}
+
+// ApproveDirRemoval is the rmdir analogue of ApproveDeletion: the human answer
+// to a pending dir-removal, canonically checked in-root and not claim-gated.
+func (g *Guard) ApproveDirRemoval(path string, author uint8) error {
+	if path == "" {
+		return errors.New("approve needs a path")
+	}
+	if !g.humanAuthor(author) {
+		return errors.New(errApproveDirNotHuman)
+	}
+	name, err := g.claimPath(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.ApproveDirRemoval(name)
+}
+
+// Hooks, PutHook, DeleteHook and SetHookEnabled pass the hook surface down to
+// the host. They add no policy of their own: validation lives in the hooks
+// domain, which the host applies, and the transport rule lives in localOnly,
+// so the Guard is only the ordering seam.
+func (g *Guard) Hooks() ([]HookRow, error) { return g.Host.Hooks() }
+
+func (g *Guard) PutHook(row HookRow) error { return g.Host.PutHook(row) }
+
+func (g *Guard) DeleteHook(name string) error { return g.Host.DeleteHook(name) }
+
+func (g *Guard) SetHookEnabled(name string, enabled bool) error {
+	return g.Host.SetHookEnabled(name, enabled)
 }
 
 // Ls lists a directory's immediate children. It is a read, ungated like
@@ -801,11 +923,12 @@ func (g *Guard) checkOperandKind(name string, wantDir bool) error {
 	return nil
 }
 
-// Proposals rolls the three pending listings into one flat tagged list: each
-// open buffer's pending change sets, the pending file deletions and the
-// pending dir-removals. It is a read-only view, ungated like Deletions, and
-// the order is deterministic — kind (set, delete, rmdir), then path, then
-// group id — so a caller can compare two listings directly.
+// Proposals rolls the pending listings into one flat tagged list: each open
+// buffer's pending change sets and invalid sets, the pending file deletions
+// and the pending dir-removals. It is a read-only view, ungated like
+// Deletions, and the order is deterministic — kind (set, delete, rmdir,
+// invalid), then path, then group id — so a caller can compare two listings
+// directly.
 func (g *Guard) Proposals() []Proposal {
 	out := g.Host.Proposals()
 	rank := func(kind string) int {
@@ -814,8 +937,12 @@ func (g *Guard) Proposals() []Proposal {
 			return 0
 		case "delete":
 			return 1
-		default:
+		case "rmdir":
 			return 2
+		case "invalid":
+			return 3
+		default:
+			return 4
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -838,6 +965,38 @@ func (g *Guard) Goto(path string, line, col int) error {
 		return err
 	}
 	return g.Host.Goto(name, line, col)
+}
+
+// Reveal routes a reveal through the same resolution every other verb uses,
+// and validates a byte span the way apply validates a hunk: both -1 means the
+// whole file, and any other negative or a reversed span is refused before the
+// host is asked.
+func (g *Guard) Reveal(path string, start, end int) error {
+	if err := validateRevealSpan(start, end); err != nil {
+		return err
+	}
+	name, err := g.canonical(path)
+	if err != nil {
+		return err
+	}
+	return g.Host.Reveal(name, start, end)
+}
+
+// validateRevealSpan is the reveal span rule: (-1,-1) is the whole file, and
+// anything else must be a non-negative, ordered byte span. A lone -1 is
+// refused rather than read as "to the end", because a single default is a
+// caller that said nothing about one end.
+func validateRevealSpan(start, end int) error {
+	if start == -1 && end == -1 {
+		return nil
+	}
+	if start < 0 || end < 0 {
+		return fmt.Errorf("reveal span: start %d, end %d; both -1 means the whole file", start, end)
+	}
+	if end < start {
+		return fmt.Errorf("reveal span: start %d, end %d; end is before start", start, end)
+	}
+	return nil
 }
 
 // Close refuses a dirty buffer before the host is asked, so the refusal
@@ -956,12 +1115,19 @@ func (g *Guard) Review(path string, listOnly bool) ([]Group, error) {
 	return g.Host.Review(name, listOnly)
 }
 
-// Patch writes, so it runs the same author check as Apply: a socket may not
+// Patch is patch with no task: the in-process form, for a caller that has no
+// connection identity. A socket's task comes from its participant, and
+// Dispatch reaches the task-aware patch below.
+func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, []GroupOverlap, error) {
+	return g.patch(path, author, id, newText, "")
+}
+
+// patch writes, so it runs the same author check as Apply: a socket may not
 // write as the file-as-loaded nor as a person, or its text becomes
 // indistinguishable from typed text. The offsets are implicit — the snapshot's
 // span told the editor where the chunk lives — so there is no hunk span to
 // validate here; the host refuses a snapshot this writer does not own.
-func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uint64, []Conflict, []GroupOverlap, error) {
+func (g *Guard) patch(path string, author uint8, id uint64, newText, task string) (uint64, []Conflict, []GroupOverlap, error) {
 	if author == AuthorOriginal {
 		return 0, nil, nil, fmt.Errorf("author %d is the file as loaded, not a writer", author)
 	}
@@ -976,10 +1142,17 @@ func (g *Guard) Patch(path string, author uint8, id uint64, newText string) (uin
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	return g.Host.Patch(name, author, id, newText)
+	return g.Host.Patch(name, author, id, newText, task)
 }
 
+// Apply is apply with no task: the in-process form, for a caller that has no
+// connection identity. A socket's task comes from its participant, and
+// Dispatch reaches the task-aware apply below.
 func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uint64, []Conflict, []GroupOverlap, error) {
+	return g.apply(path, author, base, hunks, "")
+}
+
+func (g *Guard) apply(path string, author uint8, base uint64, hunks []Hunk, task string) (uint64, []Conflict, []GroupOverlap, error) {
 	// A socket may not write as the file-as-loaded. It may write as an agent,
 	// as an undeclared (provisional) connection, or as a durable joined human
 	// other than the local one: an attached client joins as a second human, and
@@ -1017,7 +1190,7 @@ func (g *Guard) Apply(path string, author uint8, base uint64, hunks []Hunk) (uin
 			return 0, nil, nil, fmt.Errorf("hunk %d: start %d, end %d", i, h.Start, h.End)
 		}
 	}
-	return g.Host.Apply(name, author, base, hunks)
+	return g.Host.Apply(name, author, base, hunks, task)
 }
 
 // writesAsHuman reports whether id is a durable joined human other than the
@@ -1030,6 +1203,42 @@ func (g *Guard) writesAsHuman(id uint8) bool {
 	}
 	p, ok := g.Participants.Get(id)
 	return ok && p.Kind == KindHuman
+}
+
+// humanAuthor reports whether author may run a human-only gesture: the local
+// keyboard row, or a durable joined human (an attached client). An agent, an
+// undeclared connection and the file-as-loaded are refused. Without a registry
+// the id rule still stands, so a Guard built by hand refuses an agent.
+func (g *Guard) humanAuthor(author uint8) bool {
+	if author == LocalHuman {
+		return true
+	}
+	if g.Participants == nil {
+		return author != AuthorOriginal && author < FirstAgent
+	}
+	return g.writesAsHuman(author)
+}
+
+// IsHuman reports whether author may run a human-only gesture: the local
+// keyboard row, or a durable joined human (an attached client). It is
+// humanAuthor exposed so the app's removal owner check can share the exact
+// predicate the Guard applies rather than reimplementing the id rule and
+// drifting from it.
+func (g *Guard) IsHuman(author uint8) bool { return g.humanAuthor(author) }
+
+// taskOf is the work a writer's writes belong to: the task its connection
+// registered with, empty for the local human and for a connection that
+// registered none. It is derived from the registry by author rather than
+// carried on every frame, so an ordinary reconnect does not have to restate
+// it and a program's sub-requests inherit it from the connection's author.
+func (g *Guard) taskOf(author uint8) string {
+	if g.Participants == nil {
+		return ""
+	}
+	if p, ok := g.Participants.Get(author); ok {
+		return p.Task
+	}
+	return ""
 }
 
 // escapingGlob reports a glob that reaches outside the workspace. The document
@@ -1100,12 +1309,160 @@ func (s guardedSearcher) Search(ctx context.Context, q SearchQuery, emit func([]
 	return s.inner.Search(ctx, q, emit)
 }
 
-func (g *Guard) Save(path string, force bool) (uint64, error) {
+// Save writes a buffer to disk for the person at the keyboard. It is the one
+// verb an agent cannot run: a proposal becomes disk bytes through the user's
+// save, never the writer's own, and a socket that could save would make every
+// review gate decorative. The local keyboard row is allowed by id; a durable
+// joined human is an attached client saving as its own person; an agent, an
+// undeclared connection and the file-as-loaded are refused. Without a registry
+// the id rule still stands, so a Guard built by hand refuses an agent.
+func (g *Guard) Save(path string, author uint8, force bool) (uint64, error) {
+	if !g.humanAuthor(author) {
+		return 0, errors.New(errSaveNotHuman)
+	}
 	name, err := g.canonical(path)
 	if err != nil {
 		return 0, err
 	}
 	return g.Host.Save(name, force)
+}
+
+// // Land is the human's one-gesture landing: accept every pending change set
+// whose task is task, in every buffer, then save each buffer whose pending
+// sets all belonged to that task. A buffer that also holds another task's
+// pending sets has this task's accepted but is not saved -- save is the
+// approval gesture, so writing it would approve work this land did not name;
+// such a buffer is reported held. A buffer whose save is refused for another
+// reason carries that error in the report rather than being skipped silently.
+// The caller has already passed the human gate; Save re-checks it, so a land
+// is no weaker than the save it performs.
+//
+// A set's overlap report is gone once it is accepted, so the wave's dependency
+// graph is read before anything is accepted (DependencyWarning): a non-linear
+// dependency is reported, never guessed. After the saves the accepted wave is
+// exported as one commit on raj/baseline (landExport); an export failure is
+// reported rather than failing the gesture that already approved the work.
+func (g *Guard) Land(task string, author uint8) ([]LandFile, *LandExport, error) {
+	if task == "" {
+		return nil, nil, errors.New("land needs a task; pass the task its change sets were written under")
+	}
+	// Which buffer holds which set, gathered first so the overlap edges (only
+	// reported for still-proposed sets) can be read before accepting anything.
+	type landJob struct {
+		path    string
+		mine    []uint64
+		foreign bool
+		err     string
+	}
+	var jobs []landJob
+	var wave []intent.WaveGroup
+	for _, b := range g.Host.Buffers() {
+		if b.Path == "" {
+			// An unnamed buffer has no path to save or to name in a report.
+			continue
+		}
+		name, err := g.canonical(b.Path)
+		if err != nil {
+			jobs = append(jobs, landJob{path: b.Path, err: err.Error()})
+			continue
+		}
+		groups, err := g.Host.Groups(name)
+		if err != nil {
+			jobs = append(jobs, landJob{path: name, err: err.Error()})
+			continue
+		}
+		job := landJob{path: name}
+		for _, gr := range groups {
+			if gr.State != "proposed" || gr.Invalid {
+				continue
+			}
+			if gr.Task != task {
+				job.foreign = true
+				continue
+			}
+			job.mine = append(job.mine, gr.ID)
+			wg := intent.WaveGroup{ID: gr.ID, Path: name}
+			if gr.Overlaps != nil {
+				for _, ov := range gr.Overlaps.Sets {
+					wg.Overlaps = append(wg.Overlaps, ov.Group)
+				}
+			}
+			wave = append(wave, wg)
+		}
+		jobs = append(jobs, job)
+	}
+	warning := intent.DependencyWarning(wave)
+
+	var out []LandFile
+	accepted := 0
+	for _, job := range jobs {
+		if job.err != "" {
+			out = append(out, LandFile{Path: job.path, Err: job.err})
+			continue
+		}
+		if len(job.mine) == 0 {
+			continue
+		}
+		ok := true
+		for _, id := range job.mine {
+			if err := g.Host.Decide(job.path, id, true); err != nil {
+				out = append(out, LandFile{Path: job.path, Err: err.Error()})
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		accepted += len(job.mine)
+		f := LandFile{Path: job.path, Sets: len(job.mine)}
+		if job.foreign {
+			f.Held = true
+			out = append(out, f)
+			continue
+		}
+		if _, err := g.Save(job.path, author, false); err != nil {
+			f.Err = err.Error()
+			out = append(out, f)
+			continue
+		}
+		f.Saved = true
+		out = append(out, f)
+	}
+	if accepted == 0 {
+		return out, nil, nil
+	}
+	exp, err := g.landExport(task, warning)
+	if err != nil {
+		// The sets are accepted and the buffers saved; the commit did not
+		// happen. Report the export failure rather than undoing a gesture the
+		// person already made.
+		return out, &LandExport{Ref: git.BaselineRef, Warning: warning, Err: err.Error()}, nil
+	}
+	return out, exp, nil
+}
+
+// landExport asks the host to export the landed wave as one commit on
+// raj/baseline. The overlap warning was computed before the sets were accepted
+// (their overlap reports are gone once accepted), so it rides along. The
+// caller reports an error rather than failing the land that already saved.
+func (g *Guard) landExport(task, warning string) (*LandExport, error) {
+	payload, err := json.Marshal(intent.Command{Mode: "land", Task: task})
+	if err != nil {
+		return nil, err
+	}
+	out, err := g.Host.Intent(string(payload))
+	if err != nil {
+		return nil, err
+	}
+	var res intent.Result
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		return nil, err
+	}
+	return &LandExport{
+		Commit: res.Commit, Parent: res.Parent, BaseSHA: res.BaseSHA,
+		Tree: res.Tree, Ref: git.BaselineRef, Warning: warning,
+	}, nil
 }
 
 // Reload takes the on-disk version for a buffer. It is a read of the disk into
@@ -1166,9 +1523,10 @@ func (g *Guard) Revert(path string, author uint8) error {
 // filesystem reacts: formatters, watchers, `git status`, a dev server
 // reloading. Nothing here should cause those without being asked.
 //
-// So: run it, report the stale files, count them. When layered proposals land,
-// this becomes "materialise the accepted composition and run against that",
-// and the count is what says how much that is worth.
+// So: run it, report the stale files, count them. `exec --projected` is the
+// other answer: it materialises the accepted-and-proposed composition into a
+// scratch tree and runs there, so the stale count is what says how much the
+// ordinary worktree run still costs.
 
 // CheckExec validates a command and reports which buffers are stale. Called on
 // the event thread, since it reads the buffers. A non-nil error refuses the
@@ -1490,11 +1848,54 @@ func readPaths(g *Guard, req Request, start, end, lineStart, lineEnd int) Respon
 	return res
 }
 
+// errIntentPublishNotHuman is the refusal for an agent's intent publish. The
+// export half is agent-allowed because inert objects change nothing outward;
+// publish moves a ref and is the user's decision (H5).
+var errIntentPublishNotHuman = "intent publish is the outward step and is the user's decision: an agent may export, not publish"
+
+// dispatchIntent routes the intention op through its explicit admission policy.
+// The owner is stamped from the connection on the server, so a payload that
+// names another writer cannot make the intention theirs. new/add/remove/list/
+// show and export are agent-allowed -- object-writing changes nothing outward
+// and preparing an export for review is the point -- while publish is the
+// outward step and stays human-only (H5). No intent mode is ungated.
+func dispatchIntent(g *Guard, req Request) Response {
+	var cmd intent.Command
+	if err := json.Unmarshal([]byte(req.HookJSON), &cmd); err != nil {
+		return Response{Err: "intent: " + err.Error()}
+	}
+	if cmd.Mode == "publish" && !g.IsHuman(req.Author) {
+		return Response{Err: errIntentPublishNotHuman}
+	}
+	cmd.Owner = fmt.Sprintf("%d", req.Author)
+	payload, err := json.Marshal(cmd)
+	if err != nil {
+		return Response{Err: "intent: " + err.Error()}
+	}
+	out, err := g.Host.Intent(string(payload))
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, HookJSON: out}
+}
+
 // Dispatch turns one decoded request into a response. It is the only place the
 // verbs are interpreted, so the socket adapter and an in-process caller cannot
 // diverge about what an op means.
 func Dispatch(g *Guard, req Request) Response {
 	switch req.Op {
+	case "intent":
+		return dispatchIntent(g, req)
+	case "hook":
+		return dispatchHook(g, req)
+	case "hookprep":
+		// Internal: connection.runHook asks the event thread to admit a hook
+		// and hand back its command, projection and root, then runs the
+		// command off the thread. The wire form is the "hook" op with mode
+		// run; this op is the in-process half and has no wire representation.
+		return dispatchHook(g, Request{HookMode: "run", HookName: req.HookName, Author: req.Author})
+	case "git":
+		return dispatchGit(g, req)
 	case "ping":
 		return Response{OK: true, Root: g.Root(), Roots: g.roots()}
 	case "buffers":
@@ -1542,6 +1943,18 @@ func Dispatch(g *Guard, req Request) Response {
 			return Response{Err: err.Error()}
 		}
 		if err := g.Goto(name, req.Line, req.Col); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "reveal":
+		start, end := -1, -1
+		if req.Start != nil {
+			start = *req.Start
+		}
+		if req.End != nil {
+			end = *req.End
+		}
+		if err := g.Reveal(req.Path, start, end); err != nil {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}
@@ -1655,6 +2068,13 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		return Response{OK: true, Groups: groups}
 	case "accept", "reject":
+		// Accepting lands an agent's proposal, which is the person's decision,
+		// not the writer's, so only the human the save gate admits may accept.
+		// Reject leaves the text pending and stays open to an agent, recorded
+		// under the connection's own author by the chokepoint in connection.one.
+		if req.Op == "accept" && !g.humanAuthor(req.Author) {
+			return Response{Err: errAcceptNotHuman}
+		}
 		name, err := g.canonical(req.Path)
 		if err != nil {
 			return Response{Err: err.Error()}
@@ -1694,6 +2114,15 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		return Response{OK: true}
 	case "delete":
+		if req.Withdraw && req.Approve {
+			return Response{Err: errApproveWithdraw}
+		}
+		if req.Approve {
+			if err := g.ApproveDeletion(req.Path, req.Author); err != nil {
+				return Response{Err: err.Error()}
+			}
+			return Response{OK: true}
+		}
 		if err := g.Delete(req.Path, req.Author, req.Withdraw); err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -1701,6 +2130,15 @@ func Dispatch(g *Guard, req Request) Response {
 	case "deletions":
 		return Response{OK: true, Deletions: g.Deletions()}
 	case "rmdir":
+		if req.Withdraw && req.Approve {
+			return Response{Err: errApproveWithdraw}
+		}
+		if req.Approve {
+			if err := g.ApproveDirRemoval(req.Path, req.Author); err != nil {
+				return Response{Err: err.Error()}
+			}
+			return Response{OK: true}
+		}
 		if err := g.Rmdir(req.Path, req.Author, req.Withdraw); err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -1727,13 +2165,32 @@ func Dispatch(g *Guard, req Request) Response {
 		// Internal: the socket asks on the event thread, then runs the command
 		// off it. Splitting the check from the run is what lets a long command
 		// be cancelled without the editor waiting on it.
-		dirty, err := g.CheckExec(req.Argv, req.Dir)
+		if req.ExecProjected && req.Dir != "" {
+			return Response{Err: "exec --projected runs at the projected tree root; --dir is not supported"}
+		}
+		dir := req.Dir
+		if req.ExecProjected {
+			// The run directory is the scratch tree the runner builds, not a
+			// workspace directory, so the -dir check has nothing to validate.
+			dir = ""
+		}
+		dirty, err := g.CheckExec(req.Argv, dir)
 		if err != nil {
 			return Response{Err: err.Error(), Stats: g.Stats()}
 		}
 		// Stale buffers ride along with the go-ahead, so the runner can attach
 		// them to the result rather than the caller having to ask separately.
-		return Response{OK: true, Dirty: dirty}
+		res := Response{OK: true, Dirty: dirty}
+		if req.ExecProjected {
+			// The projection and the root ride in-process to the connection
+			// that materialises them; neither is wire-encoded.
+			res.Projection = g.Projection(ProjectionWithProposed)
+			res.Root = g.Root()
+			if p, ok := firstOutsideRoot(res.Projection, res.Root); ok {
+				return Response{Err: fmt.Sprintf("exec --projected materialises the primary root %s only; %s is under another workspace root, and multi-root projected exec is not supported", res.Root, p)}
+			}
+		}
+		return res
 	case "snapshot":
 		// The document a client renders itself from. The payload travels as a
 		// JSON string like diff and lsp, because the wire's one text field is
@@ -1826,8 +2283,28 @@ func Dispatch(g *Guard, req Request) Response {
 		}
 		return res
 	case "save":
-		v, err := g.Save(req.Path, req.Force)
+		v, err := g.Save(req.Path, req.Author, req.Force)
 		return done(v, err)
+	case "land":
+		// Landing accepts by task and then saves, so it is the same human
+		// gesture save is; an agent is refused before any set is touched.
+		if !g.humanAuthor(req.Author) {
+			return Response{Err: errLandNotHuman}
+		}
+		files, exp, err := g.Land(req.LandTask, req.Author)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		res := Response{OK: true, Land: files}
+		if exp != nil {
+			// The export rides as JSON in the generic payload field: the land
+			// report has no field for the object ids, and a client that does
+			// not ask for them still reads the per-buffer list.
+			if data, err := json.Marshal(exp); err == nil {
+				res.HookJSON = string(data)
+			}
+		}
+		return res
 	case "reload":
 		if err := g.Reload(req.Path); err != nil {
 			return Response{Err: err.Error()}
@@ -1841,7 +2318,7 @@ func Dispatch(g *Guard, req Request) Response {
 			v, err := g.Version(req.Path, req.Author)
 			return done(v, err)
 		}
-		v, conflicts, warnings, err := g.Apply(req.Path, req.Author, *req.Base, req.Hunks)
+		v, conflicts, warnings, err := g.apply(req.Path, req.Author, *req.Base, req.Hunks, g.taskOf(req.Author))
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -1867,7 +2344,7 @@ func Dispatch(g *Guard, req Request) Response {
 		return Response{OK: true, DumpID: id, Version: v, Hash: hash,
 			Spans: []Span{{Text: text, Author: req.Author}}}
 	case "patch":
-		v, conflicts, warnings, err := g.Patch(req.Path, req.Author, req.DumpID, req.PatchText)
+		v, conflicts, warnings, err := g.patch(req.Path, req.Author, req.DumpID, req.PatchText, g.taskOf(req.Author))
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -1880,6 +2357,243 @@ func Dispatch(g *Guard, req Request) Response {
 		return res
 	}
 	return Response{Err: "unknown op " + req.Op}
+}
+
+// dispatchHook answers the hook verb. list and show read the stored rows, put
+// validates and stores one, and rm, enable and disable author. run is the
+// event-thread half of `raj hook run`: it admits the hook, snapshots the
+// projection, and reserves the run on the shared Gate. Authoring is
+// local-only: localOnly refuses put/rm/enable/disable on a TCP connection
+// before Dispatch is reached, while list, show and run cross; run's own
+// boundary is admission, not the transport. Put validates through the hooks
+// domain so an invalid row is refused before the host is asked to store it.
+func dispatchHook(g *Guard, req Request) Response {
+	switch req.HookMode {
+	case "list":
+		rows, err := g.Hooks()
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		if rows == nil {
+			rows = []HookRow{}
+		}
+		data, err := json.Marshal(rows)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true, HookJSON: string(data)}
+	case "show":
+		if req.HookName == "" {
+			return Response{Err: "hook show needs a name"}
+		}
+		rows, err := g.Hooks()
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		for _, row := range rows {
+			if row.Name != req.HookName {
+				continue
+			}
+			data, err := json.Marshal(row)
+			if err != nil {
+				return Response{Err: err.Error()}
+			}
+			return Response{OK: true, HookJSON: string(data)}
+		}
+		return Response{Err: fmt.Sprintf("no such hook %q", req.HookName)}
+	case "put":
+		var row HookRow
+		if err := json.Unmarshal([]byte(req.HookJSON), &row); err != nil {
+			return Response{Err: "hook put: " + err.Error()}
+		}
+		hook, err := hooks.Parse(hookRaw(row))
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		// Parse owns the default: an omitted tree is stored as projected, so the
+		// column never holds a value the runner would have to guess at.
+		row.Tree = string(hook.Tree)
+		if err := g.PutHook(row); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "rm", "enable", "disable":
+		if req.HookName == "" {
+			return Response{Err: "hook " + req.HookMode + " needs a name"}
+		}
+		var err error
+		switch req.HookMode {
+		case "rm":
+			err = g.DeleteHook(req.HookName)
+		case "enable":
+			err = g.SetHookEnabled(req.HookName, true)
+		case "disable":
+			err = g.SetHookEnabled(req.HookName, false)
+		}
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	case "run":
+		if req.HookName == "" {
+			return Response{Err: "hook run needs a name"}
+		}
+		rows, err := g.Hooks()
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		// Derived per request, never cached: a put or rm between two runs has
+		// to be visible to the next one, and the store is the authority on what
+		// a hook is.
+		raws := make([]hooks.Raw, len(rows))
+		for i, row := range rows {
+			raws[i] = hookRaw(row)
+		}
+		set, _ := hooks.NewSet(raws)
+		hook, err := set.Admit(req.HookName, g.hookCallerAgent(req.Author))
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		if g.HookGate == nil {
+			return Response{Err: "hook run is not available"}
+		}
+		root := g.Root()
+		// A workspace hook runs in the saved root itself, so it must not start
+		// while any buffer is unsaved or holds a pending change set: the run would
+		// test a tree that is not what the editor shows. The check is the same
+		// predicate `raj ctl status` applies, decided here on the event thread. A
+		// projected hook materialises the live composition instead and needs no
+		// such gate.
+		var proj map[string][]byte
+		revision := uint64(0)
+		if hook.Tree == hooks.TreeWorkspace {
+			if blockers := hookWorkspaceBlockers(g.Buffers()); len(blockers) > 0 {
+				return Response{Err: fmt.Sprintf("hook %q runs on the saved workspace, but it is not ready: %s",
+					hook.Name, strings.Join(blockers, "; "))}
+			}
+			// The provenance stamp and the may_write check both need git, so the
+			// work-tree refusal belongs here, before the command starts. The probe
+			// is a filesystem check, not a git call: it runs on the event thread,
+			// which must not spawn a process. A `.git` directory is an ordinary
+			// checkout and a `.git` file is a linked worktree's gitdir pointer;
+			// either is a work tree. The full `git view` still runs off-thread in
+			// the run path.
+			dotGit := filepath.Join(root, ".git")
+			if info, err := os.Stat(dotGit); err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
+				return Response{Err: fmt.Sprintf("hook %q runs on the saved workspace, but it is not a git work tree: %s", hook.Name, root)}
+			}
+			// When ready, the projection is the saved text; hashing it still keys
+			// the per-revision cap on the composition the run saw.
+			revision = projectionRevision(g.Projection(ProjectionWithProposed))
+		} else {
+			proj = g.Projection(ProjectionWithProposed)
+			// A projection that reaches a second workspace root cannot be
+			// materialised from the primary one alone, exactly as for a projected
+			// exec: the scratch tree would silently omit those buffers, so the run
+			// is refused by name rather than run against a partial tree.
+			if p, ok := firstOutsideRoot(proj, root); ok {
+				return Response{Err: fmt.Sprintf("hook run materialises the primary root %s only; %s is under another workspace root, and multi-root projected hook runs are not supported", root, p)}
+			}
+			revision = projectionRevision(proj)
+		}
+		now := time.Now()
+		retryAfter, ok, reason := g.HookGate.Allow(hook.Name, revision, now)
+		if !ok {
+			return Response{Err: fmt.Sprintf("hook %q: %s", hook.Name, reason),
+				RetryAfterMS: int(retryAfter / time.Millisecond)}
+		}
+		// Begin on the event thread, so the very next admission -- this
+		// connection or another -- sees the run in flight. End runs on the
+		// connection goroutine once the command finishes.
+		g.HookGate.Begin(hook.Name, revision, now)
+		return Response{OK: true, Root: root, Projection: proj, HookRevision: revision,
+			HookArgv: hook.Argv, HookShell: hook.Shell, HookTree: string(hook.Tree),
+			HookMayWrite: hook.MayWrite, HookDetach: hook.Detach,
+			HookTimeoutMS: int(hook.Timeout / time.Millisecond),
+			HookBuiltin:   hook.Builtin, HookBuiltinArgs: hook.BuiltinArgs}
+	default:
+		return Response{Err: "hook: unknown mode " + req.HookMode}
+	}
+}
+
+// blockingBuffers returns the buffers that make a workspace unready for a gate:
+// an unsaved buffer or one holding a pending change set. It is the one
+// definition `raj ctl status` and workspace-hook admission both apply, so the
+// client answer and the server refusal cannot drift.
+func blockingBuffers(buffers []Buffer) []Buffer {
+	var out []Buffer
+	for _, b := range buffers {
+		if b.Dirty || b.Pending > 0 {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// hookWorkspaceBlockers names the buffers blocking a workspace-tree hook, one
+// per line and worded like the `raj ctl status` listing so the refusal and the
+// status command point at the same fix. An empty result means the saved tree is
+// exactly what the editor shows.
+func hookWorkspaceBlockers(buffers []Buffer) []string {
+	var out []string
+	for _, b := range blockingBuffers(buffers) {
+		name := b.Path
+		if name == "" {
+			name = "(unnamed buffer, not addressable)"
+		}
+		var reasons []string
+		if b.Dirty {
+			reasons = append(reasons, "dirty")
+		}
+		if b.Pending > 0 {
+			reasons = append(reasons, fmt.Sprintf("%d pending", b.Pending))
+		}
+		out = append(out, name+": "+strings.Join(reasons, ", "))
+	}
+	return out
+}
+
+// hookCallerAgent reports whether author is an agent driver rather than the
+// local human or a joined human. The local keyboard row is LocalHuman; a joined
+// human is a durable participant of KindHuman, the same predicate writesAsHuman
+// applies to a write. Everything else -- a durable agent, a provisional
+// connection -- counts as an agent, because the hook Agent flag exists to gate
+// exactly those drivers. Without a registry, the id rule still excludes the
+// local human and treats every other writer as an agent.
+func (g *Guard) hookCallerAgent(author uint8) bool {
+	return author != LocalHuman && !g.writesAsHuman(author)
+}
+
+// hookRaw converts a control row to the hooks domain's raw input, so put's
+// validation goes through the same Parse the host applies.
+func hookRaw(row HookRow) hooks.Raw {
+	return hooks.Raw{
+		Name: row.Name, Action: row.Action, Trigger: row.Trigger, Tree: row.Tree, Agent: row.Agent,
+		CooldownMS: row.CooldownMS, TimeoutMS: row.TimeoutMS,
+		MayWrite: row.MayWrite, Detach: row.Detach, Enabled: row.Enabled,
+	}
+}
+
+// dispatchGit answers the read-only git verb. Git runs host-side against the
+// workspace root and moves no ref: status, diff, show, numstat and log only
+// read. The service rides on the Guard so a test can inject a fake runner or a
+// service aimed at a temp repository; a nil one builds a real service over the
+// workspace root.
+func dispatchGit(g *Guard, req Request) Response {
+	svc := g.Git
+	if svc == nil {
+		svc = git.New(g.Root())
+	}
+	result, err := svc.Call(context.Background(), git.Query{
+		Mode: req.GitMode, Path: req.Path, Rev: req.GitRev, Count: req.GitCount})
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, GitJSON: string(data)}
 }
 
 func done(v uint64, err error) Response {

@@ -95,10 +95,14 @@ Define one API in `piecetable`:
   still moves later coordinates, because later ops were written in a frame that
   contained it. Excluded bytes are dropped, not the coordinate shift.
 
-  1a defines this only for journals where no included op sits inside an excluded
-  op. In production that case cannot arise: the leases in §12.1 make spans
-  disjoint, so the projection never chooses an anchor. Overlap is 1c invalidation
-  reporting, not a composition rule.
+  1a's overlap case is now defined too. The leases in §12.1 do not make every
+  journal disjoint: the agent path treats a Proposed run as advisory, and a set
+  can be rejected after an accepted edit has already consumed part of its
+  inserted run. When that has happened, the run's newline bytes survive as
+  structural separators and only its remaining bytes are removed, so the
+  excluded run cannot fuse the accepted text around it; an intact run is
+  removed whole. Overlap remains 1c invalidation reporting as well: the
+  projection composes a defined result rather than choosing an anchor.
 
 Resolved 2026-09-11:
 
@@ -129,7 +133,12 @@ Resolved 2026-09-11:
 - **`save`** — writes `AcceptedOnly`, never proposed text. For phase 1 it keeps
   refusing while anything is proposed, so cmd+s still means what it means today;
   the composition split is visible as `save`/`exec` (`AcceptedOnly`) versus the
-  screen (accepted + proposed), and accept/save stay separable gestures.
+  screen (accepted + proposed), and accept/save stay separable gestures. The
+  verb is the user's: only the local keyboard row and a durable joined human (an
+  attached client) may run it, a connection
+  cannot claim the human's id (the author on the wire is stamped from the
+  connection, not believed), and an agent's `save` is refused by raj itself —
+  the edit stays in the buffer and the user's own save writes it.
 - **`exec`** — materialise `AcceptedOnly` and run against that; the stale-run
   counter finally has a composition to check against.
 - **LSP** — sync `AcceptedOnly` under a policy, or the compiler sees rejected
@@ -146,7 +155,74 @@ The journal plus decisions is the artifact that survives a restart. It holds:
     journal     the ops, append-only
     decisions   group id -> state
     authors     author id -> identity string, name, kind
+    revisions   per applied version: path, version, blob_sha, algorithm, task, applied_at
     session     tabs, cursors, scroll, focus (today's session.json)
+
+**Git measurement on each revision.** Every applied version records the git blob
+id of the file's bytes at that version — `sha1("blob <len>\0" + bytes)` —
+computable without git and without writing an object, so it works with no
+checkout. It is the smallest git-shaped fact about a change: enough to match a
+revision against a commit's tree, and to prove a rebuild (replay to version V,
+hash the bytes, compare). It is per revision, not per op: one hash per accepted
+version (or per save/export), never per keystroke. `task` carries the intent (the
+key `scripts/call-runs.mjs` joins on) and `applied_at` says whether it became
+part of the agreed composition. The algorithm is stored because git is sha1
+today and sha256 exists; without it a migration makes old ids look wrong.
+
+**Time travel and revert, without git.** The journal is append-only, so a past
+state is reconstructed rather than remembered:
+
+- **by ops:** replay to a sequence number — the ops are ordered — gives the text
+  at that point;
+- **by decision:** the decisions must be logged append-only too. A
+  `decisions` map only holds the *current* state, so a decision log
+  (`group, state, seq`) is needed to know what was accepted at a past point;
+- **by author:** every op carries author/group/task, so "revert agent X's change"
+  is a new rejection decision for that group, not a text edit — the other changes
+  stay, and un-rejecting restores it.
+
+A revert is therefore a **decision event, not a rewrite**: nothing is mutated,
+the history shows both the change and its reversal, and a revision's `blob_sha`
+proves the reconstructed bytes match a known state. This is *not* git revert or
+checkout — no commits, no branches; a git export is a separate snapshot.
+Compaction bounds how far back replay is cheap (deferred), but the log is the
+record.
+
+**The session program, and its inverse.** A session's changes are a nameable set —
+every op carries author/group/task — so they compile into one `run --prog` frame:
+
+- **forward** — the session's groups and their decisions: "this was the entire
+  change set";
+- **inverse** — `reject`/`clear` for those groups: the deterministic way back, in
+  one frame.
+
+`session-prog <task>` (and `--inverse`) is the shape; it reads the journal, not
+git, and needs no model.
+
+Two rules to keep straight:
+
+- `revert`/`reverseGroup` is **text-level** and **self-only**: a writer can only
+  revert its own pieces. Reverting *another* writer's change is decision-level
+  (`reject`/`clear`), which is non-destructive and is the better default.
+- The forward program is also a **fingerprint**: comparing programs across
+  sessions is how a repeated intention's pattern is found and codified into a
+  skill, then a deterministic plugin.
+
+**The manifest, and the program derived from it.** The durable record of a
+session's work is **data, not code**:
+
+    manifest(task) = [ { group, path, blob_before, blob_after, decision } ]
+
+- It is the audit, the revert source and the pattern fingerprint in one.
+- A `run --prog` blob is **derived** from it on demand: per path, then
+  `group <id>` plus `accept`/`reject`/`clear`. Decisions are coordinate-free, so
+  the derived program does not go stale when the code moves.
+- Programs are never stored, so they cannot rot; recompile one from the manifest
+  whenever it is wanted.
+
+The **task key is an opaque string** (today an opencode session/message id). raj
+records it; it does not need opencode to read its own manifest. opencode is one
+harness that *feeds* the key, not the keeper of the record.
 
 **Engine: deferred.** Phase 0 writes a dependency-free, append-only log: each
 record length-prefixed and checksummed, decoded until the first short or bad
@@ -353,9 +429,11 @@ Resolved 2026-09-12 (supersedes 2, 4 and 6; retires the promote rule):
    supplies the evidence).
    The human typing path (`EditLeased`) is unchanged and
    still treats a Proposed run as read-only. Overlap through the agent path is
-   therefore advisory rather than prevented; where an accepted edit consumes a
-   proposal's inserted run, the agreed composition is the undefined overlap
-   §12.3's `Invalid` flag resolves, and the projection does not yet.
+   therefore advisory rather than prevented; where an accepted edit consumes
+   part of a proposal's inserted run, the agreed composition is defined by
+   `unapplyRemoveInsKeepNewlines`: the run's newlines survive as structural
+   separators, so removing the excluded run cannot fuse the accepted text
+   around it. §12.3's `Invalid` flag still covers the wholly consumed run.
 2. **Rejected and invalidated spans are hidden from the edit view and annotated
    in Review mode.** Edit mode shows accepted + proposed; Review mode shows every
    state with its annotation; `save`/`exec` still see `AcceptedOnly`, while

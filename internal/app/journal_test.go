@@ -343,6 +343,117 @@ func TestJournalRestoresAuthorTable(t *testing.T) {
 	}
 }
 
+// A write records the task its author was working under, so a restart seeds
+// the participant with it and a manifest built from the restored session still
+// finds the work each change set belongs to. The task is derived from the
+// author row, the same record that carries the identity and kind.
+func TestJournalSeedTask(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := controlHarness(t, "hello\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	id, err := h.control.Participants.Join("agent-task", "claude-task", control.KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.control.Participants.SetTask(id, "task-3")
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Author(id), p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 0, Text: "A"}})
+	p.File.End()
+	group := p.File.Session().LastGroup()
+	h.flushJournal(p)
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.primaryRoot(), 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	sock := controlSock(t, "c-task.sock")
+	if err := a.StartControl(sock); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.StopControl)
+
+	got, ok := a.control.Participants.Get(id)
+	if !ok {
+		t.Fatalf("author %d missing from the restored registry", id)
+	}
+	if got.Task != "task-3" {
+		t.Errorf("restored participant task = %q, want task-3", got.Task)
+	}
+
+	var restored *editor.File
+	for _, tab := range a.Tabs.All() {
+		if tab.File.Path == p.File.Path {
+			restored = tab.File
+			break
+		}
+	}
+	if restored == nil {
+		t.Fatal("the restored buffer is not open")
+	}
+	if task := restored.Session().GroupTask(group); task != "task-3" {
+		t.Errorf("restored group %d task = %q, want task-3", group, task)
+	}
+}
+
+// A participant whose name is registered after its first write is restored
+// under that name: the author row is written again when the name changes, and
+// the last row for an id wins, so a restart does not fall back to the identity
+// key the row first carried.
+func TestJournalRestoresARenamedAuthor(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := controlHarness(t, "hello\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	id, err := h.control.Participants.Join("agent-r", "", control.KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The identity-as-name fallback is what the first write records.
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Author(id), p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 0, Text: "A"}})
+	p.File.End()
+	h.flushJournal(p)
+
+	// register --name arrives after that write; a later write by the same
+	// author flushes again, and the row must be rewritten so the name, not the
+	// key, is what survives.
+	if _, err := h.control.Participants.Join("agent-r", "claude-r", control.KindAgent); err != nil {
+		t.Fatal(err)
+	}
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Author(id), p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 0, Text: "B"}})
+	p.File.End()
+	h.flushJournal(p)
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.primaryRoot(), 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	sock := controlSock(t, "c-rename.sock")
+	if err := a.StartControl(sock); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.StopControl)
+
+	got, ok := a.control.Participants.Get(id)
+	if !ok {
+		t.Fatalf("author %d missing from the restored registry", id)
+	}
+	if got.Name != "claude-r" {
+		t.Errorf("restored name = %q, want claude-r", got.Name)
+	}
+}
+
 // A log whose base no longer matches the disk is rotated into logs/archive and
 // the file opens clean; the next edit starts a fresh log whose base is the
 // current bytes, rather than refusing or appending to the archived one.
@@ -904,6 +1015,83 @@ func TestJournalRestoreReplaysUnsavedEditAfterSave(t *testing.T) {
 	}
 }
 
+// A CRLF-to-LF rewrite is invisible to the decoded text: the buffer reads the
+// same either way. Base.Hash must digest the raw bytes, or the guard matches
+// and the log re-encodes its recorded CRLF shape over the LF file on the next
+// save, silently reverting the external edit.
+func TestJournalRestoreDetectsShapeOnlyExternalEdit(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, "a\r\nb\r\n")
+	defer h.closeJournals()
+
+	p := h.Pane()
+	if !p.File.Enc.CRLF {
+		t.Fatalf("setup: opened with %+v, want CRLF line endings", p.File.Enc)
+	}
+	h.typeText("X")
+	h.flushJournal(p)
+
+	logPath := filepath.Join(h.journalDir(), journalName(p.File.Path))
+	base, ok := baseOf(readLog(t, h, p.File.Path))
+	if !ok {
+		t.Fatal("the log has no base record")
+	}
+	// Precondition: the recorded base digests the CRLF bytes, not the decoded
+	// text, and the two really do differ for a CRLF origin.
+	raw, err := p.File.EncodeText(string(base.Bytes))
+	if err != nil {
+		t.Fatalf("encoding the origin: %v", err)
+	}
+	if base.Hash != hashBytes(raw) {
+		t.Fatalf("base hash = %q, want the raw-bytes digest", base.Hash)
+	}
+	if hashBytes(raw) == hashBytes(base.Bytes) {
+		t.Fatal("the CRLF origin must digest differently from its decoded text")
+	}
+
+	// An external tool rewrites the file with LF endings. The decoded text is
+	// unchanged; only the bytes moved.
+	if err := os.WriteFile(p.File.Path, []byte("a\nb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := editor.Open(p.File.Path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Enc.CRLF {
+		t.Fatal("the external edit did not change the shape")
+	}
+	if changed.Text() != string(base.Bytes) {
+		t.Fatalf("external text = %q, want the log origin text %q", changed.Text(), base.Bytes)
+	}
+
+	// A real restart has the tab in the session, so record it: without that the
+	// log reads as a clean leftover and is dropped before the guard runs.
+	h.sessionTick(time.Now())
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.primaryRoot(), 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Errorf("the shape-mismatched log still sits in the restore path (err=%v)", err)
+	}
+	if got := archivedLogs(t, a); len(got) != 1 {
+		t.Fatalf("archived logs = %d, want the shape-mismatched one", len(got))
+	}
+	if !strings.Contains(a.Status(), "changed on disk") {
+		t.Errorf("status = %q, want the changed-on-disk note", a.Status())
+	}
+	if a.Pane() == nil {
+		t.Fatal("the changed file did not open")
+	}
+	if got := a.Pane().File.Text(); got != string(base.Bytes) {
+		t.Errorf("restored text = %q, want the clean disk text %q", got, base.Bytes)
+	}
+}
+
 // A log with no encoding tail — an older log, or a default UTF-8/LF file —
 // must restore to the default and save exactly the text back. Sibling:
 // TestJournalSaveThenRestoreIsClean; this pins the default arm of the mapping
@@ -1055,5 +1243,90 @@ func TestJournalRecordsBufferEncoding(t *testing.T) {
 	}
 	if mark.Encoding != want {
 		t.Errorf("written encoding = %+v, want %+v", mark.Encoding, want)
+	}
+}
+
+// countAuthorRows counts the Author records in a scanned log.
+func countAuthorRows(l *journal.Log) int {
+	n := 0
+	for _, r := range l.Records {
+		if _, ok := r.(journal.Author); ok {
+			n++
+		}
+	}
+	return n
+}
+
+// A participant that only joins — never writes a buffer — still owns its row:
+// the author-table log carries it across a restart, so a listener keeps its id
+// and name instead of having them erased and its id recycled. A reconnect with
+// the same name appends no second row, because recordAuthor's change check sees
+// the row it already recorded.
+func TestJournalRestoresAJoinedAuthorWithoutAWrite(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := controlHarness(t, "hello\n")
+	defer h.closeJournals()
+
+	id, err := h.control.Participants.Join("listener-1", "chat", control.KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.drain() // the join is drained on the event thread and persisted
+
+	// The same identity reconnecting with the same name is not a new row.
+	if again, err := h.control.Participants.Join("listener-1", "chat", control.KindAgent); err != nil || again != id {
+		t.Fatalf("reconnect = %d, %v, want %d", again, err, id)
+	}
+	h.drain()
+
+	l, err := journal.Open(h.authorsLogPath())
+	if err != nil {
+		t.Fatalf("opening the author-table log: %v", err)
+	}
+	if got := countAuthorRows(l); got != 1 {
+		t.Fatalf("author rows = %d, want 1 (a repeat hello grew the log)", got)
+	}
+
+	// Restart: the row is read back and seeded before anything can recycle its
+	// id, even though the participant never wrote a buffer.
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.primaryRoot(), 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	sock := controlSock(t, "c-join.sock")
+	if err := a.StartControl(sock); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.StopControl)
+
+	got, ok := a.control.Participants.Get(id)
+	if !ok {
+		t.Fatalf("author %d missing from the restored registry", id)
+	}
+	if got.Name != "chat" {
+		t.Errorf("restored name = %q, want chat", got.Name)
+	}
+	if got.Identity != "listener-1" {
+		t.Errorf("restored identity = %q, want listener-1", got.Identity)
+	}
+	// A reconnect after the restart appends nothing either: the restored tap
+	// already carries the row, so the equality check holds across the restart.
+	if again, err := a.control.Participants.Join("listener-1", "chat", control.KindAgent); err != nil || again != id {
+		t.Fatalf("post-restart reconnect = %d, %v, want %d", again, err, id)
+	}
+	a.drainJoins()
+	l2, err := journal.Open(a.authorsLogPath())
+	if err != nil {
+		t.Fatalf("reopening the author-table log: %v", err)
+	}
+	if got := countAuthorRows(l2); got != 1 {
+		t.Errorf("author rows after a post-restart reconnect = %d, want 1", got)
+	}
+
+	// The restored id is not handed to a different identity.
+	if joined, err := a.control.Participants.Join("other", "other", control.KindAgent); err != nil || joined == id {
+		t.Errorf("Join(other) = %d, %v; the restored id %d was recycled", joined, err, id)
 	}
 }

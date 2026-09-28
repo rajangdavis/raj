@@ -10,6 +10,7 @@ import (
 // The fallback keeps a hint whenever its whole line, hints included, still
 // fits one visual row, so a wrap toggle no longer drops an installed hint.
 func TestWrapKeepsFittingHints(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	if !h.Pane().Wrap {
 		t.Fatal("setup: wrapping is on by default")
@@ -41,6 +42,7 @@ func TestWrapKeepsFittingHints(t *testing.T) {
 // the pane, while a hint on another line that fits is kept — and the dropped
 // line keeps the un-hinted column maths.
 func TestTooWideHintIsNotInstalled(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.Draw() // the fit test needs a laid-out width
 	h.installInlay(
@@ -65,6 +67,7 @@ func TestTooWideHintIsNotInstalled(t *testing.T) {
 // was too wide for the editor beside the sidebar appears once the sidebar
 // closes and the editor takes the whole terminal.
 func TestSidebarWidthChangeRefiltersHints(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.Draw()
 	// Wider than the editor-with-sidebar text width, narrower than the full

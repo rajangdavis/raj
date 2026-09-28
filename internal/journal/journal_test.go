@@ -106,6 +106,41 @@ func TestEncodingRoundTripsThroughBaseAndWritten(t *testing.T) {
 	}
 }
 
+// An author row written before Task existed ends after Kind. It must still
+// load, with the empty task meaning none, rather than being refused as a
+// trailing-bytes record or read past its end.
+func TestLegacyJournalNoTask(t *testing.T) {
+	e := &encoder{}
+	e.u8(3)
+	e.str("tok_old")
+	e.str("claude")
+	e.u8(uint8(Agent))
+	if e.err != nil {
+		t.Fatal(e.err)
+	}
+	rec, err := decodeRecord(KindAuthor, e.b)
+	if err != nil {
+		t.Fatalf("legacy author record: %v", err)
+	}
+	a, ok := rec.(Author)
+	if !ok {
+		t.Fatalf("record = %T, want Author", rec)
+	}
+	if a.Task != "" || a.ID != 3 || a.Identity != "tok_old" || a.Name != "claude" || a.Kind != Agent {
+		t.Errorf("legacy author = %+v, want the old fields and no task", a)
+	}
+
+	// Re-encoding is byte-for-byte the legacy payload: the empty task is
+	// omitted, so decode followed by encode still reproduces the record.
+	kind, payload, err := encodeRecord(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != KindAuthor || !bytes.Equal(payload, e.b) {
+		t.Errorf("re-encoded legacy author = %x (kind %d), want %x", payload, kind, e.b)
+	}
+}
+
 // A record written before the encoding field existed still decodes, and the
 // missing tail reads as the default — UTF-8, LF, no BOM. The old layout is a
 // prefix of the new one, so an older log's Base and Written decode without a

@@ -37,8 +37,12 @@ type Snapshot struct {
 	Store      [][]byte              `json:"store"`
 	Journal    []Op                  `json:"journal"`
 	GroupState map[uint64]GroupState `json:"group_state,omitempty"`
-	NextGroup  uint64                `json:"next_group"`
-	Compacted  []SnapshotOrigin      `json:"compacted,omitempty"`
+	// GroupTask carries the task each change set was opened under, so a
+	// restored session keeps the work its sets belong to through the same
+	// snapshot that carries the journal.
+	GroupTask map[uint64]string `json:"group_task,omitempty"`
+	NextGroup uint64            `json:"next_group"`
+	Compacted []SnapshotOrigin  `json:"compacted,omitempty"`
 }
 
 // SnapshotOrigin is the wire form of the session's unexported insOrigin: a
@@ -83,6 +87,9 @@ func (s *Session) SnapshotState() (Snapshot, error) {
 	}
 	if len(s.groupState) > 0 {
 		snap.GroupState = maps.Clone(s.groupState)
+	}
+	if len(s.groupTask) > 0 {
+		snap.GroupTask = maps.Clone(s.groupTask)
 	}
 	for _, c := range s.compacted {
 		snap.Compacted = append(snap.Compacted, SnapshotOrigin{Buf: c.buf, Start: c.start, End: c.end, Group: c.group})
@@ -145,6 +152,9 @@ func Restore(snap Snapshot) (*Session, error) {
 	// journal, which can be lower than the original's next id when a group was
 	// opened and produced no op. The snapshot carries the exact value.
 	s.group = snap.NextGroup
+	if len(snap.GroupTask) > 0 {
+		s.groupTask = maps.Clone(snap.GroupTask)
+	}
 	for _, c := range snap.Compacted {
 		s.compacted = append(s.compacted, insOrigin{buf: c.Buf, start: c.Start, end: c.End, group: c.Group})
 	}

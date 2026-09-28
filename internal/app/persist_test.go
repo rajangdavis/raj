@@ -32,6 +32,7 @@ func (h *harness) journalRow(t *testing.T, path string) (store.JournalEntry, boo
 // reopened buffer comes from disk and both the proposed text and the set are
 // gone.
 func TestJournalRestoresAProposedSetAcrossRestart(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	path := filepath.Join(root, "test.go")
 	if err := os.WriteFile(path, []byte("hello world\n"), 0o644); err != nil {
@@ -78,6 +79,7 @@ func TestJournalRestoresAProposedSetAcrossRestart(t *testing.T) {
 // next open is clean. Without the delete the saved bytes would be replaced on
 // reopen by the snapshot from just before the save.
 func TestJournalSaveClearsTheRow(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	path := filepath.Join(root, "test.go")
 	if err := os.WriteFile(path, []byte("one\n"), 0o644); err != nil {
@@ -116,6 +118,7 @@ func TestJournalSaveClearsTheRow(t *testing.T) {
 // row's digest, so the row is dropped and the disk version opens. Without the
 // digest check the stale unsaved text would silently overwrite the new file.
 func TestJournalDropsARowWhenTheDiskMoved(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	path := filepath.Join(root, "test.go")
 	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
@@ -148,6 +151,7 @@ func TestJournalDropsARowWhenTheDiskMoved(t *testing.T) {
 // The encoding is stored beside the snapshot, so a BOM and CRLF file comes back
 // in the shape it was read in rather than as bare UTF-8 LF.
 func TestJournalRoundTripsTheEncoding(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	path := filepath.Join(root, "test.go")
 	if err := os.WriteFile(path, []byte("\xef\xbb\xbfone\r\ntwo\r\n"), 0o644); err != nil {
@@ -175,6 +179,7 @@ func TestJournalRoundTripsTheEncoding(t *testing.T) {
 // never write a local row. The attach guard is the second line of defence behind
 // IsSnapshot.
 func TestJournalIsNotWrittenForAnAttachedClient(t *testing.T) {
+	t.Parallel()
 	srv := controlHarness(t, "hello\n")
 	ch := attachClient(t, srv)
 	ch.cli.drain()
@@ -188,6 +193,7 @@ func TestJournalIsNotWrittenForAnAttachedClient(t *testing.T) {
 // Browsing writes nothing: a clean buffer has no row, and a tick leaves it that
 // way. Without the dirty gate the tick would snapshot every open file.
 func TestJournalWritesNothingForACleanBuffer(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	path := filepath.Join(root, "test.go")
 	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {

@@ -24,9 +24,10 @@ func headlessListed(srv *harness, path string) bool {
 	return false
 }
 
-// The client shows the daemon real tabs, not the buffers an agent loaded to
-// read. Without the Headless filter StartClient gives a tab to every buffer in
-// the reply, and a phone shows files nobody has open in the workspace.
+// The client shows the daemon real tabs with unsaved work, not the buffers an
+// agent loaded to read. Without the Headless filter StartClient gives a tab to
+// every buffer in the reply, and a phone shows files nobody has open in the
+// workspace.
 func TestClientSkipsHeadlessBuffersOnAttach(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	dir := filepath.Dir(srv.Tabs.Active().File.Path)
@@ -42,6 +43,7 @@ func TestClientSkipsHeadlessBuffersOnAttach(t *testing.T) {
 	if !headlessListed(srv, probe) {
 		t.Fatal("setup: the probe was not registered headless")
 	}
+	srv.typeText("X") // unsaved work is what makes the real tab mirror
 
 	ch := attachClient(t, srv)
 	ch.cli.drain()
@@ -93,9 +95,11 @@ func TestClientWatchIgnoresHeadlessBuffers(t *testing.T) {
 	}
 }
 
-// A tab the daemon closes is closed on the client too. Without the removal
-// reconcile the client keeps showing a document the daemon no longer has open.
-func TestClientWatchClosesRemovedTab(t *testing.T) {
+// A clean daemon tab is never mirrored, so opening and then closing one on the
+// daemon changes nothing on the client: the leak was re-adopting a daemon tab
+// the client never took on. A mirrored dirty tab is sticky instead — a separate
+// test pins that a daemon discard does not remove it.
+func TestClientWatchDoesNotAdoptACleanDaemonTab(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	dir := filepath.Dir(srv.Tabs.Active().File.Path)
 	second := filepath.Join(dir, "second.go")
@@ -108,43 +112,55 @@ func TestClientWatchClosesRemovedTab(t *testing.T) {
 	}
 	ch := attachClient(t, srv)
 	ch.cli.drain()
-	if got := ch.cli.Tabs.Count(); got != 2 {
-		t.Fatalf("client tabs = %d, want 2", got)
+	if got := ch.cli.Tabs.Count(); got != 0 {
+		t.Fatalf("client tabs = %d, want a clean daemon to mirror nothing", got)
 	}
-	// Close the clean second tab on the daemon: the file stays, the tab goes.
+	// Close the clean second tab on the daemon: the file stays, the tab goes,
+	// and the client never had it to drop.
 	if r := c.do(srv, control.Request{Op: "close", Path: second}); !r.OK {
 		t.Fatalf("close = %+v", r)
 	}
 	srv.Handle(ui.Tick{})
-
-	deadline := time.After(3 * time.Second)
-	for ch.cli.Tabs.Count() != 1 {
-		select {
-		case <-deadline:
-			t.Fatalf("client tabs = %d, want 1 after the daemon closed one", ch.cli.Tabs.Count())
-		default:
-		}
-		srv.drain()
-		ch.cli.drain()
-		time.Sleep(time.Millisecond)
-	}
+	pumpFor(ch, 100*time.Millisecond)
 	for _, p := range ch.cli.Tabs.All() {
 		if p.File.Path == second {
-			t.Errorf("client kept a tab for the closed path %s", second)
+			t.Errorf("client adopted the clean daemon tab %s", second)
 		}
 	}
 }
 
-// A daemon tab opened after the client attached appears without a relaunch:
-// the reconcile mirrors every daemon real tab the client does not already show.
-// Without the continuous mirror a file opened on the laptop after the attach
-// stayed invisible on the phone.
+// A mirrored dirty tab stays when the daemon discards it: a client tab leaves
+// only when the user closes it there, not when the daemon does.
+func TestClientKeepsMirroredTabWhenDaemonDiscards(t *testing.T) {
+	srv := controlHarness(t, "hello\n")
+	path := srv.Tabs.Active().File.Path
+	srv.typeText("X")
+	ch := attachClient(t, srv)
+	ch.cli.drain()
+	if got := ch.cli.Tabs.Count(); got != 1 {
+		t.Fatalf("setup: client tabs = %d, want the mirrored dirty tab", got)
+	}
+	c := srv.dial(t)
+	if r := c.do(srv, control.Request{Op: "close", Path: path, Discard: true}); !r.OK {
+		t.Fatalf("close -discard = %+v", r)
+	}
+	srv.Handle(ui.Tick{})
+	pumpFor(ch, 100*time.Millisecond)
+	if !clientHasTab(ch, path) {
+		t.Errorf("the client dropped a mirrored tab when the daemon discarded it")
+	}
+}
+
+// A daemon tab with unsaved work opened after the client attached appears
+// without a relaunch: the reconcile mirrors a daemon real tab the client does
+// not already show. Without the continuous mirror a file opened and edited on
+// the laptop after the attach stayed invisible on the phone.
 func TestClientWatchAddsDaemonTabOpenedAfterAttach(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	ch := attachClient(t, srv)
 	ch.cli.drain()
-	if got := ch.cli.Tabs.Count(); got != 1 {
-		t.Fatalf("setup: client tabs = %d, want 1", got)
+	if got := ch.cli.Tabs.Count(); got != 0 {
+		t.Fatalf("setup: client tabs = %d, want a clean daemon to mirror nothing", got)
 	}
 	dir := filepath.Dir(srv.Tabs.Active().File.Path)
 	second := filepath.Join(dir, "second.go")
@@ -157,15 +173,18 @@ func TestClientWatchAddsDaemonTabOpenedAfterAttach(t *testing.T) {
 	}
 	// Precondition: the daemon really shows the new tab before the client is
 	// asked to converge on it.
-	found := false
+	var pane *editor.Pane
 	for _, p := range srv.Tabs.All() {
 		if p.File.Path == second {
-			found = true
+			pane = p
 		}
 	}
-	if !found {
+	if pane == nil {
 		t.Fatal("setup: the daemon has no tab for the new path")
 	}
+	// Unsaved work is what attaches it: a clean tab is not mirrored.
+	srv.Tabs.Focus(pane)
+	srv.typeText("Z")
 	srv.Handle(ui.Tick{})
 
 	deadline := time.After(3 * time.Second)
@@ -223,13 +242,22 @@ func TestClientSaveWritesOnTheDaemon(t *testing.T) {
 
 // A host refusal to save is the status, and the local snapshot is untouched.
 // The daemon refuses while proposals await the user; the phone save must show
-// that rather than forcing a local write.
+// that rather than forcing a local write. The warning now covers every human
+// save path, the desktop attach included, so the confirm's default (Save
+// anyway) is answered first and the daemon refusal is what lands in the status.
 func TestClientSaveRefusalIsStatus(t *testing.T) {
 	ch := newClientHarness(t) // carries a pending proposal on the daemon
 	ch.cli.drain()
 	p := ch.cli.Tabs.Active()
 	before := p.File
-	runClient(t, ch, func() { ch.cli.saveActive(nil) })
+	runClient(t, ch, func() {
+		ch.cli.saveActive(nil)
+		if !ch.cli.Prompt.Open {
+			t.Error("the desktop attach save did not open the confirm")
+			return
+		}
+		ch.cli.press("enter")
+	})
 
 	if p.File != before {
 		t.Error("a refused save refetched the buffer anyway")
@@ -271,14 +299,14 @@ func TestClientOpenLoadsThroughTheDaemon(t *testing.T) {
 	}
 	ch := attachClient(t, srv)
 	ch.cli.drain()
-	if got := ch.cli.Tabs.Count(); got != 1 {
-		t.Fatalf("setup: client tabs = %d, want 1", got)
+	if got := ch.cli.Tabs.Count(); got != 0 {
+		t.Fatalf("setup: client tabs = %d, want a clean daemon to mirror nothing", got)
 	}
 	runClient(t, ch, func() { ch.cli.OpenFile(fresh) })
 	ch.cli.drain()
 
-	if got := ch.cli.Tabs.Count(); got != 2 {
-		t.Fatalf("client tabs = %d, want the daemon-open file added", got)
+	if got := ch.cli.Tabs.Count(); got != 1 {
+		t.Fatalf("client tabs = %d, want the client-open file added", got)
 	}
 	p := ch.cli.Tabs.Active()
 	if p == nil || p.File.Path != fresh || p.File.Text() != "package fresh\n" {
@@ -297,25 +325,24 @@ func TestClientOpenLoadsThroughTheDaemon(t *testing.T) {
 func TestClientOpenAlreadyOpenFocuses(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	dir := filepath.Dir(srv.Tabs.Active().File.Path)
-	other := filepath.Join(dir, "other.go")
-	if err := os.WriteFile(other, []byte("package other\n"), 0o644); err != nil {
+	fresh := filepath.Join(dir, "fresh.go")
+	if err := os.WriteFile(fresh, []byte("package fresh\n"), 0o644); err != nil {
 		t.Fatal(err)
-	}
-	c := srv.dial(t)
-	if r := c.do(srv, control.Request{Op: "open", Path: other}); !r.OK {
-		t.Fatalf("open = %+v", r)
 	}
 	ch := attachClient(t, srv)
 	ch.cli.drain()
-	if got := ch.cli.Tabs.Count(); got != 2 {
-		t.Fatalf("setup: client tabs = %d, want 2", got)
+	runClient(t, ch, func() { ch.cli.OpenFile(fresh) })
+	ch.cli.drain()
+	if got := ch.cli.Tabs.Count(); got != 1 {
+		t.Fatalf("setup: client tabs = %d, want the opened path", got)
 	}
-	first := srv.Tabs.Active().File.Path
-	runClient(t, ch, func() { ch.cli.OpenFile(first) })
-	if got := ch.cli.Tabs.Count(); got != 2 {
+	// Re-opening an already client-owned path focuses it rather than reaching
+	// the daemon for a second tab.
+	runClient(t, ch, func() { ch.cli.OpenFile(fresh) })
+	if got := ch.cli.Tabs.Count(); got != 1 {
 		t.Errorf("client tabs = %d, want no duplicate from a re-open", got)
 	}
-	if p := ch.cli.Tabs.Active(); p == nil || p.File.Path != first {
+	if p := ch.cli.Tabs.Active(); p == nil || p.File.Path != fresh {
 		t.Errorf("client active = %+v, want the focused existing tab", p)
 	}
 }
@@ -367,10 +394,11 @@ func TestClientCloseRemovesTabWithoutPromptOrSave(t *testing.T) {
 
 // A tab the user closed locally is not re-added by a later reconcile while its
 // own daemon buffer is unchanged, even when another tab moves. Without the
-// snooze mark the watch would re-add it on the next wake.
+// snooze mark the watch would re-mirror the still-dirty tab on the next wake.
 func TestClientClosedTabStaysClosedWhileUnchanged(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	primary := srv.Tabs.Active().File.Path
+	srv.typeText("X") // unsaved work is what makes the daemon tabs mirror
 	dir := filepath.Dir(primary)
 	other := filepath.Join(dir, "other.go")
 	if err := os.WriteFile(other, []byte("package other\n"), 0o644); err != nil {
@@ -380,6 +408,17 @@ func TestClientClosedTabStaysClosedWhileUnchanged(t *testing.T) {
 	if r := c.do(srv, control.Request{Op: "open", Path: other}); !r.OK {
 		t.Fatalf("open = %+v", r)
 	}
+	var otherPane *editor.Pane
+	for _, p := range srv.Tabs.All() {
+		if p.File.Path == other {
+			otherPane = p
+		}
+	}
+	if otherPane == nil {
+		t.Fatal("setup: the daemon has no tab for other")
+	}
+	srv.Tabs.Focus(otherPane)
+	srv.typeText("Y")
 	ch := attachClient(t, srv)
 	ch.cli.drain()
 	if got := ch.cli.Tabs.Count(); got != 2 {
@@ -487,8 +526,8 @@ func TestClientCloseLoadedBufferLeavesNoDaemonTab(t *testing.T) {
 	ch.cli.drain()
 	runClient(t, ch, func() { ch.cli.OpenFile(fresh) })
 	ch.cli.drain()
-	if got := ch.cli.Tabs.Count(); got != 2 {
-		t.Fatalf("setup: client tabs = %d, want 2", got)
+	if got := ch.cli.Tabs.Count(); got != 1 {
+		t.Fatalf("setup: client tabs = %d, want 1", got)
 	}
 	idx := -1
 	for i, p := range ch.cli.Tabs.All() {
@@ -500,8 +539,8 @@ func TestClientCloseLoadedBufferLeavesNoDaemonTab(t *testing.T) {
 		t.Fatalf("no client tab for %s", fresh)
 	}
 	ch.cli.closeTabAt(idx)
-	if got := ch.cli.Tabs.Count(); got != 1 {
-		t.Errorf("client tabs = %d after close, want 1", got)
+	if got := ch.cli.Tabs.Count(); got != 0 {
+		t.Errorf("client tabs = %d after close, want 0", got)
 	}
 	if got := srv.Tabs.Count(); got != 1 {
 		t.Errorf("daemon real tabs = %d, want the client open to have added none", got)
@@ -532,19 +571,24 @@ func TestLocalOpenStillReadsFromDisk(t *testing.T) {
 
 // A close is durable against a fetch already in flight: a snapshot staged
 // before the close, whose daemon facts still match the close mark, is dropped
-// by the install re-check rather than re-adding the tab. Without the snooze the
-// install adds the tab back.
+// by the install re-check rather than re-adding the tab. The path is a
+// client-open — clean, so the mirror predicate would not re-add it — which
+// leaves the snooze as the only guard and the stale install as the test.
 func TestClientClosedPathDropsAStaleInstall(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
+	dir := filepath.Dir(srv.Tabs.Active().File.Path)
+	fresh := filepath.Join(dir, "fresh.go")
+	if err := os.WriteFile(fresh, []byte("package fresh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	ch := attachClient(t, srv)
 	ch.cli.drain()
-	p := ch.cli.Tabs.Active()
-	if p == nil {
-		t.Fatal("client attached with no tab")
-	}
-	path := p.File.Path
-	// A file the watch fetched before the close.
-	stale := editor.NewFile(path, "hello\n", 2)
+	runClient(t, ch, func() { ch.cli.OpenFile(fresh) })
+	ch.cli.drain()
+	path := fresh
+	// A file the watch fetched before the close: same version and review facts
+	// the client held, so the close mark still matches.
+	stale := editor.NewFile(path, "package fresh\n", 2)
 
 	ch.cli.closeTabAt(ch.cli.Tabs.Index())
 	if got := ch.cli.Tabs.Count(); got != 0 {

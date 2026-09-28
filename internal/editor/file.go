@@ -133,6 +133,14 @@ type File struct {
 	// and byte order mark — so a save reproduces what was opened.
 	Enc Encoding
 
+	// SaveCheck is the composition guard Save and SaveOver apply before they
+	// write. It lives here, like Enc, because the save path reads it off the
+	// File: the application resolves the save_check setting and installs it on
+	// a buffer just before a save. The zero value is SaveCheckOff, so a File
+	// built directly opts out; NewFile and NewRestoredFile install the
+	// default the setting names.
+	SaveCheck SaveCheck
+
 	// disk is what the file looked like the last time raj read or wrote it,
 	// so a save can refuse to clobber another writer's work.
 	disk stamp
@@ -195,6 +203,7 @@ func NewFile(path, content string, tab int) *File {
 		Syntax:     syntax.New(path, true),
 		dark:       true,
 		sess:       piecetable.NewSession(piecetable.NewDoc(content, 0)),
+		SaveCheck:  SaveCheckOff,
 		idx:        view.NewIndex(content),
 	}
 	f.markSaved(content) // what was opened is what is on disk
@@ -236,6 +245,7 @@ func NewRestoredFile(path string, sess *piecetable.Session, tab int, wrote Resto
 		Syntax:     syntax.New(path, true),
 		dark:       true,
 		sess:       sess,
+		SaveCheck:  SaveCheckOff,
 		idx:        view.NewIndex(content),
 	}
 	f.applied = sess.Version()
@@ -508,6 +518,11 @@ func (f *File) SavedDigest() [sha256.Size]byte { return f.savedDisk }
 // SavedDigest. A restored buffer sets it from the log's Written marker, so
 // the next write records the same version the bytes carry.
 func (f *File) SavedVersion() piecetable.Version { return f.saved }
+
+// EncodeText returns the exact bytes text would be written as under the file's
+// recorded encoding. The op log digests a buffer's origin by these bytes rather
+// than its decoded text, so a shape-only external edit is visible on restore.
+func (f *File) EncodeText(text string) ([]byte, error) { return encode(text, f.Enc) }
 
 // Name is the file's base name, or a placeholder for an unnamed buffer.
 func (f *File) Name() string {
@@ -935,13 +950,14 @@ func (f *File) applyToIndex(op piecetable.Op) {
 }
 
 // UnsavedProposedError reports a save the editor refused because it would have
-// written the agreed composition while the edit view still shows text from a
-// superseded change set. The sets it names are still Proposed but Invalid --
-// every member a later edit moved past -- so the save's AcceptPending does not
-// agree to them and Project(AcceptedOnly) omits them, while a rejected collider
-// can restore their run to the edit view. Refusing is the safe default for
-// text: the save wrote nothing and changed no decision, and the error names the
-// two gestures that resolve it.
+// written the agreed composition while the edit view still showed text from a
+// superseded change set. Project excludes an Invalid set from the edit
+// composition as well as the agreed one, so UnsavedProposed is empty and this
+// is a defensive guard -- it can only fire if the projection and the save
+// disagree about what the view holds. Refusing is the safe default for text
+// when that happens: the save writes nothing and changes no decision. The
+// decided behaviour for an invalid set at the save gesture is disposal and a
+// reported count, performed by the app-level save before it reaches here.
 type UnsavedProposedError struct {
 	// Groups are the still-Proposed sets the save would have dropped, oldest
 	// first.
@@ -968,6 +984,10 @@ func (e *UnsavedProposedError) Error() string {
 // before it reaches here. But the acceptance only stands if the text can be
 // written: a save whose encoding refuses the text rolls that acceptance back,
 // so a write that never happens approves nothing.
+//
+// The composition guard runs at the same point, before the write: a text
+// that fails the active save_check is refused with a SaveCheckError and its
+// acceptance is rolled back the same way.
 //
 // The write is atomic — see writeAtomic — so an interrupted save leaves the
 // previous file rather than a truncated one.
@@ -1004,11 +1024,11 @@ func (f *File) SaveOver() error {
 	}
 	// AcceptPending has agreed to every set with a surviving hunk, but a
 	// Proposed set with none -- an Invalid, superseded set -- is left out of
-	// the agreed composition, and a rejected collider can still restore its run
-	// to the edit view. Writing now would drop text the user can see with
-	// nothing on screen to say so, so refuse and roll the acceptance back:
-	// UnsavedProposedError names the sets and the two gestures that resolve
-	// them.
+	// the agreed composition. Project excludes such a set from the edit
+	// composition too, so there is no run a save would drop and UnsavedProposed
+	// is empty; the check below is a guard should the projection and the save
+	// ever disagree. Refusing still rolls the acceptance back, so a write that
+	// never happened approves nothing.
 	if dropped := f.sess.UnsavedProposed(); len(dropped) > 0 {
 		for _, g := range pending {
 			f.sess.MarkGroup(g.ID, piecetable.Proposed)
@@ -1016,6 +1036,15 @@ func (f *File) SaveOver() error {
 		return &UnsavedProposedError{Groups: dropped}
 	}
 	content := f.sess.Project(piecetable.AcceptedOnly).Text()
+	// A composition the session's decisions fused or left unbalanced must
+	// not reach disk: the buffer on screen can still look fine. Refuse and
+	// roll the acceptance back exactly as a refused encode does.
+	if err := CheckSaveText(f.Path, content, f.SaveCheck); err != nil {
+		for _, g := range pending {
+			f.sess.MarkGroup(g.ID, piecetable.Proposed)
+		}
+		return err
+	}
 	data, err := encode(content, f.Enc)
 	if err != nil {
 		for _, g := range pending {
@@ -1036,9 +1065,9 @@ func (f *File) SaveOver() error {
 	// member of which a later edit moved past, holding no text and blocking
 	// nothing. Left Proposed they keep a buffer that matches disk reporting a
 	// decision forever, and its groups listing never settles.
-	// InvalidWithoutMembers is empty while a rejected collider still restores a
-	// run to the view -- the refusal case above -- so this can only mark
-	// memberless sets, and the bytes written are identical with or without it.
+	// An invalid set is in neither composition, so this marks the memberless
+	// half and the bytes written are identical with or without it; a set that
+	// removed text is left to the disposal path.
 	// Rejecting is the same state-only disposal ClearGroup gives a memberless
 	// invalid Proposal, and it keeps a later un-reject of the collider from
 	// resurrecting the run as agreed text.

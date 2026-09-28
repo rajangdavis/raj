@@ -26,6 +26,7 @@ func main() {
 // chord would ask a server that answers method-not-found and show a transport
 // error where the scanner should have been consulted.
 func TestDocumentSymbolCapabilityGate(t *testing.T) {
+	t.Parallel()
 	if got := capabilityGap(nil, "document symbols"); got != "language server does not support document symbols" {
 		t.Errorf("absent provider: gap = %q", got)
 	}
@@ -42,6 +43,7 @@ func TestDocumentSymbolCapabilityGate(t *testing.T) {
 // only one that advertised the provider takes the request. Reading the wrong
 // capability here would send every symbol jump to a method the server refuses.
 func TestCanAnswerDocumentSymbols(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		ls   *langServer
@@ -74,6 +76,7 @@ func TestCanAnswerDocumentSymbols(t *testing.T) {
 // liveness would take the LSP path against a connection that is not there and
 // open no overlay at all.
 func TestGotoSymbolFallsBackToTheScannerWithoutALiveServer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, goSrc)
 	key := serverKey{root: h.servers.rootFor(h.Pane().File.Path), lang: lsp.LanguageID(h.Pane().File.Path)}
 	h.servers.byID[key] = &langServer{
@@ -102,6 +105,7 @@ func TestGotoSymbolFallsBackToTheScannerWithoutALiveServer(t *testing.T) {
 // than the name. Enter opens the chosen declaration through the same path a
 // reference uses.
 func TestDocumentSymbolsOpenThePicker(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, documentSymbolSrc)
 	path := h.Pane().File.Path
 	h.lspGen = 1
@@ -162,6 +166,7 @@ func TestDocumentSymbolsOpenThePicker(t *testing.T) {
 // No symbols is a word on the status line, not an empty overlay — the same
 // answer the scanner gives, so the two sources behave alike when empty.
 func TestDocumentSymbolsNotFound(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerDocumentSymbols})
@@ -178,6 +183,7 @@ func TestDocumentSymbolsNotFound(t *testing.T) {
 // generation counter guards it so a reply for a chord the user has passed is
 // not shown as though it answered the current one.
 func TestDocumentSymbolsStaleAnswerDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, documentSymbolSrc)
 	path := h.Pane().File.Path
 	h.lspGen = 5
@@ -200,6 +206,7 @@ func TestDocumentSymbolsStaleAnswerDropped(t *testing.T) {
 // is not told sends the flat SymbolInformation shape instead, which loses the
 // nesting the picker indents.
 func TestDocumentSymbolCapabilityAsksForHierarchy(t *testing.T) {
+	t.Parallel()
 	caps := clientCapabilities()
 	td, _ := caps["textDocument"].(map[string]any)
 	sym, ok := td["documentSymbol"].(map[string]any)

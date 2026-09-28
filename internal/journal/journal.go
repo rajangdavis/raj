@@ -202,9 +202,10 @@ const (
 // codec only ever writes the kinds below.
 type Record interface{ recordKind() RecordKind }
 
-// Base is the origin: the file the log started from. Bytes is the content as
-// first read, Hash a digest of it to detect a workspace that moved underneath
-// the editor.
+// Base is the origin: the file the log started from. Bytes is the decoded
+// content as first read, Hash a digest of the exact raw bytes it decoded from --
+// encoding included -- so a shape-only move (CRLF to LF, a dropped BOM) is
+// detected as a workspace that changed underneath the editor.
 type Base struct {
 	Path  string
 	Hash  string
@@ -262,17 +263,22 @@ type Decision struct {
 func (Decision) recordKind() RecordKind { return KindDecision }
 
 // Author is one author-table row: the byte its text carries, the durable
-// identity behind it, a display name, and what kind of writer it is.
+// identity behind it, a display name, and what kind of writer it is. Task is
+// the work the writer's changes belong to, so a restart seeds the participant
+// with the task its register call pinned. It trails the older fields and is
+// omitted when empty, so a legacy log's bytes are unchanged.
 type Author struct {
 	ID       uint8
 	Identity string
 	Name     string
 	Kind     ParticipantKind
+	Task     string
 }
 
 func (Author) recordKind() RecordKind { return KindAuthor }
 
 // Session is the view-state blob: tabs, cursors, scroll, focus. The journal
+
 // stores the bytes; the shape of them is internal/app's business.
 type Session struct {
 	Blob []byte
@@ -620,7 +626,11 @@ func encodeRecord(r Record) (RecordKind, []byte, error) {
 		e.str(v.Identity)
 		e.str(v.Name)
 		e.u8(uint8(v.Kind))
+		if v.Task != "" {
+			e.str(v.Task)
+		}
 	case Written:
+
 		e.str(v.Path)
 		e.str(v.Hash)
 		e.u64(v.Version)
@@ -680,7 +690,14 @@ func decodeRecord(kind RecordKind, b []byte) (Record, error) {
 	case KindDecision:
 		r = Decision{Group: d.u64(), State: GroupState(d.u8())}
 	case KindAuthor:
-		r = Author{ID: d.u8(), Identity: d.str(), Name: d.str(), Kind: ParticipantKind(d.u8())}
+		a := Author{ID: d.u8(), Identity: d.str(), Name: d.str(), Kind: ParticipantKind(d.u8())}
+		// Task is optional and trailing: a record an older log holds ends
+		// before it, and the empty string is what that means.
+		if d.off < len(d.b) {
+			a.Task = d.str()
+		}
+		r = a
+
 	case KindWritten:
 		w := Written{Path: d.str(), Hash: d.str(), Version: d.u64()}
 		w.Encoding = d.encoding()

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"raj/internal/control"
 	"raj/internal/piecetable"
 	"raj/internal/session"
 )
@@ -44,6 +45,7 @@ func mkTree(t *testing.T, h *harness) string {
 // A pending dir-removal raises the review at once, listing the subtree paths
 // and offering both answers.
 func TestDirRemovalProposalRaisesReview(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	dir := mkTree(t, h)
 	proposeDirRemoval(t, h, dir)
@@ -78,6 +80,7 @@ func TestDirRemovalProposalRaisesReview(t *testing.T) {
 // old one-truncated-line prompt; the listing wraps now, so the workaround is
 // gone and a row is openable as it stands.
 func TestDirRemovalPathsAreAbsoluteAndSorted(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	dir := mkTree(t, h)
 
@@ -159,6 +162,7 @@ func TestRemoveForeverTrashesDir(t *testing.T) {
 // A dirty buffer under the directory offers only Ignore: there is no force
 // path, and the subtree survives even though the prompt was answered.
 func TestRemoveForeverRefusedWhenSubtreeDirty(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	dir := mkTree(t, h)
 	h.OpenFile(filepath.Join(dir, "a.go"))
@@ -191,6 +195,7 @@ func TestRemoveForeverRefusedWhenSubtreeDirty(t *testing.T) {
 // A buffer holding a change set still awaiting a decision offers only Ignore
 // too; there is no force path, and the prompt names the set.
 func TestRemoveForeverRefusedWithPendingSetUnder(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	dir := mkTree(t, h)
 	h.OpenFile(filepath.Join(dir, "a.go"))
@@ -220,6 +225,7 @@ func TestRemoveForeverRefusedWithPendingSetUnder(t *testing.T) {
 // Ignore for now is the whole answer: the directory keeps working and the
 // proposal stays pending.
 func TestIgnoreDirRemovalKeepsProposal(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	dir := mkTree(t, h)
 	proposeDirRemoval(t, h, dir)
@@ -239,5 +245,110 @@ func TestIgnoreDirRemovalKeepsProposal(t *testing.T) {
 	}
 	if got := h.DirRemovals(); len(got) != 1 || got[0].Path != dir {
 		t.Errorf("pending dir-removals after Ignore = %+v, want the proposal kept", got)
+	}
+}
+
+// The control approve is the human answer for a whole subtree: it takes the
+// same removeDirDeleted path as the review's Remove forever, so the directory
+// leaves disk, the buffers under it close and the pending entry clears.
+func TestApproveDirRemovalRemovesTheTree(t *testing.T) {
+	t.Setenv("RAJ_TRASH", "")
+	h := newHarness(t, "hello\n")
+	dir := mkTree(t, h)
+	h.OpenFile(filepath.Join(dir, "a.go"))
+	proposeDirRemoval(t, h, dir)
+	if err := h.App.ApproveDirRemoval(dir); err != nil {
+		t.Fatalf("ApproveDirRemoval: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("directory still on disk after approve (err=%v)", err)
+	}
+	if got := h.DirRemovals(); len(got) != 0 {
+		t.Errorf("pending dir-removals after approve = %+v, want none", got)
+	}
+	if got := h.Tabs.Count(); got != 1 {
+		t.Errorf("tab count = %d, want only the original test.go left", got)
+	}
+}
+
+// Approving a directory with no pending proposal is refused by name.
+func TestApproveDirRemovalRefusesANotPendingPath(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	missing := filepath.Join(h.primaryRoot(), "nope")
+	err := h.App.ApproveDirRemoval(missing)
+	if err == nil || !strings.Contains(err.Error(), "no pending dir-removal") {
+		t.Fatalf("approve of a not-pending dir = %v, want a naming refusal", err)
+	}
+}
+
+// An agent may withdraw only its own pending dir-removal: a peer's proposal
+// survives. Precondition: a dir-removal proposed by one agent, a withdraw
+// naming a different agent.
+func TestWithdrawDirRemovalRefusesAPeerAgent(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	dir := mkTree(t, h)
+	proposeDirRemoval(t, h, dir)
+
+	peer := uint8(piecetable.Agent + 1)
+	err := h.App.WithdrawDirRemoval(dir, peer)
+	if err == nil || !strings.Contains(err.Error(), "not this writer") {
+		t.Fatalf("an agent withdrew a peer's dir-removal = %v, want the owner refusal", err)
+	}
+	if got := h.DirRemovals(); len(got) != 1 || got[0].Path != dir {
+		t.Errorf("pending dir-removals = %+v, want the proposal kept", got)
+	}
+}
+
+// The proposer withdraws its own dir-removal: the entry clears and the subtree
+// stays. Precondition: one agent's proposal, withdrawn by that same agent.
+func TestWithdrawDirRemovalByItsAgentClears(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	dir := mkTree(t, h)
+	proposeDirRemoval(t, h, dir)
+
+	owner := uint8(piecetable.Agent + 7)
+	if err := h.App.WithdrawDirRemoval(dir, owner); err != nil {
+		t.Fatalf("WithdrawDirRemoval(owner): %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("withdraw removed the directory: %v", err)
+	}
+	if got := h.DirRemovals(); len(got) != 0 {
+		t.Errorf("pending dir-removals = %+v, want none", got)
+	}
+}
+
+// A durable joined human may withdraw an agent's pending dir-removal too.
+// Precondition: a seeded Registry with a KindHuman row attached to the app's
+// guard, and a dir-removal proposed by an agent. Without the human branch the
+// owner check refuses and the proposal survives.
+func TestWithdrawDirRemovalAllowsAJoinedHuman(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	dir := mkTree(t, h)
+	proposeDirRemoval(t, h, dir)
+
+	reg := control.NewRegistry()
+	human, err := reg.Join("client:desk", "desk", control.KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if human == control.LocalHuman {
+		t.Fatalf("fixture: the joined human reused the local row %d", control.LocalHuman)
+	}
+	h.App.guard = control.NewGuard(hostOf(h.App))
+	h.App.guard.Participants = reg
+
+	if err := h.App.WithdrawDirRemoval(dir, human); err != nil {
+		t.Fatalf("a joined human's withdraw was refused: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("withdraw removed the directory: %v", err)
+	}
+	if got := h.DirRemovals(); len(got) != 0 {
+		t.Errorf("pending dir-removals = %+v, want none", got)
 	}
 }

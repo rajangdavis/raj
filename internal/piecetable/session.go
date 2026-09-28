@@ -24,6 +24,12 @@ type Session struct {
 	// groupState records decisions about change sets. Sparse: only groups that
 	// are not simply Accepted have an entry, so ordinary typing costs nothing.
 	groupState map[uint64]GroupState
+	// groupTask records the task each change set was opened under, keyed by
+	// group id. Sparse: an empty task -- the local human, or a no-task
+	// connection -- has no entry, so ordinary typing costs nothing and the
+	// default stays the empty string. A manifest derives its rows from it and
+	// a snapshot carries it, so it lives exactly as long as the journal does.
+	groupTask map[uint64]string
 	// reversers maps an op to the ops that reverse it. Whether an op is in
 	// effect is DERIVED from this rather than tracked as a flag: op X is live
 	// exactly when no live op reverses it. A flag cannot express that, because
@@ -283,6 +289,14 @@ func (s *Session) ApplyDiff(author Author, base Version, hunks []Hunk) (Version,
 		start, end, at, ok := s.rebase(h.Start, h.End, base)
 		if !ok {
 			conflicts = append(conflicts, Conflict{Index: i, Hunk: h, At: at})
+			continue
+		}
+		// A hunk that replaces a range with the bytes already there is no
+		// change either. Rebasing can carry it onto identical text without the
+		// caller knowing, and committing it would open a change set whose only
+		// member nets zero -- a set with nothing to review. Skip it before it
+		// can, the same way the empty hunk above is skipped.
+		if end > start && h.Text != "" && string(s.buf.Slice(start, end-start)) == h.Text {
 			continue
 		}
 		// A pending or rejected span is a read-only lease, but the two states

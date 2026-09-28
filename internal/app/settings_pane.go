@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"raj/internal/editor"
 	"raj/internal/keys"
 	"raj/internal/store"
 	"raj/internal/ui"
@@ -16,7 +17,7 @@ import (
 // where the cursor is, which scope the next write goes to, and the digits of a
 // half-typed width.
 //
-// The language-server settings will be a later section under the five editor
+// The language-server settings will be a later section under the six editor
 // settings. It is deliberately not sketched here as a row: a row with no
 // behaviour behind it is dead code, and settingsRows is the seam to add it.
 
@@ -27,6 +28,7 @@ const (
 	settingsRowScope   settingsRowKind = iota // choose the scope writes go to
 	settingsRowNumeric                        // a positive integer, edited in place
 	settingsRowBool                           // on or off
+	settingsRowChoice                         // one of a small set of named values, cycled in place
 )
 
 // settingsRow is one line of the pane.
@@ -46,6 +48,7 @@ func settingsRows() []settingsRow {
 		{key: settingWrap, label: "Wrap lines", kind: settingsRowBool},
 		{key: settingAutoPairs, label: "Auto pairs", kind: settingsRowBool},
 		{key: settingInlayHints, label: "Inlay hints", kind: settingsRowBool},
+		{key: settingSaveCheck, label: "Save check", kind: settingsRowChoice}, // off | parse
 	}
 }
 
@@ -136,6 +139,8 @@ func (p *settingsPane) activate(a *App) {
 		// display spelling, so the store keeps one representation of a bool
 		// however the pane happens to draw it.
 		p.write(a, r.key, strconv.FormatBool(!truthy(a.Settings()[r.key])))
+	case settingsRowChoice:
+		p.cycle(a, r.key, +1)
 	}
 }
 
@@ -159,7 +164,38 @@ func (p *settingsPane) step(a *App, delta int) {
 		p.write(a, r.key, strconv.Itoa(n))
 	case settingsRowBool:
 		p.write(a, r.key, strconv.FormatBool(delta > 0))
+	case settingsRowChoice:
+		p.cycle(a, r.key, delta)
 	}
+}
+
+// saveCheckChoices is the cycle order of the save_check row. "off" never
+// refuses a save; "parse" runs go/parser on .go files and refuses the first
+// parse error.
+var saveCheckChoices = []string{"off", "parse"}
+
+// cycle writes the next or previous value of a named-value row. Only
+// save_check is one today; the helper keeps the wrapping and the current-value
+// lookup in one place.
+func (p *settingsPane) cycle(a *App, key string, delta int) {
+	if key != settingSaveCheck {
+		return
+	}
+	cur, _ := editor.ParseSaveCheck(a.Settings()[key])
+	name := cur.String()
+	i := 0
+	for j, v := range saveCheckChoices {
+		if v == name {
+			i = j
+			break
+		}
+	}
+	n := len(saveCheckChoices)
+	i = (i + delta) % n
+	if i < 0 {
+		i += n
+	}
+	p.write(a, key, saveCheckChoices[i])
 }
 
 // handleEdit is the tab_width field: digits build the buffer, enter commits,
@@ -309,8 +345,8 @@ func (p *settingsPane) line(r settingsRow, vals, origin map[string]string, w int
 // or default layer that actually won, not the layer that named the broken key.
 func (a *App) settingOrigins() map[string]string {
 	user, workspace := settingScopes(a.state)
-	out := make(map[string]string, 5)
-	for _, key := range []string{settingTabWidth, settingTabs, settingWrap, settingAutoPairs, settingInlayHints} {
+	out := make(map[string]string, 6)
+	for _, key := range []string{settingTabWidth, settingTabs, settingWrap, settingAutoPairs, settingInlayHints, settingSaveCheck} {
 		switch {
 		case settingValueValid(key, workspace[key]):
 			out[key] = store.ScopeWorkspace

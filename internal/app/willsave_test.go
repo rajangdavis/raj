@@ -15,6 +15,7 @@ import (
 // when neither does. Without the capability read the hook would ask every
 // server for an answer the protocol says it does not provide.
 func TestWillSaveActionOnlyWhenAdvertised(t *testing.T) {
+	t.Parallel()
 	none := lsp.ServerCapabilities{}
 	wait := lsp.ServerCapabilities{TextDocumentSync: json.RawMessage(`{"willSaveWaitUntil":true}`)}
 	notify := lsp.ServerCapabilities{TextDocumentSync: json.RawMessage(`{"willSave":true}`)}
@@ -64,6 +65,7 @@ func waitForWillSave(h *harness, edits []lsp.TextEdit) {
 // the ordering the save would write the unformatted bytes first and the server
 // edits would only dirty the buffer afterwards.
 func TestWillSaveEditsLandBeforeTheWrite(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	waitForWillSave(h, []lsp.TextEdit{{
 		Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 8}, End: lsp.Position{Line: 0, Character: 12}},
@@ -87,6 +89,7 @@ func TestWillSaveEditsLandBeforeTheWrite(t *testing.T) {
 // Without the fall-through a failed formatter would strand the buffer dirty
 // with the bytes never reaching disk.
 func TestWillSaveFailureStillSaves(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	waitForWillSave(h, nil)
 	h.applyAnswer()
@@ -107,6 +110,7 @@ func TestWillSaveFailureStillSaves(t *testing.T) {
 // file, and skipping the write would lose the save. The disk shows the edit
 // did not land and the user text did.
 func TestWillSaveStaleEditsAreDroppedButTheSaveLands(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	waitForWillSave(h, []lsp.TextEdit{{
 		Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 8}, End: lsp.Position{Line: 0, Character: 12}},
@@ -133,6 +137,7 @@ func TestWillSaveStaleEditsAreDroppedButTheSaveLands(t *testing.T) {
 // answers. Without the check File.Save would accept the proposal and write it,
 // approving work the user never saw.
 func TestWillSaveResumeReroutesWhenAProposalArrives(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	waitForWillSave(h, []lsp.TextEdit{{
 		Range:   lsp.Range{Start: lsp.Position{Line: 0, Character: 6}, End: lsp.Position{Line: 0, Character: 11}},
@@ -162,6 +167,7 @@ func TestWillSaveResumeReroutesWhenAProposalArrives(t *testing.T) {
 // the buffer. Without the nil-server guard the save would wait on a server
 // that was never started and never arrive.
 func TestWillSaveWithoutAServerSavesNormally(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.typeText("x")
 	want := h.text()
@@ -187,6 +193,7 @@ func TestWillSaveWithoutAServerSavesNormally(t *testing.T) {
 // chose to discard. resumeSave checks that the pane is still open before it
 // writes and drops the answer otherwise.
 func TestWillSaveResumeDoesNotWriteAClosedPane(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.typeText("x") // a change, so the close is a decision the user made
 	p := h.Pane()

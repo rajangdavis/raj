@@ -33,6 +33,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -46,6 +47,9 @@ import (
 	"syscall"
 	"time"
 
+	"raj/internal/git"
+	"raj/internal/hooks"
+	"raj/internal/hooks/builtin"
 	"raj/internal/safe"
 )
 
@@ -78,10 +82,11 @@ type Request struct {
 	// alongside Path.
 	NewPath string
 	// Author is the writer this request claims to be. Zero means "whatever the
-	// connection was assigned". Only revert compares a non-zero claim to the
-	// connection's real author and refuses a mismatch, because it discards that
-	// writer's pieces. A few verbs compare it to a stored record's owner, but
-	// the field is trusted for attribution, so tightening that is a TODO.
+	// connection was assigned", and connection.one stamps it so. Any other
+	// value must equal the connection's real author: every verb, direct or a
+	// program sub-request, is refused otherwise (errAuthorSpoof, or the
+	// contract wording save, revert, approve and withdraw pin). send, hook and
+	// exec read it as inert data and act as the connection regardless.
 	Author uint8
 	Base   *uint64
 	Hunks  []Hunk
@@ -103,6 +108,27 @@ type Request struct {
 	// never re-implements the editor's byte model.
 	LineStart *int
 	LineEnd   *int
+
+	// GitMode names the git sub-operation: status, diff, show, numstat or
+	// log. GitRev is the revision it reads (empty means HEAD) and GitCount
+	// caps log. They are read-only: git owns durable history and raj moves
+	// no ref through them.
+	GitMode  string
+	GitRev   string
+	GitCount int
+
+	// HookMode names the hook sub-operation: list, show, run, put, rm, enable
+	// or disable. HookName is the hook that show, run, rm, enable and disable
+	// address, and HookJSON is a put's HookRow as JSON. Authoring is refused
+	// over TCP, exactly as exec is; run crosses, because running a hook is what
+	// crosses the line, but admission still bounds it: an agent caller needs
+	// the hook's Agent flag. list and show are reads that cross freely.
+	HookMode string
+	HookName string
+	HookJSON string
+	// HookRunID names an in-flight run for `hook cancel`. It is the id the
+	// final frame's stamp reported and `hook ps` lists.
+	HookRunID uint64
 
 	// LSPMode is the sub-operation of an lsp request: hover, definition,
 	// references, completion, diagnostics, inlay-hints, symbols or
@@ -158,6 +184,10 @@ type Request struct {
 	// Create, so a peer that does not know it omits it and keeps the
 	// proposing default.
 	Withdraw bool
+	// Approve carries out a pending removal for delete and rmdir: it is the
+	// human answer to a proposal. It crosses as a presence flag like Withdraw,
+	// so a peer that does not know it omits it and keeps the proposing default.
+	Approve bool
 	// Hidden, on ls, includes entries the hidden policy would skip — the same
 	// include-hidden switch search carries in its query. It crosses as a
 	// presence flag like Create, so a peer that does not know it omits it and
@@ -173,6 +203,28 @@ type Request struct {
 	// client can be the second person at the workspace rather than another
 	// agent.
 	Kind string
+	// Task is the work this participant's writes belong to. It rides hello,
+	// which stores it on the participant row; a later write does not send it,
+	// because the server derives it from the connection's author. Absent means
+	// none, the default for the local human and every ordinary connection.
+	Task string // State, StateOn and StateNote are a `state set`: the declared working
+	// LandTask is a land request's task: the change sets to accept and, when
+	// nothing of another task remains pending, save. It is separate from Task,
+	// which names the work this connection's own writes belong to, because a
+	// land may select work the caller did not author.
+	LandTask string
+	// state and its optional counterpart and note. An empty State is a read
+	// of the connection's own state.
+	State     string
+	StateOn   string
+	StateNote string
+
+	// To and Message are a send: the recipient, named by author id, identity
+	// key, display name or "all", and the text for its mailbox. The sender is
+	// never a field — it is the connection's own author — so a frame cannot
+	// put words in another participant's mouth.
+	To      string
+	Message string
 	// Group addresses a change set for accept, reject and clear.
 	Group uint64
 	// DumpID addresses a snapshot for patch: the id a prior dump returned.
@@ -184,12 +236,33 @@ type Request struct {
 	// Argv is the command for exec, and Dir the directory to run it in.
 	Argv []string
 	Dir  string
+	// ExecProjected runs the command against a materialised projection of the
+	// live buffers rather than the worktree: accepted and proposed text
+	// included, in a scratch tree. It is exec's switch, so it rides the same
+	// op and inherits exec's refusal, streaming and cancellation. Dir is
+	// refused with it, because the run directory is the scratch root.
+	ExecProjected bool
 	// Token authenticates a TCP client. Ignored on a Unix socket, where the
 	// filesystem permissions have already decided.
 	Token string
 	// Program is a batch of requests encoded as opcodes; see prog.go. Present
 	// only on the "prog" op, which compiles it and runs the results.
 	Program []byte
+}
+
+// HookRow is one stored hook as it crosses the control surface. Action is the
+// stored JSON: an argv array, {"shell":"..."} or a builtin object.
+type HookRow struct {
+	Name       string `json:"name"`
+	Action     string `json:"action"`
+	Trigger    string `json:"trigger"`
+	Tree       string `json:"tree"`
+	Agent      bool   `json:"agent"`
+	CooldownMS int    `json:"cooldown_ms"`
+	TimeoutMS  int    `json:"timeout_ms"`
+	MayWrite   bool   `json:"may_write"`
+	Detach     bool   `json:"detach"`
+	Enabled    bool   `json:"enabled"`
 }
 
 // Group is a change set: what one apply, or one user action, did. Reviewable as
@@ -203,12 +276,17 @@ type Group struct {
 	Path   string `json:"path"`
 	Author uint8  `json:"author"`
 	State  string `json:"state"` // proposed, accepted, rejected
-	Ops    int    `json:"ops"`
-	Bytes  int    `json:"bytes"`
-	First  uint64 `json:"first"`
-	Last   uint64 `json:"last"`
-	Hunks  int    `json:"hunks"`
-	Moved  int    `json:"moved"`
+	// Task is the work this set was opened under, populated by the host so
+	// `land` can select by it. It is in-process only: the hGroups wire record
+	// is positional, so the field does not cross and a remote `groups` reads
+	// it empty.
+	Task  string `json:"task,omitempty"`
+	Ops   int    `json:"ops"`
+	Bytes int    `json:"bytes"`
+	First uint64 `json:"first"`
+	Last  uint64 `json:"last"`
+	Hunks int    `json:"hunks"`
+	Moved int    `json:"moved"`
 	// Overlaps names the other live change sets whose projected ranges
 	// intersect this one's, with the bytes where they meet. Two sets awaiting a
 	// decision that claim the same text is a fact the editor reports and does
@@ -239,6 +317,34 @@ type GroupOverlap struct {
 // that carries it stays a comparable pointer.
 type GroupOverlaps struct {
 	Sets []GroupOverlap `json:"sets"`
+}
+
+// LandFile is one buffer's outcome in a land report: how many of the task's
+// pending sets were accepted there, and whether the buffer was saved, held
+// back because another task's pending sets remain, or refused a save for
+// another reason. Err names a refusal so a skipped buffer is never silent.
+type LandFile struct {
+	Path  string `json:"path"`
+	Sets  int    `json:"sets"`
+	Saved bool   `json:"saved"`
+	Held  bool   `json:"held"`
+	Err   string `json:"error,omitempty"`
+}
+
+// LandExport is the commit-on-land outcome: the one commit on raj/baseline a
+// land exported (or found already exported), its base parent and tree, and a
+// non-linear dependency warning when the wave's overlap graph could not be
+// ordered. Err names an export that failed after the land already accepted and
+// saved the work, so the failure is reported rather than hidden. It is absent
+// on a land that accepted no set.
+type LandExport struct {
+	Commit  string `json:"commit,omitempty"`
+	Parent  string `json:"parent,omitempty"`
+	BaseSHA string `json:"base_sha,omitempty"`
+	Tree    string `json:"tree,omitempty"`
+	Ref     string `json:"ref,omitempty"`
+	Warning string `json:"warning,omitempty"`
+	Err     string `json:"error,omitempty"`
 }
 
 // DiffGroup is one pending change set rendered for review: the Group as
@@ -421,13 +527,14 @@ type Buffer struct {
 	// pending count as the next buffer's path.
 	Pending int `json:"pending"`
 	Moved   int `json:"moved"`
-	// Superseded is how many of this buffer's proposed sets a save would drop
-	// even though the edit view still shows their text: an invalid set whose
-	// run a rejected collider restores. It is a field of its own rather than
-	// folded into Pending because such a file reports no pending set and yet
-	// cannot be saved, and "dirty and cannot be saved" has to be legible. It
-	// travels in its own sparse header field, for the same positional-record
-	// reason Pending and Moved do.
+	// Superseded is how many of this buffer's proposed sets are invalid: a
+	// still-Proposed set with no surviving hunk, which Pending drops and accept
+	// or reject cannot reach, and which a save disposes deliberately rather
+	// than writing. It is a field of its own rather than folded into Pending
+	// because such a file reports no pending set and yet is not clean, and
+	// "holds a set a save will discard" has to be legible. It travels in its
+	// own sparse header field, for the same positional-record reason Pending
+	// and Moved do.
 	Superseded int `json:"superseded,omitempty"`
 	// Tally is the buffer's brace balance, string- and comment-aware, or nil
 	// when the buffer is unnamed or unreadable. It is computed CLI-side from
@@ -540,6 +647,11 @@ const (
 	LSPStatusMissing     = "missing"
 	LSPStatusNoServer    = "no-server"
 	LSPStatusGaveUp      = "gave-up"
+
+	// LSPStatusUnassociated: the server answered, but it has no package or
+	// workspace association for the document, so the list is not a reading of
+	// the text.
+	LSPStatusUnassociated = "unassociated"
 )
 
 // LSPLocation is a file and a 1-based line and column — the editor's own
@@ -713,12 +825,24 @@ type Entry struct {
 // Start/End are -1 when no honest span exists (a set every member of which a
 // later edit has moved past), so a caller knows to ask `diff` instead.
 type Proposal struct {
-	Kind   string `json:"kind"` // "set" | "delete" | "rmdir"
+	Kind   string `json:"kind"` // "set" | "delete" | "rmdir" | "invalid"
 	Path   string `json:"path"`
 	Author uint8  `json:"author"`
 	Group  uint64 `json:"group"`
 	Start  int    `json:"start"`
 	End    int    `json:"end"`
+}
+
+// Reveal is one user-initiated request to put a buffer in front of the user,
+// optionally at a byte span: the unit the watch answer carries so every
+// attached client can mount the path. Start and End are byte offsets, both -1
+// for the whole file. It rides the watch answer rather than the reveal request
+// (which names the span with the ordinary Start/End fields) because a reveal is
+// a broadcast to every client, not a reply to the one that asked.
+type Reveal struct {
+	Path  string `json:"path"`
+	Start int    `json:"start"`
+	End   int    `json:"end"`
 }
 
 // Response is one line out. Err is a string rather than a code because the
@@ -735,8 +859,21 @@ type Response struct {
 	// and search show the daemon's roots rather than the launch directory.
 	Roots []string
 	PID   int
+	// Projection is the live composition a projected exec materialises, keyed
+	// by absolute path. It is in-process only: EncodeResponse builds its
+	// header field by field, so a field with no encoder line is dropped, and
+	// this one is never encoded. It carries the bytes from the event thread to
+	// the connection that builds the scratch tree, without a second round trip.
+	// The json tag keeps it out of runProgram --json, the one path that
+	// marshals a whole Response.
+	Projection map[string][]byte `json:"-"`
 
 	Buffers []Buffer
+	// Reveals are the user-initiated reveals a watch answer carries: paths the
+	// agent asked to surface, with the byte span to place the caret at (-1,-1
+	// for the whole file). Sparse like the other response lists, so a peer that
+	// does not know the field reads none and every other reply is unchanged.
+	Reveals []Reveal
 	Matches []SearchMatch
 	Files   int
 	// Considered is how many files the walk opened and scanned, as distinct
@@ -803,9 +940,52 @@ type Response struct {
 	Searcher Searcher
 	// Exit is a finished command's status, and Dirty the buffers that stopped
 	// one from starting.
-	Exit         int
-	Dirty        []DirtyBuffer
-	Stats        ExecStats
+	Exit  int
+	Dirty []DirtyBuffer
+	Stats ExecStats
+	// RetryAfterMS is a refused hook run's retry hint in milliseconds: how
+	// long until the in-flight or cooldown reason lifts. Zero means the
+	// refusal carries no duration (a policy or unknown-hook refusal).
+	RetryAfterMS int `json:"retry_after_ms,omitempty"`
+	// HookArgv, HookShell and HookTimeoutMS carry the admitted hook from the
+	// event thread to the connection that runs it, in-process, like
+	// Projection. EncodeResponse builds its header field by field, so none is
+	// wire-encoded, and the json tags keep them out of runProgram --json, the
+	// one path that marshals a whole Response.
+	HookArgv      []string `json:"-"`
+	HookShell     string   `json:"-"`
+	HookTree      string   `json:"-"`
+	HookMayWrite  bool     `json:"-"`
+	HookDetach    bool     `json:"-"`
+	HookTimeoutMS int      `json:"-"`
+
+	// HookBuiltin and HookBuiltinArgs carry a builtin action from the event
+	// thread to the connection that runs it, on the same in-process route as
+	// the fields above. They are sparse: an external hook sends neither.
+	HookBuiltin     string         `json:"-"`
+	HookBuiltinArgs map[string]any `json:"-"`
+
+	// HookRevision is the projection revision the run was admitted at. It
+	// crosses on the final frame too, for a caller that only reads the reply.
+	HookRevision uint64
+	// HookRunID, HookName, HookHead, HookDirty, HookDurationMS and
+	// HookTruncated are the run stamp the final frame carries: what ran, at
+	// which revision and git state, how it ended and how long it took. They
+	// are sparse: a frame that is not a hook run's final frame sends none, so
+	// a peer that does not know them reads zero values.
+	HookRunID      uint64
+	HookName       string
+	HookHead       string
+	HookDirty      string
+	HookDurationMS int64
+	HookTruncated  bool
+	// HookOff reports the workspace's hook panic switch; HookLogJSON and
+	// HookPSJSON carry the run log and the in-flight list as JSON arrays. All
+	// three are reads: they cross either transport.
+	HookOff     bool
+	HookLogJSON string
+	HookPSJSON  string
+
 	Participants []Participant
 	Groups       []Group
 	// Claims is an identity's claim set in stable order, and ClaimWarnings the
@@ -833,6 +1013,10 @@ type Response struct {
 	// directory sends none and a peer that does not know the field reads no
 	// entries rather than an error.
 	Entries []Entry
+	// Land is a land gesture's per-buffer outcome, one record per buffer that
+	// held the task's pending sets. Sparse: a response that is not a land
+	// sends none.
+	Land []LandFile
 
 	// SrcVersion is the revision the server was built from. connection.send
 	// stamps it on every response, so a client learns it on any frame, not
@@ -856,6 +1040,15 @@ type Response struct {
 	// request can run off the event thread. LSP never crosses the wire.
 	LSPJSON string
 	LSP     LSPCaller
+	// GitJSON is the JSON-encoded git.Result the git verb returns: the
+	// structured repo read or a patch, nested like LSPJSON so it crosses as
+	// one header string.
+	GitJSON string
+	// HookJSON carries a hook verb's answer or an intent request/answer: a
+	// hook list returns every HookRow as a JSON array, show returns one as a
+	// JSON object, and the intent op carries its Command in and its Result
+	// out. Nested like GitJSON so it crosses as one header string.
+	HookJSON string
 	// DiffJSON is the JSON-encoded []DiffGroup a diff request returns: the
 	// pending change sets as old→new text. Nested like LSPJSON, so it
 	// crosses the wire as one header string rather than as flat records.
@@ -949,6 +1142,33 @@ type Server struct {
 	// the one thing that layer must never do.
 	Mail Mailbox
 
+	// HookGate and HookRuns are the workspace's hook run state: the gate that
+	// coalesces runs and applies the cooldown and per-revision policy, and the
+	// registry of runs in flight. They live on the Server, not on a connection,
+	// because they are properties of the one running editor: two sockets asking
+	// to run the same hook must serialize against each other, and a second
+	// `raj hook run` has to see the first's in-flight run. Initialised once in
+	// ListenAll and shared by every connection for the server's life.
+	HookGate *hookGate
+	HookRuns *hooks.Registry
+
+	// HookLog is the in-memory log of the last hooks.DefaultLogSize completed
+	// runs, oldest first, and the hookMu-guarded hookOff is the global panic
+	// switch: while set, every run is refused before admission. Both live on
+	// the Server for the same reason HookGate and HookRuns do -- they are
+	// properties of the one running editor, not of a connection -- and both
+	// are in memory by design.
+	HookLog *hooks.Log
+
+	// HookDir is the directory detached runs write their logs and exit files
+	// to, alongside the journal and trash in the workspace state directory. It
+	// is empty when the app has no state directory, which leaves detached runs
+	// unable to start rather than the editor failing to start.
+	HookDir string
+
+	hookMu  sync.Mutex
+	hookOff bool
+
 	// heartbeat is a test seam: the per-connection heartbeat interval, with
 	// the zero value leaving a connection on heartbeatEvery. It is a server
 	// field rather than a package var so a test shortens its own server's
@@ -965,6 +1185,11 @@ type Server struct {
 	gen      uint64
 	watchers map[uint64]chan struct{}
 	watchSeq uint64
+	// reveals is the recent broadcast history: each reveal tagged with the
+	// generation it was published at. A watcher takes the entries newer than
+	// the generation its request named, so every attached client sees a reveal
+	// once and a reconnect does not replay old ones.
+	reveals []revealAt
 
 	path  string
 	paths []string
@@ -981,6 +1206,12 @@ type Server struct {
 	mu     sync.Mutex
 	queue  []*Pending
 	closed bool
+	// joins holds the author ids whose rows have joined since the event thread
+	// last persisted them. Join runs on a connection goroutine, so it queues
+	// the id here and wakes the editor; the journal write happens on the
+	// editor own thread. Keyed by id, so a reconnecting hello does not queue
+	// the same row twice. Guarded by mu.
+	joins map[uint8]bool
 }
 
 // Send queues a message from the person at the keyboard to a participant.
@@ -1021,6 +1252,72 @@ func (s *Server) PostNotice(to uint8, text string) error {
 	return s.Mail.Post(to, Message{From: AuthorOriginal, Text: text})
 }
 
+// Roster returns every participant with its working state filled, for who and
+// the hello reply. A hook run in flight under an author keeps it working even
+// while it sends no requests.
+func (s *Server) Roster() []Participant {
+	return s.Participants.States(s.hookRunInFlight)
+}
+
+// noteJoin queues an author id whose row is new or changed, for the editor to
+// persist on its own thread, and wakes it. It is the registry joined hook, so it
+// runs on the connection goroutine that answered the hello and must stay cheap:
+// it only touches this map. Nothing here reads the document or the filesystem.
+func (s *Server) noteJoin(id uint8) {
+	s.mu.Lock()
+	if s.joins == nil {
+		s.joins = map[uint8]bool{}
+	}
+	fresh := !s.joins[id]
+	s.joins[id] = true
+	s.mu.Unlock()
+	if fresh && s.Notify != nil {
+		s.Notify()
+	}
+}
+
+// TakeJoins returns and clears the author ids queued since the last call, in id
+// order. The editor drains it on the event thread and persists each row; a row
+// unchanged since it was last written appends nothing.
+func (s *Server) TakeJoins() []uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.joins) == 0 {
+		return nil
+	}
+	out := make([]uint8, 0, len(s.joins))
+	for id := range s.joins {
+		out = append(out, id)
+	}
+	s.joins = nil
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// hookRunInFlight reports whether author has a hook run in flight. A nil
+// registry is no runs, which is the case before ListenAll wires one.
+func (s *Server) hookRunInFlight(author uint8) bool {
+	if s.HookRuns == nil {
+		return false
+	}
+	for _, run := range s.HookRuns.List() {
+		if run.Author == author {
+			return true
+		}
+	}
+	return false
+}
+
+// participant returns one participant with its working state filled.
+func (s *Server) participant(id uint8) (Participant, bool) {
+	for _, p := range s.Roster() {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return Participant{}, false
+}
+
 // Drivers lists the participants a message can be sent to, connected first.
 // The disconnected are still listed, because their mail keeps.
 func (s *Server) Drivers() []Participant {
@@ -1032,6 +1329,163 @@ func (s *Server) Drivers() []Participant {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Connected && !out[j].Connected })
 	return out
+}
+
+// MaxMessage is the longest text one send may carry. A message is a note to a
+// peer — paths, group ids, a few lines — and the mailbox holds sixteen of them
+// in memory, so a caller with more to say belongs in a document it points at.
+const MaxMessage = 16 << 10
+
+// SendFrom queues a message from one participant to another: the agent half of
+// the mailbox Send fills for the person at the keyboard.
+//
+// to names the recipient by author id, durable identity (the key register
+// minted), or display name, and "all" (or "*") is every connected driver but
+// the sender. A recipient must be a driver, as with Send: a person reads the
+// editor, not a mailbox. Sending to yourself is refused rather than delivered,
+// because it is always a mistake in the name and never a message.
+//
+// from is the caller's real author, never a request field. It returns the
+// participants the message was queued for.
+func (s *Server) SendFrom(from uint8, to, text string) ([]Participant, error) {
+	// A sender that never declared an identity holds a reserved id with no
+	// registry row, so the recipient's recv cannot resolve a reply target and
+	// its answer has nowhere to go. Refuse rather than deliver a dead end.
+	if s.Participants.IsProvisional(from) {
+		return nil, fmt.Errorf("send needs a registered identity: run `raj ctl register` (or pass --as KEY) first")
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("nothing to send")
+	}
+	if len(text) > MaxMessage {
+		return nil, fmt.Errorf("message is %d bytes, over the %d-byte limit; put the detail in a file and send its path", len(text), MaxMessage)
+	}
+	to = strings.TrimSpace(to)
+	if to == "" {
+		return nil, fmt.Errorf("send needs a recipient: --to KEY, NAME, ID or all")
+	}
+	var targets []Participant
+	if to == "all" || to == "*" {
+		for _, p := range s.Participants.List() {
+			if p.Kind == KindAgent && p.Connected && p.ID != from {
+				targets = append(targets, p)
+			}
+		}
+		if len(targets) == 0 {
+			return nil, fmt.Errorf("no other driver is connected")
+		}
+	} else {
+		p, err := s.resolveRecipient(to)
+		if err != nil {
+			return nil, err
+		}
+		if p.ID == from {
+			return nil, fmt.Errorf("%s is you; name another participant", to)
+		}
+		if p.Kind != KindAgent {
+			return nil, fmt.Errorf("%s is not a driver; a person reads the editor, not a mailbox", p.Name)
+		}
+		targets = []Participant{p}
+	}
+	// The reply target is the sender's durable identity and name, captured
+	// before the post so a replayed message can still name where to reply
+	// after the sender has gone or the id has been re-seeded.
+	senderKey, senderName := "", ""
+	if p, ok := s.Participants.Get(from); ok {
+		senderKey, senderName = p.Identity, p.Name
+	}
+	var sent []Participant
+	for _, p := range targets {
+		if err := s.Mail.Post(p.ID, Message{From: from, FromKey: senderKey, FromName: senderName, Text: text}); err != nil {
+			if len(targets) == 1 {
+				return nil, err
+			}
+			continue
+		}
+		sent = append(sent, p)
+	}
+
+	if len(sent) == 0 {
+		return nil, fmt.Errorf("every recipient's mailbox is full")
+	}
+	return sent, nil
+}
+
+// resolveRecipient finds one participant by id, identity or name, in that
+// order. A name two rows share is resolved to the connected one, and refused
+// when that still leaves more than one: guessing would deliver to the wrong
+// driver, which is worse than asking for the key.
+func (s *Server) resolveRecipient(to string) (Participant, error) {
+	rows := s.Participants.List()
+	if n, err := strconv.Atoi(to); err == nil && n > 0 && n <= MaxParticipants {
+		if p, ok := s.Participants.Get(uint8(n)); ok {
+			return p, nil
+		}
+		return Participant{}, fmt.Errorf("no participant with author id %d", n)
+	}
+	for _, p := range rows {
+		if p.Identity == to {
+			return p, nil
+		}
+	}
+	var named, live []Participant
+	for _, p := range rows {
+		if p.Name == to {
+			named = append(named, p)
+			if p.Connected {
+				live = append(live, p)
+			}
+		}
+	}
+	switch {
+	case len(named) == 1:
+		return named[0], nil
+	case len(live) == 1:
+		return live[0], nil
+	case len(named) == 0:
+		return Participant{}, fmt.Errorf("no participant named %q; `raj ctl who` lists them", to)
+	}
+	return Participant{}, fmt.Errorf("%d participants are named %q; send to a key or an id instead", len(named), to)
+}
+
+// state records or reports a connection's declared working state. It runs on
+// the connection goroutine like send: the registry is on the server and no
+// document state is involved.
+func (c *connection) state(req Request, emit func(Response)) {
+	c.mu.Lock()
+	id := c.author
+	c.mu.Unlock()
+	switch req.State {
+	case "":
+		// A read: report the connection's own state without changing it.
+	case StateWorking, StateBlocked, StateReview, StateIdle:
+		c.srv.Participants.SetState(id, req.State, req.StateOn, req.StateNote)
+	default:
+		emit(Response{ID: req.ID, Err: "unknown state " + req.State + "; use working, blocked, review or idle", Final: true})
+		return
+	}
+	p, ok := c.srv.participant(id)
+	if !ok {
+		emit(Response{ID: req.ID, Err: "no participant row for this connection", Final: true})
+		return
+	}
+	emit(Response{ID: req.ID, OK: true, Final: true, Participants: []Participant{p}})
+}
+
+// sendMail answers a send off the event thread, like recv: the mailbox is on
+// the server and nothing about a message touches the document. The sender is
+// the connection's own author, read under the lock, so a frame claiming
+// another id still sends as itself.
+func (c *connection) sendMail(req Request, emit func(Response)) {
+	c.mu.Lock()
+	from := c.author
+	c.mu.Unlock()
+	sent, err := c.srv.SendFrom(from, req.To, req.Message)
+	if err != nil {
+		emit(Response{ID: req.ID, Err: err.Error(), Final: true})
+		return
+	}
+	emit(Response{ID: req.ID, OK: true, Final: true, Author: from, Participants: sent})
 }
 
 // DefaultPath is the Unix socket for this process: one per raj, so two editors do
@@ -1084,7 +1538,16 @@ func ListenAll(addrs []string, notify func()) (*Server, error) {
 	if notify == nil {
 		return nil, errors.New("control: Notify is required")
 	}
-	s := &Server{Notify: notify, Participants: NewRegistry()}
+	s := &Server{
+		Notify:       notify,
+		Participants: NewRegistry(),
+		HookGate:     newHookGate(hooks.NewGate(hooks.Options{})),
+		HookRuns:     hooks.NewRegistry(),
+		HookLog:      hooks.NewLog(0),
+	}
+	// Every successful join is announced here; the server only queues the id
+	// and wakes the editor, which persists the author table on its own thread.
+	s.Participants.setJoined(s.noteJoin)
 	for _, addr := range addrs {
 		if addr == "" {
 			s.Close()
@@ -1279,6 +1742,10 @@ func (s *Server) serve(conn net.Conn, network string) {
 			c.send(Response{ID: f.Header.ID, Err: derr.Error(), Final: true})
 			continue
 		}
+		// Every request stamps the participant's last activity, so the
+		// derived working state reads this connection's own traffic and the
+		// serve loop stays a cheap lock-guarded map write.
+		s.Participants.Touch(author)
 		if !s.authorised(req, network) {
 			// One refusal, then the connection ends. The token is 32 random
 			// bytes, so this is not rate limiting against a guesser — it is
@@ -1299,8 +1766,8 @@ func (s *Server) serve(conn net.Conn, network string) {
 			c.send(Response{ID: req.ID, OK: true, Final: true, Token: s.token})
 			continue
 		}
-		if req.Op == "exec" && network == "tcp" {
-			c.send(Response{ID: req.ID, Err: errRemoteExec, Final: true})
+		if network == "tcp" && localOnly(req) {
+			c.send(Response{ID: req.ID, Err: remoteRefusal(req), Final: true})
 			continue
 		}
 		if req.Op == "hello" {
@@ -1324,7 +1791,7 @@ func (s *Server) serve(conn net.Conn, network string) {
 				// Anonymous on a local socket keeps its provisional id: the
 				// filesystem permissions already decided who may connect.
 				c.send(Response{ID: req.ID, OK: true, Final: true,
-					Participants: s.Participants.List()})
+					Participants: s.Roster()})
 				continue
 			}
 			// The control token is shared with agents in a container, so a TCP
@@ -1343,6 +1810,16 @@ func (s *Server) serve(conn net.Conn, network string) {
 				c.send(Response{ID: req.ID, Err: err.Error(), Final: true})
 				continue
 			}
+			// Mail persisted for this identity while it was away is queued the
+			// moment it rejoins, so a message sent to a gone participant is
+			// delivered on its next hello rather than waiting for a restart.
+			s.Mail.ReplayIdentity(identity)
+
+			// The task is stored on the participant, so a later write on this or
+			// a reconnecting connection derives it from the author rather than
+			// carrying it on every frame. An empty task leaves the row as it is,
+			// so the ordinary bind-first hello does not erase what register set.
+			s.Participants.SetTask(id, req.Task)
 			if id != author {
 				if bound {
 					// A second hello on one connection rebinding it to a
@@ -1354,6 +1831,13 @@ func (s *Server) serve(conn net.Conn, network string) {
 					// now, not at disconnect, so it is recyclable at once.
 					s.Participants.Release(author)
 				}
+			} else if bound {
+				// A repeat hello naming the identity this connection already
+				// holds (the CLI's bind-first hello, then recv's or register's
+				// own) joined the same row twice. Registry counts connections,
+				// and this one closes once, so give back the extra count now or
+				// the participant reads as connected forever after it leaves.
+				s.Participants.Leave(id)
 			}
 			author = id
 			bound = true
@@ -1361,7 +1845,7 @@ func (s *Server) serve(conn net.Conn, network string) {
 			c.author = id
 			c.mu.Unlock()
 			c.send(Response{ID: req.ID, OK: true, Final: true, Identity: minted,
-				Participants: s.Participants.List()})
+				Participants: s.Roster()})
 			continue
 		}
 		if req.Op == "cancel" {
@@ -1374,18 +1858,6 @@ func (s *Server) serve(conn net.Conn, network string) {
 		}
 		if req.Author == 0 {
 			req.Author = author
-		}
-		// A revert discards the writer's own pieces, so naming a different
-		// author is a refusal rather than a fallback. Dropping another writer's
-		// accepted text is the user's decision (reject then clear), and the
-		// check lives here on the reading goroutine where the connection's real
-		// author is known, not in the handler where the claimed id is just a
-		// field. A program cannot carry a revert, so a batch is not a way round
-		// it.
-		if req.Op == "revert" && req.Author != author {
-			c.send(Response{ID: req.ID, Err: "revert discards only your own pieces; " +
-				"another writer's text is dropped with reject then clear", Final: true})
-			continue
 		}
 		wg.Add(1)
 		safe.Go(func() {
@@ -1451,7 +1923,7 @@ func (c *connection) send(res Response) {
 	c.mu.Lock()
 	res.Author = c.author
 	c.mu.Unlock()
-	res.SrcVersion = srcVersion
+	res.SrcVersion = currentSrcVersion()
 	h, body := EncodeResponse(res)
 	// A final frame ends the request, so stop the heartbeat before the frame can
 	// reach the socket. This is best-effort, not strict ordering: a tick already
@@ -1573,14 +2045,55 @@ func (c *connection) handle(req Request) {
 // while four verbs were still to come. So who gets to say Final is the caller's
 // decision, and the streaming handlers no longer reach for the socket directly.
 func (c *connection) one(req Request, emit func(Response)) {
-	// The remote-execution gate is re-checked here because the serve loop only
-	// sees the outer request: a program arrives as one "prog" frame and its
-	// exec verb would otherwise slip past the refusal that a direct exec gets.
+	// The local-only gate is re-checked here because the serve loop only sees
+	// the outer request: a program arrives as one "prog" frame and its exec
+	// verb would otherwise slip past the refusal that a direct exec gets.
 	// Re-checking at the single chokepoint every request passes through keeps a
 	// batch from being a way around the refusal.
-	if req.Op == "exec" && c.network == "tcp" {
-		emit(Response{ID: req.ID, Err: errRemoteExec, Final: true})
+	if c.network == "tcp" && localOnly(req) {
+		emit(Response{ID: req.ID, Err: remoteRefusal(req), Final: true})
 		return
+	}
+	// A request runs as the connection's own writer, so a frame may not name
+	// another author. The author a request carries is a claimed field, not the
+	// connection: a raw client can send Author: LocalHuman, and a program's
+	// sub-requests are built by Requests(prog, req.Author) from the outer
+	// frame's claimed id, so they never pass the serve loop's own checks. The
+	// refusal lives here, at the one chokepoint every direct request and every
+	// program sub-request reaches, and compares the claim with c.author, the
+	// real author: set when the connection is accepted and rebound only by a
+	// hello on the reading goroutine. A zero author carries no claim — it is
+	// stamped from the connection — and hello and register never reach here, so
+	// both pass. save, revert, approve and withdraw keep their own contract
+	// wording, which their tests pin; every other verb is refused with
+	// errAuthorSpoof. The verbs whose Author is inert data rather than identity
+	// (send, hook, exec) are exempt: they already act as the connection.
+	c.mu.Lock()
+	realAuthor := c.author
+	c.mu.Unlock()
+	if req.Author != 0 && req.Author != realAuthor && !authorIsInert(req.Op) {
+		emit(Response{ID: req.ID, Err: authorSpoofRefusal(req), Final: true})
+		return
+	}
+	// A zero author is stamped here too, not only in the serve loop: a program
+	// sub-request carries whatever its OpAuthor said, and a zero there passes
+	// the check above but would reach the handlers as AuthorOriginal and write
+	// text that reads as the file's own.
+	if req.Author == 0 {
+		req.Author = realAuthor
+	}
+	// Accepting and landing are the person's decisions, and the Unix socket is
+	// the person's trust boundary — the same rule hook run and hook authoring
+	// use. An undeclared connection there is the user's own `raj ctl accept`
+	// or `raj ctl land` from a shell, so it acts as the local human; a
+	// connection that registered as an agent keeps its identity and the Guard
+	// refuses it like any agent. Save deliberately stays as it was (the
+	// connection's own author, so an undeclared socket client is refused):
+	// widening it is WAVE-PLAN L7.
+	if (req.Op == "accept" || req.Op == "land") && c.network == "unix" {
+		if p, ok := c.srv.Participants.Get(realAuthor); !ok || p.Kind != KindAgent {
+			req.Author = LocalHuman
+		}
 	}
 	switch req.Op {
 	case "search":
@@ -1592,14 +2105,48 @@ func (c *connection) one(req Request, emit func(Response)) {
 	case "recv":
 		c.recv(req, emit)
 		return
+	case "send":
+		c.sendMail(req, emit)
+		return
+	case "state":
+		c.state(req, emit)
+		return
 	case "watch":
 		c.watch(req, emit)
 		return
 	case "lsp":
 		c.lsp(req, emit)
 		return
+	case "hook":
+		// hook run has the same two-phase shape as exec: the decision is made
+		// on the event thread, the command runs off it. log, ps, cancel and
+		// the panic switch never touch the document, so they are answered here
+		// on the connection goroutine; the authoring and read modes are
+		// ordinary parked requests and fall through to submit below.
+		switch req.HookMode {
+		case "run":
+			c.runHook(req, emit)
+			return
+		case "log":
+			c.hookLog(req, emit)
+			return
+		case "ps":
+			c.hookPS(req, emit)
+			return
+		case "cancel":
+			c.hookCancel(req, emit)
+			return
+		case "off", "on":
+			c.hookSwitch(req, emit)
+			return
+		}
 	}
 	res := c.srv.submit(req)
+	// A hook list reports the panic switch alongside the rows, so a reader
+	// learns hooks are off from the list it was already asking for.
+	if req.Op == "hook" && req.HookMode == "list" {
+		res.HookOff = c.srv.hooksOff()
+	}
 	res.Final = true
 	emit(res)
 }
@@ -1649,13 +2196,23 @@ func (c *connection) program(req Request) {
 // request that is already waiting would deliver one participant's mail to
 // another.
 func (c *connection) recv(req Request, emit func(Response)) {
-	ctx, stop := context.WithCancel(context.Background())
+	ctx, stop := context.WithCancelCause(context.Background())
+	stopFn := func() { stop(nil) }
 	c.mu.Lock()
-	c.running[req.ID] = stop
+	c.running[req.ID] = stopFn
 	to := c.author
 	c.mu.Unlock()
+	// A parked recv is the sole reader for its author id: Park preempts
+	// whatever recv was already parked for the same identity (see mailbox.go)
+	// rather than leaving two goroutines racing one channel.
+	token := c.srv.Mail.Park(to, stop)
+	// A parked recv is what the derived listening state reads; the count is
+	// per participant, so a short call closing does not clear it.
+	c.srv.Participants.SetListening(to, true)
 	defer func() {
-		stop()
+		stopFn()
+		c.srv.Mail.Unpark(to, token)
+		c.srv.Participants.SetListening(to, false)
 		c.mu.Lock()
 		delete(c.running, req.ID)
 		c.mu.Unlock()
@@ -1663,10 +2220,15 @@ func (c *connection) recv(req Request, emit func(Response)) {
 
 	msgs, ok := c.srv.Mail.Wait(ctx, to)
 	if !ok {
-		// Cancelled, or the connection went away. Answered rather than
-		// dropped: a client that cancelled is waiting for the frame that says
-		// its id is finished, and one that hung up will never see this.
-		emit(Response{ID: req.ID, Err: "cancelled", Final: true})
+		// Cancelled, the connection went away, or a newer recv for this
+		// identity preempted this one (ErrSuperseded) — distinguished so a
+		// driver can tell "someone else is reading my mail now" from an
+		// ordinary cancel and knows not to re-park.
+		reason := "cancelled"
+		if errors.Is(context.Cause(ctx), ErrSuperseded) {
+			reason = ErrSuperseded.Error()
+		}
+		emit(Response{ID: req.ID, Err: reason, Final: true})
 		return
 	}
 	emit(Response{ID: req.ID, OK: true, Final: true, Messages: msgs})
@@ -1707,7 +2269,7 @@ func (c *connection) watch(req Request, emit func(Response)) {
 				return
 			}
 			emit(Response{ID: req.ID, OK: true, Gen: c.srv.Gen(),
-				Buffers: list.Buffers, Final: true})
+				Buffers: list.Buffers, Reveals: c.srv.revealsSince(req.Gen), Final: true})
 			return
 		}
 		select {
@@ -1727,7 +2289,7 @@ func (c *connection) watch(req Request, emit func(Response)) {
 // on the event thread, because it reads the buffers, and the command then runs
 // here so a slow one neither blocks the editor nor becomes uncancellable.
 func (c *connection) exec(req Request, emit func(Response)) {
-	check := c.srv.submit(Request{ID: req.ID, Op: "execcheck", Argv: req.Argv, Dir: req.Dir})
+	check := c.srv.submit(Request{ID: req.ID, Op: "execcheck", Argv: req.Argv, Dir: req.Dir, ExecProjected: req.ExecProjected})
 	if check.Err != "" {
 		check.ID, check.Final = req.ID, true
 		emit(check)
@@ -1745,7 +2307,24 @@ func (c *connection) exec(req Request, emit func(Response)) {
 		c.mu.Unlock()
 	}()
 
-	code, err := Run(ctx, req.Argv, req.Dir, func(stream uint8, b []byte) {
+	runDir := req.Dir
+	if req.ExecProjected {
+		// The event thread handed us the projection and the root; build the
+		// scratch tree here, off it, and run with that as the command's cwd.
+		// A materialise failure emits the final error and runs nothing.
+		m, prov, err := materialiseWith(ctx, git.New(check.Root), check.Projection, git.MaterialiseOptions{})
+		if err != nil {
+			emit(Response{ID: req.ID, Err: err.Error(), Final: true})
+			return
+		}
+		defer m.Remove()
+		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
+			Out: fmt.Sprintf("raj: exec --projected ran against the projected tree at HEAD %s (dirty %s); accepted and proposed text included\n",
+				prov.Head, prov.DirtyDigest)})
+		runDir = m.Dir
+	}
+
+	code, err := Run(ctx, req.Argv, runDir, func(stream uint8, b []byte) {
 		emit(Response{ID: req.ID, OK: true, Stream: stream, Out: string(b)})
 	})
 	// Dirty is carried to the result, not used to refuse: the caller needs it
@@ -1759,6 +2338,335 @@ func (c *connection) exec(req Request, emit func(Response)) {
 		final.OK = false
 	}
 	emit(final)
+}
+
+// runHook runs an admitted hook, in the same two phases as exec: admission is
+// decided on the event thread, because it reads the hook set and the live
+// projection, and the command then runs here so a slow hook neither blocks the
+// editor nor becomes uncancellable.
+//
+// Admission already marked the hook in flight on the shared Gate; the deferred
+// End releases it however this attempt finishes, including a failure to prepare
+// the run, so a failed attempt cannot wedge the hook off for the process's
+// life. Reruns are not queued in v0 -- an in-flight or cooling hook is refused
+// with a retry, and the caller decides whether to ask again. Revision dedupe
+// and cached results are deferred too: every admitted run prepares its tree,
+// then executes.
+// hookOutputCap bounds the bytes one run streams back. There is no per-hook
+// override: the cap protects the unattended agent and the log, not the hook
+// author, so one number is enough. The command still runs to completion after
+// the cap is reached -- only the output is cut -- so the exit status is the
+// hook's own either way.
+const hookOutputCap = 1 << 20
+
+func (c *connection) runHook(req Request, emit func(Response)) {
+	// The panic switch is checked before admission: while it is on, no run
+	// starts, and the refusal names the state rather than a hook policy.
+	if c.srv.hooksOff() {
+		emit(Response{ID: req.ID, Err: errHooksOff, Final: true})
+		return
+	}
+	// On the Unix socket the caller is the local human -- the same trust
+	// boundary authoring uses -- so `raj hook run` may run a hook that is not
+	// agent-callable, and the run is attributed to the person. The exception
+	// is a connection that registered as an agent (`--as KEY` on a host-side
+	// driver): it declared itself, so it keeps agent admission and its own
+	// attribution in the log. Over TCP the caller is whatever agent it
+	// registered as, and admission applies the hook's Agent flag.
+	caller := c.author
+	if c.network == "unix" {
+		if p, ok := c.srv.Participants.Get(c.author); !ok || p.Kind != KindAgent {
+			caller = LocalHuman
+		}
+	}
+	prep := c.srv.submit(Request{ID: req.ID, Op: "hookprep", HookName: req.HookName, Author: caller})
+	if prep.Err != "" {
+		prep.ID, prep.Final = req.ID, true
+		emit(prep)
+		return
+	}
+	// The event thread admitted the hook and marked it in flight. This one
+	// defer ends the gate before it forgets the run, whatever happens from here
+	// -- a failure to prepare the run included -- so a caller that sees the
+	// registry empty also sees the hook free to run again.
+	var runID uint64
+	defer func() {
+		if prep.HookDetach {
+			// A detached run owns its own lifetime: the completion goroutine
+			// ends the gate and removes the registry entry, however long it
+			// takes. The request's return must not free the hook.
+			return
+		}
+		c.srv.HookGate.End(req.HookName)
+		if runID != 0 {
+			c.srv.HookRuns.Remove(runID)
+		}
+	}()
+
+	ctx, stop := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.running[req.ID] = stop
+	c.mu.Unlock()
+	defer func() {
+		stop()
+		c.mu.Lock()
+		delete(c.running, req.ID)
+		c.mu.Unlock()
+	}()
+
+	// A workspace hook runs against the saved tree: no scratch tree is built,
+	// so it sees exactly what the user saved, which the readiness gate above has
+	// already guaranteed has nothing unsaved to miss. A projected hook keeps
+	// v0's behaviour and runs in a scratch tree built here, off the event
+	// thread. A builtin leaf instead runs in-process with no tree, so neither
+	// the scratch materialisation nor the workspace git view and status is
+	// built for it: there is nothing to hand it and no working directory to
+	// stamp.
+	runDir := prep.Root
+	var prov Provenance
+	// cleanup removes a projected run's scratch tree; a detached run hands it
+	// to its completion goroutine, a synchronous one defers it here.
+	var cleanup func()
+	switch {
+	case prep.HookBuiltin != "":
+		// No tree: a leaf receives its args and the run context, nothing else.
+	case prep.HookTree == string(hooks.TreeWorkspace):
+		svc := git.New(prep.Root)
+		view, verr := svc.View(ctx)
+		if verr != nil {
+			emit(Response{ID: req.ID, Err: verr.Error(), Final: true})
+			return
+		}
+		dirty, derr := svc.StatusDigest(ctx)
+		if derr != nil {
+			emit(Response{ID: req.ID, Err: derr.Error(), Final: true})
+			return
+		}
+		prov = Provenance{Head: view.Head, DirtyDigest: dirty}
+	default:
+		m, p, merr := materialiseWith(ctx, git.New(prep.Root), prep.Projection, git.MaterialiseOptions{})
+		if merr != nil {
+			emit(Response{ID: req.ID, Err: merr.Error(), Final: true})
+			return
+		}
+		if prep.HookDetach {
+			// The scratch tree must outlive the request for a detached run, so
+			// the completion goroutine removes it; a synchronous run removes it
+			// on return.
+			cleanup = func() { _ = m.Remove() }
+		} else {
+			defer m.Remove()
+		}
+		prov, runDir = p, m.Dir
+	}
+
+	if prep.HookDetach {
+		c.runHookDetached(req, emit, prep, prov, runDir, caller, cleanup)
+		return
+	}
+
+	started := time.Now()
+	// The registry records the run so `hook ps` can show it and `hook cancel`
+	// can stop it. Cancel is the connection context cancel: it reaches the
+	// command through runCtx and kills the process group. RunReport fills the
+	// pid and pgid once the command has started.
+	runID = c.srv.HookRuns.Add(hooks.Run{Hook: req.HookName, Author: caller,
+		Started: started, Cancel: stop})
+
+	argv := prep.HookArgv
+	if prep.HookShell != "" {
+		argv = []string{"/bin/sh", "-c", prep.HookShell}
+	}
+	timeout := time.Duration(prep.HookTimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = hooks.DefaultTimeout
+	}
+	// The timeout is a context deadline so Run's process-group kill fires on
+	// it, not just a timer around the call.
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if prep.HookBuiltin != "" {
+		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
+			Out: fmt.Sprintf("raj: hook %s ran builtin %s\n", req.HookName, prep.HookBuiltin)})
+	} else if prep.HookTree == string(hooks.TreeWorkspace) {
+		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
+			Out: fmt.Sprintf("raj: hook %s ran against the saved workspace root at HEAD %s (dirty %s)\n",
+				req.HookName, prov.Head, prov.DirtyDigest)})
+	} else {
+		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
+			Out: fmt.Sprintf("raj: hook %s ran against the projected tree at HEAD %s (dirty %s); accepted and proposed text included\n",
+				req.HookName, prov.Head, prov.DirtyDigest)})
+	}
+
+	var outMu sync.Mutex
+	var outBytes int
+	truncated := false
+	// The cap is per run and shared by both streams. The pumps run
+	// concurrently, so the running total is behind a mutex. Once the cap is
+	// reached the callback drops chunks but the process keeps running, which is
+	// what lets the stamp still report its exit status. The cut flag is read
+	// back under the same mutex after RunReport returns, so a still-draining
+	// cancelled run cannot race the read.
+	stream := func(stream uint8, b []byte) {
+		outMu.Lock()
+		remaining := hookOutputCap - outBytes
+		if remaining <= 0 {
+			truncated = true
+			outMu.Unlock()
+			return
+		}
+		if len(b) > remaining {
+			b = b[:remaining]
+			truncated = true
+		}
+		outBytes += len(b)
+		outMu.Unlock()
+		emit(Response{ID: req.ID, OK: true, Stream: stream, Out: string(b)})
+	}
+	onStart := func(pid, pgid int) {
+		c.srv.HookRuns.SetProcess(runID, pid, pgid)
+	}
+	// A builtin action never reaches the exec path: the leaf runs in-process
+	// here, under the same Admit and Gate the external path already passed, and
+	// its output streams through the same relay, so a downstream
+	// RAJ_STEP_<name>_OUT sees it exactly as it would see a command's stdout.
+	var code int
+	var rerr error
+	if prep.HookBuiltin != "" {
+		// The leaf gets the workspace root the run was admitted with, so it
+		// resolves prep.Root rather than the process working directory.
+		code, rerr = runBuiltinLeaf(builtin.WithRoot(runCtx, prep.Root), prep.HookBuiltin, prep.HookBuiltinArgs, stream)
+	} else {
+		code, rerr = RunReport(runCtx, argv, runDir, onStart, stream)
+	}
+
+	outMu.Lock()
+	truncatedFinal := truncated
+	outMu.Unlock()
+
+	// A may_write=0 workspace hook must leave the tree alone: git status is the
+	// cheap definition of "the tree changed", so a run that moves it fails with
+	// a named error even when the command exited zero. Projected hooks keep
+	// v0's behaviour and are not checked, and a builtin leaf has no tree to move.
+	writeErr := ""
+	if prep.HookBuiltin == "" && prep.HookTree == string(hooks.TreeWorkspace) && !prep.HookMayWrite {
+		after, derr := git.New(prep.Root).StatusDigest(ctx)
+		switch {
+		case derr != nil:
+			writeErr = fmt.Sprintf("hook %q may not write, but its workspace status could not be read: %v", req.HookName, derr)
+		case after != prov.DirtyDigest:
+			writeErr = fmt.Sprintf("hook %q modified the workspace", req.HookName)
+		}
+	}
+
+	final := Response{ID: req.ID, OK: rerr == nil, Exit: code, Final: true,
+		HookRunID: runID, HookName: req.HookName, HookRevision: prep.HookRevision,
+		HookHead: prov.Head, HookDirty: prov.DirtyDigest, HookTruncated: truncatedFinal,
+		HookDurationMS: time.Since(started).Milliseconds()}
+	if rerr != nil {
+		final.Err = rerr.Error()
+	}
+	if writeErr != "" {
+		final.Err = writeErr
+		final.OK = false
+	}
+	if runCtx.Err() != nil {
+		// A timeout or a cancel is a refusal, never a zero exit: the command
+		// did not finish, so the status Run cancel path returned must not be
+		// read as success.
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			final.Err = fmt.Sprintf("hook %q timed out after %s", req.HookName, timeout)
+		} else {
+			final.Err = "cancelled"
+		}
+		final.OK = false
+	}
+	if c.srv.HookLog != nil {
+		c.srv.HookLog.Add(hooks.Result{
+			ID: runID, Hook: req.HookName, Author: caller,
+			Revision: prep.HookRevision, Head: prov.Head, Dirty: prov.DirtyDigest,
+			Exit: code, DurationMS: time.Since(started).Milliseconds(),
+			Truncated: truncatedFinal, Err: final.Err,
+		})
+	}
+	emit(final)
+}
+
+// hookLog answers `raj hook log`: the in-memory run log, oldest first, as
+// JSON. It is a read, so it crosses either transport.
+func (c *connection) hookLog(req Request, emit func(Response)) {
+	// A run id turns the read into `hook log --show`: the tail of that one run's
+	// file rather than the in-memory listing. The text rides in HookLogJSON,
+	// the field a log answer already uses.
+	if req.HookRunID != 0 {
+		text, err := tailHookRunLog(c.srv.HookDir, req.HookRunID)
+		if err != nil {
+			emit(Response{ID: req.ID, Err: err.Error(), Final: true})
+			return
+		}
+		emit(Response{ID: req.ID, OK: true, HookLogJSON: text, Final: true})
+		return
+	}
+	var entries []hooks.Result
+	if c.srv.HookLog != nil {
+		entries = c.srv.HookLog.List()
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		emit(Response{ID: req.ID, Err: err.Error(), Final: true})
+		return
+	}
+	emit(Response{ID: req.ID, OK: true, HookLogJSON: string(data),
+		HookOff: c.srv.hooksOff(), Final: true})
+}
+
+// hookPS answers `raj hook ps`: the runs in flight right now, as JSON. It is a
+// read like the log. The panic switch rides along, so a ps also says whether
+// runs are currently refused.
+func (c *connection) hookPS(req Request, emit func(Response)) {
+	var runs []hooks.Run
+	if c.srv.HookRuns != nil {
+		runs = c.srv.HookRuns.List()
+	}
+	data, err := json.Marshal(runs)
+	if err != nil {
+		emit(Response{ID: req.ID, Err: err.Error(), Final: true})
+		return
+	}
+	emit(Response{ID: req.ID, OK: true, HookPSJSON: string(data),
+		HookOff: c.srv.hooksOff(), Final: true})
+}
+
+// hookCancel stops one in-flight run by id. It is local-only -- the process
+// lives on the editor host -- and it never touches the document, so it is
+// answered on the connection goroutine.
+func (c *connection) hookCancel(req Request, emit func(Response)) {
+	if req.HookRunID == 0 {
+		emit(Response{ID: req.ID, Err: "hook cancel needs a run id", Final: true})
+		return
+	}
+	var run hooks.Run
+	var ok bool
+	if c.srv.HookRuns != nil {
+		run, ok = c.srv.HookRuns.Get(req.HookRunID)
+	}
+	if !ok {
+		emit(Response{ID: req.ID, Err: fmt.Sprintf("no in-flight hook run %d", req.HookRunID), Final: true})
+		return
+	}
+	if run.Cancel != nil {
+		run.Cancel()
+	}
+	emit(Response{ID: req.ID, OK: true, HookRunID: run.ID, HookName: run.Hook, PID: run.PID, Final: true})
+}
+
+// hookSwitch flips the workspace global panic switch. It is local-only and in
+// memory: it lives only as long as the editor process.
+func (c *connection) hookSwitch(req Request, emit func(Response)) {
+	off := req.HookMode == "off"
+	c.srv.setHooksOff(off)
+	emit(Response{ID: req.ID, OK: true, HookOff: off, Final: true})
 }
 
 // lsp asks the language server. Two phases, like search: the event thread syncs
@@ -1843,13 +2751,171 @@ func (c *connection) search(req Request, emit func(Response)) {
 	emit(final)
 }
 
-// The refusals a remote client can hit that a local one cannot. Both are
-// strings a person will read at a terminal, and both say what to do.
+// The refusals a remote client can hit that a local one cannot. They are
+// strings a person will read at a terminal, and each says what to do.
 const (
 	errUnauthorised = "unauthorized: set " + TokenEnv + " to the token raj printed when it started"
 	errRemoteExec   = "exec is refused over TCP: the command would run on the editor's machine, " +
 		"outside your sandbox — run it with your own shell instead"
+	errRemoteHook = "hook authoring is refused over TCP: hooks are host state, and only the " +
+		"local human may create, change or remove one — run `raj hook` on the editor's machine"
+
+	// errRemoteHookControl is the refusal for the hook verbs that need the local
+	// host: cancel stops a process and off/on flips the panic switch. They are
+	// local-only for the same reason authoring is.
+	errRemoteHookControl = "hook cancel and the off/on panic switch are refused over TCP: " +
+		"the run and its process live on the editor host — run `raj hook` there"
+
+	// errHooksOff is the global panic switch refusal. It names the state and the
+	// local verb that lifts it, because the switch is deliberately local-only.
+	errHooksOff = "hooks are off: the workspace panic switch is engaged; " +
+		"run `raj hook on` on the editor machine to re-enable"
+
+	// errSaveNotHuman is the save contract's single wording. Guard.Save refuses
+	// an agent by kind; connection.one refuses a request that claims another
+	// writer's id, the human's included. One string, so a client cannot tell
+	// which layer said no.
+	errSaveNotHuman = "save is the user's action: an agent's edit is written " +
+		"when the user saves it; it is in the buffer and will reach disk then"
+
+	// errApproveDeletionNotHuman is the removal gate's wording for a file. It
+	// is the same contract as errSaveNotHuman: carrying out a removal is the
+	// user's action. connection.one uses it for a forged author too, so a
+	// client cannot tell which layer said no.
+	errApproveDeletionNotHuman = "removing a file is the user's action: an agent's deletion proposal is carried out when the user approves it; withdraw it to leave the file alone"
+
+	// errApproveDirNotHuman is the dir-removal variant, naming the directory.
+	errApproveDirNotHuman = "removing a directory is the user's action: an agent's dir-removal proposal is carried out when the user approves it; withdraw it to leave the directory alone"
+
+	// errApproveWithdraw is the conflict refusal for a request that both
+	// approves and withdraws: they name opposite answers to one removal.
+	errApproveWithdraw = "approve and withdraw are opposite answers to a removal; pass one"
+
+	// errWithdrawSpoof is the withdraw contract's single wording. A withdraw
+	// runs as the connection's own writer, so a frame may not retract a
+	// removal as another author; Guard.Delete/Rmdir own the human-or-proposer
+	// rule, and connection.one refuses the imposture before either is asked.
+	errWithdrawSpoof = "a withdraw runs as the connection's own writer: a frame may not retract a removal as another author"
+
+	// errAuthorSpoof is the refusal for a request that names another writer.
+	// A request runs as the connection's own writer, so the author a frame
+	// carries is a claim, not a credential; it is refused before any handler
+	// sees it. The verbs whose Author is inert data (send, hook, exec) are
+	// exempt because they act as the connection regardless of the field.
+	errAuthorSpoof = "a request runs as the connection's own writer; a frame may not name another author"
+
+	// errRevertForeign is the revert contract's wording. It lived in the serve
+	// loop until connection.one held every author check; a revert discards the
+	// writer's own pieces, so naming a different author is a refusal rather
+	// than a fallback, and a batch cannot carry one.
+	errRevertForeign = "revert discards only your own pieces; " +
+		"another writer's text is dropped with reject then clear"
+
+	// errAcceptNotHuman is the refusal for an accept that is not the person's.
+	// Accepting is the same decision as saving or approving a removal, so an
+	// agent's accept is refused before the group is touched.
+	errAcceptNotHuman = "accepting a change set is the user's decision: " +
+		"an agent's proposal is landed when the user accepts it, not when the writer asks"
+
+	// errLandNotHuman is the refusal for a land that is not the person's.
+	// Landing is one gesture that accepts and saves the change sets of a task,
+	// the same decision save makes, so an agent's land is refused before any
+	// set is accepted or any buffer saved.
+	errLandNotHuman = "land is the user's one-gesture approval: it accepts and saves " +
+		"a task's change sets; an agent's sets are landed when the user runs it, not when the writer asks"
 )
+
+// approveRefusal names the removal gate's wording for the op, so a forged
+// approve is refused in the same words the Guard uses for a non-human.
+func approveRefusal(op string) string {
+	if op == "rmdir" {
+		return errApproveDirNotHuman
+	}
+	return errApproveDeletionNotHuman
+}
+
+// authorSpoofRefusal names the wording for a request that names another writer.
+// Save, revert, approve and withdraw keep the contract wording their tests pin,
+// so a client cannot tell the chokepoint's refusal from the Guard's own kind
+// refusal; every other verb is refused with errAuthorSpoof.
+func authorSpoofRefusal(req Request) string {
+	switch {
+	case req.Op == "save":
+		return errSaveNotHuman
+	case req.Op == "revert":
+		return errRevertForeign
+	case req.Approve && (req.Op == "delete" || req.Op == "rmdir"):
+		return approveRefusal(req.Op)
+	case req.Withdraw && (req.Op == "delete" || req.Op == "rmdir"):
+		return errWithdrawSpoof
+	}
+	return errAuthorSpoof
+}
+
+// authorIsInert reports whether a verb reads Author as data rather than as
+// identity. send takes the sender, hook the caller and exec the run owner from
+// the connection and ignores the field, so a frame that names another writer
+// there cannot make the verb act as it; the claim is inert, and they stay
+// admitted rather than refused. Every other verb acts on the author it is
+// given, so it must be the connection's own.
+func authorIsInert(op string) bool {
+	switch op {
+	case "send", "hook", "exec":
+		return true
+	}
+	return false
+}
+
+// localOnly reports whether a request may only be served on a local transport.
+// exec runs a command on the editor's machine, and hook authoring writes host
+// policy; both are refused on a TCP connection, while hook list, show, run, log
+// and ps cross. cancel stops a process and off/on flips the panic switch, so
+// those are local too, for the same reason authoring is. run is not refused
+// here on purpose: running is what crosses the line, and its boundary is
+// admission (an agent may only run a hook with its Agent flag set), not the
+// transport. This is the one predicate both chokepoints use, so the rule cannot
+// drift between the serve loop and connection.one.
+func localOnly(req Request) bool {
+	if req.Op == "exec" {
+		return true
+	}
+	if req.Op != "hook" {
+		return false
+	}
+	switch req.HookMode {
+	case "put", "rm", "enable", "disable", "cancel", "off", "on":
+		return true
+	}
+	return false
+}
+
+// remoteRefusal is the message for a local-only request refused on TCP. The
+// predicate localOnly decides which requests; this only says why.
+func remoteRefusal(req Request) string {
+	if req.Op == "hook" {
+		switch req.HookMode {
+		case "cancel", "off", "on":
+			return errRemoteHookControl
+		}
+		return errRemoteHook
+	}
+	return errRemoteExec
+}
+
+// hooksOff reports the hook panic switch. While true, every hook run is
+// refused before admission.
+func (s *Server) hooksOff() bool {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return s.hookOff
+}
+
+// setHooksOff flips the hook panic switch.
+func (s *Server) setHooksOff(off bool) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.hookOff = off
+}
 
 // authorised checks a request's token against the server's. A Unix connection
 // is already authorised by the filesystem and needs no token; only a TCP one
@@ -1895,6 +2961,23 @@ var srcVersion = func() string {
 	return ""
 }()
 
+// srcVersion is read on every response (connection.send) and by the CLI's skew
+// warning, and a test swaps it to pin the stamp; guard it so a test that pins
+// it cannot race a live server goroutine (seen under -race, 2026-09-27).
+var srcVersionMu sync.RWMutex
+
+func currentSrcVersion() string {
+	srcVersionMu.RLock()
+	defer srcVersionMu.RUnlock()
+	return srcVersion
+}
+
+func setSrcVersion(v string) {
+	srcVersionMu.Lock()
+	srcVersion = v
+	srcVersionMu.Unlock()
+}
+
 // mintIdentity returns a fresh identity token for an anonymous TCP client.
 // Server-minted rather than client-chosen: no collisions, and no two agents
 // both arriving as claude-1.
@@ -1931,6 +3014,58 @@ func (s *Server) BumpGen(gen uint64) {
 		}
 	}
 	s.watchMu.Unlock()
+}
+
+// revealHistory bounds the reveal broadcast kept for watchers that have not run
+// yet. A watcher asks only for reveals newer than the generation it last saw,
+// so an old entry is never delivered to an up-to-date client; the cap keeps a
+// long-lived server from accumulating them.
+const revealHistory = 32
+
+// revealAt is one published reveal with the generation it was posted at, so a
+// watcher receives exactly the reveals that happened after the generation its
+// request named.
+type revealAt struct {
+	gen uint64
+	rev Reveal
+}
+
+// PublishReveal records a reveal for every parked watch and wakes them,
+// advancing the generation. It returns the new generation so the caller can
+// keep its response counter in step. A reveal is a reason to wake a watcher
+// like any other, and tagging it with the generation is what lets a watcher
+// take only what it has not already seen.
+func (s *Server) PublishReveal(rev Reveal) uint64 {
+	s.watchMu.Lock()
+	s.gen++
+	gen := s.gen
+	s.reveals = append(s.reveals, revealAt{gen: gen, rev: rev})
+	if len(s.reveals) > revealHistory {
+		s.reveals = s.reveals[len(s.reveals)-revealHistory:]
+	}
+	for _, ch := range s.watchers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	s.watchMu.Unlock()
+	return gen
+}
+
+// revealsSince returns the reveals published after the generation a watch named,
+// without consuming them, so every watcher that has not yet seen them receives
+// them exactly once.
+func (s *Server) revealsSince(gen uint64) []Reveal {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	var out []Reveal
+	for _, r := range s.reveals {
+		if r.gen > gen {
+			out = append(out, r.rev)
+		}
+	}
+	return out
 }
 
 // watchRegister parks one watcher and returns a cancel that removes it. The

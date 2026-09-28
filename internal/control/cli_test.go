@@ -66,6 +66,11 @@ type fakeEditor struct {
 	// searchHidden records the -hidden flag the last search carried, so a CLI
 	// test can assert it reaches the query without a real walker.
 	searchHidden bool
+	// searchInclude and searchExclude record the globs the last search carried,
+	// so a CLI test can assert the repeatable flags accumulate into one wire
+	// field without a real walker.
+	searchInclude string
+	searchExclude string
 	// entries is the canned ls answer, and lastLs records the request the CLI
 	// sent, so the verb and its -hidden switch can be asserted on the wire.
 	entries []Entry
@@ -117,13 +122,21 @@ type fakeEditor struct {
 	// mkdirs records every mkdir request path, so a CLI test can assert the
 	// verb reaches the wire with its operand intact. The fake has no
 	// filesystem; the real MkdirAll semantics are covered in internal/app.
-	mkdirs        []string
-	lastRename    Request
-	lastDelete    Request
-	deletions     []Deletion
-	lastRmdir     Request
-	dirRemovals   []DirRemoval
-	proposals     []Proposal
+	mkdirs      []string
+	lastRename  Request
+	lastDelete  Request
+	deletions   []Deletion
+	lastRmdir   Request
+	dirRemovals []DirRemoval
+	proposals   []Proposal
+	// groupsByPath and pendingByPath are per-buffer overrides for the
+	// otherwise workspace-global groups and pending fixtures. A workspace-wide
+	// clear or reject walks the buffers and asks each for its own groups or
+	// pending projection, so a test with sets in two buffers needs each buffer
+	// to answer for itself; a nil map keeps the single global fixture every
+	// other test uses.
+	groupsByPath  map[string][]Group
+	pendingByPath map[string][]Group
 	claimWarnings []string
 	claimOverlaps []ClaimOverlap
 	// groups is the canned change-set list `groups` returns; decided records
@@ -147,7 +160,33 @@ type fakeEditor struct {
 	// wedge names a group that cannot be reversed while another is still
 	// pending; 0 means wedged outright.
 	wedge map[uint64]uint64
-	stop  chan struct{}
+	// saveErr makes a named buffer's save refuse, standing in for a disk that
+	// changed underneath it; saves records every save the CLI sent, so a bulk
+	// save can be checked to reach each dirty buffer and pass --force.
+	saveErr map[string]string
+	saves   []Request
+	// decisions records every accept/reject/clear request with its path, so a
+	// workspace-wide bulk can be checked to target each buffer rather than only
+	// counting decisions.
+	decisions []Request
+
+	// lastGit records the git request and gitJSON is the canned answer, so a
+	// CLI test can assert the verb parses and prints without a real repo.
+	lastGit Request
+	gitJSON string
+	// lastReveal records the reveal request, so a CLI test can assert the path
+	// and span the verb sent without a real editor.
+	lastReveal Request
+	// lastHook records the hook request; the fake answers it from the memHost
+	// hook set through Dispatch, so a CLI test can assert each subcommand's
+	// request shape without a real store.
+	lastHook Request
+	// lastExecCheck records the execcheck request connection.exec submitted,
+	// so a CLI test can assert a flag survived the client, the wire and the
+	// two-phase exec path.
+	lastExecCheck Request
+
+	stop chan struct{}
 }
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
@@ -200,6 +239,9 @@ func newFakeEditorAddrs(t *testing.T, addrs []string, docs map[string]string) *f
 	mem := newMemHost("/w", nil)
 	f.policyMem = mem
 	f.policy = NewGuard(mem)
+	// The hook Gate lives on the server; point the fake's guard at it so the
+	// shipped dispatchHook admits runs exactly as the app's guard does.
+	f.policy.HookGate = srv.HookGate
 	f.srv = srv
 	go func() {
 		for {
@@ -233,7 +275,22 @@ func (f *fakeEditor) run(req Request) Response {
 		path = f.only()
 	}
 	switch req.Op {
-	case "execcheck", "stats":
+	case "hook":
+		f.lastHook = req
+		return Dispatch(f.policy, req)
+	case "hookprep":
+		// connection.runHook's event-thread half. It carries the client's run
+		// as an internal op; record a synthesized run request so a CLI test can
+		// assert mode run reached the server.
+		f.lastHook = Request{Op: "hook", HookMode: "run", HookName: req.HookName, Author: req.Author}
+		return Dispatch(f.policy, req)
+	case "git":
+		f.lastGit = req
+		return Response{OK: true, GitJSON: f.gitJSON}
+	case "execcheck":
+		f.lastExecCheck = req
+		return Dispatch(f.policy, req)
+	case "stats":
 		return Dispatch(f.policy, req)
 	case "searchsnapshot":
 		return Response{OK: true, Searcher: f}
@@ -423,33 +480,56 @@ func (f *fakeEditor) run(req Request) Response {
 		}
 		return Response{OK: true, Version: f.vers[path], Warnings: f.warnings}
 	case "save":
+		f.saves = append(f.saves, req)
+		if msg, ok := f.saveErr[path]; ok {
+			return Response{Err: msg}
+		}
 		return Response{OK: true, Version: f.vers[path]}
+	case "land":
+		// land is a Guard verb, so it runs against the real Guard and memHost
+		// rather than a fake outcome; the CLI test then exercises the wire too.
+		return Dispatch(f.policy, req)
 	case "groups":
+		if f.groupsByPath != nil {
+			return Response{OK: true, Groups: append([]Group(nil), f.groupsByPath[path]...)}
+		}
 		return Response{OK: true, Groups: append([]Group(nil), f.groups...)}
 	case "accept", "reject":
-		if req.Op == "reject" && f.pending != nil {
-			// A set a newer overlapping set still blocks cannot come out — the
-			// same refusal the real Session gives.
-			if blocker, ok := f.wedge[req.Group]; ok {
-				blocked := blocker == 0
-				for _, g := range f.pending {
-					if g.ID == blocker {
-						blocked = true
+		f.decisions = append(f.decisions, req)
+		if req.Op == "reject" {
+			list := f.pending
+			if f.pendingByPath != nil {
+				list = f.pendingByPath[path]
+			}
+			if list != nil {
+				// A set a newer overlapping set still blocks cannot come out — the
+				// same refusal the real Session gives.
+				if blocker, ok := f.wedge[req.Group]; ok {
+					blocked := blocker == 0
+					for _, g := range list {
+						if g.ID == blocker {
+							blocked = true
+						}
+					}
+					if blocked {
+						return Response{Err: fmt.Sprintf("change set %d could not be backed out: "+
+							"later edits overlap it", req.Group)}
 					}
 				}
-				if blocked {
-					return Response{Err: fmt.Sprintf("change set %d could not be backed out: "+
-						"later edits overlap it", req.Group)}
+				for i := range list {
+					if list[i].ID == req.Group {
+						list = append(list[:i], list[i+1:]...)
+						if f.pendingByPath != nil {
+							f.pendingByPath[path] = list
+						} else {
+							f.pending = list
+						}
+						f.decided = append(f.decided, req.Group)
+						return Response{OK: true}
+					}
 				}
+				return Response{Err: fmt.Sprintf("no change set %d", req.Group)}
 			}
-			for i := range f.pending {
-				if f.pending[i].ID == req.Group {
-					f.pending = append(f.pending[:i], f.pending[i+1:]...)
-					f.decided = append(f.decided, req.Group)
-					return Response{OK: true}
-				}
-			}
-			return Response{Err: fmt.Sprintf("no change set %d", req.Group)}
 		}
 		if msg, ok := f.decideErr[req.Group]; ok {
 			return Response{Err: msg}
@@ -457,6 +537,7 @@ func (f *fakeEditor) run(req Request) Response {
 		f.decided = append(f.decided, req.Group)
 		return Response{OK: true}
 	case "clear":
+		f.decisions = append(f.decisions, req)
 		if c, ok := f.clearBlock[req.Group]; ok {
 			return Response{Err: fmt.Sprintf("change set %d cannot be cleared: change set %d overlaps it",
 				req.Group, c.Group), Conflicts: []Conflict{c}}
@@ -464,22 +545,36 @@ func (f *fakeEditor) run(req Request) Response {
 		if msg, ok := f.clearErr[req.Group]; ok {
 			return Response{Err: msg}
 		}
-		for i := range f.groups {
-			if f.groups[i].ID != req.Group {
+		list := f.groups
+		if f.groupsByPath != nil {
+			list = f.groupsByPath[path]
+		}
+		for i := range list {
+			if list[i].ID != req.Group {
 				continue
 			}
-			if f.groups[i].State != "rejected" {
+			if list[i].State != "rejected" && !list[i].Invalid {
 				return Response{Err: fmt.Sprintf("change set %d is not rejected", req.Group)}
 			}
-			f.groups[i].State = "accepted"
+			list[i].State = "rejected"
+			list[i].Invalid = false
+			if f.groupsByPath != nil {
+				f.groupsByPath[path] = list
+			} else {
+				f.groups = list
+			}
 			f.decided = append(f.decided, req.Group)
 			return Response{OK: true}
 		}
 		return Response{Err: fmt.Sprintf("no change set %d", req.Group)}
 	case "diff":
-		if f.pending != nil {
-			diffs := make([]DiffGroup, 0, len(f.pending))
-			for _, g := range f.pending {
+		pending := f.pending
+		if f.pendingByPath != nil {
+			pending = f.pendingByPath[path]
+		}
+		if pending != nil {
+			diffs := make([]DiffGroup, 0, len(pending))
+			for _, g := range pending {
 				// One surviving hunk marks the set pending, which is all the
 				// CLI reads the projection for.
 				diffs = append(diffs, DiffGroup{Group: g, Hunks: []DiffHunk{{Start: 0, End: 0}}})
@@ -561,6 +656,9 @@ func (f *fakeEditor) run(req Request) Response {
 	case "revert":
 		f.lastRevert = req
 		return Response{OK: true, Version: f.vers[path]}
+	case "reveal":
+		f.lastReveal = req
+		return Response{OK: true}
 	}
 	return Response{Err: "unknown op " + req.Op}
 }
@@ -718,6 +816,28 @@ func TestCLIStatusNamesDirtyBuffer(t *testing.T) {
 	}
 	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "dirty") {
 		t.Errorf("status = %q, want it to name /w/a.go and say dirty", out)
+	}
+}
+
+// A rejected set pins a buffer dirty even though a save cannot clean it: the
+// text stays in the view, the agreed composition on disk matches, and only
+// clear disposes of the set. status must name that count rather than report a
+// bare "dirty", so a gate that retries forever has the reason in its output.
+func TestCLIStatusNamesRejectedSets(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.dirty = map[string]bool{"/w/a.go": true}
+	ed.groupsByPath = map[string][]Group{"/w/a.go": {
+		{ID: 1, Path: "/w/a.go", State: "accepted"},
+		{ID: 3, Path: "/w/a.go", State: "rejected"},
+		{ID: 6, Path: "/w/a.go", State: "rejected"},
+	}}
+
+	out, errs, code := run(t, "status")
+	if code != 1 {
+		t.Fatalf("code %d: %s; want 1 for a buffer holding rejected sets", code, errs)
+	}
+	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "dirty: 2 rejected sets (clear to dispose)") {
+		t.Errorf("status = %q, want the two rejected sets named beside the dirty reason", out)
 	}
 }
 
@@ -1022,6 +1142,62 @@ func TestCLIRefusesPositionalSpan(t *testing.T) {
 	}
 }
 
+// reveal names a path and, optionally, a byte span on --start/--end. The span
+// is validated at the CLI so a malformed one is a usage error, and the plain
+// and -json forms both name the path and span that were sent.
+func TestCLIReveal(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "one\ntwo\nthree\n"})
+
+	out, errs, code := run(t, "reveal", "/w/a.go", "--start", "4", "--end", "7")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if ed.lastReveal.Op != "reveal" || ed.lastReveal.Path != "/w/a.go" ||
+		ed.lastReveal.Start == nil || *ed.lastReveal.Start != 4 ||
+		ed.lastReveal.End == nil || *ed.lastReveal.End != 7 {
+		t.Errorf("reveal request = %+v, want /w/a.go 4..7", ed.lastReveal)
+	}
+	if !strings.Contains(out, "/w/a.go") || !strings.Contains(out, "4..7") {
+		t.Errorf("reveal output = %q", out)
+	}
+
+	// The whole file names no span and sends none.
+	out, errs, code = run(t, "reveal", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("whole-file reveal: code %d: %s", code, errs)
+	}
+	if ed.lastReveal.Start != nil || ed.lastReveal.End != nil {
+		t.Errorf("whole-file reveal carried a span: %+v", ed.lastReveal)
+	}
+	if !strings.Contains(out, "/w/a.go") {
+		t.Errorf("whole-file reveal output = %q", out)
+	}
+
+	// -json names the path and span.
+	out, _, code = run(t, "reveal", "/w/a.go", "--start", "4", "--end", "7", "--json")
+	if code != 0 {
+		t.Fatalf("reveal --json: code %d", code)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("reveal --json output = %q: %v", out, err)
+	}
+	if m["path"] != "/w/a.go" || m["start"] != 4.0 || m["end"] != 7.0 {
+		t.Errorf("reveal --json = %v", m)
+	}
+
+	// A missing path, a lone -1 and a reversed span are usage errors.
+	if _, _, code = run(t, "reveal"); code != 2 {
+		t.Errorf("missing path: code = %d, want 2", code)
+	}
+	if _, _, code = run(t, "reveal", "/w/a.go", "--start", "5"); code != 2 {
+		t.Errorf("one-sided span: code = %d, want 2", code)
+	}
+	if _, _, code = run(t, "reveal", "/w/a.go", "--start", "7", "--end", "4"); code != 2 {
+		t.Errorf("reversed span: code = %d, want 2", code)
+	}
+}
+
 // The point of the CLI over the raw protocol: a string, not an offset.
 func TestCLIEditByString(t *testing.T) {
 	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n\nfunc f() {}\n"})
@@ -1152,7 +1328,369 @@ func TestCLIRecvJSONTimeoutExitsThree(t *testing.T) {
 	}
 }
 
+// waitParkedRecv waits until a recv has parked for author id, so a test can
+// order a preemption deterministically.
+func waitParkedRecv(t *testing.T, ed *fakeEditor, id uint8) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ed.srv.Mail.mu.Lock()
+		_, ok := ed.srv.Mail.waiters[id]
+		ed.srv.Mail.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no recv parked for author %d", id)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A second recv for one identity preempts the first: the loser must exit 3
+// (cancelled, re-park), not 1 (refusal, back off), and the winner must keep
+// the mailbox. Before the exit-code split the loser exited 1, a plugin backed
+// off to 60s, and a save posted in the churn never reached the session
+// (docs/TODO.md, oc2 mail drop).
+func TestCLIRecvLoserOfAPreemptionExitsThree(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	id := bindParticipant(t, ed, "raj-supersede")
+
+	// First reader parks; it is the one the second will preempt.
+	_, firstErrs, first := runRecv(t, ed, "raj-supersede", false, true)
+	waitParkedRecv(t, ed, id)
+
+	// Second reader takes the identity, handing the first ErrSuperseded.
+	out, errs, second := runRecv(t, ed, "raj-supersede", false, true)
+
+	select {
+	case code := <-first:
+		if code != 3 {
+			t.Fatalf("preempted recv exited %d, want 3 (stderr %q)", code, firstErrs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("preempted recv did not exit")
+	}
+
+	// The winner still owns the mailbox: a message posted now reaches it.
+	sender, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	if hi, err := sender.Do(Request{Op: "hello", Identity: "raj-supersede-sender", Name: "sender"}); err != nil || !hi.OK {
+		t.Fatalf("sender hello = %+v, %v", hi, err)
+	}
+	if res, err := sender.Do(Request{Op: "send", To: "raj-supersede", Message: "still delivered"}); err != nil || !res.OK {
+		t.Fatalf("send = %+v, %v", res, err)
+	}
+
+	select {
+	case code := <-second:
+		if code != 0 {
+			t.Fatalf("winner recv exited %d, want 0 (stderr %q)", code, errs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("winner recv did not receive the message")
+	}
+
+	var msgs []mailOut
+	if err := json.Unmarshal([]byte(out.String()), &msgs); err != nil {
+		t.Fatalf("winner recv output = %q: %v", out.String(), err)
+	}
+	if len(msgs) != 1 || msgs[0].Text != "still delivered" {
+		t.Fatalf("winner recv = %+v, want the message posted after the preemption", msgs)
+	}
+}
+
+// A parked recv whose connection dies (a daemon restart) must exit 5, the code
+// a driver reads as re-park now: mail is durable and replays at the next park,
+// unlike a refusal. Before the split this was an indistinguishable 1.
+func TestCLIRecvConnectionLossExitsFive(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	id := bindParticipant(t, ed, "raj-conn-lost")
+
+	conn, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errs bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- recv(conn, "raj-conn-lost", "recv-side", 0, false, &out, &errs, true) }()
+	waitParkedRecv(t, ed, id)
+
+	conn.Close()
+	select {
+	case code := <-done:
+		if code != 5 {
+			t.Fatalf("recv after connection loss exited %d, want 5 (stderr %q)", code, errs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recv did not return after its connection closed")
+	}
+}
+
+// A peer that registers after a recv has said hello and parked is absent from
+// the participant list that hello returned. Its message must still name it:
+// without a re-read it prints as "author N", and a driver cannot tell which
+// peer spoke. The recipient hello is observed through the registry, so the
+// sender is guaranteed to join after the snapshot the bug depends on.
+func TestRecvNamesAPeerThatJoinedAfterParking(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	recvConn, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recvConn.Close()
+
+	var out, errs bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- recv(recvConn, "raj-late-recv", "recv-side", 0, false, &out, &errs, true) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		found := false
+		for _, p := range ed.srv.Participants.List() {
+			if p.Identity == "raj-late-recv" {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recv never bound its identity")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	sender, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	if hi, err := sender.Do(Request{Op: "hello", Identity: "raj-late-sender", Name: "late"}); err != nil || !hi.OK {
+		t.Fatalf("sender hello = %+v, %v", hi, err)
+	}
+	if res, err := sender.Do(Request{Op: "send", To: "raj-late-recv", Message: "from a late peer"}); err != nil || !res.OK {
+		t.Fatalf("send = %+v, %v", res, err)
+	}
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("recv exited %d: %s", code, errs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recv did not return after the send")
+	}
+
+	var msgs []mailOut
+	if err := json.Unmarshal([]byte(out.String()), &msgs); err != nil {
+		t.Fatalf("recv output = %q: %v", out.String(), err)
+	}
+	if len(msgs) != 1 || msgs[0].Text != "from a late peer" {
+		t.Fatalf("recv = %+v, want the late peer message", msgs)
+	}
+	if msgs[0].FromKey != "raj-late-sender" || msgs[0].FromName != "late" {
+		t.Errorf("late peer labelled %q/%q, want its key and name", msgs[0].FromKey, msgs[0].FromName)
+	}
+}
+
+// recv --json must carry a message's own reply target even when the sender is
+// not in the hello snapshot: a gone, renamed or store-replayed sender still has
+// to be addressable.
+func TestRecvRowsPreferTheMessageReplyTarget(t *testing.T) {
+	msgs := []Message{
+		{From: 9, FromKey: "raj-gone", FromName: "gone", Text: "still here"},
+	}
+	// The snapshot knows the same id under a new identity and name.
+	senders := map[uint8]Participant{9: {ID: 9, Identity: "raj-renamed", Name: "new"}}
+	rows := recvRows(msgs, senders, false)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one", rows)
+	}
+	if rows[0].FromKey != "raj-gone" || rows[0].FromName != "gone" {
+		t.Errorf("reply target = %q/%q, want the message's raj-gone/gone", rows[0].FromKey, rows[0].FromName)
+	}
+
+	// With no target on the message, the hello snapshot is the fallback.
+	rows = recvRows([]Message{{From: 9, Text: "plain"}}, senders, false)
+	if rows[0].FromKey != "raj-renamed" || rows[0].FromName != "new" {
+		t.Errorf("fallback target = %q/%q, want the snapshot's raj-renamed/new", rows[0].FromKey, rows[0].FromName)
+	}
+
+	// --peers-only drops the editor's own notice (author 0).
+	rows = recvRows([]Message{{From: AuthorOriginal, Text: "notice"}}, senders, true)
+	if len(rows) != 0 {
+		t.Errorf("peers-only rows = %+v, want none", rows)
+	}
+}
+
+// bindParticipant says hello with identity on its own connection and returns
+// the author id the editor minted, so a test can address that participant's
+// mailbox before a recv parks on it.
+func bindParticipant(t *testing.T, ed *fakeEditor, identity string) uint8 {
+	t.Helper()
+	conn, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	hi, err := conn.Do(Request{Op: "hello", Identity: identity})
+	if err != nil || !hi.OK {
+		t.Fatalf("hello %s = %+v, %v", identity, hi, err)
+	}
+	for _, p := range ed.srv.Participants.List() {
+		if p.Identity == identity {
+			return p.ID
+		}
+	}
+	t.Fatalf("identity %s did not register", identity)
+	return 0
+}
+
+// runRecv runs one recv on its own connection in the background, returning the
+// output buffers and a channel the exit code arrives on. The buffers are safe
+// to read once the code is received.
+func runRecv(t *testing.T, ed *fakeEditor, identity string, peersOnly, asJSON bool) (*bytes.Buffer, *bytes.Buffer, <-chan int) {
+	t.Helper()
+	conn, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	var out, errs bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- recv(conn, identity, "recv-side", 0, peersOnly, &out, &errs, asJSON) }()
+	return &out, &errs, done
+}
+
+// waitMailboxEmpty waits until a recipient's mailbox is drained, so a test can
+// post the next message knowing the last one was consumed.
+func waitMailboxEmpty(t *testing.T, ed *fakeEditor, id uint8) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for ed.srv.Mail.Unread(id) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("mailbox for author %d was never drained", id)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// --peers-only drops the editor's own notices (author 0) from a returned
+// batch, in both output forms: a driver that relays them is passing the
+// editor's bookkeeping off as something a person said.
+func TestCLIRecvPeersOnlyDropsEditorNotices(t *testing.T) {
+	for _, asJSON := range []bool{false, true} {
+		name := "text"
+		if asJSON {
+			name = "json"
+		}
+		t.Run(name, func(t *testing.T) {
+			ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+			id := bindParticipant(t, ed, "raj-peers-drop-recv")
+			// Queue both before recv parks so one batch carries the notice
+			// and the peer message together.
+			if err := ed.srv.Mail.Post(id, Message{From: AuthorOriginal, Text: "change set 1 was landed over"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := ed.srv.Mail.Post(id, Message{From: 5, Text: "from a peer"}); err != nil {
+				t.Fatal(err)
+			}
+			out, errs, done := runRecv(t, ed, "raj-peers-drop-recv", true, asJSON)
+
+			select {
+			case code := <-done:
+				if code != 0 {
+					t.Fatalf("recv exited %d: %s", code, errs.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("recv did not return after the peer message")
+			}
+			if strings.Contains(out.String(), "landed over") {
+				t.Errorf("recv printed the editor notice: %q", out.String())
+			}
+			if !strings.Contains(out.String(), "from a peer") {
+				t.Errorf("recv did not print the peer message: %q", out.String())
+			}
+			if asJSON {
+				var msgs []mailOut
+				if err := json.Unmarshal([]byte(out.String()), &msgs); err != nil {
+					t.Fatalf("recv output = %q: %v", out.String(), err)
+				}
+				if len(msgs) != 1 || msgs[0].From != 5 || msgs[0].Text != "from a peer" {
+					t.Errorf("recv = %+v, want only the peer's message", msgs)
+				}
+			}
+		})
+	}
+}
+
+// --peers-only parks past a batch that holds only the editor's notices instead
+// of returning an empty answer, then prints the peer message that follows.
+func TestCLIRecvPeersOnlyParksPastNotices(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	id := bindParticipant(t, ed, "raj-peers-park-recv")
+	out, errs, done := runRecv(t, ed, "raj-peers-park-recv", true, true)
+
+	if err := ed.srv.Mail.Post(id, Message{From: AuthorOriginal, Text: "saved /w/a.go"}); err != nil {
+		t.Fatal(err)
+	}
+	waitMailboxEmpty(t, ed, id)
+	if err := ed.srv.Mail.Post(id, Message{From: 5, Text: "from a peer"}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("recv exited %d: %s", code, errs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recv did not return after the peer message")
+	}
+	var msgs []mailOut
+	if err := json.Unmarshal([]byte(out.String()), &msgs); err != nil {
+		t.Fatalf("recv output = %q: %v", out.String(), err)
+	}
+	if len(msgs) != 1 || msgs[0].From != 5 {
+		t.Fatalf("recv = %+v, want only the peer's message", msgs)
+	}
+}
+
+// Without --peers-only recv is unchanged: an editor notice is a message like
+// any other and prints bare.
+func TestCLIRecvWithoutPeersOnlyKeepsEditorNotice(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+	id := bindParticipant(t, ed, "raj-notice-recv")
+	if err := ed.srv.Mail.Post(id, Message{From: AuthorOriginal, Text: "saved /w/a.go"}); err != nil {
+		t.Fatal(err)
+	}
+	out, errs, done := runRecv(t, ed, "raj-notice-recv", false, false)
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("recv exited %d: %s", code, errs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recv did not return after the editor notice")
+	}
+	if out.String() != "saved /w/a.go\n" {
+		t.Errorf("recv = %q, want the editor notice printed bare", out.String())
+	}
+}
+
 // A process squatting the control address accepts the connection and then says
+
 // nothing. The 2s connect timeout cannot catch it: the connect succeeded, so an
 // ordinary request must bound its wait for the answer and name the wrong
 // process rather than parking the driver forever.
@@ -2582,6 +3120,96 @@ func TestCLIGroupsCountsAndStateFilter(t *testing.T) {
 	}
 }
 
+// `groups --task T` lists only the sets opened under T. The task crosses the
+// wire on the group, so a remote CLI filters on the set's own record rather
+// than a local guess.
+func TestGroupsByTask(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.groups = []Group{
+		{ID: 1, Path: "/w/a.go", Author: 2, State: "proposed", Task: "task-1", Ops: 1},
+		{ID: 2, Path: "/w/a.go", Author: 2, State: "proposed", Task: "task-2", Ops: 1},
+	}
+	out, errs, code := run(t, "groups", "-task", "task-1", "-json", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"id": 1`) || strings.Contains(out, `"id": 2`) {
+		t.Errorf("groups -task task-1 = %q, want only set 1", out)
+	}
+}
+
+// An explicit empty --task is the untasked bucket: the sets that registered no
+// task, which is the default for the local human and every ordinary connection.
+func TestUntaskedBucket(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.groups = []Group{
+		{ID: 1, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1},
+		{ID: 2, Path: "/w/a.go", Author: 2, State: "proposed", Task: "task-1", Ops: 1},
+	}
+	out, errs, code := run(t, "groups", "-task", "", "-json", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, `"id": 1`) || strings.Contains(out, `"id": 2`) {
+		t.Errorf("groups -task '' = %q, want only the untasked set", out)
+	}
+}
+
+// A buffer can hold sets from more than one task. Filtering to one of them is
+// partial by construction, so the other task's sets are counted and named
+// rather than silently dropped: a reader must not mistake the filtered list
+// for the whole buffer.
+func TestGroupMultiTaskFlagged(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello world\n"})
+	ed.groups = []Group{
+		{ID: 1, Path: "/w/a.go", Author: 2, State: "proposed", Task: "task-1", Ops: 1},
+		{ID: 2, Path: "/w/a.go", Author: 2, State: "proposed", Task: "task-2", Ops: 1},
+	}
+	out, errs, code := run(t, "groups", "-task", "task-1", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "1\tauthor 2\tproposed") {
+		t.Errorf("groups -task task-1 dropped its own set: %q", out)
+	}
+	// A --task listing is the qualified member form: the buffer path is
+	// printed beside the id, so an id that collides across buffers stays
+	// distinct.
+	if !strings.Contains(out, "/w/a.go\t1\tauthor 2\tproposed") {
+		t.Errorf("groups -task task-1 did not qualify the set with its buffer path: %q", out)
+	}
+	if strings.Contains(out, "2\tauthor") {
+		t.Errorf("groups -task task-1 listed another task's set: %q", out)
+	}
+	if !strings.Contains(out, "1 change set(s) belong to another task") {
+		t.Errorf("groups -task task-1 did not flag the sets it left out: %q", out)
+	}
+}
+
+// A harness pins the work with RAJ_TASK, the counterpart to RAJ_IDENTITY, so a
+// brief generator sets one variable and the session's register binds the task
+// to its participant. An explicit --task still wins.
+func TestBriefTaskFlag(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	t.Setenv("RAJ_TASK", "task-7")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	out, errs, code := run(t, "register", "-as", "brief-task", "-json")
+	if code != 0 {
+		t.Fatalf("register exited %d: %s", code, errs)
+	}
+	var got struct {
+		Author uint8 `json:"author"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	p, ok := ed.srv.Participants.Get(got.Author)
+	if !ok || p.Task != "task-7" {
+		t.Errorf("participant %d task = %q (found %v), want task-7 from RAJ_TASK", got.Author, p.Task, ok)
+	}
+}
+
 func TestCLIUsage(t *testing.T) {
 	if _, errs, code := run(t); code != 2 || !strings.Contains(errs, "usage") {
 		t.Errorf("no args: code %d, stderr %q", code, errs)
@@ -2615,8 +3243,8 @@ func TestCLIWithNoEditorRunning(t *testing.T) {
 	os.Unsetenv("RAJ_SOCKET")
 	os.Unsetenv("RAJ_CONTROL_ADDR")
 	_, errs, code := run(t, "buffers")
-	if code == 0 || !strings.Contains(errs, "no running raj found") {
-		t.Errorf("code %d, stderr %q", code, errs)
+	if code != exitUnreachable || !strings.Contains(errs, "no running raj found") {
+		t.Errorf("code %d, want %d, stderr %q", code, exitUnreachable, errs)
 	}
 }
 
@@ -2697,6 +3325,8 @@ func (f *fakeEditor) Search(ctx context.Context, q SearchQuery, emit func([]Sear
 	truncated := append([]TruncatedFile(nil), f.truncated...)
 	f.searchPath = q.Path
 	f.searchHidden = q.Hidden
+	f.searchInclude = q.Include
+	f.searchExclude = q.Exclude
 	f.mu.Unlock()
 
 	var inc []string
@@ -3147,8 +3777,8 @@ func TestRegisterMintsAndBindsAKey(t *testing.T) {
 	if len(got.Key) != len("raj-")+8 || strings.Trim(suffix, "0123456789abcdef") != "" {
 		t.Errorf("key = %q, want raj- plus 8 lowercase hex chars", got.Key)
 	}
-	if got.Name != "raj" {
-		t.Errorf("name = %q, want the default", got.Name)
+	if got.Name != got.Key {
+		t.Errorf("name = %q, want the key %q", got.Name, got.Key)
 	}
 	if got.Author < FirstAgent {
 		t.Errorf("author = %d, want an agent id", got.Author)
@@ -3206,6 +3836,43 @@ func TestRegisterMintsAndBindsAKey(t *testing.T) {
 	}
 	if pinned.Author < FirstAgent {
 		t.Errorf("pinned author = %d, want an agent id", pinned.Author)
+	}
+}
+
+// register --task stores the work on the participant row, and a later command
+// that binds the same identity with no task keeps it: that is what lets an
+// apply filed by a fresh connection carry the task its register call pinned.
+func TestRegisterCarriesTheTask(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "hello\n"})
+
+	out, errs, code := run(t, "register", "-as", "tasked", "-task", "task-9", "-json")
+	if code != 0 {
+		t.Fatalf("register exited %d: %s", code, errs)
+	}
+	var got struct {
+		Author uint8 `json:"author"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	p, ok := ed.srv.Participants.Get(got.Author)
+	if !ok || p.Task != "task-9" {
+		t.Errorf("participant %d task = %q (found %v), want task-9", got.Author, p.Task, ok)
+	}
+
+	// A later command binds the same identity with no task, and the row keeps
+	// the task its register call pinned.
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if hi, err := c.Do(Request{Op: "hello", Identity: "tasked"}); err != nil || !hi.OK {
+		t.Fatalf("hello = %+v, %v", hi, err)
+	}
+	if p, _ := ed.srv.Participants.Get(got.Author); p.Task != "task-9" {
+		t.Errorf("task after a taskless reconnect = %q, want task-9", p.Task)
 	}
 }
 
@@ -3274,6 +3941,37 @@ func TestMintRegisterKeyRetriesAndBounds(t *testing.T) {
 // setDirty makes the shared policy see unsaved buffers.
 func (f *fakeEditor) setDirty(d ...DirtyBuffer) {
 	f.policyMem.dirty = d
+}
+
+// exec --projected reaches the server as a projected request, and the ordinary
+// form does not: the flag survives the CLI parse, EncodeRequest/DecodeRequest
+// and connection.exec's execcheck submit.
+//
+// Precondition: the fake editor's execcheck is the shipped Dispatch over a
+// memHost, which records the request it was handed. Without the Request field
+// and its wire plumbing, both runs would land ExecProjected false. The
+// projected run cannot materialise /w (it is not a repository), so its exit is
+// not the assertion; the execcheck request is written before that.
+func TestCLIExecProjectedFlagReachesTheRequest(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+
+	run(t, "exec", "--projected", "--", "true")
+	ed.mu.Lock()
+	projected := ed.lastExecCheck.ExecProjected
+	ed.mu.Unlock()
+	if !projected {
+		t.Error("exec --projected landed an execcheck with ExecProjected false")
+	}
+
+	if _, _, code := run(t, "exec", "--", "true"); code != 0 {
+		t.Fatalf("exec -- true exited %d, want 0", code)
+	}
+	ed.mu.Lock()
+	plain := ed.lastExecCheck.ExecProjected
+	ed.mu.Unlock()
+	if plain {
+		t.Error("exec -- true landed a projected execcheck")
+	}
 }
 
 // A command runs, its output streams back, and its exit status is preserved —
@@ -3549,9 +4247,9 @@ func TestSrcVersionAndIdentityRoundTrip(t *testing.T) {
 // The version check is a warning, not a refusal, and stays silent when either
 // side cannot name its build.
 func TestWarnVersionSkew(t *testing.T) {
-	old := srcVersion
-	defer func() { srcVersion = old }()
-	srcVersion = "ctl-abc"
+	old := currentSrcVersion()
+	defer setSrcVersion(old)
+	setSrcVersion("ctl-abc")
 
 	var b strings.Builder
 	warnVersionSkew(&b, "editor-def")
@@ -3895,6 +4593,217 @@ func TestCLIClearAllReportsAWedge(t *testing.T) {
 	}
 }
 
+// accept --all --everywhere decides every pending set in the workspace, not
+// only the active buffer's: the proposals rollup names the scope, and each
+// decision carries the buffer its set lives in, so two buffers' sets both come
+// out with the buffer they belong to. Without the flag the command is a usage
+// error, and without the change the rollup is never consulted.
+func TestCLIAcceptAllEverywhereDecidesEveryBuffer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n", "/w/b.go": "y\n"})
+	ed.proposals = []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 2, Group: 3},
+		{Kind: "set", Path: "/w/b.go", Author: 2, Group: 7},
+	}
+	out, errs, code := run(t, "accept", "-all", "--everywhere")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	for _, want := range []string{"accepted change set 3", "accepted change set 7"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output %q missing %q", out, want)
+		}
+	}
+	if len(ed.decisions) != 2 {
+		t.Fatalf("decisions = %+v, want both buffers", ed.decisions)
+	}
+	got := map[string]uint64{}
+	for _, d := range ed.decisions {
+		got[d.Path] = d.Group
+	}
+	if got["/w/a.go"] != 3 || got["/w/b.go"] != 7 {
+		t.Errorf("decisions = %+v, want /w/a.go group 3 and /w/b.go group 7", ed.decisions)
+	}
+}
+
+// --all without --everywhere keeps its old scope: the active buffer's groups
+// and nothing from the workspace rollup. This is the guard that the new flag
+// did not widen the plain form.
+func TestCLIAcceptAllStaysInTheActiveBuffer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n", "/w/b.go": "y\n"})
+	ed.groups = []Group{{ID: 3, Path: "/w/a.go"}}
+	ed.proposals = []Proposal{{Kind: "set", Path: "/w/b.go", Author: 2, Group: 7}}
+	out, errs, code := run(t, "accept", "/w/a.go", "-all")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if len(ed.decided) != 1 || ed.decided[0] != 3 {
+		t.Errorf("decided %v, want only the active buffer's 3", ed.decided)
+	}
+	if len(ed.decisions) != 1 || ed.decisions[0].Path != "/w/a.go" {
+		t.Errorf("decisions = %+v, want only /w/a.go", ed.decisions)
+	}
+	if strings.Contains(out, "change set 7") {
+		t.Errorf("output %q reached another buffer's set", out)
+	}
+}
+
+// reject --all --everywhere unwinds every buffer that holds a pending set, not
+// only the active buffer's. The proposals rollup names the buffers and each
+// buffer's own pending projection drives its newest-first unwind, so a later
+// set comes out before the earlier one it blocks. Without the flag the sweep
+// never leaves the active buffer, so the other buffer's sets stay pending.
+func TestCLIRejectAllEverywhereUnwindsEveryBuffer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n", "/w/b.go": "y\n"})
+	ed.proposals = []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 2, Group: 3},
+		{Kind: "set", Path: "/w/b.go", Author: 2, Group: 7},
+	}
+	ed.pendingByPath = map[string][]Group{
+		"/w/a.go": {
+			{ID: 3, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, First: 1, Last: 1},
+			{ID: 5, Path: "/w/a.go", Author: 2, State: "proposed", Ops: 1, First: 4, Last: 4},
+		},
+		"/w/b.go": {
+			{ID: 7, Path: "/w/b.go", Author: 2, State: "proposed", Ops: 1, First: 2, Last: 2},
+			{ID: 9, Path: "/w/b.go", Author: 2, State: "proposed", Ops: 1, First: 6, Last: 6},
+		},
+	}
+	out, errs, code := run(t, "reject", "-all", "--everywhere")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	want := []uint64{5, 3, 9, 7}
+	if len(ed.decided) != len(want) {
+		t.Fatalf("decided %v, want %v", ed.decided, want)
+	}
+	for i, id := range want {
+		if ed.decided[i] != id {
+			t.Fatalf("decided %v, want newest-first per buffer %v", ed.decided, want)
+		}
+	}
+	where := map[uint64]string{}
+	for _, d := range ed.decisions {
+		where[d.Group] = d.Path
+	}
+	for _, w := range []struct {
+		group uint64
+		path  string
+	}{{3, "/w/a.go"}, {5, "/w/a.go"}, {7, "/w/b.go"}, {9, "/w/b.go"}} {
+		if where[w.group] != w.path {
+			t.Errorf("change set %d decided at %q, want %q", w.group, where[w.group], w.path)
+		}
+	}
+	for _, s := range []string{"rejected change set 9", "rejected change set 3"} {
+		if !strings.Contains(out, s) {
+			t.Errorf("stdout %q missing %q", out, s)
+		}
+	}
+}
+
+// save --all writes every dirty buffer and reports each path, and leaves a
+// clean one alone. The buffers rollup is the enumeration: a dirty buffer with
+// no pending set is exactly the case a proposals walk would miss.
+func TestCLISaveAllSavesEveryDirtyBuffer(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{
+		"/w/a.go": "x\n", "/w/b.go": "y\n", "/w/c.go": "z\n",
+	})
+	ed.dirty = map[string]bool{"/w/a.go": true, "/w/b.go": true}
+	out, errs, code := run(t, "save", "-all")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	for _, want := range []string{"saved /w/a.go", "saved /w/b.go"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output %q missing %q", out, want)
+		}
+	}
+	if strings.Contains(out, "/w/c.go") {
+		t.Errorf("output %q touched the clean buffer", out)
+	}
+	if len(ed.saves) != 2 {
+		t.Fatalf("saves = %+v, want two", ed.saves)
+	}
+	for _, s := range ed.saves {
+		if s.Force {
+			t.Errorf("save %+v carried --force it was not given", s)
+		}
+	}
+}
+
+// A refusal on one buffer names it, saves the rest anyway, and exits nonzero:
+// a gate must not read a partly failed save as a clean run.
+func TestCLISaveAllKeepsGoingAfterARefusal(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n", "/w/b.go": "y\n"})
+	ed.dirty = map[string]bool{"/w/a.go": true, "/w/b.go": true}
+	ed.saveErr = map[string]string{"/w/a.go": "file changed on disk; pass --force"}
+	out, errs, code := run(t, "save", "-all")
+	if code == 0 {
+		t.Fatalf("a partly refused save reported success: %q", out)
+	}
+	if !strings.Contains(out, "saved /w/b.go") {
+		t.Errorf("stdout = %q, want the buffer that saved", out)
+	}
+	if !strings.Contains(errs, "/w/a.go") {
+		t.Errorf("stderr = %q, want the refused buffer named", errs)
+	}
+	if len(ed.saves) != 2 {
+		t.Errorf("saves = %+v, want the refusal not to stop the second", ed.saves)
+	}
+}
+
+// --force rides every save a bulk save makes, so the disk-changed prompt one
+// buffer would raise is answered Overwrite for the whole sweep.
+func TestCLISaveAllPassesForceThrough(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n", "/w/b.go": "y\n"})
+	ed.dirty = map[string]bool{"/w/a.go": true, "/w/b.go": true}
+	_, errs, code := run(t, "save", "-all", "--force")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if len(ed.saves) != 2 {
+		t.Fatalf("saves = %+v, want two", ed.saves)
+	}
+	for _, s := range ed.saves {
+		if !s.Force {
+			t.Errorf("save %+v lost --force", s)
+		}
+	}
+}
+
+// save --all is already the whole workspace, so --everywhere has no wider scope
+// to name; it is refused rather than silently dropped, matching the guard that
+// refuses --everywhere without --all.
+func TestCLISaveEverywhereIsARefusal(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	out, errs, code := run(t, "save", "-all", "--everywhere")
+	if code != 2 {
+		t.Fatalf("save --all --everywhere: code = %d, want the usage refusal; stdout %q stderr %q", code, out, errs)
+	}
+	if !strings.Contains(errs, "--everywhere names no wider scope") {
+		t.Errorf("stderr = %q, want the save-specific --everywhere refusal", errs)
+	}
+}
+
+// --all --everywhere --group is a usage refusal: --all and --group are already
+// alternatives, and widening the scope does not change that.
+func TestCLIEverywhereWithGroupIsARefusal(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "accept", "-all", "--everywhere", "-group", "3")
+	if code != 2 || !strings.Contains(errs, "--all and --group are alternatives") {
+		t.Errorf("code %d, stderr %q", code, errs)
+	}
+}
+
+// --everywhere on its own names a scope with no bulk decision to widen, so it
+// is refused rather than silently ignored.
+func TestCLIEverywhereWithoutAllIsARefusal(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "accept", "--everywhere", "/w/a.go")
+	if code != 2 || !strings.Contains(errs, "--everywhere widens --all") {
+		t.Errorf("code %d, stderr %q", code, errs)
+	}
+}
+
 // open without -create refuses a path that is neither a buffer nor a file,
 // naming it; -create is the caller saying it means to make a new buffer.
 func TestCLIOpenRefusesMissingPathWithoutCreate(t *testing.T) {
@@ -4156,6 +5065,104 @@ func TestCLIRmdirAndRmdirs(t *testing.T) {
 	// No operand is a usage error.
 	if _, _, code = run(t, "rmdir"); code != 2 {
 		t.Errorf("rmdir with no operand: code = %d, want 2", code)
+	}
+}
+
+// proposals names an invalid set under its own kind, both for a person and in
+// the JSON a script reads, so a driver asking what is waiting sees a set no
+// accept or reject can reach.
+func TestCLIProposalsShowsInvalidSet(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.proposals = []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 4, Group: 7, Start: 1, End: 4},
+		{Kind: "invalid", Path: "/w/a.go", Author: 4, Group: 9, Start: -1, End: -1},
+	}
+
+	out, errs, code := run(t, "proposals")
+	if code != 0 {
+		t.Fatalf("proposals: code = %d: %s", code, errs)
+	}
+	for _, want := range []string{"change sets:", "invalid change sets:",
+		"group 7", "group 9", "author 4"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("proposals output %q missing %q", out, want)
+		}
+	}
+
+	out, _, code = run(t, "proposals", "-json")
+	if code != 0 || !strings.Contains(out, "\"kind\": \"invalid\"") ||
+		!strings.Contains(out, "\"group\": 9") {
+		t.Errorf("proposals -json = %q (code %d)", out, code)
+	}
+}
+
+// clear --all disposes invalid Proposed sets too, not only rejected ones: an
+// invalid set is exactly the one accept or reject cannot reach, so a bulk
+// clear that skipped it would leave the wedge in place.
+func TestCLIClearAllDisposesInvalidSets(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.groups = []Group{
+		{ID: 5, Path: "/w/a.go", Author: 3, State: "rejected", Ops: 1},
+		{ID: 6, Path: "/w/a.go", Author: 3, State: "proposed", Ops: 1, Invalid: true},
+	}
+
+	_, errs, code := run(t, "clear", "--all")
+	if code != 0 {
+		t.Fatalf("clear --all: code = %d: %s", code, errs)
+	}
+	seen := map[uint64]bool{}
+	for _, id := range ed.decided {
+		seen[id] = true
+	}
+	if len(ed.decided) != 2 || !seen[5] || !seen[6] {
+		t.Fatalf("decided = %v, want both the rejected set 5 and the invalid set 6", ed.decided)
+	}
+}
+
+// clear --all --everywhere reaches the rejected sets in every buffer, not only
+// the invalid ones the proposals rollup still carries. The buffers rollup is
+// the enumeration and each buffer's own groups are filtered to the sets a clear
+// can dispose, newest-first, so the workspace form matches the active-buffer
+// form. An accepted set is left alone, exactly as it is in one buffer.
+func TestCLIClearAllEverywhereReachesRejectedSets(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n", "/w/b.go": "y\n"})
+	ed.groupsByPath = map[string][]Group{
+		"/w/a.go": {
+			{ID: 3, Path: "/w/a.go", Author: 2, State: "rejected", Ops: 1, First: 1, Last: 1},
+			{ID: 5, Path: "/w/a.go", Author: 2, State: "accepted", Ops: 1, First: 4, Last: 4},
+		},
+		"/w/b.go": {
+			{ID: 7, Path: "/w/b.go", Author: 2, State: "rejected", Ops: 1, First: 2, Last: 2},
+			{ID: 9, Path: "/w/b.go", Author: 2, State: "proposed", Ops: 1, First: 6, Last: 6, Invalid: true},
+		},
+	}
+	out, errs, code := run(t, "clear", "-all", "--everywhere")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	got := map[uint64]bool{}
+	for _, id := range ed.decided {
+		got[id] = true
+	}
+	if len(ed.decided) != 3 || !got[3] || !got[7] || !got[9] {
+		t.Fatalf("cleared %v, want the rejected and invalid sets 3, 7, 9", ed.decided)
+	}
+	if got[5] {
+		t.Errorf("cleared %v, want the accepted set 5 left alone", ed.decided)
+	}
+	// Newest-first within a buffer: /w/b.go's invalid 9 comes out before its
+	// older rejected 7. Buffer order across paths is not constrained.
+	pos := map[uint64]int{}
+	for i, id := range ed.decided {
+		pos[id] = i
+	}
+	if pos[9] > pos[7] {
+		t.Errorf("cleared %v, want 9 before 7 in /w/b.go", ed.decided)
+	}
+	for _, s := range []string{"cleared change set 3", "cleared change set 7", "cleared change set 9"} {
+		if !strings.Contains(out, s) {
+			t.Errorf("stdout %q missing %q", out, s)
+		}
 	}
 }
 
@@ -4625,6 +5632,93 @@ func TestCLILSPDiagnosticsPlainNamesEachPath(t *testing.T) {
 	}
 }
 
+// `lsp diagnostics --all` sweeps the workspace's changed files: every buffer a
+// pending change set touches, deduped and sorted, so one call registers them
+// all with the language server. This is the precondition the feature exists
+// for: a per-file check reads ok while a file the sweep skipped is broken.
+func TestCLILSPDiagnosticsAllSweepsChangedFiles(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{
+		"/w/a.go": "package a\n",
+		"/w/b.go": "package b\n",
+		"/w/c.go": "package c\n",
+	})
+	ed.proposals = []Proposal{
+		{Kind: "set", Path: "/w/b.go", Author: 2, Group: 1},
+		{Kind: "set", Path: "/w/a.go", Author: 3, Group: 2},
+		{Kind: "set", Path: "/w/a.go", Author: 4, Group: 3}, // one entry per path
+		{Kind: "invalid", Path: "/w/c.go", Author: 4, Group: 4},
+		{Kind: "delete", Path: "/w/gone.go", Author: 2}, // no text to diagnose
+	}
+	ed.lspJSONByPath = map[string]string{
+		"/w/a.go": `{"status":"ok"}`,
+		"/w/b.go": `{"status":"ok"}`,
+		"/w/c.go": `{"status":"ok"}`,
+	}
+	out, errs, code := run(t, "lsp", "diagnostics", "--all", "-json")
+	if code != 0 {
+		t.Fatalf("code = %d, stderr %q", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path   string `json:"path"`
+			Status string `json:"status"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("--all -json is not one document: %v (%q)", err, out)
+	}
+	want := []string{"/w/a.go", "/w/b.go", "/w/c.go"}
+	if len(got.Files) != len(want) {
+		t.Fatalf("swept files = %+v, want %v", got.Files, want)
+	}
+	for i, p := range want {
+		if got.Files[i].Path != p {
+			t.Errorf("entry %d path = %q, want %q", i, got.Files[i].Path, p)
+		}
+		if got.Files[i].Status != "ok" {
+			t.Errorf("entry %d status = %q, want ok; every swept file must carry a status", i, got.Files[i].Status)
+		}
+	}
+	if _, errs, code := run(t, "lsp", "diagnostics", "--all", "/w/a.go"); code != 2 || !strings.Contains(errs, "takes no paths") {
+		t.Errorf("--all with a path: code = %d, stderr %q, want a usage refusal", code, errs)
+	}
+}
+
+// A parsed-but-statusless multi-path answer is an old server's `{}`. It is not
+// a reading, so the entry must say so rather than carrying no status at all:
+// before the fix an entry could have neither status nor detail, and a reader
+// could not tell "no problems" from "the editor never answered".
+func TestCLILSPDiagnosticsBatchStatuslessEntryGetsAStatus(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n", "/w/b.go": "package b\n"})
+	ed.lspJSONByPath = map[string]string{
+		"/w/a.go": `{}`,
+		"/w/b.go": `{"status":"ok"}`,
+	}
+	out, _, code := run(t, "lsp", "diagnostics", "/w/a.go", "/w/b.go", "-json")
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 for a statusless answer", code)
+	}
+	var got struct {
+		Files []struct {
+			Path   string `json:"path"`
+			Status string `json:"status"`
+			Detail string `json:"detail"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("batch -json = %q: %v", out, err)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want two entries", got.Files)
+	}
+	if got.Files[0].Status != "error" {
+		t.Errorf("statusless entry = %+v, want an error status", got.Files[0])
+	}
+	if !strings.Contains(got.Files[0].Detail, "did not report a diagnostics status") {
+		t.Errorf("statusless entry detail = %q, want the rebuild note", got.Files[0].Detail)
+	}
+}
+
 // The CLI usage lists the reload verb and the save force flag, so a driver
 // reading the help can find both.
 func TestCLIUsageListsReloadAndForce(t *testing.T) {
@@ -4982,5 +6076,249 @@ func TestSearchMultipleQueriesFlagsAndHint(t *testing.T) {
 	}
 	if !strings.Contains(errs, `"func ("`) {
 		t.Errorf("stderr = %q, want the hint to name the metacharacter pattern", errs)
+	}
+}
+
+// --include and --exclude are repeatable and accumulating, and the repeat form
+// produces the same wire field as one comma-separated value. Before the
+// globList change they were plain flag.String values, so the second Set
+// overwrote the first and `--include '*.go' --include '*.md'` searched only
+// *.md while the comma form worked.
+//
+// Precondition: /w/a.go holds the needle, so each search reaches the fake's
+// Search handler and records the query; the globs are read off the wire field
+// the request carries, not off a real walk.
+func TestSearchIncludeExcludeRepeatAndComma(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "needle\n"})
+
+	check := func(t *testing.T, wantInclude, wantExclude string, args ...string) {
+		t.Helper()
+		if _, errs, code := run(t, args...); code != 0 {
+			t.Fatalf("%v: code %d: %s", args, code, errs)
+		}
+		ed.mu.Lock()
+		gotInclude, gotExclude := ed.searchInclude, ed.searchExclude
+		ed.mu.Unlock()
+		if gotInclude != wantInclude || gotExclude != wantExclude {
+			t.Errorf("%v: query include=%q exclude=%q, want include=%q exclude=%q",
+				args, gotInclude, gotExclude, wantInclude, wantExclude)
+		}
+	}
+
+	// One comma-separated value is the baseline.
+	check(t, "*.go,*.md", "", "search", "-q", "needle", "-include", "*.go,*.md")
+	// Repeating the flag accumulates to exactly the same field, in order.
+	check(t, "*.go,*.md", "", "search", "-q", "needle", "-include", "*.go", "-include", "*.md")
+	// --exclude accumulates the same way, repeated or comma-separated.
+	check(t, "*.go,*.md", "vendor/**,*_test.go",
+		"search", "-q", "needle", "-include", "*.go,*.md", "-exclude", "vendor/**,*_test.go")
+	check(t, "*.go,*.md", "vendor/**,*_test.go",
+		"search", "-q", "needle",
+		"-include", "*.go", "-include", "*.md",
+		"-exclude", "vendor/**", "-exclude", "*_test.go")
+	// A single flag is unchanged, and pieces around a comma are trimmed.
+	check(t, "*.go", "", "search", "-q", "needle", "-include", "*.go")
+	check(t, "", "vendor/**", "search", "-q", "needle", "-exclude", "vendor/**")
+	check(t, "*.go,*.md", "", "search", "-q", "needle", "-include", "*.go, *.md,")
+}
+
+// Two --at spans for one path are both read, in argument order, each echoing
+// its own span. Before this change atSpanFlag.Set keyed an index by path and
+// overwrote the earlier entry, and readTargets deduped by path, so
+// `read --at a.go=1,2 --at a.go=20,21` returned only the 20,21 region.
+//
+// Precondition: /w/a.go has 21 lines, so the 1,2 and 20,21 regions are
+// disjoint and a result carrying only one of them is visibly wrong.
+func TestCLIReadAtKeepsRepeatedPathSpans(t *testing.T) {
+	var b strings.Builder
+	for i := 1; i <= 21; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	newFakeEditor(t, map[string]string{"/w/a.go": b.String()})
+
+	out, errs, code := run(t, "read", "-json", "--at", "/w/a.go=1,2", "--at", "/w/a.go=20,21")
+	if code != 0 {
+		t.Fatalf("read --at repeated path: code %d: %s", code, errs)
+	}
+	var got struct {
+		Files []struct {
+			Path      string `json:"path"`
+			Text      string `json:"text"`
+			LineStart int    `json:"line_start"`
+			LineEnd   int    `json:"line_end"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("read --at -json is not parseable: %v (%q)", err, out)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %+v, want two targets for /w/a.go", got.Files)
+	}
+	wants := []struct {
+		text string
+		lo   int
+		hi   int
+	}{
+		{"line 1\nline 2\n", 1, 2},
+		{"line 20\nline 21\n", 20, 21},
+	}
+	for i, w := range wants {
+		f := got.Files[i]
+		if f.Path != "/w/a.go" || f.Text != w.text || f.LineStart != w.lo || f.LineEnd != w.hi {
+			t.Errorf("files[%d] = %+v, want /w/a.go text %q lines %d,%d", i, f, w.text, w.lo, w.hi)
+		}
+	}
+
+	// The plain form carries both regions under the path header, in order.
+	pout, perrs, pcode := run(t, "read", "--at", "/w/a.go=1,2", "--at", "/w/a.go=20,21")
+	if pcode != 0 {
+		t.Fatalf("plain read --at repeated path: code %d: %s", pcode, perrs)
+	}
+	first := strings.Index(pout, "line 1\nline 2\n")
+	second := strings.Index(pout, "line 20\nline 21\n")
+	if first < 0 || second < 0 || first >= second {
+		t.Errorf("plain read --at = %q, want both regions in argument order", pout)
+	}
+}
+
+// --approve lands on the wire for delete, and a local --approve with
+// --withdraw is refused before the client dials: the two name opposite answers.
+func TestCLIDeleteApprove(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	out, errs, code := run(t, "delete", "--approve", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("delete --approve: code = %d: %s", code, errs)
+	}
+	if !ed.lastDelete.Approve || ed.lastDelete.Withdraw {
+		t.Errorf("the wire carried %+v, want an approve for /w/a.go", ed.lastDelete)
+	}
+	if !strings.Contains(out, "approved") {
+		t.Errorf("approve output = %q, want it to say so", out)
+	}
+	if _, _, code = run(t, "delete", "--approve", "--withdraw", "/w/a.go"); code != 2 {
+		t.Fatalf("delete --approve --withdraw: code = %d, want 2", code)
+	}
+	if ed.lastDelete.Withdraw {
+		t.Errorf("the conflicting call was dialed and recorded: %+v", ed.lastDelete)
+	}
+}
+
+// The rmdir twin: --approve crosses, and the pair is refused locally.
+func TestCLIRmdirApprove(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+
+	out, errs, code := run(t, "rmdir", "--approve", "/w/pkg")
+	if code != 0 {
+		t.Fatalf("rmdir --approve: code = %d: %s", code, errs)
+	}
+	if !ed.lastRmdir.Approve || ed.lastRmdir.Withdraw {
+		t.Errorf("the wire carried %+v, want an approve for /w/pkg", ed.lastRmdir)
+	}
+	if !strings.Contains(out, "approved") {
+		t.Errorf("approve output = %q, want it to say so", out)
+	}
+	if _, _, code = run(t, "rmdir", "--approve", "--withdraw", "/w/pkg"); code != 2 {
+		t.Fatalf("rmdir --approve --withdraw: code = %d, want 2", code)
+	}
+	if ed.lastRmdir.Withdraw {
+		t.Errorf("the conflicting call was dialed and recorded: %+v", ed.lastRmdir)
+	}
+}
+
+// who -json carries each participant's working state, the declared state and
+// its optional note and on, and milliseconds since the last request, so a
+// supervisor can read presence without parsing prose.
+func TestCLIWhoJSONCarriesWorkingState(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	out, errs, code := run(t, "state", "set", "review", "--on", "user", "--note", "checking", "--as", "raj-state-test")
+	if code != 0 {
+		t.Fatalf("state set: code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "review") || !strings.Contains(out, "checking") {
+		t.Errorf("state set output %q does not name the declared state and note", out)
+	}
+
+	read, _, code := run(t, "state", "--as", "raj-state-test")
+	if code != 0 || !strings.Contains(read, "review") {
+		t.Errorf("state read = %q, code %d; want the declared review", read, code)
+	}
+
+	out, errs, code = run(t, "who", "-json", "--as", "raj-state-test")
+	if code != 0 {
+		t.Fatalf("who: code %d: %s", code, errs)
+	}
+	for _, want := range []string{
+		`"state": "review"`, `"declared": "review"`, `"since_ms"`,
+		`"note": "checking"`, `"on": "user"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("who -json = %q, want it to carry %s", out, want)
+		}
+	}
+}
+
+// A CLI land over a real socket drives the shipped CLI, wire, Guard and host:
+// the task's pending sets are accepted, the buffer whose pending sets are all
+// that task's is saved, and a buffer that also holds another task's pending
+// set is held back and named rather than approved under this task's banner. An
+// un-tasked set is never selected, and a second land finds nothing pending.
+func TestCLILandAcceptsByTaskAndSaves(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "a\n", "/w/b.go": "b\n", "/w/c.go": "c\n"})
+	// land walks the policy host, not the fake's own doc map, so the buffers
+	// and their pending sets have to live on the memHost behind the Guard.
+	ed.policyMem.docs = map[string]string{"/w/a.go": "a\n", "/w/b.go": "b\n", "/w/c.go": "c\n"}
+	ed.policyMem.vers = map[string]uint64{"/w/a.go": 1, "/w/b.go": 1, "/w/c.go": 1}
+	ed.policyMem.groupsByPath = map[string][]Group{
+		"/w/a.go": {{ID: 1, Path: "/w/a.go", State: "proposed", Task: "task-1", Author: 2}},
+		"/w/b.go": {
+			{ID: 2, Path: "/w/b.go", State: "proposed", Task: "task-1", Author: 2},
+			{ID: 3, Path: "/w/b.go", State: "proposed", Task: "task-2", Author: 2},
+		},
+		"/w/c.go": {{ID: 4, Path: "/w/c.go", State: "proposed", Author: 2}},
+	}
+
+	out, errs, code := run(t, "land", "task-1")
+	if code != 0 {
+		t.Fatalf("land: code %d: stdout %q stderr %q", code, out, errs)
+	}
+	if !strings.Contains(out, "landed task-1: 2 set(s) in 1 file(s)") {
+		t.Errorf("out = %q, want the landed summary counting the task's sets and saved files", out)
+	}
+	if !strings.Contains(out, "/w/a.go") {
+		t.Errorf("out = %q, want the saved buffer named", out)
+	}
+	if !strings.Contains(out, "held /w/b.go: foreign pending sets") {
+		t.Errorf("out = %q, want the held buffer named", out)
+	}
+	if got := ed.policyMem.groupsByPath["/w/a.go"][0].State; got != "accepted" {
+		t.Errorf("a.go task-1 set state = %q, want accepted", got)
+	}
+	if got := ed.policyMem.groupsByPath["/w/b.go"][0].State; got != "accepted" {
+		t.Errorf("b.go task-1 set state = %q, want accepted even though the buffer is held", got)
+	}
+	if got := ed.policyMem.groupsByPath["/w/b.go"][1].State; got != "proposed" {
+		t.Errorf("b.go task-2 set state = %q, want untouched", got)
+	}
+	if got := ed.policyMem.groupsByPath["/w/c.go"][0].State; got != "proposed" {
+		t.Errorf("c.go un-tasked set state = %q, want untouched", got)
+	}
+	if ed.policyMem.saves != 1 {
+		t.Errorf("saves = %d, want only the fully landed buffer", ed.policyMem.saves)
+	}
+
+	out, _, code = run(t, "land", "task-1")
+	if code != 0 || !strings.Contains(out, "nothing pending for task-1") {
+		t.Errorf("second land = %q, code %d; want nothing pending", out, code)
+	}
+}
+
+// land needs the task to select by; without one the CLI refuses before it
+// dials for a meaningless gesture.
+func TestCLILandNeedsATask(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "land")
+	if code != 2 || !strings.Contains(errs, "needs a task") {
+		t.Errorf("code %d, stderr %q; want the usage refusal", code, errs)
 	}
 }

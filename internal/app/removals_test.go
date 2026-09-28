@@ -55,6 +55,7 @@ func TestPendingDeletionNoteAndReopenApprove(t *testing.T) {
 // Withdraw is the third answer the gate now offers: it retracts the proposal
 // without touching disk, through the same WithdrawDeletion path the wire uses.
 func TestPendingDeletionWithdrawRetracts(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	path := proposeDeletion(t, h)
 
@@ -108,6 +109,7 @@ func TestPendingDirRemovalNoteAndReopenApprove(t *testing.T) {
 
 // Withdraw retracts a dir-removal too, leaving the subtree on disk.
 func TestPendingDirRemovalWithdrawRetracts(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	dir := mkTree(t, h)
 	proposeDirRemoval(t, h, dir)
@@ -130,6 +132,7 @@ func TestPendingDirRemovalWithdrawRetracts(t *testing.T) {
 // The re-raise chord presents the oldest proposal first, across both lists: a
 // file deletion recorded before a dir-removal is the one the key raises.
 func TestReopenRemovalPresentsTheOldestFirst(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("two\n"), 0o644); err != nil {
@@ -154,6 +157,7 @@ func TestReopenRemovalPresentsTheOldestFirst(t *testing.T) {
 
 // With nothing pending the surface is invisible: no note, no stray indicator.
 func TestNoPendingRemovalsIsInvisible(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	if got := h.pendingRemovalNote(); got != "" {
 		t.Errorf("note = %q with nothing pending, want empty", got)

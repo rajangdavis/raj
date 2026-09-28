@@ -102,6 +102,9 @@ const (
 	OpLSPMode    = 0x10 // string: hover, definition, completion or diagnostics
 	OpReviewList = 0x11 // flag: review returns the list only, entering no mode
 	OpArg        = 0x12 // one argv element for exec; repeated, they accumulate
+	OpGitMode    = 0x13 // string: status, diff, show, numstat or log
+	OpGitRev     = 0x14 // string: the revision show/diff/numstat read; default HEAD
+	OpGitCount   = 0x15 // varint: the most log entries to list; zero is a default
 
 	// verbs (0x80–0xff) are the driver verbs, refused when unknown
 	OpPing    = 0x80
@@ -133,6 +136,8 @@ const (
 	// every verb above them.
 	OpSnapshot = 0x97 // the whole document a client needs to render it itself
 	OpWatch    = 0x98 // park until the open buffers change generation
+	OpGit      = 0x99 // read-only git: status, diff, show, numstat, log
+	OpReveal   = 0x9a // put a path, and optionally a byte span, in front of the user
 
 )
 
@@ -163,6 +168,8 @@ var names = map[byte]string{
 	OpLSPMode: "lsp-mode", OpLSP: "lsp", OpDiff: "diff",
 	OpReviewList: "review-list", OpArg: "arg", OpReview: "review", OpClear: "clear",
 	OpFind: "find", OpExec: "exec", OpSnapshot: "snapshot", OpWatch: "watch",
+	OpGitMode: "git-mode", OpGitRev: "git-rev", OpGitCount: "git-count", OpGit: "git",
+	OpReveal: "reveal",
 }
 
 // Name is the opcode's spelling, for disassembly and error messages. An

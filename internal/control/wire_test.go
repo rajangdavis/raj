@@ -58,6 +58,28 @@ func TestReadSpanRoundTripsThroughHeader(t *testing.T) {
 	}
 }
 
+// A hello carries the task its connection will write under, so the field has
+// to survive the header and the request codec together: the server stores it
+// on the participant and every later write derives it from there.
+func TestTaskSurvivesHelloRoundTrip(t *testing.T) {
+	h, body := EncodeRequest(Request{ID: 5, Op: "hello", Identity: "agent-1", Name: "claude", Task: "task-7"})
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, h, body); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := DecodeRequest(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Op != "hello" || req.Identity != "agent-1" || req.Task != "task-7" {
+		t.Errorf("hello = %+v, want task-7 on agent-1", req)
+	}
+}
+
 // The review verb's list-only flag must survive the header, or `raj ctl
 // review -json` would enter the mode it promised to leave alone.
 func TestReviewListSurvives(t *testing.T) {
@@ -160,6 +182,35 @@ func TestDeletionsResponseRoundTrips(t *testing.T) {
 	for i := range want {
 		if got.Deletions[i] != want[i] {
 			t.Errorf("deletion %d = %+v, want %+v", i, got.Deletions[i], want[i])
+		}
+	}
+}
+
+// The watch answer reveal list crosses as its own sparse field, each record of
+// path and byte span intact — including the -1,-1 whole-file span, which must
+// survive next to a real one.
+func TestRevealsResponseRoundTrips(t *testing.T) {
+	want := []Reveal{
+		{Path: "/w/a.go", Start: 4, End: 7},
+		{Path: "/w/b.go", Start: -1, End: -1},
+	}
+	h, body := EncodeResponse(Response{ID: 4, OK: true, Reveals: want})
+	var buf bytes.Buffer
+	WriteFrame(&buf, h, body)
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Reveals) != len(want) {
+		t.Fatalf("reveals = %+v, want %+v", got.Reveals, want)
+	}
+	for i := range want {
+		if got.Reveals[i] != want[i] {
+			t.Errorf("reveal %d = %+v, want %+v", i, got.Reveals[i], want[i])
 		}
 	}
 }
@@ -459,14 +510,32 @@ func TestResponseCarriesRoots(t *testing.T) {
 	}
 }
 
+// Projection is in-process only: it carries the live composition from the
+// event thread to the exec runner inside the server, and EncodeResponse builds
+// its header field by field, so a field with no encoder line is dropped. This
+// pins that the bytes never cross the wire, so an execcheck reply cannot leak
+// the projected text to a client.
+func TestResponseProjectionIsNotWireEncoded(t *testing.T) {
+	proj := map[string][]byte{"/w/a.go": []byte("package projected\n")}
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Projection: proj, Root: "/w"})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Projection != nil {
+		t.Errorf("Projection crossed the wire: %v", got.Projection)
+	}
+}
+
 // Messages ride in the header rather than the body, so the one thing that can
 // go wrong is EncodeResponse or DecodeResponse forgetting the field — which
 // costs nothing at compile time and delivers an empty recv at runtime.
 func TestResponseCarriesMessages(t *testing.T) {
 	want := []Message{
 		{From: AuthorUser, Text: "stop what you are doing"},
-		{From: AuthorUser, Text: "second thoughts: carry on"},
+		{From: 7, FromKey: "raj-peer", FromName: "peer", Text: "second thoughts: carry on"},
 	}
+
 	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Messages: want})
 	got, err := DecodeResponse(Frame{Header: h, Body: body})
 	if err != nil {
@@ -704,9 +773,9 @@ func TestSrcVersionCrossesTheWire(t *testing.T) {
 // forgotten by a verb: whatever the client asks first — handshake or not —
 // the answer names the build it came from.
 func TestServerStampsItsBuildRevision(t *testing.T) {
-	old := srcVersion
-	defer func() { srcVersion = old }()
-	srcVersion = "srv-abc"
+	old := currentSrcVersion()
+	defer setSrcVersion(old)
+	setSrcVersion("srv-abc")
 
 	ed := newFakeEditor(t, nil)
 	c, err := Dial(ed.srv.Path())

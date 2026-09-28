@@ -70,6 +70,7 @@ func explorerSelect(t *testing.T, h *harness, name string) {
 }
 
 func TestExplorerOpensFile(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	if h.Focused() != FocusSidebar {
@@ -87,6 +88,7 @@ func TestExplorerOpensFile(t *testing.T) {
 }
 
 func TestExplorerExpandsDirectory(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	before := len(h.Explorer.Tree.Entries())
@@ -104,6 +106,7 @@ func TestExplorerExpandsDirectory(t *testing.T) {
 // back through the changed-only toggle. Once focus is in the editor, shift+tab
 // is an outdent and cannot bring it back — the one-way rule.
 func TestSidebarTabOpensAndShiftTabWalksBack(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 
@@ -139,6 +142,7 @@ func TestSidebarTabOpensAndShiftTabWalksBack(t *testing.T) {
 
 // Once focus is in the editor, tab is indentation rather than navigation.
 func TestTabIndentsInEditor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "line")
 	h.press("tab")
 	if got := h.text(); got != "\tline" {
@@ -150,6 +154,7 @@ func TestTabIndentsInEditor(t *testing.T) {
 }
 
 func TestSearchFindsAndOpens(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -172,6 +177,7 @@ func TestSearchFindsAndOpens(t *testing.T) {
 
 // The include field must narrow results by glob.
 func TestSearchIncludeGlob(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -191,6 +197,7 @@ func TestSearchIncludeGlob(t *testing.T) {
 
 // A bad regex must report rather than crash, and only when regex mode is on.
 func TestSearchBadRegex(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("a(b")
@@ -205,6 +212,7 @@ func TestSearchBadRegex(t *testing.T) {
 }
 
 func TestPickerOpensFile(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	if h.Focused() != FocusPicker {
@@ -221,6 +229,7 @@ func TestPickerOpensFile(t *testing.T) {
 }
 
 func TestPickerEscapeCancels(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	h.press("esc")
@@ -230,6 +239,7 @@ func TestPickerEscapeCancels(t *testing.T) {
 }
 
 func TestTabsOpenCloseReopen(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))
@@ -249,6 +259,7 @@ func TestTabsOpenCloseReopen(t *testing.T) {
 
 // Closing the last tab leaves raj running with an empty editor.
 func TestCloseLastTabKeepsRunning(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "content")
 	h.press("super+w")
 	if h.quit {
@@ -263,6 +274,7 @@ func TestCloseLastTabKeepsRunning(t *testing.T) {
 }
 
 func TestOpeningSameFileReusesTab(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	p := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	h.OpenFile(p)
@@ -273,6 +285,7 @@ func TestOpeningSameFileReusesTab(t *testing.T) {
 }
 
 func TestTabSwitching(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))
@@ -289,6 +302,7 @@ func TestTabSwitching(t *testing.T) {
 
 // Below the narrow breakpoint only one pane draws, and which one follows focus.
 func TestNarrowLayoutShowsOnePane(t *testing.T) {
+	t.Parallel()
 	wide := computeLayout(120, 24, SidebarExplorer, FocusSidebar)
 	if !wide.ShowSidebar || !wide.ShowEditor {
 		t.Error("a wide window should show both panes")
@@ -308,6 +322,7 @@ func TestNarrowLayoutShowsOnePane(t *testing.T) {
 
 // cmd+b closes the sidebar and returns focus to the editor.
 func TestToggleSidebar(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.press("super+b")
@@ -325,6 +340,7 @@ func TestToggleSidebar(t *testing.T) {
 
 // Pressing a sidebar's own chord while it has focus closes it.
 func TestSidebarChordToggles(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.press("shift+super+e")
@@ -335,6 +351,7 @@ func TestSidebarChordToggles(t *testing.T) {
 
 // Switching between sidebars keeps focus rather than closing.
 func TestSwitchBetweenSidebars(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.press("shift+super+f")
@@ -345,6 +362,7 @@ func TestSwitchBetweenSidebars(t *testing.T) {
 
 // Results are grouped: a header per file, then one row per hit.
 func TestSearchGroupsByFile(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -387,6 +405,7 @@ func TestSearchGroupsByFile(t *testing.T) {
 
 // A file with several hits gets one header, not one per hit.
 func TestSearchGroupsRepeatedHits(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("func")
@@ -409,6 +428,7 @@ func TestSearchGroupsRepeatedHits(t *testing.T) {
 
 // Enter on a header folds the group; enter on a match opens the file.
 func TestSearchHeaderTogglesAndMatchOpens(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -439,6 +459,7 @@ func TestSearchHeaderTogglesAndMatchOpens(t *testing.T) {
 
 // Left and right collapse and expand without moving off the header.
 func TestSearchArrowsFold(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -461,6 +482,7 @@ func TestSearchArrowsFold(t *testing.T) {
 // the size-driven layout change never reaches the clear — which is how the bug
 // hid while FakeHost had a fixed size.
 func TestResizeInvalidates(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.drain()
 	beforeI, beforeR := h.host.Invalidations(), h.host.Repaints()
@@ -480,6 +502,7 @@ func TestResizeInvalidates(t *testing.T) {
 // on every sidebar toggle, and a full write is enough when raj is the only
 // writer.
 func TestLayoutChangeRepaints(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	beforeR, beforeI := h.host.Repaints(), h.host.Invalidations()
@@ -500,6 +523,7 @@ func TestLayoutChangeRepaints(t *testing.T) {
 // request, and answering it at the bottom of the screen looks like nothing
 // happened at all.
 func TestOpenBinaryIsDeclined(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	bin := filepath.Join(h.Explorer.Tree.Root, "a.out")
 	if err := os.WriteFile(bin, []byte("\x7fELF\x02\x00\x1b[2J\x00garbage"), 0o644); err != nil {
@@ -526,6 +550,7 @@ func TestOpenBinaryIsDeclined(t *testing.T) {
 // were previously a single unmarked row that only responded to typing r, c or
 // w, which is undiscoverable.
 func TestSearchTogglesAreFocusable(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -555,6 +580,7 @@ func TestSearchTogglesAreFocusable(t *testing.T) {
 // row in a focused pane and an ordinary row, or a sidebar you have tabbed away
 // from still looks like it is taking keystrokes.
 func TestFocusStatesAreDistinct(t *testing.T) {
+	t.Parallel()
 	th := widgetTheme()
 	sel := th.Focus(true, true)
 	inactive := th.Focus(true, false)
@@ -569,6 +595,7 @@ func TestFocusStatesAreDistinct(t *testing.T) {
 
 // cmd+f opens the in-buffer bar, steps through matches, and escape closes it.
 func TestFindInFileThroughKeybindings(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha beta alpha gamma alpha")
 	h.press("super+f")
 	h.typeText("alpha")
@@ -595,6 +622,7 @@ func TestFindInFileThroughKeybindings(t *testing.T) {
 
 // Typing while find is open goes to the query, not the buffer.
 func TestFindCapturesTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc")
 	h.press("super+f")
 	h.typeText("b")
@@ -609,6 +637,7 @@ func TestFindCapturesTyping(t *testing.T) {
 // cmd+f, tab to the replace row, then enter replaces the current match. The
 // edit is one ordinary pane edit, so a single undo restores it.
 func TestFindReplaceThroughKeybindings(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one two one")
 	h.press("super+f")
 	h.typeText("one")
@@ -628,6 +657,7 @@ func TestFindReplaceThroughKeybindings(t *testing.T) {
 
 // cmd+enter in the replace row replaces every match.
 func TestFindReplaceAllThroughKeybindings(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one two one")
 	h.press("super+f")
 	h.typeText("one")
@@ -647,6 +677,7 @@ func TestFindReplaceAllThroughKeybindings(t *testing.T) {
 // A replace in Review mode is refused with the read-only note: the bar sits
 // ahead of the editor's own read-only check, so the gate has to be inside it.
 func TestFindReplaceRefusedInReviewMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one two one")
 	h.press("super+r")
 	if h.mode != ModeReview {
@@ -667,6 +698,7 @@ func TestFindReplaceRefusedInReviewMode(t *testing.T) {
 
 // cmd+c writes to the system clipboard via the host.
 func TestCopyWritesClipboard(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "copy me\nsecond")
 	h.press("super+a")
 	h.press("super+c")
@@ -676,6 +708,7 @@ func TestCopyWritesClipboard(t *testing.T) {
 }
 
 func TestCutRemovesAndCopies(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "cut this")
 	h.press("super+a")
 	h.press("super+x")
@@ -689,6 +722,7 @@ func TestCutRemovesAndCopies(t *testing.T) {
 
 // The whole chain for the new editing chords.
 func TestNewEditingChords(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name, content, chord, want string
 	}{
@@ -709,6 +743,7 @@ func TestNewEditingChords(t *testing.T) {
 
 // cmd+d selects the word, then adds a cursor per press.
 func TestAddNextOccurrenceChord(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "go go go")
 	h.press("super+d")
 	if n := h.Pane().Cursors.Count(); n != 1 {
@@ -723,6 +758,10 @@ func TestAddNextOccurrenceChord(t *testing.T) {
 
 // Highlighting must never run during a frame: chroma costs tens of
 // milliseconds and rendering happens on every keystroke.
+//
+// Deliberately not parallel: the bound is wall-clock, so the parallel suite's
+// CPU contention would fail it for the machine's load rather than for the
+// behaviour it pins.
 func TestRenderDoesNotBlockOnSyntax(t *testing.T) {
 	h := newHarness(t, strings.Repeat("func f() { x := 1 }\n", 400))
 	start := time.Now()
@@ -737,6 +776,7 @@ func TestRenderDoesNotBlockOnSyntax(t *testing.T) {
 // One user action is one undo step. Typing with several cursors used to take
 // one cmd+z per cursor, and the intermediate states were ones no user created.
 func TestUndoIsOneStepPerAction(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "go go go")
 	h.press("super+d", "super+d", "super+d") // select word, then two more
 	if n := h.Pane().Cursors.Count(); n != 3 {
@@ -758,6 +798,7 @@ func TestUndoIsOneStepPerAction(t *testing.T) {
 
 // A multi-line action is also a single step.
 func TestUndoGroupsMultiLineActions(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc")
 	h.press("super+a")
 	h.press("tab") // indents three lines
@@ -773,6 +814,7 @@ func TestUndoGroupsMultiLineActions(t *testing.T) {
 // A reopened tab must be highlighted like any other, not left plain because it
 // bypassed the normal open path.
 func TestReopenedTabIsHighlighted(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.OpenFile(filepath.Join(h.Explorer.Tree.Root, "main.go"))
 	h.press("super+w")
@@ -797,6 +839,7 @@ func TestReopenedTabIsHighlighted(t *testing.T) {
 
 // A freshly opened file tokenises without needing an edit first.
 func TestOpenedFileTokenisesWithoutEditing(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.OpenFile(filepath.Join(h.Explorer.Tree.Root, "main.go"))
 	deadline := time.Now().Add(3 * time.Second)
@@ -812,6 +855,7 @@ func TestOpenedFileTokenisesWithoutEditing(t *testing.T) {
 
 // Editing must retokenise promptly, not only when the idle tick comes round.
 func TestSyntaxRefreshesAfterEdit(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.OpenFile(filepath.Join(h.Explorer.Tree.Root, "main.go"))
 	deadline := time.Now().Add(3 * time.Second)
@@ -833,6 +877,7 @@ func TestSyntaxRefreshesAfterEdit(t *testing.T) {
 // reports a column past the end of its line, and the view scrolls sideways —
 // which is what made undo look like it was mangling the whole file.
 func TestUndoMovesCursorToTheChange(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "line one\nline two\nline three")
 	h.press("super+down") // to the end of the document
 	h.typeText("X")
@@ -855,6 +900,7 @@ func TestUndoMovesCursorToTheChange(t *testing.T) {
 // step. Both directions are checked: cmd+1-9 went back to the terminal, so the
 // cycling chords are now the only way in and carry the focus behaviour alone.
 func TestTabSwitchFocusesEditor(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))
@@ -877,6 +923,7 @@ func TestTabSwitchFocusesEditor(t *testing.T) {
 // Tab reveals the replace row rather than indenting. Once revealed the bar
 // stays two rows tall, and shift+tab walks focus back without closing it.
 func TestFindTabRevealsReplaceRow(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aa bb aa cc aa")
 	h.press("super+f")
 	h.typeText("aa")
@@ -899,6 +946,7 @@ func TestFindTabRevealsReplaceRow(t *testing.T) {
 // Cutting a whole line leaves the cursor at the start of the line that took its
 // place, not at a column past the end of it.
 func TestCutLineCursorPosition(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaaaaaaaaa\nbb\ncc")
 	h.press("super+right") // end of line 0
 	h.press("super+x")
@@ -915,6 +963,7 @@ func TestCutLineCursorPosition(t *testing.T) {
 // cmd+up and cmd+down move between the search query and its results, which is
 // the only move you make often: the glob fields are set once and left alone.
 func TestSearchJumpsBetweenQueryAndResults(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -939,6 +988,7 @@ func TestSearchJumpsBetweenQueryAndResults(t *testing.T) {
 // happened to be committed last — which was the bottom of the file, since edits
 // apply highest-offset-first.
 func TestUndoRestoresMultiCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "go\ngo\ngo")
 	h.press("super+d", "super+d", "super+d")
 	if n := h.Pane().Cursors.Count(); n != 3 {
@@ -961,6 +1011,7 @@ func TestUndoRestoresMultiCursor(t *testing.T) {
 // A paste is one edit: one undo step, and a handful of pieces however many
 // cursors are active.
 func TestPasteIsASingleEdit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "a\nb\nc")
 	h.press("super+d", "super+d") // two cursors
 	before := h.Pane().File.Pieces()
@@ -983,6 +1034,7 @@ func TestPasteIsASingleEdit(t *testing.T) {
 // cursor with the view reads fine with one caret and badly with several: paging
 // to look at something else would collapse a multi-cursor set.
 func TestPageScrollsWithoutMovingCursors(t *testing.T) {
+	t.Parallel()
 	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
 	h.drain()
 	h.press("pgdown")
@@ -1002,6 +1054,7 @@ func TestPageScrollsWithoutMovingCursors(t *testing.T) {
 // The view stays where it was scrolled to until something moves a cursor, and
 // then it snaps back — otherwise an edit would land off screen.
 func TestCursorMotionPullsTheViewBack(t *testing.T) {
+	t.Parallel()
 	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
 	h.drain()
 	h.press("pgdown", "pgdown")
@@ -1018,6 +1071,7 @@ func TestCursorMotionPullsTheViewBack(t *testing.T) {
 // A multi-cursor set must survive paging: this is the case the old behaviour
 // got wrong, since moving the cursor collapses the set to one.
 func TestPagePreservesMultiCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
 	h.drain()
 	h.press("alt+super+down", "alt+super+down")
@@ -1034,6 +1088,7 @@ func TestPagePreservesMultiCursor(t *testing.T) {
 // Shift+page still moves the cursor: it is a selection, and a selection needs
 // an end to move.
 func TestSelPageStillMovesTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarnessSize(t, strings.Repeat("x\n", 200), 80, 12)
 	h.drain()
 	h.press("shift+pgdown")
@@ -1045,6 +1100,7 @@ func TestSelPageStillMovesTheCursor(t *testing.T) {
 // With nothing open, raj starts in the explorer: an editor with no file is not
 // a useful place for the keys to be.
 func TestStartsInExplorerWhenNothingOpen(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.drain()
 	if h.Focused() != FocusSidebar || h.SidebarMode() != SidebarExplorer {
@@ -1054,6 +1110,7 @@ func TestStartsInExplorerWhenNothingOpen(t *testing.T) {
 
 // Naming a file on the command line takes focus to it instead.
 func TestOpeningAFileFocusesTheEditor(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.OpenFile(filepath.Join(h.Explorer.Tree.Root, "main.go"))
 	if h.Focused() != FocusEditor {
@@ -1064,6 +1121,7 @@ func TestOpeningAFileFocusesTheEditor(t *testing.T) {
 // The debug pane records what arrived and what it resolved to, which is the
 // only way to tell a chord Ghostty swallowed from one that did nothing.
 func TestDebugPaneRecordsKeys(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello")
 	h.press("shift+ctrl+d")
 	if !h.Debug.Open {
@@ -1098,6 +1156,7 @@ func TestDebugPaneRecordsKeys(t *testing.T) {
 // into the search box or the picker vanished silently: the payload arrives as
 // one event, so the text fields never saw it and had nothing to fall back to.
 func TestPasteIntoSearchField(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("shift+super+f")
 	if h.Focused() != FocusSidebar || h.SidebarMode() != SidebarSearch {
@@ -1113,6 +1172,7 @@ func TestPasteIntoSearchField(t *testing.T) {
 // A multi-line paste into a single-line field takes the first line: the field
 // has nowhere to put the rest, and literal newlines render as placeholders.
 func TestPasteIntoFieldTakesFirstLine(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("shift+super+f")
 	h.Handle(ui.Paste{Text: "first\nsecond\nthird"})
@@ -1125,6 +1185,7 @@ func TestPasteIntoFieldTakesFirstLine(t *testing.T) {
 // A path pasted from a shell carries a trailing newline, which must not be
 // searched for literally.
 func TestPasteTrimsTrailingNewline(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("shift+super+f")
 	h.Handle(ui.Paste{Text: "main.go\n"})
@@ -1139,6 +1200,7 @@ func TestPasteTrimsTrailingNewline(t *testing.T) {
 // resolved against the workspace rather than against the shell's cwd — which
 // is the same thing only when raj was started from the directory it is editing.
 func TestPickerOpensTheRealFile(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	h.typeText("helper")
@@ -1161,6 +1223,7 @@ func TestPickerOpensTheRealFile(t *testing.T) {
 // The picker had no paste coverage at all, which is how the field could hold a
 // pasted path while the list showed nothing without a test noticing.
 func TestPasteIntoPicker(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	if h.Focused() != FocusPicker {
@@ -1182,6 +1245,7 @@ func TestPasteIntoPicker(t *testing.T) {
 // A path pasted from a shell or a compiler carries a prefix and a position the
 // index does not. The picker narrows it rather than searching for it literally.
 func TestPasteIntoPickerNarrowsAPath(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	h.Handle(ui.Paste{Text: filepath.Join(h.primaryRoot(), "main.go") + ":12:4\n"})
@@ -1198,6 +1262,7 @@ func TestPasteIntoPickerNarrowsAPath(t *testing.T) {
 // where the compiler was pointing. The position is parsed out to make the path
 // match; throwing it away afterwards would land at the top of the file.
 func TestPasteIntoPickerOpensAtThePosition(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	h.Handle(ui.Paste{Text: filepath.Join(h.primaryRoot(), "pkg/helper.go") + ":3:6\n"})
@@ -1218,6 +1283,7 @@ func TestPasteIntoPickerOpensAtThePosition(t *testing.T) {
 
 // A path with no position opens at the top, unchanged.
 func TestPickerWithoutAPositionOpensAtTheTop(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	h.Handle(ui.Paste{Text: "pkg/helper.go"})
@@ -1232,6 +1298,7 @@ func TestPickerWithoutAPositionOpensAtTheTop(t *testing.T) {
 // The explorer has no text field, and its only keys.None handler treats a space
 // as the changed-only toggle. A pasted space must not flip that filter.
 func TestPasteIntoExplorerIsIgnored(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("shift+super+e")
 	before := h.Explorer.Tree.ChangedOnly
@@ -1246,6 +1313,7 @@ func TestPasteIntoExplorerIsIgnored(t *testing.T) {
 // edge is worse than one continuing below, so horizontal scrolling is the
 // fallback rather than the default — and there is no flag to remember.
 func TestWrapIsOnByDefault(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	if !h.WrapDefault {
 		t.Fatal("WrapDefault is off")
@@ -1264,6 +1332,7 @@ func TestWrapIsOnByDefault(t *testing.T) {
 // A wrapped pane never scrolls horizontally: the line continues below instead,
 // so there is nothing off to the right to scroll to.
 func TestWrappedPaneDoesNotScrollHorizontally(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 60, 12)
 	dir := h.Explorer.Tree.Root
 	path := filepath.Join(dir, "wide.md")
@@ -1286,6 +1355,7 @@ func TestWrappedPaneDoesNotScrollHorizontally(t *testing.T) {
 // The changed-only toggle sits under the heading and is reachable with cmd+up,
 // with cmd+down going back to the tree — the same jump the search pane uses.
 func TestExplorerFilterIsReachableWithCmdUpDown(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 
@@ -1302,6 +1372,7 @@ func TestExplorerFilterIsReachableWithCmdUpDown(t *testing.T) {
 // Deep paths are truncated in the tree, so the selected one is spelled out on
 // the pane's last row.
 func TestExplorerShowsSelectedPath(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	explorerSelect(t, h, "pkg")
@@ -1320,6 +1391,7 @@ func TestExplorerShowsSelectedPath(t *testing.T) {
 // cmd+g steps to the next match with the find bar closed: find something, keep
 // editing, then keep stepping without reopening anything.
 func TestFindNextWithTheBarClosed(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "needle\nfiller\nneedle\nfiller\nneedle\n")
 	h.press("super+f")
 	h.typeText("needle")
@@ -1345,6 +1417,7 @@ func TestFindNextWithTheBarClosed(t *testing.T) {
 // request and a status line at the bottom of the screen looks like nothing
 // happened.
 func TestOpenUnsupportedEncodingIsDeclined(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "utf32.txt")
 	// A UTF-32 little-endian byte order mark: identifiable, unsupported, and

@@ -11,6 +11,7 @@ import (
 
 // cmd+r toggles the application between Edit and Review mode.
 func TestToggleReviewMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	if h.mode != ModeEdit {
 		t.Fatalf("mode = %v at startup, want Edit", h.mode)
@@ -27,6 +28,7 @@ func TestToggleReviewMode(t *testing.T) {
 
 // A text mutation in Review mode is refused and the document is untouched.
 func TestReviewModeRefusesTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	h.press("super+r")
 	before := h.text()
@@ -41,6 +43,7 @@ func TestReviewModeRefusesTyping(t *testing.T) {
 
 // Structural edits are refused too: backspace at the caret must not delete.
 func TestReviewModeRefusesBackspace(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	p := h.Pane()
 	p.Cursors.Set(len("hello"), len("hello"))
@@ -53,6 +56,7 @@ func TestReviewModeRefusesBackspace(t *testing.T) {
 
 // Movement and selection stay live in Review mode.
 func TestReviewModeKeepsMovement(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	h.press("super+r")
 	h.press("down")
@@ -64,6 +68,7 @@ func TestReviewModeKeepsMovement(t *testing.T) {
 // Entering Review jumps to the first pending set; entering with none is an
 // allowed read-only browse and says so.
 func TestReviewEntersAtTheFirstSet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
@@ -77,6 +82,7 @@ func TestReviewEntersAtTheFirstSet(t *testing.T) {
 }
 
 func TestReviewEntersWithNoProposals(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	h.press("super+r")
 	if h.mode != ModeReview {
@@ -92,6 +98,7 @@ func TestReviewEntersWithNoProposals(t *testing.T) {
 
 // Accept and reject are decisions, not edits, so they stay live in Review mode.
 func TestReviewModeKeepsAccept(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r")
@@ -105,6 +112,7 @@ func TestReviewModeKeepsAccept(t *testing.T) {
 }
 
 func TestReviewModeKeepsReject(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r")
@@ -125,6 +133,7 @@ func TestReviewModeKeepsReject(t *testing.T) {
 
 // Reload moved off cmd+r: shift+super+r still reloads in Edit mode.
 func TestReloadIsOnShiftSuperR(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	rewriteOnDisk(t, h, "theirs\n")
 	h.press("shift+super+r")
@@ -138,6 +147,7 @@ func TestReloadIsOnShiftSuperR(t *testing.T) {
 
 // Reload is refused in Review mode: it would discard the sets under review.
 func TestReviewModeRefusesReload(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	rewriteOnDisk(t, h, "theirs\n")
 	h.press("super+r")
@@ -153,6 +163,7 @@ func TestReviewModeRefusesReload(t *testing.T) {
 // The keybar is derived from the binding table: it names the real chords, not
 // the design shorthand letters.
 func TestReviewBarNamesTheRealChords(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	h.press("super+r")
 	bar := h.reviewBar()
@@ -171,6 +182,7 @@ func TestReviewBarNamesTheRealChords(t *testing.T) {
 // A lease keeps each set whole, so the bar progress total and the next/prev
 // own count still agree.
 func TestReviewBarProgressMatchesTheCycle(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	propose(t, h, piecetable.Hunk{Start: 0, End: 3, Text: "uno"})
 	propose(t, h, piecetable.Hunk{Start: 8, End: 13, Text: "tres"})
@@ -206,6 +218,7 @@ func TestReviewBarProgressMatchesTheCycle(t *testing.T) {
 // The lease stops a set being overwritten, so it stays pending and the bar
 // keeps counting it instead of quietly dropping it.
 func TestReviewBarKeepsALeasedSet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	// Try to replace every byte of the inserted text with the user's own.
@@ -241,6 +254,7 @@ func TestReviewBarKeepsALeasedSet(t *testing.T) {
 // refused and the set keeps both of them: the bar counts it whole and names no
 // unplaced member.
 func TestReviewBarKeepsBothMembersOfALeasedSet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "aaa bbb ccc\n")
 	propose(t, h,
 		piecetable.Hunk{Start: 0, End: 3, Text: "AAA"},
@@ -271,6 +285,7 @@ func TestReviewBarKeepsBothMembersOfALeasedSet(t *testing.T) {
 
 // The rendered status line carries the badge, not just the app field.
 func TestReviewBadgeIsDrawn(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	h.press("super+r")
 	frame := h.host.Text()
@@ -284,6 +299,7 @@ func TestReviewBadgeIsDrawn(t *testing.T) {
 // path feeds the pane's display from the mode. Before this slice disp was
 // always nil, so the fold marker could never appear.
 func TestDrawProjectsByMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	if !h.Pane().File.RejectGroup(id) {

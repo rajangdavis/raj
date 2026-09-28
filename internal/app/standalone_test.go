@@ -5,6 +5,7 @@ import "testing"
 // A standalone editor opens no workspace store: there is no state directory
 // for the file's directory and no session to save or restore.
 func TestStandaloneOpensNoStore(t *testing.T) {
+	t.Parallel()
 	h := newOptionsHarness(t, "x\n", Options{Standalone: true})
 	if h.state != nil {
 		t.Errorf("standalone opened a workspace store: %p", h.state)
@@ -20,6 +21,7 @@ func TestStandaloneOpensNoStore(t *testing.T) {
 // A standalone editor serves no control listener, even when an address is
 // passed to the app: it is a private single-file session.
 func TestStandaloneServesNoControl(t *testing.T) {
+	t.Parallel()
 	h := newOptionsHarness(t, "x\n", Options{Standalone: true})
 	if err := h.StartControlAddrs([]string{"tcp://127.0.0.1:0"}); err != nil {
 		t.Fatalf("StartControlAddrs(standalone) = %v", err)
@@ -36,6 +38,7 @@ func TestStandaloneServesNoControl(t *testing.T) {
 // FocusExplorer chord cannot open it, and the frame keeps the full width for
 // the editor.
 func TestStandaloneSidebarStaysHidden(t *testing.T) {
+	t.Parallel()
 	h := newOptionsHarness(t, "x\n", Options{Standalone: true})
 	if got := h.SidebarMode(); got != SidebarNone {
 		t.Fatalf("standalone sidebar = %v, want closed", got)
@@ -62,6 +65,7 @@ func TestStandaloneSidebarStaysHidden(t *testing.T) {
 // The other sidebar chords are no-ops too, so no route conjures the explorer
 // or the problems pane in a one-file session.
 func TestStandaloneSidebarChordsAreNoOps(t *testing.T) {
+	t.Parallel()
 	h := newOptionsHarness(t, "x\n", Options{Standalone: true})
 	for _, chord := range []string{"shift+super+e", "shift+super+f", "shift+super+m", "super+b"} {
 		h.press(chord)

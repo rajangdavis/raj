@@ -14,6 +14,7 @@ import (
 // missing, not only the last one.
 
 func TestNewFileOpensAnUnnamedTab(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original")
 	before := h.Tabs.Count()
 
@@ -40,6 +41,7 @@ func TestNewFileOpensAnUnnamedTab(t *testing.T) {
 // Two presses mean two buffers. Tabs dedupes by path and an unnamed buffer has
 // none, so this is the case where that dedupe could wrongly collapse them.
 func TestNewFileTwiceOpensTwoBuffers(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	before := h.Tabs.Count()
 	h.press("super+n")
@@ -56,6 +58,7 @@ func TestNewFileTwiceOpensTwoBuffers(t *testing.T) {
 }
 
 func TestSaveAsWritesToTheChosenPath(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("super+n")
 	h.typeText("scratch contents")
@@ -96,6 +99,7 @@ func TestSaveAsWritesToTheChosenPath(t *testing.T) {
 // A cancelled save-as must leave the disk alone AND leave the buffer unnamed,
 // so the next cmd+s asks again rather than writing somewhere half-chosen.
 func TestSaveAsCancelledWritesNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("super+n")
 	h.typeText("unsaved")
@@ -115,6 +119,7 @@ func TestSaveAsCancelledWritesNothing(t *testing.T) {
 }
 
 func TestSaveAsRelativePathResolvesAgainstTheRoot(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	if err := os.Mkdir(filepath.Join(h.primaryRoot(), "sub"), 0o755); err != nil {
 		t.Fatal(err)
@@ -133,6 +138,7 @@ func TestSaveAsRelativePathResolvesAgainstTheRoot(t *testing.T) {
 }
 
 func TestSaveAsOverExistingFileAsksFirst(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		keys    []string
@@ -176,6 +182,7 @@ func TestSaveAsOverExistingFileAsksFirst(t *testing.T) {
 // A named file saves straight through: the dialog is for buffers that have
 // nowhere to go, and making cmd+s always ask would be intolerable.
 func TestSaveOnANamedFileDoesNotAsk(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "start")
 	h.typeText("x")
 	h.press("super+s")
@@ -193,6 +200,7 @@ func TestSaveOnANamedFileDoesNotAsk(t *testing.T) {
 }
 
 func TestCloseCleanTabDoesNotAsk(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "untouched")
 	h.press("super+w")
 
@@ -207,6 +215,7 @@ func TestCloseCleanTabDoesNotAsk(t *testing.T) {
 // The core guarantee: a tab with unsaved changes is never closed without an
 // answer that asked for it.
 func TestCloseDirtyTabAsksBeforeDiscarding(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		answer    []string
@@ -252,6 +261,7 @@ func TestCloseDirtyTabAsksBeforeDiscarding(t *testing.T) {
 // Closing a dirty unnamed buffer is the chain: confirm, then save-as, then
 // close — and only if the second question is answered too.
 func TestCloseDirtyUnnamedBufferChainsIntoSaveAs(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	before := h.Tabs.Count()
 	h.press("super+n")
@@ -290,6 +300,7 @@ func TestCloseDirtyUnnamedBufferChainsIntoSaveAs(t *testing.T) {
 // Cancelling the path question must abandon the close as well. Losing the work
 // here would be the worst outcome available: the user asked to keep it.
 func TestCancellingSaveAsAbandonsTheClose(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("super+n")
 	h.typeText("precious")
@@ -310,6 +321,7 @@ func TestCancellingSaveAsAbandonsTheClose(t *testing.T) {
 // A dialog is modal. While it is open the global chords underneath must not
 // fire — least of all the one that would close the tab being asked about.
 func TestDialogSwallowsGlobalChords(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base")
 	h.typeText("edit")
 	h.press("super+w")
@@ -331,6 +343,7 @@ func TestDialogSwallowsGlobalChords(t *testing.T) {
 }
 
 func TestDialogIsRendered(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "base")
 	h.typeText("edit")
 	h.press("super+w")
@@ -344,6 +357,7 @@ func TestDialogIsRendered(t *testing.T) {
 }
 
 func TestSaveAsSetsTheLanguageForHighlighting(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("super+n")
 	h.typeText("package main")

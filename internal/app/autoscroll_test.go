@@ -25,6 +25,7 @@ func longDoc() string {
 // The gesture this exists for: hold the pointer below the pane and the document
 // scrolls under it, so a selection can exceed a screenful by pointer alone.
 func TestDragBelowScrollsAndExtends(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	x, y := editorOrigin(h)
 	click(h, x, y, 0)
@@ -45,6 +46,7 @@ func TestDragBelowScrollsAndExtends(t *testing.T) {
 
 // And upwards, which needs the view to have somewhere above it to go.
 func TestDragAboveScrollsUp(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	h.Pane().ScrollRows(50)
 	h.drain()
@@ -64,6 +66,7 @@ func TestDragAboveScrollsUp(t *testing.T) {
 // pointer last was. A view that scrolls without extending is worse than one
 // that does neither: it looks like it is working.
 func TestSelectionGrowsWithEachTick(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	x, y := editorOrigin(h)
 	click(h, x, y, 0)
@@ -83,6 +86,7 @@ func TestSelectionGrowsWithEachTick(t *testing.T) {
 // the convention everywhere and is what makes a 150 ms tick usable: the way to
 // ask for faster is to push further.
 func TestFartherIsFaster(t *testing.T) {
+	t.Parallel()
 	near := newHarness(t, longDoc())
 	far := newHarness(t, longDoc())
 	_, rows := near.screen.Size()
@@ -105,6 +109,7 @@ func TestFartherIsFaster(t *testing.T) {
 // Speed is capped, or flinging the pointer to the far corner would jump the
 // length of the document in one tick.
 func TestSpeedIsCapped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	x, y := editorOrigin(h)
 	click(h, x, y, 0)
@@ -126,6 +131,7 @@ func TestSpeedIsCapped(t *testing.T) {
 // made, and a view that crept while the pointer sat in the middle of the text
 // would make an ordinary selection impossible to place.
 func TestDragInsideDoesNotScroll(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	x, y := editorOrigin(h)
 	click(h, x, y, 0)
@@ -141,6 +147,7 @@ func TestDragInsideDoesNotScroll(t *testing.T) {
 // Releasing stops it. A view that kept scrolling after the button came up
 // would be a runaway with no way to stop it but clicking again.
 func TestReleaseStopsScrolling(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	x, y := editorOrigin(h)
 	click(h, x, y, 0)
@@ -160,6 +167,7 @@ func TestReleaseStopsScrolling(t *testing.T) {
 // At the end of the document there is nothing to scroll to, and the ticks must
 // simply stop rather than spinning or extending past the last line.
 func TestStopsAtTheEndOfTheDocument(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	x, y := editorOrigin(h)
 	click(h, x, y, 0)
@@ -180,6 +188,7 @@ func TestStopsAtTheEndOfTheDocument(t *testing.T) {
 // A tick with no drag in progress must not touch the view: the tick also drives
 // retokenising and runs constantly.
 func TestIdleTicksDoNotScroll(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, longDoc())
 	h.Pane().ScrollRows(10)
 	h.drain()

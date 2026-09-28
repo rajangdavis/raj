@@ -71,6 +71,35 @@ func TestSnapshotRoundTripsExactly(t *testing.T) {
 	}
 }
 
+// The group task is part of the journal's record, so a snapshot carries it and
+// a restored session reads the same task back off each group. Without this, a
+// manifest built after a restart would lose the work its rows belong to.
+func TestSnapshotCarriesGroupTasks(t *testing.T) {
+	s := NewSession(NewDoc("hello\n", 0))
+	s.Insert(Agent, 0, "X")
+	id := s.LastGroup()
+	s.SetGroupTask(id, "task-1")
+
+	snap, err := s.SnapshotState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := snap.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeSnapshot(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task := got.GroupTask(id); task != "task-1" {
+		t.Errorf("restored GroupTask(%d) = %q, want task-1", id, task)
+	}
+	if gs := got.Groups(); len(gs) != 1 || gs[0].Task != "task-1" {
+		t.Errorf("restored groups = %+v, want the set to carry task-1", gs)
+	}
+}
+
 // A snapshot that is truncated, not JSON, the wrong version, or whose journal
 // points outside the store is refused with an error rather than panicking in
 // the piece tree.

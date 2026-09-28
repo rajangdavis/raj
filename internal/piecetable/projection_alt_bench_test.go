@@ -54,9 +54,13 @@ func (s *Session) projectForwardInPlace(p Policy) DerivedProject {
 	for j := range mu {
 		mu[j] = j
 	}
+	var invalid map[uint64]bool
+	if p != Annotated {
+		invalid = s.invalidGroups()
+	}
 	var origins []insOrigin
 	for _, o := range s.journal {
-		eff := s.included(o, p)
+		eff := s.included(o, p, invalid, nil)
 		pos, del, ins := o.Pos, o.DelLen(), o.InsLen()
 		compStart, compEnd := mu[pos], mu[pos+del]
 		if eff {
@@ -141,13 +145,17 @@ func (s *Session) projectUnapply(p Policy) DerivedProject {
 	comp := &Naive{store: s.Store()}
 	comp.pieces = append([]PieceRec(nil), s.buf.pieceRange(0, s.buf.Len())...)
 
+	var invalid map[uint64]bool
+	if p != Annotated {
+		invalid = s.invalidGroups()
+	}
 	var origins []insOrigin
 	if p == Annotated {
 		// Every non-base piece left after the removals descends from an
 		// included op, so collecting those ops' ranges is enough for
 		// stateRuns to label what survives.
 		for _, o := range s.journal {
-			if !s.included(o, p) {
+			if !s.included(o, p, invalid, nil) {
 				continue
 			}
 			for _, r := range o.Ins {
@@ -160,7 +168,7 @@ func (s *Session) projectUnapply(p Policy) DerivedProject {
 
 	for i := len(s.journal) - 1; i >= 0; i-- {
 		o := s.journal[i]
-		if o.Kind != KindEdit || !s.live(o.Seq) || s.included(o, p) {
+		if o.Kind != KindEdit || !s.live(o.Seq) || s.included(o, p, invalid, nil) {
 			continue
 		}
 		at, _ := unapplyRemoveOwned(comp, o.Ins)

@@ -53,14 +53,15 @@ func dialControl(addr string) (clientConn, error) {
 type clientFile struct {
 	path string
 	file *editor.File
-	// remove closes the tab for path instead of installing a file: the daemon
-	// no longer lists it as an open tab (it was closed, or it is now headless),
-	// so the client must not keep showing it.
-	remove bool
 	// adopted marks a file that changed the client view membership — a host
 	// proposal the client took on, or a daemon tab it newly mirrors — so the
 	// event thread persists the view once it installs.
 	adopted bool
+	// reveal, when set, is a user-initiated reveal: the pane is focused and the
+	// caret placed at the span start (the top of the file for a whole-file
+	// reveal). It rides the watch answer and becomes a clientFile here, so a
+	// reveal reaches every attached client without a reconnect.
+	reveal *control.Reveal
 }
 
 // bufferMark is what the client last fetched for one path: the facts that
@@ -95,6 +96,13 @@ func (m bufferMark) matches(b control.Buffer) bool {
 	return m.version == b.Version && m.dirty == b.Dirty &&
 		m.pending == uint64(b.Pending) && m.moved == uint64(b.Moved) &&
 		m.superseded == uint64(b.Superseded)
+}
+
+// hasUnsavedWork reports whether a daemon buffer is one the viewer mirrors: a
+// real tab with unsaved text or a pending change set. A clean tab is the
+// daemon own to show and is never adopted by a viewer that did not open it.
+func hasUnsavedWork(b control.Buffer) bool {
+	return b.Dirty || b.Pending > 0
 }
 
 // stillClosed reports whether the daemon buffer still matches the facts a local
@@ -214,7 +222,7 @@ func (a *App) StartClient() {
 		a.adoptVisibleRoots(roots)
 	}
 	vers := make(map[string]bufferMark, len(res.Buffers))
-	a.clientMirrored = make(map[string]bool, len(res.Buffers))
+	a.clientOwned = make(map[string]bool, len(res.Buffers))
 	a.clientClosed = make(map[string]bufferMark)
 	a.clientEdits = make(map[string]*clientEdit)
 	// The daemon facts for every buffer, keyed by path, seed the marks below.
@@ -229,10 +237,11 @@ func (a *App) StartClient() {
 	}
 	var files []clientFile
 	var dropped []string
-	// The saved view restores tab order and the client own closed marks, but it
-	// no longer decides membership: the daemon real tabs are mirrored below
-	// whether or not the saved view named them, so a tab the daemon opened
-	// while the client was away appears on attach.
+	// The saved view restores the owned tab set and the client own closed
+	// marks. Ownership is sticky: a path the client showed before is restored
+	// whether or not the daemon still lists it, and the mirror is re-derived
+	// below from the daemon's unsaved tabs rather than re-adopted from the
+	// saved list.
 	if saved, ok := a.readClientView(); ok {
 		for _, cm := range saved.Closed {
 			if cm.legacy || cm.Path == "" {
@@ -242,11 +251,11 @@ func (a *App) StartClient() {
 			}
 			a.clientClosed[cm.Path] = cm.mark()
 		}
-		for _, path := range saved.Open {
-			if _, seen := a.clientMirrored[path]; seen {
+		for _, path := range saved.ownedForAttach(byPath) {
+			if _, seen := a.clientOwned[path]; seen {
 				continue
 			}
-			b, isTab := byPath[path]
+			b := byPath[path]
 			if a.clientTabSnoozed(path, b) {
 				continue
 			}
@@ -256,21 +265,19 @@ func (a *App) StartClient() {
 				continue
 			}
 			vers[path] = markOf(v, b)
-			// A saved path the daemon also shows as a real tab is mirrored, so
-			// the reconcile drops it when the daemon closes it; one the daemon
-			// only has headless stays client-owned.
-			a.clientMirrored[path] = isTab && !b.Headless
+			a.clientOwned[path] = true
 			files = append(files, clientFile{path: path, file: f})
 		}
 	}
-	// Mirror the daemon real tabs. A headless buffer is one an agent loaded to
-	// read; showing it would open a file nobody has on screen in the editor
-	// that owns the workspace.
+	// Mirror the daemon real tabs that carry unsaved work: a dirty buffer or
+	// one with a pending change set. A headless buffer is one an agent loaded
+	// to read, and a clean tab is the daemon's own to show; neither is a
+	// reason to put a tab in front of the viewer.
 	for _, b := range res.Buffers {
-		if b.Path == "" || b.Headless {
+		if b.Path == "" || b.Headless || !hasUnsavedWork(b) {
 			continue
 		}
-		if _, seen := a.clientMirrored[b.Path]; seen {
+		if _, seen := a.clientOwned[b.Path]; seen {
 			continue
 		}
 		if a.clientTabSnoozed(b.Path, b) {
@@ -283,13 +290,13 @@ func (a *App) StartClient() {
 			return
 		}
 		vers[b.Path] = markOf(v, b)
-		a.clientMirrored[b.Path] = true
+		a.clientOwned[b.Path] = true
 		files = append(files, clientFile{path: b.Path, file: f})
 	}
 	// Adoption is what attach means: a host path with a pending change set that
 	// the client does not show becomes a tab, so a proposal in a file the client
 	// never opened is visible.
-	files = append(files, a.adoptPending(c, byPath, vers, a.clientMirrored)...)
+	files = append(files, a.adoptPending(c, byPath, vers, a.clientOwned)...)
 	for _, cf := range files {
 		a.installClientFile(cf)
 	}
@@ -426,15 +433,15 @@ func (a *App) watchLoop(c clientConn, gen uint64, vers map[string]bufferMark) {
 // error while fetching is returned, because it means the link went away
 // mid-cycle and the caller should reconnect.
 func (a *App) syncClient(c clientConn, res control.Response, vers map[string]bufferMark) error {
-	// The client owns its tabs, and the daemon decides what that means: the
-	// reconcile syncs the paths the client shows and mirrors any daemon real tab
-	// it does not yet have. A client-loaded path is headless in the daemon, so a
-	// headless filter would drop it; an agent headless read is simply not in the
-	// owned set.
+	// The owned set is the membership: a client-opened path, or a daemon tab
+	// with unsaved work that was mirrored, stays a tab until the user closes it
+	// here. The mirror is re-derived each cycle, so a clean daemon tab is never
+	// taken on and a daemon tab that goes clean keeps its tab rather than
+	// dropping.
 	a.clientTabMu.Lock()
-	owned := make(map[string]bool, len(a.clientMirrored))
-	for path, mirrored := range a.clientMirrored {
-		owned[path] = mirrored
+	owned := make(map[string]bool, len(a.clientOwned))
+	for path := range a.clientOwned {
+		owned[path] = true
 	}
 	a.clientTabMu.Unlock()
 
@@ -447,17 +454,11 @@ func (a *App) syncClient(c clientConn, res control.Response, vers map[string]buf
 	}
 
 	var files []clientFile
-	for path, mirrored := range owned {
+	for path := range owned {
 		b, ok := byPath[path]
 		if !ok {
-			// The daemon dropped it. A mirrored tab is one the laptop closed;
-			// a client-loaded buffer may only have been evicted from the
-			// headless registry, so it stays.
-			if mirrored {
-				a.unmarkClientTab(path)
-				delete(vers, path)
-				files = append(files, clientFile{path: path, remove: true})
-			}
+			// The daemon dropped it, but the tab is owned: it stays, holding
+			// the last snapshot the client had.
 			continue
 		}
 		if a.clientTabSnoozed(path, b) {
@@ -465,18 +466,6 @@ func (a *App) syncClient(c clientConn, res control.Response, vers map[string]buf
 			// fetch is dropped by the install re-check, which is the durable
 			// guard; this one also saves the round trip.
 			continue
-		}
-		if mirrored && b.Headless {
-			// The daemon no longer shows it as a real tab.
-			a.unmarkClientTab(path)
-			delete(vers, path)
-			files = append(files, clientFile{path: path, remove: true})
-			continue
-		}
-		if !mirrored && !b.Headless {
-			// The daemon opened this path as a real tab, so it becomes a
-			// mirror: a later daemon close removes it.
-			a.markClientAdopted(path, true)
 		}
 		if cur, ok := vers[path]; ok && cur.matches(b) {
 			continue
@@ -488,12 +477,13 @@ func (a *App) syncClient(c clientConn, res control.Response, vers map[string]buf
 		vers[path] = markOf(fv, b)
 		files = append(files, clientFile{path: path, file: f})
 	}
-	// A daemon tab opened since the last wake is mirrored, so it appears with
-	// no relaunch. A path the user closed is skipped only while the daemon
-	// facts still match the close mark; a later proposal, decision or edit
-	// clears the mark and the path is re-added.
+	// Mirror a daemon real tab with unsaved work that the client does not own,
+	// so a new proposal or an unsaved edit appears with no relaunch. A path the
+	// user closed is skipped only while the daemon facts still match the close
+	// mark; a later proposal, decision or edit clears the mark and the path is
+	// re-mirrored.
 	for _, b := range res.Buffers {
-		if b.Path == "" || b.Headless {
+		if b.Path == "" || b.Headless || !hasUnsavedWork(b) {
 			continue
 		}
 		if _, has := owned[b.Path]; has {
@@ -507,13 +497,44 @@ func (a *App) syncClient(c clientConn, res control.Response, vers map[string]buf
 			return err
 		}
 		vers[b.Path] = markOf(fv, b)
-		a.markClientAdopted(b.Path, true)
+		a.markClientOwned(b.Path)
 		owned[b.Path] = true
 		files = append(files, clientFile{path: b.Path, file: f, adopted: true})
 	}
 	// Adopt host buffers that have picked up a pending change set since the
 	// last wake, so a proposal in a file the client never opened is visible.
 	files = append(files, a.adoptPending(c, byPath, vers, owned)...)
+	// A reveal is a user-initiated request to put a path in front of every
+	// attached client. It rides the watch answer and becomes a clientFile the
+	// event thread installs, so the client mounts or re-points the tab with no
+	// reconnect. An explicit reveal overrides a local close, and the path joins
+	// the owned set so it persists.
+	for _, rev := range res.Reveals {
+		if rev.Path == "" {
+			continue
+		}
+		r := rev
+		a.clearClientClosed(r.Path)
+		if cf := clientFileFor(files, r.Path); cf != nil {
+			cf.reveal = &r
+			a.markClientOwned(r.Path)
+			owned[r.Path] = true
+			continue
+		}
+		b, ok := byPath[r.Path]
+		f, fv, err := a.fetchSnapshot(c, r.Path)
+		if err != nil {
+			return err
+		}
+		if ok {
+			vers[r.Path] = markOf(fv, b)
+		} else {
+			vers[r.Path] = bufferMark{version: fv}
+		}
+		a.markClientOwned(r.Path)
+		owned[r.Path] = true
+		files = append(files, clientFile{path: r.Path, file: f, adopted: true, reveal: &r})
+	}
 	if len(files) > 0 {
 		a.clientMu.Lock()
 		a.clientFiles = append(a.clientFiles, files...)
@@ -521,6 +542,37 @@ func (a *App) syncClient(c clientConn, res control.Response, vers map[string]buf
 		a.host.Post(ui.Wake{})
 	}
 	return nil
+}
+
+// clientFileFor returns the queued clientFile for a path, or nil. A reveal
+// uses it to attach its span to a snapshot the same watch cycle already queued
+// rather than fetching the same buffer twice.
+func clientFileFor(files []clientFile, path string) *clientFile {
+	for i := range files {
+		if files[i].path == path {
+			return &files[i]
+		}
+	}
+	return nil
+}
+
+// revealClientFile focuses a revealed pane and places its caret at the reveal
+// span start (the top of the file for a whole-file reveal), centring the
+// viewport. It shares placeCaret with the daemon host, so both sides of the
+// same gesture place a caret identically.
+func (a *App) revealClientFile(p *editor.Pane, rev *control.Reveal) {
+	if p == nil || rev == nil {
+		return
+	}
+	off := 0
+	if rev.Start >= 0 {
+		off = rev.Start
+	}
+	placeCaret(p, off)
+	a.Tabs.Focus(p)
+	if !a.Prompt.Open {
+		a.focus = FocusEditor
+	}
 }
 
 // reconnectClient dials the daemon again with a bounded backoff until it has a
@@ -717,6 +769,8 @@ func (a *App) drainClient() {
 	a.clientNote = ""
 	refetch := a.clientRefetch
 	a.clientRefetch = nil
+	removals := a.clientRemovals
+	a.clientRemovals = nil
 	a.clientMu.Unlock()
 	if lost != "" {
 		a.status = lost
@@ -733,6 +787,12 @@ func (a *App) drainClient() {
 			adopted = true
 		}
 		a.installClientFile(cf)
+	}
+	// A removal proposal the watch cycle found becomes visible pending state
+	// the moment its Wake is collected, so the note, the chord and the gate all
+	// see it without the daemon re-announcing it.
+	for _, pr := range removals {
+		a.mirrorRemoval(pr)
 	}
 	// A refused forward leaves local text the daemon never saw; restore the pane
 	// from the daemon now that the queued snapshot decisions have settled.
@@ -776,13 +836,8 @@ func (a *App) CloseClient() {
 
 // installClientFile mounts a daemon buffer: it replaces the file of an open tab
 // for the same path, preserving the cursor and viewport, or adds a tab for a
-// buffer the client has not seen. A removal closes the tab instead, for a path
-// the daemon no longer has open.
+// buffer the client has not seen.
 func (a *App) installClientFile(cf clientFile) *editor.Pane {
-	if cf.remove {
-		a.removeClientTab(cf.path)
-		return nil
-	}
 	// The user may have closed this tab after the snapshot was fetched. The
 	// close mark is the guard the watch cannot race: an install that still
 	// agrees with the facts recorded at close is a stale fetch and is dropped,
@@ -801,6 +856,7 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	for _, p := range a.Tabs.All() {
 		if p.File.Path == cf.path {
 			a.applyClientFile(p, cf.file)
+			a.revealClientFile(p, cf.reveal)
 			return p
 		}
 	}
@@ -816,7 +872,10 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	p.SetDisplay(a.displayPolicy())
 	a.Tabs.Add(p)
 	a.recordClientSynced(cf.path, cf.file)
-	if prev != nil {
+	if cf.reveal != nil {
+		// A reveal is the one install that is meant to move the viewer.
+		a.revealClientFile(p, cf.reveal)
+	} else if prev != nil {
 		// A buffer opened on the daemon after the attach is announced by
 		// adding the tab, not by stealing the tab the user is reading.
 		a.Tabs.Focus(prev)
@@ -1166,27 +1225,6 @@ func (a *App) warnClientEdit(path, note string) {
 	a.host.Post(ui.Wake{})
 }
 
-// removeClientTab closes the tab for a path the daemon no longer lists as open.
-// It is a reconcile, not a user close, so it never asks about unsaved work: the
-// client copy is the daemon, and the daemon has already moved on.
-func (a *App) removeClientTab(path string) {
-	// The watch already unmarked the path; persist the pruned view so a
-	// reattach does not resurrect a tab the daemon dropped.
-	a.saveClientView()
-	for i, p := range a.Tabs.All() {
-		if p.File.Path != path {
-			continue
-		}
-		a.closeDoc(p)
-		a.Tabs.CloseIndex(i)
-		a.refreshProblems()
-		if a.Tabs.Active() == nil {
-			a.status = "attach: no open tabs"
-		}
-		return
-	}
-}
-
 // saveRemote saves the daemon buffer for an attached client. The daemon save is
 // the one that writes: it refuses while proposals await the user, and that
 // refusal is the status here, with the snapshot copy left alone.
@@ -1235,7 +1273,7 @@ func (a *App) openRemote(path string, focus bool) {
 	if p == nil {
 		return
 	}
-	a.markClientTab(path)
+	a.markClientOwned(path)
 	a.saveClientView()
 	if focus {
 		a.Tabs.Focus(p)
@@ -1246,19 +1284,30 @@ func (a *App) openRemote(path string, focus bool) {
 
 // adoptPending loads any host path with a pending change set that the client
 // does not already show, so an agent proposal in a file the phone never opened
-// is visible. It is additive to both the first-attach mirror and a saved view.
-// A path the user closed is skipped only while the daemon still matches the
-// facts recorded at close, so a new proposal reopens it. An adopted path joins
-// the owned set so the reconcile keeps syncing it, and it is never auto-removed
-// when the proposals are decided: the tab stays a normal client tab.
+// is visible. It is additive to the restored owned set and the re-derived
+// mirror. A path the user closed is skipped only while the daemon still matches
+// the facts recorded at close, so a new proposal reopens it. An adopted path
+// joins the owned set, so it is persisted and stays after the set is decided
+// rather than dropping.
 func (a *App) adoptPending(c clientConn, byPath map[string]control.Buffer, vers map[string]bufferMark, owned map[string]bool) []clientFile {
 	props, err := c.Do(control.Request{Op: "proposals"})
 	if err != nil || !props.OK {
 		return nil
 	}
 	var files []clientFile
+	var removals []control.Proposal
 	for _, pr := range props.Proposals {
-		if pr.Kind != "set" || pr.Path == "" {
+		if pr.Path == "" {
+			continue
+		}
+		if pr.Kind == "delete" || pr.Kind == "rmdir" {
+			// A removal is a workspace-level path fact, not text, so it never
+			// becomes a snapshot: queue it for the event thread, which owns the
+			// pending maps and the arrival queue.
+			removals = append(removals, pr)
+			continue
+		}
+		if pr.Kind != "set" {
 			continue
 		}
 		if owned[pr.Path] {
@@ -1273,45 +1322,111 @@ func (a *App) adoptPending(c clientConn, byPath map[string]control.Buffer, vers 
 			// skip it rather than failing the watch.
 			continue
 		}
-		// A host real tab is mirrored, so the reconcile removes it if the host
-		// closes it; a host-headless buffer is client-owned, so it is not
-		// dropped by the headless rule.
-		mirrored := !byPath[pr.Path].Headless
-		a.markClientAdopted(pr.Path, mirrored)
-		owned[pr.Path] = mirrored
+		// The proposal makes the path owned for good: the tab is the review,
+		// and it stays until the user closes it rather than dropping when the
+		// set is decided.
+		a.markClientOwned(pr.Path)
+		owned[pr.Path] = true
 		vers[pr.Path] = markOf(v, byPath[pr.Path])
 		files = append(files, clientFile{path: pr.Path, file: f, adopted: true})
 	}
+	a.stageClientRemovals(removals)
 	return files
 }
 
-// markClientAdopted records a path the client took on because the host has a
-// pending change set there. It joins the owned set so the reconcile keeps
-// syncing it; mirrored is true when the host shows it as a real tab.
-func (a *App) markClientAdopted(path string, mirrored bool) {
-	if path == "" {
+// stageClientRemovals queues daemon removal proposals for the event thread.
+// adoptPending runs on the watch goroutine, and pendingDeletions,
+// pendingDirRemovals and pendingRemovals belong to the event thread, which
+// reads them every frame; the mirror is therefore a handoff the way a snapshot
+// is. A (kind, path) already queued is not appended again, and the Wake makes
+// drainClient collect the queue even on a cycle that rebuilt no pane.
+func (a *App) stageClientRemovals(removals []control.Proposal) {
+	if len(removals) == 0 {
 		return
 	}
-	a.clientTabMu.Lock()
-	if a.clientMirrored == nil {
-		a.clientMirrored = map[string]bool{}
+	added := false
+	a.clientMu.Lock()
+	for _, pr := range removals {
+		dup := false
+		for _, q := range a.clientRemovals {
+			if q.Kind == pr.Kind && q.Path == pr.Path {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			a.clientRemovals = append(a.clientRemovals, pr)
+			added = true
+		}
 	}
-	a.clientMirrored[path] = mirrored
-	a.clientTabMu.Unlock()
+	a.clientMu.Unlock()
+	if added {
+		a.host.Post(ui.Wake{})
+	}
 }
 
-// markClientTab records that the client shows a tab for path. The watch reads
-// the set to decide what to sync, so a client-loaded headless buffer keeps
-// updating even though the daemon does not list it as a real tab.
-func (a *App) markClientTab(path string) {
+// mirrorRemoval installs one daemon removal proposal into the client's pending
+// maps and arrival queue. It runs on the event thread and is idempotent: a key
+// already pending keeps its original author, and notePendingRemoval's own scan
+// keeps the same proposal out of the arrival queue twice, so a watch cycle
+// that repeats an undecided proposal cannot duplicate it.
+func (a *App) mirrorRemoval(pr control.Proposal) {
+	switch pr.Kind {
+	case "delete":
+		if a.pendingDeletions == nil {
+			a.pendingDeletions = map[string]control.Deletion{}
+		}
+		if _, ok := a.pendingDeletions[pr.Path]; ok {
+			return
+		}
+		a.pendingDeletions[pr.Path] = control.Deletion{Path: pr.Path, Author: pr.Author}
+		a.notePendingRemoval(pr.Path, false)
+		// A proposal for the file already on screen raises the gate now, the
+		// way ProposeDeletion does on the daemon; without clearing the tracked
+		// pane the once-per-focus guard would suppress it.
+		if p := a.openDeletionPane(pr.Path); p != nil && p == a.Tabs.Active() {
+			a.deletionPromptPane = nil
+		}
+	case "rmdir":
+		if a.pendingDirRemovals == nil {
+			a.pendingDirRemovals = map[string]control.DirRemoval{}
+		}
+		if _, ok := a.pendingDirRemovals[pr.Path]; ok {
+			return
+		}
+		a.pendingDirRemovals[pr.Path] = control.DirRemoval{Path: pr.Path, Author: pr.Author}
+		a.notePendingRemoval(pr.Path, true)
+	}
+}
+
+// dropClientRemoval discards a queued removal the event thread has already
+// answered, so a watch cycle that staged the proposal just before the decision
+// cannot re-add it after the daemon cleared it.
+func (a *App) dropClientRemoval(kind, path string) {
+	a.clientMu.Lock()
+	out := a.clientRemovals[:0]
+	for _, pr := range a.clientRemovals {
+		if pr.Kind == kind && pr.Path == path {
+			continue
+		}
+		out = append(out, pr)
+	}
+	a.clientRemovals = out
+	a.clientMu.Unlock()
+}
+
+// markClientOwned records that the client shows a tab for path, in the durable
+// owned set the saved view persists. A client open and a mirrored daemon tab
+// both join it, and only a user close removes one.
+func (a *App) markClientOwned(path string) {
 	if path == "" {
 		return
 	}
 	a.clientTabMu.Lock()
-	if a.clientMirrored == nil {
-		a.clientMirrored = map[string]bool{}
+	if a.clientOwned == nil {
+		a.clientOwned = map[string]bool{}
 	}
-	a.clientMirrored[path] = false
+	a.clientOwned[path] = true
 	a.clientTabMu.Unlock()
 }
 
@@ -1326,7 +1441,7 @@ func (a *App) markClientClosed(path string, f *editor.File) {
 	}
 	mark := markFromFile(f)
 	a.clientTabMu.Lock()
-	delete(a.clientMirrored, path)
+	delete(a.clientOwned, path)
 	if a.clientClosed == nil {
 		a.clientClosed = map[string]bufferMark{}
 	}
@@ -1390,12 +1505,38 @@ func (a *App) clientTabSnoozedFile(path string, f *editor.File) bool {
 	return true
 }
 
-// clientView is the client own tab set persisted per workspace and client key:
-// the paths it shows and the daemon facts each locally closed path was closed
-// at. The documents come from the daemon on attach.
+// clientView is the client owned tab set persisted per workspace and client
+// key: the paths it shows and the daemon facts each locally closed path was
+// closed at. The documents come from the daemon on attach; the mirror of the
+// daemon's unsaved tabs is re-derived at attach and on every watch, never
+// saved, so a clean daemon tab can never be re-adopted from the view.
 type clientView struct {
-	Open   []string    `json:"open"`
+	// Owned is the persistent membership. A path enters when the client opens
+	// it or mirrors a daemon tab with unsaved work, and leaves only when the
+	// user closes the tab there.
+	Owned []string `json:"owned,omitempty"`
+	// Open is the older flat shape's union of owned and mirrored paths. It is
+	// read only to migrate a view written before the split.
+	Open   []string    `json:"open,omitempty"`
 	Closed closedMarks `json:"closed"`
+}
+
+// ownedForAttach is the owned set to restore on attach. A view written by this
+// version names it in Owned. The older flat shape persisted every daemon tab in
+// Open, so an Open entry is kept only when the daemon buffer still has unsaved
+// work and would be mirrored again; the stale clean entries drop instead of
+// being re-adopted as client-owned tabs, which is the leak the split fixes.
+func (v clientView) ownedForAttach(byPath map[string]control.Buffer) []string {
+	if v.Owned != nil || len(v.Open) == 0 {
+		return v.Owned
+	}
+	var out []string
+	for _, path := range v.Open {
+		if hasUnsavedWork(byPath[path]) {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // closedMark is one persisted close: the path and the daemon facts recorded at
@@ -1474,11 +1615,11 @@ func (a *App) saveClientView() {
 	}
 	a.clientTabMu.Lock()
 	v := clientView{
-		Open:   make([]string, 0, len(a.clientMirrored)),
+		Owned:  make([]string, 0, len(a.clientOwned)),
 		Closed: make(closedMarks, 0, len(a.clientClosed)),
 	}
-	for path := range a.clientMirrored {
-		v.Open = append(v.Open, path)
+	for path := range a.clientOwned {
+		v.Owned = append(v.Owned, path)
 	}
 	for path, m := range a.clientClosed {
 		v.Closed = append(v.Closed, closedMark{
@@ -1490,24 +1631,13 @@ func (a *App) saveClientView() {
 		})
 	}
 	a.clientTabMu.Unlock()
-	sort.Strings(v.Open)
+	sort.Strings(v.Owned)
 	sort.Slice(v.Closed, func(i, j int) bool { return v.Closed[i].Path < v.Closed[j].Path })
 	blob, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
 	_ = a.state.SetSetting(store.ScopeClient, a.attachKey, string(blob))
-}
-
-// unmarkClientTab forgets a client tab. Closing is local: the daemon buffer and
-// any daemon tab are untouched.
-func (a *App) unmarkClientTab(path string) {
-	if path == "" {
-		return
-	}
-	a.clientTabMu.Lock()
-	delete(a.clientMirrored, path)
-	a.clientTabMu.Unlock()
 }
 
 // decideRemote sends one decision to the daemon and re-fetches the buffer, so
@@ -1605,5 +1735,21 @@ func (a *App) sendDecision(op, path string, group uint64) (control.Response, err
 		req.Path = path
 		req.Group = group
 	}
+	return c.Do(req)
+}
+
+// sendRemovalDecision sends the human answer for a pending removal on the
+// decision connection. Both answers are the person's own gesture, so neither
+// carries an author: the serve loop stamps the connection's own durable human,
+// and the daemon admits a human to retract any pending removal. That is what
+// lets an attached client's Withdraw retract an agent's proposal without
+// forging the proposer's id. A transport failure or a daemon refusal is
+// returned; the caller shows it as the status, as saveRemote does.
+func (a *App) sendRemovalDecision(op, path string, approve bool) (control.Response, error) {
+	c := a.decideClient()
+	if c == nil {
+		return control.Response{}, errors.New("not attached to a daemon")
+	}
+	req := control.Request{Op: op, Path: path, Approve: approve, Withdraw: !approve}
 	return c.Do(req)
 }

@@ -4,8 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
+	"raj/internal/editor"
+	"raj/internal/piecetable"
 	"raj/internal/session"
 	"raj/internal/store"
 	"raj/internal/ui"
@@ -40,8 +43,9 @@ func seedSettings(t *testing.T, root, scope string, rows map[string]string) {
 }
 
 func TestResolveSettingsDefaults(t *testing.T) {
+	t.Parallel()
 	got, bad := resolveSettings(defaultSettings(2), nil, nil)
-	want := ResolvedSettings{TabWidth: 2, Tabs: false, Wrap: true, AutoPairs: true, InlayHints: true}
+	want := ResolvedSettings{TabWidth: 2, Tabs: false, Wrap: true, AutoPairs: true, InlayHints: true, SaveCheck: editor.SaveCheckOff, SaveConfirm: true}
 	if got != want {
 		t.Errorf("resolveSettings defaults = %+v, want %+v", got, want)
 	}
@@ -51,6 +55,7 @@ func TestResolveSettingsDefaults(t *testing.T) {
 }
 
 func TestResolveSettingsPrecedence(t *testing.T) {
+	t.Parallel()
 	got, bad := resolveSettings(defaultSettings(2),
 		map[string]string{"wrap": "false", "tab_width": "4"},
 		map[string]string{"wrap": "true", "inlay_hints": "false"})
@@ -72,6 +77,7 @@ func TestResolveSettingsPrecedence(t *testing.T) {
 }
 
 func TestResolveSettingsBadValueIgnored(t *testing.T) {
+	t.Parallel()
 	got, bad := resolveSettings(defaultSettings(2),
 		map[string]string{"tab_width": "wide", "wrap": "maybe"},
 		nil)
@@ -88,13 +94,16 @@ func TestResolveSettingsBadValueIgnored(t *testing.T) {
 }
 
 func TestNewWithOptionsAppliesSettings(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	seedSettings(t, root, store.ScopeWorkspace, map[string]string{
-		"tab_width":   "4",
-		"tabs":        "true",
-		"wrap":        "false",
-		"auto_pairs":  "false",
-		"inlay_hints": "false",
+		"tab_width":    "4",
+		"tabs":         "true",
+		"wrap":         "false",
+		"auto_pairs":   "false",
+		"inlay_hints":  "false",
+		"save_check":   "off",
+		"save_confirm": "off",
 	})
 	host := ui.NewFakeHost(80, 24)
 	t.Cleanup(func() { host.Close() })
@@ -111,9 +120,16 @@ func TestNewWithOptionsAppliesSettings(t *testing.T) {
 		t.Errorf("defaults not overridden: wrap=%v auto_pairs=%v inlay_hints=%v",
 			a.WrapDefault, a.AutoPairs, a.InlayHints)
 	}
+	if a.settings.SaveCheck != editor.SaveCheckOff {
+		t.Errorf("save_check = %v, want the stored off", a.settings.SaveCheck)
+	}
+	if a.settings.SaveConfirm {
+		t.Error("save_confirm = true, want the stored off")
+	}
 }
 
 func TestNewWithOptionsExplicitFlagOverridesSettings(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	seedSettings(t, root, store.ScopeWorkspace, map[string]string{
 		"tab_width": "4",
@@ -141,6 +157,7 @@ func TestNewWithOptionsExplicitFlagOverridesSettings(t *testing.T) {
 }
 
 func TestNewKeepsBuiltInDefaults(t *testing.T) {
+	t.Parallel()
 	host := ui.NewFakeHost(80, 24)
 	t.Cleanup(func() { host.Close() })
 	a := New(host, t.TempDir(), 2)
@@ -156,9 +173,13 @@ func TestNewKeepsBuiltInDefaults(t *testing.T) {
 	if a.Tabs.TabWidthPinned() {
 		t.Error("New pinned a tab width; a default launch must leave detection the winner")
 	}
+	if a.settings.SaveCheck != editor.SaveCheckOff {
+		t.Errorf("save_check = %v, want the built-in off", a.settings.SaveCheck)
+	}
 }
 
 func TestSettingsReturnsResolvedMap(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	seedSettings(t, root, store.ScopeUser, map[string]string{"auto_pairs": "off"})
 	host := ui.NewFakeHost(80, 24)
@@ -168,11 +189,13 @@ func TestSettingsReturnsResolvedMap(t *testing.T) {
 
 	got := a.Settings()
 	want := map[string]string{
-		"tab_width":   "2",
-		"tabs":        "false",
-		"wrap":        "true",
-		"auto_pairs":  "false",
-		"inlay_hints": "true",
+		"tab_width":    "2",
+		"tabs":         "false",
+		"wrap":         "true",
+		"auto_pairs":   "false",
+		"inlay_hints":  "true",
+		"save_check":   "off",
+		"save_confirm": "true",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Settings() = %v, want %v", got, want)
@@ -180,6 +203,7 @@ func TestSettingsReturnsResolvedMap(t *testing.T) {
 }
 
 func TestSetSettingWritesAndApplies(t *testing.T) {
+	t.Parallel()
 	a := newSettingsApp(t, Options{})
 	if err := a.SetSetting(store.ScopeWorkspace, "wrap", "false"); err != nil {
 		t.Fatalf("SetSetting: %v", err)
@@ -200,6 +224,7 @@ func TestSetSettingWritesAndApplies(t *testing.T) {
 }
 
 func TestSetSettingRefusedWithoutStore(t *testing.T) {
+	t.Parallel()
 	host := ui.NewFakeHost(80, 24)
 	t.Cleanup(func() { host.Close() })
 	// root == "" means no workspace, so no store; the write must be refused
@@ -210,7 +235,71 @@ func TestSetSettingRefusedWithoutStore(t *testing.T) {
 	}
 }
 
+// save_confirm is a bool with a default: the resolver must default it on, take
+// off, and report an unknown spelling as bad so the default stands, the rule
+// every other bool key follows.
+func TestResolveSettingsSaveConfirm(t *testing.T) {
+	t.Parallel()
+	def, bad := resolveSettings(defaultSettings(2), nil, nil)
+	if !def.SaveConfirm {
+		t.Error("default save_confirm = false, want the warning on")
+	}
+	if len(bad) != 0 {
+		t.Errorf("default bad = %v, want none", bad)
+	}
+	got, gotBad := resolveSettings(defaultSettings(2), map[string]string{"save_confirm": "off"}, nil)
+	if got.SaveConfirm {
+		t.Error("save_confirm=off resolved on, want off")
+	}
+	if len(gotBad) != 0 {
+		t.Errorf("save_confirm=off bad = %v, want none", gotBad)
+	}
+	got, gotBad = resolveSettings(defaultSettings(2), map[string]string{"save_confirm": "maybe"}, nil)
+	if !got.SaveConfirm {
+		t.Error("an unknown save_confirm changed the default; a bad value must be ignored")
+	}
+	if !reflect.DeepEqual(gotBad, []string{"user/save_confirm"}) {
+		t.Errorf("bad = %v, want [user/save_confirm]", gotBad)
+	}
+}
+
+// save_confirm is the stored escape hatch for the save warning: off means the
+// save gesture never opens the confirm, so a build whose confirm misbehaves can
+// still save. The setting is read on the save path, not from the UI, so a
+// degraded screen cannot hide the switch.
+func TestSaveConfirmSettingOffSkipsTheConfirm(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	seedSettings(t, root, store.ScopeWorkspace, map[string]string{"save_confirm": "off"})
+	path := filepath.Join(root, "test.go")
+	if err := os.WriteFile(path, []byte(reviewFixture), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := NewWithOptions(host, root, Options{})
+	t.Cleanup(a.CloseState)
+	h := &harness{App: a, host: host}
+	a.OpenFile(path)
+
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+
+	h.press("super+s")
+
+	if h.Prompt.Open {
+		t.Error("save_confirm off still opened the confirm")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello socket\n" {
+		t.Errorf("on disk = %q, want the save to have gone through", string(data))
+	}
+}
+
 func TestControlCloseRemembersPosition(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "line one\nline two\nline three\n")
 	path := h.Tabs.Active().File.Path
 	h.Tabs.Active().Cursors.Set(5, 5)
@@ -235,6 +324,7 @@ func TestControlCloseRemembersPosition(t *testing.T) {
 // the width one indent unit inserts. The files detect two-space indentation, so
 // the assertions prove the explicit setting outranks detection.
 func TestSetSettingTabWidthIsLive(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	first := filepath.Join(root, "first.txt")
 	second := filepath.Join(root, "second.txt")
@@ -292,6 +382,7 @@ func TestSetSettingTabWidthIsLive(t *testing.T) {
 // file's own two spaces win the indent width and only the display width
 // follows the setting.
 func TestStoredTabWidthPinsDetection(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.txt")
 	if err := os.WriteFile(f, []byte("  alpha\n"), 0o644); err != nil {
@@ -323,6 +414,7 @@ func TestStoredTabWidthPinsDetection(t *testing.T) {
 // workspace), so the live value stays the workspace's. The row is still
 // written, so removing the workspace row later would let it surface.
 func TestSetSettingLowerScopeDoesNotBeatHigherScope(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	seedSettings(t, root, store.ScopeWorkspace, map[string]string{"wrap": "false"})
 	host := ui.NewFakeHost(80, 24)
@@ -355,6 +447,7 @@ func TestSetSettingLowerScopeDoesNotBeatHigherScope(t *testing.T) {
 // running session even when a launch flag named the same key; the flag wins
 // again on the next launch, where it is layered over the scopes.
 func TestSetSettingBeatsLaunchFlagForTheSession(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	host := ui.NewFakeHost(80, 24)
 	t.Cleanup(func() { host.Close() })
@@ -388,6 +481,7 @@ func TestSetSettingBeatsLaunchFlagForTheSession(t *testing.T) {
 // and no pin is set, rather than tabs.New(0) and a SetTabWidth whose guard
 // refuses the bad value.
 func TestExplicitNonPositiveTabWidthIsIgnored(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		tab  int
@@ -420,6 +514,7 @@ func TestExplicitNonPositiveTabWidthIsIgnored(t *testing.T) {
 // the pin is the observable here, since the fallback width itself is 2 either
 // way.
 func TestSetSettingBadValueIsStoredButInert(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	host := ui.NewFakeHost(80, 24)
 	t.Cleanup(func() { host.Close() })
@@ -452,6 +547,7 @@ func TestSetSettingBadValueIsStoredButInert(t *testing.T) {
 // unset falls back to the built-in map, and a command that is set but empty
 // disables the language.
 func TestLSPOverrideResolution(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name            string
 		user, workspace map[string]string
@@ -522,6 +618,7 @@ func TestLSPOverrideResolution(t *testing.T) {
 // The dynamic key family is what knownSetting and settingValueValid have to
 // accept, and a key that only looks like one must still be refused.
 func TestLSPSettingKeyParsing(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ key, lang, field string }{
 		{"lsp.go.command", "go", "command"},
 		{"lsp.python.args", "python", "args"},
@@ -556,6 +653,7 @@ func TestLSPSettingKeyParsing(t *testing.T) {
 // A stored override is resolved at construction, before the first request, and
 // servers.for_ reads the cache rather than the store.
 func TestNewWithOptionsAppliesLSPOverrides(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	seedSettings(t, root, store.ScopeWorkspace, map[string]string{
 		"lsp.python.command": "ty",
@@ -613,6 +711,7 @@ func TestSetSettingRefreshesLSPOverrides(t *testing.T) {
 // A workspace write beats a user write in the live cache, the same precedence
 // the typed settings use.
 func TestSetSettingLSPWorkspaceBeatsUser(t *testing.T) {
+	t.Parallel()
 	a := newSettingsApp(t, Options{})
 	if err := a.SetSetting(store.ScopeUser, "lsp.python.command", "tpy"); err != nil {
 		t.Fatalf("SetSetting(user): %v", err)
@@ -632,11 +731,121 @@ func TestSetSettingLSPWorkspaceBeatsUser(t *testing.T) {
 // only resembles the family, so the new key space reaches the store without
 // opening it to typos.
 func TestSetSettingLSPKeySeam(t *testing.T) {
+	t.Parallel()
 	a := newSettingsApp(t, Options{})
 	if err := a.SetSetting(store.ScopeWorkspace, "lsp.go.args", "--remote=auto"); err != nil {
 		t.Fatalf("SetSetting(lsp.go.args) = %v, want accepted", err)
 	}
 	if err := a.SetSetting(store.ScopeWorkspace, "lsp.go", "x"); err == nil {
 		t.Error("SetSetting(lsp.go) = nil, want an unknown-key error")
+	}
+}
+
+// save_check is a string-valued setting with a default, so the resolver must
+// default it, accept each of its two values, and report an unknown spelling as
+// bad so the default stands; that parse-or-ignore rule is the one every other
+// key follows, so a bad save_check is no exception.
+func TestResolveSettingsSaveCheck(t *testing.T) {
+	t.Parallel()
+	def, bad := resolveSettings(defaultSettings(2), nil, nil)
+	if def.SaveCheck != editor.SaveCheckOff {
+		t.Errorf("default save_check = %v, want off", def.SaveCheck)
+	}
+	if len(bad) != 0 {
+		t.Errorf("default bad = %v, want none", bad)
+	}
+	for raw, want := range map[string]editor.SaveCheck{
+		"off":   editor.SaveCheckOff,
+		"parse": editor.SaveCheckParse,
+	} {
+		got, gotBad := resolveSettings(defaultSettings(2), map[string]string{"save_check": raw}, nil)
+		if got.SaveCheck != want {
+			t.Errorf("save_check=%q resolved to %v, want %v", raw, got.SaveCheck, want)
+		}
+		if len(gotBad) != 0 {
+			t.Errorf("save_check=%q reported bad = %v", raw, gotBad)
+		}
+	}
+	for _, raw := range []string{"sometimes", "structural"} {
+		got, gotBad := resolveSettings(defaultSettings(2), map[string]string{"save_check": raw}, nil)
+		if got.SaveCheck != editor.SaveCheckOff {
+			t.Errorf("unknown save_check=%q = %v, want the default off", raw, got.SaveCheck)
+		}
+		if !reflect.DeepEqual(gotBad, []string{"user/save_check"}) {
+			t.Errorf("save_check=%q bad = %v, want [user/save_check]", raw, gotBad)
+		}
+	}
+}
+
+// save_check reaches a real save. With save_check=parse, a composition the Go
+// parser rejects is refused, the accept is rolled back, and nothing is written;
+// without the wiring parse would be silently off and the broken bytes would
+// land.
+func TestSaveCheckSettingRefusesUnbalancedComposition(t *testing.T) {
+	t.Parallel()
+	const original = "package p\n\nfunc f() {\n\tx()\n\ty()\n}\n"
+	root := t.TempDir()
+	seedSettings(t, root, store.ScopeWorkspace, map[string]string{"save_check": "parse"})
+	path := filepath.Join(root, "test.go")
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarnessAt(t, root)
+	h.OpenFile(path)
+	p := h.Tabs.Active()
+	// Append a ')' so the composition is not valid Go. Parse is the only mode
+	// that refuses a save now, so this text must be rejected by go/parser
+	// rather than a byte heuristic.
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 34, End: 34, Text: ")"}})
+	p.File.End()
+	id := p.File.Session().LastGroup()
+	p.File.ProposeGroup(id)
+
+	h.press("super+s", "enter") // answer the save review
+
+	if got := p.File.Session().GroupState(id); got != piecetable.Proposed {
+		t.Errorf("state after a refused save = %v, want the set rolled back to Proposed", got)
+	}
+	if got := len(p.File.Session().Pending()); got != 1 {
+		t.Errorf("pending after a refused save = %d, want 1", got)
+	}
+	if got := h.Status(); !strings.Contains(got, "save refused") {
+		t.Errorf("status = %q, want the composition refusal", got)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != original {
+		t.Errorf("file = %q err %v, want the original bytes untouched", got, err)
+	}
+}
+
+// Off is the default and the escape hatch: save_check=off lets the same
+// unbalanced composition reach disk.
+func TestSaveCheckOffSettingWritesUnbalancedComposition(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	seedSettings(t, root, store.ScopeWorkspace, map[string]string{"save_check": "off"})
+	path := filepath.Join(root, "test.go")
+	const original = "package p\n\nfunc f() {\n\tx()\n\ty()\n}\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarnessAt(t, root)
+	h.OpenFile(path)
+	p := h.Tabs.Active()
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 34, End: 34, Text: ")"}})
+	p.File.End()
+	p.File.ProposeGroup(p.File.Session().LastGroup())
+
+	h.press("super+s", "enter")
+
+	if got := len(p.File.Session().Pending()); got != 0 {
+		t.Errorf("pending after an off save = %d, want none", got)
+	}
+	want := original + ")"
+	if got, err := os.ReadFile(path); err != nil || string(got) != want {
+		t.Errorf("file = %q err %v, want the unbalanced composition written", got, err)
 	}
 }

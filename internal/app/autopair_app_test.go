@@ -10,6 +10,7 @@ import (
 // End to end through the real key path: the conveniences are on by default, so
 // they have to work from a keystroke rather than only from a direct call.
 func TestTypingBracketsInTheEditor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.typeText("func f(")
 	if got, want := h.Pane().File.Text(), "func f()"; got != want {
@@ -18,6 +19,7 @@ func TestTypingBracketsInTheEditor(t *testing.T) {
 }
 
 func TestNewlineIndentsThroughTheKeyPath(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "        deep")
 	h.press("ctrl+g")
 	h.typeText("1")
@@ -34,6 +36,7 @@ func TestNewlineIndentsThroughTheKeyPath(t *testing.T) {
 // A paste arriving as a ui.Paste event is data and must not be paired, which
 // is the distinction that keeps the feature safe.
 func TestPastedBracketsAreUntouched(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.Handle(ui.Paste{Text: "if (x) { return [1] }"})
 	h.drain()
@@ -45,6 +48,7 @@ func TestPastedBracketsAreUntouched(t *testing.T) {
 // Typing a whole line of code comes out as written, with no doubled closers
 // and nothing swallowed.
 func TestTypingALineOfCode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.typeText(`x := map[string]int{"a": 1}`)
 	if got, want := h.Pane().File.Text(), `x := map[string]int{"a": 1}`; got != want {

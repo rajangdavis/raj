@@ -25,6 +25,7 @@ func main() {
 // End to end through the key path: typing enough of a word offers the words
 // already in the buffer.
 func TestCompletionOffersBufferWords(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -42,6 +43,7 @@ func TestCompletionOffersBufferWords(t *testing.T) {
 
 // One character is not enough to discriminate, so nothing is offered.
 func TestCompletionWaitsForEnoughPrefix(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -54,6 +56,7 @@ func TestCompletionWaitsForEnoughPrefix(t *testing.T) {
 
 // Tab accepts, replacing the typed prefix with the whole word.
 func TestCompletionAcceptsWithTab(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -74,6 +77,7 @@ func TestCompletionAcceptsWithTab(t *testing.T) {
 
 // Accepting is one edit, so it is one undo step.
 func TestCompletionIsOneUndo(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -90,6 +94,7 @@ func TestCompletionIsOneUndo(t *testing.T) {
 // Escape dismisses without changing the buffer, which is what makes the popup
 // safe to leave on screen.
 func TestCompletionEscapeLeavesTheBuffer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -109,6 +114,7 @@ func TestCompletionEscapeLeavesTheBuffer(t *testing.T) {
 // The popup must not swallow ordinary editing. Every key it does not claim has
 // to reach the editor, or typing becomes unpredictable while it is showing.
 func TestCompletionDoesNotSwallowTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -130,6 +136,7 @@ func TestCompletionDoesNotSwallowTyping(t *testing.T) {
 // Moving the cursor closes it: a cursor that jumped is no longer finishing the
 // word it was on.
 func TestCompletionClosesOnCursorMove(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("7")
@@ -148,6 +155,7 @@ func TestCompletionClosesOnCursorMove(t *testing.T) {
 // it at cursors mid-word in different identifiers would replace text nobody
 // looked at.
 func TestCompletionClosesWithMultipleCursors(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "han\nhan\nhan\n")
 	h.press("ctrl+g")
 	h.typeText("1")
@@ -167,6 +175,7 @@ func TestCompletionClosesWithMultipleCursors(t *testing.T) {
 // The cache must not change what is suggested — it is a cost fix, and a stale
 // entry would show up as a suggestion for text that is no longer in the buffer.
 func TestCompletionStaysCorrectAcrossEdits(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, completeSrc)
 	h.press("ctrl+g")
 	h.typeText("8")
@@ -203,6 +212,7 @@ func TestCompletionStaysCorrectAcrossEdits(t *testing.T) {
 // Closing a tab drops its words, or a long session suggests from every file
 // ever opened.
 func TestCompletionForgetsClosedBuffers(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.OpenFile(filepath.Join(h.primaryRoot(), "pkg/helper.go"))
 	h.drain()

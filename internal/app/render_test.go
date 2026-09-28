@@ -78,6 +78,7 @@ func gutterCell(h *harness, l Layout, row int) ui.Cell {
 // row, not its session line: session line 5 lands on display row 4, so the
 // naive placement would paint one row low.
 func TestDiagnosticMarkFollowsFoldShift(t *testing.T) {
+	t.Parallel()
 	h, hiddenTail := foldedMarkHarness(t)
 	path := h.docPath(h.Pane())
 	h.diags.set(path, []lsp.Diagnostic{{Range: lsp.Range{Start: lsp.Position{Line: hiddenTail}}, Severity: sevError}})
@@ -97,6 +98,7 @@ func TestDiagnosticMarkFollowsFoldShift(t *testing.T) {
 // A diagnostic on a line the fold hides is skipped, not clamped onto the fold
 // row: the hidden line has no display row of its own.
 func TestDiagnosticMarkInsideFoldIsSkipped(t *testing.T) {
+	t.Parallel()
 	h, _ := foldedMarkHarness(t)
 	path := h.docPath(h.Pane())
 	h.diags.set(path, []lsp.Diagnostic{{Range: lsp.Range{Start: lsp.Position{Line: 1}}, Severity: sevError}})
@@ -123,6 +125,7 @@ func TestDiagnosticMarkInsideFoldIsSkipped(t *testing.T) {
 // row, matching PendingMark.DispLine; the review gutter follows the same shift
 // as the diagnostics gutter.
 func TestProposalMarkFollowsFoldShift(t *testing.T) {
+	t.Parallel()
 	h, _ := foldedMarkHarness(t)
 	off := strings.Index(h.text(), "ddd")
 	propose(t, h, piecetable.Hunk{Start: off, End: off + len("ddd"), Text: "DDD"})
@@ -147,9 +150,56 @@ func TestProposalMarkFollowsFoldShift(t *testing.T) {
 	}
 }
 
+// Review mode marks an invalid set in the gutter with a dim stale rune on the
+// live run of the set that consumed it, and Edit mode draws nothing: the
+// invalid set is a review fact, not an editing one.
+func TestReviewMarksInvalidSets(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewFixture)
+	p := h.Pane()
+	sess := p.File.Session()
+	base := sess.Version()
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, base, []piecetable.Hunk{{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew}})
+	p.File.End()
+	superseded := sess.LastGroup()
+	sess.MarkGroup(superseded, piecetable.Proposed)
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.User, sess.Version(), []piecetable.Hunk{{Start: 6, End: 12, Text: "port"}})
+	p.File.End()
+	invalid := false
+	for _, g := range sess.Groups() {
+		if g.ID == superseded && g.Invalid && g.InvalidBy != nil {
+			invalid = true
+		}
+	}
+	if !invalid {
+		t.Fatalf("setup: set %d is not invalid with a named collider", superseded)
+	}
+
+	// Edit mode draws no stale mark.
+	h.Draw()
+	l := editorLayout(h)
+	if cell := gutterCell(h, l, 0); cell.Rune == '~' {
+		t.Fatal("Edit mode drew the invalid-set mark")
+	}
+
+	h.EnterReview()
+	h.Draw()
+	l = editorLayout(h)
+	cell := gutterCell(h, l, 0)
+	if cell.Rune != '~' {
+		t.Errorf("review gutter rune = %q, want the stale marker %q", cell.Rune, '~')
+	}
+	if cell.Style.Attr&ui.Dim == 0 {
+		t.Errorf("review stale mark attr = %v, want the dim attribute", cell.Style.Attr)
+	}
+}
+
 // With no decisions the map is the identity, so a diagnostic and a proposal
 // land on their session lines exactly as they did before the projection.
 func TestMarksIdentityWithoutFolds(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, foldedFixture)
 	off := strings.Index(h.text(), "ddd")
 	propose(t, h, piecetable.Hunk{Start: off, End: off + len("ddd"), Text: "DDD"})
@@ -175,37 +225,53 @@ func TestMarksIdentityWithoutFolds(t *testing.T) {
 	}
 }
 
-// sessionTopFor hands a session-anchored overlay the viewport top in the
-// anchor's coordinate, so the overlay's (anchorLine - top) is the display
-// delta. With no fold it is the plain viewport top, which is what keeps a
-// clean buffer's popup exactly where it was.
-func TestSessionTopForIdentityWithoutFolds(t *testing.T) {
-	h := newHarness(t, foldedFixture)
-	p := h.Pane()
-	p.Viewport.Top = 2
-	// No projection: the anchor rows and columns are the session ones.
-	if got := sessionTopFor(p, 3, 0); got != p.Viewport.Top {
-		t.Errorf("sessionTopFor = %d, want the viewport top %d with no fold", got, p.Viewport.Top)
+// The hover panel anchors in display coordinates, the same map showCompletion
+// uses, so the box hangs from the row its line is drawn on. With no fold that
+// is the session line, which keeps a clean buffer's panel exactly where it was.
+// A hint's tooltip is the one hover anchor a test can drive without a language
+// server; pointerHint captures its anchor with DispPos.
+func TestHoverAnchorIdentityWithoutFolds(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "abc\ndef\n")
+	notesPane(h) // no language server can start on an idle tick
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
+	col, row := hintScreenCell(h, 1, 0)
+
+	move(h, col, row)
+	rest(h)
+	if !h.Hover.Open {
+		t.Fatal("resting on the hint showed no tooltip")
+	}
+	if line, _ := h.Hover.Anchor(); line != 1 {
+		t.Errorf("hover anchor line = %d, want session line 1 with no fold", line)
 	}
 }
 
-// Below a fold the overlay placement rows are display rows: sessionTopFor
-// cancels the anchor's session-to-display offset, so (anchorLine - top) is the
-// anchor display row minus the viewport top. Session line 5 sits on display row
-// 4, and with the viewport top on display row 2 the top must come back as
-// session line 3 so the difference is 1.
-func TestSessionTopForAdjustsBelowFold(t *testing.T) {
+// Below a fold the hover anchor is the display row, not the session line: the
+// panel must hang from the row its line is drawn on. Session line 5 sits on
+// display row 4, so a session-coordinate anchor would read 5 and drop the box a
+// row low. This is the hover twin of TestCompletionAnchorsBelowAFold.
+func TestHoverAnchorAdjustsBelowFold(t *testing.T) {
+	t.Parallel()
 	h, tail := foldedMarkHarness(t)
 	p := h.Pane()
-	p.Viewport.Top = 2
-	got := sessionTopFor(p, tail, 0)
-	// anchorRow(tail) = 4, so got = 5 - 4 + 2 = 3.
-	if got != 3 {
-		t.Fatalf("sessionTopFor = %d, want 3", got)
+	notesPane(h)
+	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: tail, Character: 0}, Text: "int", Tooltip: "the type"})
+
+	row := p.DispOfDocLine(tail)
+	if row == tail {
+		t.Fatalf("fixture did not shift: display row %d == session line %d", row, tail)
 	}
-	anchorRow, _ := p.DispPos(p.File.LineStart(tail) + 0)
-	if delta := tail - got; delta != anchorRow-p.Viewport.Top {
-		t.Errorf("anchor - top = %d, want the display delta %d", delta, anchorRow-p.Viewport.Top)
+	col, _ := hintScreenCell(h, tail, 0)
+	_, oy := editorOrigin(h)
+	y := oy + row - p.Viewport.Top
+	move(h, col, y)
+	rest(h)
+	if !h.Hover.Open {
+		t.Fatal("resting on the hint below the fold showed no tooltip")
+	}
+	if line, _ := h.Hover.Anchor(); line != row {
+		t.Errorf("hover anchor line = %d, want display row %d (session line %d)", line, row, tail)
 	}
 }
 
@@ -213,6 +279,7 @@ func TestSessionTopForAdjustsBelowFold(t *testing.T) {
 // in Edit and in Review, at least two rows tall and full width. The ordinary
 // profile draws no drawer at all.
 func TestPhoneDrawerHandleOnlyInPhone(t *testing.T) {
+	t.Parallel()
 	p := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	p.status = ""
 	p.Draw()
@@ -258,6 +325,7 @@ func TestPhoneDrawerHandleOnlyInPhone(t *testing.T) {
 // The handle is a two-row, full-width target: a tap on either row toggles it,
 // and a tap above the open panel collapses it.
 func TestPhoneDrawerTapOpensAndOutsideCloses(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.status = ""
 	h.Draw()
@@ -296,6 +364,7 @@ func TestPhoneDrawerTapOpensAndOutsideCloses(t *testing.T) {
 // whole cell, so a tap on any row or column dispatches; a row outside the cell
 // does not. The real tap dispatches the same path as the chord.
 func TestPhoneDrawerButtonCellTapsEveryRowAndColumn(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r") // the review controls live in Review mode
@@ -351,6 +420,7 @@ func TestPhoneDrawerButtonCellTapsEveryRowAndColumn(t *testing.T) {
 // The close button is the existing close, so it still refuses unsaved work: the
 // buffer stays open and the question is asked.
 func TestPhoneDrawerCloseRefusesDirty(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\n", 120, 30)
 	h.typeText("x") // dirty the buffer
 	if !h.Pane().File.ViewDirty() {
@@ -382,6 +452,7 @@ func TestPhoneDrawerCloseRefusesDirty(t *testing.T) {
 // esc toggles the drawer in the phone profile only; the ordinary profile keeps
 // esc as Cancel and never grows a drawer.
 func TestPhoneDrawerKeyToggles(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarness(t, "one\ntwo\n")
 	h.Draw()
 	if h.drawerOpen {
@@ -407,6 +478,7 @@ func TestPhoneDrawerKeyToggles(t *testing.T) {
 // combined table holds both. Without the split Edit mode would still show the
 // review buttons.
 func TestPhoneDrawerButtonsDispatchTheExistingActions(t *testing.T) {
+	t.Parallel()
 	review := map[keys.Action]bool{}
 	for _, b := range drawerReviewButtons {
 		review[b.action] = true
@@ -447,6 +519,7 @@ func TestPhoneDrawerButtonsDispatchTheExistingActions(t *testing.T) {
 // The status and the handle share the two-row handle strip: the status takes
 // the first row, the label the last, and expiring the status leaves the handle.
 func TestPhoneStatusSharesTheHandleRow(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarness(t, "one\ntwo\n")
 	h.press("super+r") // Review
 	if h.mode != ModeReview {
@@ -484,6 +557,7 @@ func TestPhoneStatusSharesTheHandleRow(t *testing.T) {
 // the whole path — key event, alias resolution, dispatch, toggleReview — so a
 // dropped alias or a broken dispatch fails here, not only in the keymap.
 func TestPhoneCtrlRAliasEntersReview(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarness(t, "one\ntwo\n")
 	if h.mode != ModeEdit {
 		t.Fatalf("fixture mode = %v at startup, want Edit", h.mode)
@@ -527,6 +601,7 @@ func openPhoneDrawer(h *harness) {
 // of taps. Without the keep-open change the first tap closes it and the next
 // must reopen it by hand.
 func TestPhoneDrawerStaysOpenAcrossButtonTaps(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r") // prev and next are review controls
@@ -552,6 +627,7 @@ func TestPhoneDrawerStaysOpenAcrossButtonTaps(t *testing.T) {
 // shows. Without the shared cell geometry the border rows would fall outside
 // the hit rectangle the pointer uses.
 func TestPhoneDrawerButtonBorders(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.status = ""
 	h.Draw()
@@ -609,10 +685,59 @@ func TestPhoneDrawerButtonBorders(t *testing.T) {
 	}
 }
 
+// The drawer's open default follows what the file can do: a clean file opens
+// onto close, because on a phone the next move is to leave it; a file with a
+// pending set in Edit opens onto files; Review with something pending opens
+// onto next. The default is named by action, so a short screen that drops the
+// cell still resolves.
+func TestPhoneDrawerOpensOntoTheNextMove(t *testing.T) {
+	t.Parallel()
+	t.Run("clean opens onto close", func(t *testing.T) {
+		h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
+		h.status = ""
+		h.Draw()
+		openPhoneDrawer(h)
+		if got := h.drawerPanel[h.drawerSel].action; got != keys.CloseTab {
+			t.Errorf("open default = %q, want %q", got, keys.CloseTab)
+		}
+	})
+	t.Run("a pending set in Edit opens onto files", func(t *testing.T) {
+		h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
+		propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+		h.status = ""
+		h.Draw()
+		openPhoneDrawer(h)
+		if got := h.drawerPanel[h.drawerSel].action; got != keys.FocusExplorer {
+			t.Errorf("open default = %q, want %q", got, keys.FocusExplorer)
+		}
+	})
+	t.Run("Review with a pending set opens onto next", func(t *testing.T) {
+		h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
+		propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+		h.press("super+r")
+		h.status = ""
+		h.Draw()
+		openPhoneDrawer(h)
+		if got := h.drawerPanel[h.drawerSel].action; got != keys.NextProposed {
+			t.Errorf("open default = %q, want %q", got, keys.NextProposed)
+		}
+	})
+	t.Run("no tabs opens onto exit", func(t *testing.T) {
+		h, _, _ := newRootsHarness(t) // built with nothing open
+		if n := h.Tabs.Count(); n != 0 {
+			t.Fatalf("fixture has %d tab(s), want none", n)
+		}
+		if got := h.drawerOpenWant(); got != keys.Quit {
+			t.Errorf("open default = %q, want %q", got, keys.Quit)
+		}
+	})
+}
+
 // The review controls are drawn only in Review; the general controls are drawn
 // in both modes. Without the split both modes draw the same ten buttons, and a
 // phone in Edit mode offers decisions it cannot make.
 func TestPhoneDrawerReviewControlsOnlyInReview(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.status = ""
@@ -659,6 +784,7 @@ func TestPhoneDrawerReviewControlsOnlyInReview(t *testing.T) {
 // shorter Edit panel. Without the split the accept cell is drawn in Edit and a
 // tap would decide a change.
 func TestPhoneDrawerReviewCellAbsentInEdit(t *testing.T) {
+	t.Parallel()
 	r := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, r, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	r.press("super+r")
@@ -682,10 +808,11 @@ func TestPhoneDrawerReviewCellAbsentInEdit(t *testing.T) {
 	}
 }
 
-// Up opens the drawer and selects the first drawn button, and the selected cell
+// Up opens the drawer and selects the context default, and the selected cell
 // carries the highlight. Without the directional routing Up would scroll the
 // editor and there would be no selection to highlight.
-func TestPhoneDrawerUpOpensAndSelectsFirst(t *testing.T) {
+func TestPhoneDrawerUpOpensAndSelectsTheDefault(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.status = ""
 	h.Draw()
@@ -696,16 +823,20 @@ func TestPhoneDrawerUpOpensAndSelectsFirst(t *testing.T) {
 	if !h.drawerOpen {
 		t.Fatal("up did not open the drawer")
 	}
-	if h.drawerSel != 0 {
-		t.Fatalf("selection = %d, want the first button", h.drawerSel)
-	}
 	h.Draw()
 	if len(h.drawerPanel) == 0 {
 		t.Fatal("the open drawer drew no buttons")
 	}
-	sel := h.drawerPanel[0]
-	if want := drawerGeneralButtons[0].label; sel.label != want {
-		t.Errorf("first Edit button = %q, want %q", sel.label, want)
+	want, ok := drawerActionIndex(h.drawerPanel, keys.CloseTab)
+	if !ok {
+		t.Fatal("the clean-file default close is not drawn")
+	}
+	if h.drawerSel != want {
+		t.Fatalf("selection = %d, want the default button %d", h.drawerSel, want)
+	}
+	sel := h.drawerPanel[h.drawerSel]
+	if want := "close"; sel.label != want {
+		t.Errorf("default Edit button = %q, want %q", sel.label, want)
 	}
 	frame := h.host.Last()
 	if st := frame.At(sel.x, sel.y).Style; st.Fg != ui.Ansi(15) || st.Bg != ui.Ansi(4) {
@@ -732,6 +863,7 @@ func TestPhoneDrawerUpOpensAndSelectsFirst(t *testing.T) {
 // Down closes an open drawer and is the editor line-down when closed. Without
 // the routing Down would do nothing while open.
 func TestPhoneDrawerDownClosesAndIsNormalWhenClosed(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.status = ""
 	h.Draw()
@@ -756,6 +888,7 @@ func TestPhoneDrawerDownClosesAndIsNormalWhenClosed(t *testing.T) {
 // ends; they never select a button the current mode omitted. Entering Review
 // grows the set and leaving it clamps the selection back in.
 func TestPhoneDrawerLeftRightClamp(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.status = ""
@@ -810,6 +943,7 @@ func TestPhoneDrawerLeftRightClamp(t *testing.T) {
 // Tab activates the selected button through the same dispatch a tap uses.
 // Without the routing Tab would indent the editor instead.
 func TestPhoneDrawerTabActivatesSelection(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.typeText("x") // dirty, so the save has an observable effect
 	h.status = ""
@@ -833,6 +967,7 @@ func TestPhoneDrawerTabActivatesSelection(t *testing.T) {
 
 // The ordinary profile routes neither Up nor Tab through a drawer.
 func TestOrdinaryProfileUpAndTabUnchanged(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\n")
 	// Build the asserted state explicitly. The frame first: a pane that has
 	// never been laid out has Viewport.Cols == 0, and wrapped vertical movement
@@ -877,6 +1012,7 @@ func TestOrdinaryProfileUpAndTabUnchanged(t *testing.T) {
 // wrapping exactly as the tab-cycle chord does. With it open they move the
 // selection and leave the tab alone.
 func TestPhoneDrawerClosedLeftRightCycleTabs(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	dir := filepath.Dir(h.Pane().File.Path)
 	second := filepath.Join(dir, "second.go")
@@ -911,13 +1047,18 @@ func TestPhoneDrawerClosedLeftRightCycleTabs(t *testing.T) {
 	if !h.drawerOpen {
 		t.Fatal("up did not open the drawer")
 	}
+	h.Draw()
+	start, ok := drawerActionIndex(h.drawerPanel, keys.CloseTab)
+	if !ok {
+		t.Fatal("the clean-file default close is not drawn")
+	}
 	before := active()
 	h.press("right")
 	if active() != before {
 		t.Errorf("right with the drawer open changed the tab to %s", active())
 	}
-	if h.drawerSel != 1 {
-		t.Errorf("selection = %d, want 1", h.drawerSel)
+	if want := start + 1; h.drawerSel != want {
+		t.Errorf("selection = %d, want %d (one past the default)", h.drawerSel, want)
 	}
 }
 
@@ -925,6 +1066,7 @@ func TestPhoneDrawerClosedLeftRightCycleTabs(t *testing.T) {
 // [actions] label, with a live status on the row above. Opening and closing a
 // tab updates it.
 func TestPhoneHandleShowsTabCount(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 20, 30)
 	h.Draw()
 	handleRow := func() string {
@@ -971,6 +1113,7 @@ func TestPhoneHandleShowsTabCount(t *testing.T) {
 // first: its modal key handling would otherwise swallow every key the picker
 // needs. Without the close rule the typed text never reaches the picker.
 func TestPhoneDrawerOpenClosesAndPickerReceivesKeys(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.status = ""
 	h.Draw()
@@ -994,6 +1137,7 @@ func TestPhoneDrawerOpenClosesAndPickerReceivesKeys(t *testing.T) {
 // empties the set removes them again, and a local tap on accept keeps the
 // drawer open because the action stays in the editor.
 func TestPhoneDrawerReviewControlsNeedPendingChanges(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	h.status = ""
 	h.press("super+r") // Review, but nothing pending yet
@@ -1050,6 +1194,7 @@ func drawerSelIndex(t *testing.T, h *harness, action keys.Action) int {
 // and a save moves it to close. Without the follow-up the selection stays on
 // the review button and, once the panel shrinks, clamps to the wrong cell.
 func TestPhoneDrawerDecisionSelectsSaveThenClose(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r")
@@ -1075,6 +1220,7 @@ func TestPhoneDrawerDecisionSelectsSaveThenClose(t *testing.T) {
 // because one set is still pending; the second decision, which empties the set,
 // moves it to save.
 func TestPhoneDrawerFirstDecisionKeepsReviewSelection(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "aaa\nbbb\nccc\n", 120, 30)
 	twoSets(t, h)
 	h.press("super+r")
@@ -1105,6 +1251,7 @@ func TestPhoneDrawerFirstDecisionKeepsReviewSelection(t *testing.T) {
 // Rejecting the last set from the drawer moves the selection to save too, even
 // though the reject itself leaves the caret in place.
 func TestPhoneDrawerRejectOfLastSelectsSave(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r")
@@ -1144,6 +1291,7 @@ func drawerOrder(t *testing.T, h *harness) (files, search, save int) {
 // drawer through the focus-change rule. Without them there is no tap route to
 // the explorer or search on a phone.
 func TestPhoneDrawerFilesAndSearchBeforeSave(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	h.status = ""
 	h.Draw()
@@ -1183,6 +1331,7 @@ func TestPhoneDrawerFilesAndSearchBeforeSave(t *testing.T) {
 // the sidebar rather than cycling tabs. Without the focus gate Up would open
 // the drawer and Left/Right would switch tabs.
 func TestPhoneArrowKeysReachTheFocusedSidebar(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	dir := filepath.Dir(h.Pane().File.Path)
 	second := filepath.Join(dir, "second.go")
@@ -1251,6 +1400,7 @@ func TestPhoneArrowKeysReachTheFocusedSidebar(t *testing.T) {
 // button, found by action rather than position. Without the context default it
 // would open on the first cell (prev in Review, files in Edit).
 func TestPhoneDrawerOpensOnNextInReview(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	h.press("super+r")
@@ -1260,26 +1410,29 @@ func TestPhoneDrawerOpensOnNextInReview(t *testing.T) {
 	}
 }
 
-// Edit, and Review with nothing pending, keep the first general button as the
-// open default.
-func TestPhoneDrawerOpensOnFilesWithoutReview(t *testing.T) {
+// Edit, and Review with nothing pending, open onto close: there is nothing to
+// review, so the next move is to leave the file. A file with a pending set
+// keeps files as the default (see TestPhoneDrawerOpensOntoTheNextMove).
+func TestPhoneDrawerOpensOnCloseWithoutReview(t *testing.T) {
+	t.Parallel()
 	edit := newPhoneHarnessSize(t, "one\ntwo\n", 120, 30)
 	edit.press("up")
-	if got := edit.drawerPanel[edit.drawerSel].action; got != drawerGeneralButtons[0].action {
-		t.Errorf("Edit open selected %v, want %v", got, drawerGeneralButtons[0].action)
+	if got := edit.drawerPanel[edit.drawerSel].action; got != keys.CloseTab {
+		t.Errorf("Edit open selected %v, want close", got)
 	}
 
 	review := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	review.press("super+r") // Review, nothing pending
 	review.press("up")
-	if got := review.drawerPanel[review.drawerSel].action; got != drawerGeneralButtons[0].action {
-		t.Errorf("empty Review open selected %v, want %v", got, drawerGeneralButtons[0].action)
+	if got := review.drawerPanel[review.drawerSel].action; got != keys.CloseTab {
+		t.Errorf("empty Review open selected %v, want close", got)
 	}
 }
 
 // Both open gestures get the same context default: a handle tap and esc in
 // Review with a pending set both land on next.
 func TestPhoneDrawerTapAndEscOpenOnNextInReview(t *testing.T) {
+	t.Parallel()
 	tap := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, tap, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	tap.press("super+r")
@@ -1306,6 +1459,7 @@ func TestPhoneDrawerTapAndEscOpenOnNextInReview(t *testing.T) {
 // reported it decided the last set on one tab and moved to save and close with
 // the drawer still open; the next tab then opened on clear.
 func TestPhoneDrawerSelectionResetsOnTabSwitch(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, reviewFixture, 120, 30)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	first := h.Pane()

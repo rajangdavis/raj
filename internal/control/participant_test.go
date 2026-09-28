@@ -29,6 +29,39 @@ func TestSameIdentityKeepsItsAuthorID(t *testing.T) {
 	}
 }
 
+// A participant's task is set by its register call and survives the ordinary
+// reconnect that carries no task, which is what lets a later command's writes
+// still be filed under it. A non-empty task updates the row.
+func TestTaskSurvivesReconnectAndUpdates(t *testing.T) {
+	r := NewRegistry()
+	id, err := r.Join("harness-abc", "claude-1", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetTask(id, "task-1")
+	if p, _ := r.Get(id); p.Task != "task-1" {
+		t.Fatalf("task = %q, want task-1", p.Task)
+	}
+
+	// A reconnect with no task -- the bind-first hello every later command
+	// sends -- keeps the row's task rather than clearing it.
+	r.Leave(id)
+	again, err := r.Join("harness-abc", "claude-1", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetTask(again, "")
+	if p, _ := r.Get(again); p.Task != "task-1" {
+		t.Errorf("task after a taskless reconnect = %q, want task-1", p.Task)
+	}
+
+	// A register for a different task moves the participant's future writes.
+	r.SetTask(again, "task-2")
+	if p, _ := r.Get(again); p.Task != "task-2" {
+		t.Errorf("task after re-register = %q, want task-2", p.Task)
+	}
+}
+
 // A disconnected participant stays listed: its text is still in the document,
 // so a reader still needs to know whose it is.
 func TestLeaveKeepsTheRow(t *testing.T) {
@@ -44,6 +77,35 @@ func TestLeaveKeepsTheRow(t *testing.T) {
 	}
 	if p.Name != "claude" {
 		t.Errorf("name = %q", p.Name)
+	}
+}
+
+// One participant holds several connections at once — an agent's parked recv
+// and every short `raj ctl` call under the same key — so one of them closing
+// must not mark the row gone. Before connections were counted, the first
+// short call to finish cleared Connected while the recv still listened, and
+// `send --to all` refused with "no other driver is connected".
+func TestLeaveKeepsARowWithAnotherConnectionLive(t *testing.T) {
+	r := NewRegistry()
+	recv, _ := r.Join("raj-agent", "claude", KindAgent)
+	call, _ := r.Join("raj-agent", "", KindAgent)
+	if call != recv {
+		t.Fatalf("second connection got id %d, want %d", call, recv)
+	}
+	r.Leave(call)
+	if p, _ := r.Get(recv); !p.Connected {
+		t.Error("closing one of two connections marked the participant gone")
+	}
+	r.Leave(recv)
+	if p, _ := r.Get(recv); p.Connected {
+		t.Error("closing the last connection left the participant connected")
+	}
+	// A stray extra Leave does not drive the count negative, so the next
+	// connection still reads as live.
+	r.Leave(recv)
+	again, _ := r.Join("raj-agent", "", KindAgent)
+	if p, _ := r.Get(again); !p.Connected {
+		t.Error("a reconnect after an extra Leave did not read as connected")
 	}
 }
 
@@ -89,6 +151,44 @@ func TestJoinRequiresAnIdentity(t *testing.T) {
 	r := NewRegistry()
 	if _, err := r.Join("", "nameless", KindAgent); err == nil {
 		t.Error("an empty identity was accepted")
+	}
+}
+
+// Join announces a row to the joined hook only when it is new or its name
+// changes, so the editor can persist the author table and an ordinary
+// per-command hello costs it nothing. A refused join announces nothing.
+func TestJoinAnnouncesChangedRows(t *testing.T) {
+	r := NewRegistry()
+	var got []uint8
+	r.setJoined(func(id uint8) { got = append(got, id) })
+
+	first, err := r.Join("h", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reconnects that change nothing announce nothing.
+	if _, err := r.Join("h", "", KindAgent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Join("h", "claude", KindAgent); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != first {
+		t.Fatalf("joined = %v, want one announce of %d for the new row", got, first)
+	}
+	// A rename is a row the editor has to persist.
+	if _, err := r.Join("h", "claude-2", KindAgent); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1] != first {
+		t.Errorf("joined after a rename = %v, want a second announce of %d", got, first)
+	}
+	// A refused join never reaches the hook.
+	if _, err := r.Join("", "nameless", KindAgent); err == nil {
+		t.Fatal("an empty identity was accepted")
+	}
+	if len(got) != 2 {
+		t.Errorf("a refused join announced %v", got[2:])
 	}
 }
 
@@ -260,6 +360,29 @@ func TestSeedRestoresExplicitAuthors(t *testing.T) {
 	}
 	if fresh, err := r.Join("fresh", "", KindAgent); err != nil || fresh <= 7 {
 		t.Errorf("Join(fresh) = %d, %v, want an id past the seeded 7", fresh, err)
+	}
+}
+
+// A seeded row keeps its display name when the same identity reconnects with
+// an empty-name hello: after a restart the harness comes back under its key
+// with no name, so the seeded name is what `chat --to` and `who` resolve. A
+// later hello that carries a name still replaces the seeded one.
+func TestSeedNameSurvivesAnEmptyHello(t *testing.T) {
+	r := NewRegistry()
+	if !r.Seed(Participant{ID: 5, Identity: "tok_a", Name: "claude-a", Kind: KindAgent}) {
+		t.Fatal("Seed refused a fresh explicit row")
+	}
+	if _, err := r.Join("tok_a", "", KindAgent); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := r.Get(5); !ok || p.Name != "claude-a" {
+		t.Errorf("name after an empty-name hello = %q, want claude-a", p.Name)
+	}
+	if _, err := r.Join("tok_a", "claude-b", KindAgent); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := r.Get(5); p.Name != "claude-b" {
+		t.Errorf("name after a named hello = %q, want claude-b", p.Name)
 	}
 }
 
@@ -494,5 +617,76 @@ func TestDurableIdentitySurvivesReservations(t *testing.T) {
 	}
 	if again != id {
 		t.Errorf("rejoined as %d, was %d", again, id)
+	}
+}
+
+// The derived working states, and the declared state winning over them, at an
+// injected clock so the windows move without sleeping. A request inside
+// activeWindow is working; quiet with nothing held is idle; a parked recv is
+// listening; a held proposal is waiting; a declared state wins; a declared
+// working state gone past staleWindow reads stale; a closed row reads gone.
+func TestWorkingStatesDerivedAndDeclared(t *testing.T) {
+	r := NewRegistry()
+	now := time.Unix(1000, 0)
+	r.now = func() time.Time { return now }
+	id, err := r.Join("harness", "claude", KindAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateOf := func(hookRunning func(uint8) bool) string {
+		t.Helper()
+		for _, p := range r.States(hookRunning) {
+			if p.ID == id {
+				return p.State
+			}
+		}
+		t.Fatalf("participant %d missing from the roster", id)
+		return ""
+	}
+
+	r.Touch(id)
+	if got := stateOf(nil); got != StateWorking {
+		t.Errorf("recent request = %q, want working", got)
+	}
+
+	now = now.Add(activeWindow + time.Second)
+	if got := stateOf(nil); got != StateIdle {
+		t.Errorf("quiet with nothing held = %q, want idle", got)
+	}
+	if got := stateOf(func(uint8) bool { return true }); got != StateWorking {
+		t.Errorf("hook run in flight = %q, want working", got)
+	}
+
+	r.SetListening(id, true)
+	if got := stateOf(nil); got != StateListening {
+		t.Errorf("parked recv = %q, want listening", got)
+	}
+
+	r.SetListening(id, false)
+	r.SetPending(map[uint8]bool{id: true})
+	if got := stateOf(nil); got != StateWaiting {
+		t.Errorf("quiet while holding a proposal = %q, want waiting", got)
+	}
+	r.SetPending(nil)
+
+	r.SetState(id, StateReview, "user", "checking")
+	for _, p := range r.States(nil) {
+		if p.ID != id {
+			continue
+		}
+		if p.State != StateReview || p.Declared != StateReview || p.On != "user" || p.Note != "checking" {
+			t.Errorf("declared row = %+v, want review on user with its note", p)
+		}
+	}
+
+	now = now.Add(staleWindow)
+	r.SetState(id, StateWorking, "", "")
+	if got := stateOf(nil); got != StateStale {
+		t.Errorf("declared working gone quiet = %q, want stale", got)
+	}
+
+	r.Leave(id)
+	if got := stateOf(nil); got != StateGone {
+		t.Errorf("closed connection = %q, want gone", got)
 	}
 }

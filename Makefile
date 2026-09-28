@@ -1,12 +1,15 @@
-.PHONY: build check fmt fmt-check vet test race smoke
+.PHONY: build check fmt fmt-check vet test race smoke test-times test-pkgs
 
 build:
 	go build -o ./bin/ ./cmd/raj
 
-# check is what CI runs, in the order that fails cheapest first: formatting
-# before types, types before the suite, the suite before the race detector.
-# Keeping the commands here rather than in the workflow means the thing that
-# gates a merge is the same thing you can run before pushing.
+# check is the product gate CI runs, in the order that fails cheapest first:
+# formatting before types, types before the suite, the suite before the race
+# detector. Keeping the commands here rather than in the workflow means the
+# thing that gates a merge is the same thing you can run before pushing.
+#
+# The dev-process tests (the Claude guard and the cycle test) are not part of
+# the product; scripts/raj-cycle.sh step 1 runs them before it calls check.
 check: fmt fmt-check vet build test race
 
 fmt:
@@ -45,3 +48,14 @@ race:
 # up by accident.
 smoke:
 	go test -tags smoke -count=1 ./internal/smoke/
+
+# test-times prints the slowest tests in one package, slowest first, so a
+# 30-second package reads as a few spikes or a broad serial load. Defaults to
+# internal/app; PACKAGE=./internal/control make test-times for another.
+PACKAGE ?= ./internal/app
+test-times:
+	go test -v $(PACKAGE) 2>&1 | grep -E '^--- (PASS|FAIL)' | sort -t'(' -k2 -rn | head -30
+
+# test-pkgs prints the per-package wall time across the repo, slowest first.
+test-pkgs:
+	go test ./... 2>&1 | grep -E '^(ok|FAIL)' | sort -k3 -rn

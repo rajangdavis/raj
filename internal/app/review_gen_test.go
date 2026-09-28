@@ -18,6 +18,7 @@ import (
 // is a decision, not an edit, so it leaves Session().Version() alone while
 // flipping the agreed composition. The watch must still wake.
 func TestReviewGenerationMovesOnADecision(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	p := h.Pane()
 	sess := p.File.Session()
@@ -64,6 +65,7 @@ func TestReviewGenerationMovesOnADecision(t *testing.T) {
 // every watcher, or a client's removal list goes stale until some unrelated
 // edit happens.
 func TestReviewGenerationMovesOnRemovals(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	path := filepath.Join(h.primaryRoot(), "ghost.go") // unopened: the file proposal raises no gate
 
@@ -103,6 +105,7 @@ func TestReviewGenerationMovesOnRemovals(t *testing.T) {
 // state, not of when or how often it is read. Two removals are pending so Go's
 // per-iteration map order would show through if the keys were not sorted.
 func TestReviewGenerationStableWhenIdle(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 
 	first := h.reviewGeneration()
@@ -126,6 +129,7 @@ func TestReviewGenerationStableWhenIdle(t *testing.T) {
 // that folded only those two would stay parked. The dirty flag is part of the
 // generation for exactly this case.
 func TestReviewGenerationMovesOnABareSave(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	p := h.Pane()
 	p.InsertText("X")

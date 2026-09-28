@@ -25,6 +25,7 @@ func editorTop(h *harness) int { return h.Pane().Viewport.Top }
 // terminal's own scrollback, which the alt screen is not part of, so nothing
 // happened at all.
 func TestWheelScrollsTheEditor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(200))
 	if editorTop(h) != 0 {
 		t.Fatal("setup: should start at the top")
@@ -43,6 +44,7 @@ func TestWheelScrollsTheEditor(t *testing.T) {
 // the cursor would change what the next keystroke edits and put it somewhere
 // nobody chose.
 func TestWheelDoesNotMoveTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(200))
 	before := h.Pane().Cursors.Primary().Head
 	wheel(h, keys.WheelDown, 80, 5)
@@ -56,6 +58,7 @@ func TestWheelDoesNotMoveTheCursor(t *testing.T) {
 
 // Scrolling stops at both ends rather than running off.
 func TestWheelClampsAtTheEnds(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(30))
 	wheel(h, keys.WheelUp, 80, 10)
 	if got := editorTop(h); got != 0 {
@@ -75,6 +78,7 @@ func TestWheelClampsAtTheEnds(t *testing.T) {
 // The wheel scrolls what is under the pointer, not what has focus. That is
 // what a pointer is for — reaching something without going there first.
 func TestWheelRoutesByPosition(t *testing.T) {
+	t.Parallel()
 	// A short pane, so the fixture's handful of files is more than fits and
 	// there is something to scroll. Sizing the window to the data beats
 	// padding the fixture with files no other test wants.
@@ -113,6 +117,7 @@ func TestWheelRoutesByPosition(t *testing.T) {
 // An overlay takes the wheel wherever the pointer is: it is drawn over
 // everything, so scrolling the pane behind it would scroll something invisible.
 func TestWheelOverAnOpenPickerScrollsThePicker(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 30)
 	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
@@ -130,6 +135,7 @@ func TestWheelOverAnOpenPickerScrollsThePicker(t *testing.T) {
 // A horizontal wheel does nothing rather than scrolling vertically, which is
 // what happens if the button is not checked.
 func TestHorizontalWheelIsIgnored(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(200))
 	wheel(h, keys.WheelLeft, 80, 3)
 	wheel(h, keys.WheelRight, 80, 3)
@@ -141,6 +147,7 @@ func TestHorizontalWheelIsIgnored(t *testing.T) {
 // A non-wheel mouse event is carried but does nothing yet, and must not be
 // mistaken for a keystroke that types into the buffer.
 func TestClicksDoNothingYet(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello")
 	h.Handle(ui.Mouse{Mouse: keys.Mouse{Button: keys.MouseLeft, Press: true, Col: 2, Row: 2}})
 	h.drain()

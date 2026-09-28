@@ -12,6 +12,7 @@ import (
 // seam exists and nothing uses it. Draining here is deliberate: the test asserts
 // that a Wake ARRIVES without a Tick having been delivered.
 func TestFinishedSearchPostsAWake(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.press("shift+super+f") // focus search
 	h.typeText("package")
@@ -57,6 +58,7 @@ func TestFinishedSearchPostsAWake(t *testing.T) {
 // A Wake must be harmless on its own: it carries nothing, so handling one is
 // only worth doing because Run draws afterwards.
 func TestWakeIsHandledWithoutSideEffects(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello")
 	before := h.text()
 	h.Handle(ui.Wake{})

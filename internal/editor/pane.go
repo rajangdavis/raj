@@ -77,6 +77,12 @@ type Pane struct {
 	// diskStale records the file changed on disk since raj read or wrote it,
 	// set by the app idle tick and cleared by save or reload.
 	diskStale bool
+	// saveRefused records that the last save of this pane was refused. A
+	// refusal is not the same as a clean close: the accepted composition a
+	// save would write may differ from the bytes on screen, so a view that
+	// happens to match disk must not let the tab be dropped silently. It
+	// clears on a write that lands.
+	saveRefused bool
 
 	// cursorHistory records where the cursors were before each movement, so
 	// cmd+u can put them back. A snapshot of a place rather than of an action:
@@ -152,6 +158,17 @@ func (p *Pane) ClearDiskStale() { p.diskStale = false }
 
 // DiskStale reports whether the file changed on disk since raj read or wrote it.
 func (p *Pane) DiskStale() bool { return p.diskStale }
+
+// MarkSaveRefused records that a save of this pane was refused, so a close
+// asks rather than treating a view that happens to match disk as permission to
+// drop work a save would not write.
+func (p *Pane) MarkSaveRefused() { p.saveRefused = true }
+
+// ClearSaveRefused forgets a refusal once the bytes have reached disk.
+func (p *Pane) ClearSaveRefused() { p.saveRefused = false }
+
+// SaveRefused reports whether the last save attempt on this pane was refused.
+func (p *Pane) SaveRefused() bool { return p.saveRefused }
 
 // NewPane wraps a file for editing.
 func NewPane(f *File) *Pane {

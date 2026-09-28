@@ -55,12 +55,16 @@ type Position struct {
 // Boundary errors. The methods wrap these with the operation and the offending
 // value, so a caller can test for the class with errors.Is.
 var (
-	errEmptyPath    = errors.New("empty path")
-	errEmptyScope   = errors.New("empty scope")
-	errUnknownScope = errors.New("unknown scope")
-	errEmptyKey     = errors.New("empty key")
-	errNegative     = errors.New("negative position")
-	errEmptyJournal = errors.New("empty journal snapshot")
+	errEmptyPath       = errors.New("empty path")
+	errEmptyScope      = errors.New("empty scope")
+	errUnknownScope    = errors.New("unknown scope")
+	errEmptyKey        = errors.New("empty key")
+	errNegative        = errors.New("negative position")
+	errEmptyJournal    = errors.New("empty journal snapshot")
+	errEmptyHookName   = errors.New("empty hook name")
+	errEmptyHookAction = errors.New("empty hook action")
+	errEmptyIdentity   = errors.New("empty identity")
+	errEmptyMailText   = errors.New("empty mail text")
 )
 
 // validScope reports whether scope names one of the settings scopes. The set is
@@ -325,6 +329,14 @@ func applyMigration(db *sql.DB, from int) error {
 	}
 	for _, stmt := range migrations[from] {
 		if _, err := tx.Exec(stmt); err != nil {
+			// An ADD COLUMN is the one step SQLite cannot write as CREATE ...
+			// IF NOT EXISTS. A re-run, or a lost race with another Open, that
+			// finds the column already there has the step's intent satisfied, so
+			// the duplicate is ignored and the transaction continues to record
+			// the new version.
+			if addColumnExists(stmt, err) {
+				continue
+			}
 			tx.Rollback()
 			return fmt.Errorf("store: migrate v%d: %w", from, err)
 		}
@@ -337,6 +349,20 @@ func applyMigration(db *sql.DB, from int) error {
 		return fmt.Errorf("store: migrate v%d: commit: %w", from, err)
 	}
 	return nil
+}
+
+// addColumnExists reports whether stmt is an ALTER TABLE ... ADD COLUMN that
+// failed only because the column is already present. It is what makes the one
+// migration statement SQLite cannot express as CREATE ... IF NOT EXISTS safe to
+// run again: the column exists, which is exactly what the step wanted.
+func addColumnExists(stmt string, err error) bool {
+	if !strings.HasPrefix(strings.TrimSpace(stmt), "ALTER TABLE ") {
+		return false
+	}
+	if !strings.Contains(strings.ToLower(stmt), " add column ") {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
 }
 
 // JournalEntry is one dirty buffer's persisted session: the encoded

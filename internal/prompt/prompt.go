@@ -31,7 +31,18 @@ import (
 // matches on the answer it gets back, and a shared constant is the only thing
 // that stops that comparison from drifting away from what was drawn on screen.
 const (
-	Save    = "Save"
+	Save = "Save"
+	// SaveAnyway is the save review's affirmative answer: the save proceeds
+	// even though another writer's change sets are pending, because the
+	// confirm warns rather than blocks. It is listed first, so the default
+	// answer proceeds with the save.
+	SaveAnyway = "Save anyway"
+
+	// ReviewOption steps into Review mode instead of saving, so the pending
+	// sets can be read before the save approves them. Its own name because
+	// Prompt.Review is the dialog method.
+	ReviewOption = "Review"
+
 	Discard = "Don't Save"
 	Cancel  = "Cancel"
 
@@ -174,6 +185,16 @@ func (p *Prompt) Review(title, message string, rows []string, options []string,
 	moved func(row int), done func(answer string, ok bool)) {
 	*p = Prompt{Open: true, kind: review, title: title, message: message,
 		rows: rows, options: options, moved: moved, done: done}
+}
+
+// ReviewFits reports whether a Review dialog with this message and these rows
+// can be drawn on a screen of the given size. It computes the same box Render
+// uses, so a caller that must not block on a dialog — the save confirm, which
+// warns but never guards — can skip opening one the screen cannot show.
+func ReviewFits(message string, rows []string, cols, screenRows int) bool {
+	p := Prompt{kind: review, message: message, rows: rows}
+	_, _, _, _, ok := p.box(cols, screenRows)
+	return ok
 }
 
 // ActiveInput is the field of an open text question, and nil for a button

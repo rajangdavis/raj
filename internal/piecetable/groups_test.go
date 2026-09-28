@@ -58,6 +58,36 @@ func TestGroupStateDefaultsToAccepted(t *testing.T) {
 	}
 }
 
+// A set's task is the work its connection registered, recorded when the group
+// was opened and read back off the group. A set with no task reads empty,
+// which is the default and the local human.
+func TestGroupCarriesItsTask(t *testing.T) {
+	s := groupSession(t, "x")
+	s.Insert(Agent, 0, "a")
+	asserted := s.LastGroup()
+	s.SetGroupTask(asserted, "task-1")
+
+	s.Insert(User, 1, "b")
+	plain := s.LastGroup()
+
+	gs := s.Groups()
+	if len(gs) != 2 {
+		t.Fatalf("groups = %+v, want two", gs)
+	}
+	if gs[0].Task != "task-1" {
+		t.Errorf("group %d task = %q, want task-1", gs[0].ID, gs[0].Task)
+	}
+	if gs[1].Task != "" {
+		t.Errorf("group %d task = %q, want empty", gs[1].ID, gs[1].Task)
+	}
+	if got := s.GroupTask(asserted); got != "task-1" {
+		t.Errorf("GroupTask(%d) = %q, want task-1", asserted, got)
+	}
+	if got := s.GroupTask(plain); got != "" {
+		t.Errorf("GroupTask(%d) = %q, want empty", plain, got)
+	}
+}
+
 // A reject is a pure state flip: the text stays in the document and only the
 // decision changes. It can address an older change without depending on
 // anything landing after it, and it cannot fail.
@@ -1194,9 +1224,8 @@ func TestInvalidClearsWhenColliderClears(t *testing.T) {
 
 // Naming a set invalid is derived from the same per-member projection the
 // composition uses, so it must not perturb the composition: under every policy
-// the projection still agrees with the fold oracle where the contract defines
-// it, and the run lengths still agree where it does not. Modelled on the
-// per-step checks in FuzzProjectAgainstOracle.
+// the projection still agrees with the fold oracle, overlap included. Modelled
+// on the per-step checks in FuzzProjectAgainstOracle.
 func TestInvalidKeepsProjectionInvariants(t *testing.T) {
 	const orig = "hello world\n"
 	s := groupSession(t, orig)
@@ -1206,9 +1235,19 @@ func TestInvalidKeepsProjectionInvariants(t *testing.T) {
 	s.MarkGroup(superseded, Proposed)
 	v0 := s.Version()
 	s.ApplyDiff(User, v0, []Hunk{{Start: 6, End: 12, Text: "port"}})
+	collider := s.LastGroup()
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
 
 	if g, ok := findGroup(s, superseded); !ok || !g.Invalid {
 		t.Fatalf("set %d = %+v (listed %v), want invalid", superseded, g, ok)
+	}
+	// Both excluded sets restore each other's deletions, so the edit
+	// composition is the base text: the invalid set's stale bytes must not
+	// reappear through the rejected collider's reversal.
+	if got := s.Project(AcceptedAndProposed).Text(); got != "hello world\n" {
+		t.Fatalf("edit composition %q, want %q", got, "hello world\n")
 	}
 	for _, p := range []Policy{AcceptedOnly, AcceptedAndProposed, Annotated} {
 		proj := s.Project(p)
@@ -1219,13 +1258,83 @@ func TestInvalidKeepsProjectionInvariants(t *testing.T) {
 		if proj.Len() != len(orc.text) {
 			t.Fatalf("%v: Len %d, oracle %d", p, proj.Len(), len(orc.text))
 		}
-		if orc.overlap {
-			continue // the contract does not define the composition here
-		}
 		checkSegments(t, s, p)
 		if got := proj.Text(); got != orc.text {
-			t.Fatalf("%v: composition %q, oracle %q", p, got, orc.text)
+			t.Fatalf("%v: composition %q, oracle %q (overlap %v)", p, got, orc.text, orc.overlap)
 		}
+	}
+}
+
+// An invalidated set is excluded from the edit and agreed compositions even
+// when the collider that consumed its text is itself excluded: un-applying the
+// collider restores the superseded bytes, and consulting Invalid then drops
+// them rather than letting the stale proposal reappear. Modelled on
+// TestInvalidWhollyOverwrittenProposal, with a Rejected collider so the
+// restored run is observable.
+func TestProjectExcludesInvalidatedProposalFromBothCompositions(t *testing.T) {
+	s := groupSession(t, "aaa")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 1, End: 2, Text: "XY"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	v0 := s.Version()
+	s.ApplyDiff(User, v0, []Hunk{{Start: 1, End: 3, Text: "Z"}})
+	collider := s.LastGroup()
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+	if got := text(s); got != "aZa" {
+		t.Fatalf("setup produced %q, want %q", got, "aZa")
+	}
+
+	g, ok := findGroup(s, superseded)
+	if !ok || !g.Invalid {
+		t.Fatalf("set %d = %+v (listed %v), want invalid", superseded, g, ok)
+	}
+	if got := s.Project(AcceptedAndProposed).Text(); strings.Contains(got, "XY") {
+		t.Errorf("edit composition %q still holds the invalid set's text", got)
+	}
+	if got := s.Project(AcceptedOnly).Text(); strings.Contains(got, "XY") {
+		t.Errorf("agreed composition %q still holds the invalid set's text", got)
+	}
+	// Review is the session view: every live byte, annotated by Groups.
+	if got := s.Project(Annotated).Text(); got != "aZa" {
+		t.Errorf("review composition %q, want the session view %q", got, "aZa")
+	}
+}
+
+// Invalid is derived, so clearing the colliding edit clears the flag and the
+// set's text returns to the composition. Modelled on
+// TestInvalidClearsWhenColliderClears, with the collider Rejected so the edit
+// composition can distinguish the excluded set from the restored one.
+func TestInvalidProposalReturnsToCompositionWhenColliderClears(t *testing.T) {
+	s := groupSession(t, "aaa")
+	base := s.Version()
+	s.ApplyDiff(Agent, base, []Hunk{{Start: 1, End: 2, Text: "XY"}})
+	superseded := s.LastGroup()
+	s.MarkGroup(superseded, Proposed)
+	v0 := s.Version()
+	s.ApplyDiff(User, v0, []Hunk{{Start: 1, End: 3, Text: "Z"}})
+	collider := s.LastGroup()
+	if !s.RejectGroup(collider) {
+		t.Fatal("reject of the collider failed")
+	}
+
+	if got := s.Project(AcceptedAndProposed).Text(); got != "aaa" {
+		t.Fatalf("edit composition with the invalid set = %q, want %q", got, "aaa")
+	}
+	if !s.ClearRejected(collider) {
+		t.Fatal("clear of the collider failed")
+	}
+	if got := text(s); got != "aXYa" {
+		t.Fatalf("after clearing the collider text = %q, want the proposal back", got)
+	}
+	g, _ := findGroup(s, superseded)
+	if g.Invalid {
+		t.Errorf("set %d stayed invalid after the colliding edit was cleared", superseded)
+	}
+	if got := s.Project(AcceptedAndProposed).Text(); got != "aXYa" {
+		t.Fatalf("edit composition after clearing = %q, want the proposal back %q", got, "aXYa")
 	}
 }
 
@@ -1614,14 +1723,13 @@ func TestRevertAuthorKeepsASharedGroupsDecision(t *testing.T) {
 	}
 }
 
-// A superseded proposal whose text a rejected collider restores to the edit
-// view is what a save would silently drop: Pending has already let it go, and
-// AcceptedOnly never held it. UnsavedProposed names it. Without the comparison
-// against AcceptedAndProposed the function would either name every invalid set
-// -- including the wholly-consumed one that is honestly absent from both views
-// -- or none. Modelled on TestInvalidWhollyOverwrittenProposal for the setup
-// and on TestProjectPoliciesDifferOnRejected and friends for the policy split.
-func TestUnsavedProposedNamesTheSetASaveWouldDrop(t *testing.T) {
+// A superseded proposal a rejected collider had restored is no longer what a
+// save would drop: Project consults Invalid and keeps the set out of the edit
+// composition, so the invalid run is in neither view and UnsavedProposed is
+// silent. What the rejected collider puts back is the base run the set deleted,
+// not the proposal. Modelled on
+// TestProjectExcludesInvalidatedProposalFromBothCompositions for the setup.
+func TestUnsavedProposedIsSilentWhenInvalidRunIsExcluded(t *testing.T) {
 	s := groupSession(t, "hello world\n")
 	base := s.Version()
 	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
@@ -1629,8 +1737,8 @@ func TestUnsavedProposedNamesTheSetASaveWouldDrop(t *testing.T) {
 	s.MarkGroup(superseded, Proposed)
 
 	// The user deletes the whole line; the set's insertion is consumed. The
-	// deletion is rejected, so its bytes come back to the session and the
-	// projection restores them, which is what separates the two compositions.
+	// deletion is rejected, so its bytes come back to the session, but the
+	// invalid proposal they carried does not come back to the composition.
 	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 12, Text: ""}})
 	collider := s.LastGroup()
 	if !s.RejectGroup(collider) {
@@ -1638,17 +1746,21 @@ func TestUnsavedProposedNamesTheSetASaveWouldDrop(t *testing.T) {
 	}
 
 	if len(s.Pending()) != 0 {
-		t.Fatalf("Pending = %+v, want none; the refusal is for a set Pending drops", s.Pending())
+		t.Fatalf("Pending = %+v, want none; Pending drops the invalid set", s.Pending())
 	}
 	if g, _ := findGroup(s, superseded); !g.Invalid {
 		t.Fatalf("set %d = %+v, want invalid", superseded, g)
 	}
-	got := s.UnsavedProposed()
-	if len(got) != 1 || got[0].ID != superseded {
-		t.Fatalf("UnsavedProposed = %+v, want just set %d", got, superseded)
+	edit := s.Project(AcceptedAndProposed).Text()
+	agreed := s.Project(AcceptedOnly).Text()
+	if strings.Contains(edit, "socket") {
+		t.Errorf("edit composition %q still holds the invalid set's text", edit)
 	}
-	if got[0].State != Proposed {
-		t.Errorf("named set state = %v, want Proposed", got[0].State)
+	if edit != agreed {
+		t.Errorf("compositions disagree on the invalid set: edit %q, agreed %q", edit, agreed)
+	}
+	if got := s.UnsavedProposed(); len(got) != 0 {
+		t.Errorf("UnsavedProposed = %+v, want none; the invalid run is in neither view", got)
 	}
 }
 
@@ -1722,30 +1834,34 @@ func TestInvalidWithoutMembersNamesTheDeadSets(t *testing.T) {
 	}
 }
 
-// InvalidWithoutMembers is silent when a rejected collider restores the
-// superseded run to the edit view: that set is UnsavedProposed's, and a save
-// must refuse over it rather than retire it. It pins the distinction the two
-// predicates share; without the projection guard the function would hand a set
-// holding visible text to the retirement path. Sibling:
-// TestUnsavedProposedNamesTheSetASaveWouldDrop.
-func TestInvalidWithoutMembersIsSilentWhenTextIsShown(t *testing.T) {
+// InvalidWithoutMembers does not name an invalid set that removed text, even
+// when a rejected collider restores the run it deleted: retiring a
+// deletion-bearing set is left to the disposal path, not the save's
+// bookkeeping. The set's own insertion is excluded from both compositions, so
+// it is not UnsavedProposed's either. Modelled on
+// TestInvalidWithoutMembersNamesTheDeadSets for the memberless half.
+func TestInvalidWithoutMembersIgnoresASetThatDeletedText(t *testing.T) {
 	s := groupSession(t, "hello world\n")
 	base := s.Version()
 	s.ApplyDiff(Agent, base, []Hunk{{Start: 6, End: 11, Text: "socket"}})
 	superseded := s.LastGroup()
 	s.MarkGroup(superseded, Proposed)
 	// The user deletes the whole line and the deletion is rejected, so its
-	// bytes come back to the session and the projection restores them.
+	// bytes come back to the session; the set's insertion stays out of the
+	// composition and the set deleted base text of its own.
 	s.ApplyDiff(User, s.Version(), []Hunk{{Start: 0, End: 12, Text: ""}})
 	collider := s.LastGroup()
 	if !s.RejectGroup(collider) {
 		t.Fatal("reject of the collider failed")
 	}
-	if got := s.UnsavedProposed(); len(got) != 1 || got[0].ID != superseded {
-		t.Fatalf("setup: UnsavedProposed = %+v, want just set %d", got, superseded)
+	if g, _ := findGroup(s, superseded); !g.Invalid {
+		t.Fatalf("set %d = %+v, want invalid", superseded, g)
 	}
 	if got := s.InvalidWithoutMembers(); len(got) != 0 {
-		t.Errorf("InvalidWithoutMembers = %+v, want none while the run is restored", got)
+		t.Errorf("InvalidWithoutMembers = %+v, want none for a set that removed text", got)
+	}
+	if got := s.UnsavedProposed(); len(got) != 0 {
+		t.Errorf("UnsavedProposed = %+v, want none; the invalid run is in neither view", got)
 	}
 }
 

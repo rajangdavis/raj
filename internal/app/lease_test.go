@@ -11,6 +11,7 @@ import (
 // A pending change set is a read-only lease: typing inside it changes nothing
 // and the status line names the set that has to be decided first.
 func TestLeaseRefusesTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	p := h.Pane()
@@ -30,6 +31,7 @@ func TestLeaseRefusesTyping(t *testing.T) {
 // Backspace reaching into a lease is refused too, so a deletion cannot take
 // leased bytes even when the caret itself sits outside the run.
 func TestLeaseRefusesBackspaceIntoTheRun(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	p := h.Pane()
@@ -48,6 +50,7 @@ func TestLeaseRefusesBackspaceIntoTheRun(t *testing.T) {
 // An insertion flush with a run's first byte is before the run, so it is not
 // refused; the boundary belongs to neither side.
 func TestLeaseAllowsABoundaryInsert(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	p := h.Pane()
@@ -63,6 +66,7 @@ func TestLeaseAllowsABoundaryInsert(t *testing.T) {
 // Accepting the set ends the lease: the bytes become ordinary text and typing
 // at the same caret now lands.
 func TestLeaseEndsWhenTheSetIsAccepted(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 	p := h.Pane()
@@ -83,6 +87,7 @@ func TestLeaseEndsWhenTheSetIsAccepted(t *testing.T) {
 // pure-deletion set owned no inserted run and this write succeeded, which could
 // move the set past what its reversal could carry.
 func TestLeaseRefusesAWriteAcrossAProposedDeletion(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	id := propose(t, h, piecetable.Hunk{Start: 6, End: 11, Text: ""})
 	p := h.Pane()

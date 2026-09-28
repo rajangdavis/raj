@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"raj/internal/control"
+	"raj/internal/manifest"
 	"raj/internal/piecetable"
 	"raj/internal/ui"
 )
@@ -32,6 +33,20 @@ func (h *harness) dial(t *testing.T) *client {
 	}
 	t.Cleanup(func() { c.Close() })
 	return &client{t: t, c: c}
+}
+
+// dialHuman dials the control socket and hellos as a joined human: the
+// attached client whose save is legitimate. Save is the user's gesture, so a
+// test that wants it to reach the host saves over this connection; an
+// undeclared one is an agent and is refused.
+func (h *harness) dialHuman(t *testing.T) *client {
+	t.Helper()
+	c := h.dial(t)
+	if hi := c.do(h, control.Request{Op: "hello", Identity: "client:test", Name: "test",
+		Kind: string(control.KindHuman)}); !hi.OK {
+		t.Fatalf("hello as human: %+v", hi)
+	}
+	return c
 }
 
 // do sends a request, claiming the write target first when the Guard gates it.
@@ -113,6 +128,7 @@ func controlSock(t *testing.T, id string) string {
 }
 
 func TestControlReadsBuffers(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\nworld\n")
 	c := h.dial(t)
 
@@ -138,6 +154,7 @@ func TestControlReadsBuffers(t *testing.T) {
 // paths against the process's working directory or refuse a path it has
 // already canonicalised.
 func TestControlPathSpellingsResolveAlike(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "alpha\nbeta\n")
 	c := h.dial(t)
 	abs := h.Tabs.Active().File.Path
@@ -177,6 +194,7 @@ func TestControlPathSpellingsResolveAlike(t *testing.T) {
 }
 
 func TestControlAppliesAnEdit(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 
@@ -197,11 +215,21 @@ func TestControlAppliesAnEdit(t *testing.T) {
 		t.Error("version did not advance")
 	}
 
-	// An agent's own save is refused while its change set is proposed: two
-	// calls in a row is not the moment to look that Save exists to provide.
+	// Save is the user's gesture: the agent that wrote the change cannot run
+	// it, and the edit stays in the buffer.
 	s := c.do(h, control.Request{Op: "save"})
 	if s.OK {
-		t.Fatal("save succeeded with the change still proposed")
+		t.Fatal("an agent's save succeeded")
+	}
+	if !strings.Contains(s.Err, "save is the user's action") {
+		t.Errorf("refusal = %q, want the human-only save message", s.Err)
+	}
+	// The same save over a joined human's connection reaches the host, which
+	// still refuses while a proposal awaits the user and says so.
+	human := h.dialHuman(t)
+	s = human.do(h, control.Request{Op: "save"})
+	if s.OK {
+		t.Fatal("the user's save succeeded with the change still proposed")
 	}
 	if !strings.Contains(s.Err, "approval") {
 		t.Errorf("refusal = %q, want it to say what is pending", s.Err)
@@ -224,10 +252,10 @@ func TestControlAppliesAnEdit(t *testing.T) {
 	if id == 0 {
 		t.Fatalf("no proposed group in %+v", groups.Groups)
 	}
-	if a := c.do(h, control.Request{Op: "accept", Group: id}); !a.OK {
+	if a := human.do(h, control.Request{Op: "accept", Group: id}); !a.OK {
 		t.Fatalf("accept = %+v", a)
 	}
-	if s := c.do(h, control.Request{Op: "save"}); !s.OK {
+	if s := human.do(h, control.Request{Op: "save"}); !s.OK {
 		t.Fatalf("save = %+v", s)
 	}
 	data, err := os.ReadFile(h.Tabs.Active().File.Path)
@@ -239,10 +267,106 @@ func TestControlAppliesAnEdit(t *testing.T) {
 	}
 }
 
+// The manifest files a change set under the task its connection registered,
+// with no caller-supplied key. Two connections naming different tasks write to
+// one buffer, and a third names none, so all three keys land in one manifest.
+func TestManifestKeysRowsByTheConnectionsTask(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "one two three\n")
+	path := h.Tabs.Active().File.Path
+
+	alpha := h.dial(t)
+	if hi := alpha.do(h, control.Request{Op: "hello", Identity: "agent-alpha", Task: "task-alpha"}); !hi.OK {
+		t.Fatalf("hello alpha = %+v", hi)
+	}
+	base := alpha.do(h, control.Request{Op: "text", Path: path}).Version
+	if r := alpha.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 3, Text: "ONE"}}}); !r.OK {
+		t.Fatalf("alpha apply = %+v", r)
+	}
+
+	beta := h.dial(t)
+	if hi := beta.do(h, control.Request{Op: "hello", Identity: "agent-beta", Task: "task-beta"}); !hi.OK {
+		t.Fatalf("hello beta = %+v", hi)
+	}
+	base = beta.do(h, control.Request{Op: "text", Path: path}).Version
+	if r := beta.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 8, End: 13, Text: "THREE"}}}); !r.OK {
+		t.Fatalf("beta apply = %+v", r)
+	}
+
+	plain := h.dial(t)
+	base = plain.do(h, control.Request{Op: "text", Path: path}).Version
+	if r := plain.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 4, End: 7, Text: "TWO"}}}); !r.OK {
+		t.Fatalf("no-task apply = %+v", r)
+	}
+
+	m, err := manifest.BuildManifest(h.Tabs.Active().File)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if got := len(m.ForTask("task-alpha")); got != 1 {
+		t.Errorf("ForTask(task-alpha) = %d rows, want 1", got)
+	}
+	if got := len(m.ForTask("task-beta")); got != 1 {
+		t.Errorf("ForTask(task-beta) = %d rows, want 1", got)
+	}
+	if got := len(m.ForTask("")); got != 1 {
+		t.Errorf("ForTask(empty) = %d rows, want the one no-task set", got)
+	}
+	if tasks := m.Tasks(); len(tasks) != 3 {
+		t.Errorf("Tasks() = %v, want three keys", tasks)
+	}
+	alphaRows, betaRows := m.ForTask("task-alpha"), m.ForTask("task-beta")
+	if alphaRows[0].Group == betaRows[0].Group {
+		t.Errorf("the two tasks share change set %d; the rows are not distinct", alphaRows[0].Group)
+	}
+}
+
+// A revision carries the task of the group it summarizes. The set is proposed
+// until the user accepts it, and only then does it reach the revision list,
+// which reads the task off the group rather than taking one as an argument.
+func TestRevisionsCarryTheGroupsTask(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello world\n")
+	path := h.Tabs.Active().File.Path
+	c := h.dial(t)
+	if hi := c.do(h, control.Request{Op: "hello", Identity: "agent-rev", Task: "task-rev"}); !hi.OK {
+		t.Fatalf("hello = %+v", hi)
+	}
+	base := c.do(h, control.Request{Op: "text", Path: path}).Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	if revs, err := manifest.BuildRevisions(h.Tabs.Active().File); err != nil || len(revs) != 0 {
+		t.Fatalf("revisions before accept = %+v, %v; want none", revs, err)
+	}
+	var id uint64
+	for _, g := range c.do(h, control.Request{Op: "groups", Path: path}).Groups {
+		if g.State == "proposed" {
+			id = g.ID
+		}
+	}
+	human := h.dialHuman(t)
+	if r := human.do(h, control.Request{Op: "accept", Path: path, Group: id}); !r.OK {
+		t.Fatalf("accept = %+v", r)
+	}
+	revs, err := manifest.BuildRevisions(h.Tabs.Active().File)
+	if err != nil {
+		t.Fatalf("BuildRevisions: %v", err)
+	}
+	if len(revs) != 1 || revs[0].Task != "task-rev" {
+		t.Fatalf("revisions = %+v, want one carrying task-rev", revs)
+	}
+}
+
 // revert is the inverse of attribution: it discards the connection's own pieces
 // — here a change set still proposed — reversing them out of the buffer and
 // leaving the text as it was before the apply.
 func TestControlRevertsItsOwnPieces(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 
@@ -266,6 +390,7 @@ func TestControlRevertsItsOwnPieces(t *testing.T) {
 // A writer with no live pieces has nothing to drop, so revert refuses rather
 // than reporting a success that changed nothing.
 func TestControlRevertWithNothingToDropIsRefused(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 
@@ -282,6 +407,7 @@ func TestControlRevertWithNothingToDropIsRefused(t *testing.T) {
 // for one driver that is a typo, for several writing concurrently it is silent
 // corruption. The read verbs and the write surface share the one check.
 func TestSpanBoundsAreChecked(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 
@@ -308,9 +434,10 @@ func TestSpanBoundsAreChecked(t *testing.T) {
 func intPtr(v int) *int { return &v }
 
 // The user's own save is the approval gesture: it writes the file and clears
-// every pending mark, so a later agent save is not refused for work that is
-// already committed.
+// every pending mark. An agent's own save stays refused afterwards, because
+// save is the user's gesture rather than a writer's.
 func TestUserSaveAcceptsPendingChanges(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 
@@ -350,8 +477,11 @@ func TestUserSaveAcceptsPendingChanges(t *testing.T) {
 	if string(data) != "hello socket\n" {
 		t.Errorf("on disk = %q", string(data))
 	}
-	if s := c.do(h, control.Request{Op: "save"}); !s.OK {
-		t.Errorf("save refused after the user accepted: %+v", s)
+	// The user's save already committed the work; the agent still cannot save,
+	// because save is the user's gesture rather than a writer's.
+	if s := c.do(h, control.Request{Op: "save"}); s.OK ||
+		!strings.Contains(s.Err, "save is the user's action") {
+		t.Errorf("an agent's save after the user accepted = %+v, want the human-only refusal", s)
 	}
 }
 
@@ -359,6 +489,7 @@ func TestUserSaveAcceptsPendingChanges(t *testing.T) {
 // disk without polling. The message rides the same mailbox `recv` parks on;
 // a driver that is gone or has no room must not fail the save.
 func TestUserSaveNotifiesConnectedDrivers(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 
 	// Two connections, one identity: the parked recv needs its own client
@@ -396,6 +527,9 @@ func TestUserSaveNotifiesConnectedDrivers(t *testing.T) {
 		if len(res.Messages) != 1 || res.Messages[0].Text != "saved "+path {
 			t.Fatalf("messages = %+v, want a saved notice for %s", res.Messages, path)
 		}
+		if res.Messages[0].From != control.AuthorOriginal {
+			t.Errorf("save notice From = %d, want the editor (AuthorOriginal); a save is not the user", res.Messages[0].From)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a save did not reach the connected driver")
 	}
@@ -405,6 +539,7 @@ func TestUserSaveNotifiesConnectedDrivers(t *testing.T) {
 // buffer keeps the rejected bytes, read returns them by default as the view,
 // and the file on disk holds only the agreed bytes.
 func TestControlSaveWritesTheAgreedComposition(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -429,8 +564,9 @@ func TestControlSaveWritesTheAgreedComposition(t *testing.T) {
 	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: id}); !r.OK {
 		t.Fatalf("reject = %+v", r)
 	}
-	// The rejected set no longer blocks a save, and it is not written.
-	if s := c.do(h, control.Request{Op: "save", Path: path}); !s.OK {
+	// The rejected set no longer blocks the user's save, and it is not written.
+	human := h.dialHuman(t)
+	if s := human.do(h, control.Request{Op: "save", Path: path}); !s.OK {
 		t.Fatalf("save = %+v", s)
 	}
 	data, err := os.ReadFile(path)
@@ -449,6 +585,7 @@ func TestControlSaveWritesTheAgreedComposition(t *testing.T) {
 // corrupt a file: the offsets were computed against some version, and applying
 // them to whatever the buffer is now looks like success.
 func TestControlRefusesAnApplyWithNoBase(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	r := c.do(h, control.Request{Op: "apply", Hunks: []control.Hunk{{Start: 0, End: 5, Text: "x"}}})
@@ -464,6 +601,7 @@ func TestControlRefusesAnApplyWithNoBase(t *testing.T) {
 // only no-ops advances nothing and opens no change set; a batch mixing real and
 // no-op hunks applies only the real one and opens exactly one.
 func TestControlNoOpHunksCreateNoChangeSet(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	base := c.do(h, control.Request{Op: "text"}).Version
@@ -504,9 +642,41 @@ func TestControlNoOpHunksCreateNoChangeSet(t *testing.T) {
 	}
 }
 
+// A disposed set leaves no row behind in the listing a driver decides from.
+// clear reverses a rejected set out of the document, so the set has no live
+// member left; the host drops that `0 ops` tombstone from `groups`, which is
+// how a buffer accumulated empty sets. The buffer is clean again, not merely
+// re-listed empty.
+func TestControlClearDropsTheDisposedSet(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	base := c.do(h, control.Request{Op: "text"}).Version
+	if r := c.do(h, control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 6, End: 11, Text: "socket"}}}); !r.OK {
+		t.Fatalf("apply = %+v", r)
+	}
+	id := groupByState(t, h, c, path, "proposed").ID
+	if r := c.do(h, control.Request{Op: "reject", Path: path, Group: id}); !r.OK {
+		t.Fatalf("reject = %+v", r)
+	}
+	if r := c.do(h, control.Request{Op: "clear", Path: path, Group: id}); !r.OK {
+		t.Fatalf("clear = %+v", r)
+	}
+	if got := h.text(); got != "hello world\n" {
+		t.Errorf("buffer = %q, want the set reversed out", got)
+	}
+	if groups := c.do(h, control.Request{Op: "groups", Path: path}); len(groups.Groups) != 0 {
+		t.Errorf("groups = %+v after clear, want no tombstone listed", groups.Groups)
+	}
+}
+
 // A stale base is reported as a conflict rather than applied at the offset it
 // was written against.
 func TestControlReportsConflicts(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	base := c.do(h, control.Request{Op: "text"}).Version
@@ -535,6 +705,7 @@ func TestControlReportsConflicts(t *testing.T) {
 }
 
 func TestControlErrors(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "x\n")
 	c := h.dial(t)
 	for _, req := range []control.Request{
@@ -557,6 +728,7 @@ func TestControlErrors(t *testing.T) {
 // Edits arriving over the socket are the Agent's, not the user's, so cmd+z does
 // not swallow them and the tint shows where they came from.
 func TestControlEditsAreAttributedToTheAgent(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	base := c.do(h, control.Request{Op: "text"}).Version
@@ -575,6 +747,7 @@ func TestControlEditsAreAttributedToTheAgent(t *testing.T) {
 // that touched the model from the accept goroutine fails here rather than in
 // someone's unsaved work.
 func TestControlConcurrentClientsSerialise(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "\n")
 	const clients = 8
 	const each = 5
@@ -615,6 +788,7 @@ func TestControlConcurrentClientsSerialise(t *testing.T) {
 // A request that the event thread never picks up must fail rather than hang the
 // client for ever.
 func TestControlTimesOutWhenTheEditorNeverDrains(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "x\n")
 	c, err := control.Dial(h.ControlPath())
 	if err != nil {
@@ -645,6 +819,7 @@ func TestControlTimesOutWhenTheEditorNeverDrains(t *testing.T) {
 // Closing removes the socket file; a path left behind answers nothing and looks
 // like a live editor.
 func TestControlCleansUpItsSocket(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "x\n")
 	path := h.ControlPath()
 	if _, err := os.Stat(path); err != nil {
@@ -662,6 +837,7 @@ func TestControlCleansUpItsSocket(t *testing.T) {
 // The App itself does not listen until the CLI starts the listeners: a plain
 // editor serves nothing, and main owns which addresses, if any, are started.
 func TestControlIsOffByDefault(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "x\n")
 	if h.ControlPath() != "" {
 		t.Error("a socket exists before StartControl")
@@ -673,6 +849,7 @@ func TestControlIsOffByDefault(t *testing.T) {
 // to grep: an open buffer can differ from the file on disk, and a driver that
 // searched the filesystem would find stale text and edit against it.
 func TestControlSearchSeesUnsavedEdits(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "package a\n\nfunc needle() {}\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -719,6 +896,7 @@ func TestControlSearchSeesUnsavedEdits(t *testing.T) {
 // -path limits the walk to one subtree under the workspace root, and a path
 // that reaches outside it is refused rather than walked.
 func TestControlSearchPathScopesAndRefusesEscape(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root needle\n")
 	c := h.dial(t)
 	root := filepath.Dir(h.Tabs.Active().File.Path)
@@ -766,6 +944,7 @@ func TestControlSearchPathScopesAndRefusesEscape(t *testing.T) {
 // existing directory is a no-op, and an outside-the-root path is refused
 // without touching the filesystem.
 func TestControlMkdirCreatesDirectories(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 
@@ -800,6 +979,7 @@ func TestControlMkdirCreatesDirectories(t *testing.T) {
 // removes it. The file on disk is untouched throughout — W4b-1 records; the
 // prompt and the unlink are W4b-2.
 func TestControlDeleteProposesWithoutUnlinking(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -844,6 +1024,7 @@ func TestControlDeleteProposesWithoutUnlinking(t *testing.T) {
 // nothing is recorded. The refusal is the strict one the write verbs give when
 // the set is empty.
 func TestControlDeleteNeedsAClaim(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -862,6 +1043,7 @@ func TestControlDeleteNeedsAClaim(t *testing.T) {
 // removes it. Nothing on disk is touched throughout — W4c-2 records; the
 // review tab and the actual removal are a later wave.
 func TestControlRmdirProposesWithoutRemoving(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 
@@ -914,6 +1096,7 @@ func TestControlRmdirProposesWithoutRemoving(t *testing.T) {
 // be rejected — a decision that keeps the text in the document and drops the
 // set from the agreed composition, unlike the clear gesture that purges it.
 func TestAgentEditsArriveAsProposals(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1001,6 +1184,7 @@ func groupByState(t *testing.T, h *harness, c *client, path, state string) contr
 // because the decision changes its standing, not whether its bytes are there.
 // This is the decided counterpart to the proposed-set case above.
 func TestControlGroupsCountsDecidedSets(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1016,7 +1200,8 @@ func TestControlGroupsCountsDecidedSets(t *testing.T) {
 		t.Fatalf("proposed hunks/moved = %d/%d, want 1/0", first.Hunks, first.Moved)
 	}
 
-	if r := c.do(h, control.Request{Op: "accept", Path: path, Group: first.ID}); !r.OK {
+	human := h.dialHuman(t)
+	if r := human.do(h, control.Request{Op: "accept", Path: path, Group: first.ID}); !r.OK {
 		t.Fatalf("accept = %+v", r)
 	}
 	if g := groupByState(t, h, c, path, "accepted"); g.ID != first.ID || g.Hunks != 1 || g.Moved != 0 {
@@ -1049,6 +1234,7 @@ func TestControlGroupsCountsDecidedSets(t *testing.T) {
 // comes back as old→new text with the span it covers now, and a clean buffer
 // answers with an empty list rather than an error.
 func TestControlDiffRendersPendingChanges(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1114,6 +1300,7 @@ func TestControlDiffRendersPendingChanges(t *testing.T) {
 // surface still shows what it wrote: dropping it to a bare count left a
 // reviewer with nothing to look at.
 func TestControlDiffKeepsMovedMemberAsWritten(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1154,6 +1341,7 @@ func TestControlDiffKeepsMovedMemberAsWritten(t *testing.T) {
 // The user's own typing is not a proposal. Marking it would make the person
 // approve their own keystrokes.
 func TestUserEditsAreNotProposals(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	h.press("x")
@@ -1169,6 +1357,7 @@ func TestUserEditsAreNotProposals(t *testing.T) {
 // Accepting leaves the text alone — it is already in the document — and only
 // clears the pending mark.
 func TestAcceptClearsTheMarkWithoutChangingText(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1183,7 +1372,8 @@ func TestAcceptClearsTheMarkWithoutChangingText(t *testing.T) {
 		}
 	}
 	before := h.text()
-	if r := c.do(h, control.Request{Op: "accept", Path: path, Group: id}); !r.OK {
+	human := h.dialHuman(t)
+	if r := human.do(h, control.Request{Op: "accept", Path: path, Group: id}); !r.OK {
 		t.Fatalf("accept = %+v", r)
 	}
 	if h.text() != before {
@@ -1201,6 +1391,7 @@ func TestAcceptClearsTheMarkWithoutChangingText(t *testing.T) {
 // harness root is a temp directory, so a bare file name can only mean the open
 // buffer if the host joins it to the root.
 func TestControlRelativePathsResolveAgainstTheRoot(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\nworld\n")
 	c := h.dial(t)
 
@@ -1230,6 +1421,7 @@ func TestControlRelativePathsResolveAgainstTheRoot(t *testing.T) {
 // unopened absolute path gets: the seam resolves the spelling, it does not
 // invent a buffer.
 func TestControlRelativePathWithNoBufferRefuses(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	r := c.do(h, control.Request{Op: "text", Path: "not-open.go"})
@@ -1240,6 +1432,7 @@ func TestControlRelativePathWithNoBufferRefuses(t *testing.T) {
 
 // The absolute spelling is unchanged by the seam.
 func TestControlAbsolutePathStillNamesTheBuffer(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	abs := h.Tabs.Active().File.Path
@@ -1252,6 +1445,7 @@ func TestControlAbsolutePathStillNamesTheBuffer(t *testing.T) {
 // itself; reopening by the relative name reuses the tab the harness already
 // opened rather than stacking a duplicate.
 func TestControlOpenAcceptsARelativePath(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	before := h.Tabs.Count()
@@ -1269,6 +1463,7 @@ func TestControlOpenAcceptsARelativePath(t *testing.T) {
 // means to make a new buffer; the tab then appears in the background, because a
 // socket open does not steal the user's active tab.
 func TestControlOpenRefusesAMissingPathWithoutCreate(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	original := h.Tabs.Active().File.Path
@@ -1306,6 +1501,7 @@ func TestControlOpenRefusesAMissingPathWithoutCreate(t *testing.T) {
 // to tell a create from a reuse, or a name it only meant to make looks like a
 // file that was there all along.
 func TestControlOpenReportsCreated(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1340,6 +1536,7 @@ func TestControlOpenReportsCreated(t *testing.T) {
 // it compares, so climbing out of a directory and back in is not a different
 // buffer.
 func TestControlPathThroughDotDotNamesTheSameBuffer(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	abs := h.Tabs.Active().File.Path
@@ -1356,6 +1553,7 @@ func TestControlPathThroughDotDotNamesTheSameBuffer(t *testing.T) {
 // insertion stayed indexed for good. The count then ran away from the text and
 // read -lines near EOF walked past the buffer.
 func TestControlLineIndexSurvivesApplyRejectCycles(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "one\ntwo\nthree\nfour\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1445,6 +1643,7 @@ func TestControlLineIndexSurvivesApplyRejectCycles(t *testing.T) {
 // group that owns the text, so the caller can tell a lease from a stale offset
 // and knows which decision has to come first.
 func TestControlLeaseRefusalCarriesTheGroup(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1546,6 +1745,7 @@ func proposeOver(t *testing.T, h *harness, path, identity, name string, start, e
 // canned memHost, so this pins the semantics rather than the plumbing. Modelled
 // on TestControlLeaseRefusalCarriesTheGroup (two identities over the real host).
 func TestControlApplyOverAProposalWarnsTheRealSet(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	path := h.Tabs.Active().File.Path
 
@@ -1582,6 +1782,7 @@ func TestControlApplyOverAProposalWarnsTheRealSet(t *testing.T) {
 // on TestControlApplyOverAProposalWarnsTheRealSet and on
 // TestControlLeaseRefusalCarriesTheGroup.
 func TestControlPatchOverAProposalWarnsTheRealSet(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	path := h.Tabs.Active().File.Path
 
@@ -1620,6 +1821,7 @@ func TestControlPatchOverAProposalWarnsTheRealSet(t *testing.T) {
 // on TestControlLeaseRefusalCarriesTheGroup (two identities over the real host)
 // and TestControlPatchOverAProposalWarnsTheRealSet (the real-host patch path).
 func TestControlPatchAllRefusedDoesNotReproposePriorSet(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	path := h.Tabs.Active().File.Path
 	sess := h.Pane().File.Session()
@@ -1669,6 +1871,7 @@ func TestControlPatchAllRefusedDoesNotReproposePriorSet(t *testing.T) {
 // TestRecvDeliversWhatWasSaidWhileAway (the box keeps for a durable identity)
 // and TestControlApplyOverAProposalWarnsTheRealSet (the real host apply path).
 func TestControlSupersededAuthorIsNotified(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	path := h.Tabs.Active().File.Path
 
@@ -1713,6 +1916,7 @@ func TestControlSupersededAuthorIsNotified(t *testing.T) {
 // TestControlSupersededAuthorIsNotified (the same mailbox delivery over the real
 // host).
 func TestControlSupersededNoticeShipsNoPath(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	path := h.Tabs.Active().File.Path
 
@@ -1771,6 +1975,7 @@ func findGroup(t *testing.T, groups []control.Group, id uint64) control.Group {
 // groups and in diff, with the other's author and span. The editor does not
 // arbitrate: nothing is clamped, merged or refused here.
 func TestControlGroupsReportLiveOverlaps(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1834,6 +2039,7 @@ func TestControlGroupsReportLiveOverlaps(t *testing.T) {
 // span overlaps it -- group, author and span -- so the caller can clear that
 // one first instead of guessing.
 func TestControlClearReportsTheBlockingOverlap(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -1882,6 +2088,7 @@ func TestControlClearReportsTheBlockingOverlap(t *testing.T) {
 // pending change sets and, unless the caller asked for the list only, enters
 // Review mode so the document is read-only while the sets are decided.
 func TestControlReviewEntersTheMode(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, reviewFixture)
 	c := h.dial(t)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
@@ -1913,6 +2120,7 @@ func TestControlReviewEntersTheMode(t *testing.T) {
 // the same tab as the listed sets. Without this, reviewing a background file
 // listed its sets while the caret jumped in the active tab.
 func TestControlReviewFocusesTheNamedBuffer(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, reviewFixture)
 	c := h.dial(t)
 	first := h.Tabs.Active().File.Path
@@ -1951,6 +2159,7 @@ func TestControlReviewFocusesTheNamedBuffer(t *testing.T) {
 // addressable, but no tab appears in front of the user. This is the spec's
 // loaded-versus-announced split at the socket.
 func TestHeadlessReadDoesNotAddATab(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -1980,6 +2189,7 @@ func TestHeadlessReadDoesNotAddATab(t *testing.T) {
 // version and lsp diagnostics reach a closed-but-readable path the same way:
 // loaded and served, no tab.
 func TestHeadlessVersionAndDiagnosticsDoNotAddTabs(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2011,6 +2221,7 @@ func TestHeadlessVersionAndDiagnosticsDoNotAddTabs(t *testing.T) {
 // A proposal must be visible: applying to a buffer that was only inspected
 // announces it as a tab before the change set lands.
 func TestHeadlessApplyAnnounces(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2047,6 +2258,7 @@ func TestHeadlessApplyAnnounces(t *testing.T) {
 // The buffers listing carries headless buffers, marked so a caller can tell
 // them from tabs.
 func TestBuffersReportsHeadless(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2081,6 +2293,7 @@ func TestBuffersReportsHeadless(t *testing.T) {
 // The registry is bounded; a clean headless buffer is dropped and re-read on
 // demand rather than accumulating for a whole inspection sweep.
 func TestHeadlessEvictionReloads(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "root\n")
 	hh := hostOf(h.App)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2116,6 +2329,7 @@ func TestHeadlessEvictionReloads(t *testing.T) {
 // mark the session for rewriting the way the UI closeTabAt does. Without this
 // a tab an agent closed over the socket reappears on the next editor start.
 func TestControlCloseTouchesTheSession(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	path := h.Tabs.Active().File.Path
 	h.sessionDirty = false
@@ -2136,6 +2350,7 @@ func TestControlCloseTouchesTheSession(t *testing.T) {
 // A close refused because the buffer is dirty is not a change to the session:
 // nothing moved, so marking it dirty would write a session that never changed.
 func TestControlRefusedCloseLeavesSessionUntouched(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	path := h.Tabs.Active().File.Path
 	h.typeText("x") // unsaved, so the close is refused
@@ -2153,6 +2368,7 @@ func TestControlRefusedCloseLeavesSessionUntouched(t *testing.T) {
 // records — so it must mark the session for rewriting like the editor's own
 // goto.
 func TestControlGotoTouchesTheSession(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "one\ntwo\nthree\n")
 	path := h.Tabs.Active().File.Path
 	h.sessionDirty = false
@@ -2171,6 +2387,7 @@ func TestControlGotoTouchesTheSession(t *testing.T) {
 // must be refused: the buffer is 11 bytes now, and a current-length check is
 // what let the out-of-range offset be rebased to EOF instead.
 func TestApplyValidatesAgainstTheBaseLength(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "")
 	c := h.dial(t)
 
@@ -2202,6 +2419,7 @@ func TestApplyValidatesAgainstTheBaseLength(t *testing.T) {
 // text and version, and the path it is keyed on follows. The tab is the same
 // object, so the session records the new name rather than a reopened one.
 func TestControlRenameCarriesACleanBuffer(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	p := h.Tabs.Active()
@@ -2237,6 +2455,7 @@ func TestControlRenameCarriesACleanBuffer(t *testing.T) {
 // A dirty buffer is refused: the rename would move the file out from under
 // unsaved text, and there is no force path. Nothing moves.
 func TestControlRenameRefusesADirtyBuffer(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	h.typeText("x")
@@ -2259,6 +2478,7 @@ func TestControlRenameRefusesADirtyBuffer(t *testing.T) {
 // A buffer holding a pending change set is refused the same way: the proposed
 // text exists only in the buffer, and renaming the file does not materialise it.
 func TestControlRenameRefusesPendingSets(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	read := c.do(h, control.Request{Op: "text"})
@@ -2291,6 +2511,7 @@ func TestControlRenameRefusesPendingSets(t *testing.T) {
 // is dirty: the work stays in the piece table and follows the name. Refusing it
 // forced a driver to close -discard and leave the old name behind.
 func TestControlRenameCarriesANotYetSavedBuffer(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2334,6 +2555,7 @@ func TestControlRenameCarriesANotYetSavedBuffer(t *testing.T) {
 // says so, so a driver that recreated the content under a new name does not
 // leave a duplicate behind silently.
 func TestControlCloseDiscardNotesTheFileThatRemains(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -2357,6 +2579,7 @@ func TestControlCloseDiscardNotesTheFileThatRemains(t *testing.T) {
 // A discarded buffer that never reached disk has nothing to report: there is no
 // file to leave behind.
 func TestControlCloseDiscardQuietWhenNothingRemains(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2377,6 +2600,7 @@ func TestControlCloseDiscardQuietWhenNothingRemains(t *testing.T) {
 // A file nobody has open is a plain filesystem move: no tab appears, and the
 // bytes are at the new name.
 func TestControlRenameMovesAnUnopenedFile(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2404,6 +2628,7 @@ func TestControlRenameMovesAnUnopenedFile(t *testing.T) {
 // The old name has to be in the caller's claim set, so an agent cannot move a
 // file it never declared.
 func TestControlRenameRefusesAnUnclaimedOld(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	old := h.Tabs.Active().File.Path
@@ -2423,6 +2648,7 @@ func TestControlRenameRefusesAnUnclaimedOld(t *testing.T) {
 // The assertion does not depend on the filesystem folding case: it only checks
 // that the two-hop move arrived where it was asked to and the pane followed.
 func TestControlRenameCaseOnly(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	c := h.dial(t)
 	p := h.Tabs.Active()
@@ -2448,6 +2674,7 @@ func TestControlRenameCaseOnly(t *testing.T) {
 // renumber the request: the caret lands file-true on the named session line,
 // while the viewport centres on the display row that draws it.
 func TestControlGotoIsFileTrueUnderAFold(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, strings.Repeat("xxxxxxxxxx\n", 40))
 	p := h.Pane()
 	hidden := propose(t, h, piecetable.Hunk{Start: 0, End: 0, Text: "X\nY\n"})
@@ -2492,25 +2719,14 @@ func sessionGroup(t *testing.T, s *piecetable.Session, id uint64) (piecetable.Gr
 	return piecetable.Group{}, false
 }
 
-// A save the editor would refuse because it drops a superseded set is surfaced
-// by the socket save too, in the one wording: the buffer keeps the text, the
-// file stays as it was, and the message names the set and both exits. Without
-// the refusal this save succeeds and writes a file the buffer does not
-// describe; without saveRefusal it reaches the caller as a bare err.Error()
-// with no gestures in it. Sibling: the ordinary pending refusal in
-// TestControlSaveRefusedWhileProposed.
-func TestControlSaveRefusesSupersededText(t *testing.T) {
-	h := controlHarness(t, "hello world\n")
-	c := h.dial(t)
-	path := h.Tabs.Active().File.Path
+// supersededFixture builds the one shape the invalid-set tests need: a Proposed
+// insertion a later user deletion consumes, with the deletion rejected so its
+// bytes come back to the edit view and the proposal is left Invalid. It returns
+// the buffer path and the invalid set's id.
+func supersededFixture(t *testing.T, h *harness) (string, uint64) {
+	t.Helper()
 	p := h.Pane()
 	sess := p.File.Session()
-
-	// A set whose insertion a later deletion consumes is invalid. The deletion
-	// is rejected, so the session no longer holds its bytes and the projection
-	// restores the proposed run to the edit view while AcceptedOnly drops it.
-	// The invalid set is the only thing holding the difference, and Pending has
-	// already dropped it.
 	base := sess.Version()
 	p.File.Begin()
 	p.File.ApplyDiff(piecetable.Agent, base, []piecetable.Hunk{{Start: 6, End: 11, Text: "socket"}})
@@ -2519,9 +2735,6 @@ func TestControlSaveRefusesSupersededText(t *testing.T) {
 	sess.MarkGroup(superseded, piecetable.Proposed)
 
 	p.File.Begin()
-	// The caret Delete path refuses an edit that intersects a Proposed run, so
-	// the collider has to land the way a real overwrite does: through the diff
-	// path, which treats a Proposed run as advisory.
 	p.File.ApplyDiff(piecetable.User, sess.Version(),
 		[]piecetable.Hunk{{Start: 0, End: 12, Text: ""}})
 	p.File.End()
@@ -2529,35 +2742,86 @@ func TestControlSaveRefusesSupersededText(t *testing.T) {
 	if !sess.RejectGroup(collider) {
 		t.Fatal("reject of the collider failed")
 	}
+	if g, ok := sessionGroup(t, sess, superseded); !ok || !g.Invalid {
+		t.Fatalf("fixture: set %d = %+v, want invalid", superseded, g)
+	}
+	return p.File.Path, superseded
+}
 
-	g, ok := sessionGroup(t, sess, superseded)
-	if !ok || !g.Invalid {
-		t.Fatalf("set %d = %+v, want invalid", superseded, g)
-	}
-	if len(sess.Pending()) != 0 {
-		t.Fatalf("Pending = %+v, want none; the refusal is for a set Pending drops", sess.Pending())
-	}
-	if edit, agreed := sess.Project(piecetable.AcceptedAndProposed).Text(),
-		sess.Project(piecetable.AcceptedOnly).Text(); edit == agreed {
-		t.Fatalf("setup did not separate the compositions: %q", edit)
-	}
+// A save the editor once refused because it dropped a superseded set now
+// disposes that set first, writes the agreed composition and reports the
+// count, so the drop is deliberate rather than silent.
+func TestControlSaveDisposesSupersededText(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello world\n")
+	c := h.dialHuman(t)
+	path, superseded := supersededFixture(t, h)
 
 	res := c.do(h, control.Request{Op: "save", Path: path})
-	if res.OK {
-		t.Fatal("save succeeded while the agreed composition would drop visible text")
+	if !res.OK {
+		t.Fatalf("save = %+v, want the invalid set disposed rather than refused", res)
 	}
-	if !strings.Contains(res.Err, fmt.Sprintf("change set(s) [%d]", superseded)) {
-		t.Errorf("refusal = %q, want it to name set %d", res.Err, superseded)
+	if got := h.Pane().File.Session().GroupState(superseded); got != piecetable.Rejected {
+		t.Errorf("state after save = %v, want Rejected", got)
 	}
-	if !strings.Contains(res.Err, "accept them to keep the text") ||
-		!strings.Contains(res.Err, "clear them to discard it") {
-		t.Errorf("refusal = %q, want both exits named", res.Err)
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "hello world\n" {
+		t.Errorf("file = %q err %v, want the agreed composition", data, err)
 	}
-	if data, err := os.ReadFile(path); err != nil || string(data) != "hello world\n" {
-		t.Errorf("file = %q err %v, want the refused save to have written nothing", data, err)
+	if !strings.Contains(h.Status(), "discarded 1 invalid change set") {
+		t.Errorf("status = %q, want the disposal count", h.Status())
 	}
-	if got := len(sess.Pending()); got != 0 {
-		t.Errorf("Pending after a refused save = %d, want none; the refusal changed no decision", got)
+}
+
+// buffers reports the invalid-set count, so one call tells a driver a buffer
+// holds sets a save will dispose even though it reports no pending set.
+func TestControlBuffersReportsSuperseded(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path, _ := supersededFixture(t, h)
+
+	res := c.do(h, control.Request{Op: "buffers"})
+	if !res.OK {
+		t.Fatalf("buffers = %+v", res)
+	}
+	var found *control.Buffer
+	for i := range res.Buffers {
+		if res.Buffers[i].Path == path {
+			found = &res.Buffers[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("buffers = %+v, want %s", res.Buffers, path)
+	}
+	if found.Superseded != 1 {
+		t.Errorf("buffer %s Superseded = %d, want 1", path, found.Superseded)
+	}
+	if found.Pending != 0 {
+		t.Errorf("buffer %s Pending = %d, want 0: an invalid set is not pending", path, found.Pending)
+	}
+}
+
+// proposals names an invalid set as its own kind, so the workspace rollup a
+// driver reads does not report a clean buffer while a save would discard text.
+func TestControlProposalsNamesInvalidSet(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello world\n")
+	c := h.dial(t)
+	path, superseded := supersededFixture(t, h)
+
+	res := c.do(h, control.Request{Op: "proposals"})
+	if !res.OK {
+		t.Fatalf("proposals = %+v", res)
+	}
+	var found bool
+	for _, p := range res.Proposals {
+		if p.Kind == "invalid" && p.Path == path && p.Group == superseded {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("proposals = %+v, want an invalid entry for set %d at %s", res.Proposals, superseded, path)
 	}
 }
 
@@ -2569,6 +2833,7 @@ func TestControlSaveRefusesSupersededText(t *testing.T) {
 // rejected set" -- which is the wedge. Sibling: TestControlClearReportsTheBlockingOverlap
 // for the rejected path.
 func TestControlClearDisposesASupersededSet(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -2618,6 +2883,7 @@ func TestControlClearDisposesASupersededSet(t *testing.T) {
 // path is reused and a new one gets a tab, but the active tab and focus stay
 // where the user left them: the tab is there to be found, not to interrupt.
 func TestControlOpenDoesNotStealFocus(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	aPath := h.Tabs.Active().File.Path
@@ -2659,6 +2925,7 @@ func TestControlOpenDoesNotStealFocus(t *testing.T) {
 // A new path opened by an agent gets a tab without becoming active and without
 // moving focus, even when the user is not in the editor.
 func TestControlOpenNewPathDoesNotStealFocus(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	aPath := h.Tabs.Active().File.Path
@@ -2687,6 +2954,7 @@ func TestControlOpenNewPathDoesNotStealFocus(t *testing.T) {
 // A proposal landing on a headless buffer still announces a tab, but quietly:
 // the user's active tab and focus do not move.
 func TestHeadlessApplyAnnouncesQuietly(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	aPath := h.Tabs.Active().File.Path
@@ -2728,6 +2996,7 @@ func TestHeadlessApplyAnnouncesQuietly(t *testing.T) {
 // goto is the deliberate exception: it is a request to look at a place, so it
 // still brings the buffer forward and focuses the editor.
 func TestControlGotoStillBringsTheBufferForward(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "root\n")
 	c := h.dial(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
@@ -2758,6 +3027,7 @@ func TestControlGotoStillBringsTheBufferForward(t *testing.T) {
 // ate a newline. This pins the line search finds to the line read returns, with
 // its newline, on a buffer whose proposed text is in the view but not on disk.
 func TestControlReadLinesAndSearchAgree(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "alpha\nbravo\ncharlie\ndelta\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -2816,6 +3086,7 @@ func TestControlReadLinesAndSearchAgree(t *testing.T) {
 // the encoding and path ride with it so the client can rebuild the buffer
 // byte-for-byte without another read.
 func TestControlSnapshotIsTheWholeDocument(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\nworld\n")
 	c := h.dial(t)
 	path := h.Tabs.Active().File.Path
@@ -2868,6 +3139,7 @@ func TestControlSnapshotIsTheWholeDocument(t *testing.T) {
 // and the wake comes from the app's idle tick rather than the edit itself, so
 // all of them see the same moment.
 func TestControlWatchWakesEveryWatcherOnAnEdit(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello\n")
 	// One tick settles the generation at the initial buffer, so the snapshot
 	// and the watch start from the same number rather than racing the first
@@ -2930,6 +3202,7 @@ func TestControlWatchWakesEveryWatcherOnAnEdit(t *testing.T) {
 // there is no human to ask, so it never prompts. Without the verb the request
 // is unknown.
 func TestControlReloadTakesDisk(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "original\n")
 	c := h.dial(t)
 
@@ -2964,8 +3237,9 @@ func TestControlReloadTakesDisk(t *testing.T) {
 // save -force answers the disk-changed prompt with Overwrite; the normal save
 // still refuses a stale stamp.
 func TestControlSaveForceOverwritesStaleDisk(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "original\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	h.typeText("mine ") // dirty so the save has bytes to write
 	rewriteOnDisk(t, h, "theirs\n")
 
@@ -2984,5 +3258,80 @@ func TestControlSaveForceOverwritesStaleDisk(t *testing.T) {
 	}
 	if h.Pane().DiskStale() {
 		t.Error("save -force left the stale mark")
+	}
+}
+
+// Reveal moves the daemon caret to the span start and, because a reveal is a
+// request to look, announces a headless buffer and loads a path that is not
+// open. Without the verb there is no way to surface a file over the socket.
+func TestControlRevealMovesCaretAndShows(t *testing.T) {
+	h := controlHarness(t, "one\ntwo\nthree\n")
+	c := h.dial(t)
+	path := h.Tabs.Active().File.Path
+
+	s, e := 4, 7 // the bytes of "two"
+	if r := c.do(h, control.Request{Op: "reveal", Path: path, Start: &s, End: &e}); !r.OK {
+		t.Fatalf("reveal = %+v", r)
+	}
+	if p := h.Pane(); p.File.Path != path {
+		t.Fatalf("revealed pane = %q, want %q", p.File.Path, path)
+	}
+	if got := h.Pane().Cursors.Primary().Head; got != s {
+		t.Errorf("caret = %d, want the span start %d", got, s)
+	}
+
+	// The whole file puts the caret at line 1 column 1.
+	if r := c.do(h, control.Request{Op: "reveal", Path: path}); !r.OK {
+		t.Fatalf("whole-file reveal = %+v", r)
+	}
+	if got := h.Pane().Cursors.Primary().Head; got != 0 {
+		t.Errorf("whole-file caret = %d, want 0", got)
+	}
+}
+
+// A headless buffer gets a tab, and a path that is not open is loaded: a
+// reveal that left either invisible would not be a reveal.
+func TestControlRevealAnnouncesHeadlessAndLoads(t *testing.T) {
+	h := controlHarness(t, "one\ntwo\n")
+	c := h.dial(t)
+	dir := filepath.Dir(h.Tabs.Active().File.Path)
+
+	// Loading a file for inspection puts it in the buffer registry with no tab;
+	// read does exactly that.
+	read := filepath.Join(dir, "read.go")
+	if err := os.WriteFile(read, []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.do(h, control.Request{Op: "text", Path: read}); !r.OK {
+		t.Fatalf("headless read = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != 1 {
+		t.Fatalf("tabs after a headless read = %d, want 1", got)
+	}
+
+	s, e := 6, 10
+	if r := c.do(h, control.Request{Op: "reveal", Path: read, Start: &s, End: &e}); !r.OK {
+		t.Fatalf("reveal headless = %+v", r)
+	}
+	if got := h.Tabs.Count(); got != 2 {
+		t.Fatalf("tabs after a reveal = %d, want the headless buffer announced", got)
+	}
+	if p := h.Pane(); p.File.Path != read {
+		t.Fatalf("focused pane = %q, want the revealed %q", p.File.Path, read)
+	}
+	if got := h.Pane().Cursors.Primary().Head; got != s {
+		t.Errorf("caret = %d, want %d", got, s)
+	}
+
+	// A path nobody has loaded is loaded by the reveal.
+	fresh := filepath.Join(dir, "fresh.go")
+	if err := os.WriteFile(fresh, []byte("x\ny\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := c.do(h, control.Request{Op: "reveal", Path: fresh}); !r.OK {
+		t.Fatalf("reveal unloaded = %+v", r)
+	}
+	if p := h.Pane(); p.File.Path != fresh || p.File.Text() != "x\ny\n" {
+		t.Fatalf("revealed unloaded pane = %q %q", p.File.Path, p.File.Text())
 	}
 }

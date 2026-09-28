@@ -13,6 +13,7 @@ import (
 // can only select a subset of it. Filtering locally gives the same answer as
 // asking again, and the flag is what makes that safe to assume.
 func TestCompleteListIsFilteredRatherThanRefetched(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -48,6 +49,7 @@ func TestCompleteListIsFilteredRatherThanRefetched(t *testing.T) {
 // would freeze the first answer's arbitrary cut, so a large package would show
 // a handful of results that never improve however much more is typed.
 func TestIncompleteListIsRefetched(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -74,6 +76,7 @@ func TestIncompleteListIsRefetched(t *testing.T) {
 // somewhere else is a different question, and answering it from the cache would
 // suggest completions computed against another scope entirely.
 func TestCachedListDoesNotFollowTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -104,6 +107,7 @@ func TestCachedListDoesNotFollowTheCursor(t *testing.T) {
 // Moving the cursor away drops the cached list along with the popup. Keeping it
 // would let the next word be answered from the previous word's list.
 func TestCachedListIsDroppedWhenThePopupCloses(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -132,6 +136,7 @@ func TestCachedListIsDroppedWhenThePopupCloses(t *testing.T) {
 // Completion appears on its own after MinPrefix characters. ctrl+space asks for
 // it deliberately, which is the only way to get it with a shorter prefix.
 func TestTriggerKeySummonsWithAShortPrefix(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -153,6 +158,7 @@ func TestTriggerKeySummonsWithAShortPrefix(t *testing.T) {
 // Pressing it again re-asks rather than redisplaying what is already up. "Ask
 // again" is the only thing a second press could reasonably mean.
 func TestTriggerKeyReasksWhenAlreadyOpen(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -174,6 +180,7 @@ func TestTriggerKeyReasksWhenAlreadyOpen(t *testing.T) {
 // The chord must not type a space. It is decoded as ctrl+space and would
 // otherwise fall through to the buffer as literal text.
 func TestTriggerKeyDoesNotType(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "word\n")
 	before := h.text()
 	h.press("ctrl+space")
@@ -185,6 +192,7 @@ func TestTriggerKeyDoesNotType(t *testing.T) {
 // Somewhere with no word and no candidates says so rather than doing nothing
 // visible. An explicit ask deserves an explicit answer.
 func TestTriggerKeyWithNothingToOfferSaysSo(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("ctrl+space")
 	if h.Complete.Open {
@@ -199,6 +207,7 @@ func TestTriggerKeyWithNothingToOfferSaysSo(t *testing.T) {
 // where it now lives: the popup must still not appear on its own after one
 // character.
 func TestPopupStillWaitsForTwoCharacters(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "handoff()\n\n")
 	h.press("ctrl+g")
 	h.typeText("2")
@@ -221,6 +230,7 @@ func TestPopupStillWaitsForTwoCharacters(t *testing.T) {
 // the code is worse than the status line it replaced, because it is bigger and
 // looks more authoritative.
 func TestHoverPanelClosesOnAnyAction(t *testing.T) {
+	t.Parallel()
 	for _, chord := range []string{"down", "right", "super+left", "backspace"} {
 		h := newHarness(t, "package main\n\nfunc F() {}\n")
 		h.lspGen = 1
@@ -240,6 +250,7 @@ func TestHoverPanelClosesOnAnyAction(t *testing.T) {
 // Typing closes it too: the text under the cursor has changed, so the answer
 // describes a version of the line that no longer exists.
 func TestHoverPanelClosesOnTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerHover, text: "func F()"})
@@ -257,6 +268,7 @@ func TestHoverPanelClosesOnTyping(t *testing.T) {
 // Escape closes the panel before anything else sees it, so the first escape
 // dismisses the box rather than a selection underneath it.
 func TestEscapeClosesTheHoverPanelFirst(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.press("shift+right") // make a selection to compete with
 	h.lspGen = 1
@@ -279,6 +291,7 @@ func TestEscapeClosesTheHoverPanelFirst(t *testing.T) {
 // it overflows, and the document underneath stays where it was. Escape still
 // dismisses it. Modelled on TestHoverPanelClosesOnAnyAction.
 func TestHoverPanelScrollsWithoutMovingTheCaret(t *testing.T) {
+	t.Parallel()
 	h := newHarnessSize(t, "package main\n\nfunc F() {}\n", 100, 24)
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerHover, text: strings.Repeat("doc line\n", 30)})

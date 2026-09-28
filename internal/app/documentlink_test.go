@@ -16,6 +16,7 @@ import (
 // that answers method-not-found and reports the transport error instead of the
 // missing feature.
 func TestDocumentLinkCapabilityGate(t *testing.T) {
+	t.Parallel()
 	if got := documentLinkGap(lsp.ServerCapabilities{}); got != "language server does not support document links" {
 		t.Errorf("absent provider: gap = %q", got)
 	}
@@ -42,6 +43,7 @@ func linkAnswer(h *harness, line, col int, links ...lsp.DocumentLink) lspAnswer 
 // uses. The link range is what says the caret is on it; without following it
 // the user gets a status line and no file.
 func TestFollowLinkOpensAFileTarget(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "see other.go here\n")
 	other := filepath.Join(h.primaryRoot(), "other.go")
 	if err := os.WriteFile(other, []byte("package other\n"), 0o644); err != nil {
@@ -62,6 +64,7 @@ func TestFollowLinkOpensAFileTarget(t *testing.T) {
 // silently doing nothing would leave the user unable to tell a missing link
 // from an unopenable one. The status names the scheme.
 func TestFollowLinkRefusesANonFileTarget(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "see https://example.com here\n")
 	before := h.Tabs.Active().File.Path
 	h.lspGen = 1
@@ -81,6 +84,7 @@ func TestFollowLinkRefusesANonFileTarget(t *testing.T) {
 // A link the server left unresolved is refused by name: the target is missing,
 // not the file, and saying which is what keeps the message actionable.
 func TestFollowLinkRefusesAnUnresolvedLink(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "see other.go here\n")
 	before := h.Tabs.Active().File.Path
 	h.lspGen = 1
@@ -101,6 +105,7 @@ func TestFollowLinkRefusesAnUnresolvedLink(t *testing.T) {
 // into text that is gone, so following it would open a path the user never
 // pointed at. Without the version check the stale answer is followed anyway.
 func TestFollowLinkDropsAStaleAnswer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "see other.go here\n")
 	before := h.Tabs.Active().File.Path
 	h.lspGen = 1
@@ -122,6 +127,7 @@ func TestFollowLinkDropsAStaleAnswer(t *testing.T) {
 // A caret that is not on any link says so, rather than following the nearest
 // one or opening nothing silently.
 func TestFollowLinkWithNoLinkAtTheCaret(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "see other.go here\n")
 	h.lspGen = 1
 	h.park(linkAnswer(h, 0, 0)) // no links

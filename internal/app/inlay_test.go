@@ -25,6 +25,7 @@ func ihl(line, off int, text string) editor.LineHint {
 // An answer round-trips with the version it describes, which is what lets the
 // apply path drop an answer for text the buffer has left.
 func TestInlaySetAndForPath(t *testing.T) {
+	t.Parallel()
 	s := newInlayStore()
 	s.set("/w/a.go", 7, []editor.LineHint{ih(1, "x")})
 
@@ -43,6 +44,7 @@ func TestInlaySetAndForPath(t *testing.T) {
 // A second answer for the same path replaces the first: each answer is the
 // complete set for one version, not an increment.
 func TestInlaySetReplaces(t *testing.T) {
+	t.Parallel()
 	s := newInlayStore()
 	s.set("/w/a.go", 1, []editor.LineHint{ih(1, "old")})
 	s.set("/w/a.go", 2, []editor.LineHint{ih(9, "new")})
@@ -58,6 +60,7 @@ func TestInlaySetReplaces(t *testing.T) {
 
 // Files are independent: an answer for one must not disturb another.
 func TestInlayPathsAreIndependent(t *testing.T) {
+	t.Parallel()
 	s := newInlayStore()
 	s.set("/w/a.go", 1, []editor.LineHint{ih(0, "a")})
 	s.set("/w/b.go", 2, []editor.LineHint{ih(0, "b")})
@@ -74,6 +77,7 @@ func TestInlayPathsAreIndependent(t *testing.T) {
 
 // An unknown path has no answer, which is distinct from an answer of none.
 func TestInlayForPathUnknown(t *testing.T) {
+	t.Parallel()
 	s := newInlayStore()
 	if _, _, ok := s.forPath("/w/never.go"); ok {
 		t.Error("an untouched path reported an answer")
@@ -84,6 +88,7 @@ func TestInlayForPathUnknown(t *testing.T) {
 // describes, so a later answer for the same version can replace it. A nil slice
 // reads back as no hints.
 func TestInlayEmptyAnswerIsStored(t *testing.T) {
+	t.Parallel()
 	s := newInlayStore()
 	s.set("/w/a.go", 3, nil)
 
@@ -103,6 +108,7 @@ func TestInlayEmptyAnswerIsStored(t *testing.T) {
 // constructor for — still answers, records and clears without panicking, so the
 // nil-map guard in set is exercised rather than assumed.
 func TestInlayHandBuiltStore(t *testing.T) {
+	t.Parallel()
 	s := &inlayStore{}
 	if _, _, ok := s.forPath("/w/a.go"); ok {
 		t.Error("a hand-built store claimed an answer it never saw")
@@ -120,6 +126,7 @@ func TestInlayHandBuiltStore(t *testing.T) {
 // The line is carried with the hint. A Hint's Off is line-relative, so a store
 // that kept only []editor.Hint would lose which line each belongs on.
 func TestInlayStoreKeepsLine(t *testing.T) {
+	t.Parallel()
 	s := newInlayStore()
 	s.set("/w/a.go", 1, []editor.LineHint{ihl(7, 3, "x")})
 
@@ -164,6 +171,7 @@ func (h *harness) installInlay(hints ...lsp.InlayHint) {
 // The guard: the idle tick asks again only when the path, version or range has
 // moved. Without it every tick would put a request on the wire forever.
 func TestHintsWantedGuard(t *testing.T) {
+	t.Parallel()
 	a := &App{}
 	if !a.hintsWanted("/w/a.go", 1, 0, 40) {
 		t.Fatal("a fresh app did not want hints")
@@ -187,6 +195,7 @@ func TestHintsWantedGuard(t *testing.T) {
 // a request that actually happened, so the hints still appear once a lazily
 // started server becomes ready rather than being suppressed for the session.
 func TestMaybeRequestHintsWithoutAServerRecordsNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	// A file type with no configured server: for_ answers without spawning, so
 	// this test cannot start a real gopls even where one is installed.
@@ -205,6 +214,7 @@ func TestMaybeRequestHintsWithoutAServerRecordsNothing(t *testing.T) {
 // The toggle is authoritative: hints already on screen go before the next
 // frame, and no request is made while the feature is off.
 func TestInlayHintsOffClearsAndRequestsNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "x"})
 	if h.Pane().File.Hints == nil {
@@ -236,6 +246,7 @@ func TestInlayHintsOffClearsAndRequestsNothing(t *testing.T) {
 // the offset relative to that line, and each text edit converted to absolute
 // byte offsets exactly as completion edits are.
 func TestApplyInlayInstallsHints(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.installInlay(lsp.InlayHint{
 		Pos:          lsp.Position{Line: 1, Character: 1},
@@ -277,6 +288,7 @@ func TestApplyInlayInstallsHints(t *testing.T) {
 // A superseded answer is dropped rather than installed, even when its version
 // happens to match.
 func TestStaleInlayGenerationIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.inlayGen = 5
 	h.park(lspAnswer{
@@ -297,6 +309,7 @@ func TestStaleInlayGenerationIsDropped(t *testing.T) {
 // An answer for a document version the buffer has left is dropped: a stale
 // hint's offsets have moved, so it would shift every display column after it.
 func TestInlayAnswerForAMovedVersionIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.inlayGen++
 	h.park(lspAnswer{
@@ -314,6 +327,7 @@ func TestInlayAnswerForAMovedVersionIsDropped(t *testing.T) {
 // An answer that arrives after the user switched tabs belongs to the pane that
 // asked, not to whatever is active now.
 func TestInlayAnswerForAnotherPaneIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.inlayGen++
 	h.park(lspAnswer{
@@ -331,6 +345,7 @@ func TestInlayAnswerForAnotherPaneIsDropped(t *testing.T) {
 // An answer arriving while the feature is off is refused, whatever the
 // generation and version say.
 func TestApplyInlayRefusesWhenHintsAreOff(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		alter func(*harness)
@@ -353,6 +368,7 @@ func TestApplyInlayRefusesWhenHintsAreOff(t *testing.T) {
 // An edit clears the hints before the next frame, so a stale hint cannot be
 // drawn even once. The generation moves too, discarding any answer in flight.
 func TestEditClearsHintsAndBumpsGeneration(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1}, Text: "x"})
 	if h.Pane().File.Hints == nil {
@@ -372,6 +388,7 @@ func TestEditClearsHintsAndBumpsGeneration(t *testing.T) {
 // Undo is an edit like any other: the version moves, and the clearing at draw
 // time catches it without the undo path knowing hints exist.
 func TestUndoClearsHintsAtTheNextDraw(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.typeText("z") // one undoable op
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1}, Text: "x"})
@@ -388,6 +405,7 @@ func TestUndoClearsHintsAtTheNextDraw(t *testing.T) {
 // A mutation that never passes through the key handler — an accept, a control
 // write, an applied hint edit — is caught by the version check at draw time.
 func TestHintsClearAtTheNextDrawAfterAnyEdit(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1}, Text: "x"})
 	if h.Pane().File.Hints == nil {
@@ -406,6 +424,7 @@ func TestHintsClearAtTheNextDrawAfterAnyEdit(t *testing.T) {
 // turning them back on leaves the guard clear so the next idle tick asks
 // again. The application default is untouched.
 func TestToggleInlayHintsClearsAndReRequests(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	// A file type with no configured server: the request path is exercised
 	// without spawning a real gopls, and the pane guard stays observable.
@@ -462,6 +481,7 @@ func TestToggleInlayHintsClearsAndReRequests(t *testing.T) {
 // column is display-aware: the hint pushes the byte after it to a later column,
 // and moving down onto an un-hinted line lands on the byte that column names.
 func TestSelectionDownOntoAHintUsesDisplayColumns(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abcdef\nabcdef\n")
 	h.Draw()
 	// The plain vertical move is the one under test; the wrap fallback has its
@@ -490,6 +510,7 @@ func TestSelectionDownOntoAHintUsesDisplayColumns(t *testing.T) {
 // Find works in document bytes, so a match after a hint lands on the byte it
 // names rather than one shifted by the hint's display columns.
 func TestFindAfterAHintLandsOnTheByte(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abcdef\n")
 	h.Draw()
 	h.installInlay(lsp.InlayHint{
@@ -511,6 +532,7 @@ func TestFindAfterAHintLandsOnTheByte(t *testing.T) {
 // fold above the window the two spaces differ, so the bounds must come through
 // the pane map; the old code compared the display top to File.Lines directly.
 func TestHintLinesMapDisplayWindowToSession(t *testing.T) {
+	t.Parallel()
 	h, _ := foldedMarkHarness(t)
 	p := h.Pane()
 	// Display rows: 0 aaa, 1 fold, 2 bbb, 3 ccc, 4 ddd, 5 the trailing empty
@@ -531,6 +553,7 @@ func TestHintLinesMapDisplayWindowToSession(t *testing.T) {
 // same session lines the old code did, and hintRange covers the line at the
 // top through the one past the bottom.
 func TestHintLinesIdentityWithoutFolds(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, foldedFixture)
 	p := h.Pane()
 	p.Viewport.Top, p.Viewport.Rows = 3, 1
@@ -546,6 +569,7 @@ func TestHintLinesIdentityWithoutFolds(t *testing.T) {
 // hintRange turns the session bounds into byte positions: top maps to that
 // line's start, bottom to its start as the exclusive end.
 func TestHintRangeUsesSessionBounds(t *testing.T) {
+	t.Parallel()
 	h, _ := foldedMarkHarness(t)
 	p := h.Pane()
 	// Session lines 4 (ccc) and 5 (ddd) after the folded insertion.
@@ -568,6 +592,7 @@ func TestHintRangeUsesSessionBounds(t *testing.T) {
 // not to the start of the last line: bottom stays exclusive and the hidden
 // lines between do not make it overshoot.
 func TestHintLinesReachesFileEnd(t *testing.T) {
+	t.Parallel()
 	h, _ := foldedMarkHarness(t)
 	p := h.Pane()
 	p.Viewport.Top, p.Viewport.Rows = 0, 50
@@ -590,6 +615,7 @@ func TestHintLinesReachesFileEnd(t *testing.T) {
 // one undo reverses the whole batch. The offsets are the absolute bytes the
 // install resolved, and no LSP conversion happens at apply time.
 func TestApplyInlayEditLandsAsOneUndoStep(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.installInlay(lsp.InlayHint{
 		Pos:  lsp.Position{Line: 1, Character: 0},
@@ -620,6 +646,7 @@ func TestApplyInlayEditLandsAsOneUndoStep(t *testing.T) {
 // rather than landed at shifted positions. Without the version pin the old
 // [2,3) span would replace whatever byte now sits there.
 func TestApplyInlayEditRefusesStaleOffsets(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abcdef\n")
 	h.installInlay(lsp.InlayHint{
 		Pos:  lsp.Position{Line: 0, Character: 2},
@@ -648,6 +675,7 @@ func TestApplyInlayEditRefusesStaleOffsets(t *testing.T) {
 // with no hint says that instead. Both are the "the chord did something" half
 // of gating the apply on the hint actually carrying edits.
 func TestApplyInlayEditRefusalsSpeak(t *testing.T) {
+	t.Parallel()
 	t.Run("no edits", func(t *testing.T) {
 		h := newHarness(t, "abc\ndef\n")
 		h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 1}, Text: "int"})
@@ -684,6 +712,7 @@ func TestApplyInlayEditRefusalsSpeak(t *testing.T) {
 
 // Review mode is read-only for the document, and a hint's edits are an edit.
 func TestApplyInlayEditRefusedInReviewMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	h.installInlay(lsp.InlayHint{
 		Pos:  lsp.Position{Line: 1, Character: 0},
@@ -744,6 +773,7 @@ func rest(h *harness) {
 // Before the motion path the bare move was decoded and discarded, so a hint's
 // tooltip was unreachable: no caret can enter a hint's cells.
 func TestHintTooltipShowsAfterDwell(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	notesPane(h)
 	h.installInlay(lsp.InlayHint{
@@ -771,6 +801,7 @@ func TestHintTooltipShowsAfterDwell(t *testing.T) {
 // absence; the negative half would catch a hit test built on the anchor clamp
 // instead of the column-map span.
 func TestHintTooltipOnlyOnTheHintCells(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	notesPane(h)
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
@@ -792,6 +823,7 @@ func TestHintTooltipOnlyOnTheHintCells(t *testing.T) {
 // Leaving the hint closes its tooltip; the pointer that has stopped being on
 // the hint is the only thing that dismisses it.
 func TestHintTooltipHidesWhenThePointerLeaves(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	notesPane(h)
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})
@@ -813,6 +845,7 @@ func TestHintTooltipHidesWhenThePointerLeaves(t *testing.T) {
 // A hint with no tooltip shows no box: the label is already inline, and an
 // empty box is worse than none.
 func TestHintWithoutATooltipShowsNoBox(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	notesPane(h)
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int"})
@@ -829,6 +862,7 @@ func TestHintWithoutATooltipShowsNoBox(t *testing.T) {
 // must not dismiss a box it did not open. Crossing a hint without resting — the
 // common gesture — leaves the document hover exactly as it was.
 func TestHintLeaveDoesNotHideADocumentHover(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	notesPane(h)
 	h.lspGen++
@@ -853,6 +887,7 @@ func TestHintLeaveDoesNotHideADocumentHover(t *testing.T) {
 // the pointer leaving the hint must not close the replacement. The state's
 // text-and-anchor match is what tells the two boxes apart.
 func TestHintLeaveLeavesAReplacedPanelAlone(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "abc\ndef\n")
 	notesPane(h)
 	h.installInlay(lsp.InlayHint{Pos: lsp.Position{Line: 1, Character: 0}, Text: "int", Tooltip: "the type"})

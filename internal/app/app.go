@@ -282,6 +282,11 @@ type App struct {
 	// tick expires it. The ordinary profile ignores both.
 	statusShown string
 	statusAt    time.Time
+	// activity is the agent-working indicator's snapshot, rebuilt on the idle
+	// tick and read by the status segment, the phone review bar and the save
+	// confirm, so those surfaces cannot disagree.
+	activity activitySnapshot
+
 	// drawerOpen is the phone action drawer's expanded state. drawerHandle and
 	// drawerPanel are where the last frame drew its touch targets, so the
 	// pointer resolves a tap against what was painted rather than against a
@@ -370,6 +375,13 @@ type App struct {
 	// Ids are explicit, so a restored op's author resolves to the identity,
 	// name and kind it was written under rather than a fresh join order.
 	restoredAuthors []control.Participant
+	// authorTap is the workspace author-table log, separate from the per-buffer
+	// logs. A participant that only joins has no buffer to carry its row, so
+	// its row is appended here when it is new or its name changes, and read
+	// back into restoredAuthors at the next start. Opened lazily; nil until a
+	// restore or a join opens it. Every write is on the event thread, like the
+	// buffer taps.
+	authorTap *logTap
 
 	// tabWidth is the indent width the tab set was built with, kept so a log
 	// restore can build a File with the same geometry as one read from disk.
@@ -402,13 +414,14 @@ type App struct {
 	// clientStop is closed by CloseClient to tell the watch goroutine that the
 	// transport error it is about to see is an orderly shutdown, not news.
 	clientStop chan struct{}
-	// clientTabMu guards clientMirrored, the set of paths the client shows as
-	// tabs. The value is true for a path mirrored from a daemon real tab and
-	// false for one the client loaded itself; that distinction lets a reconcile
-	// drop a mirrored tab the daemon closed while it keeps a client-loaded
-	// headless buffer.
-	clientTabMu    sync.Mutex
-	clientMirrored map[string]bool
+	// clientTabMu guards clientOwned, the set of paths the client shows as
+	// tabs. It is the client view's membership and is persisted: a path enters
+	// when the client opens it, or when a daemon real tab with unsaved work is
+	// mirrored, and it leaves only when the user closes the tab there. The
+	// mirror itself is re-derived from the daemon's dirty or pending tabs on
+	// attach and on every watch, so it is never saved.
+	clientTabMu sync.Mutex
+	clientOwned map[string]bool
 	// clientClosed records the daemon facts for a path the user closed on this
 	// client. It is a snooze, not a mute: the path is skipped while the daemon
 	// buffer still matches the mark, and re-added once the version or review
@@ -433,6 +446,12 @@ type App struct {
 	clientMu    sync.Mutex
 	clientFiles []clientFile
 	clientLost  string
+	// clientRemovals carries pending delete/rmdir proposals the watch
+	// goroutine found in the daemon rollup. Like clientFiles it is a handoff
+	// to the event thread, which owns pendingDeletions, pendingDirRemovals
+	// and the arrival queue; adoptPending runs off-thread, so it queues here
+	// and drainClient mirrors each into the maps.
+	clientRemovals []control.Proposal
 	// clientEdits tracks, per owned client path, the daemon version and text a
 	// pane's local copy was synced from, plus the dirty/running state of a
 	// local edit being forwarded. Guarded by clientMu: the event thread updates
@@ -1743,6 +1762,7 @@ func (a *App) Handle(e ui.Event) {
 		a.drainDiagnostics()
 		a.drainServerMessages()
 		a.drainControl()
+		a.drainJoins()
 		a.drainClient()
 	case ui.Tick:
 		// A drag held outside the pane scrolls from here, because the pointer
@@ -1788,6 +1808,10 @@ func (a *App) Handle(e ui.Event) {
 		// Clients parked on watch are woken here, once per change, rather
 		// than at every mutation site.
 		a.controlTick()
+		// Rebuild the agent-working snapshot on the same idle tick: no second
+		// timer, and the indicator can never lag the control generation.
+		a.refreshActivity()
+
 		// Local edits an attached client typed are forwarded on the idle tick
 		// too, so a mutator that does not pass through handleEditor still
 		// reaches the daemon.
@@ -2613,7 +2637,12 @@ func (a *App) closeTabAt(i int) {
 	// A client tab is the daemon document, not unsaved local work: closing it
 	// just closes the view, so it never prompts and never saves. The watch is
 	// told the path was closed locally so a reconcile does not re-add it.
-	if a.attach || !p.File.ViewDirty() {
+	// A refused save keeps the pane protected even when the view matches
+	// disk: the accepted composition a save would write is not the bytes on
+	// screen, so a clean view is not permission to drop the work the refusal
+	// named. SaveRefused clears when a write lands, so an ordinary saved buffer
+	// still closes without a prompt.
+	if a.attach || (!p.File.ViewDirty() && !p.SaveRefused()) {
 		a.rememberPosition(p)
 		a.closeDoc(p)
 		a.Tabs.CloseIndex(i)
@@ -2669,28 +2698,46 @@ func (a *App) saveActive(then func(saved bool)) {
 // because the buffer being completed need not be the one on screen: the user
 // may have switched tabs while the server worked, and a change set that arrived
 // in the meantime is re-routed through the same review.
+//
+// A save approves whatever is pending, so when another writer's proposed sets
+// are in the buffer it warns first. Every human save path warns, the desktop
+// attach included. Save anyway is the default and the confirm never blocks the
+// save, because a check that can refuse its own fix is a deadlock; the user's
+// own pending work is not warned about.
 func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 	if p == nil {
 		report(then, false)
 		return
 	}
-	// An attached client does not own the bytes: save acts on the daemon, and a
-	// refusal (pending proposals, disk conflict) is the status rather than a
-	// local write the next wake would overwrite.
+	// save_confirm reads before the gate: it is the stored escape hatch, off
+	// means no prompt, and it is a plain settings read, so a degraded UI cannot
+	// hide the switch and make the tree unsaveable. The warning is on every
+	// human save path, the desktop attach included — the daemon refuses that
+	// save as a status, but the warning still belongs on the gesture that
+	// approves the work — and reviewSave fails open if the screen cannot draw
+	// it.
+	if a.settings.SaveConfirm {
+		if pending := p.File.Session().Pending(); len(pending) > 0 {
+			if other := a.otherAuthorPending(pending); len(other) > 0 {
+				a.reviewSave(p, pending, other, then)
+				return
+			}
+		}
+	}
+	a.saveNow(p, then)
+}
+
+// saveNow is the write side of savePane, reached once any pending-set confirm
+// has been answered. An attached client does not own the bytes, so its save
+// acts on the daemon; a named buffer writes in place and an unnamed one asks
+// where to go first.
+func (a *App) saveNow(p *editor.Pane, then func(saved bool)) {
 	if a.attach {
 		// A local edit still inside the forward debounce would otherwise be
 		// saved after it, so flush the pending forward first; the save then
 		// sees the daemon text this client just placed.
 		a.flushClientEdit(p)
 		a.saveRemote(p, then)
-		return
-	}
-	// Proposed change sets get reviewed before they get saved: the gesture
-	// opens a listing to step through rather than accepting sight-unseen.
-	// Accept-all-and-save stays one chord, so the review is a glance, not a
-	// gate.
-	if pending := p.File.Session().Pending(); len(pending) > 0 {
-		a.reviewSave(p, pending, then)
 		return
 	}
 	if p.File.Path == "" {
@@ -2883,6 +2930,7 @@ func (a *App) reload(p *editor.Pane, then func(saved bool)) error {
 		return err
 	}
 	p.ClearDiskStale()
+	p.ClearSaveRefused()
 	a.status = "reloaded " + name + " from disk"
 	report(then, false)
 	return nil
@@ -2977,6 +3025,15 @@ func (a *App) finishWrite(p *editor.Pane, path string, force, renamed bool, was 
 	if timing.On {
 		saveStart = time.Now()
 	}
+	// A save disposes the invalid sets it would otherwise drop, before the
+	// write, and counts them into the status line, so the drop is deliberate
+	// rather than silent. An invalid set has no surviving hunk, so Pending
+	// never offered it to review; this is the one gesture that reaches it.
+	discarded := a.disposeInvalid(p)
+	if discarded > 0 {
+		a.flushJournal(p)
+	}
+	p.File.SaveCheck = a.settings.SaveCheck
 	save := p.File.Save
 	if force {
 		save = p.File.SaveOver
@@ -2993,9 +3050,21 @@ func (a *App) finishWrite(p *editor.Pane, path string, force, renamed bool, was 
 			a.conflict(p, path, func(saved bool) { runThens(thens, saved) })
 			return
 		}
+		// A composition the guard refused is the editor's own refusal, not a
+		// disk conflict; surface its reason verbatim and put the name back so a
+		// retry after the fix is an ordinary save.
+		var check *editor.SaveCheckError
+		if errors.As(err, &check) {
+			p.MarkSaveRefused()
+			p.File.SetPath(was)
+			a.status = err.Error()
+			runThens(thens, false)
+			return
+		}
 		// Put the name back. Leaving it set means the buffer claims a path it
 		// is not at, so the next plain save writes there without asking —
 		// which turns one visible failure into a silent one.
+		p.MarkSaveRefused()
 		p.File.SetPath(was)
 		a.status = "save failed: " + err.Error()
 		runThens(thens, false)
@@ -3005,7 +3074,13 @@ func (a *App) finishWrite(p *editor.Pane, path string, force, renamed bool, was 
 		tSaved = time.Now()
 	}
 	a.status = "saved " + p.File.Name()
+	if discarded > 0 {
+		a.status += fmt.Sprintf(" (discarded %d invalid change set(s))", discarded)
+	}
 	p.ClearDiskStale()
+	// A refusal does not survive a write that lands: from here the bytes a
+	// save would produce are the bytes on disk.
+	p.ClearSaveRefused()
 	// Every connected driver hears that the file reached disk, so a harness can
 	// react without polling. Best-effort: a delivery failure is not a save
 	// failure, and with no control listener this is nothing.

@@ -506,7 +506,7 @@ func TestJournalRoundTrip(t *testing.T) {
 }
 
 // TestJournalMigrationFromV1 covers the forward step: a database written at v1
-// gains the journal table and moves to v2, and the rows written before the
+// gains the journal table and moves to v3, and the rows written before the
 // migration survive it.
 func TestJournalMigrationFromV1(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
@@ -557,5 +557,43 @@ func TestJournalMigrationFromV1(t *testing.T) {
 		Digest:   sum[:],
 	}); err != nil {
 		t.Fatalf("PutJournal after migration: %v", err)
+	}
+}
+
+// TestIntentionMembersRoundTripAndLegacy is the store half of qualified
+// membership: the current {path, id} shape round-trips, and a legacy row that
+// stored a bare id array still loads, with the id and an empty path.
+func TestIntentionMembersRoundTripAndLegacy(t *testing.T) {
+	s := mustOpen(t, filepath.Join(t.TempDir(), "state.db"))
+
+	row := IntentionRow{
+		Name: "i", Owner: "o", Base: "HEAD", Task: "t",
+		Members: []IntentionMember{{ID: 1, Path: "a.go"}, {ID: 1, Path: "b.go"}},
+		State:   "open", BaseSHA: "sha", Created: 7,
+	}
+	if err := s.PutIntention(row); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.Intention("i")
+	if err != nil || !ok {
+		t.Fatalf("Intention = %+v, %v, %v", got, ok, err)
+	}
+	if len(got.Members) != 2 || got.Members[0] != (IntentionMember{ID: 1, Path: "a.go"}) ||
+		got.Members[1] != (IntentionMember{ID: 1, Path: "b.go"}) {
+		t.Fatalf("members = %+v, want the two qualified entries kept apart", got.Members)
+	}
+
+	// A legacy row wrote the bare ids as a JSON array. It stays loadable: each
+	// id reads as a member with no path, which the host resolves by id.
+	if _, err := s.db.Exec(upsertIntention, "legacy", "", "HEAD", "", "[4,5]", "open", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	old, ok, err := s.Intention("legacy")
+	if err != nil || !ok {
+		t.Fatalf("legacy Intention = %+v, %v, %v", old, ok, err)
+	}
+	if len(old.Members) != 2 || old.Members[0].ID != 4 || old.Members[1].ID != 5 ||
+		old.Members[0].Path != "" || old.Members[1].Path != "" {
+		t.Fatalf("legacy members = %+v, want the bare ids with empty paths", old.Members)
 	}
 }

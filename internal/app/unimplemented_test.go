@@ -20,14 +20,18 @@ import (
 // The signal is the "unhandled:" status the editor already sets, which exists
 // for exactly this reason: an action reaching the pane with nobody to take it.
 func TestUnimplementedActionsReallyAreUnimplemented(t *testing.T) {
+	t.Parallel()
 	for action, why := range keys.Unimplemented {
-		h := newHarness(t, "package main\n")
-		h.handleKeyAction(action)
-		if !strings.HasPrefix(h.Status(), "unhandled:") {
-			t.Errorf("%s is listed as unimplemented (%q) but something handled it; "+
-				"drop it from keys.Unimplemented and regenerate docs/KEYBINDINGS.md",
-				action, why)
-		}
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, "package main\n")
+			h.handleKeyAction(action)
+			if !strings.HasPrefix(h.Status(), "unhandled:") {
+				t.Errorf("%s is listed as unimplemented (%q) but something handled it; "+
+					"drop it from keys.Unimplemented and regenerate docs/KEYBINDINGS.md",
+					action, why)
+			}
+		})
 	}
 }
 
@@ -38,6 +42,7 @@ func TestUnimplementedActionsReallyAreUnimplemented(t *testing.T) {
 // Actions that end the session or reach outside the process are skipped by
 // name, since pressing them in a test would take the test with them.
 func TestEveryBoundActionIsHandled(t *testing.T) {
+	t.Parallel()
 	skip := map[keys.Action]bool{
 		keys.Quit:    true, // ends the session
 		keys.Suspend: true, // stops the process
@@ -46,11 +51,14 @@ func TestEveryBoundActionIsHandled(t *testing.T) {
 		if skip[action] || keys.Unimplemented[action] != "" {
 			continue
 		}
-		h := newHarness(t, "package main\nfunc F() {}\n")
-		h.handleKeyAction(action)
-		if strings.HasPrefix(h.Status(), "unhandled:") {
-			t.Errorf("%s is bound but nothing handles it; either implement it or "+
-				"add it to keys.Unimplemented and regenerate docs/KEYBINDINGS.md", action)
-		}
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, "package main\nfunc F() {}\n")
+			h.handleKeyAction(action)
+			if strings.HasPrefix(h.Status(), "unhandled:") {
+				t.Errorf("%s is bound but nothing handles it; either implement it or "+
+					"add it to keys.Unimplemented and regenerate docs/KEYBINDINGS.md", action)
+			}
+		})
 	}
 }

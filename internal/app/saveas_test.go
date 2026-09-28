@@ -49,6 +49,7 @@ func answer(h *harness, want string) {
 // os.WriteFile error — "no such file or directory" against a path just typed in
 // full, which reads as the save being rejected rather than as a missing folder.
 func TestSaveAsOffersToCreateAMissingDirectory(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	saveAsPrompt(t, h)
 	setPromptText(h, filepath.Join(h.Explorer.Tree.Root, "new", "deep", "notes.md"))
@@ -64,6 +65,7 @@ func TestSaveAsOffersToCreateAMissingDirectory(t *testing.T) {
 
 // Answering Create makes the directory and completes the save.
 func TestCreatingTheDirectorySaves(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	saveAsPrompt(t, h)
@@ -85,6 +87,7 @@ func TestCreatingTheDirectorySaves(t *testing.T) {
 // puts something on disk the user did not name, so a typo must not leave a
 // stray tree behind.
 func TestDecliningLeavesNoDirectory(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	saveAsPrompt(t, h)
@@ -100,6 +103,7 @@ func TestDecliningLeavesNoDirectory(t *testing.T) {
 // An existing directory is not asked about: the question is only worth asking
 // when the answer changes something.
 func TestExistingDirectoryIsNotQueried(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	saveAsPrompt(t, h)
@@ -118,6 +122,7 @@ func TestExistingDirectoryIsNotQueried(t *testing.T) {
 // next plain save writes there without asking — turning one visible failure
 // into a silent one.
 func TestFailedSaveRestoresThePath(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	// Saving onto a directory fails for anyone, including root — which
@@ -148,6 +153,7 @@ func TestFailedSaveRestoresThePath(t *testing.T) {
 // as a no-op, and the buffer stayed dirty until closing the tab threw the work
 // away. A normal save now reaches the same prompt.
 func TestSaveNamedOffersToCreateAMissingDirectory(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	// The file never existed, so there is no disk stamp to conflict with: the
 	// only thing missing is the directory a plain save would write into.
@@ -177,6 +183,7 @@ func TestSaveNamedOffersToCreateAMissingDirectory(t *testing.T) {
 // leaves nothing behind — the same contract ensureParent gives save-as, now on
 // the path a caller about to close a tab depends on.
 func TestSaveNamedDecliningReportsNotSaved(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "gone", "notes.md")
 	h.OpenFile(path)
@@ -208,6 +215,7 @@ func TestSaveNamedDecliningReportsNotSaved(t *testing.T) {
 // Tab in a path field completes, which is what made save-as feel like a text
 // box rather than a file dialog.
 func TestTabCompletesAUniqueName(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	saveAsPrompt(t, h)
@@ -222,6 +230,7 @@ func TestTabCompletesAUniqueName(t *testing.T) {
 // Ambiguity completes as far as the names agree and then stops, so repeated
 // tabs converge rather than cycling through candidates.
 func TestTabCompletesToTheCommonPrefix(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	for _, n := range []string{"report-a.md", "report-b.md"} {
@@ -246,6 +255,7 @@ func TestTabCompletesToTheCommonPrefix(t *testing.T) {
 // A completed directory gets a separator, so tab walks down a tree one press
 // per level rather than needing a slash typed between each.
 func TestTabAppendsASeparatorForDirectories(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	saveAsPrompt(t, h)
@@ -259,6 +269,7 @@ func TestTabAppendsASeparatorForDirectories(t *testing.T) {
 
 // Nothing to complete does nothing, rather than clearing the field or beeping.
 func TestTabWithNoMatchesLeavesTheFieldAlone(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	saveAsPrompt(t, h)
@@ -274,6 +285,7 @@ func TestTabWithNoMatchesLeavesTheFieldAlone(t *testing.T) {
 // Hidden files are completed only when asked for, the same rule the tree and
 // the search walk use.
 func TestTabSkipsHiddenFilesUnlessAsked(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	if err := os.WriteFile(filepath.Join(root, ".secret"), []byte("x"), 0o644); err != nil {
@@ -289,6 +301,7 @@ func TestTabSkipsHiddenFilesUnlessAsked(t *testing.T) {
 
 // Tab must not complete in a question whose answer is not a path.
 func TestTabDoesNotCompleteInAPlainQuestion(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.ask("Rename", "REA", func(string, bool) {})
 	h.drain()

@@ -14,6 +14,7 @@ import (
 // searched.
 
 func TestCopyInTheSearchBoxTakesTheQuery(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "document contents here")
 	h.press("shift+super+f")
 	h.typeText("needle")
@@ -26,6 +27,7 @@ func TestCopyInTheSearchBoxTakesTheQuery(t *testing.T) {
 }
 
 func TestCutInTheSearchBoxLeavesTheDocumentAlone(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "document contents here")
 	before := h.text()
 	h.press("shift+super+f")
@@ -44,6 +46,7 @@ func TestCutInTheSearchBoxLeavesTheDocumentAlone(t *testing.T) {
 // A field has no "current line" to fall back on, so cut with nothing selected
 // must do nothing rather than empty the box.
 func TestCutWithNoSelectionInAFieldIsInert(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "body")
 	h.press("shift+super+f")
 	h.typeText("keepme")
@@ -60,6 +63,7 @@ func TestCutWithNoSelectionInAFieldIsInert(t *testing.T) {
 // The find bar lives inside the editor pane, so focus alone does not
 // distinguish it — it is the case most likely to be missed.
 func TestCopyInTheFindBarTakesTheQuery(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha beta gamma")
 	h.press("super+f")
 	h.typeText("beta")
@@ -73,6 +77,7 @@ func TestCopyInTheFindBarTakesTheQuery(t *testing.T) {
 
 // The save-as dialog is modal and sits above whatever had focus.
 func TestCopyInADialogTakesTheField(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	h.press("super+n")
 	h.typeText("scratch")
@@ -90,6 +95,7 @@ func TestCopyInADialogTakesTheField(t *testing.T) {
 
 // With focus in the document, cut and copy must still act on the document.
 func TestCopyInTheEditorStillTakesTheDocument(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha beta")
 	h.press("super+a")
 	h.press("super+c")
@@ -102,6 +108,7 @@ func TestCopyInTheEditorStillTakesTheDocument(t *testing.T) {
 // The explorer has no text field, so it must fall through to the document
 // rather than silently doing nothing.
 func TestCopyInTheExplorerFallsThroughToTheDocument(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha beta")
 	h.press("super+a") // select all in the editor first
 	h.press("shift+super+e")
@@ -116,6 +123,7 @@ func TestCopyInTheExplorerFallsThroughToTheDocument(t *testing.T) {
 // the system text the terminal re-delivers; the app must not reuse the source
 // buffer's piece records against the destination's store.
 func TestPasteAcrossBuffers(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))

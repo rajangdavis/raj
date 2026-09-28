@@ -28,6 +28,7 @@ func rewriteOnDisk(t *testing.T, h *harness, content string) {
 // A dirty buffer gets Overwrite first, because reloading would throw away work
 // that exists nowhere else and a dialog should not default to that.
 func TestConflictOnADirtyBufferDefaultsToOverwrite(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	h.typeText("mine ")
 	rewriteOnDisk(t, h, "theirs\n")
@@ -52,6 +53,7 @@ func TestConflictOnADirtyBufferDefaultsToOverwrite(t *testing.T) {
 
 // A clean buffer has nothing to lose, so reloading is offered first.
 func TestConflictOnACleanBufferDefaultsToReload(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	rewriteOnDisk(t, h, "theirs\n")
 	h.press("super+s")
@@ -82,6 +84,7 @@ func TestConflictOnACleanBufferDefaultsToReload(t *testing.T) {
 // Reloading over unsaved work asks again. It is the one answer that destroys
 // the only copy of something.
 func TestReloadOverADirtyBufferAsksTwice(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		second   []string
@@ -117,6 +120,7 @@ func TestReloadOverADirtyBufferAsksTwice(t *testing.T) {
 // Cancelling leaves everything alone: the buffer keeps its edits and the file
 // keeps whatever the other writer put there.
 func TestConflictCancelWritesNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	h.typeText("mine ")
 	rewriteOnDisk(t, h, "theirs\n")
@@ -141,6 +145,7 @@ func TestConflictCancelWritesNothing(t *testing.T) {
 // cmd+shift+r takes the disk version deliberately, instead of the only route being to
 // attempt a save you did not want.
 func TestReloadBindingOnACleanBuffer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	rewriteOnDisk(t, h, "theirs\n")
 	h.press("shift+super+r")
@@ -154,6 +159,7 @@ func TestReloadBindingOnACleanBuffer(t *testing.T) {
 }
 
 func TestReloadBindingOnADirtyBufferAsks(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		answer   []string
@@ -183,6 +189,7 @@ func TestReloadBindingOnADirtyBufferAsks(t *testing.T) {
 // Reload never writes: an unnamed buffer has nothing to reload from and must
 // not be turned into an error the user has to dismiss.
 func TestReloadBindingOnAnUnnamedBuffer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	h.press("super+n")
 	h.typeText("scratch")
@@ -200,6 +207,7 @@ func TestReloadBindingOnAnUnnamedBuffer(t *testing.T) {
 // buffer keeps the mark so the save prompt stops being a surprise, and its
 // unsaved text is not thrown away.
 func TestIdleTickMarksDirtyDiskChangedTab(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	h.typeText("mine ") // dirty: the tick must not discard it
 	rewriteOnDisk(t, h, "theirs\n")
@@ -223,6 +231,7 @@ func TestIdleTickMarksDirtyDiskChangedTab(t *testing.T) {
 // A clean buffer has nothing to lose, so the idle tick takes the disk version
 // instead of marking a conflict the user would have to resolve.
 func TestIdleTickReloadsCleanDiskChangedTab(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	rewriteOnDisk(t, h, "theirs\n")
 
@@ -244,6 +253,7 @@ func TestIdleTickReloadsCleanDiskChangedTab(t *testing.T) {
 
 // Saving the buffer clears the mark: the bytes now match what the tab shows.
 func TestSaveClearsDiskChangedMark(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "original\n")
 	h.typeText("mine ")
 	rewriteOnDisk(t, h, "theirs\n")

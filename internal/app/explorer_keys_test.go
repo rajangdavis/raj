@@ -9,6 +9,7 @@ import (
 // Without the rework Tab cycled the explorer's focus stops and reached the
 // editor without opening anything.
 func TestTabInExplorerOpensFileAndFocusesEditor(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -26,6 +27,7 @@ func TestTabInExplorerOpensFileAndFocusesEditor(t *testing.T) {
 // Tab on a file that is already an open tab focuses that tab instead of
 // opening a duplicate.
 func TestTabOnAnOpenFileFocusesItWithoutDuplicate(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "README.md"))
@@ -51,6 +53,7 @@ func TestTabOnAnOpenFileFocusesItWithoutDuplicate(t *testing.T) {
 
 // Tab on a directory opens it in place and keeps focus in the explorer.
 func TestTabOnADirectoryOpensIt(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()

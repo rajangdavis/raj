@@ -55,6 +55,10 @@ type Group struct {
 	ID     uint64
 	Author Author
 	State  GroupState
+	// Task is the work the set belongs to, recorded when the group was
+	// opened. It is empty for the local human and for a connection that
+	// registered no task, which is the default.
+	Task string
 	// Ops is how many live edits it still contains. A group whose members have
 	// all been reversed reads as zero.
 	Ops int
@@ -95,6 +99,24 @@ func (s *Session) MarkGroup(id uint64, st GroupState) {
 	}
 	s.groupState[id] = st
 }
+
+// SetGroupTask records the task a change set was opened under, so a manifest
+// derives its rows from the set's own task rather than a caller naming one.
+// Sparse: the empty task is not stored, and a set it is never called for reads
+// empty, which is the local human and every no-task connection. The map lives
+// with the session, so the task survives as long as the journal does.
+func (s *Session) SetGroupTask(id uint64, task string) {
+	if task == "" {
+		return
+	}
+	if s.groupTask == nil {
+		s.groupTask = map[uint64]string{}
+	}
+	s.groupTask[id] = task
+}
+
+// GroupTask returns the task a change set was opened under, empty when none.
+func (s *Session) GroupTask(id uint64) string { return s.groupTask[id] }
 
 // hasGroup reports whether any op in the journal belongs to id. RejectGroup
 // addresses a real change set: marking an id nothing wrote would record a
@@ -266,7 +288,7 @@ func (s *Session) addMember(byID map[uint64]*Group, o Op) {
 	g, ok := byID[o.Group]
 	if !ok {
 		g = &Group{ID: o.Group, Author: o.Author, State: s.GroupState(o.Group),
-			First: o.Seq, Last: o.Seq}
+			Task: s.GroupTask(o.Group), First: o.Seq, Last: o.Seq}
 		byID[o.Group] = g
 	}
 	if o.Seq < g.First {
@@ -316,17 +338,11 @@ func (s *Session) Pending() []Group {
 // agreed to: what remains Proposed then is an Invalid set, whose members a
 // later edit has moved past.
 //
-// Invalid alone is not enough to refuse a save, and the classification is per
-// set. A wholly consumed insertion is absent from the edit view as well, so
-// there is nothing on screen to lose; but a collider that is itself excluded --
-// a rejected edit that deleted the run -- restores the superseded bytes to
-// AcceptedAndProposed while AcceptedOnly still omits them. Asking each set
-// whether any of its inserted bytes is present in AcceptedAndProposed tells the
-// two apart: the restored run points back into the inserted store range of the
-// superseded member, so visible names exactly the sets a save would drop. A
-// whole-document comparison cannot, because a memberless set can still differ
-// between the two compositions by its *deletion* coming back in AcceptedOnly,
-// which adds text rather than dropping it.
+// Project consults Invalid, so an invalid set is excluded from
+// AcceptedAndProposed as well as from AcceptedOnly, and none of its inserted
+// bytes is in the edit composition: there is nothing on screen for a save to
+// drop, so this returns empty. visible is the ownership test that says so
+// rather than assuming it.
 func (s *Session) UnsavedProposed() []Group {
 	d := s.Project(AcceptedAndProposed)
 	var out []Group
@@ -340,18 +356,14 @@ func (s *Session) UnsavedProposed() []Group {
 
 // InvalidWithoutMembers lists the still-Proposed Invalid sets a save can retire
 // without changing a byte of either composition: every live member is a pure
-// insertion whose bytes are already gone. It is the bookkeeping half of the
-// Invalid sets, the complement of UnsavedProposed: a set whose inserted bytes
-// are still in AcceptedAndProposed would be dropped by a save and is refused;
-// a set with no such byte and nothing removed contributes nothing to either
-// view, and retiring it (a state-only reject) changes no text.
+// insertion whose bytes are already gone, so no insertion of the set is in
+// either composition and no removal of its own has to be put back. Retiring
+// such a set (a state-only reject) changes no text.
 //
-// visible answers the inserted-bytes question from the AcceptedAndProposed
-// composition with the same store-range ownership projectMember uses, so a
-// rejected collider restored run counts and the two listings cannot overlap.
-// deletes excludes a member that removed text: an Invalid set has no surviving
-// inserted run, so un-applying such a member to retire the record would restore
-// the bytes it removed and change the view -- an edit, not bookkeeping.
+// Project excludes an Invalid set from both compositions, so no inserted byte
+// of an invalid set is ever visible and visible is false for every set here;
+// deletes still screens out a set that removed text, because retiring such a
+// set is left to the disposal path rather than the save's bookkeeping.
 func (s *Session) InvalidWithoutMembers() []Group {
 	d := s.Project(AcceptedAndProposed)
 	var out []Group
@@ -364,10 +376,9 @@ func (s *Session) InvalidWithoutMembers() []Group {
 }
 
 // deletes reports whether any live member of the set removed text. It is the
-// deletion-side companion of visible: an Invalid set has no surviving inserted
-// run, so the removals of its members are the only thing excluding it would put
-// back, and putting them back is a real edit rather than the state-only
-// disposal retirement is.
+// deletion-side companion of visible: a set that removed bytes is left to the
+// disposal path rather than retired as save bookkeeping, which keeps the save's
+// text-neutral retirement narrowly scoped.
 func (s *Session) deletes(g Group) bool {
 	for _, o := range s.journal {
 		if o.Group == g.ID && o.Kind == KindEdit && s.live(o.Seq) && o.DelLen() > 0 {
@@ -381,10 +392,10 @@ func (s *Session) deletes(g Group) bool {
 // composition d. It is the composition-side form of the ownership test that
 // projectMember makes against the buffer the session holds: a piece that points
 // into a store range the set inserted -- or a compacted origin of one --
-// belongs to the set, wherever the projection placed it. Reading the
-// composition rather than the session buffer is what lets a restored run from a
-// rejected collider count: its bytes are gone from the view and only excluding
-// the collider puts them back.
+// belongs to the set, wherever the projection placed it. Project excludes an
+// Invalid set from AcceptedAndProposed, so an invalid set contributes no piece
+// and this is false for it; the test is the ownership check itself rather than
+// an assumption about what the projection did.
 func (s *Session) visible(d DerivedProject, g Group) bool {
 	for _, o := range s.journal {
 		if o.Group != g.ID || o.Kind != KindEdit || !s.live(o.Seq) {

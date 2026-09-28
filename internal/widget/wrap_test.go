@@ -1,6 +1,7 @@
 package widget
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -8,7 +9,7 @@ import (
 // Wrap must keep every byte of a long unbroken token: an absolute path has no
 // space to break at, and losing its middle is the truncation bug in miniature.
 func TestWrapKeepsWholeUnbrokenWord(t *testing.T) {
-	long := "/Users/rajandavis/Desktop/projects/raj/internal/app/deletion.go"
+	long := filepath.Join(t.TempDir(), "internal", "app", "deletion.go")
 	for _, w := range []int{8, 16, 24, 33, 49} {
 		lines := Wrap(long, w)
 		if got := strings.Join(lines, ""); got != long {

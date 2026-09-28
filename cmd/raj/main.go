@@ -13,6 +13,7 @@
 //	                          control listener, for use as $EDITOR
 //	raj --no-restore          start fresh instead of where you left off
 //	raj ctl <cmd>             read and edit a running raj's buffers
+//	raj hook <cmd>            author, list, run and remove host hooks (authoring is local only)
 //	raj --attach              attach to a running raj and render its workspace locally
 //	raj --phone               attach as a client with the phone profile
 //	raj --attach --workspace NAME
@@ -49,6 +50,9 @@ import (
 	"raj/internal/app"
 	"raj/internal/control"
 	"raj/internal/daemon"
+	// The git capability leaves register themselves at init; this import is
+	// what makes hooks.Parse resolve git.status/git.diff/... in this binary.
+	_ "raj/internal/hooks/builtin/gitleaves"
 	"raj/internal/keys"
 	"raj/internal/probe"
 	"raj/internal/termconf"
@@ -110,6 +114,17 @@ func main() {
 	// handled before flag.Parse because its flags are its own.
 	if len(os.Args) > 1 && os.Args[1] == "ctl" {
 		os.Exit(control.CLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	// `raj hook ...` authors, lists and removes the workspace's host hooks. It
+	// is its own program like ctl: it talks to a running editor and never opens
+	// a terminal. Handled before flag.Parse because its flags are its own.
+	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		os.Exit(control.HookCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	// `raj chat` is a line-oriented chat with the agents on a running editor,
+	// over the same mailboxes send and recv use. Its own program, like hook.
+	if len(os.Args) > 1 && os.Args[1] == "chat" {
+		os.Exit(control.ChatCLI(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
 	// `raj daemon ...` manages the background host. `daemon run` is the
 	// foreground worker itself, so it is stripped and the invocation continues

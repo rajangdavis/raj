@@ -1537,9 +1537,16 @@ func stubHandshakeGopls(t *testing.T) {
 // the server running for each path. A bounded poll is the only way to observe
 // the asynchronous start; the deadline fails the test rather than hanging it if
 // the stub never answers.
+//
+// The deadline is generous on purpose. Each handshake spawns a shell stub, and
+// under `make check`'s -race pass on a busy host two of them took longer than
+// the old 5 s often enough that TestServersArePerRootForRunningAndLive failed
+// three runs in a row (2026-09-26) while passing on a quiet machine. Now that
+// agents gate their own work on check, a timing flake reads as their bug; only a
+// real hang should fail here, and the failure prints the table so it says why.
 func waitLiveServers(t *testing.T, h *harness, paths ...string) []*langServer {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		out := make([]*langServer, len(paths))
 		ready := true
@@ -1553,9 +1560,25 @@ func waitLiveServers(t *testing.T, h *harness, paths ...string) []*langServer {
 			return out
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("language server handshake did not complete: %v", out)
+			var table []string
+			for _, ls := range h.servers.byID {
+				table = append(table, ls.srv.Dir)
+			}
+			t.Fatalf("language server handshake did not complete in 30s: live=%v registered=%v", out, table)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// shortShutdown makes each live server's Close wait only a moment for a
+// shutdown reply. The stub answers initialize but not shutdown, so the polite
+// two-second grace would be paid in full on every teardown; the grace is
+// injectable for exactly this, and production keeps the default.
+func shortShutdown(live []*langServer) {
+	for _, ls := range live {
+		if c := ls.srv.Conn(); c != nil {
+			c.ShutdownGrace = 10 * time.Millisecond
+		}
 	}
 }
 
@@ -1595,6 +1618,7 @@ func TestServersArePerRootForRunningAndLive(t *testing.T) {
 	h.servers.for_(pathB, func() {})
 
 	live := waitLiveServers(t, h, pathA, pathB)
+	shortShutdown(live)
 	lsA, lsB := live[0], live[1]
 	if lsA == lsB {
 		t.Fatal("one server was reused for two roots")
@@ -1628,6 +1652,7 @@ func TestStopAllStopsEveryRoot(t *testing.T) {
 	h.servers.for_(pathB, func() {})
 
 	live := waitLiveServers(t, h, pathA, pathB)
+	shortShutdown(live)
 	h.servers.stopAll()
 
 	if n := len(h.servers.byID); n != 0 {

@@ -29,6 +29,7 @@ func cursorCol(h *harness) int {
 }
 
 func TestGotoLineJumps(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(200))
 	h.press("ctrl+g")
 	if !h.Prompt.Open {
@@ -49,6 +50,7 @@ func TestGotoLineJumps(t *testing.T) {
 // The field is seeded with where the cursor already is, so the dialog says
 // where you are as well as asking where to go.
 func TestGotoLineSeedsTheCurrentLine(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(50))
 	h.press("ctrl+g")
 	h.typeText("30")
@@ -63,6 +65,7 @@ func TestGotoLineSeedsTheCurrentLine(t *testing.T) {
 // The seed is a default, not a prefix. Typing replaces it, because nobody
 // presses ctrl+g on line 1 and types 30 meaning line 130.
 func TestGotoLineSeedIsReplacedByTyping(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(200))
 	h.press("ctrl+g")
 	h.typeText("30")
@@ -78,6 +81,7 @@ func TestGotoLineSeedIsReplacedByTyping(t *testing.T) {
 // A pasted "12:4" replaces the seed the same way typing does, so a position
 // copied out of a compiler needs no editing.
 func TestGotoLinePasteReplacesTheSeed(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(200))
 	h.press("ctrl+g")
 	h.Handle(ui.Paste{Text: "12:4\n"})
@@ -97,6 +101,7 @@ func TestGotoLinePasteReplacesTheSeed(t *testing.T) {
 // Enter with nothing typed accepts the suggestion rather than clearing it, so
 // selecting the seed does not turn ctrl+g+enter into an error.
 func TestGotoLineAcceptsTheSeedUntouched(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(80))
 	h.press("ctrl+g")
 	h.typeText("40")
@@ -114,6 +119,7 @@ func TestGotoLineAcceptsTheSeedUntouched(t *testing.T) {
 
 // A compiler prints line:column, and pasting one in should not need editing.
 func TestGotoLineAcceptsLineColon(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(40))
 	h.press("ctrl+g")
 	h.typeText("12:4")
@@ -129,6 +135,7 @@ func TestGotoLineAcceptsLineColon(t *testing.T) {
 
 // Past the end means the end. Refusing would be pedantry.
 func TestGotoLineClampsPastTheEnd(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(20))
 	lines := h.Pane().File.Lines()
 	h.press("ctrl+g")
@@ -144,6 +151,7 @@ func TestGotoLineClampsPastTheEnd(t *testing.T) {
 }
 
 func TestGotoLineRejectsNonsense(t *testing.T) {
+	t.Parallel()
 	for _, in := range []string{"abc", "-3", "1.5", "12x"} {
 		h := newHarness(t, doc(30))
 		h.press("ctrl+g")
@@ -162,6 +170,7 @@ func TestGotoLineRejectsNonsense(t *testing.T) {
 // A bare ":col" is a column on the line already showing, which is what the
 // seeded field makes the natural thing to type.
 func TestGotoColumnOnTheCurrentLine(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(40))
 	h.press("ctrl+g")
 	h.typeText("15")
@@ -180,6 +189,7 @@ func TestGotoColumnOnTheCurrentLine(t *testing.T) {
 }
 
 func TestGotoLineCancelLeavesTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, doc(60))
 	h.press("ctrl+g")
 	h.typeText("45")
@@ -194,6 +204,7 @@ func TestGotoLineCancelLeavesTheCursor(t *testing.T) {
 }
 
 func TestParsePosition(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		in        string
 		line, col int

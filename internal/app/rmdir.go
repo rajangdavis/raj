@@ -43,6 +43,22 @@ func dirRemovalPaths(dir string) []string {
 	return paths
 }
 
+// pendingDirRemovalFor finds the pending dir-removal for a path. The exact key
+// is the common case -- ProposeDirRemoval and the control verb key on the same
+// canonical name -- and the sameFile scan absorbs a symlink spelling that
+// slipped through one of them, exactly as pendingDeletionFor does.
+func (a *App) pendingDirRemovalFor(path string) (control.DirRemoval, bool) {
+	if d, ok := a.pendingDirRemovals[path]; ok {
+		return d, true
+	}
+	for key, d := range a.pendingDirRemovals {
+		if sameFile(key, path) {
+			return d, true
+		}
+	}
+	return control.DirRemoval{}, false
+}
+
 // underDir reports whether path names something inside dir. filepath.Rel gives
 // the answer directly: "." or a child spelling is inside, ".." or a path that
 // starts with it is outside.
@@ -121,8 +137,18 @@ func (a *App) promptDirRemoval(d control.DirRemoval) {
 		case !ok, answer == ignoreForNow:
 			return
 		case answer == removeForever:
+			if a.attach {
+				// A viewer does not own the subtree: the daemon carries out the
+				// removal it was asked to approve.
+				a.approveDirRemovalRemote(d)
+				return
+			}
 			a.removeDirDeleted(d)
 		case answer == withdrawRemoval:
+			if a.attach {
+				a.withdrawDirRemovalRemote(d)
+				return
+			}
 			a.withdrawDirRemoval(d)
 		}
 	}

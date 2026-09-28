@@ -35,6 +35,7 @@ func (h *harness) installSemantic(tokens ...lsp.SemanticToken) {
 // The store keeps the overlay with the version it describes, which is what lets
 // the install and invalidate paths drop an answer for text the buffer has left.
 func TestSemanticStoreRoundTrips(t *testing.T) {
+	t.Parallel()
 	s := newSemanticStore()
 	set := editor.NewSemanticSet(map[int][]syntax.Span{1: {{Start: 2, End: 4}}})
 	s.set("/w/a.go", 7, set)
@@ -55,6 +56,7 @@ func TestSemanticStoreRoundTrips(t *testing.T) {
 // text it describes, so "no tokens" is distinct from "never asked", and the
 // overlay that was there must come off.
 func TestSemanticStoreKeepsEmptyAnswer(t *testing.T) {
+	t.Parallel()
 	s := newSemanticStore()
 	s.set("/w/a.go", 3, nil)
 	got, version, ok := s.forPath("/w/a.go")
@@ -67,6 +69,7 @@ func TestSemanticStoreKeepsEmptyAnswer(t *testing.T) {
 // the decoded tokens never reach a pane and the file keeps only its chroma
 // colour — the feature would decode perfectly and paint nothing.
 func TestSemanticOverlayInstalls(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	h.installSemantic(stok(0, 6, 5, "function"))
 	if h.Pane().File.Semantic == nil {
@@ -89,6 +92,7 @@ func TestSemanticOverlayInstalls(t *testing.T) {
 // decodes to the empty type), paints nothing: the byte keeps whatever chroma
 // gave it. Guessing a colour would be indistinguishable from a correct one.
 func TestSemanticOverlaySkipsUnknownType(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	h.installSemantic(stok(0, 0, 5, ""), stok(0, 6, 5, "not-a-real-token-type"))
 	if h.Pane().File.Semantic != nil {
@@ -102,6 +106,7 @@ func TestSemanticOverlaySkipsUnknownType(t *testing.T) {
 // onto moved bytes: a stale span is not merely the wrong colour, it is the
 // wrong colour in the wrong place.
 func TestStaleSemanticAnswerIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	h.semanticGen++
 	h.park(lspAnswer{
@@ -121,6 +126,7 @@ func TestStaleSemanticAnswerIsDropped(t *testing.T) {
 // it before it can paint a token at the wrong offset. This is the version-memo
 // drop: without it the stale colours would survive until the next server answer.
 func TestSemanticOverlayDroppedWhenTextMoves(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	h.Draw()
 	h.installSemantic(stok(0, 6, 5, "function"))
@@ -137,6 +143,7 @@ func TestSemanticOverlayDroppedWhenTextMoves(t *testing.T) {
 // The guard keeps the idle tick from asking the server the same question every
 // 150 ms: only a moved path or version makes a new request worth making.
 func TestSemanticWantedGuard(t *testing.T) {
+	t.Parallel()
 	a := &App{}
 	if !a.semanticWanted("/w/a.go", 1) {
 		t.Fatal("a fresh app did not want tokens")
@@ -157,6 +164,7 @@ func TestSemanticWantedGuard(t *testing.T) {
 // rune starts at the right byte. Without this every non-ASCII file would have
 // its semantic colours shifted by the number of multi-byte runes before them.
 func TestSemanticSpansUsesUTF16AndSkipsUnknown(t *testing.T) {
+	t.Parallel()
 	doc := lsp.NewDocument("héllo wörld\n")
 	spans := semanticSpans(doc, []lsp.SemanticToken{
 		stok(0, 6, 5, "function"),
@@ -176,6 +184,7 @@ func TestSemanticSpansUsesUTF16AndSkipsUnknown(t *testing.T) {
 // and a present-and-false provider means no. Without this read the feature would
 // ask a method the server answers method-not-found.
 func TestSemanticCapabilityGate(t *testing.T) {
+	t.Parallel()
 	const want = "language server does not support semantic tokens"
 	if got := semanticGap(lsp.ServerCapabilities{}); got != want {
 		t.Errorf("absent provider: %q", got)
@@ -198,6 +207,7 @@ func TestSemanticCapabilityGate(t *testing.T) {
 // from the draw path, so it is not claimed and a server does not send a shape
 // this client would discard.
 func TestClientCapabilitiesAdvertiseSemanticTokens(t *testing.T) {
+	t.Parallel()
 	caps := clientCapabilities()
 	td, _ := caps["textDocument"].(map[string]any)
 	if td == nil {
@@ -234,6 +244,7 @@ func TestClientCapabilitiesAdvertiseSemanticTokens(t *testing.T) {
 // nothing to apply edits to and would have to fall back to a full request every
 // time, which is the behavior the base exists to avoid.
 func TestSemanticStoreBaseRoundTrips(t *testing.T) {
+	t.Parallel()
 	s := newSemanticStore()
 	s.note("/w/a.go", "r1", []uint32{0, 0, 1, 0, 0})
 	id, data, ok := s.base("/w/a.go")
@@ -259,6 +270,7 @@ func TestSemanticStoreBaseRoundTrips(t *testing.T) {
 // the next idle tick re-requests. Leaving it set would re-request every tick;
 // never setting it would ignore the server saying its results are stale.
 func TestSemanticRefreshMarker(t *testing.T) {
+	t.Parallel()
 	ls := &langServer{}
 	if ls.takeSemanticRefresh() {
 		t.Fatal("an unmarked server reported a refresh")
@@ -280,6 +292,7 @@ func TestSemanticRefreshMarker(t *testing.T) {
 // has left is dropped before it can paint, because a stale span is not merely
 // the wrong colour, it is the wrong range.
 func TestStaleSemanticRangeAnswerIsDropped(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	h.semanticGen++
 	h.park(lspAnswer{

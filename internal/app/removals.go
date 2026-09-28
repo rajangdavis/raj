@@ -140,3 +140,82 @@ func (a *App) withdrawDirRemoval(d control.DirRemoval) {
 	}
 	a.status = "withdrew the removal of " + filepath.Base(d.Path)
 }
+
+// approveDeletionRemote forwards the Remove forever answer to the daemon for an
+// attached client. The client never unlinks the file itself: the daemon owns
+// the filesystem for a viewer, and its ApproveDeletion is the one removal path.
+// The mirrored entry clears only on an OK answer, so a refusal (say, the
+// proposal was withdrawn meanwhile) leaves the pending surface honest and the
+// reason in the status. A transport failure is the status too, like saveRemote.
+func (a *App) approveDeletionRemote(d control.Deletion) {
+	res, err := a.sendRemovalDecision("delete", d.Path, true)
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	a.dropClientRemoval("delete", d.Path)
+	delete(a.pendingDeletions, d.Path)
+	a.clearPendingRemoval(d.Path, false)
+	a.deletionPromptPane = nil
+	a.status = "approved the removal of " + filepath.Base(d.Path)
+}
+
+// withdrawDeletionRemote forwards the Withdraw answer to the daemon, retracting
+// the proposal through the wire's `delete --withdraw` without touching disk. It
+// sends no author: the daemon admits the client's own durable human, who may
+// retract any pending removal.
+func (a *App) withdrawDeletionRemote(d control.Deletion) {
+	res, err := a.sendRemovalDecision("delete", d.Path, false)
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	a.dropClientRemoval("delete", d.Path)
+	delete(a.pendingDeletions, d.Path)
+	a.clearPendingRemoval(d.Path, false)
+	a.deletionPromptPane = nil
+	a.status = "withdrew the deletion of " + filepath.Base(d.Path)
+}
+
+// approveDirRemovalRemote is approveDeletionRemote for a directory: the Remove
+// forever answer becomes rmdir --approve on the daemon.
+func (a *App) approveDirRemovalRemote(d control.DirRemoval) {
+	res, err := a.sendRemovalDecision("rmdir", d.Path, true)
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	a.dropClientRemoval("rmdir", d.Path)
+	delete(a.pendingDirRemovals, d.Path)
+	a.clearPendingRemoval(d.Path, true)
+	a.status = "approved the removal of " + filepath.Base(d.Path)
+}
+
+// withdrawDirRemovalRemote is withdrawDeletionRemote for a directory.
+func (a *App) withdrawDirRemovalRemote(d control.DirRemoval) {
+	res, err := a.sendRemovalDecision("rmdir", d.Path, false)
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	a.dropClientRemoval("rmdir", d.Path)
+	delete(a.pendingDirRemovals, d.Path)
+	a.clearPendingRemoval(d.Path, true)
+	a.status = "withdrew the removal of " + filepath.Base(d.Path)
+}

@@ -1,7 +1,6 @@
 package editor
 
 import (
-	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -185,24 +184,23 @@ func TestDeleteRefusedAcrossAProposedDeletion(t *testing.T) {
 	}
 }
 
-// A save whose agreed composition would drop a superseded set that the edit
-// view still shows is refused, and the refusal is a no-op: no bytes written, no
-// pending set accepted. The historical case is a declaration that exists only
-// in a superseded run -- a rejected collider restores it to the edit view while
-// AcceptedOnly omits it -- which a plain save would have written out, leaving a
-// file that does not compile while the buffer still showed the declaration.
-// Without the check the save succeeds and the file is truncated; without the
-// rollback the successful AcceptGroup is left behind on a write that never
-// happened. Sibling: TestSaveFailedEncodeLeavesPendingProposed, which pins the
-// same rollback for the encoding refusal.
-func TestSaveRefusesSupersededText(t *testing.T) {
+// Project excludes an invalid set from both the agreed and the edit
+// composition, so the case this test used to build -- a superseded set a
+// rejected collider restored to the edit view, which a plain save would have
+// dropped -- no longer exists: the compositions agree and there is no text on
+// screen for a save to discard. The save writes the agreed composition without
+// refusing, and the decided behaviour for an invalid set at the save gesture
+// is the app save's: dispose it and report the count
+// (TestControlSaveDisposesSupersededText). The refusal path is a defensive
+// guard, not a reachable refusal.
+func TestSaveDoesNotRefuseOverAnExcludedInvalidSet(t *testing.T) {
 	p := savedPane(t, "hello world\n")
 	f := p.File
 	superseded := proposeAt(t, f, 6, 11, "socket")
 
 	// A later user deletion consumes the set's insertion; rejecting the
-	// deletion restores its bytes to the session, so the projection puts them
-	// back into the edit view while AcceptedOnly stays without them.
+	// deletion leaves the deleted base bytes out of the agreed composition and
+	// the superseded insertion out of both.
 	f.Begin()
 	// The caret Delete path refuses an edit that intersects a Proposed run, so
 	// the collider has to land the way a real overwrite does: through the diff
@@ -218,33 +216,25 @@ func TestSaveRefusesSupersededText(t *testing.T) {
 		t.Fatalf("setup: set %d is not invalid", superseded)
 	}
 	if len(f.Session().Pending()) != 0 {
-		t.Fatalf("Pending = %+v, want none; the refusal is for a set Pending drops", f.Session().Pending())
+		t.Fatalf("Pending = %+v, want none; Pending drops the invalid set", f.Session().Pending())
 	}
-	if edit, agreed := f.Session().Project(piecetable.AcceptedAndProposed).Text(),
-		f.Session().Project(piecetable.AcceptedOnly).Text(); edit == agreed {
-		t.Fatalf("setup did not separate the compositions: %q", edit)
+	edit := f.Session().Project(piecetable.AcceptedAndProposed).Text()
+	agreed := f.Session().Project(piecetable.AcceptedOnly).Text()
+	if edit != agreed {
+		t.Fatalf("compositions disagree on the invalid set: edit %q, agreed %q", edit, agreed)
+	}
+	if strings.Contains(edit, "socket") {
+		t.Fatalf("setup: the invalid set's text is still in the edit composition: %q", edit)
 	}
 
-	err := f.SaveOver()
-	var refused *UnsavedProposedError
-	if !errors.As(err, &refused) {
-		t.Fatalf("SaveOver() = %v, want *UnsavedProposedError", err)
-	}
-	if len(refused.Groups) != 1 || refused.Groups[0].ID != superseded {
-		t.Errorf("refused groups = %+v, want just set %d", refused.Groups, superseded)
-	}
-	if !strings.Contains(refused.Error(), "accept them to keep the text") ||
-		!strings.Contains(refused.Error(), "clear them to discard it") {
-		t.Errorf("refusal = %q, want both exits named", refused.Error())
+	if err := f.SaveOver(); err != nil {
+		t.Fatalf("SaveOver() = %v, want the agreed composition written", err)
 	}
 	if data, rerr := os.ReadFile(f.Path); rerr != nil || string(data) != "hello world\n" {
-		t.Errorf("file = %q err %v, want the refused save to have written nothing", data, rerr)
+		t.Errorf("file = %q err %v, want the agreed composition", data, rerr)
 	}
-	if got := f.Session().GroupState(superseded); got != piecetable.Proposed {
-		t.Errorf("state after the refused save = %v, want the proposal still pending", got)
-	}
-	if f.Dirty() && !f.ViewDirty() {
-		t.Error("a refused save must not report the buffer clean")
+	if got := f.Session().Project(piecetable.AcceptedAndProposed).Text(); got != "hello world\n" {
+		t.Errorf("edit composition after save = %q, want the written text", got)
 	}
 }
 
@@ -294,7 +284,7 @@ func TestClearGroupDisposesASupersededSet(t *testing.T) {
 // settles; the save retires it as Rejected and the bytes it writes are
 // unchanged. Without the retirement the state assertion fails -- the set stays
 // Proposed after the save. Sibling: TestSaveAcceptsPendingProposals for the
-// hunk-carrying case and TestSaveRefusesSupersededText for the refusal.
+// hunk-carrying case and TestSaveDoesNotRefuseOverAnExcludedInvalidSet.
 func TestSaveRetiresMemberlessInvalidSets(t *testing.T) {
 	p := savedPane(t, "hello world\n")
 	f := p.File

@@ -18,6 +18,7 @@ import (
 // this they are held for the life of the session — counted in nothing visible,
 // and resurrected stale the moment the file is reopened.
 func TestClosingATabClearsItsDiagnostics(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	h.OpenFile(path)
@@ -50,6 +51,7 @@ func TestClosingATabClearsItsDiagnostics(t *testing.T) {
 // Reopening a closed file must not show the problems it had when it was closed.
 // They describe a version of the file that nothing has re-checked.
 func TestReopeningDoesNotResurrectDiagnostics(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	h.OpenFile(path)
@@ -66,6 +68,7 @@ func TestReopeningDoesNotResurrectDiagnostics(t *testing.T) {
 // An unnamed buffer has no path to key anything on, and closing one must not
 // panic or clear somebody else's diagnostics.
 func TestClosingAnUnnamedBufferIsHarmless(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	h.OpenFile(path)
@@ -84,6 +87,7 @@ func TestClosingAnUnnamedBufferIsHarmless(t *testing.T) {
 // The pane is a view over the store, so opening it must show what the store
 // already holds rather than only what arrives afterwards.
 func TestProblemsPaneShowsExistingDiagnostics(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	h.diags.set(path, []lsp.Diagnostic{{Message: "undefined: needle", Severity: sevError}})
@@ -103,6 +107,7 @@ func TestProblemsPaneShowsExistingDiagnostics(t *testing.T) {
 // Enter on a problem opens its file at its line, which is the whole point of
 // the pane: the gutter answers "what is wrong here", this answers "where".
 func TestProblemsPaneJumps(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	var d lsp.Diagnostic
@@ -131,6 +136,7 @@ func TestProblemsPaneJumps(t *testing.T) {
 // A list naming a file no tab is showing, with problems nothing will re-check,
 // is worse than an empty list.
 func TestClosingAFileRemovesItFromTheProblemsPane(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.Explorer.Tree.Root, "main.go")
 	h.OpenFile(path)
@@ -152,6 +158,7 @@ func TestClosingAFileRemovesItFromTheProblemsPane(t *testing.T) {
 // the list — so the agreement is asserted rather than assumed, since the two
 // switch statements are deliberately duplicated.
 func TestSeverityRankingsAgree(t *testing.T) {
+	t.Parallel()
 	for sev := 0; sev <= 5; sev++ {
 		var d lsp.Diagnostic
 		d.Severity = sev

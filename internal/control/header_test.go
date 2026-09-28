@@ -16,10 +16,15 @@ func i64p(n int64) *int64 { return &n }
 // them cross the wire.
 func fullHeader() Header {
 	base := uint64(41)
+	start, end := 1, 4
 	return Header{
+		Start: &start, End: &end,
 		ID: 7, Op: "apply", Path: "/w/main.go", NewPath: "/w/renamed.go", Author: 3, Token: "t0ken",
 		Base: &base, Cancel: 2, Group: 9, Identity: "agent-1", Name: "Agent", Kind: "human",
-		Argv: []string{"go", "test", "./..."}, Dir: "/w",
+		Task: "task-1", LandTask: "task-2", To: "raj-0a1b2c3d", Message: "review ready",
+		State: "working", StateOn: "user", StateNote: "reviewing",
+
+		Argv: []string{"go", "test", "./..."}, Dir: "/w", ExecProjected: true,
 		Query: &SearchQuery{Text: "f.*o", Include: "*.go", Exclude: "vendor/**", Path: "internal", Regex: true, Word: true, Hidden: true, Context: 2},
 		Hunks: []HunkMeta{{Start: 0, End: 4, Len: 2}, {Start: 10, End: 10, Len: 5}},
 		Exit:  3, Stream: 2, OutLen: 12, Final: true, OK: true, Err: "boom",
@@ -44,9 +49,30 @@ func fullHeader() Header {
 		Annotated:    true,
 		Discard:      true,
 		Withdraw:     true,
+		Approve:      true,
 		Hidden:       true,
 		Remains:      true,
 		Created:      true,
+
+		GitMode:  "status",
+		GitRev:   "HEAD",
+		GitCount: 3,
+		GitJSON:  `{"mode":"status"}`,
+
+		HookMode:       "show",
+		HookName:       "check",
+		HookJSON:       `{"name":"check"}`,
+		HookRunID:      12,
+		HookRevision:   41,
+		HookHead:       "abc1234",
+		HookDirty:      "d0d1d2",
+		HookDurationMS: 250,
+		HookTruncated:  true,
+		HookOff:        true,
+		HookLogJSON:    `[{"id":1}]`,
+		HookPSJSON:     `[{"id":1}]`,
+
+		RetryAfterMS: 1500,
 
 		Paths:         []string{"/w/a.go", "/w/b.go"},
 		ClaimAdd:      true,
@@ -60,9 +86,18 @@ func fullHeader() Header {
 			{Kind: "set", Path: "/w/a.go", Author: 3, Group: 4, Start: -1, End: -1},
 			{Kind: "delete", Path: "/w/b.go", Author: 4, Start: 7, End: 9},
 		},
+		Reveals: []Reveal{
+			{Path: "/w/a.go", Start: 4, End: 7},
+			{Path: "/w/b.go", Start: -1, End: -1},
+		},
 		Entries: []Entry{
 			{Name: "pkg", Path: "/w/pkg", Dir: true},
 			{Name: "main.go", Path: "/w/main.go", Size: i64p(9)},
+		},
+		Land: []LandFile{
+			{Path: "/w/a.go", Sets: 2, Saved: true},
+			{Path: "/w/b.go", Sets: 1, Held: true},
+			{Path: "/w/c.go", Sets: 1, Err: "disk changed"},
 		},
 	}
 }
@@ -108,6 +143,9 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"author", got.Author, want.Author}, {"token", got.Token, want.Token},
 		{"cancel", got.Cancel, want.Cancel}, {"group", got.Group, want.Group},
 		{"identity", got.Identity, want.Identity}, {"name", got.Name, want.Name},
+		{"task", got.Task, want.Task},
+		{"gitmode", got.GitMode, want.GitMode}, {"gitrev", got.GitRev, want.GitRev},
+		{"gitcount", got.GitCount, want.GitCount}, {"gitjson", got.GitJSON, want.GitJSON},
 		{"dir", got.Dir, want.Dir}, {"exit", got.Exit, want.Exit},
 		{"stream", got.Stream, want.Stream}, {"outlen", got.OutLen, want.OutLen},
 		{"final", got.Final, want.Final}, {"ok", got.OK, want.OK}, {"err", got.Err, want.Err},
@@ -122,6 +160,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		{"annotated", got.Annotated, want.Annotated},
 		{"withdraw", got.Withdraw, want.Withdraw},
 		{"hidden", got.Hidden, want.Hidden},
+		{"execprojected", got.ExecProjected, want.ExecProjected},
 		{"remains", got.Remains, want.Remains},
 		{"created", got.Created, want.Created},
 		{"found", got.Found, want.Found},
@@ -277,8 +316,10 @@ func TestNonUTF8PathSurvivesTheHeader(t *testing.T) {
 // heard of is skipped rather than refused.
 func TestUnknownHeaderFieldIsSkipped(t *testing.T) {
 	b := encodeHeader(Header{ID: 5, Op: "ping"})
-	// Splice in a field from a later raj, in the argument range.
-	later := prog.Encode([]prog.Op{{Code: 0x7e, Payload: []byte("from the future")}})
+	// Splice in a field from a later raj, in the argument range. 0x1f is the
+	// one argument code this build does not allocate.
+	later := prog.Encode([]prog.Op{{Code: 0x1f, Payload: []byte("from the future")}})
+
 	spliced := append(append([]byte{}, b...), later[2:]...)
 
 	got, err := decodeHeader(spliced)
@@ -370,7 +411,9 @@ func TestEveryVerbHasACode(t *testing.T) {
 		"cancel", "recv", "snapshot", "prog", "diff", "review", "claim",
 		"mkdir", "delete", "deletions", "rename", "reload",
 		"proposals", "revert", "token",
-		"rmdir", "rmdirs", "ls", "watch",
+		"rmdir", "rmdirs", "ls", "watch", "git", "hook", "reveal",
+		"state",
+		"land",
 	} {
 		if _, ok := verbCodes[op]; !ok {
 			t.Errorf("op %q has no code, so it crosses the wire as text", op)
@@ -428,6 +471,30 @@ func TestEnumsTravelAsCodes(t *testing.T) {
 	}
 	if back.Groups[0].State != "half-accepted" {
 		t.Errorf("state = %q", back.Groups[0].State)
+	}
+}
+
+// A participant's task is the work its writes belong to, and it must cross the
+// roster: a `who` or a hello reply read over the wire has to name it. It rides
+// in a sparse positional field of its own, so a participant with no task next
+// to one that has a task must decode as empty rather than borrowing it.
+func TestParticipantTaskRoundTrip(t *testing.T) {
+	want := []Participant{
+		{ID: 2, Identity: "agent", Name: "claude", Kind: KindAgent, Connected: true, Task: "task-7"},
+		{ID: 3, Identity: "plain", Name: "plain", Kind: KindAgent, Connected: true},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Participants: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Participants) != 2 {
+		t.Fatalf("participants = %+v, want two", got.Participants)
+	}
+	if got.Participants[0].Task != "task-7" {
+		t.Errorf("tasked participant task = %q, want task-7", got.Participants[0].Task)
+	}
+	if got.Participants[1].Task != "" {
+		t.Errorf("untasked participant task = %q, want empty", got.Participants[1].Task)
 	}
 }
 
@@ -690,10 +757,34 @@ func TestBufferPendingAndMovedRoundTrip(t *testing.T) {
 
 // Headless is per-buffer state
 
+// An invalid proposal crosses as its own kind, so a driver filtering the wire
+// rollup for "set" never mistakes an invalid set for one a decision can reach.
+func TestProposalsInvalidKindRoundTrips(t *testing.T) {
+	want := []Proposal{
+		{Kind: "set", Path: "/w/a.go", Author: 2, Group: 7, Start: 1, End: 4},
+		{Kind: "invalid", Path: "/w/a.go", Author: 2, Group: 8, Start: -1, End: -1},
+	}
+	got, err := decodeHeader(encodeHeader(Header{Proposals: want}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Proposals) != len(want) {
+		t.Fatalf("proposals = %+v, want %+v", got.Proposals, want)
+	}
+	for i := range want {
+		if got.Proposals[i] != want[i] {
+			t.Errorf("proposal %d = %+v, want %+v", i, got.Proposals[i], want[i])
+		}
+	}
+	if got.Proposals[1].Kind != "invalid" {
+		t.Errorf("invalid proposal kind = %q, want %q", got.Proposals[1].Kind, "invalid")
+	}
+}
+
 // Superseded is a per-buffer count that must survive the wire: it is how
-// `buffers` says a file holds text a save would refuse even though it reports
-// no pending set. It rides in a sparse field of its own, so a buffer without it
-// decodes as zero.
+// `buffers` says a file holds an invalid set a save will dispose even though it
+// reports no pending set. It rides in a sparse field of its own, so a buffer
+// without it decodes as zero.
 func TestBufferSupersededRoundTrip(t *testing.T) {
 	want := []Buffer{
 		{Path: "/w/a.go", Version: 3, Bytes: 90, Lines: 5, Superseded: 1},

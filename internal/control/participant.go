@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Who is writing, as distinct from which author id their text carries.
@@ -38,6 +39,38 @@ const (
 	KindAgent Kind = "agent"
 )
 
+// The working-state vocabulary. A participant declares working, blocked,
+// review or idle through `state set`; the rest raj derives from activity it
+// already sees. Declared wins over derived, except that a declared working
+// state gone quiet reads stale and a closed connection reads gone.
+const (
+	StateListening = "listening"
+	StateWorking   = "working"
+	StateWaiting   = "waiting"
+	StateStale     = "stale"
+	StateGone      = "gone"
+	StateIdle      = "idle"
+	StateBlocked   = "blocked"
+	StateReview    = "review"
+)
+
+// The windows a derived state reads. activeWindow is how long after its last
+// request a participant still counts as working; staleWindow is how long a
+// participant that declared itself working may then go quiet before the
+// declaration itself is doubted.
+const (
+	activeWindow = 30 * time.Second
+	staleWindow  = 10 * time.Minute
+)
+
+// declared is the state a participant reported through `state set`, with the
+// optional counterpart and note that go with it.
+type declared struct {
+	state string
+	on    string
+	note  string
+}
+
 // Participant is one writer.
 type Participant struct {
 	// ID is the author byte its text carries in the piece table.
@@ -48,10 +81,27 @@ type Participant struct {
 	// Name is for display — a gutter label, a legend. Short.
 	Name string `json:"name"`
 	Kind Kind   `json:"kind"`
+	// Task is the work this participant's writes belong to, set by `hello` and
+	// carried on the groups those writes open. It is empty for the local human
+	// and for a connection that registered no task.
+	Task string `json:"task,omitempty"`
 	// Connected is whether anything is currently attached as this participant.
 	// A disconnected one is still listed: its text is in the document, so a
 	// reader still needs to know whose it is.
 	Connected bool `json:"connected"`
+	// State is the working state shown for this participant: the declared one
+	// when it has one, else the state raj derives from activity. It is filled
+	// by States, not stored on the row, and empty on a plain List.
+	State string `json:"state,omitempty"`
+	// Declared is the state the participant reported, empty when none.
+	Declared string `json:"declared,omitempty"`
+	// SinceMS is milliseconds since the participant's last request, or -1
+	// when it has made none.
+	SinceMS int64 `json:"since_ms"`
+	// Note and On are the declared state's optional text and counterpart
+	// (the user or another participant's key).
+	Note string `json:"note,omitempty"`
+	On   string `json:"on,omitempty"`
 }
 
 // LocalHuman is the person at the keyboard, and the first participant. Nothing
@@ -79,13 +129,40 @@ type Registry struct {
 	byID       map[uint8]*Participant
 	byIdentity map[string]uint8
 	reserved   map[uint8]bool
-	next       uint16
+	// conns counts the live connections bound to each durable row. One
+	// participant routinely holds several at once — an agent's parked recv
+	// plus every short `raj ctl` call under the same key — so Connected is
+	// "at least one is open", not "the last one to report". Kept off
+	// Participant so the wire record does not change.
+	conns map[uint8]int
+	next  uint16
+	// The state surface. lastActive is when each participant last sent a
+	// request and declared is what it reported; listening counts its parked
+	// recvs and pending says it holds a proposal. All are the raw facts state
+	// derivation reads, kept off Participant so a plain List does not compute
+	// them. now is the clock, replaced in a test to move the windows without
+	// sleeping.
+	lastActive map[uint8]time.Time
+	declared   map[uint8]declared
+	listening  map[uint8]int
+	pending    map[uint8]bool
+	now        func() time.Time
+	// joined, when set, is told the author id of a Join that installs a new row
+	// or changes one. It is how the editor persists the author table without
+	// the control package having to reach into it: Join runs on a connection
+	// goroutine and only reports the id, and the editor writes the row on its
+	// own thread.
+	joined func(uint8)
 }
 
 // NewRegistry returns a registry holding only the local human.
 func NewRegistry() *Registry {
 	r := &Registry{byID: map[uint8]*Participant{}, byIdentity: map[string]uint8{},
-		reserved: map[uint8]bool{}, next: uint16(LocalHuman) + 1}
+		reserved: map[uint8]bool{}, conns: map[uint8]int{},
+		lastActive: map[uint8]time.Time{}, declared: map[uint8]declared{},
+		listening: map[uint8]int{}, pending: map[uint8]bool{},
+		now: time.Now, next: uint16(LocalHuman) + 1}
+
 	local := &Participant{ID: LocalHuman, Identity: "local", Name: "you",
 		Kind: KindHuman, Connected: true}
 	r.byID[LocalHuman] = local
@@ -104,19 +181,48 @@ func NewRegistry() *Registry {
 // rows is not full of writers. Recycling forgets the evicted identity — its
 // text now reads as the new writer — so it stays the pressure valve, not the
 // first choice: fresh ids go out in order for as long as there are any.
+//
+// A join that installs a new row, or changes one, is announced to the registry
+// joined hook, if one is set, so the editor can persist the author table; see
+// setJoined. An ordinary reconnect announces nothing.
 func (r *Registry) Join(identity, name string, kind Kind) (uint8, error) {
 	if identity == "" {
 		return 0, fmt.Errorf("participant: an identity is required")
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	id, changed, err := r.join(identity, name, kind)
+	joined := r.joined
+	r.mu.Unlock()
+	if err == nil && changed && joined != nil {
+		joined(id)
+	}
+	return id, err
+}
+
+// setJoined installs the hook Join announces to, once, when the server is built.
+// It takes the registry lock, so a join racing the installation sees either the
+// hook or none and never a torn read.
+func (r *Registry) setJoined(fn func(uint8)) {
+	r.mu.Lock()
+	r.joined = fn
+	r.mu.Unlock()
+}
+
+// join is the body of Join, with the caller holding the lock. The announce
+// happens in Join, after the unlock, because the hook reads the registry back
+// and would otherwise deadlock on the lock it was called under.
+func (r *Registry) join(identity, name string, kind Kind) (uint8, bool, error) {
 	if id, ok := r.byIdentity[identity]; ok {
 		p := r.byID[id]
+		r.conns[id]++
 		p.Connected = true
+		// Announce only a row the editor does not already have: an ordinary
+		// reconnect changes nothing and must not touch the hot path.
+		changed := name != "" && name != p.Name
 		if name != "" {
 			p.Name = name
 		}
-		return id, nil
+		return id, changed, nil
 	}
 	if name == "" {
 		name = identity
@@ -135,14 +241,16 @@ func (r *Registry) Join(identity, name string, kind Kind) (uint8, error) {
 		// live connection, so a durable identity must never be handed it.
 		gone, ok := lowestGone(r.byID)
 		if !ok {
-			return 0, fmt.Errorf("participant: no author ids left (%d used)", len(r.byID))
+			return 0, false, fmt.Errorf("participant: no author ids left (%d used)", len(r.byID))
 		}
 		delete(r.byIdentity, r.byID[gone].Identity)
 		id = gone
 	}
 	r.byID[id] = &Participant{ID: id, Identity: identity, Name: name, Kind: kind, Connected: true}
 	r.byIdentity[identity] = id
-	return id, nil
+	// A recycled id starts its count afresh: the row it replaced was gone.
+	r.conns[id] = 1
+	return id, true, nil
 }
 
 // nextFree finds the next author id a durable identity may take: the first id
@@ -256,7 +364,14 @@ func (r *Registry) Leave(id uint8) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if p := r.byID[id]; p != nil {
-		p.Connected = false
+		// One connection closing is not the participant leaving: an agent's
+		// parked recv outlives every short call made under the same key, and
+		// marking the row gone on the first close made `send --to all` find
+		// nobody while the agent was still listening.
+		if r.conns[id] > 0 {
+			r.conns[id]--
+		}
+		p.Connected = r.conns[id] > 0
 	}
 }
 
@@ -269,6 +384,23 @@ func (r *Registry) Get(id uint8) (Participant, bool) {
 		return Participant{}, false
 	}
 	return *p, true
+}
+
+// SetTask records the task this participant's writes belong to. An empty task
+// leaves the row as it is: every ordinary command reconnects and says hello
+// with no task, and that reconnect must not erase the task its register call
+// pinned. A non-empty task replaces it, so a register for a different task
+// moves the participant's future writes under it; sets already recorded keep
+// the task they were opened under, which is the journal's own record.
+func (r *Registry) SetTask(id uint8, task string) {
+	if task == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p := r.byID[id]; p != nil {
+		p.Task = task
+	}
 }
 
 // IsAgent reports whether an author id writes as an agent.
@@ -308,4 +440,109 @@ func (r *Registry) List() []Participant {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// Touch records a request from id at the registry's clock. A reserved id has
+// no row, so touching one is a no-op: it is a connection, not a writer.
+func (r *Registry) Touch(id uint8) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.byID[id]; ok {
+		r.lastActive[id] = r.now()
+	}
+}
+
+// SetListening marks a parked recv starting (on) or finishing (!on) for id.
+// The count is what lets a participant hold several connections at once and
+// only read as listening while at least one is parked.
+func (r *Registry) SetListening(id uint8, on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if on {
+		r.listening[id]++
+		return
+	}
+	if r.listening[id] > 0 {
+		r.listening[id]--
+	}
+}
+
+// SetState records the state id declared through `state set`, with its
+// optional counterpart and note. An empty state clears the declaration.
+func (r *Registry) SetState(id uint8, state, on, note string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.byID[id]; !ok {
+		return
+	}
+	if state == "" {
+		delete(r.declared, id)
+		return
+	}
+	r.declared[id] = declared{state: state, on: on, note: note}
+}
+
+// SetPending replaces the set of authors that hold a pending proposal, the
+// fact behind the derived waiting state. The app owns the pending set and
+// pushes it here; connection goroutines only read it.
+func (r *Registry) SetPending(held map[uint8]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pending = make(map[uint8]bool, len(held))
+	for id := range held {
+		r.pending[id] = true
+	}
+}
+
+// States returns every participant with its working state filled, for who and
+// the hello reply. hookRunning reports whether id has a hook run in flight;
+// nil means no run can be observed.
+func (r *Registry) States(hookRunning func(uint8) bool) []Participant {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	out := make([]Participant, 0, len(r.byID))
+	for _, p := range r.byID {
+		q := *p
+		q.State, q.Declared, q.SinceMS, q.On, q.Note = r.stateOf(p, now, hookRunning)
+		out = append(out, q)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// stateOf computes one participant's state. A closed connection is gone
+// whatever it declared; a declared working state gone quiet is stale; anything
+// else declared wins over what activity would say. Derived, in order: a hook
+// run in flight or a request inside activeWindow is working, a parked recv is
+// listening, a held proposal is waiting, and the rest is idle.
+func (r *Registry) stateOf(p *Participant, now time.Time, hookRunning func(uint8) bool) (state, declaredState string, sinceMS int64, on, note string) {
+	sinceMS = -1
+	if last, ok := r.lastActive[p.ID]; ok {
+		sinceMS = now.Sub(last).Milliseconds()
+	}
+	d := r.declared[p.ID]
+	declaredState, on, note = d.state, d.on, d.note
+	if !p.Connected {
+		return StateGone, declaredState, sinceMS, on, note
+	}
+	if d.state == StateWorking && sinceMS >= int64(staleWindow/time.Millisecond) {
+		return StateStale, declaredState, sinceMS, on, note
+	}
+	if d.state != "" {
+		return d.state, declaredState, sinceMS, on, note
+	}
+	if hookRunning != nil && hookRunning(p.ID) {
+		return StateWorking, declaredState, sinceMS, on, note
+	}
+	if sinceMS >= 0 && sinceMS < int64(activeWindow/time.Millisecond) {
+		return StateWorking, declaredState, sinceMS, on, note
+	}
+	if r.listening[p.ID] > 0 {
+		return StateListening, declaredState, sinceMS, on, note
+	}
+	if r.pending[p.ID] {
+		return StateWaiting, declaredState, sinceMS, on, note
+	}
+	return StateIdle, declaredState, sinceMS, on, note
 }

@@ -17,6 +17,7 @@ import (
 // format rewrites the file to a style the editor does not use. Without the
 // change formatOptions does not exist and the request has no options at all.
 func TestFormatOptionsComeFromTheBufferIndent(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		style  editor.Indent
@@ -43,6 +44,7 @@ func TestFormatOptionsComeFromTheBufferIndent(t *testing.T) {
 // the same voice as the other feature gates, rather than asked a method it
 // answers method-not-found. Without the change neither provider is read.
 func TestFormattingCapabilityGatesReadTheirOwnProvider(t *testing.T) {
+	t.Parallel()
 	caps := lsp.ServerCapabilities{
 		DocumentFormattingProvider:      json.RawMessage(`true`),
 		DocumentRangeFormattingProvider: json.RawMessage(`false`),
@@ -68,6 +70,7 @@ func TestFormattingCapabilityGatesReadTheirOwnProvider(t *testing.T) {
 // rather than sent as a zero-byte range. Without the change selectionRange does
 // not exist and requestFormat has no range to send.
 func TestSelectionRangeIsThePrimarySelection(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one two\nthree\n")
 	if _, ok := selectionRange(h.Pane()); ok {
 		t.Fatal("a collapsed caret produced a range")
@@ -89,6 +92,7 @@ func TestSelectionRangeIsThePrimarySelection(t *testing.T) {
 // step, so undoing a format is not once per edit. Without applyServerEdits the
 // edits go through the old per-candidate path and each is its own undo.
 func TestApplyFormatIsOneUndo(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one two\nthree four\n")
 	before := h.text()
 	h.lspGen = 1
@@ -112,6 +116,7 @@ func TestApplyFormatIsOneUndo(t *testing.T) {
 // "already formatted" is the normal answer for a clean file. Without the change
 // an empty answer would be applied as nothing and say nothing.
 func TestApplyFormatEmptyListIsANoOp(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.text()
 	h.lspGen = 1
@@ -130,6 +135,7 @@ func TestApplyFormatEmptyListIsANoOp(t *testing.T) {
 // that is gone, and applying them would mangle the file. Without the version
 // check the stale edits land at whatever happens to be there now.
 func TestApplyFormatDropsAnAnswerForAnEarlierVersion(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.text()
 	h.lspGen = 1
@@ -155,6 +161,7 @@ func TestApplyFormatDropsAnAnswerForAnEarlierVersion(t *testing.T) {
 // the batch lease check the edits that do not overlap land and the buffer is
 // left half-formatted with no note of which part.
 func TestApplyFormatRefusesOverAProposedSpan(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 	read := c.do(h, control.Request{Op: "text"})
@@ -184,6 +191,7 @@ func TestApplyFormatRefusesOverAProposedSpan(t *testing.T) {
 // edit and names the chord that leaves the mode. Without the gate the global
 // action bypasses the editor's read-only check and formats under a review.
 func TestFormatIsRefusedInReviewMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.text()
 	h.mode = ModeReview
@@ -200,6 +208,7 @@ func TestFormatIsRefusedInReviewMode(t *testing.T) {
 // replacement put it. Without shiftThroughEdits a whole-file format leaves the
 // caret at the lowest edit's start, which is the top of the file.
 func TestShiftThroughEdits(t *testing.T) {
+	t.Parallel()
 	edits := []complete.Edit{
 		{Start: 0, End: 3, Text: "xx"},  // -1 delta
 		{Start: 10, End: 10, Text: "!"}, // pure insertion
@@ -230,6 +239,7 @@ func TestShiftThroughEdits(t *testing.T) {
 // matched. Without it the typing path either asks on every keystroke or never
 // asks at all.
 func TestOnTypeFormatForSelectsTriggers(t *testing.T) {
+	t.Parallel()
 	caps := lsp.ServerCapabilities{DocumentOnTypeFormattingProvider: json.RawMessage(
 		`{"firstTriggerCharacter":"}","moreTriggerCharacter":["\n",";"]}`)}
 	cases := []struct {
@@ -266,6 +276,7 @@ func TestOnTypeFormatForSelectsTriggers(t *testing.T) {
 // when it names a gap — a keystroke is not a request for the feature — but the
 // provider is read in exactly one place, and this is it.
 func TestOnTypeFormatGap(t *testing.T) {
+	t.Parallel()
 	if got := onTypeFormatGap(lsp.ServerCapabilities{}); got != "language server does not support on-type formatting" {
 		t.Errorf("absent provider: gap = %q", got)
 	}
@@ -282,6 +293,7 @@ func TestOnTypeFormatGap(t *testing.T) {
 // Without installTextEdits the edits go through a per-edit path and each is its
 // own undo.
 func TestApplyOnTypeFormatIsOneUndo(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one two\nthree four\n")
 	before := h.text()
 	h.onTypeGen = 1
@@ -305,6 +317,7 @@ func TestApplyOnTypeFormatIsOneUndo(t *testing.T) {
 // is gone, and applying them at the new offsets would mangle the file. Without
 // the version check the stale edits land wherever those offsets now point.
 func TestApplyOnTypeFormatDropsAStaleAnswer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.text()
 	h.onTypeGen = 1
@@ -326,6 +339,7 @@ func TestApplyOnTypeFormatDropsAStaleAnswer(t *testing.T) {
 // text. Without the generation check the first answer lands after the second
 // request was made.
 func TestApplyOnTypeFormatDropsASupersededAnswer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.text()
 	h.onTypeGen = 2
@@ -345,6 +359,7 @@ func TestApplyOnTypeFormatDropsASupersededAnswer(t *testing.T) {
 // An empty edit list is a no-op: the server had nothing to change, which is the
 // normal answer for most trigger characters and not a failure.
 func TestApplyOnTypeFormatEmptyIsANoOp(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.text()
 	h.onTypeGen = 1
@@ -361,6 +376,7 @@ func TestApplyOnTypeFormatEmptyIsANoOp(t *testing.T) {
 // its wire shape are covered by the lsp package's tests; internal/app has no
 // fake language server to observe the round trip here.
 func TestMaybeOnTypeFormatWithoutAServerIsHarmless(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.onTypeGen = 0
 	h.maybeOnTypeFormat(h.Pane(), "}", true)

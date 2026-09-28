@@ -292,7 +292,7 @@ func TestSearchArgumentsCompileInAnyOrder(t *testing.T) {
 // opcode this build has not allocated are refused by the ordinary unknown-verb
 // rule rather than by a special case.
 func TestVerbsThatStayOutOfPrograms(t *testing.T) {
-	for _, code := range []byte{0x98, 0x99, 0xff} { // OpWatch, then unallocated verbs
+	for _, code := range []byte{0x98, 0x9b, 0xff} { // OpWatch, then unallocated verbs
 		p := prog.Encode([]prog.Op{{Code: code}})
 		if _, err := Requests(p, 1); !errors.Is(err, prog.ErrUnknownVerb) {
 			t.Errorf("verb %#x = %v, want ErrUnknownVerb", code, err)
@@ -335,6 +335,30 @@ func TestGotoAndCloseCompileAsProgramVerbs(t *testing.T) {
 		if len(reqs) != 1 || reqs[0].Op != tc.want {
 			t.Errorf("verb %#x = %+v, want one request with op %q", tc.code, reqs, tc.want)
 		}
+	}
+}
+
+// reveal is a program verb like goto: the path and span accumulate and the verb
+// consumes them onto Start/End rather than onto a hunk, because a reveal writes
+// no text.
+func TestRevealCompilesAsAProgramVerb(t *testing.T) {
+	p := prog.Encode([]prog.Op{
+		{Code: prog.OpPath, Payload: []byte("/w/a.go")},
+		{Code: prog.OpSpan, Payload: prog.Pair(4, 7)},
+		{Code: prog.OpReveal},
+	})
+	reqs, err := Requests(p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 || reqs[0].Op != "reveal" || reqs[0].Path != "/w/a.go" {
+		t.Fatalf("reveal program = %+v, want one reveal", reqs)
+	}
+	if reqs[0].Start == nil || *reqs[0].Start != 4 || reqs[0].End == nil || *reqs[0].End != 7 {
+		t.Errorf("reveal span = %v..%v, want 4..7", reqs[0].Start, reqs[0].End)
+	}
+	if len(reqs[0].Hunks) != 0 {
+		t.Errorf("the reveal carried a hunk: %+v", reqs[0].Hunks)
 	}
 }
 

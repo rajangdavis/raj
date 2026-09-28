@@ -93,6 +93,7 @@ func menuClick(t *testing.T, h *harness, label string) {
 // MouseRight branch in pointer, every right press returned at the "not left"
 // guard and no menu ever appeared.
 func TestRightClickExplorerFileOpensMenu(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -118,6 +119,7 @@ func TestRightClickExplorerFileOpensMenu(t *testing.T) {
 // renaming anything on its own. Without the chooseMenu -> renamePath dispatch
 // the row would be inert.
 func TestMenuRenameOpensNamePrompt(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -139,6 +141,7 @@ func TestMenuRenameOpensNamePrompt(t *testing.T) {
 // proposeDeleteFile dispatch the file would be untouched, but so would the
 // proposal; this pins both halves: recorded, and still on disk.
 func TestMenuDeleteProposesBeforeApproval(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.primaryRoot(), "README.md")
 	h.OpenFile(path)
@@ -174,6 +177,7 @@ func TestMenuDeleteProposesBeforeApproval(t *testing.T) {
 // A left-click on a menu row runs it. Copy Path reaches the host clipboard the
 // same way the copy chord does, which is the observable end of the dispatch.
 func TestMenuLeftClickRunsRow(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -194,6 +198,7 @@ func TestMenuLeftClickRunsRow(t *testing.T) {
 // Esc closes the menu. It is the same Cancel action the widget consumes, so a
 // right-click menu is dismissible exactly like every other overlay.
 func TestMenuEscapeCloses(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -213,6 +218,7 @@ func TestMenuEscapeCloses(t *testing.T) {
 // or move what was underneath. Without the first-refusal branch in pointer the
 // click would fall through to the editor and move the caret.
 func TestMenuOutsideClickIsSwallowed(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 24)
 	h.OpenFile(filepath.Join(h.primaryRoot(), "main.go"))
 	h.drain()
@@ -243,6 +249,7 @@ func TestMenuOutsideClickIsSwallowed(t *testing.T) {
 // A right-click on the tab bar opens the tab item set for the tab under the
 // pointer, not for the active one.
 func TestRightClickTabOpensTabMenu(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))
@@ -271,6 +278,7 @@ func TestRightClickTabOpensTabMenu(t *testing.T) {
 // This is the handleGlobal wiring the brief calls for; without the case the
 // action fell through to the focused pane and did nothing.
 func TestOpenMenuKeyOpensForFocus(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -306,6 +314,7 @@ func TestOpenMenuKeyOpensForFocus(t *testing.T) {
 // bounds check the heading would resolve to row zero and open the first file's
 // menu instead.
 func TestMenuNeedsATarget(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -335,6 +344,7 @@ func TestMenuNeedsATarget(t *testing.T) {
 // bare os.WriteFile before opening it; this pins the replacement: the prompt is
 // AskPath's (tab completes) and the buffer's save is what makes the file.
 func TestMenuNewFileOpensASeededSaveAsPrompt(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -376,6 +386,7 @@ func TestMenuNewFileOpensASeededSaveAsPrompt(t *testing.T) {
 // save, and the buffer that made it becomes that file rather than a leftover
 // untitled tab.
 func TestMenuNewFileCompletesThroughSaveAs(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -403,6 +414,7 @@ func TestMenuNewFileCompletesThroughSaveAs(t *testing.T) {
 // same save-as path: naming a file in a folder that is not there asks before
 // creating the tree, which the old create-immediately item never did.
 func TestMenuNewFileOffersToCreateAMissingParent(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -428,6 +440,7 @@ func TestMenuNewFileOffersToCreateAMissingParent(t *testing.T) {
 // buffer the item opened. The old item created the file before opening it, so
 // this is the buffer the new path has to clean up after itself.
 func TestMenuNewFileCancelLeavesNoFileOrTab(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()

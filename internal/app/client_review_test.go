@@ -405,7 +405,7 @@ func TestClientRefreshesWithoutAnIdleTick(t *testing.T) {
 		t.Fatal("client attached with no tab")
 	}
 	id := p.File.Session().LastGroup()
-	c := ch.srv.dial(t)
+	c := ch.srv.dialHuman(t)
 	if r := c.do(ch.srv, control.Request{Op: "accept", Path: p.File.Path, Group: id}); !r.OK {
 		t.Fatalf("accept = %+v", r)
 	}

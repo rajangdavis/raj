@@ -16,9 +16,13 @@ import (
 
 	"raj/internal/control"
 	"raj/internal/editor"
+	"raj/internal/fslist"
+	"raj/internal/hooks"
 	"raj/internal/lsp"
 	"raj/internal/piecetable"
 	"raj/internal/search"
+	"raj/internal/session"
+	"raj/internal/store"
 	"raj/internal/ui"
 	"raj/internal/view"
 )
@@ -71,8 +75,30 @@ func (a *App) StartControlAddrs(addrs []string) error {
 		return err
 	}
 	a.control = srv
+	// Point the server at the persistent run directory before any connection
+	// can ask for a detached run. Best-effort: no state directory leaves
+	// detached runs unable to start, not the editor unable to run.
+	srv.SetHookDir(a.hookRunsDir())
+	// The durable mail queue is per workspace and lives in the store: a message
+	// sent while the editor is down is replayed when it restarts and that
+	// identity parks. A nil store leaves the mailbox in memory, as it was.
+	if a.state != nil {
+		srv.Mail.SetStore(mailStore{a.state}, srv.Participants)
+		srv.Mail.Prune()
+	}
 	a.seedParticipants()
+	srv.Mail.Replay()
 	return nil
+}
+
+// hookRunsDir is where detached hook runs write their logs, alongside the
+// journal and trash in the workspace state directory. It is empty when there is
+// no root set, which leaves detached runs refused rather than logging nowhere.
+func (a *App) hookRunsDir() string {
+	if a.roots.Len() == 0 {
+		return ""
+	}
+	return filepath.Join(session.StateDirForRoots(a.roots.All()), "hook-runs")
 }
 
 // ControlToken is the secret a TCP client must present, and "" when the
@@ -123,6 +149,9 @@ func (a *App) Tell(to uint8, text string) error {
 
 // notifySaved tells every connected driver that a buffer reached disk.
 //
+// It posts an editor notice (AuthorOriginal), not a message from the user, so
+// "from the user" always means a person typed it.
+//
 // Best-effort by design: the user asked for the save, and a driver whose
 // mailbox is full or that went away between the listing and the send must not
 // turn that into a failed save. Errors are dropped for the same reason. With no
@@ -140,7 +169,8 @@ func (a *App) notifySaved(path string) {
 		if !d.Connected {
 			continue
 		}
-		_ = a.Tell(d.ID, "saved "+path)
+		// PostNotice, not Tell: a save is the editor's own notice (author 0).
+		_ = a.control.PostNotice(d.ID, "saved "+path)
 	}
 }
 
@@ -228,6 +258,19 @@ func (a *App) reviewGeneration() uint64 {
 	return h.Sum64()
 }
 
+// drainJoins persists the author row of every participant that joined since the
+// last wake. A join runs on a connection goroutine, where it only queued the
+// id; the journal write belongs here, on the thread that owns every log writer,
+// and reuses recordAuthor's change check so a repeat hello appends nothing.
+func (a *App) drainJoins() {
+	if a.control == nil {
+		return
+	}
+	for _, id := range a.control.TakeJoins() {
+		a.recordJoin(id)
+	}
+}
+
 // drainControl executes every parked request. One Wake may cover several.
 func (a *App) drainControl() {
 	if a.control == nil {
@@ -238,6 +281,10 @@ func (a *App) drainControl() {
 		// The registry is how the guard tells an agent from a person; without
 		// it, it falls back to the id-range rule.
 		a.guard.Participants = a.control.Participants
+		// The hook Gate is per server, and the guard is the event thread's seam
+		// to it: dispatchHook's run admission needs it on the goroutine that
+		// owns the model.
+		a.guard.HookGate = a.control.HookGate
 	}
 	for _, p := range a.control.Take() {
 		res := control.Dispatch(a.guard, p.Req)
@@ -252,6 +299,11 @@ func (a *App) drainControl() {
 	// next idle tick, so a decision on one client reaches the others at the
 	// same beat its own author sees it. The idle tick still calls controlTick,
 	// which is what catches a change made outside a control request.
+	// The roster's waiting state is a property of the document — a quiet
+	// participant holding a pending proposal — so push the authors that hold
+	// one into the server's registry after every batch, where connection
+	// goroutines read it lock-guarded.
+	a.syncWaiting()
 	a.controlTick()
 }
 
@@ -292,6 +344,16 @@ func (a *App) notifySuperseded(req control.Request, res control.Response) {
 type host struct{ a *App }
 
 func hostOf(a *App) control.BufferHost { return host{a} }
+
+// Projection composes the live buffers under policy, keyed by absolute editor
+// path. It maps the control policy onto the piecetable policy App.Project takes,
+// so the wire-facing policy never leaks into the composition primitive.
+func (h host) Projection(policy control.ProjectionPolicy) map[string][]byte {
+	if policy == control.ProjectionWithProposed {
+		return h.a.Project(piecetable.AcceptedAndProposed)
+	}
+	return h.a.Project(piecetable.AcceptedOnly)
+}
 
 func (h host) Root() string { return h.a.visible.Primary() }
 
@@ -336,6 +398,21 @@ func (h host) Buffers() []control.Buffer {
 			b.Pending = len(pending)
 			for _, d := range sess.DiffPending() {
 				b.Moved += d.Moved
+			}
+		}
+		// An invalid set is invisible to Pending: it is Proposed with no
+		// surviving hunk to accept, so the count a driver needs is the invalid
+		// sets a save will dispose deliberately rather than silently. With no
+		// decisions there is nothing invalid, and the walk is skipped.
+		if sess.HasDecisions() {
+			invalid := 0
+			for _, g := range sess.Groups() {
+				if g.State == piecetable.Proposed && g.Invalid {
+					invalid++
+				}
+			}
+			if invalid > 0 {
+				b.Superseded = invalid
 			}
 		}
 		out = append(out, b)
@@ -546,17 +623,59 @@ func (h host) Goto(path string, line, col int) error {
 	if col <= 0 {
 		col = 1
 	}
-	off := p.File.OffsetAt(line-1, col-1)
+	placeCaret(p, p.File.OffsetAt(line-1, col-1))
+	// A cursor and viewport move is view state the session records, so persist
+	// it the same way the editor's own goto does.
+	h.a.TouchSession()
+	return nil
+}
+
+// Reveal puts a buffer in front of the user and, through the control server,
+// in front of every attached client: it loads the path if it is not open,
+// gives it a tab and focuses it, and places the caret at the span start. It
+// shares placeCaret with Goto so the two caret paths cannot drift, and it
+// publishes the reveal on the control server so each parked watch carries the
+// path and span to the client that is watching.
+func (h host) Reveal(path string, start, end int) error {
+	p, err := h.findOrLoad(path)
+	if err != nil {
+		return err
+	}
+	// A reveal is a request to look, so it announces a headless buffer and
+	// focuses the tab either way; goto stays quiet for an already-open buffer,
+	// but a reveal whose whole point is to put a file in front of the user
+	// must move the view.
+	h.a.announce(p)
+	off := 0
+	if start >= 0 {
+		off = start
+	}
+	placeCaret(p, off)
+	h.a.TouchSession()
+	if h.a.control != nil {
+		h.a.controlGen = h.a.control.PublishReveal(control.Reveal{
+			Path: p.File.Path, Start: start, End: end})
+	}
+	return nil
+}
+
+// placeCaret puts the cursor of p at a byte offset, clamps it into the
+// document, and centres the viewport on the row that draws it. It is the one
+// caret placement body Goto and Reveal share on the daemon, and an attached
+// client calls it through revealClientFile, so the two sides cannot drift.
+func placeCaret(p *editor.Pane, off int) {
+	if off < 0 {
+		off = 0
+	}
+	if max := p.File.Len(); off > max {
+		off = max
+	}
 	p.Cursors.Set(off, off)
 	// The caret is placed file-true; the viewport centres on the row that draws
 	// the offset, which a fold above it shifts away from the session line. A
 	// line a fold hides maps to its fold row, so the caret is still shown.
 	row, _ := p.DispPos(off)
 	p.Viewport.Center(row, p.DisplayLines())
-	// A cursor and viewport move is view state the session records, so persist
-	// it the same way the editor's own goto does.
-	h.a.TouchSession()
-	return nil
 }
 
 // Close removes a buffer's tab. A buffer with unsaved changes is refused, and
@@ -568,7 +687,10 @@ func (h host) Close(path string) error {
 	if err != nil {
 		return err
 	}
-	if p.File.ViewDirty() {
+	// A refused save is protected the same way unsaved changes are: the
+	// buffer cannot be written as it stands, so a socket close must not take a
+	// view that happens to match disk as permission to drop it.
+	if p.File.ViewDirty() || p.SaveRefused() {
 		return fmt.Errorf("%s has unsaved changes; save or reject them first", p.File.Path)
 	}
 	// A headless buffer has no tab to remove; dropping it from the registry is
@@ -770,19 +892,48 @@ func (a *App) ProposeDeletion(path string, author uint8) error {
 	return nil
 }
 
+// authorIsHuman reports whether id may retract any pending removal: the local
+// keyboard row, or a durable joined human (an attached client). It shares the
+// Guard's own predicate when the app has one, and falls back to the same id
+// rule when it does not — the test harness builds an App with no guard — so the
+// removal owner check and the Guard cannot drift apart.
+func (a *App) authorIsHuman(id uint8) bool {
+	if a.guard != nil {
+		return a.guard.IsHuman(id)
+	}
+	return id != control.AuthorOriginal && id < control.FirstAgent
+}
+
 // WithdrawDeletion removes the pending deletion for path when author proposed
-// it. A path that is not pending is a no-op; one proposed by another writer is
-// refused, so an agent cannot retract a peer's proposal.
+// it, or when author is a human: a person may retract any pending removal,
+// while an agent may retract only its own. A path that is not pending is a
+// no-op.
 func (a *App) WithdrawDeletion(path string, author uint8) error {
 	d, ok := a.pendingDeletions[path]
 	if !ok {
 		return nil
 	}
-	if d.Author != author {
+	if d.Author != author && !a.authorIsHuman(author) {
 		return fmt.Errorf("pending deletion of %s was proposed by author %d, not this writer", path, d.Author)
 	}
 	delete(a.pendingDeletions, path)
 	a.clearPendingRemoval(path, false)
+	return nil
+}
+
+// ApproveDeletion carries out the pending deletion for path: the human answer
+// to a proposal, doing exactly what the prompt Remove forever answer does. The
+// pending entry is looked up by sameFile as the prompt does, so a symlink
+// spelling that reached the map still matches; a path with no pending proposal
+// is refused by name rather than silently removing the file. The open pane, if
+// any, is handed to removeDeleted so the buffer close, the pending clear, the
+// tree refresh and the status line all run in the one removal path.
+func (a *App) ApproveDeletion(path string) error {
+	d, ok := a.pendingDeletionFor(path)
+	if !ok {
+		return fmt.Errorf("no pending deletion for %s", path)
+	}
+	a.removeDeleted(a.openDeletionPane(path), d.Path)
 	return nil
 }
 
@@ -811,6 +962,8 @@ func (h host) WithdrawDeletion(path string, author uint8) error {
 	return h.a.WithdrawDeletion(path, author)
 }
 
+func (h host) ApproveDeletion(path string) error { return h.a.ApproveDeletion(path) }
+
 func (h host) Deletions() []control.Deletion { return h.a.Deletions() }
 
 // ProposeDirRemoval records a pending dir-removal for path, proposed by
@@ -838,18 +991,33 @@ func (a *App) ProposeDirRemoval(path string, author uint8) error {
 }
 
 // WithdrawDirRemoval removes the pending dir-removal for path when author
-// proposed it. A path that is not pending is a no-op; one proposed by another
-// writer is refused, so an agent cannot retract a peer's proposal.
+// proposed it, or when author is a human: a person may retract any pending
+// removal, while an agent may retract only its own. A path that is not pending
+// is a no-op.
 func (a *App) WithdrawDirRemoval(path string, author uint8) error {
 	d, ok := a.pendingDirRemovals[path]
 	if !ok {
 		return nil
 	}
-	if d.Author != author {
+	if d.Author != author && !a.authorIsHuman(author) {
 		return fmt.Errorf("pending dir-removal of %s was proposed by author %d, not this writer", path, d.Author)
 	}
 	delete(a.pendingDirRemovals, path)
 	a.clearPendingRemoval(path, true)
+	return nil
+}
+
+// ApproveDirRemoval carries out the pending dir-removal for path: the human
+// answer to a proposal, the rmdir analogue of ApproveDeletion. The pending
+// entry is matched by sameFile as the review does, and a path with no pending
+// proposal is refused by name. removeDirDeleted is the one removal path, so the
+// buffers under the tree close, the pending entry clears and the tree refreshes.
+func (a *App) ApproveDirRemoval(path string) error {
+	d, ok := a.pendingDirRemovalFor(path)
+	if !ok {
+		return fmt.Errorf("no pending dir-removal for %s", path)
+	}
+	a.removeDirDeleted(d)
 	return nil
 }
 
@@ -868,11 +1036,13 @@ func (a *App) DirRemovals() []control.DirRemoval {
 }
 
 // Proposals is the unified pending surface: one flat tagged list over every
-// open buffer's pending change sets, the pending file deletions and the
-// pending dir-removals. It is read-only and ungated; each kind can still be
-// listed on its own. A change set's span is the min start and max end across
-// its rebased hunks, or -1/-1 when a later edit has moved every member past,
-// so a caller knows to ask `diff` for the text.
+// open buffer's pending change sets and invalid sets, the pending file
+// deletions and the pending dir-removals. It is read-only and ungated; each
+// kind can still be listed on its own. A change set's span is the min start
+// and max end across its rebased hunks, or -1/-1 when a later edit has moved
+// every member past, so a caller knows to ask `diff` for the text. An invalid
+// set is its own kind because Pending drops it: no hunk survives, so listing it
+// as a "set" would invite an accept that cannot work.
 func (a *App) Proposals() []control.Proposal {
 	var out []control.Proposal
 	panes := append(append([]*editor.Pane{}, a.Tabs.All()...), a.headless...)
@@ -900,6 +1070,20 @@ func (a *App) Proposals() []control.Proposal {
 				}
 			}
 		}
+		// Pending drops an invalid set by design: no hunk survives, so there is
+		// nothing to accept, and a driver asking "what is waiting" must still
+		// see it rather than be told the file is clean while a save would
+		// discard text. It rides the rollup under its own kind, so a filter for
+		// kind "set" stays exactly the sets a decision can reach.
+		for _, g := range sess.Groups() {
+			if g.State != piecetable.Proposed || !g.Invalid {
+				continue
+			}
+			out = append(out, control.Proposal{
+				Kind: "invalid", Path: p.File.Path, Author: uint8(g.Author), Group: g.ID,
+				Start: -1, End: -1,
+			})
+		}
 	}
 	for _, d := range a.Deletions() {
 		out = append(out, control.Proposal{Kind: "delete", Path: d.Path, Author: d.Author, Start: -1, End: -1})
@@ -920,6 +1104,8 @@ func (h host) ProposeDirRemoval(path string, author uint8) error {
 func (h host) WithdrawDirRemoval(path string, author uint8) error {
 	return h.a.WithdrawDirRemoval(path, author)
 }
+
+func (h host) ApproveDirRemoval(path string) error { return h.a.ApproveDirRemoval(path) }
 
 func (h host) DirRemovals() []control.DirRemoval { return h.a.DirRemovals() }
 
@@ -1087,7 +1273,7 @@ func (h host) Version(path string, author uint8) (uint64, error) {
 // the journal, so there is no old_str to get wrong. A hunk that lands over
 // another writer's Proposed span is allowed -- the advisory lease -- and the
 // warning names the set it moved past; a Rejected span is still a conflict.
-func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk) (uint64, []control.Conflict, []control.GroupOverlap, error) {
+func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk, task string) (uint64, []control.Conflict, []control.GroupOverlap, error) {
 	p, err := h.find(path)
 	if err != nil {
 		return 0, nil, nil, err
@@ -1120,17 +1306,23 @@ func (h host) Apply(path string, author uint8, base uint64, hunks []control.Hunk
 	p.File.Begin()
 	conflicts, blocks := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(base), pt)
 	p.File.End()
-	// An agent's change set is a proposal, not an edit: it is in the document
-	// and visible, but marked as awaiting a decision. Marked here rather than
-	// in the piece table because only this layer knows which authors are
-	// agents — and a second human's edits must not be marked.
+	// A set this call opened carries the connection's task, so a manifest built
+	// later keys it by the work that produced it; a no-task connection records
+	// nothing and reads empty.
 	//
 	// No-op hunks are skipped by ApplyDiff, so a batch of only no-ops commits
-	// nothing and LastGroup would name whatever set came before. Only mark a
-	// set this call actually opened: the version advances exactly when at
-	// least one real hunk committed.
-	if h.isAgent(author) && p.File.Session().Version() > before {
-		p.File.ProposeGroup(p.File.Session().LastGroup())
+	// nothing and LastGroup would name whatever set came before. Only record
+	// or mark a set this call actually opened: the version advances exactly
+	// when at least one real hunk committed.
+	if p.File.Session().Version() > before {
+		p.File.Session().SetGroupTask(p.File.Session().LastGroup(), task)
+		// An agent's change set is a proposal, not an edit: it is in the
+		// document and visible, but marked as awaiting a decision. Marked here
+		// rather than in the piece table because only this layer knows which
+		// authors are agents — and a second human's edits must not be marked.
+		if h.isAgent(author) {
+			p.File.ProposeGroup(p.File.Session().LastGroup())
+		}
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
@@ -1213,7 +1405,7 @@ func (h host) Dump(path string, start, end int, author uint8) (uint64, uint64, s
 // the current document, so concurrent edits elsewhere in the file are preserved
 // and only the chunk's own change is applied. It refuses a snapshot this writer
 // does not own, or one whose buffer has moved on to a different name.
-func (h host) Patch(path string, author uint8, id uint64, newText string) (uint64, []control.Conflict, []control.GroupOverlap, error) {
+func (h host) Patch(path string, author uint8, id uint64, newText string, task string) (uint64, []control.Conflict, []control.GroupOverlap, error) {
 	snap, ok := h.a.snapshots[id]
 	if !ok || snap.author != author {
 		return 0, nil, nil, fmt.Errorf("no snapshot %d for this writer (snapshots are per-writer and evicted on restart)", id)
@@ -1244,10 +1436,13 @@ func (h host) Patch(path string, author uint8, id uint64, newText string) (uint6
 	conflicts, blocks := p.File.ApplyDiff(piecetable.Author(author), piecetable.Version(snap.version), pt)
 	p.File.End()
 	// Like apply: a patch whose every hunk was refused commits nothing, so
-	// LastGroup would name whatever set came before and ProposeGroup would
-	// flip its state. Only mark a set this call actually opened.
-	if h.isAgent(author) && p.File.Session().Version() > before {
-		p.File.ProposeGroup(p.File.Session().LastGroup())
+	// LastGroup would name whatever set came before. Only record or mark a set
+	// this call actually opened, and record the task it belongs to.
+	if p.File.Session().Version() > before {
+		p.File.Session().SetGroupTask(p.File.Session().LastGroup(), task)
+		if h.isAgent(author) {
+			p.File.ProposeGroup(p.File.Session().LastGroup())
+		}
 	}
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
@@ -1325,54 +1520,146 @@ func (h host) Snapshot() control.Searcher {
 			docs[p.File.Path] = p.File.Text()
 		}
 	}
-	return snapshotSearcher{roots: h.a.visible.All(), docs: docs, versions: versions}
+	return fslist.SnapshotSearcher{Roots: h.a.visible.All(), Docs: docs, Versions: versions}
 }
 
-// snapshotSearcher walks off the event thread against the copy it was handed,
-// so the editor stays responsive for the seconds a search takes and a cancel
-// can be serviced while it runs. It carries the whole root set, so a hit in any
-// root surfaces.
-type snapshotSearcher struct {
-	roots    []string
-	docs     search.Docs
-	versions search.DocVersions
-}
-
-func (s snapshotSearcher) Search(ctx context.Context, q control.SearchQuery,
-	emit func([]control.SearchMatch)) (int, int, bool, []control.TruncatedFile, error) {
-	// The walk lives in ls.go so Search and SearchHidden share one body; nil
-	// rules keep the configured hidden policy search substitutes by default.
-	return s.runSearch(ctx, q, nil, emit)
-}
-
-// walkRoots resolves a query's -path against the workspace root set. With no
-// path every root is walked, in supplied order. A relative path is joined to
-// the primary root; an absolute one is taken as given. Either way it must stay
-// inside some root, the same rule the Guard applies to exec's -dir: a walk is
-// refused rather than allowed to read outside the tree. The Guard validates the
-// query before it reaches here, so this check is the backstop for a Searcher
-// driven directly.
-func (s snapshotSearcher) walkRoots(path string) ([]string, error) {
+// Ls lists the immediate children of a directory. It resolves a path to the
+// workspace's canonical coordinates and leaves the listing itself to
+// fslist.List, which carries no App state. With no path it lists the workspace
+// roots when there are several, or the primary root's children when there is
+// one.
+func (h host) Ls(path string, all bool) ([]control.Entry, error) {
 	if path == "" {
-		return s.roots, nil
-	}
-	primary := ""
-	if len(s.roots) > 0 {
-		primary = s.roots[0]
-	}
-	dir := path
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(primary, dir)
-	}
-	dir = filepath.Clean(dir)
-	for _, root := range s.roots {
-		rel, err := filepath.Rel(filepath.Clean(root), dir)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
+		// No path names the workspace itself. One root means its immediate
+		// children, exactly as before; several means one top-level entry per
+		// root, in supplied order, so every root is visible and none is
+		// mistaken for the primary's contents.
+		if h.a.visible.Len() > 1 {
+			return fslist.RootEntries(h.a.visible.All()), nil
 		}
-		return []string{dir}, nil
+		path = h.a.visible.Primary()
 	}
-	return nil, fmt.Errorf("search path %q is outside the workspace", path)
+	dir := h.canonicalPath(path)
+	return fslist.List(dir, all, h.a.rootFor(dir), h.a.visible.All())
+}
+
+// Hooks lists the workspace's stored hooks, converted from the store rows and
+// sorted by name (the store's own order). A nil store has none, so the answer
+// is an empty non-nil slice rather than an error.
+func (h host) Hooks() ([]control.HookRow, error) {
+	if h.a.state == nil {
+		return []control.HookRow{}, nil
+	}
+	stored, err := h.a.state.Hooks()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]control.HookRow, 0, len(stored))
+	for _, s := range stored {
+		out = append(out, storeHookRow(s))
+	}
+	return out, nil
+}
+
+// PutHook validates row with the hooks domain and stores it. The validation is
+// repeated here, not only in Dispatch, so a direct in-process caller cannot
+// store a row the domain would refuse.
+func (h host) PutHook(row control.HookRow) error {
+	if h.a.state == nil {
+		return errors.New("hooks: no workspace store to write to")
+	}
+	// Every field crosses, Tree and Detach included: a row that loses them here
+	// is stored as a projected, attached hook whatever the author asked for.
+	if _, err := hooks.Parse(hooks.Raw{
+		Name: row.Name, Action: row.Action, Trigger: row.Trigger, Tree: row.Tree,
+		Agent: row.Agent, CooldownMS: row.CooldownMS, TimeoutMS: row.TimeoutMS,
+		MayWrite: row.MayWrite, Detach: row.Detach, Enabled: row.Enabled,
+	}); err != nil {
+		return err
+	}
+	return h.a.state.PutHook(store.Hook{
+		Name: row.Name, Action: row.Action, Trigger: row.Trigger, Tree: row.Tree,
+		Agent: row.Agent, CooldownMS: row.CooldownMS, TimeoutMS: row.TimeoutMS,
+		MayWrite: row.MayWrite, Detach: row.Detach, Enabled: row.Enabled,
+	})
+}
+
+// DeleteHook removes the named hook. Deleting an absent name is not an error.
+func (h host) DeleteHook(name string) error {
+	if h.a.state == nil {
+		return errors.New("hooks: no workspace store to write to")
+	}
+	return h.a.state.DeleteHook(name)
+}
+
+// SetHookEnabled flips the named hook's enabled flag, refusing a name that is
+// not stored rather than creating a disabled stub.
+func (h host) SetHookEnabled(name string, enabled bool) error {
+	if h.a.state == nil {
+		return errors.New("hooks: no workspace store to write to")
+	}
+	row, ok, err := h.a.state.Hook(name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no such hook %q", name)
+	}
+	row.Enabled = enabled
+	return h.a.state.PutHook(row)
+}
+
+// storeHookRow converts one store row to the control surface's shape.
+func storeHookRow(s store.Hook) control.HookRow {
+	return control.HookRow{
+		Name: s.Name, Action: s.Action, Trigger: s.Trigger, Tree: s.Tree,
+		Agent: s.Agent, CooldownMS: s.CooldownMS, TimeoutMS: s.TimeoutMS,
+		MayWrite: s.MayWrite, Detach: s.Detach, Enabled: s.Enabled,
+	}
+}
+
+// mailStore adapts the workspace store's mail table to the control mailbox's
+// durable hook. It lives here, in the app, because neither package may import
+// the other: the control layer owns the message shape and the store owns the
+// row.
+type mailStore struct{ s *store.Store }
+
+// InsertMail stores one message for a durable identity.
+func (m mailStore) InsertMail(toIdentity string, from uint8, fromKey, fromName, text string, createdMS int64) (int64, error) {
+	return m.s.InsertMail(store.Mail{
+		ToIdentity: toIdentity,
+		FromAuthor: int(from),
+		FromKey:    fromKey,
+		FromName:   fromName,
+		Text:       text,
+		CreatedMS:  createdMS,
+	})
+}
+
+// MarkMailDelivered confirms the rows a recipient's next park handed over.
+func (m mailStore) MarkMailDelivered(ids []int64) error {
+	return m.s.MarkMailDelivered(ids)
+}
+
+// LoadUndeliveredMail reads one identity's unread mail back.
+func (m mailStore) LoadUndeliveredMail(toIdentity string) ([]control.StoredMessage, error) {
+	rows, err := m.s.LoadUndeliveredMail(toIdentity)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]control.StoredMessage, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, control.StoredMessage{
+			ID: r.ID, From: uint8(r.FromAuthor),
+			FromKey: r.FromKey, FromName: r.FromName, Text: r.Text,
+		})
+	}
+	return out, nil
+}
+
+// PruneDeliveredMail drops rows a recipient already confirmed.
+func (m mailStore) PruneDeliveredMail() error {
+	return m.s.PruneDeliveredMail()
 }
 
 // Groups lists a buffer's change sets.
@@ -1394,6 +1681,14 @@ func (h host) Groups(path string) ([]control.Group, error) {
 	overlaps := sess.PendingOverlaps()
 	var out []control.Group
 	for _, g := range sess.Groups() {
+		// A set every live member of which has been reversed out is not a
+		// change any more. Its op records stay in the journal -- the manifest
+		// audits them -- but the listing a driver decides from must not carry
+		// the tombstone, or a buffer accumulates the `0 ops, +0 bytes, 0
+		// hunks` sets a clear left behind.
+		if g.Ops == 0 {
+			continue
+		}
 		c, ok := counts[g.ID]
 		if !ok {
 			// Accepted or rejected: not pending, but its members are still in
@@ -1404,7 +1699,7 @@ func (h host) Groups(path string) ([]control.Group, error) {
 		}
 		cg := control.Group{
 			ID: g.ID, Path: p.File.Path, Author: uint8(g.Author),
-			State: g.State.String(), Ops: g.Ops, Bytes: g.Bytes,
+			State: g.State.String(), Task: g.Task, Ops: g.Ops, Bytes: g.Bytes,
 			First: uint64(g.First), Last: uint64(g.Last),
 			Hunks: c[0], Moved: c[1],
 			Invalid: g.Invalid, InvalidBy: groupCollider(g.InvalidBy),
@@ -1519,7 +1814,7 @@ func (h host) Review(path string, listOnly bool) ([]control.Group, error) {
 	for _, g := range p.File.Session().Pending() {
 		out = append(out, control.Group{
 			ID: g.ID, Path: p.File.Path, Author: uint8(g.Author),
-			State: g.State.String(), Ops: g.Ops, Bytes: g.Bytes,
+			State: g.State.String(), Task: g.Task, Ops: g.Ops, Bytes: g.Bytes,
 			First: uint64(g.First), Last: uint64(g.Last),
 		})
 	}
@@ -1562,6 +1857,32 @@ func (h host) Decide(path string, group uint64, accept bool) error {
 	p.Cursors.Normalize()
 	h.a.Explorer.Tree.MarkChanged(p.File.Path)
 	return nil
+}
+
+// disposeInvalid drops every still-Proposed invalid change set in p and reports
+// how many it disposed. An invalid set has no surviving hunk: accept and reject
+// address nothing, and Pending has already let it go, so ClearGroup is the only
+// gesture that reaches it, and for an invalid Proposed set that is a state-only
+// reject. The bytes a save writes are unchanged either way -- an invalid run is
+// in neither the agreed composition nor, once cleared, the edit composition --
+// which is why a save counts the drop rather than refusing over it. A snapshot
+// holds no decisions to move and is left alone.
+func (a *App) disposeInvalid(p *editor.Pane) int {
+	if p == nil || p.File.IsSnapshot() || !p.File.Session().HasDecisions() {
+		return 0
+	}
+	n := 0
+	// Groups() returns a copy, so the walk is stable while ClearGroup moves the
+	// session's decisions.
+	for _, g := range p.File.Session().Groups() {
+		if g.State != piecetable.Proposed || !g.Invalid {
+			continue
+		}
+		if ok, _ := p.File.ClearGroup(g.ID); ok {
+			n++
+		}
+	}
+	return n
 }
 
 // Clear disposes of a change set in one gesture: a Rejected set is reversed
@@ -1659,11 +1980,11 @@ func (h host) Revert(path string, author uint8) error {
 // The buffer keeps the text — it is in the document, tinted, exactly where the
 // user can see it — and only the user's own save writes it out.
 //
-// The refusal is deliberately not conditional on who is asking. An agent that
-// has had its work accepted can save; one that has not, cannot; and a human
-// second participant is subject to the same rule for the same reason. What
-// makes a save legitimate is that somebody agreed to the change, not which
-// table row the caller occupies.
+// The refusal is about the buffer's state, not the caller. The save verb is
+// the user's: the Guard's identity gate refuses an agent before this runs, so
+// only the local keyboard or a joined human reaches here. What this method
+// decides is whether the agreed composition can be written at all — a buffer
+// with proposals pending waits for the user, whoever is asking.
 //
 // A save from here announces itself the same way App.write's does: connected
 // drivers hear via App.notifySaved, and the live language server hears via
@@ -1675,10 +1996,18 @@ func (h host) Revert(path string, author uint8) error {
 // have dropped a superseded set gets an actionable message naming the set and
 // the two gestures that resolve it, and the set ids ride along so a caller can
 // route the decision. Any other error -- disk changed, an unencodable
-// character -- is the editor's own, returned unchanged.
+// character, a composition the save_check guard refused -- is the editor's
+// own, returned unchanged.
 func saveRefusal(err error) (string, []uint64) {
 	var refused *editor.UnsavedProposedError
-	if !errors.As(err, &refused) {
+	var check *editor.SaveCheckError
+	switch {
+	case errors.As(err, &refused):
+	case errors.As(err, &check):
+		// The composition guard's reason is the whole message; prefixing it
+		// with "save failed" would say the same thing twice.
+		return check.Error(), nil
+	default:
 		return "save failed: " + err.Error(), nil
 	}
 	msg := refused.Error() + "; save with proposed changes to accept them, or `clear` them to discard"
@@ -1717,6 +2046,15 @@ func (h host) Save(path string, force bool) (uint64, error) {
 		return 0, fmt.Errorf("%d proposed change set(s) await the user's approval; "+
 			"the edit is in the buffer and will reach disk when they save", len(pending))
 	}
+	// A save disposes the invalid sets it would otherwise drop, before the
+	// write, and the count rides the status line below, so the drop is
+	// deliberate rather than silent. An invalid set is not Pending, so no
+	// review offered it; this is the gesture that reaches it.
+	discarded := h.a.disposeInvalid(p)
+	if discarded > 0 {
+		h.a.flushJournal(p)
+	}
+	p.File.SaveCheck = h.a.settings.SaveCheck
 	save := p.File.Save
 	if force {
 		// force is the prompt Overwrite: write over a file that changed on
@@ -1728,17 +2066,30 @@ func (h host) Save(path string, force bool) (uint64, error) {
 		save = p.File.SaveOver
 	}
 	if err := save(); err != nil {
-		// The only save that can refuse for a reason beyond disk or encoding is
-		// one whose agreed composition would drop a superseded set; give the
-		// caller the same actionable wording the user's own save shows.
+		// A composition or encoding refusal is the guard refusal: the pane is
+		// protected from a close even when its view matches disk, because the
+		// accepted composition a later save would write is still the one this
+		// refusal named. A disk conflict is not marked: the caller answers a
+		// question about it, and a clean buffer loses nothing either way.
+		if !errors.Is(err, editor.ErrDiskChanged) {
+			p.MarkSaveRefused()
+		}
+		// A save that still refused over a set the disposal could not reach is
+		// surfaced in the same actionable wording the user's own save shows;
+		// anything else -- disk changed, an unencodable character -- is the
+		// editor's own and is returned unchanged.
 		if msg, _ := saveRefusal(err); msg != "save failed: "+err.Error() {
 			return 0, errors.New(msg)
 		}
 		return 0, err
 	}
 	// The bytes reached disk; both announcements are best-effort, like App.write's.
+	p.ClearSaveRefused()
 	h.a.notifySaved(p.File.Path)
 	h.a.lspSaved(p)
+	if discarded > 0 {
+		h.a.status = fmt.Sprintf("saved %s (discarded %d invalid change set(s))", p.File.Name(), discarded)
+	}
 	return uint64(p.File.Session().Version()), nil
 }
 
@@ -2384,16 +2735,20 @@ func lspStatus(st serverState) string {
 // diagnosticsStatus decides whether a cached publish is a reading of the
 // buffer in front of the caller, and words the reason when it is not.
 //
-// It is pure so the rule can be tested without a live server. published is the
-// store's latch, pubVersion the document version that publish applied to (nil
-// when the server sent none), syncedVersion the version the server was last
-// told about, and bufVersion the buffer's current version. A set is a real
-// reading only when it was published for the text the buffer holds now: a
-// publish that predates it, or a server that has not even been told about it,
-// is stale rather than clean. A publish that carried no version cannot be
-// dated here; freshnessLocked refines this verdict for it with the store
-// publish/sync sequence.
-func diagnosticsStatus(published bool, pubVersion *int, syncedVersion, bufVersion int) (status, detail string) {
+// It is pure so the rule can be tested without a live server. path names the
+// document, for the unassociated detail. published is the store's latch,
+// pubVersion the document version that publish applied to (nil when the server
+// sent none), syncedVersion the version the server was last told about, and
+// bufVersion the buffer's current version. items is the published list: a
+// fresh list carrying gopls's "no package for this open file" diagnostic is
+// not a reading of the text, because the server answered without associating
+// the document with any package. A set is a real reading only when it was
+// published for the text the buffer holds now: a publish that predates it, or
+// a server that has not even been told about it, is stale rather than clean.
+// A publish that carried no version cannot be dated here; freshnessLocked
+// resolves that case first, so a stale versionless publish never reaches the
+// unassociated rule.
+func diagnosticsStatus(path string, published bool, pubVersion *int, syncedVersion, bufVersion int, items []lsp.Diagnostic) (status, detail string) {
 	switch {
 	case !published:
 		return control.LSPStatusUnpublished,
@@ -2404,6 +2759,12 @@ func diagnosticsStatus(published bool, pubVersion *int, syncedVersion, bufVersio
 	case pubVersion != nil && *pubVersion != bufVersion:
 		return control.LSPStatusStale,
 			"the language server's diagnostics are for an earlier version of the file"
+	case hasNoPackageDiagnostic(items):
+		// The server answered, but with no package association for the
+		// document: its list carries the "no package" notice, not a reading of
+		// the text, so an otherwise empty list must not read as clean.
+		return control.LSPStatusUnassociated,
+			"the language server has no package for " + path + ", so its diagnostics are not a reading of the text"
 	}
 	return control.LSPStatusOK, ""
 }
@@ -2426,4 +2787,19 @@ func completionKindName(k int) string {
 		return "snippet"
 	}
 	return ""
+}
+
+// syncWaiting tells the server which authors hold a pending proposal, so the
+// roster can derive a quiet participant as waiting rather than idle. It runs
+// on the event thread, which owns the pending set, and replaces the server's
+// copy whole: a set accepted, rejected or cleared drops out.
+func (a *App) syncWaiting() {
+	if a.control == nil || a.control.Participants == nil {
+		return
+	}
+	held := map[uint8]bool{}
+	for _, p := range a.Proposals() {
+		held[p.Author] = true
+	}
+	a.control.Participants.SetPending(held)
 }

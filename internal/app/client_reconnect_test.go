@@ -96,6 +96,7 @@ func (h *harness) dropWatch() {
 // text is refreshed, and no duplicate tab appears.
 func TestClientReconnectsAndResyncs(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
+	srv.typeText("X") // unsaved work is what makes the daemon tab mirror
 	ch := attachClientAt(t, srv, Options{Phone: true}, 120, 30)
 	ch.cli.drain()
 	p := ch.cli.Tabs.Active()

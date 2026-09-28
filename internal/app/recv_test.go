@@ -12,6 +12,7 @@ import (
 // over a real socket: the driver asks, nothing answers, the user says
 // something, the request wakes.
 func TestRecvParksUntilTheUserSays(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "hello world\n")
 	c := h.dial(t)
 
@@ -72,6 +73,7 @@ func TestRecvParksUntilTheUserSays(t *testing.T) {
 // keyed on the author id, and an identity keeps its id across reconnects, so a
 // harness that was restarting still gets what the user said.
 func TestRecvDeliversWhatWasSaidWhileAway(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "x\n")
 
 	first := h.dial(t)
@@ -95,6 +97,7 @@ func TestRecvDeliversWhatWasSaidWhileAway(t *testing.T) {
 // Tell refuses what it cannot deliver rather than queueing into a void: an id
 // nobody holds, the human's own id, and an empty message.
 func TestTellRefusesBadRecipients(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "x\n")
 	c := h.dial(t)
 	hi := c.do(h, control.Request{Op: "hello", Identity: "driver-1"})
@@ -113,6 +116,7 @@ func TestTellRefusesBadRecipients(t *testing.T) {
 // Drivers is what a prompt would offer. Nothing has connected in a fresh
 // editor, which is the case that should be refused rather than asked about.
 func TestDriversListsConnectedAgents(t *testing.T) {
+	t.Parallel()
 	h := controlHarness(t, "x\n")
 	if got := h.Drivers(); len(got) != 0 {
 		t.Fatalf("drivers = %+v in a fresh editor", got)

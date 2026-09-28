@@ -22,6 +22,7 @@ func snippetItem(label, template string) lsp.CompletionItem {
 // on the first placeholder, selected. Without the engine the template's label
 // would be inserted instead and no stop would exist to select.
 func TestSnippetAcceptExpandsAndStartsSession(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", snippetItem("hand", "handler(${1:req})"))
 	h.press("tab")
 
@@ -40,6 +41,7 @@ func TestSnippetAcceptExpandsAndStartsSession(t *testing.T) {
 // Tab moves to the next stop and selects its placeholder, the one key the
 // session claims from the editor.
 func TestSnippetTabAdvancesStops(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", snippetItem("hand", "${1:a}${2:b}"))
 	h.press("tab")
 
@@ -61,6 +63,7 @@ func TestSnippetTabAdvancesStops(t *testing.T) {
 // real buffer selection. The edit also ends the session, so the stops do not
 // survive text that moved them.
 func TestSnippetTypingReplacesSelection(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", snippetItem("hand", "${1:a}${2:b}"))
 	h.press("tab")
 	h.typeText("x")
@@ -76,6 +79,7 @@ func TestSnippetTypingReplacesSelection(t *testing.T) {
 // Escape ends the session and falls through to the editor's cancel, so tab
 // means indent again — the session claims tab only while it is running.
 func TestSnippetEscapeEndsAndTabIndents(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", snippetItem("hand", "${1:a}${2:b}"))
 	h.press("tab")
 	if !h.snippet.active {
@@ -95,6 +99,7 @@ func TestSnippetEscapeEndsAndTabIndents(t *testing.T) {
 // A snippet carried by a textEdit replaces the server's range with the expanded
 // text, not the raw template.
 func TestSnippetTextEditExpandsTheRange(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", lsp.CompletionItem{
 		Label:            "handler",
 		InsertTextFormat: 2,
@@ -119,6 +124,7 @@ func TestSnippetTextEditExpandsTheRange(t *testing.T) {
 // the inserted text right; the stops must move with it or the selection lands
 // on the wrong bytes.
 func TestSnippetStopsFollowAnAdditionalEdit(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", lsp.CompletionItem{
 		Label:            "handler",
 		InsertTextFormat: 2,
@@ -143,6 +149,7 @@ func TestSnippetStopsFollowAnAdditionalEdit(t *testing.T) {
 // A plain completion is untouched: same insert, same one undo, and no session
 // to arbitrate tab against indent.
 func TestPlainCompletionDoesNotStartASession(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", lsp.CompletionItem{Label: "handleRequest", Insert: "handleRequest"})
 	h.press("tab")
 
@@ -157,6 +164,7 @@ func TestPlainCompletionDoesNotStartASession(t *testing.T) {
 // Shift+tab steps back through the stops and stops at the first one rather than
 // wrapping, so a mistaken key cannot leave the snippet.
 func TestSnippetShiftTabStepsBack(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", snippetItem("hand", "${1:a}${2:b}"))
 	h.press("tab")
 	h.press("tab")
@@ -172,6 +180,7 @@ func TestSnippetShiftTabStepsBack(t *testing.T) {
 // as accepting a plain word. Without the single change group, the delete of the
 // prefix and the insert of the expansion would be two undo steps.
 func TestSnippetAcceptIsOneUndo(t *testing.T) {
+	t.Parallel()
 	h := acceptServerEdit(t, "hand", snippetItem("hand", "handler(${1:req})"))
 	h.press("tab")
 	if !h.snippet.active {

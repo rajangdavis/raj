@@ -176,8 +176,8 @@ func TestRootFor(t *testing.T) {
 // and fails, which is the point. The value is
 // "raj-" + slug("raj") + "-" + the first four bytes of sha256 of the path.
 func TestStateKeyGolden(t *testing.T) {
-	const path = "/Users/rajandavis/Desktop/projects/raj"
-	const want = "raj-raj-89862ebb"
+	const path = "/repo/raj"
+	const want = "raj-raj-e30ba01d"
 	if got := workspace.StateKey([]string{path}); got != want {
 		t.Errorf("StateKey(%q) = %q, want %q", path, got, want)
 	}

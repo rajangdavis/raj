@@ -15,11 +15,13 @@ import (
 // left alone, so a newer raj can add a setting to the store without an older
 // one misreading it.
 const (
-	settingTabWidth   = "tab_width"
-	settingTabs       = "tabs"
-	settingWrap       = "wrap"
-	settingAutoPairs  = "auto_pairs"
-	settingInlayHints = "inlay_hints"
+	settingTabWidth    = "tab_width"
+	settingTabs        = "tabs"
+	settingWrap        = "wrap"
+	settingAutoPairs   = "auto_pairs"
+	settingInlayHints  = "inlay_hints"
+	settingSaveCheck   = "save_check"
+	settingSaveConfirm = "save_confirm"
 )
 
 // Options is the launch configuration main hands to NewWithOptions. Each *Set
@@ -112,6 +114,17 @@ type ResolvedSettings struct {
 	Wrap       bool
 	AutoPairs  bool
 	InlayHints bool
+
+	// SaveCheck is the composition guard a save applies to the agreed
+	// composition; it is the resolved save_check setting. It rides to the File
+	// at the save gesture, where SaveOver reads it.
+	SaveCheck editor.SaveCheck
+
+	// SaveConfirm is whether a save holding another writer's proposed sets
+	// warns first; it is the resolved save_confirm setting, on by default. The
+	// confirm is a warning, never a guard, so turning it off only skips the
+	// prompt — the save still goes through.
+	SaveConfirm bool
 }
 
 // defaultSettings is the built-in baseline. tabWidth is the caller's own
@@ -122,10 +135,12 @@ func defaultSettings(tabWidth int) ResolvedSettings {
 		tabWidth = 2
 	}
 	return ResolvedSettings{
-		TabWidth:   tabWidth,
-		Wrap:       true,
-		AutoPairs:  true,
-		InlayHints: true,
+		TabWidth:    tabWidth,
+		Wrap:        true,
+		AutoPairs:   true,
+		InlayHints:  true,
+		SaveCheck:   editor.SaveCheckOff,
+		SaveConfirm: true,
 	}
 }
 
@@ -179,6 +194,20 @@ func resolveSettings(def ResolvedSettings, user, workspace map[string]string) (R
 					continue
 				}
 				out.InlayHints = b
+			case settingSaveCheck:
+				v, ok := parseSaveCheckSetting(raw)
+				if !ok {
+					bad = append(bad, scope+"/"+key)
+					continue
+				}
+				out.SaveCheck = v
+			case settingSaveConfirm:
+				b, ok := parseBoolSetting(raw)
+				if !ok {
+					bad = append(bad, scope+"/"+key)
+					continue
+				}
+				out.SaveConfirm = b
 			}
 		}
 	}
@@ -213,6 +242,14 @@ func parseBoolSetting(raw string) (bool, bool) {
 		return false, false
 	}
 	return b, true
+}
+
+// parseSaveCheckSetting maps a save_check value to a mode, reporting false for a
+// spelling it does not know so resolveSettings can report the bad key and leave
+// the lower scope or the default in charge, exactly as it does for a bad bool
+// or width.
+func parseSaveCheckSetting(raw string) (editor.SaveCheck, bool) {
+	return editor.ParseSaveCheck(raw)
 }
 
 // LSP override keys. A language's server is chosen by `lsp.<lang>.command`, an
@@ -257,7 +294,7 @@ func parseLPSSettingKey(key string) (lang, field string, ok bool) {
 // the settings menu.
 func knownSetting(key string) bool {
 	switch key {
-	case settingTabWidth, settingTabs, settingWrap, settingAutoPairs, settingInlayHints:
+	case settingTabWidth, settingTabs, settingWrap, settingAutoPairs, settingInlayHints, settingSaveCheck, settingSaveConfirm:
 		return true
 	}
 	_, _, ok := parseLPSSettingKey(key)
@@ -274,7 +311,10 @@ func settingValueValid(key, raw string) bool {
 	case settingTabWidth:
 		_, ok := parseIntSetting(raw)
 		return ok
-	case settingTabs, settingWrap, settingAutoPairs, settingInlayHints:
+	case settingSaveCheck:
+		_, ok := parseSaveCheckSetting(raw)
+		return ok
+	case settingTabs, settingWrap, settingAutoPairs, settingInlayHints, settingSaveConfirm:
 		_, ok := parseBoolSetting(raw)
 		return ok
 	}
@@ -318,11 +358,13 @@ func tabWidthExplicit(o Options, user, workspace map[string]string) bool {
 // SetSetting.
 func (r ResolvedSettings) values() map[string]string {
 	return map[string]string{
-		settingTabWidth:   strconv.Itoa(r.TabWidth),
-		settingTabs:       strconv.FormatBool(r.Tabs),
-		settingWrap:       strconv.FormatBool(r.Wrap),
-		settingAutoPairs:  strconv.FormatBool(r.AutoPairs),
-		settingInlayHints: strconv.FormatBool(r.InlayHints),
+		settingTabWidth:    strconv.Itoa(r.TabWidth),
+		settingTabs:        strconv.FormatBool(r.Tabs),
+		settingWrap:        strconv.FormatBool(r.Wrap),
+		settingAutoPairs:   strconv.FormatBool(r.AutoPairs),
+		settingInlayHints:  strconv.FormatBool(r.InlayHints),
+		settingSaveCheck:   r.SaveCheck.String(),
+		settingSaveConfirm: strconv.FormatBool(r.SaveConfirm),
 	}
 }
 
@@ -441,6 +483,14 @@ func (a *App) applySetting(key, value string) {
 		for _, p := range a.Tabs.All() {
 			p.Hints = b
 		}
+	case settingSaveCheck:
+		a.settings.SaveCheck, _ = editor.ParseSaveCheck(value)
+	case settingSaveConfirm:
+		b, ok := parseBoolSetting(value)
+		if !ok {
+			return
+		}
+		a.settings.SaveConfirm = b
 	}
 }
 

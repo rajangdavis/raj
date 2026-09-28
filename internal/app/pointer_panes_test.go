@@ -62,6 +62,7 @@ func middleClick(h *harness, col, row int) {
 // Clicking a tab switches to it. The bar is drawn from labels of varying width,
 // so this is the case that would break first if the spans were recomputed.
 func TestClickTabSwitches(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	root := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(root, "main.go"))
@@ -82,6 +83,7 @@ func TestClickTabSwitches(t *testing.T) {
 // each column of each label in turn is the cheap exhaustive version of the test
 // above, and it is what catches an off-by-one at a tab boundary.
 func TestClickEveryColumnOfEveryTab(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	root := h.Explorer.Tree.Root
 	for _, name := range []string{"main.go", "README.md", "pkg/helper.go", "pkg/other.go"} {
@@ -110,6 +112,7 @@ func TestClickEveryColumnOfEveryTab(t *testing.T) {
 // Middle-click closes the tab under the pointer, which need not be the active
 // one — that is the whole point of aiming at it.
 func TestMiddleClickClosesTheTabUnderThePointer(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	root := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(root, "main.go"))
@@ -130,6 +133,7 @@ func TestMiddleClickClosesTheTabUnderThePointer(t *testing.T) {
 // A tab holding unsaved work asks before closing, however it was asked to. The
 // pointer must not be a way round the guard the chord respects.
 func TestMiddleClickOnDirtyTabAsksFirst(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.OpenFile(filepath.Join(h.Explorer.Tree.Root, "main.go"))
 	h.typeText("x")
@@ -152,6 +156,7 @@ func TestMiddleClickOnDirtyTabAsksFirst(t *testing.T) {
 
 // Clicking a file in the tree opens it, on the first click.
 func TestClickExplorerFileOpens(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 
@@ -169,6 +174,7 @@ func TestClickExplorerFileOpens(t *testing.T) {
 // Clicking a directory folds it rather than opening anything, which is what
 // enter does on one and what the disclosure triangle says will happen.
 func TestClickExplorerDirectoryExpands(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	before := len(h.Explorer.Tree.Entries())
@@ -187,6 +193,7 @@ func TestClickExplorerDirectoryExpands(t *testing.T) {
 // Clicking a binary refuses out loud. A status line under a tree that still
 // shows the name it just declined reads as nothing having happened.
 func TestClickBinaryInExplorerRefusesLoudly(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	bin := filepath.Join(h.Explorer.Tree.Root, "a.out")
 	if err := os.WriteFile(bin, []byte("\x7fELF\x02\x00garbage"), 0o644); err != nil {
@@ -211,6 +218,7 @@ func TestClickBinaryInExplorerRefusesLoudly(t *testing.T) {
 
 // The changed-only toggle is drawn as a checkbox, so clicking it flips it.
 func TestClickExplorerFilterToggle(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 20)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	before := h.Explorer.Tree.ChangedOnly
@@ -227,6 +235,7 @@ func TestClickExplorerFilterToggle(t *testing.T) {
 
 // Clicking a match opens its file at its line.
 func TestClickSearchMatchOpensAtLine(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -261,6 +270,7 @@ func TestClickSearchMatchOpensAtLine(t *testing.T) {
 
 // Clicking a file header folds it, which is what enter does on one.
 func TestClickSearchHeaderFolds(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -291,6 +301,7 @@ func TestClickSearchHeaderFolds(t *testing.T) {
 // A search option is drawn as a checkbox, so clicking it flips that option and
 // not one of its neighbours — they sit three columns apart.
 func TestClickSearchToggles(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -309,6 +320,7 @@ func TestClickSearchToggles(t *testing.T) {
 // Clicking into the query field places the caret where it was clicked, so
 // typing lands there rather than at the end.
 func TestClickSearchFieldPlacesCaret(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	h.openSidebar("shift+super+f", SidebarSearch)
 	h.typeText("needle")
@@ -326,6 +338,7 @@ func TestClickSearchFieldPlacesCaret(t *testing.T) {
 
 // A dialog is modal, so a press on the tab bar behind it must not reach it.
 func TestPromptSwallowsClicksBehindIt(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	root := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(root, "main.go"))
@@ -348,6 +361,7 @@ func TestPromptSwallowsClicksBehindIt(t *testing.T) {
 
 // Clicking a dialog's button answers with it rather than merely selecting it.
 func TestClickPromptButtonAnswers(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.OpenFile(filepath.Join(h.Explorer.Tree.Root, "main.go"))
 	h.typeText("x")
@@ -369,6 +383,7 @@ func TestClickPromptButtonAnswers(t *testing.T) {
 
 // Clicking a result in the file picker opens it.
 func TestClickPickerResultOpens(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.press("super+p")
 	if !h.Picker.Open {

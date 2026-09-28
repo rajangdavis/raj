@@ -47,6 +47,7 @@ func editorOrigin(h *harness) (x, y int) {
 
 // A click puts the cursor where it landed.
 func TestClickMovesTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "first line\nsecond line\nthird line\n")
 	ox, oy := editorOrigin(h)
 	click(h, ox+3, oy+1, 0)
@@ -60,6 +61,7 @@ func TestClickMovesTheCursor(t *testing.T) {
 // A press outside the text area is not the editor's. Clicking the gutter must
 // not move the cursor to column zero of that line by accident.
 func TestClickOutsideTheTextAreaIsIgnored(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "first line\nsecond line\n")
 	ox, oy := editorOrigin(h)
 	before := h.Pane().Cursors.Primary().Head
@@ -72,6 +74,7 @@ func TestClickOutsideTheTextAreaIsIgnored(t *testing.T) {
 
 // A drag selects, and keeps its anchor where the press was.
 func TestDragSelects(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	ox, oy := editorOrigin(h)
 
@@ -91,6 +94,7 @@ func TestDragSelects(t *testing.T) {
 // the drag, and a pointer wandering across the screen afterwards is not a
 // selection.
 func TestMotionAfterReleaseDoesNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	ox, oy := editorOrigin(h)
 
@@ -109,6 +113,7 @@ func TestMotionAfterReleaseDoesNothing(t *testing.T) {
 // A release outside the editor still ends the drag. Leaving the flag set would
 // make the next pointer movement extend a selection nobody is holding.
 func TestReleaseOutsideTheEditorEndsTheDrag(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 30)
 	h.OpenFile(h.primaryRoot() + "/main.go")
 	h.drain()
@@ -125,6 +130,7 @@ func TestReleaseOutsideTheEditorEndsTheDrag(t *testing.T) {
 // Two rapid presses in one place select a word; three select the line. Two far
 // apart are two clicks however quickly they arrive.
 func TestDoubleAndTripleClick(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha beta gamma\nsecond line\n")
 	ox, oy := editorOrigin(h)
 
@@ -143,6 +149,7 @@ func TestDoubleAndTripleClick(t *testing.T) {
 }
 
 func TestClicksFarApartAreNotADoubleClick(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "alpha beta gamma\n")
 	ox, oy := editorOrigin(h)
 
@@ -156,6 +163,7 @@ func TestClicksFarApartAreNotADoubleClick(t *testing.T) {
 // A slow second press is a new click. The tracker is a real threshold, not
 // "whatever happened last".
 func TestSlowSecondClickIsNotADouble(t *testing.T) {
+	t.Parallel()
 	var c clickTracker
 	now := time.Now()
 	if got := c.press(5, 5, now); got != 1 {
@@ -169,6 +177,7 @@ func TestSlowSecondClickIsNotADouble(t *testing.T) {
 // A fourth click starts over rather than doing nothing, so hammering the
 // button cycles rather than sticking on "line selected".
 func TestFourthClickStartsOver(t *testing.T) {
+	t.Parallel()
 	var c clickTracker
 	now := time.Now()
 	want := []int{1, 2, 3, 1, 2}
@@ -182,6 +191,7 @@ func TestFourthClickStartsOver(t *testing.T) {
 // Shift-click extends from where the cursor is, which is how a selection is
 // made without holding the button.
 func TestShiftClickExtends(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	ox, oy := editorOrigin(h)
 
@@ -199,6 +209,7 @@ func TestShiftClickExtends(t *testing.T) {
 
 // A modifier click adds a cursor rather than moving the existing one.
 func TestModifierClickAddsACursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\nthree\n")
 	ox, oy := editorOrigin(h)
 
@@ -212,6 +223,7 @@ func TestModifierClickAddsACursor(t *testing.T) {
 // Clicking the editor focuses it, so the next keystroke goes where the click
 // went rather than to whatever had focus before.
 func TestClickFocusesTheEditor(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 30)
 	h.OpenFile(h.primaryRoot() + "/main.go")
 	h.drain()
@@ -229,6 +241,7 @@ func TestClickFocusesTheEditor(t *testing.T) {
 
 // Right and middle buttons do nothing rather than something surprising.
 func TestOtherButtonsDoNothing(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello\n")
 	before := h.Pane().Cursors.Primary().Head
 	for _, b := range []keys.MouseButton{keys.MouseRight, keys.MouseMiddle} {
@@ -242,6 +255,7 @@ func TestOtherButtonsDoNothing(t *testing.T) {
 
 // Clicking with no file open must not panic.
 func TestClickWithNoPane(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	for _, p := range h.Tabs.All() {
 		h.Tabs.Focus(p)
@@ -259,6 +273,7 @@ func TestClickWithNoPane(t *testing.T) {
 // is an ordinary left click: it falls through to clickSidebar, which opens the
 // file, and no menu ever appears.
 func TestCtrlClickExplorerRowOpensMenu(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -284,6 +299,7 @@ func TestCtrlClickExplorerRowOpensMenu(t *testing.T) {
 // under the pointer, not for the active one. Without the ctrl branch the press
 // is a plain left click, which selects the tab and opens no menu.
 func TestCtrlClickTabOpensTabMenu(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))
@@ -313,6 +329,7 @@ func TestCtrlClickTabOpensTabMenu(t *testing.T) {
 // straight to rightClick — the press would resolve no target, rightClick would
 // return without opening anything, and the caret would never move.
 func TestCtrlClickInEditorIsAPlainClick(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "first line\nsecond line\nthird line\n")
 	ox, oy := editorOrigin(h)
 
@@ -331,6 +348,7 @@ func TestCtrlClickInEditorIsAPlainClick(t *testing.T) {
 // opens no menu. The ctrl condition is what keeps the gesture from being wired
 // to every left press, which would open a menu instead of selecting.
 func TestPlainLeftClickStillSelectsNoMenu(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 160, 24)
 	dir := h.Explorer.Tree.Root
 	h.OpenFile(filepath.Join(dir, "main.go"))
@@ -357,6 +375,7 @@ func TestPlainLeftClickStillSelectsNoMenu(t *testing.T) {
 // is the ordering guard — a ctrl check placed above that block would dismiss
 // the menu and resolve the press again instead of choosing.
 func TestCtrlClickChoosesOpenMenuRow(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	h.openSidebar("shift+super+e", SidebarExplorer)
 	h.drain()
@@ -384,6 +403,7 @@ func TestCtrlClickChoosesOpenMenuRow(t *testing.T) {
 // selects that entry. Without the tall rows the second row is the next entry
 // and the tap opens the wrong file.
 func TestPhoneExplorerTallBlockIsTheTapTarget(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "x\n", 120, 30)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
 	first := filepath.Join(dir, "aaa.go")
@@ -423,6 +443,7 @@ func TestPhoneExplorerTallBlockIsTheTapTarget(t *testing.T) {
 // first row of the next block is the neighbour. Without the shared mapping the
 // app would resolve the lower row to the next entry.
 func TestPhoneExplorerMenuRowUsesTallBlocks(t *testing.T) {
+	t.Parallel()
 	h := newPhoneHarnessSize(t, "x\n", 120, 30)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
 	if err := os.WriteFile(filepath.Join(dir, "aaa.go"), []byte("package aaa\n"), 0o644); err != nil {

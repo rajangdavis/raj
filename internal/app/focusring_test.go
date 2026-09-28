@@ -9,6 +9,7 @@ import "testing"
 // The explorer opens on the tree rather than its filter field, so the first
 // shift+tab walks back within the pane and only the second leaves it.
 func TestShiftTabLeavesTheExplorerBackwards(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "body")
 	h.press("shift+super+e")
 	if h.Focused() != FocusSidebar {
@@ -27,6 +28,7 @@ func TestShiftTabLeavesTheExplorerBackwards(t *testing.T) {
 }
 
 func TestShiftTabLeavesTheSearchPaneBackwards(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "body")
 	h.press("shift+super+f")
 	if h.Focused() != FocusSidebar {
@@ -42,6 +44,7 @@ func TestShiftTabLeavesTheSearchPaneBackwards(t *testing.T) {
 // Only from the first component. Elsewhere shift+tab still walks the ring, or
 // the pane would be impossible to move backwards through at all.
 func TestShiftTabWalksBackWithinThePane(t *testing.T) {
+	t.Parallel()
 	// Tall enough for the full layout: the compact one has no glob fields to
 	// walk back through.
 	h := newHarnessSize(t, "body", 120, 24)
@@ -65,6 +68,7 @@ func TestShiftTabWalksBackWithinThePane(t *testing.T) {
 // one-key route in would make editing interruptible — that is the constraint
 // the old dead end was protecting, and it must survive.
 func TestTabInTheEditorDoesNotReturnToTheSidebar(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "body")
 	h.press("shift+super+e")
 	h.press("shift+tab", "shift+tab")
@@ -89,6 +93,7 @@ func TestTabInTheEditorDoesNotReturnToTheSidebar(t *testing.T) {
 // Forward still exits too — the change must not have traded one dead end for
 // another.
 func TestTabStillLeavesTheExplorerForwards(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "body")
 	h.press("shift+super+e")
 	for i := 0; i < 8 && h.Focused() == FocusSidebar; i++ {

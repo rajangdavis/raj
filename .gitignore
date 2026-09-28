@@ -3,3 +3,9 @@ raj
 .tool-versions
 bin/raj-linux 
 bin/raj
+
+# The dev process is out of the product: dev docs and the cycle scripts are not shipped.
+/docs/dev/
+/scripts/raj-cycle.sh
+/scripts/raj-cycle.test.sh
+/scripts/call-runs.mjs

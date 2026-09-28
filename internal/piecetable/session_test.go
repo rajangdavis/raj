@@ -31,6 +31,32 @@ func TestApplyDiffClean(t *testing.T) {
 	}
 }
 
+// A hunk that replaces a range with the bytes already there changes nothing,
+// so it must not open a change set: a set whose only member nets zero is a
+// listing with nothing to review, and it is how zero-op sets accumulated. An
+// empty hunk is skipped the same way before it reaches the rebase.
+func TestApplyDiffNoOpOpensNoSet(t *testing.T) {
+	for name, s := range sessions("aaa bbb ccc") {
+		before := s.Version()
+		if _, conflicts, _ := s.ApplyDiff(Agent, before, []Hunk{
+			{Start: 0, End: 3, Text: "aaa"},
+			{Start: 4, End: 7, Text: "bbb"},
+			{Start: 8, End: 8, Text: ""},
+		}); len(conflicts) != 0 {
+			t.Fatalf("%s: unexpected conflicts %+v", name, conflicts)
+		}
+		if got := s.Version(); got != before {
+			t.Errorf("%s: version moved %d -> %d on a no-op diff", name, before, got)
+		}
+		if gs := s.Groups(); len(gs) != 0 {
+			t.Errorf("%s: groups = %+v, want no set from a no-op diff", name, gs)
+		}
+		if got := text(s); got != "aaa bbb ccc" {
+			t.Errorf("%s: text = %q, want it unchanged", name, got)
+		}
+	}
+}
+
 // Offsets written against an old version are carried forward, not applied
 // literally: the user typing earlier in the file must not misplace agent edits.
 func TestApplyDiffRebasesStaleOffsets(t *testing.T) {

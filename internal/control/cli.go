@@ -10,9 +10,13 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"raj/internal/git"
+	"raj/internal/intent"
 	"raj/internal/syntax"
 )
 
@@ -45,6 +49,23 @@ import (
 // 0 success, 1 refusal, 2 usage. A shell tool reports the code, so a refusal
 // has to be a non-zero exit and not a cheerful message: an agent that reads
 // "could not find that text" on exit 0 will carry on as though it had worked.
+//
+// 3 means cancelled, not failed: no message arrived while parked, or another
+// reader took this identity's mailbox (superseded). A parked loop should
+// re-park on 3 rather than back off, which is why it is distinct from 1.
+//
+// 4 means the daemon was unreachable (could not locate or connect) and 5 means
+// the connection was lost mid-conversation. Both are transport failures rather
+// than refusals: a parked loop re-parks promptly on 5, because a restart is
+// transient and durable mail replays at the next park, but backs off on 4
+// rather than spin while nothing is listening.
+
+// Exit codes a parked reader must tell apart. 0/1/2 are used as literals
+// throughout; these are named because recv branches on them.
+const (
+	exitUnreachable = 4
+	exitConnLost    = 5
+)
 
 const ctlUsage = `usage: raj ctl <command> [options]
 
@@ -58,24 +79,34 @@ const ctlUsage = `usage: raj ctl <command> [options]
   rename <old> <new>         move a file within the workspace, carrying an open clean buffer; alias: mv
   delete <path>              propose deleting a file for the user to review; claim-gated
   delete --withdraw <path>   retract a pending deletion you proposed
+  delete --approve <path>    carry out a pending deletion (the human answer; human only)
   deletions                  list the pending deletions (path and author)
   rmdir <dir>                propose removing a directory and its subtree for review; claim-gated
   rmdir --withdraw <dir>     retract a pending dir-removal you proposed
+  rmdir --approve <dir>      carry out a pending dir-removal (the human answer; human only)
   rmdirs                     list the pending dir-removals (dir and author)
   proposals [--mine]         every pending proposal: change sets, deletions, dir-removals
 
   claim [path]...            set the working set; --add extends it, --clear releases it
   goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
+  reveal <path> [--start N --end N]
+                             put a file in front of the user, and every attached client; --start/--end is a byte span to place the caret at
   close [path]                close a buffer; refused while it has unsaved work, --discard drops it anyway and reports whether the file remains
   whoami                     the author id this connection writes as
-  register [--as KEY]        mint an explicit identity key; --as binds a chosen one
+  register [--as KEY] [--task ID]  mint an explicit identity key; --as and --task bind a chosen one and its work
   token                      the running server's TCP token, read from a local socket
-  who [--live]               everyone writing in this workspace; --live filters to connected
-  recv                       wait for the user to say something, then print it
-  groups [path]              change sets in a buffer, and their state
-  accept [path] --group N    agree to a change set; --all for every pending one
-  reject [path] --group N    mark a set rejected; --all for every pending one
-  clear [path] --group N     hard-purge a rejected change set; --all for every rejected one
+  who [--live]               everyone writing in this workspace; --live filters to connected  state [set working|blocked|review|idle]
+                             report or set this connection's working state; --task, --on and --note are optional
+
+  recv                       wait for the user, or a peer, to say something, then print it; --peers-only drops the editor's notices and keeps waiting for a person or peer
+  send --to WHO [TEXT]       message another agent: WHO is a key, name, id or all; --text-file - reads stdin
+  groups [path]              change sets in a buffer, and their state; --task T lists one task's sets across the workspace, each qualified by its buffer path
+  intent SUBCOMMAND          intentions over a base: new|add|remove|list|show|export|materialise; --ref is the base, --group/positional ids are members, --task selects a task's groups; export writes objects only and moves no ref
+
+  accept [path] --group N    agree to a change set; --all for the buffer's pending ones, --all --everywhere for the workspace's
+  reject [path] --group N    mark a set rejected; --all for the buffer's pending ones, --all --everywhere for the workspace's
+  clear [path] --group N     hard-purge a rejected change set; --all for the buffer's rejected or invalid ones, --all --everywhere for the workspace's
+
   revert [path] [--author N] discard your own pieces; the inverse of attribution
   diff [path]                pending change sets as old→new text, for review
   review [path]              enter review mode and list pending change sets; --json lists without entering
@@ -86,13 +117,14 @@ const ctlUsage = `usage: raj ctl <command> [options]
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] --dump N      replace a snapshot's text; the editor diffs and applies
   lsp MODE [path] LINE:COL   hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics, inlay-hints, symbols, format, range-format or document-symbols
-  lsp diagnostics [path...]  cached diagnostics for one or more files, in one call
+  lsp diagnostics [path...]  cached diagnostics for one or more files; --all sweeps the changed files
   lsp symbols [path] LINE:COL [query]
                              project-wide symbols matching query, from the language server
   lsp document-symbols [path]
                              one file's declarations from the language server, as a tree
   lsp inlay-hints [path] [--lines A,B]
                              inlay hints for a file or a 1-based inclusive line range
+  git MODE [path]            read-only git: status, diff, show, numstat or log
   apply [path] --base N [--start N --end N [--text S | --text-file F | -- TEXT]]
                              replace bytes [start,end) with text; -- passes a
                              body beginning with "-"
@@ -102,9 +134,10 @@ const ctlUsage = `usage: raj ctl <command> [options]
   edit [path] --old S --new S replace an exact string (convenience over apply);
                              -- OLD NEW passes strings beginning with "-", and
                              --verbatim strips one trailing newline from a file
-  save [path]                write a buffer to disk; --force overwrites a file that changed on disk
+  save [path]                write a buffer to disk; --all saves every dirty buffer, --force overwrites a file that changed on disk
+  land <task>                accept every pending set of <task> and save each buffer whose pending sets are all that task's; human only
   reload [path]              take the version on disk, discarding unsaved changes
-  exec -- CMD [ARGS...]      run a command; refused while buffers are unsaved
+  exec [--projected] -- CMD  run a command; --projected runs against a materialised tree of the live buffers
   stats                      what the exec policy has cost this session
   run --prog BYTES           run a program of opcodes; @FILE or - for stdin
 
@@ -220,13 +253,19 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	dumpID := fs.Uint64("dump", 0, "patch: the snapshot id, from dump")
 	identity := fs.String("as", "", "identity to write as; the same one reconnecting keeps its author id")
 	name := fs.String("name", "", "display name for this participant")
+	task := fs.String("task", "", "the work this connection's writes belong to, stored on the participant; groups: only sets opened under it")
+
+	intentRef := fs.String("ref", "", "intent new: the base ref")
+	intentDryRun := fs.Bool("dry-run", false, "intent materialise: report the tree without recording an export")
 	dir := fs.String("dir", "", "exec: directory to run in, inside the workspace")
+	projected := fs.Bool("projected", false, "exec: run against a materialised projection of the live buffers instead of the worktree")
 	var query searchPatternFlag
 	fs.Var(&query, "q", "search: the pattern; repeatable, one pattern per -q, any pattern may match")
 	var atSpans atSpanFlag
-	fs.Var(&atSpans, "at", "read: PATH=LO,HI, a 1-based inclusive line span for that path; repeatable")
-	include := fs.String("include", "", "search: comma-separated globs to search")
-	exclude := fs.String("exclude", "", "search: comma-separated globs to skip")
+	fs.Var(&atSpans, "at", "read: PATH=LO,HI, a 1-based inclusive line span for that path; repeatable, one span per entry")
+	var includes, excludes globList
+	fs.Var(&includes, "include", "search: globs to search as `GLOB`; repeatable or comma-separated")
+	fs.Var(&excludes, "exclude", "search: globs to skip as `GLOB`; repeatable or comma-separated")
 	searchPath := fs.String("path", "", "search: limit the walk to a directory under the workspace root; the scope itself is searched even when hidden")
 	regex := fs.Bool("regex", false, "search: treat the pattern as a regular expression")
 	matchCase := fs.Bool("case", false, "search: match case")
@@ -237,12 +276,15 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	start := fs.Int("start", -1, "apply/read: first byte of the span")
 	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
 	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over --start/--end")
+	gitRev := fs.String("rev", "", "git: the revision show/diff/numstat read; default HEAD")
+	gitCount := fs.Int("count", 0, "git log: the most commits to list; 0 is git's default")
 	context := fs.Int("context", 0, "search: lines of context before and after each hit; 0 is the hit line alone")
 	annotated := fs.Bool("annotated", false, "read: report the change set and state of each run; --json adds them as states, plain adds run lines after the text")
 	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
 	discard := fs.Bool("discard", false, "close: discard unsaved changes instead of refusing the close")
 	force := fs.Bool("force", false, "save: overwrite a file that changed on disk, the prompt Overwrite")
-	withdraw := fs.Bool("withdraw", false, "delete: retract your pending deletion instead of proposing one")
+	withdraw := fs.Bool("withdraw", false, "delete/rmdir: retract your pending removal instead of proposing one")
+	approve := fs.Bool("approve", false, "delete/rmdir: carry out a pending removal, the human answer; human only")
 	claimAdd := fs.Bool("add", false, "claim: extend the current set instead of replacing it")
 	claimClear := fs.Bool("clear", false, "claim: release the whole set")
 	textArg := fs.String("text", "", "apply: replacement text")
@@ -254,14 +296,20 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	newText := fs.String("new", "", "edit: the replacement text")
 	oldFile := fs.String("old-file", "", "edit: read --old from a file, or - for stdin")
 	newFile := fs.String("new-file", "", "edit: read --new from a file, or - for stdin")
-	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject/clear: every change set")
+	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject/clear: every change set in the active buffer; lsp diagnostics: sweep the changed files; save: every dirty buffer")
+	everywhere := fs.Bool("everywhere", false, "accept/reject/clear: widen a bulk decision from the active buffer to every buffer in the workspace")
 	mine := fs.Bool("mine", false, "groups, proposals, revert: only the connection's own work")
 	revertAuthor := fs.Uint("author", 0, "revert: the writer whose pieces to drop; must be your own author id")
 	state := fs.String("state", "", "groups: only sets in this state: proposed, accepted or rejected")
 	pendingOnly := fs.Bool("pending", false, "groups: only sets still awaiting a decision")
 	verbatim := fs.Bool("verbatim", false, "apply/edit: strip one trailing newline read from a file or stdin")
 	live := fs.Bool("live", false, "who: only participants connected right now, not every id the process has minted")
+	stateOn := fs.String("on", "", "state set: who the declared state is waiting on — user or another participant's key")
+	stateNote := fs.String("note", "", "state set: free text to show beside the declared state")
+
 	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
+	peersOnly := fs.Bool("peers-only", false, "recv: drop the editor's notices (author 0) and keep waiting for a person or peer")
+	sendTo := fs.String("to", "", "send: the recipient — a key, a name, an author id, or all")
 	// Everything after "--" is another program's argv and must reach it intact:
 	// `raj ctl exec -- go test -run X` has to give go its own -run, not have it
 	// parsed as ours or shuffled by reorder.
@@ -289,8 +337,41 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	path := fs.Arg(0)
+	// taskGiven tells an explicit --task, including an empty one (the
+	// untasked bucket `groups` can filter to), from a command that named no
+	// task at all.
+	taskGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "task" {
+			taskGiven = true
+		}
+	})
 	if code := refuseExtraArgs(cmd, fs, stderr); code != 0 {
 		return code
+	}
+
+	// save --all is already the whole workspace, so --everywhere names no wider
+	// scope and would be dropped; refuse it like the bare --everywhere case
+	// rather than accept a flag with no effect.
+	if *everywhere && cmd == "save" {
+		fmt.Fprintln(stderr, "raj ctl save: --everywhere names no wider scope; save --all already covers every buffer")
+		return 2
+	}
+	// --everywhere widens a bulk --all and nothing else; on its own it names a
+	// scope with no bulk decision to widen, so refuse it rather than quietly
+	// doing what the bare verb would have.
+	if *everywhere && !*all &&
+		(cmd == "accept" || cmd == "reject" || cmd == "clear") {
+		fmt.Fprintf(stderr, "raj ctl %s: --everywhere widens --all; pass both\n", cmd)
+		return 2
+	}
+
+	// --approve is the human answer and --withdraw retracts a proposal; they
+	// name opposite outcomes for one removal, so refuse the pair here, before
+	// the dial, rather than letting the server pick one.
+	if *approve && *withdraw && (cmd == "delete" || cmd == "rmdir") {
+		fmt.Fprintf(stderr, "raj ctl %s: --approve and --withdraw are opposite answers; pass one\n", cmd)
+		return 2
 	}
 
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
@@ -305,12 +386,12 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	sock, err := Locate(firstOf(*addr, *socket), cwd)
 	if err != nil {
 		fmt.Fprintln(stderr, "raj ctl:", err)
-		return 1
+		return exitUnreachable
 	}
 	c, err := Dial(sock)
 	if err != nil {
 		fmt.Fprintf(stderr, "raj ctl: cannot reach raj on %s: %v\n", sock, err)
-		return 1
+		return exitUnreachable
 	}
 	defer c.Close()
 	// Before anything with a path in it. The editor may be on the other side of
@@ -330,9 +411,13 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	// anonymously, exactly as it did before this handshake.
 	// register is the explicit path: it mints and binds its own key below, so
 	// the generic bind is skipped and no anonymous adopted token is printed.
+	// A harness pins the work with RAJ_TASK, the counterpart to RAJ_IDENTITY,
+	// so a brief generator sets one variable and every command the session
+	// runs carries its task. An explicit --task wins.
+	taskVal := firstOf(*task, os.Getenv("RAJ_TASK"))
 	if cmd != "register" {
 		bind := firstOf(*identity, os.Getenv("RAJ_IDENTITY"))
-		if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: *name}); err == nil && hi.Err == "" {
+		if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: *name, Task: taskVal}); err == nil && hi.Err == "" {
 			if bind == "" && hi.Identity != "" {
 				adoptedIdentity = hi.Identity
 				fmt.Fprintf(stderr, "set RAJ_IDENTITY=%s\n", hi.Identity)
@@ -373,7 +458,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "raj ctl delete: needs a path")
 			return 2
 		}
-		return deleteCmd(c, path, *withdraw, stdout, stderr, *asJSON)
+		return deleteCmd(c, path, *withdraw, *approve, stdout, stderr, *asJSON)
 	case "deletions":
 		return deletionsCmd(c, stdout, stderr, *asJSON)
 	case "rmdir":
@@ -381,7 +466,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "raj ctl rmdir: needs a directory path")
 			return 2
 		}
-		return rmdirCmd(c, path, *withdraw, stdout, stderr, *asJSON)
+		return rmdirCmd(c, path, *withdraw, *approve, stdout, stderr, *asJSON)
 	case "rmdirs":
 		return rmdirsCmd(c, stdout, stderr, *asJSON)
 	case "proposals":
@@ -410,6 +495,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			{"set", "change sets:"},
 			{"delete", "pending deletions:"},
 			{"rmdir", "pending dir-removals:"},
+			{"invalid", "invalid change sets:"},
 		} {
 			head := false
 			for _, p := range props {
@@ -425,6 +511,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tbytes %d..%d\n", p.Path, p.Group, p.Author, p.Start, p.End)
 				case p.Kind == "set":
 					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\n", p.Path, p.Group, p.Author)
+				case p.Kind == "invalid":
+					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tinvalid\n", p.Path, p.Group, p.Author)
 				default:
 					fmt.Fprintf(stdout, "%s\tauthor %d\n", p.Path, p.Author)
 				}
@@ -459,16 +547,23 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
 		return 2
+	case "reveal":
+		return revealCmd(c, path, *start, *end, stdout, stderr, *asJSON)
 	case "close":
 		return closeCmd(c, path, *discard, stdout, stderr, *asJSON)
 	case "claim":
 		return claimCmd(c, fs.Args(), *claimAdd, *claimClear, stdout, stderr, *asJSON)
 	case "save":
+		if *all {
+			return saveAll(c, *force, stdout, stderr, *asJSON)
+		}
 		return simple(c, Request{Op: "save", Path: path, Force: *force}, "saved", stdout, stderr, *asJSON)
+	case "land":
+		return landCmd(c, path, stdout, stderr, *asJSON)
 	case "reload":
 		return simple(c, Request{Op: "reload", Path: path}, "reloaded", stdout, stderr, *asJSON)
 	case "exec":
-		return doExec(c, argv, *dir, stdout, stderr, *asJSON)
+		return doExec(c, argv, *dir, *projected, stdout, stderr, *asJSON)
 	case "run":
 		return runProgram(c, *progArg, *progHex, stdout, stderr, *asJSON)
 	case "stats":
@@ -482,6 +577,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "runs %d\nran-against-stale-files %d\nstale-but-agent-only %d\n",
 			res.Stats.Runs, res.Stats.Stale, res.Stats.AgentOnly)
 		return 0
+	case "intent":
+		return intentCmd(c, fs.Args(), *intentRef, *intentDryRun, taskVal, *asJSON, stdout, stderr)
 	case "groups":
 		if *state != "" {
 			switch *state {
@@ -498,13 +595,11 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			}
 			*state = "proposed"
 		}
-		res, err := c.Do(Request{Op: "groups", Path: path})
-		if code := fail(stderr, res, err); code != 0 {
+		groups, code := groupsForRequest(c, path, taskGiven, *mine, stderr)
+		if code != 0 {
 			return code
 		}
-		if *mine {
-			res.Groups = mineOnly(res.Groups, c.Author())
-		}
+		res := Response{Groups: groups}
 		if res.Groups == nil {
 			res.Groups = []Group{}
 		}
@@ -517,12 +612,36 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			}
 			res.Groups = kept
 		}
+		// An explicit --task filters by the work each set was opened under; an
+		// empty one is the untasked bucket. Sets of another task are counted
+		// and named below rather than listed, so a partial view is never
+		// mistaken for the whole buffer.
+		otherTasks := 0
+		if taskGiven {
+			kept := make([]Group, 0, len(res.Groups))
+			for _, g := range res.Groups {
+				if g.Task == *task {
+					kept = append(kept, g)
+				} else {
+					otherTasks++
+				}
+			}
+			res.Groups = kept
+		}
 		if *asJSON {
 			return emit(stdout, res.Groups)
 		}
+
 		for _, g := range res.Groups {
-			fmt.Fprintf(stdout, "%d\tauthor %d\t%s\t%d ops\t%+d bytes\t%d hunks\t%d moved\n",
-				g.ID, g.Author, g.State, g.Ops, g.Bytes, g.Hunks, g.Moved)
+			// A `--task` listing is the qualified member form: the path names
+			// the buffer that numbers the set, so ids that collide across
+			// buffers stay distinct (S3 names a task's groups from here).
+			prefix := ""
+			if taskGiven {
+				prefix = g.Path + "\t"
+			}
+			fmt.Fprintf(stdout, "%s%d\tauthor %d\t%s\t%d ops\t%+d bytes\t%d hunks\t%d moved\n",
+				prefix, g.ID, g.Author, g.State, g.Ops, g.Bytes, g.Hunks, g.Moved)
 			if g.Overlaps != nil {
 				// An overlap is reported, not resolved: two sets still awaiting
 				// a decision that claim the same bytes is a fact the person
@@ -545,16 +664,20 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
+		if taskGiven && otherTasks > 0 {
+			fmt.Fprintf(stdout, "  %d change set(s) belong to another task\n", otherTasks)
+		}
 		return 0
 	case "accept", "reject":
+
 		if *all {
-			return decideAll(c, cmd, path, *mine, *group, stdout, stderr, *asJSON)
+			return decideAll(c, cmd, path, *mine, *group, *everywhere, stdout, stderr, *asJSON)
 		}
 		return simple(c, Request{Op: cmd, Path: path, Group: *group}, cmd+"ed",
 			stdout, stderr, *asJSON)
 	case "clear":
 		if *all {
-			return decideAll(c, cmd, path, *mine, *group, stdout, stderr, *asJSON)
+			return decideAll(c, cmd, path, *mine, *group, *everywhere, stdout, stderr, *asJSON)
 		}
 		return clearCmd(c, path, *group, stdout, stderr, *asJSON)
 	case "revert":
@@ -563,6 +686,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		return diffCmd(c, path, stdout, stderr, *asJSON)
 	case "review":
 		return reviewCmd(c, path, *asJSON, stdout, stderr)
+	case "state":
+		return stateCmd(c, fs.Args(), *stateOn, *stateNote, stdout, stderr, *asJSON)
 	case "who":
 		res, err := c.Do(Request{Op: "hello", Identity: identityOf(*identity), Name: *name})
 		if code := fail(stderr, res, err); code != 0 {
@@ -585,15 +710,35 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return emit(stdout, res.Participants)
 		}
 		for _, p := range res.Participants {
-			state := "gone"
-			if p.Connected {
-				state = "here"
+			since := "never"
+			if p.SinceMS >= 0 {
+				since = fmt.Sprintf("%ds", p.SinceMS/1000)
 			}
-			fmt.Fprintf(stdout, "%d\t%s\t%s\t%s\n", p.ID, p.Kind, p.Name, state)
+			declared := ""
+			if p.Declared != "" {
+				declared = " declared=" + p.Declared
+			}
+			on := ""
+			if p.On != "" {
+				on = " on=" + p.On
+			}
+			note := ""
+			if p.Note != "" {
+				note = " note=" + p.Note
+			}
+			task := p.Task
+			if task == "" {
+				task = "-"
+			}
+			fmt.Fprintf(stdout, "%d\t%s\t%s\t%s%s\ttask=%s\tsince=%s%s%s\n",
+				p.ID, p.Kind, p.Name, p.State, declared, task, since, on, note)
+
 		}
 		return 0
 	case "recv":
-		return recv(c, *identity, *name, *wait, stdout, stderr, *asJSON)
+		return recv(c, *identity, *name, *wait, *peersOnly, stdout, stderr, *asJSON)
+	case "send":
+		return sendCmd(c, *sendTo, path, *textArg, *textFile, *verbatim, stdout, stderr, *asJSON)
 	case "whoami":
 		res, err := c.Do(Request{Op: "ping"})
 		if code := fail(stderr, res, err); code != 0 {
@@ -625,7 +770,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, res.Token)
 		return 0
 	case "register":
-		return registerCmd(c, *identity, *name, stdout, stderr, *asJSON)
+		return registerCmd(c, *identity, *name, taskVal, stdout, stderr, *asJSON)
+
 	case "search":
 		// A bare positional is never a path here — search takes none — so it
 		// is the pattern typed in the wrong place, and accepting it silently
@@ -638,7 +784,7 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "raj ctl search: --context cannot be negative")
 			return 2
 		}
-		return doSearch(c, SearchQuery{Include: *include, Exclude: *exclude,
+		return doSearch(c, SearchQuery{Include: includes.wire(), Exclude: excludes.wire(),
 			Path: *searchPath, Hidden: *hiddenFlag, Context: *context,
 			Regex: *regex, Case: *matchCase, Word: *word}, query.patterns(), *jsonl, *asJSON, stdout, stderr)
 	case "version":
@@ -663,6 +809,24 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		// rather than a shell loop spending a round trip per file. Every other
 		// mode addresses one path and position.
 		if fs.Arg(0) == "diagnostics" {
+			if *all {
+				if len(fs.Args()) > 1 {
+					fmt.Fprintln(stderr, "raj ctl lsp diagnostics: --all sweeps the changed files; it takes no paths")
+					return 2
+				}
+				paths, code := lspChangedPaths(c, stderr)
+				if code != 0 {
+					return code
+				}
+				if len(paths) == 0 {
+					if *asJSON {
+						return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
+					}
+					fmt.Fprintln(stdout, "no changed files to sweep")
+					return 0
+				}
+				return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
+			}
 			paths := fs.Args()[1:]
 			if len(paths) == 0 {
 				paths = []string{""} // the buffer in front, as with one path
@@ -674,6 +838,8 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 			return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
 		}
 		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, fs.Arg(3), stdout, stderr, *asJSON)
+	case "git":
+		return gitCmd(c, fs.Arg(0), fs.Arg(1), *gitRev, *gitCount, stdout, stderr, *asJSON)
 	case "apply":
 		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile,
 			textOperands, *verbatim, fs, stdout, stderr, *asJSON)
@@ -737,17 +903,22 @@ func claimCmd(c *Client, paths []string, add, clear bool, stdout, stderr io.Writ
 	return 0
 }
 
-// deleteCmd proposes a pending deletion, or withdraws one this identity
-// proposed. The file is not removed: delete is a review primitive, and the
-// user approves the removal in the editor. The path is claim-gated in the
-// Guard, so an agent can only propose removing a file it declared.
-func deleteCmd(c *Client, path string, withdraw bool, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "delete", Path: path, Withdraw: withdraw})
+// deleteCmd proposes a pending deletion, withdraws one this identity proposed,
+// or carries out a pending one when approve is set. The file stays until then:
+// delete is a review primitive, and the user approves the removal in the
+// editor. The path is claim-gated in the Guard, so an agent can only propose
+// removing a file it declared.
+func deleteCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "delete", Path: path, Withdraw: withdraw, Approve: approve})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
 	if asJSON {
-		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw})
+		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw, "approve": approve})
+	}
+	if approve {
+		fmt.Fprintf(stdout, "approved the pending deletion of %s\n", path)
+		return 0
 	}
 	if withdraw {
 		fmt.Fprintf(stdout, "withdrew the pending deletion of %s\n", path)
@@ -782,17 +953,22 @@ func deletionsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 	return 0
 }
 
-// rmdirCmd proposes a pending dir-removal, or withdraws one this identity
-// proposed. Nothing is removed: rmdir is a review primitive, and the user
-// approves the removal in the editor's review tab. The path is claim-gated in
-// the Guard, with the directory itself as the claim entry (§11).
-func rmdirCmd(c *Client, path string, withdraw bool, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "rmdir", Path: path, Withdraw: withdraw})
+// rmdirCmd proposes a pending dir-removal, withdraws one this identity
+// proposed, or carries out a pending one when approve is set. Nothing is
+// removed until then: rmdir is a review primitive, and the user approves the
+// removal in the review tab. The path is claim-gated in the Guard, with the
+// directory itself as the claim entry (§11).
+func rmdirCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "rmdir", Path: path, Withdraw: withdraw, Approve: approve})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
 	if asJSON {
-		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw})
+		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw, "approve": approve})
+	}
+	if approve {
+		fmt.Fprintf(stdout, "approved the pending dir-removal of %s\n", path)
+		return 0
 	}
 	if withdraw {
 		fmt.Fprintf(stdout, "withdrew the pending dir-removal of %s\n", path)
@@ -899,20 +1075,25 @@ var argLimit = map[string]struct {
 	"rename":    {2, "rename takes <old> and <new> paths"},
 	"mv":        {2, "mv takes <old> and <new> paths"},
 	"close":     {1, "close takes a path and nothing else"},
+	"reveal":    {1, "reveal takes a path; the span goes to --start/--end"},
 	"save":      {1, "save takes a path; --force overwrites a file that changed on disk"},
+	"land":      {1, "land takes a task name and nothing else"},
 	"reload":    {1, "reload takes a path and nothing else"},
-	"groups":    {1, "groups takes a path and nothing else"},
+	"groups":    {1, "groups takes a path and nothing else; --task limits the list to one task"},
 	"accept":    {1, "accept takes a path; the change set id goes to --group"},
-	"reject":    {1, "reject takes a path; the change set id goes to --group"},
-	"clear":     {1, "clear takes a path; the change set id goes to --group"},
-	"revert":    {1, "revert takes a path; --mine or --author selects the writer"},
-	"diff":      {1, "diff takes a path and nothing else"},
-	"review":    {1, "review takes a path and nothing else"},
-	"patch":     {1, "patch takes a path; the snapshot id goes to --dump"},
-	"apply":     {1, "apply takes a path; offsets go to --base/--start/--end, and text to --text/--text-file or after --"},
-	"edit":      {1, "edit takes a path; the strings go to --old/--new, or both after --"},
-	"register":  {0, "register takes no path; the key goes to --as, or one is minted"},
-	"token":     {0, "token takes no operands; it reads the running server's TCP token"},
+
+	"reject":   {1, "reject takes a path; the change set id goes to --group"},
+	"clear":    {1, "clear takes a path; the change set id goes to --group"},
+	"revert":   {1, "revert takes a path; --mine or --author selects the writer"},
+	"diff":     {1, "diff takes a path and nothing else"},
+	"review":   {1, "review takes a path and nothing else"},
+	"patch":    {1, "patch takes a path; the snapshot id goes to --dump"},
+	"apply":    {1, "apply takes a path; offsets go to --base/--start/--end, and text to --text/--text-file or after --"},
+	"edit":     {1, "edit takes a path; the strings go to --old/--new, or both after --"},
+	"register": {0, "register takes no path; the key goes to --as, or one is minted"},
+	"git":      {2, "git takes MODE and an optional path"},
+	"token":    {0, "token takes no operands; it reads the running server's TCP token"},
+	"send":     {1, "send takes one message; quote it, or pass --text-file - to read stdin"}, "state": {2, "state takes `set` and a value, or neither to read your own state"},
 }
 
 // verbOperand is each verb's positional operands, spelled as the top-level
@@ -931,8 +1112,10 @@ var verbOperand = map[string]string{
 	"ls":       "[path]",
 	"claim":    "[path]...",
 	"goto":     "[path] LINE[:COL]",
+	"reveal":   "<path>",
 	"close":    "[path]",
 	"groups":   "[path]",
+	"intent":   "SUBCOMMAND [NAME] [GROUPS...]",
 	"accept":   "[path]",
 	"reject":   "[path]",
 	"clear":    "[path]",
@@ -944,10 +1127,13 @@ var verbOperand = map[string]string{
 	"patch":    "[path]",
 	"apply":    "[path] [TEXT]",
 	"edit":     "[path] [OLD NEW]",
+	"send":     "[TEXT]",
 	"save":     "[path]",
+	"land":     "<task>",
 	"reload":   "[path]",
 	"lsp":      "MODE [path] LINE:COL [query]",
-	"register": "[--as KEY]",
+	"git":      "MODE [path]",
+	"register": "[--as KEY] [--task ID]", "state": "[set STATE]",
 }
 
 // refuseExtraArgs rejects a positional operand the verb does not take, so a
@@ -999,10 +1185,7 @@ func identityOf(flagVal string) string {
 // is checked against the registry so it cannot land on an existing identity; a
 // caller-chosen key (-as) binds that instead, deliberately and without the
 // check, which makes register idempotent for that key.
-func registerCmd(c *Client, chosen, name string, stdout, stderr io.Writer, asJSON bool) int {
-	if name == "" {
-		name = "raj"
-	}
+func registerCmd(c *Client, chosen, name, task string, stdout, stderr io.Writer, asJSON bool) int {
 	key := chosen
 	if key == "" {
 		minted, err := mintRegisterKey(c, randomRegisterKey)
@@ -1012,7 +1195,15 @@ func registerCmd(c *Client, chosen, name string, stdout, stderr io.Writer, asJSO
 		}
 		key = minted
 	}
-	res, err := c.Do(Request{Op: "hello", Identity: key, Name: name})
+	// Default the display name to the key, never a shared constant. A bare
+	// register must not collide with another participant: `--to <name>`
+	// resolution refuses two rows with one name, and the old "raj" default
+	// made a single stray register break it (2026-09-27). An agent that
+	// wants the short name passes --name.
+	if name == "" {
+		name = key
+	}
+	res, err := c.Do(Request{Op: "hello", Identity: key, Name: name, Task: task})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -1079,11 +1270,12 @@ func mintRegisterKey(c *Client, draw func() (string, error)) (string, error) {
 // are is for the user to decide. Empty on either side means unknown, and the
 // check stays silent.
 func warnVersionSkew(stderr io.Writer, server string) {
-	if srcVersion == "" || server == "" || srcVersion == server {
+	mine := currentSrcVersion()
+	if mine == "" || server == "" || mine == server {
 		return
 	}
 	fmt.Fprintf(stderr, "raj ctl: warning — ctl is built from %s, the editor from %s; "+
-		"verbs that changed between the two may misbehave\n", srcVersion, server)
+		"verbs that changed between the two may misbehave\n", mine, server)
 }
 
 // indexOf finds a literal argument.
@@ -1283,7 +1475,7 @@ func editText(old, newText, oldFile, newFile string, pos []string, verbatim bool
 // the command itself returned. A refusal is 2 instead, so "the tests failed" and
 // "the tests never ran" are distinguishable — an agent that could not tell them
 // apart would report a passing build as broken.
-func doExec(c *Client, argv []string, dir string, stdout, stderr io.Writer, asJSON bool) int {
+func doExec(c *Client, argv []string, dir string, projected bool, stdout, stderr io.Writer, asJSON bool) int {
 	if len(argv) == 0 {
 		fmt.Fprintln(stderr, "raj ctl exec: needs a command, after --")
 		return 2
@@ -1301,7 +1493,7 @@ func doExec(c *Client, argv []string, dir string, stdout, stderr io.Writer, asJS
 			io.WriteString(stdout, b)
 		}
 	}
-	res, err := c.DoExec(Request{Op: "exec", Argv: argv, Dir: dir}, relay)
+	res, err := c.DoExec(Request{Op: "exec", Argv: argv, Dir: dir, ExecProjected: projected}, relay)
 	if err != nil {
 		fmt.Fprintln(stderr, "raj ctl exec:", err)
 		return 2
@@ -1313,7 +1505,9 @@ func doExec(c *Client, argv []string, dir string, stdout, stderr io.Writer, asJS
 	// A warning, not a refusal. The command already ran; this is what the
 	// caller needs in order to judge the result, because a subprocess reads
 	// files and these files did not match the buffers.
-	if len(res.Dirty) > 0 && !asJSON {
+	// A projected run includes the unsaved text by construction, so the stale
+	// warning would be false; the server's provenance stamp is the context.
+	if len(res.Dirty) > 0 && !asJSON && !projected {
 		fmt.Fprintln(stderr, "raj ctl exec: warning — these buffers are unsaved, so the "+
 			"command read older text:")
 		for _, d := range res.Dirty {
@@ -1342,6 +1536,16 @@ type bulkOutcome struct {
 	Error string `json:"error,omitempty"`
 }
 
+// bulkTarget is one change set a bulk decision attempts: the buffer its text
+// lives in and its group id. A workspace-wide enumeration reaches sets in many
+// buffers, so each target names its own path; the active-buffer scope carries
+// the caller's path, often empty, which the editor resolves to the buffer on
+// screen.
+type bulkTarget struct {
+	Path  string
+	Group uint64
+}
+
 // decideAll accepts, rejects or clears the path's change sets in one command.
 // It is the client-side bulk form: one listing, then one frame per set, so
 // deciding k sets is one invocation rather than 1+k. The server still decides
@@ -1359,10 +1563,17 @@ type bulkOutcome struct {
 // a bulk reject look wedged when its work was already done.
 //
 // Clearing is a reversal too, so it also unwinds newest-first, but it works
-// from `groups` filtered to the rejected sets rather than from `diff`: a
-// rejected set is exactly what ClearRejected acts on, and `diff` reports only
-// what is still proposed.
-func decideAll(c *Client, op, path string, mine bool, group uint64,
+// from `groups` filtered to the sets ClearGroup can dispose -- rejected sets
+// and invalid Proposed ones -- rather than from `diff`, which reports only a
+// set that still has a surviving hunk.
+//
+// everywhere widens the decision from the active buffer to the whole
+// workspace. The enumeration then comes from workspaceDecisions -- the
+// proposals rollup for accept and reject, the buffers rollup for clear -- while
+// the per-set decision, the failure record and the final report are the same
+// code the active-buffer form uses, so a refusal in one buffer cannot take
+// another with it.
+func decideAll(c *Client, op, path string, mine bool, group uint64, everywhere bool,
 	stdout, stderr io.Writer, asJSON bool) int {
 	if group != 0 {
 		fmt.Fprintf(stderr, "raj ctl %s: --all and --group are alternatives\n", op)
@@ -1373,70 +1584,96 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 	var failed []uint64
 	// decide performs one decision and records it, printing each as it lands so
 	// a person watching sees the outcomes rather than one batch at the end.
-	decide := func(id uint64) {
-		dres, derr := c.Do(Request{Op: op, Path: path, Group: id})
+	decide := func(t bulkTarget) {
+		dres, derr := c.Do(Request{Op: op, Path: t.Path, Group: t.Group})
 		switch {
 		case derr != nil:
-			out = append(out, bulkOutcome{ID: id, Error: derr.Error()})
-			failed = append(failed, id)
+			out = append(out, bulkOutcome{ID: t.Group, Error: derr.Error()})
+			failed = append(failed, t.Group)
 			if !asJSON {
-				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %v\n", op, id, derr)
+				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %v\n", op, t.Group, derr)
 			}
 		case dres.Err != "":
-			out = append(out, bulkOutcome{ID: id, Error: dres.Err})
-			failed = append(failed, id)
+			out = append(out, bulkOutcome{ID: t.Group, Error: dres.Err})
+			failed = append(failed, t.Group)
 			if !asJSON {
-				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %s\n", op, id, dres.Err)
+				fmt.Fprintf(stderr, "raj ctl %s: change set %d: %s\n", op, t.Group, dres.Err)
 			}
 		default:
-			out = append(out, bulkOutcome{ID: id, OK: true})
+			out = append(out, bulkOutcome{ID: t.Group, OK: true})
 			if !asJSON {
-				fmt.Fprintf(stdout, "%s change set %d\n", verb, id)
+				fmt.Fprintf(stdout, "%s change set %d\n", verb, t.Group)
 			}
 		}
 	}
 	if op == "reject" {
 		// Newest-first, re-reading the pending list after each reversal. A set
 		// already attempted is not retried in this invocation: if it could not
-		// come out when it was newest, nothing older can free it.
-		attempted := map[uint64]bool{}
-		for {
-			pending, code := pendingRejections(c, path, mine, stderr)
+		// come out when it was newest, nothing older can free it. A
+		// workspace-wide reject runs the same unwind once per buffer that holds
+		// a pending set; buffers do not overlap one another, so their order is
+		// immaterial and only the within-buffer order matters.
+		paths := []string{path}
+		if everywhere {
+			var code int
+			paths, code = workspaceSetPaths(c, mine, stderr)
 			if code != 0 {
 				return code
 			}
-			id, ok := newestRejection(pending, attempted)
-			if !ok {
-				break
+		}
+		for _, p := range paths {
+			attempted := map[uint64]bool{}
+			for {
+				pending, code := pendingRejections(c, p, mine, stderr)
+				if code != 0 {
+					return code
+				}
+				id, ok := newestRejection(pending, attempted)
+				if !ok {
+					break
+				}
+				attempted[id] = true
+				decide(bulkTarget{Path: p, Group: id})
 			}
-			attempted[id] = true
-			decide(id)
 		}
 	} else {
-		res, err := c.Do(Request{Op: "groups", Path: path})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		groups := res.Groups
-		if mine {
-			groups = mineOnly(groups, c.Author())
-		}
-		if op == "clear" {
-			// Clearing reverses text, so it unwinds newest-first like a bulk
-			// reject: a later rejected set that overlaps an earlier one has to
-			// come out before the earlier one can. Only rejected sets are
-			// attempted — clearing anything else is the refusal the single
-			// form reports, and the groups listing is where the state is read.
-			for i := len(groups) - 1; i >= 0; i-- {
-				if groups[i].State != "rejected" {
-					continue
-				}
-				decide(groups[i].ID)
+		var targets []bulkTarget
+		if everywhere {
+			var code int
+			targets, code = workspaceDecisions(c, op, mine, stderr)
+			if code != 0 {
+				return code
 			}
 		} else {
-			for _, g := range groups {
-				decide(g.ID)
+			res, err := c.Do(Request{Op: "groups", Path: path})
+			if code := fail(stderr, res, err); code != 0 {
+				return code
 			}
+			groups := res.Groups
+			if mine {
+				groups = mineOnly(groups, c.Author())
+			}
+			if op == "clear" {
+				// Clearing reverses text, so it unwinds newest-first like a bulk
+				// reject: a later rejected set that overlaps an earlier one has to
+				// come out before the earlier one can. ClearGroup disposes two
+				// kinds in one gesture: it reverses a rejected set and drops an
+				// invalid Proposed set. Any other set is skipped -- accept or
+				// reject is its decision, not clear.
+				for i := len(groups) - 1; i >= 0; i-- {
+					if groups[i].State != "rejected" && !groups[i].Invalid {
+						continue
+					}
+					targets = append(targets, bulkTarget{Path: path, Group: groups[i].ID})
+				}
+			} else {
+				for _, g := range groups {
+					targets = append(targets, bulkTarget{Path: path, Group: g.ID})
+				}
+			}
+		}
+		for _, t := range targets {
+			decide(t)
 		}
 	}
 	if len(out) == 0 {
@@ -1447,9 +1684,13 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 		}
 		kind := "pending"
 		if op == "clear" {
-			kind = "rejected"
+			kind = "rejected or invalid"
 		}
-		fmt.Fprintf(stdout, "%s: no %s change sets\n", firstOf(path, "active buffer"), kind)
+		where := firstOf(path, "active buffer")
+		if everywhere {
+			where = "workspace"
+		}
+		fmt.Fprintf(stdout, "%s: no %s change sets\n", where, kind)
 		return 0
 	}
 	if asJSON {
@@ -1471,6 +1712,98 @@ func decideAll(c *Client, op, path string, mine bool, group uint64,
 		return 1
 	}
 	return 0
+}
+
+// workspaceDecisions enumerates the change sets a workspace-wide bulk accept or
+// clear should attempt, in the order it should attempt them. Accept reads the
+// proposals rollup and takes every pending set under the "set" kind. Clear
+// cannot: the rollup has already let a rejected set go, so a clear driven by it
+// would reach only the invalid ones, while the active-buffer clear disposes
+// rejected and invalid alike. It walks the buffers rollup instead and asks each
+// buffer for its groups, the same enumeration the active-buffer form uses --
+// and, because clearing reverses text, each buffer's sets are taken
+// newest-first, exactly as the active-buffer form orders them. Paths are
+// independent of one another, so only the within-path order matters.
+func workspaceDecisions(c *Client, op string, mine bool, stderr io.Writer) ([]bulkTarget, int) {
+	if op == "clear" {
+		return workspaceClearTargets(c, mine, stderr)
+	}
+	res, err := c.Do(Request{Op: "proposals"})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	var targets []bulkTarget
+	for _, p := range res.Proposals {
+		if p.Path == "" || p.Kind != "set" {
+			continue
+		}
+		if mine && p.Author != c.Author() {
+			continue
+		}
+		targets = append(targets, bulkTarget{Path: p.Path, Group: p.Group})
+	}
+	return targets, 0
+}
+
+// workspaceClearTargets enumerates the rejected and invalid change sets a
+// workspace-wide clear should attempt, newest-first within each buffer. The
+// buffers rollup is the enumeration: every open buffer is asked for its own
+// groups, exactly as the active-buffer form asks the one it was pointed at.
+func workspaceClearTargets(c *Client, mine bool, stderr io.Writer) ([]bulkTarget, int) {
+	res, err := c.Do(Request{Op: "buffers"})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	var targets []bulkTarget
+	for _, b := range res.Buffers {
+		if b.Path == "" {
+			continue
+		}
+		gres, err := c.Do(Request{Op: "groups", Path: b.Path})
+		if code := fail(stderr, gres, err); code != 0 {
+			return nil, code
+		}
+		groups := gres.Groups
+		if mine {
+			groups = mineOnly(groups, c.Author())
+		}
+		// Clearing reverses text, so a later rejected set that overlaps an
+		// earlier one has to come out before the earlier one can.
+		for i := len(groups) - 1; i >= 0; i-- {
+			if groups[i].State != "rejected" && !groups[i].Invalid {
+				continue
+			}
+			targets = append(targets, bulkTarget{Path: b.Path, Group: groups[i].ID})
+		}
+	}
+	return targets, 0
+}
+
+// workspaceSetPaths lists the distinct buffers that hold a pending change set,
+// the sweep a workspace-wide bulk reject unwinds one buffer at a time. It is a
+// path list rather than a decision list because the per-buffer unwind re-reads
+// each buffer's own pending projection after every reversal; the rollup only
+// says which buffers have something to unwind.
+func workspaceSetPaths(c *Client, mine bool, stderr io.Writer) ([]string, int) {
+	res, err := c.Do(Request{Op: "proposals"})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	seen := map[string]bool{}
+	var paths []string
+	for _, p := range res.Proposals {
+		if p.Kind != "set" || p.Path == "" {
+			continue
+		}
+		if mine && p.Author != c.Author() {
+			continue
+		}
+		if !seen[p.Path] {
+			seen[p.Path] = true
+			paths = append(paths, p.Path)
+		}
+	}
+	return paths, 0
 }
 
 // pendingRejections is the pending projection a bulk reject works from: the
@@ -1521,6 +1854,56 @@ func newestRejection(pending []DiffGroup, attempted map[uint64]bool) (uint64, bo
 	return best.ID, found
 }
 
+// groupsForRequest answers the `groups` verb's target. A `--task` with no path
+// names work that may span buffers, so it enumerates every open buffer and
+// merges their sets; any other request reads the one buffer the path names (or
+// the active one). The sets are filtered to the caller's own work when mine is
+// set, before the caller filters by task or state.
+func groupsForRequest(c *Client, path string, taskGiven, mine bool, stderr io.Writer) ([]Group, int) {
+	if taskGiven && path == "" {
+		return workspaceGroups(c, mine, stderr)
+	}
+	res, err := c.Do(Request{Op: "groups", Path: path})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	groups := res.Groups
+	if mine {
+		groups = mineOnly(groups, c.Author())
+	}
+	if groups == nil {
+		groups = []Group{}
+	}
+	return groups, 0
+}
+
+// workspaceGroups enumerates every open buffer's change sets. It is the
+// workspace-wide counterpart to a single-buffer `groups`, so a `--task` can
+// name one task's work across the whole workspace. Each set already carries its
+// path, which is the qualified half of a member.
+func workspaceGroups(c *Client, mine bool, stderr io.Writer) ([]Group, int) {
+	res, err := c.Do(Request{Op: "buffers"})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	var out []Group
+	for _, b := range res.Buffers {
+		if b.Path == "" {
+			continue
+		}
+		gres, err := c.Do(Request{Op: "groups", Path: b.Path})
+		if code := fail(stderr, gres, err); code != 0 {
+			return nil, code
+		}
+		groups := gres.Groups
+		if mine {
+			groups = mineOnly(groups, c.Author())
+		}
+		out = append(out, groups...)
+	}
+	return out, 0
+}
+
 // mineOnly keeps the change sets this connection wrote. `groups` is the
 // attribution record — a gone participant's record is not discarded — so the
 // filter is a view applied here, not a change to what the server reports.
@@ -1545,6 +1928,28 @@ func mineProposals(props []Proposal, author uint8) []Proposal {
 	}
 	return kept
 }
+
+// globList accumulates --include/--exclude globs. Each Set splits its value
+// on commas, trims each piece and drops the empties, so repeating the flag and
+// giving one comma-separated list produce the same request. The wire field is
+// the comma-joined list the request has always carried.
+type globList struct{ globs []string }
+
+func (g *globList) String() string { return strings.Join(g.globs, ",") }
+
+func (g *globList) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			g.globs = append(g.globs, part)
+		}
+	}
+	return nil
+}
+
+// wire renders the accumulated globs as the comma-separated list the search
+// request carries. No globs is the empty string, exactly as the string flag's
+// zero value was.
+func (g *globList) wire() string { return strings.Join(g.globs, ",") }
 
 // searchPatternFlag accumulates -q. One search call may carry several
 // patterns, and every hit names the one that matched it; a single -q behaves
@@ -2089,6 +2494,97 @@ func writeDiffLines(w io.Writer, prefix, text string) {
 	}
 }
 
+// gitCmd asks the read-only git verb: the repository status, a diff, a
+// committed file, churn numbers or the commit log. It moves no ref. The answer
+// is a git.Result the verb carries as JSON, so a script reads fields rather
+// than parsing patch text; the plain form is line-oriented.
+func gitCmd(c *Client, mode, path, rev string, count int, stdout, stderr io.Writer, asJSON bool) int {
+	switch mode {
+	case "status", "diff", "show", "numstat", "log":
+	case "":
+		fmt.Fprintln(stderr, "raj ctl git: needs a mode: status, diff, show, numstat or log")
+		return 2
+	default:
+		fmt.Fprintf(stderr, "raj ctl git: unknown mode %q; want status, diff, show, numstat or log\n", mode)
+		return 2
+	}
+	res, err := c.Do(Request{Op: "git", GitMode: mode, Path: path, GitRev: rev, GitCount: count})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if res.GitJSON == "" {
+		if asJSON {
+			return emit(stdout, map[string]any{"ok": true, "mode": mode})
+		}
+		return 0
+	}
+	if asJSON {
+		fmt.Fprintln(stdout, res.GitJSON)
+		return 0
+	}
+	var out git.Result
+	if uerr := json.Unmarshal([]byte(res.GitJSON), &out); uerr != nil {
+		// An answer this build cannot parse is still git's answer.
+		fmt.Fprintln(stdout, res.GitJSON)
+		return 0
+	}
+	return printGit(stdout, out)
+}
+
+// printGit renders a git.Result for a person. The JSON stays the machine form;
+// this is the readable one.
+func printGit(stdout io.Writer, r git.Result) int {
+	switch r.Mode {
+	case "status":
+		v := r.View
+		if v == nil {
+			return 0
+		}
+		head := v.Head
+		if head == "" {
+			head = "(unborn)"
+		}
+		if v.Branch != "" {
+			head += " " + v.Branch
+		}
+		if v.Detached {
+			head += " (detached)"
+		}
+		fmt.Fprintf(stdout, "root\t%s\nhead\t%s\n", v.Root, head)
+		if v.Operation != "" {
+			fmt.Fprintf(stdout, "operation\t%s\n", v.Operation)
+		}
+		for _, e := range v.Entries {
+			line := e.Index + e.Worktree + " " + e.Path
+			if e.RenameFrom != "" {
+				line += " (from " + e.RenameFrom + ")"
+			}
+			fmt.Fprintln(stdout, line)
+		}
+		for _, p := range v.Untracked {
+			fmt.Fprintf(stdout, "?? %s\n", p)
+		}
+		for _, p := range v.Ignored {
+			fmt.Fprintf(stdout, "!! %s\n", p)
+		}
+	case "diff", "show":
+		fmt.Fprint(stdout, r.Text)
+	case "numstat":
+		for _, n := range r.Numstat {
+			if n.Binary {
+				fmt.Fprintf(stdout, "-\t-\t%s\n", n.Path)
+				continue
+			}
+			fmt.Fprintf(stdout, "%d\t%d\t%s\n", n.Additions, n.Deletions, n.Path)
+		}
+	case "log":
+		for _, e := range r.Log {
+			fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", e.SHA, e.When, e.Author, e.Subject)
+		}
+	}
+	return 0
+}
+
 // doLSP asks the language server for hover text, a definition, a declaration,
 // a type definition, an implementation, references, completions, the signature
 // of the call at a position, the cached diagnostics for a path, the inlay hints
@@ -2210,6 +2706,29 @@ func doLSP(c *Client, mode, path, pos, lines, query string, stdout, stderr io.Wr
 	return emit(stdout, out)
 }
 
+// lspChangedPaths enumerates the files the workspace's pending changes touch,
+// for `lsp diagnostics --all`. The closest existing notion of "the changed
+// files" is the proposals rollup: a wave's unsaved edits are its pending change
+// sets, and the sweep's job is to register every one of those buffers with the
+// language server so cross-file references resolve. A pending deletion or
+// dir-removal has no text to diagnose, so only change sets are swept. Paths are
+// deduped and sorted, so two runs over the same workspace answer alike.
+func lspChangedPaths(c *Client, stderr io.Writer) ([]string, int) {
+	res, err := c.Do(Request{Op: "proposals"})
+	if code := fail(stderr, res, err); code != 0 {
+		return nil, code
+	}
+	seen := map[string]bool{}
+	for _, p := range res.Proposals {
+		if p.Kind == "set" || p.Kind == "invalid" {
+			if p.Path != "" {
+				seen[p.Path] = true
+			}
+		}
+	}
+	return sortedPaths(seen), 0
+}
+
 // lspStatusError names a diagnostics entry the CLI could not obtain, so a
 // batch answer still carries a status for every operand rather than dropping
 // the ones the editor refused. It is not one of the editor's own statuses:
@@ -2256,6 +2775,15 @@ func lspDiagnostics(c *Client, paths []string, stdout, stderr io.Writer, asJSON 
 			out = LSPResult{Status: lspStatusError, Detail: firstOf(detail,
 				"the editor did not report a diagnostics status; rebuild it to match this ctl")}
 		} else if out.Status != LSPStatusOK {
+			// A parsed answer with no status is an old server's bare `{}`: no
+			// reading was produced, so the entry carries the error status and
+			// the rebuild note the single-path form refuses with, rather than
+			// omitting both and reading as neither a reading nor a refusal.
+			if out.Status == "" {
+				out.Status = lspStatusError
+				out.Detail = firstOf(out.Detail,
+					"the editor did not report a diagnostics status; rebuild it to match this ctl")
+			}
 			code = 1
 		}
 		files = append(files, lspFileResult{Path: p, LSPResult: out})
@@ -2465,6 +2993,97 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 	return seen
 }
 
+// intentCmd runs one `raj ctl intent` subcommand. The request and its answer
+// are a JSON payload on the intent op, which the host resolves against the live
+// buffers and the workspace store.
+func intentCmd(c *Client, args []string, ref string, dryRun bool, task string, asJSON bool, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "raj ctl intent: needs a subcommand: new, add, remove, list, show, export, materialise")
+		return 2
+	}
+	cmd := intent.Command{
+		Mode: args[0],
+		Base: ref, Task: task, DryRun: dryRun,
+	}
+	rest := args[1:]
+	if cmd.Mode != "list" {
+		if len(rest) == 0 {
+			fmt.Fprintf(stderr, "raj ctl intent %s: needs a name\n", cmd.Mode)
+			return 2
+		}
+		cmd.Name, rest = rest[0], rest[1:]
+	}
+	if cmd.Mode == "new" || cmd.Mode == "add" || cmd.Mode == "remove" {
+		for _, s := range rest {
+			id, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				fmt.Fprintf(stderr, "raj ctl intent %s: group %q is not a number\n", cmd.Mode, s)
+				return 2
+			}
+			cmd.Groups = append(cmd.Groups, id)
+		}
+		if len(cmd.Groups) == 0 && (cmd.Mode == "add" || cmd.Mode == "remove") {
+			fmt.Fprintf(stderr, "raj ctl intent %s: needs at least one group id\n", cmd.Mode)
+			return 2
+		}
+	}
+	if cmd.Mode == "publish" {
+		fmt.Fprintln(stderr, "raj ctl intent publish is H5; this wave implements new|add|remove|list|show|export|materialise")
+		return 2
+	}
+	payload, err := json.Marshal(cmd)
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl intent:", err)
+		return 1
+	}
+	res, err := c.Do(Request{Op: "intent", HookJSON: string(payload)})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	var out intent.Result
+	if res.HookJSON != "" {
+		if err := json.Unmarshal([]byte(res.HookJSON), &out); err != nil {
+			fmt.Fprintln(stderr, "raj ctl intent:", err)
+			return 1
+		}
+	}
+	if asJSON {
+		return emit(stdout, out)
+	}
+	return printIntent(out, cmd.Mode, stdout)
+}
+
+// printIntent renders an intent result for a person: one line for a listing, a
+// row for one intention, or the object ids an export wrote.
+func printIntent(out intent.Result, mode string, stdout io.Writer) int {
+	if out.Warning != "" {
+		fmt.Fprintln(stdout, "warning:", out.Warning)
+	}
+	switch mode {
+	case "list":
+		if len(out.Intentions) == 0 {
+			fmt.Fprintln(stdout, "no intentions")
+			return 0
+		}
+		for _, in := range out.Intentions {
+			fmt.Fprintf(stdout, "%s\tbase %s\t%s\t%d group(s)\n", in.Name, in.Base, in.State, len(in.Members))
+		}
+	case "materialise":
+		fmt.Fprintln(stdout, out.Tree)
+	case "export":
+		fmt.Fprintf(stdout, "commit %s\nparent %s\nbase %s\ntree %s\n",
+			out.Commit, out.Parent, out.BaseSHA, out.Tree)
+	default:
+		if out.Intention == nil {
+			return 0
+		}
+		in := out.Intention
+		fmt.Fprintf(stdout, "%s\towner %s\tbase %s\t%s\t%d group(s)\n",
+			in.Name, in.Owner, in.Base, in.State, len(in.Members))
+	}
+	return 0
+}
+
 func list(stdout, stderr io.Writer, asJSON bool) int {
 	found := Discover()
 	if asJSON {
@@ -2566,13 +3185,20 @@ func status(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 		Reasons []string `json:"reasons"`
 	}
 	blocking := []statusIssue{}
-	for _, b := range res.Buffers {
-		if !b.Dirty && b.Pending <= 0 {
-			continue
-		}
+	for _, b := range blockingBuffers(res.Buffers) {
 		it := statusIssue{Path: b.Path, Dirty: b.Dirty, Pending: b.Pending, Moved: b.Moved}
 		if b.Dirty {
-			it.Reasons = append(it.Reasons, "dirty")
+			// A dirty buffer is not always unsaved work. A rejected set's
+			// text stays in the view while the agreed composition matches
+			// disk, so a save cannot clean it and the buffer reads dirty
+			// until clear disposes of the set. Name that count, so the next
+			// step is in the output rather than behind another call; an
+			// ordinary unsaved buffer keeps the bare "dirty".
+			if n := rejectedSets(c, b.Path); n > 0 {
+				it.Reasons = append(it.Reasons, fmt.Sprintf("dirty: %d rejected sets (clear to dispose)", n))
+			} else {
+				it.Reasons = append(it.Reasons, "dirty")
+			}
 		}
 		if b.Pending > 0 {
 			it.Reasons = append(it.Reasons, fmt.Sprintf("%d pending", b.Pending))
@@ -2609,6 +3235,30 @@ func status(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 	}
 	fmt.Fprintln(stdout, "not ready:", len(blocking), "of", len(res.Buffers), "buffer(s) dirty or pending")
 	return 1
+}
+
+// rejectedSets counts the change sets one buffer reports as rejected. It is
+// the fact that explains a dirty buffer a save cannot clean: rejecting is a
+// decision, not an edit, so the text stays in the view while the agreed
+// composition matches disk. The count is not on the buffers header -- there is
+// no free wire field to add one -- so asking groups is how the status command
+// reaches it. Best effort: a call that fails reads zero and the reason stays
+// "dirty".
+func rejectedSets(c *Client, path string) int {
+	if path == "" {
+		return 0
+	}
+	res, err := c.Do(Request{Op: "groups", Path: path})
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, g := range res.Groups {
+		if g.State == "rejected" {
+			n++
+		}
+	}
+	return n
 }
 
 // braceTally is the buffer checking itself, no toolchain needed: a missing }
@@ -2684,13 +3334,13 @@ type atSpan struct {
 	start, end int
 }
 
-// atSpanFlag accumulates --at PATH=LO,HI entries. The value splits on the
-// last "=", so a path that contains "=" stays addressable; what follows must
-// be LO,HI with positive, ordered line numbers, and a bad entry is refused by
-// name.
+// atSpanFlag accumulates --at PATH=LO,HI entries in the order given. The value
+// splits on the last "=", so a path that contains "=" stays addressable; what
+// follows must be LO,HI with positive, ordered line numbers, and a bad entry
+// is refused by name. The entries are an ordered slice, not a map, so two
+// spans for one path are two entries and the earlier one is not overwritten.
 type atSpanFlag struct {
 	entries []atSpan
-	index   map[string]int
 }
 
 func (a *atSpanFlag) String() string { return "" }
@@ -2704,26 +3354,20 @@ func (a *atSpanFlag) Set(v string) error {
 	if !ok {
 		return fmt.Errorf("--at %q: want PATH=LO,HI with positive line numbers, LO <= HI", v)
 	}
-	path := v[:i]
-	if a.index == nil {
-		a.index = map[string]int{}
-	}
-	if at, seen := a.index[path]; seen {
-		a.entries[at] = atSpan{path: path, start: start, end: end}
-		return nil
-	}
-	a.index[path] = len(a.entries)
-	a.entries = append(a.entries, atSpan{path: path, start: start, end: end})
+	a.entries = append(a.entries, atSpan{path: v[:i], start: start, end: end})
 	return nil
 }
 
-// lookup returns the span an --at entry gave a path.
+// lookup returns the first span an --at entry gave a path. A positional
+// operand names a path once, at its earliest entry; later entries for the same
+// path are its other spans and are read on their own.
 func (a *atSpanFlag) lookup(path string) (atSpan, bool) {
-	i, ok := a.index[path]
-	if !ok {
-		return atSpan{}, false
+	for _, e := range a.entries {
+		if e.path == path {
+			return e, true
+		}
 	}
-	return a.entries[i], true
+	return atSpan{}, false
 }
 
 // parseAtSpan parses "LO,HI": both positive, LO <= HI.
@@ -2825,10 +3469,11 @@ func addLineSpan(out map[string]any, t readTarget) {
 }
 
 // readTargets resolves the operands and --at entries into the ordered list of
-// targets to read. A positional path named by --at reads once, at that span;
-// a positional path without one reads whole, or at the global --start/--end/
-// --lines span when given. An --at path with no positional operand is
-// appended in --at order.
+// targets to read. A positional path named by --at reads once, at its first
+// entry; a positional path without one reads whole, or at the global
+// --start/--end/--lines span when given. Every --at entry for a path with no
+// positional operand is appended in --at order, so two spans for one path are
+// two targets.
 func readTargets(paths []string, at *atSpanFlag, lsp, lep, sp, ep *int) []readTarget {
 	if at == nil || len(at.entries) == 0 {
 		if len(paths) == 0 {
@@ -2841,24 +3486,26 @@ func readTargets(paths []string, at *atSpanFlag, lsp, lep, sp, ep *int) []readTa
 		return out
 	}
 	var out []readTarget
-	named := make(map[string]bool, len(at.entries))
+	named := make(map[string]bool, len(paths))
 	for _, p := range paths {
+		if named[p] {
+			continue // named positionally more than once: still one read
+		}
+		named[p] = true
 		if a, ok := at.lookup(p); ok {
-			if named[p] {
-				continue // named positionally more than once: still one read
-			}
-			named[p] = true
 			lo, hi := a.start, a.end
 			out = append(out, readTarget{path: p, lineStart: &lo, lineEnd: &hi})
 			continue
 		}
 		out = append(out, readTarget{path: p, start: sp, end: ep, lineStart: lsp, lineEnd: lep})
 	}
+	// One target per --at entry, in the order given, so two spans for one path
+	// both survive instead of collapsing to the last. A path named positionally
+	// was already read once, at its first entry.
 	for _, a := range at.entries {
 		if named[a.path] {
 			continue
 		}
-		named[a.path] = true
 		lo, hi := a.start, a.end
 		out = append(out, readTarget{path: a.path, lineStart: &lo, lineEnd: &hi})
 	}
@@ -3117,7 +3764,157 @@ func simple(c *Client, req Request, ok string, stdout, stderr io.Writer, asJSON 
 	return 0
 }
 
-// clearCmd hard-purges a rejected change set. Unlike accept and reject, clear
+// saveAll writes every dirty buffer in the workspace, one save frame each. It
+// walks the buffers rollup rather than proposals: a buffer can be dirty from an
+// unsaved human edit with no pending set at all, and only the buffer knows. A
+// refusal is named and does not stop the rest, and any refusal makes the call
+// exit nonzero so a gate sees it rather than reading a clean run. force answers
+// the disk-changed prompt with Overwrite on every save.
+func saveAll(c *Client, force bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "buffers"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	saved := []string{}
+	var failed []string
+	for _, b := range res.Buffers {
+		if !b.Dirty || b.Path == "" {
+			continue
+		}
+		sres, serr := c.Do(Request{Op: "save", Path: b.Path, Force: force})
+		switch {
+		case serr != nil:
+			failed = append(failed, b.Path)
+			if !asJSON {
+				fmt.Fprintf(stderr, "raj ctl save: %s: %v\n", b.Path, serr)
+			}
+		case sres.Err != "":
+			failed = append(failed, b.Path)
+			if !asJSON {
+				fmt.Fprintf(stderr, "raj ctl save: %s: %s\n", b.Path, sres.Err)
+			}
+		default:
+			saved = append(saved, b.Path)
+			if !asJSON {
+				fmt.Fprintf(stdout, "saved %s\n", b.Path)
+			}
+		}
+	}
+	if asJSON {
+		out := map[string]any{"ok": len(failed) == 0, "saved": saved}
+		if len(failed) > 0 {
+			out["failed"] = failed
+		}
+		if code := emit(stdout, out); code != 0 {
+			return code
+		}
+		if len(failed) > 0 {
+			return 1
+		}
+		return 0
+	}
+	if len(saved) == 0 && len(failed) == 0 {
+		fmt.Fprintln(stdout, "no dirty buffers to save")
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(stderr, "raj ctl save: %d of %d buffer(s) could not be saved\n",
+			len(failed), len(failed)+len(saved))
+		return 1
+	}
+	return 0
+}
+
+// landReport is the structured --json form of a land: the task, the sets
+// accepted, and the buffers saved, held back for another task, or refused a
+// save for another reason.
+type landReport struct {
+	Task    string        `json:"task"`
+	Sets    int           `json:"sets"`
+	Saved   []string      `json:"saved"`
+	Held    []string      `json:"held"`
+	Refused []landRefusal `json:"refused,omitempty"`
+	Export  *LandExport   `json:"export,omitempty"`
+}
+
+// landRefusal is one buffer's refusal in a land report: a save the editor
+// refused, or a buffer whose sets could not be selected. It is named so a
+// skipped buffer is never silent.
+type landRefusal struct {
+	Path  string `json:"path"`
+	Error string `json:"error"`
+}
+
+// landCmd runs the human's one-gesture landing. The server owns the selection
+// and the human gate, so this only asks and prints the per-buffer outcome: the
+// sets accepted, the files saved, the files held back because another task's
+// sets remain pending, and any buffer a save refused for another reason. A
+// gesture that matches nothing says so rather than printing an empty success.
+func landCmd(c *Client, task string, stdout, stderr io.Writer, asJSON bool) int {
+	if task == "" {
+		fmt.Fprintln(stderr, "raj ctl land: needs a task; pass the task its change sets were written under")
+		return 2
+	}
+	res, err := c.Do(Request{Op: "land", LandTask: task})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	var rep landReport
+	rep.Task = task
+	for _, f := range res.Land {
+		rep.Sets += f.Sets
+		switch {
+		case f.Err != "":
+			rep.Refused = append(rep.Refused, landRefusal{Path: f.Path, Error: f.Err})
+		case f.Held:
+			rep.Held = append(rep.Held, f.Path)
+		case f.Saved:
+			rep.Saved = append(rep.Saved, f.Path)
+		}
+	}
+	if res.HookJSON != "" {
+		var exp LandExport
+		if err := json.Unmarshal([]byte(res.HookJSON), &exp); err == nil {
+			rep.Export = &exp
+		}
+	}
+	sort.Strings(rep.Saved)
+	sort.Strings(rep.Held)
+	if asJSON {
+		if code := emit(stdout, rep); code != 0 {
+			return code
+		}
+	} else if rep.Sets == 0 {
+		fmt.Fprintf(stdout, "nothing pending for %s\n", task)
+	} else {
+		fmt.Fprintf(stdout, "landed %s: %d set(s) in %d file(s)\n", task, rep.Sets, len(rep.Saved))
+		for _, p := range rep.Saved {
+			fmt.Fprintf(stdout, "  %s\n", p)
+		}
+		for _, p := range rep.Held {
+			fmt.Fprintf(stdout, "held %s: foreign pending sets\n", p)
+		}
+		for _, r := range rep.Refused {
+			fmt.Fprintf(stderr, "land %s: %s\n", r.Path, r.Error)
+		}
+		if rep.Export != nil {
+			if rep.Export.Warning != "" {
+				fmt.Fprintf(stdout, "  %s\n", rep.Export.Warning)
+			}
+			if rep.Export.Err != "" {
+				fmt.Fprintf(stderr, "land export: %s\n", rep.Export.Err)
+			} else if rep.Export.Commit != "" {
+				fmt.Fprintf(stdout, "  committed %s on %s\n", rep.Export.Commit, rep.Export.Ref)
+			}
+		}
+	}
+	if len(rep.Refused) > 0 {
+		return 1
+	}
+	return 0
+}
+
+// clearCmd hard-purges a rejected change set and drops an invalid Proposed
+// one. Unlike accept and reject, clear
 // edits the document, so it can fail on state rather than on the address: a
 // later live set can overlap a member the reversal has to remove, and the
 // refusal then names that set, its author and the span as a block, so the
@@ -3197,6 +3994,43 @@ func revertCmd(c *Client, path string, wantAuthor uint8, mine bool, stdout, stde
 		return emit(stdout, map[string]any{"ok": true, "version": res.Version})
 	}
 	fmt.Fprintf(stdout, "reverted author %d's pieces\n", me)
+	return 0
+}
+
+// revealCmd points the editor, and every attached client, at a path, optionally
+// at a byte span. Both -1 means the whole file. The span is validated here so a
+// malformed one is a usage error rather than a round trip whose refusal the
+// caller has to parse.
+func revealCmd(c *Client, path string, start, end int, stdout, stderr io.Writer, asJSON bool) int {
+	if path == "" {
+		fmt.Fprintln(stderr, "raj ctl reveal: needs a path")
+		return 2
+	}
+	whole := start == -1 && end == -1
+	if !whole && (start < 0 || end < 0 || end < start) {
+		fmt.Fprintln(stderr, "raj ctl reveal: --start/--end want a byte span, both -1 for the whole file")
+		return 2
+	}
+	req := Request{Op: "reveal", Path: path}
+	if !whole {
+		req.Start, req.End = &start, &end
+	}
+	res, err := c.Do(req)
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if asJSON {
+		out := map[string]any{"ok": true, "path": path}
+		if !whole {
+			out["start"], out["end"] = start, end
+		}
+		return emit(stdout, out)
+	}
+	if whole {
+		fmt.Fprintf(stdout, "revealed %s\n", path)
+		return 0
+	}
+	fmt.Fprintf(stdout, "revealed %s bytes %d..%d\n", path, start, end)
 	return 0
 }
 
@@ -3374,10 +4208,19 @@ func IndexAll(hay, needle string) []int {
 // block every other verb on the same client. Two connections saying hello with
 // the same identity are the same participant and share one mailbox, which is
 // what makes that split free.
-func recv(c *Client, identity, name string, wait time.Duration,
+//
+// With peersOnly, the editor's own notices (author 0) are not answers: a batch
+// made only of them is dropped and the wait continues, and any notice in a
+// returned batch is hidden. The caller wants what a person or a peer said, not
+// the editor relaying its own bookkeeping.
+func recv(c *Client, identity, name string, wait time.Duration, peersOnly bool,
 	stdout, stderr io.Writer, asJSON bool) int {
 	hi, err := c.Do(Request{Op: "hello", Identity: identityOf(identity), Name: name})
-	if code := fail(stderr, hi, err); code != 0 {
+	if err != nil {
+		fmt.Fprintln(stderr, "raj ctl:", err)
+		return exitConnLost
+	}
+	if code := fail(stderr, hi, nil); code != 0 {
 		return code
 	}
 
@@ -3411,30 +4254,228 @@ func recv(c *Client, identity, name string, wait time.Duration,
 		}()
 	}
 
-	res, err := c.Do(Request{Op: "recv"})
-	if err != nil {
-		fmt.Fprintln(stderr, "raj ctl:", err)
-		return 1
-	}
-	if res.Err == "cancelled" {
-		// Nothing arrived in time. Distinguished from a refusal by the exit
-		// code: 3 means "no message", so a polling loop can tell "the user said
-		// nothing" from "the editor said no". The JSON form still writes the
-		// empty array so `--json` always parses, but it exits 3 too: a loop
-		// reads the code, and the code must not depend on the output shape.
-		if asJSON {
-			emit(stdout, []Message{})
+	var res Response
+	for {
+		res, err = c.Do(Request{Op: "recv"})
+		if err != nil {
+			fmt.Fprintln(stderr, "raj ctl:", err)
+			return exitConnLost
 		}
-		return 3
+		if res.Err == "cancelled" || res.Err == ErrSuperseded.Error() {
+			// Nothing arrived in time, or a newer recv for this identity
+			// preempted this one. Both are cancellations, not refusals, and
+			// both exit 3 so a polling loop can tell "the user said nothing"
+			// or "someone else is reading my mail now" from "the editor said
+			// no". The JSON form still writes the empty array so `--json`
+			// always parses, but it exits 3 too: a loop reads the code, and the
+			// code must not depend on the output shape.
+			if asJSON {
+				emit(stdout, []Message{})
+			}
+			return 3
+		}
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		// With --peers-only the editor's notices are not answers: a batch made
+		// only of them is dropped and the wait goes on, so a driver does not
+		// wake to relay noise and have to re-park itself.
+		if !peersOnly || !noticesOnly(res.Messages) {
+			break
+		}
 	}
+	senders := map[uint8]Participant{}
+	for _, p := range hi.Participants {
+		senders[p.ID] = p
+	}
+	// The hello above is a snapshot from before this recv parked. A peer that
+	// joined since is absent from it, and would print as "author N". When a
+	// message actually names someone new, re-read the registry once; a hello
+	// on this same client is the cheapest listing and keeps the same
+	// connection, so the mailbox it watches does not move.
+	stale := false
+	for _, m := range res.Messages {
+		if m.From == AuthorUser || m.From == AuthorOriginal {
+			continue
+		}
+		if _, ok := senders[m.From]; !ok {
+			stale = true
+			break
+		}
+	}
+	if stale {
+		again, err := c.Do(Request{Op: "hello",
+			Identity: identityOf(identity), Name: name})
+		if err == nil && again.Err == "" {
+			for _, p := range again.Participants {
+				senders[p.ID] = p
+			}
+		}
+	}
+	if asJSON {
+		return emit(stdout, recvRows(res.Messages, senders, peersOnly))
+	}
+	for _, m := range res.Messages {
+		// The user's words and the editor's notices print bare, as they always
+		// have. A peer's are labelled, because a driver must be able to tell
+		// "the user said" from "another agent said" without asking for JSON.
+		// --peers-only drops the notices before this point.
+		if peersOnly && m.From == AuthorOriginal {
+			continue
+		}
+		if m.From == AuthorUser || m.From == AuthorOriginal {
+			fmt.Fprintln(stdout, m.Text)
+			continue
+		}
+		fmt.Fprintf(stdout, "[from %s] %s\n", peerLabel(m, senders), m.Text)
+	}
+	return 0
+}
+
+// recvRows is recv's JSON body: one mailOut per message, with the sender's
+// reply target taken from the message itself when it carries one and from the
+// hello snapshot otherwise. The message's own key and name are the durable
+// target: they survive the sender going away, renaming or being replayed from
+// the store, where the snapshot cannot.
+func recvRows(msgs []Message, senders map[uint8]Participant, peersOnly bool) []mailOut {
+	out := make([]mailOut, 0, len(msgs))
+	for _, m := range msgs {
+		if peersOnly && m.From == AuthorOriginal {
+			continue
+		}
+		o := mailOut{From: m.From, FromKey: m.FromKey, FromName: m.FromName, Text: m.Text}
+		if o.FromKey == "" {
+			if p, ok := senders[m.From]; ok && m.From != AuthorUser && m.From != AuthorOriginal {
+				o.FromKey, o.FromName = p.Identity, p.Name
+			}
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// peerLabel is recv's plain-text sender label. It prefers the participant the
+// hello snapshot named, then the reply target the message itself carries, and
+// falls back to the author id when neither is known.
+func peerLabel(m Message, senders map[uint8]Participant) string {
+	name, key := m.FromName, m.FromKey
+	if p, ok := senders[m.From]; ok {
+		name, key = p.Name, p.Identity
+	}
+	if name == "" {
+		return fmt.Sprintf("author %d", m.From)
+	}
+	if key == "" {
+		return name
+	}
+	return fmt.Sprintf("%s (%s, author %d)", name, key, m.From)
+}
+
+// mailOut is recv's JSON row: the wire Message, plus the sender's key and name
+// when it is a peer, so a waker can label a message without a second call.
+type mailOut struct {
+	From     uint8  `json:"from"`
+	FromKey  string `json:"from_key,omitempty"`
+	FromName string `json:"from_name,omitempty"`
+	Text     string `json:"text"`
+}
+
+// noticesOnly reports whether every message in a recv batch came from the
+// editor itself (author 0). --peers-only uses it to keep parking on a batch
+// that holds nothing a person or peer said: a user's message and a peer's
+// both count as an answer; only the editor's notices do not.
+func noticesOnly(msgs []Message) bool {
+	for _, m := range msgs {
+		if m.From != AuthorOriginal {
+			return false
+		}
+	}
+	return true
+}
+
+// sendCmd queues a message for another participant's mailbox, where its recv
+// (or a harness waker parked on one) picks it up. The text is --text,
+// --text-file, or the one positional argument; the sender is this
+// connection's own identity, which is why send needs --as like every write.
+func sendCmd(c *Client, to, positional, text, textFile string, verbatim bool,
+	stdout, stderr io.Writer, asJSON bool) int {
+	if to == "" {
+		fmt.Fprintln(stderr, "raj ctl send: needs --to KEY, NAME, ID or all")
+		return 2
+	}
+	sources := 0
+	for _, s := range []string{positional, text, textFile} {
+		if s != "" {
+			sources++
+		}
+	}
+	if sources != 1 {
+		fmt.Fprintln(stderr, "raj ctl send: give the message once: as an argument, --text, or --text-file")
+		return 2
+	}
+	msg := firstOf(positional, text)
+	if textFile != "" {
+		var err error
+		if msg, err = readTextFile(textFile, verbatim); err != nil {
+			fmt.Fprintln(stderr, "raj ctl send:", err)
+			return 1
+		}
+	}
+	res, err := c.Do(Request{Op: "send", To: to, Message: msg})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
 	if asJSON {
-		return emit(stdout, res.Messages)
+		return emit(stdout, map[string]any{"ok": true, "from": res.Author, "to": res.Participants})
 	}
-	for _, m := range res.Messages {
-		fmt.Fprintln(stdout, m.Text)
+	names := make([]string, 0, len(res.Participants))
+	for _, p := range res.Participants {
+		state := "queued"
+		if p.Connected {
+			state = "delivered"
+		}
+		names = append(names, fmt.Sprintf("%s (%s, author %d, %s)", p.Name, p.Identity, p.ID, state))
 	}
+	fmt.Fprintf(stdout, "sent to %s\n", strings.Join(names, ", "))
+	return 0
+}
+
+// stateCmd reports or sets this connection's declared working state. `state`
+// alone reads it; `state set VALUE` sets it. The declared state wins over the
+// derived one until the connection goes quiet, and --on/--note ride with it.
+func stateCmd(c *Client, args []string, on, note string, stdout, stderr io.Writer, asJSON bool) int {
+	req := Request{Op: "state"}
+	if len(args) > 0 {
+		if args[0] != "set" || len(args) < 2 {
+			fmt.Fprintln(stderr, "raj ctl state: expects `state` or `state set working|blocked|review|idle`")
+			return 2
+		}
+		switch args[1] {
+		case StateWorking, StateBlocked, StateReview, StateIdle:
+		default:
+			fmt.Fprintf(stderr, "raj ctl state: unknown state %q; use working, blocked, review or idle\n", args[1])
+			return 2
+		}
+		req.State, req.StateOn, req.StateNote = args[1], on, note
+	}
+	res, err := c.Do(req)
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	var p Participant
+	if len(res.Participants) > 0 {
+		p = res.Participants[0]
+	}
+	if asJSON {
+		return emit(stdout, p)
+	}
+	fmt.Fprintf(stdout, "%s\tdeclared=%s\ttask=%s\tsince=%dms", p.State, p.Declared, p.Task, p.SinceMS)
+	if p.On != "" {
+		fmt.Fprintf(stdout, "\ton=%s", p.On)
+	}
+	if p.Note != "" {
+		fmt.Fprintf(stdout, "\tnote=%s", p.Note)
+	}
+	fmt.Fprintln(stdout)
 	return 0
 }

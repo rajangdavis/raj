@@ -12,6 +12,7 @@ import (
 // the terminal for nothing. It opens the palette over the keymap, which is what
 // makes every other chord discoverable by name.
 func TestCommandPaletteOpensAndLists(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.press("shift+super+p")
 
@@ -31,6 +32,7 @@ func TestCommandPaletteOpensAndLists(t *testing.T) {
 // The list filters like the file and symbol overlays do, and the row it settles
 // on is the action the query names rather than an arbitrary subsequence match.
 func TestCommandPaletteFilters(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.press("shift+super+p")
 	all := h.Picker.Results()
@@ -52,6 +54,7 @@ func TestCommandPaletteFilters(t *testing.T) {
 // palette entry does exactly what pressing its chord does. Toggling the sidebar
 // is the harmless, observable stand-in for that dispatch.
 func TestCommandPaletteRunsTheChosenAction(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	// The harness opens a document into the explorer New starts in, so close
 	// it first: the toggle below is only observable against a known state,
@@ -78,6 +81,7 @@ func TestCommandPaletteRunsTheChosenAction(t *testing.T) {
 // action chosen from the palette is refused exactly as its chord is, and the
 // document is untouched.
 func TestCommandPaletteHonoursReviewMode(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "one\ntwo\n")
 	h.press("super+r") // toggle_review
 	if h.mode != ModeReview {

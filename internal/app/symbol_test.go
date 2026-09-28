@@ -30,6 +30,7 @@ func main() {
 // cmd+shift+o was a bound chord with nothing behind it, so it was taken from
 // the terminal for nothing.
 func TestGotoSymbolOpensTheOverlay(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, goSrc)
 	h.press("shift+super+o")
 
@@ -46,6 +47,7 @@ func TestGotoSymbolOpensTheOverlay(t *testing.T) {
 }
 
 func TestGotoSymbolJumps(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, goSrc)
 	h.press("shift+super+o")
 	h.typeText("meow")
@@ -64,6 +66,7 @@ func TestGotoSymbolJumps(t *testing.T) {
 
 // Jumping within the file must not open a second tab for it.
 func TestGotoSymbolStaysInOneTab(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, goSrc)
 	before := len(h.Tabs.All())
 	h.press("shift+super+o")
@@ -80,6 +83,7 @@ func TestGotoSymbolStaysInOneTab(t *testing.T) {
 
 // Escaping leaves the cursor alone, the same as cancelling go-to-line.
 func TestGotoSymbolCancelLeavesTheCursor(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, goSrc)
 	h.press("ctrl+g")
 	h.typeText("6")
@@ -98,6 +102,7 @@ func TestGotoSymbolCancelLeavesTheCursor(t *testing.T) {
 // A file type with no rules says so, rather than reporting an empty list that
 // looks like a file with no declarations in it.
 func TestGotoSymbolOnAnUnsupportedFile(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	notes := filepath.Join(h.primaryRoot(), "notes.txt")
 	if err := os.WriteFile(notes, []byte("func not_go() {}\n"), 0o644); err != nil {
@@ -118,6 +123,7 @@ func TestGotoSymbolOnAnUnsupportedFile(t *testing.T) {
 // The two modes share one overlay, so opening either must not leave the other's
 // rows behind.
 func TestModesDoNotLeakIntoEachOther(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, goSrc)
 	h.press("shift+super+o")
 	symbolRows := h.Picker.Results()

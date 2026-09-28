@@ -1,0 +1,17 @@
+{
+  "description": "Deny `raj ctl save` from the agent; saving is the user's gesture.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/oc/.codex/hooks/raj-guard.sh",
+            "statusMessage": "Checking for a save"
+          }
+        ]
+      }
+    ]
+  }
+}

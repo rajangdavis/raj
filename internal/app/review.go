@@ -184,27 +184,118 @@ func (a *App) clearRejected() {
 		return
 	}
 	groups := rejectedAtCaret(p.File, p.Cursors.Primary().Head)
-	if len(groups) == 0 {
-		a.status = "no rejected changes here"
-		return
-	}
 	if len(groups) > 1 {
 		a.status = fmt.Sprintf("%d rejected change sets here; the caret cannot pick one", len(groups))
 		return
 	}
-	id := groups[0]
+	if len(groups) == 1 {
+		a.clearChangeSet(p, groups[0])
+		return
+	}
+	// No rejected set here. An invalid (superseded) set has no surviving hunk
+	// of its own, but a rejected collider can restore its run to the review
+	// view; a caret on that run reaches the invalid set it holds.
+	invalids := invalidAtCaret(p.File, p.Cursors.Primary().Head)
+	if len(invalids) == 0 {
+		a.status = "no rejected or invalid changes here"
+		return
+	}
+	if len(invalids) > 1 {
+		a.status = fmt.Sprintf("%d invalid change sets here; the caret cannot pick one", len(invalids))
+		return
+	}
+	a.clearChangeSet(p, invalids[0])
+}
+
+// clearChangeSet disposes one change set through File.ClearGroup, which
+// reverses a rejected set and drops an invalid Proposed set with the same
+// gesture. It is the shared body of the clear chord, so the caret addresses a
+// set by id and the wording says which kind was disposed. An attached client
+// forwards the clear to the daemon rather than mutating the local tab.
+func (a *App) clearChangeSet(p *editor.Pane, id uint64) {
 	if a.attach {
 		a.clearRemote(p, id)
 		return
 	}
+	wasInvalid := invalidGroup(p.File, id)
 	defer a.flushJournal(p)
-	if !p.File.ClearRejected(id) {
-		a.status = fmt.Sprintf("could not clear rejected change set %d: later edits overlap it", id)
+	if ok, _ := p.File.ClearGroup(id); !ok {
+		a.status = fmt.Sprintf("could not clear change set %d: later edits overlap it", id)
 		return
 	}
 	p.Cursors.Normalize()
 	a.Explorer.Tree.MarkChanged(p.File.Path)
+	if wasInvalid {
+		a.status = fmt.Sprintf("discarded invalid change set %d", id)
+		return
+	}
 	a.status = fmt.Sprintf("cleared rejected change set %d", id)
+}
+
+// invalidGroup reports whether id names a still-Proposed invalid set. It is
+// read before the disposal, which flips the set to Rejected and so clears the
+// derived Invalid flag with it.
+func invalidGroup(f *editor.File, id uint64) bool {
+	for _, g := range f.Session().Groups() {
+		if g.ID == id {
+			return g.State == piecetable.Proposed && g.Invalid
+		}
+	}
+	return false
+}
+
+// invalidAtCaret names the invalid (superseded) change sets whose address
+// touches the caret's line, in document order. An invalid set has no surviving
+// hunk, so there are two ways to reach one: the live set that consumed it,
+// which InvalidBy names and where that set sits, or a restored run the
+// Annotated view keeps after a rejected collider put it back. A set with
+// neither (wholly consumed, no collider) has no caret address; `clear --group`
+// and `clear --all` reach it.
+func invalidAtCaret(f *editor.File, off int) []uint64 {
+	invalid := map[uint64]bool{}
+	for _, g := range f.Session().Groups() {
+		if g.State == piecetable.Proposed && g.Invalid {
+			invalid[g.ID] = true
+		}
+	}
+	if len(invalid) == 0 {
+		return nil
+	}
+	line := f.LineOf(off)
+	type hit struct {
+		id    uint64
+		start int
+	}
+	var hits []hit
+	seen := map[uint64]bool{}
+	at := func(id uint64, start, end int) {
+		first := f.LineOf(start)
+		last := first
+		if end > start {
+			last = f.LineOf(end - 1)
+		}
+		if line < first || line > last || seen[id] {
+			return
+		}
+		seen[id] = true
+		hits = append(hits, hit{id, start})
+	}
+	for _, g := range f.Session().Groups() {
+		if invalid[g.ID] && g.InvalidBy != nil {
+			at(g.ID, g.InvalidBy.Start, g.InvalidBy.End)
+		}
+	}
+	for _, r := range f.Session().Project(piecetable.Annotated).States() {
+		if invalid[r.Group] && r.Len > 0 {
+			at(r.Group, r.Off, r.Off+r.Len)
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].start < hits[j].start })
+	out := make([]uint64, len(hits))
+	for i, h := range hits {
+		out[i] = h.id
+	}
+	return out
 }
 
 // rejectedAtCaret names the rejected change sets whose live runs touch the
@@ -421,36 +512,58 @@ func (a *App) participantInitial(author piecetable.Author) string {
 	return string([]rune(name)[:1])
 }
 
-// reviewSave is the save gesture when the buffer holds proposals: a review
-// dialog listing the pending sets, with the current one jumping the caret to
-// where it sits, before the user answers accept-all-and-save or cancel. The
-// sets the listing names come from Session.Pending, and the places they sit
-// from Pane.PendingMarks — the same two projections the gutter and the
-// proposals picker read, so the save review cannot disagree with either.
-func (a *App) reviewSave(p *editor.Pane, pending []piecetable.Group, then func(saved bool)) {
+// canShowReview reports whether the save review can actually be presented on
+// the screen the app has. It is the fail-open half of the confirm: a dialog
+// whose box cannot fit draws nothing yet still takes the keyboard, so a save
+// must never be left waiting on one. A nil screen can show nothing.
+func (a *App) canShowReview(message string, rows []string) bool {
+	if a.screen == nil {
+		return false
+	}
+	cols, screenRows := a.screen.Size()
+	return prompt.ReviewFits(message, rows, cols, screenRows)
+}
+
+// reviewSave is the save gesture when the buffer holds another writer's
+// proposals: a review dialog listing the pending sets, with the current one
+// jumping the caret to where it sits, before the user answers save-anyway or
+// steps into Review mode. The sets the listing names come from Session.Pending,
+// and the places they sit from Pane.PendingMarks — the same two projections the
+// gutter and the proposals picker read, so the save review cannot disagree with
+// either. other is the subset the user did not author, whose count and names the
+// message carries.
+func (a *App) reviewSave(p *editor.Pane, pending []piecetable.Group, other []piecetable.Group, then func(saved bool)) {
 	rows, lines := a.reviewRows(p, pending)
+	message := a.saveConfirmMessage(other)
+	// FAIL OPEN. The confirm warns but never guards: if it cannot be drawn
+	// there is nothing to answer, so the save proceeds rather than waiting
+	// forever on a dialog nobody can see.
+	if !a.canShowReview(message, rows) {
+		a.saveNow(p, then)
+		return
+	}
 	a.beforePrompt()
 	a.Prompt.Review(
 		"Save with proposed changes",
-		fmt.Sprintf("Accept all %d proposed change set(s)?", len(pending)),
+		message,
 		rows,
-		[]string{prompt.Save, prompt.Cancel},
+		[]string{prompt.SaveAnyway, prompt.ReviewOption},
 		func(row int) {
 			if row < len(lines) && lines[row] > 0 {
 				jumpToSessionLine(p, lines[row])
 			}
 		},
 		func(answer string, ok bool) {
-			if !ok || answer != prompt.Save {
+			switch {
+			case !ok || answer == prompt.Cancel:
 				a.status = "save cancelled"
 				report(then, false)
-				return
+			case answer == prompt.SaveAnyway:
+				a.saveNow(p, then)
+			case answer == prompt.ReviewOption:
+				a.EnterReview()
+				report(then, false)
 			}
-			if p.File.Path == "" {
-				a.saveAs(p, then)
-				return
-			}
-			a.saveNamed(p, then)
 		})
 }
 

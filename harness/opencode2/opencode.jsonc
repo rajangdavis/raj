@@ -1,0 +1,22 @@
+{
+  // opencode v2 harness config. Behavioural baseline:
+  // harness/opencode/opencode.json.
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek/deepseek-flash",
+  "default_agent": "raj",
+  // Plugins are auto-discovered from ~/.config/opencode/plugins/ (installed
+  // there by Dockerfile.opencode2); no `plugins` key is needed.
+  // v2 discovers ~/.config/opencode/skills automatically, but name it so the
+  // raj-editor skill is found regardless.
+  "skills": ["/home/oc/.config/opencode/skills"],
+  // v1 `permission` (read/edit/grep/glob deny) mapped to {action,resource,
+  // effect}. v1's `tools` also disabled write/apply_patch/lsp; v2 has no
+  // global tools list and no lsp action, so edit deny is the closest guard and
+  // lsp stays exposed (GAP).
+  "permissions": [
+    { "action": "read", "resource": "*", "effect": "deny" },
+    { "action": "edit", "resource": "*", "effect": "deny" },
+    { "action": "grep", "resource": "*", "effect": "deny" },
+    { "action": "glob", "resource": "*", "effect": "deny" }
+  ]
+}

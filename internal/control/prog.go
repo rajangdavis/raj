@@ -28,6 +28,7 @@ var knownOps = map[byte]bool{
 	prog.OpQuery: true, prog.OpFlags: true, prog.OpID: true,
 	prog.OpInclude: true, prog.OpExclude: true,
 	prog.OpLine: true, prog.OpCol: true, prog.OpArg: true,
+	prog.OpGitMode: true, prog.OpGitRev: true, prog.OpGitCount: true,
 
 	prog.OpPing: true, prog.OpBuffers: true, prog.OpRead: true, prog.OpOpen: true,
 	prog.OpApply: true, prog.OpSave: true, prog.OpVersion: true,
@@ -42,6 +43,8 @@ var knownOps = map[byte]bool{
 	prog.OpClear: true, prog.OpExec: true,
 	prog.OpFind:     true,
 	prog.OpSnapshot: true,
+	prog.OpGit:      true,
+	prog.OpReveal:   true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
@@ -59,9 +62,11 @@ var verbNames = map[byte]string{
 	prog.OpLSP: "lsp", prog.OpDiff: "diff", prog.OpReview: "review",
 	prog.OpClear: "clear", prog.OpExec: "exec", prog.OpFind: "find",
 	prog.OpSnapshot: "snapshot",
+	prog.OpGit:      "git",
+	prog.OpReveal:   "reveal",
 }
 
-// Three verbs stay out of programs, and the reasons are different enough to be
+// Four verbs stay out of programs, and the reasons are different enough to be
 // worth separating.
 //
 //   - recv parks until the user says something, which could be hours. A batch
@@ -74,13 +79,17 @@ var verbNames = map[byte]string{
 //     a cancel can arrive during the search it cancels. Putting either in a
 //     batch would mean a request queued behind the very thing it is meant to
 //     interrupt.
+//   - hook stays out too: list and show are reads, and put/rm/enable/disable
+//     are local-only authoring whose put carries a whole HookRow as JSON, so
+//     the JSON request path and `raj hook` are the surfaces it speaks. The
+//     verb-code table still carries it for a direct frame.
 //
 // exec is reachable now that an argument op can accumulate its argv, but the
 // remote-execution gate still applies. The serve loop only sees the outer
 // "prog" request, so connection.one re-checks the gate for every exec and a
 // batch is not a way around the flag path's refusal.
 //
-// raj ctl still reaches all of them.
+// raj ctl still reaches recv, hello and cancel, and `raj hook` reaches hook.
 
 var errNoVerb = errors.New("program ended with arguments and no verb")
 
@@ -134,6 +143,14 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 				if hunk != nil {
 					req.PatchText = hunk.Text
 				}
+			case "reveal":
+				// A reveal names a path and, optionally, a byte span to place
+				// the caret at. It writes no text, so unlike the hunk verbs the
+				// span belongs on Start/End rather than on a hunk.
+				if hunk != nil {
+					s, e := hunk.Start, hunk.End
+					req.Start, req.End = &s, &e
+				}
 			default:
 				if hunk != nil {
 					req.Hunks = []Hunk{*hunk}
@@ -174,6 +191,12 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 			pending.ReviewList = true
 		case prog.OpLSPMode:
 			pending.LSPMode = string(op.Payload)
+		case prog.OpGitMode:
+			pending.GitMode = string(op.Payload)
+		case prog.OpGitRev:
+			pending.GitRev = string(op.Payload)
+		case prog.OpGitCount:
+			pending.GitCount = prog.ReadNumber(op.Payload)
 		case prog.OpLine:
 			pending.Line = prog.ReadNumber(op.Payload)
 		case prog.OpCol:

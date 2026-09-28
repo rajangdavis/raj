@@ -159,8 +159,18 @@ func (a *App) promptDeletion(p *editor.Pane, d control.Deletion) {
 		case !ok, answer == ignoreForNow:
 			return
 		case answer == removeForever:
+			if a.attach {
+				// A viewer does not own the file: the daemon carries out the
+				// removal it was asked to approve.
+				a.approveDeletionRemote(d)
+				return
+			}
 			a.removeDeleted(p, d.Path)
 		case answer == withdrawRemoval:
+			if a.attach {
+				a.withdrawDeletionRemote(d)
+				return
+			}
 			a.withdrawDeletion(d)
 		}
 	}

@@ -41,6 +41,16 @@ const execChunk = 8 << 10
 // process, or being cancelled, is an error.
 func Run(ctx context.Context, argv []string, dir string,
 	emit func(stream uint8, b []byte)) (int, error) {
+	return RunReport(ctx, argv, dir, nil, emit)
+}
+
+// RunReport is Run plus a start callback: onStart receives the child's pid and
+// process-group id once the command has started, so a caller can record them
+// and later cancel the whole group. Run is RunReport with no callback. The
+// group id equals the pid on platforms with process groups, because
+// setProcessGroup makes the child a leader; it is zero where there are none.
+func RunReport(ctx context.Context, argv []string, dir string,
+	onStart func(pid, pgid int), emit func(stream uint8, b []byte)) (int, error) {
 	if len(argv) == 0 {
 		return 0, errors.New("exec needs a command")
 	}
@@ -67,6 +77,9 @@ func Run(ctx context.Context, argv []string, dir string,
 	}
 	if err := cmd.Start(); err != nil {
 		return 0, err
+	}
+	if onStart != nil {
+		onStart(cmd.Process.Pid, processGroupID(cmd))
 	}
 
 	// Both pipes are drained concurrently. Reading one to completion first

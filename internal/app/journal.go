@@ -59,7 +59,7 @@ type logTap struct {
 	version piecetable.Version
 	store   map[uint8]int
 	state   map[uint64]piecetable.GroupState
-	authors map[uint8]bool
+	authors map[uint8]journal.Author
 }
 
 // journalTick appends any new ops and store growth for the dirty buffers. It is
@@ -167,7 +167,24 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 	path := p.File.Path
 	store := p.File.Session().Store()
 	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
-	want := hashBytes(orig)
+	// A Base must name the raw bytes its origin decoded from, encoding
+	// included, so a shape-only external edit -- CRLF to LF, a dropped BOM, a
+	// charset change -- hashes differently even though the text is identical.
+	// Re-encoding the decoded origin with the buffer's shape reproduces the
+	// bytes first read; SavedDigest is the digest Open recorded of those exact
+	// bytes, and the sure source once the session came from a log that never
+	// wrote. originHash is the shape the session itself carries, which is what
+	// a replayed log's Base must match for reuse.
+	originBytes, err := p.File.EncodeText(string(orig))
+	if err != nil {
+		a.status = "journal: " + err.Error()
+		return nil
+	}
+	originHash := hashBytes(originBytes)
+	baseHash := originHash
+	if sum := p.File.SavedDigest(); sum != ([sha256.Size]byte{}) {
+		baseHash = digestOf(sum)
+	}
 
 	logPath := filepath.Join(a.journalDir(), journalName(path))
 	l, lerr := journal.Open(logPath)
@@ -185,7 +202,7 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 			a.status = "journal: " + path + " has no base record; not capturing"
 			return nil
 		}
-		if base.Hash == want {
+		if base.Hash == originHash {
 			tap := tapFromLog(l)
 			if tap.matches(p.File.Session()) {
 				if l.Damaged {
@@ -231,7 +248,7 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 	}
 	if err := w.Append(journal.Base{
 		Path:     path,
-		Hash:     want,
+		Hash:     baseHash,
 		Bytes:    append([]byte(nil), orig...),
 		Encoding: journalEncoding(p.File.Enc),
 	}); err != nil {
@@ -244,7 +261,7 @@ func (a *App) startTap(p *editor.Pane) *logTap {
 		version: 0,
 		store:   map[uint8]int{uint8(piecetable.Original): len(orig)},
 		state:   map[uint64]piecetable.GroupState{},
-		authors: map[uint8]bool{},
+		authors: map[uint8]journal.Author{},
 	}
 	a.putTap(path, tap)
 	return tap
@@ -326,23 +343,29 @@ func (a *App) recordOpAuthors(t *logTap, o piecetable.Op) error {
 	return nil
 }
 
-// recordAuthor appends one Author row the first time an id is seen, when the
-// registry knows who it is. Author 0 is the file as loaded, not a person.
+// recordAuthor appends an Author row when the registry knows a participant and
+// the row differs from the one last recorded for that id: the first call
+// records it, and a later call after a rename records the new name, so a
+// restart seeds the name the participant last used rather than the identity it
+// was first seen under. Author 0 is the file as loaded, not a person.
 func (a *App) recordAuthor(t *logTap, id uint8) error {
-	if id == uint8(piecetable.Original) || t.authors[id] {
+	if id == uint8(piecetable.Original) {
 		return nil
 	}
 	rec, ok := a.authorRecord(id)
 	if !ok {
 		return nil
 	}
+	if last, seen := t.authors[id]; seen && last == rec {
+		return nil
+	}
 	if err := t.w.Append(rec); err != nil {
 		return err
 	}
 	if t.authors == nil {
-		t.authors = map[uint8]bool{}
+		t.authors = map[uint8]journal.Author{}
 	}
-	t.authors[id] = true
+	t.authors[id] = rec
 	return nil
 }
 
@@ -360,7 +383,8 @@ func (a *App) authorRecord(id uint8) (journal.Author, bool) {
 	if p.Kind == control.KindHuman {
 		kind = journal.Human
 	}
-	return journal.Author{ID: id, Identity: p.Identity, Name: p.Name, Kind: kind}, true
+	return journal.Author{ID: id, Identity: p.Identity, Name: p.Name, Kind: kind, Task: p.Task}, true
+
 }
 
 // localIdentity is the identity the log header carries. The registry names the
@@ -432,6 +456,11 @@ func (a *App) flushJournals() {
 	if !journalEnabled() {
 		return
 	}
+	if a.authorTap != nil && a.authorTap.w != nil {
+		if err := a.authorTap.w.Flush(); err != nil {
+			a.status = "journal: " + err.Error()
+		}
+	}
 	for _, p := range a.Tabs.All() {
 		a.flushJournal(p)
 	}
@@ -479,6 +508,10 @@ func (a *App) closeJournals() {
 		}
 		delete(a.journals, path)
 	}
+	if a.authorTap != nil && a.authorTap.w != nil {
+		_ = a.authorTap.w.Close()
+	}
+	a.authorTap = nil
 }
 
 // restoreJournals rebuilds dirty buffers from their logs at startup. It runs
@@ -489,15 +522,18 @@ func (a *App) restoreJournals() {
 		return
 	}
 	entries, err := os.ReadDir(a.journalDir())
-	if err != nil {
-		return // no logs yet: the common case
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
-			continue
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+				continue
+			}
+			a.restoreLog(filepath.Join(a.journalDir(), e.Name()))
 		}
-		a.restoreLog(filepath.Join(a.journalDir(), e.Name()))
 	}
+	// The author-table log is read last: its rows are the joins, and a later
+	// join's name must win over an older row the same id wrote into a
+	// buffer log. It is read even when there are no buffer logs yet.
+	a.restoreAuthors()
 }
 
 // restoreLog tries to turn one log back into a dirty tab. Every refusal is
@@ -549,22 +585,20 @@ func (a *App) restoreLog(logPath string) {
 		a.settle(opened)
 		p = opened
 	}
-	store := p.File.Session().Store()
-	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
-	disk := hashBytes(orig)
-	// The base hash is over the decoded text, but the Written marker hashes the
-	// exact bytes the save wrote, encoding included. Compare each against its
-	// own kind: the pane's SavedDigest still names the bytes on disk at startup,
-	// so a CRLF or UTF-16 save matches its marker instead of reading as an
-	// external edit.
-	diskBytes := digestOf(p.File.SavedDigest())
+	// Base.Hash and Written.Hash are both digests of the exact bytes on disk,
+	// encoding included; the SavedDigest the pane carries is the digest of the
+	// bytes startup read. A shape-only external edit -- CRLF to LF, a dropped
+	// BOM, a charset change -- hashes differently here even though the decoded
+	// text is identical, so the log is archived instead of re-encoding the old
+	// shape over the file.
+	disk := digestOf(p.File.SavedDigest())
 	// The disk is ours if it matches the origin the log started from, or the
 	// bytes the last save wrote: history is kept, so a save does not truncate
 	// the log, and the disk after a save is a log to restore, not one to skip.
 	// Neither match means the file moved under the editor: the log's ops no
 	// longer describe this document, so rotate it out of the restore path and
 	// let the clean file stand. A later edit starts a fresh base.
-	if disk != base.Hash && (!wrote || diskBytes != mark.Hash) {
+	if disk != base.Hash && (!wrote || disk != mark.Hash) {
 		archived := a.archiveLog(logPath)
 		a.status = filepath.Base(base.Path) + ": unsaved changes were not restored because the file changed on disk"
 		if archived != "" {
@@ -579,7 +613,7 @@ func (a *App) restoreLog(logPath string) {
 	// A disk matching the last write is a buffer that can baseline clean at the
 	// version those bytes were written at, rather than dirty against the origin.
 	saved := editor.RestoredWrite{}
-	if wrote && diskBytes == mark.Hash {
+	if wrote && disk == mark.Hash {
 		saved = editor.RestoredWrite{
 			Content: savedContent(base, sess, int(mark.Version)),
 			Version: piecetable.Version(mark.Version),
@@ -656,10 +690,10 @@ func (a *App) logIsCleanOnDisk(base journal.Base, sess *piecetable.Session, mark
 	if err != nil {
 		return false
 	}
-	store := f.Session().Store()
-	orig := store.Slice(piecetable.Original, 0, store.Len(piecetable.Original))
-	disk := hashBytes(orig)
-	if wrote && digestOf(f.SavedDigest()) == mark.Hash {
+	// Both hashes are byte digests, so the disk read here is compared to the
+	// origin and the last write by the same raw bytes, shape included.
+	disk := digestOf(f.SavedDigest())
+	if wrote && disk == mark.Hash {
 		return sess.Version() <= piecetable.Version(mark.Version)
 	}
 	return disk == base.Hash && sess.Version() == 0
@@ -690,7 +724,9 @@ func (a *App) collectAuthors(l *journal.Log) {
 			Identity: row.Identity,
 			Name:     row.Name,
 			Kind:     participantKind(row.Kind),
+			Task:     row.Task,
 		})
+
 	}
 }
 
@@ -705,12 +741,145 @@ func participantKind(k journal.ParticipantKind) control.Kind {
 // seedParticipants installs the author table read from the logs into the
 // control registry, once it exists. A row for an id already present is left
 // alone, so the local human is never overwritten.
+//
+// One id can appear in more than one log, and a rename appends a later row for
+// the same id, so the last row for an id is the one seeded: a restart restores
+// the name the participant last used, not whichever row the directory walk
+// reached first.
 func (a *App) seedParticipants() {
 	if a.control == nil || a.control.Participants == nil {
 		return
 	}
+	latest := map[uint8]control.Participant{}
+	order := make([]uint8, 0, len(a.restoredAuthors))
 	for _, p := range a.restoredAuthors {
-		a.control.Participants.Seed(p)
+		if prev, seen := latest[p.ID]; seen {
+			// A later row for an id wins, but only for what it knows: a task is
+			// set once and never cleared, so an empty-task row (an early join
+			// in the author log) must not erase a task a buffer log recorded
+			// at write time.
+			if p.Task == "" {
+				p.Task = prev.Task
+			}
+		} else {
+			order = append(order, p.ID)
+		}
+		latest[p.ID] = p
+	}
+
+	for _, id := range order {
+		a.control.Participants.Seed(latest[id])
+	}
+}
+
+// authorsLogName is the author-table log's file name, in the workspace state
+// directory beside the store and the buffer logs. It is separate from the
+// per-buffer logs because a participant that only joins has no buffer to record
+// its row into, and a reconnect must still hand it back the same id and name.
+const authorsLogName = "authors.log"
+
+// authorsLogPath is where the author-table log lives, or "" without a root.
+func (a *App) authorsLogPath() string {
+	if a.roots.Len() == 0 {
+		return ""
+	}
+	return filepath.Join(session.StateDirForRoots(a.roots.All()), authorsLogName)
+}
+
+// restoreAuthors reads the author-table log into restoredAuthors and opens it
+// for appending. It is the counterpart to recordJoin: a participant that only
+// joined writes no buffer log, so this is the only place its row survives a
+// restart. It runs from restoreJournals, after the buffer logs, and is silently
+// absent until the first join.
+func (a *App) restoreAuthors() {
+	path := a.authorsLogPath()
+	if path == "" {
+		return
+	}
+	l, err := journal.Open(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			// A log this build cannot read is rotated out of the way; a fresh
+			// one is created on the next join.
+			a.archiveLog(path)
+		}
+		return
+	}
+	a.collectAuthors(l)
+	if tap := a.authorsAppendTap(path, l); tap != nil {
+		a.authorTap = tap
+	}
+}
+
+// authorsAppendTap opens an already-scanned author-table log for appending,
+// truncating a damaged tail first, and returns a tap carrying the rows already
+// recorded so the first reconnect after a restart appends nothing.
+func (a *App) authorsAppendTap(path string, l *journal.Log) *logTap {
+	if l.Damaged {
+		if err := l.Truncate(); err != nil {
+			a.status = "journal: " + err.Error()
+			return nil
+		}
+	}
+	w, err := journal.OpenWriter(path)
+	if err != nil {
+		a.status = "journal: " + err.Error()
+		return nil
+	}
+	tap := tapFromLog(l)
+	tap.w = w
+	return tap
+}
+
+// recordJoin persists the row of an author id that just joined. It reuses
+// recordAuthor's change check, so an ordinary per-command hello — same id, same
+// name and kind — appends nothing and does not grow the log; only a new row or
+// a changed one does. It runs on the event thread, where every log writer
+// lives; the join itself only queued the id.
+func (a *App) recordJoin(id uint8) {
+	if !journalEnabled() || a.roots.Len() == 0 || a.NoRestore {
+		return
+	}
+	if a.authorTap == nil {
+		a.authorTap = a.createAuthorsLog()
+		if a.authorTap == nil {
+			return
+		}
+	}
+	if err := a.recordAuthor(a.authorTap, id); err != nil {
+		a.status = "journal: " + err.Error()
+	}
+}
+
+// createAuthorsLog lays the author-table log on the first join, opening an
+// existing one rather than replacing it so a caller that did not run the
+// restore cannot drop rows. A workspace where nobody joins writes no file, the
+// same way a clean buffer writes no buffer log.
+func (a *App) createAuthorsLog() *logTap {
+	path := a.authorsLogPath()
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		a.status = "journal: " + err.Error()
+		return nil
+	}
+	if l, err := journal.Open(path); err == nil {
+		return a.authorsAppendTap(path, l)
+	} else if !os.IsNotExist(err) {
+		a.status = "journal: " + err.Error()
+		return nil
+	}
+	w, err := journal.Create(path, journal.Header{Root: a.primaryRoot(), Identity: a.localIdentity()})
+	if err != nil {
+		a.status = "journal: " + err.Error()
+		return nil
+	}
+	return &logTap{
+		w:       w,
+		store:   map[uint8]int{},
+		state:   map[uint64]piecetable.GroupState{},
+		authors: map[uint8]journal.Author{},
 	}
 }
 
@@ -726,6 +895,13 @@ func buildSession(l *journal.Log) *piecetable.Session {
 	doc := piecetable.NewDoc(string(base.Bytes), 0)
 	var ops []piecetable.Op
 	decisions := map[uint64]piecetable.GroupState{}
+	// groupTask is the task each change set was opened under, taken from the
+	// author row of the op that opened it. A write records its author's task
+	// before its op, so this is the task the live session carried; the first
+	// op of a group wins, so a writer that re-registered mid-group does not
+	// move a set that was already opened.
+	groupTask := map[uint64]string{}
+	authorTask := map[uint8]string{}
 	for _, r := range l.Records {
 		switch v := r.(type) {
 		case journal.StoreAppend:
@@ -734,9 +910,16 @@ func buildSession(l *journal.Log) *piecetable.Session {
 			}
 			doc.Store().Append(piecetable.Author(v.Author), v.Blob)
 		case journal.Op:
+			if _, seen := groupTask[v.Group]; !seen {
+				if task := authorTask[v.Author]; task != "" {
+					groupTask[v.Group] = task
+				}
+			}
 			ops = append(ops, fromJournalOp(v))
 		case journal.Decision:
 			decisions[v.Group] = piecetable.GroupState(v.State)
+		case journal.Author:
+			authorTask[v.ID] = v.Task
 		}
 	}
 	for i, o := range ops {
@@ -744,7 +927,15 @@ func buildSession(l *journal.Log) *piecetable.Session {
 			return nil
 		}
 	}
-	return piecetable.NewRestoredSession(doc, ops, decisions, len(base.Bytes))
+	sess := piecetable.NewRestoredSession(doc, ops, decisions, len(base.Bytes))
+	// NewRestoredSession seeds review decisions but not the task map, so apply
+	// it after the replay: a manifest built from the restored session must
+	// still find the work each set belongs to.
+	for group, task := range groupTask {
+		sess.SetGroupTask(group, task)
+	}
+	return sess
+
 }
 
 // savedContent reconstructs the text a restored session held at version at, for
@@ -777,7 +968,7 @@ func tapFromLog(l *journal.Log) *logTap {
 		version: 0,
 		store:   map[uint8]int{},
 		state:   map[uint64]piecetable.GroupState{},
-		authors: map[uint8]bool{},
+		authors: map[uint8]journal.Author{},
 	}
 	for _, r := range l.Records {
 		switch v := r.(type) {
@@ -794,7 +985,7 @@ func tapFromLog(l *journal.Log) *logTap {
 		case journal.Decision:
 			t.state[v.Group] = piecetable.GroupState(v.State)
 		case journal.Author:
-			t.authors[v.ID] = true
+			t.authors[v.ID] = v
 		}
 	}
 	return t

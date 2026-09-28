@@ -46,6 +46,18 @@ rename remain.
   exists to prevent.
 - On Remove forever: move or unlink the file (section 4), drop the buffer, and
   clear the pending deletion.
+- The prompt remains the gate on a local editor; a human-gated `delete --approve`
+  (and `rmdir --approve`, section 11) is the control equivalent for an attached
+  client that cannot raise the daemon dialog, and an agent may not pass it.
+- An **attached client mirrors and forwards** rather than acting locally: the
+  daemon's pending `delete`/`rmdir` rollup lands in the client's pending maps
+  and arrival queue, and the prompt **Remove forever** / **Withdraw** answers
+  are sent as `delete --approve` / `rmdir --approve` and `--withdraw` over the
+  decision connection instead of unlinking or retracting a local file. The
+  client never touches the filesystem; the daemon's verb is the one removal
+  path. A withdraw **runs as the connection's own writer**, never as a claimed
+  author: a human may withdraw any pending removal, while an agent may withdraw
+  only its own.
 
 ## 4. Trash
 
@@ -63,7 +75,8 @@ rename remain.
 ## 6. Verb surface (built — delete/deletions; rmdir in §11)
 
 - `raj ctl delete <path>` — record a pending deletion (claim-gated).
-- `raj ctl delete --withdraw <path>` — the proposing agent withdraws it.
+- `raj ctl delete --withdraw <path>` — withdraw a pending removal; a human may
+  withdraw any, an agent only its own.
 - `raj ctl deletions` — list pending deletions (path, author), so a driver
   can see them without opening the file. (A timestamp is a later nicety.)
 - Approval is the **human prompt** (section 3). No socket accept/reject in v1:
@@ -129,8 +142,8 @@ than a one-file prompt.
 
 - `raj ctl rmdir <dir>` — propose removing the directory and its subtree;
   records a pending dir-removal (with author), unlinks nothing. Idempotent.
-- `raj ctl rmdir --withdraw <dir>` — the proposing author retracts it; no-op
-  when absent, refused for a proposal from another author.
+- `raj ctl rmdir --withdraw <dir>` — withdraw a pending removal; a human may
+  withdraw any, an agent only its own; no-op when absent.
 - `raj ctl rmdirs` — list pending dir-removals (dir, author).
 - Approval is the human **remove** answer in the review tab; no socket
   accept/reject in v1. `run --prog` reachability is out of scope, as with

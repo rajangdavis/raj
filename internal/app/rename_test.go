@@ -42,6 +42,7 @@ func renamePaneAt(t *testing.T, h *harness, path string) *editor.Pane {
 // as the other capability gates, before a request the server would answer
 // method-not-found and before a name is collected.
 func TestRenameCapabilityGate(t *testing.T) {
+	t.Parallel()
 	const want = "language server does not support rename"
 	if got := capabilityGap(nil, "rename"); got != want {
 		t.Errorf("absent provider: gap = %q", got)
@@ -59,6 +60,7 @@ func TestRenameCapabilityGate(t *testing.T) {
 // this exercises the no-server path without spawning one on a machine that
 // happens to have gopls installed.
 func TestRenameWithoutAServerIsHarmless(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	path := filepath.Join(h.primaryRoot(), "notes.txt")
 	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
@@ -82,6 +84,7 @@ func TestRenameWithoutAServerIsHarmless(t *testing.T) {
 // guards is the old shape: collect a name, send the rename, and report the
 // failure after the user has typed one.
 func TestRenamePrepareRefusalIsSpoken(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerPrepareRename})
@@ -106,6 +109,7 @@ func TestRenamePrepareRefusalIsSpoken(t *testing.T) {
 // suggested name and selected so typing replaces it. There is no second text
 // widget, and the seed is the current name rather than a blank field.
 func TestRenameCollectsANameThroughThePrompt(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n\nfunc Old() {}\n")
 	h.lspGen = 1
 	h.park(lspAnswer{gen: 1, kind: answerPrepareRename, target: &lsp.RenameTarget{
@@ -144,6 +148,7 @@ func TestRenameCollectsANameThroughThePrompt(t *testing.T) {
 // into another file and corrupt both, so this pins the grouping and the
 // replacement of each file's identifier.
 func TestRenameAppliesWorkspaceEditAcrossOpenBuffers(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	main := filepath.Join(h.primaryRoot(), "main.go")
 	helper := filepath.Join(h.primaryRoot(), "pkg", "helper.go")
@@ -178,6 +183,7 @@ func TestRenameAppliesWorkspaceEditAcrossOpenBuffers(t *testing.T) {
 // tab; the edit is all-or-nothing, so the file the user never opened still got
 // the rename rather than being skipped silently.
 func TestRenameAppliesToAnUnopenedFileAsAWhole(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	main := filepath.Join(h.primaryRoot(), "main.go")
 	helper := filepath.Join(h.primaryRoot(), "pkg", "helper.go")
@@ -217,6 +223,7 @@ func TestRenameAppliesToAnUnopenedFileAsAWhole(t *testing.T) {
 // This is the all-or-nothing rule: the document that was already open must be
 // untouched, because a half-renamed symbol is worse than an unrenamed one.
 func TestRenameRefusesWholeWhenATargetCannotBeLoaded(t *testing.T) {
+	t.Parallel()
 	h := newWorkspace(t, 120, 30)
 	main := filepath.Join(h.primaryRoot(), "main.go")
 	h.OpenFile(main)
@@ -249,6 +256,7 @@ func TestRenameRefusesWholeWhenATargetCannotBeLoaded(t *testing.T) {
 // the text while dropping the operation would leave the workspace
 // half-changed, so the whole answer is refused.
 func TestRenameRefusesFileOperations(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.Pane().File.Text()
 	h.lspGen = 1
@@ -268,6 +276,7 @@ func TestRenameRefusesFileOperations(t *testing.T) {
 // Without the version guard the edits land at stale offsets, which is the
 // silent partial-rename failure the rule exists to prevent.
 func TestRenameRefusesAnAnswerForAChangedBuffer(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n\nfunc Old() {}\n")
 	path := h.Pane().File.Path
 	text := h.Pane().File.Text()
@@ -294,6 +303,7 @@ func TestRenameRefusesAnAnswerForAChangedBuffer(t *testing.T) {
 // A rename answer with no edits is "nothing to do", not a failure and not a
 // prompt.
 func TestRenameWithNoEditsIsHarmless(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "package main\n")
 	before := h.Pane().File.Text()
 	h.lspGen = 1
@@ -311,6 +321,7 @@ func TestRenameWithNoEditsIsHarmless(t *testing.T) {
 // whole identifier, not just the half before the caret. PrefixAt stops at the
 // caret by design, so reusing it here would rename only the prefix.
 func TestRenameWordCoversTheWholeIdentifier(t *testing.T) {
+	t.Parallel()
 	text := "call + handleRequest(x)"
 	lo, hi := renameWord(text, 10)
 	if got := text[lo:hi]; got != "handleRequest" {
@@ -326,6 +337,7 @@ func TestRenameWordCoversTheWholeIdentifier(t *testing.T) {
 // document's original coordinates, so it must be read before the batch lands:
 // applyServerEdits moves the cursor as it replaces each span.
 func TestRenameKeepsTheCaretNearWhereItWas(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	text := h.text()
 	path := h.Pane().File.Path
@@ -360,6 +372,7 @@ func TestRenameKeepsTheCaretNearWhereItWas(t *testing.T) {
 // which half landed. Without the batch lease check the non-overlapping span
 // lands and the buffer changes.
 func TestRenameRefusesOverAProposedSpan(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	id := propose(t, h, piecetable.Hunk{Start: 0, End: 5, Text: "HELLO"})
 	text := h.text()
@@ -393,6 +406,7 @@ func TestRenameRefusesOverAProposedSpan(t *testing.T) {
 // the whole batch is one user action, so a single undo reverses it. Without the
 // shared applier each span would be its own undo step.
 func TestRenameWithoutLeasesIsOneUndo(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "hello world\n")
 	before := h.text()
 	text := before

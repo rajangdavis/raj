@@ -1502,8 +1502,10 @@ func (a *App) hover() {
 	conn := ls.srv.Conn()
 	// Captured now rather than read when the answer lands, so the panel is
 	// pinned to the position that was asked about. Reading the cursor later
-	// would anchor the box to wherever it had got to.
-	line, col := p.File.LineCol(head)
+	// would anchor the box to wherever it had got to. Display coordinates, so
+	// the panel maps with the viewport top unchanged: a fold above the caret
+	// shifts the row the box must hang from.
+	line, col := p.DispPos(head)
 
 	safe.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1553,8 +1555,9 @@ func (a *App) signatureHelp() {
 	conn := ls.srv.Conn()
 	// Captured with the request, like hover: the panel anchors to the call that
 	// was asked about, not to wherever the cursor has moved by the time the
-	// server answers.
-	line, col := p.File.LineCol(head)
+	// server answers. Display coordinates, so a fold above the call shifts the
+	// panel with it.
+	line, col := p.DispPos(head)
 
 	safe.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

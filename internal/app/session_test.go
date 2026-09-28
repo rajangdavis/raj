@@ -36,6 +36,7 @@ func storedSession(t *testing.T, a *App) session.State {
 // there. Two Apps over one root, because a session that only round-trips
 // through one process is not restoring anything.
 func TestSessionRestoresWhereYouWere(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	a := filepath.Join(root, "a.go")
 	b := filepath.Join(root, "sub", "b.go")
@@ -75,6 +76,7 @@ func TestSessionRestoresWhereYouWere(t *testing.T) {
 // --no-restore has to disable both directions. One that still wrote would
 // overwrite the session a person was deliberately not using.
 func TestNoRestoreIsInert(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -103,6 +105,7 @@ func TestNoRestoreIsInert(t *testing.T) {
 // open. Restoring is best-effort by design: a workspace that moved on should
 // still start.
 func TestRestoreSkipsMissingFiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	keep := filepath.Join(root, "keep.go")
 	gone := filepath.Join(root, "gone.go")
@@ -129,6 +132,7 @@ func TestRestoreSkipsMissingFiles(t *testing.T) {
 // first restore adopts it into the database and removes the file; a second run
 // reads the database, so a regression to the file path would come up empty.
 func TestLegacySessionJSONMigratesToTheStore(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -208,6 +212,7 @@ func TestLegacyStateMovesToStateDir(t *testing.T) {
 // The database's WAL and SHM sidecars travel with it, so a crashed writer's
 // un-checkpointed transactions survive the move to the state dir.
 func TestMigrateStateMovesDatabaseSidecars(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	legacy := session.Dir(root)
 	if err := os.MkdirAll(legacy, 0o755); err != nil {
@@ -237,6 +242,7 @@ func TestMigrateStateMovesDatabaseSidecars(t *testing.T) {
 // A sidecar with no database to attach to stays put: moving a WAL without its
 // database would be worse than leaving the stale file behind.
 func TestMigrateStateLeavesOrphanSidecar(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	legacy := session.Dir(root)
 	if err := os.MkdirAll(legacy, 0o755); err != nil {
@@ -259,6 +265,7 @@ func TestMigrateStateLeavesOrphanSidecar(t *testing.T) {
 // A state directory that cannot be created is not fatal: the editor still
 // starts, just without persistence, and the legacy files are left alone.
 func TestStateDirFailureDoesNotStopStartup(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	legacy := filepath.Join(session.Dir(root), "state.db")
 	if err := os.MkdirAll(session.Dir(root), 0o755); err != nil {
@@ -417,6 +424,7 @@ func TestFreshLaunchLeavesProjectClean(t *testing.T) {
 // over the same root restores the tab and cursor from it. This is the round
 // trip that replaces the file in ordinary use.
 func TestSaveSessionWritesTheStore(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("line one\nline two\nline three\n"), 0o644)
@@ -451,6 +459,7 @@ func TestSaveSessionWritesTheStore(t *testing.T) {
 // lands there. The preview path deliberately does not: arrowing through the
 // tree is a glance, not a request to move the caret.
 func TestReopenRestoresClosedPositionButPreviewDoesNot(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("line one\nline two\nline three\n"), 0o644)
@@ -487,6 +496,7 @@ func TestReopenRestoresClosedPositionButPreviewDoesNot(t *testing.T) {
 // CloseState is nil-safe and idempotent, so main and the test harness can both
 // defer it without coordinating.
 func TestCloseStateIsIdempotent(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	a := newHarnessAt(t, root)
 	a.CloseState()
@@ -498,6 +508,7 @@ func TestCloseStateIsIdempotent(t *testing.T) {
 // An unnamed buffer is keyed on a path it does not have, so it is not saved —
 // and its absence must not shift which tab comes back active.
 func TestUnnamedBuffersDoNotShiftTheActiveTab(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -527,6 +538,7 @@ func TestUnnamedBuffersDoNotShiftTheActiveTab(t *testing.T) {
 // session or reopen a file nobody opened. Without the preview skip in
 // SessionState the transient tab is persisted and restored.
 func TestPreviewIsNotSavedInTheSession(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	g := filepath.Join(root, "b.go")
@@ -550,6 +562,7 @@ func TestPreviewIsNotSavedInTheSession(t *testing.T) {
 // A restored tab must be configured like one the person opened themselves,
 // rather than missing the theme and wrap defaults every other tab gets.
 func TestRestoredTabsGetTheUsualDefaults(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -585,6 +598,7 @@ func newHarnessAt(t *testing.T, root string) *harness {
 // Saving only at exit meant a crash or a kill lost the whole session and looked
 // like the editor had forgotten. The tick writes it while running instead.
 func TestSessionSavesWhileRunning(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -602,6 +616,7 @@ func TestSessionSavesWhileRunning(t *testing.T) {
 // Debounced: this is view state, not work, and a write per keystroke is the
 // wrong trade.
 func TestSessionSaveIsDebounced(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -627,6 +642,7 @@ func TestSessionSaveIsDebounced(t *testing.T) {
 // would reopen a tab the user just closed, so the next tick writes it. Opening
 // and closing are both structural; a cursor move is not.
 func TestSessionTabChangeBypassesTheDebounce(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	g := filepath.Join(root, "b.go")
@@ -659,6 +675,7 @@ func TestSessionTabChangeBypassesTheDebounce(t *testing.T) {
 // Cursor and scroll movement is the churn the interval exists to absorb; a tab
 // set that did not change still waits it out.
 func TestSessionCursorChangeWaitsOutTheInterval(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("abcdef\n"), 0o644)
@@ -686,6 +703,7 @@ func TestSessionCursorChangeWaitsOutTheInterval(t *testing.T) {
 // Run's exit path flushes the session, so the last change lands even when the
 // quit comes inside the debounce window.
 func TestRunSavesSessionOnExit(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	g := filepath.Join(root, "b.go")
@@ -714,6 +732,7 @@ func TestRunSavesSessionOnExit(t *testing.T) {
 // Nothing to save means no writes at all, so an idle editor does not rewrite a
 // file every few seconds forever.
 func TestSessionTickIsInertWhenNothingChanged(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	a := newHarnessAt(t, root)
 	a.sessionTick(time.Now())
@@ -727,6 +746,7 @@ func TestSessionTickIsInertWhenNothingChanged(t *testing.T) {
 
 // --no-restore still disables writing, including from the tick.
 func TestSessionTickRespectsNoRestore(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -748,6 +768,7 @@ func TestSessionTickRespectsNoRestore(t *testing.T) {
 // a second tick has nothing left to fold. Modelled on
 // TestCompactMergesAdjacentSameAuthorPieces and the sessionTick tests above.
 func TestCompactTickMergesAdjacentSameAuthorPieces(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	p := h.Pane()
 	p.File.Begin()
@@ -776,6 +797,7 @@ func TestCompactTickMergesAdjacentSameAuthorPieces(t *testing.T) {
 // An empty buffer has nothing to fold, so the tick touches neither its pieces
 // nor its version. Modelled on TestSessionTickIsInertWhenNothingChanged.
 func TestCompactTickLeavesAQuietBufferAlone(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	p := h.Pane()
 	beforePieces, beforeVersion := p.File.Pieces(), p.File.Session().Version()
@@ -802,6 +824,7 @@ func TestCompactTickLeavesAQuietBufferAlone(t *testing.T) {
 // TestCompactTickMergesAdjacentSameAuthorPieces, which builds the recorded
 // state this one then closes.
 func TestCompactTickPrunesClosedPaneEntries(t *testing.T) {
+	t.Parallel()
 	h := newHarness(t, "")
 	p := h.Pane()
 	p.File.Begin()
@@ -845,6 +868,7 @@ func writeLines(t *testing.T, path string, n int) {
 // Same file, same terminal: a proportional restore lands exactly on the saved
 // line, so nothing about the old behaviour is lost.
 func TestScrollRestoresSameSize(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	writeLines(t, f, 100)
@@ -872,6 +896,7 @@ func TestScrollRestoresSameSize(t *testing.T) {
 // document, not at the same line number — the line number is the top of a
 // now much larger file.
 func TestScrollRestoresProportionallyWhenFileGrows(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	writeLines(t, f, 100)
@@ -899,6 +924,7 @@ func TestScrollRestoresProportionallyWhenFileGrows(t *testing.T) {
 
 // A file that shrank clamps at its end rather than pointing past it.
 func TestScrollRestoresClampedWhenFileShrinks(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	writeLines(t, f, 100)
@@ -929,6 +955,7 @@ func TestScrollRestoresClampedWhenFileShrinks(t *testing.T) {
 // An empty file has nothing to be proportional to: the ratio is zero, restore
 // lands at the top, and nothing divides by zero.
 func TestScrollRestoresEmptyFile(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte(""), 0o644)
@@ -952,6 +979,7 @@ func TestScrollRestoresEmptyFile(t *testing.T) {
 // document-relative, so the same file opens at the same line no matter the
 // pane height.
 func TestScrollRestoresIndependentOfTerminalSize(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	writeLines(t, f, 100)
@@ -979,6 +1007,7 @@ func TestScrollRestoresIndependentOfTerminalSize(t *testing.T) {
 // A session written before the ratio existed restores by its plain Top, so a
 // saved position from an older build still lands where it used to.
 func TestScrollRestoresLegacyJSONByTop(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	writeLines(t, f, 100)
@@ -1000,6 +1029,7 @@ func TestScrollRestoresLegacyJSONByTop(t *testing.T) {
 // pane flag, not the app default, so a tab left with hints off comes back off
 // while the default still governs tabs with no saved choice.
 func TestSessionPersistsPaneHints(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -1028,6 +1058,7 @@ func TestSessionPersistsPaneHints(t *testing.T) {
 // so it cannot linger next to the source of truth. The store's state is what
 // restores.
 func TestStaleSessionJSONIsRemovedWhenStoreHasOne(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	os.WriteFile(f, []byte("x\n"), 0o644)
@@ -1061,6 +1092,7 @@ func TestStaleSessionJSONIsRemovedWhenStoreHasOne(t *testing.T) {
 
 // The sidebar kind and its open/closed state survive a restart.
 func TestSessionRestoresSidebar(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	if err := os.WriteFile(f, []byte("x\n"), 0o644); err != nil {
@@ -1086,6 +1118,7 @@ func TestSessionRestoresSidebar(t *testing.T) {
 // sidebar. Without the tri-state the nil case would overwrite the explorer
 // default and a named pane could not re-focus.
 func TestRestoreSidebarTriState(t *testing.T) {
+	t.Parallel()
 	defaults := newHarnessAt(t, t.TempDir())
 	defaults.restoreSidebar(nil)
 	if defaults.sidebar != SidebarExplorer {
@@ -1120,6 +1153,7 @@ func TestRestoreSidebarTriState(t *testing.T) {
 // isGitPath is any component named .git, so a checkout file and a worktree
 // both count and a .github directory does not.
 func TestIsGitPath(t *testing.T) {
+	t.Parallel()
 	for _, p := range []string{"/w/.git/COMMIT_EDITMSG", "/w/sub/.git/MERGE_MSG", "/w/.git"} {
 		if !isGitPath(p) {
 			t.Errorf("isGitPath(%q) = false, want true", p)
