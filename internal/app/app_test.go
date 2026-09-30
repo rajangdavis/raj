@@ -1075,10 +1075,13 @@ func TestHeadlessHostServesControl(t *testing.T) {
 		case <-deadline:
 			t.Fatal("no reply: the headless event loop did not drain control")
 		default:
-			// Pump the headless event loop the way Run would.
+			// Pump the headless event loop the way Run would: handle one
+			// event and then draw, which is also where a queued control
+			// reply is flushed.
 			select {
 			case e := <-h.Events():
 				a.Handle(e)
+				a.Draw()
 			default:
 			}
 			time.Sleep(time.Millisecond)

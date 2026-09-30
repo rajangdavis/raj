@@ -14,6 +14,11 @@ import (
 
 // Draw renders a frame and hands it to the host.
 func (a *App) Draw() {
+	// Control answers queued by drainControl wait for the frame their request
+	// produced to be presented. Flushing last — after Present, and on the
+	// too-small early return too — means a reply never reaches a client
+	// before the screen it acknowledges does.
+	defer a.flushControlReplies()
 	// The frame timer covers the whole paint, Present included: the beat the
 	// save-review question is about is wall-clock to the screen, not to the
 	// last Set. It also brackets the pending-marks accumulator, which the
@@ -474,7 +479,7 @@ func (a *App) drawStatus(cols, y int) {
 			}
 		}
 	}
-	if note := a.pendingRemovalNote(); note != "" {
+	if note := a.waitingNote(); note != "" {
 		left += "  " + note
 	}
 	// The agent-working segment is persistent: it names who is working and

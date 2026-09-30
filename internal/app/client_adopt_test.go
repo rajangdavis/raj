@@ -357,6 +357,73 @@ func TestClientRevealReachesEveryAttachedClient(t *testing.T) {
 	}
 }
 
+// A human delete on the attached client removes the daemon's file into the
+// daemon's workspace trash. The client sends propose and approve back to back
+// over the decision connection, which is the one removal path; without that the
+// client would record a local proposal and the daemon would refuse the approve
+// as not pending.
+func TestClientDeleteForwardsToDaemonAndTrashes(t *testing.T) {
+	srv := controlHarness(t, "hello\n")
+	ch := attachClientAt(t, srv, Options{}, 120, 12)
+	ch.cli.drain()
+	path := srv.Tabs.Active().File.Path
+
+	runClient(t, ch, func() { ch.cli.OpenFile(path) })
+	ch.cli.drain()
+	pumpUntilClientTab(t, ch, path)
+
+	runClient(t, ch, func() { ch.cli.deletePath(path) })
+	if !ch.cli.Prompt.Open {
+		t.Fatal("the client's delete opened no confirm")
+	}
+	if got := ch.cli.Prompt.Selected(); got != deleteNow {
+		t.Fatalf("client answer = %q, want %q", got, deleteNow)
+	}
+	runClient(t, ch, func() { ch.cli.press("enter") })
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("daemon file still on disk after the client's delete (err=%v)", err)
+	}
+	entries, err := os.ReadDir(srv.trashDir())
+	if err != nil {
+		t.Fatalf("reading the daemon trash: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("daemon trash holds %d entr(ies), want 1: %+v", len(entries), entries)
+	}
+	if got := srv.App.Deletions(); len(got) != 0 {
+		t.Errorf("daemon pending deletions = %+v, want the decision carried out", got)
+	}
+}
+
+// An attached rename moves the file on the daemon, not on the client's machine:
+// the client sends the existing rename command over the decision connection.
+// Without renameRemote the client ran host.Rename against its own root, where
+// the daemon path does not exist.
+func TestClientRenameMovesTheDaemonFile(t *testing.T) {
+	srv := controlHarness(t, "hello\n")
+	ch := attachClientAt(t, srv, Options{}, 120, 12)
+	ch.cli.drain()
+	path := srv.Tabs.Active().File.Path
+
+	runClient(t, ch, func() { ch.cli.OpenFile(path) })
+	ch.cli.drain()
+	pumpUntilClientTab(t, ch, path)
+
+	next := filepath.Join(filepath.Dir(path), "renamed.go")
+	runClient(t, ch, func() { ch.cli.renameRemote(path, next) })
+
+	if _, err := os.Stat(next); err != nil {
+		t.Errorf("the daemon rename did not move the file: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the old daemon path survived the rename (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(ch.cli.primaryRoot(), "renamed.go")); !os.IsNotExist(err) {
+		t.Errorf("the rename landed on the client's machine (err=%v)", err)
+	}
+}
+
 // hostProposeDeletion lands a pending deletion on the daemon through the
 // socket, claim-gated the way an agent's delete is.
 func hostProposeDeletion(t *testing.T, srv *harness, path string) {
@@ -436,11 +503,8 @@ func TestClientMirrorsPendingDeletion(t *testing.T) {
 	hostProposeDeletion(t, srv, path)
 	srv.Handle(ui.Tick{})
 	pumpUntilDeletion(t, ch, path)
-	if got := ch.cli.pendingRemovalNote(); !strings.Contains(got, "1 pending removal") {
+	if got := ch.cli.waitingNote(); !strings.Contains(got, "1 waiting for you") {
 		t.Errorf("note = %q, want the mirrored deletion named", got)
-	}
-	if n := len(ch.cli.pendingRemovals); n != 1 || ch.cli.pendingRemovals[0].path != path {
-		t.Errorf("arrival queue = %+v, want the path once", ch.cli.pendingRemovals)
 	}
 }
 
@@ -457,7 +521,7 @@ func TestClientMirrorsPendingDirRemoval(t *testing.T) {
 	hostProposeDirRemoval(t, srv, dir)
 	srv.Handle(ui.Tick{})
 	pumpUntilDirRemoval(t, ch, dir)
-	if got := ch.cli.pendingRemovalNote(); !strings.Contains(got, "1 pending removal") {
+	if got := ch.cli.waitingNote(); !strings.Contains(got, "1 waiting for you") {
 		t.Errorf("note = %q, want the mirrored dir-removal named", got)
 	}
 }
@@ -476,11 +540,11 @@ func TestClientMirrorRemovalIsIdempotent(t *testing.T) {
 
 	srv.Handle(ui.Tick{})
 	pumpFor(ch, 200*time.Millisecond)
-	if n := len(ch.cli.pendingRemovals); n != 1 {
-		t.Errorf("arrival queue after two cycles = %d entries %+v, want 1", n, ch.cli.pendingRemovals)
-	}
 	if n := len(ch.cli.pendingDeletions); n != 1 {
 		t.Errorf("pending deletions after two cycles = %d, want 1", n)
+	}
+	if n := ch.cli.waitingCount(); n != 1 {
+		t.Errorf("waiting count after two cycles = %d, want 1", n)
 	}
 }
 
@@ -521,9 +585,6 @@ func TestClientApproveForwardsRemovalToDaemon(t *testing.T) {
 	}
 	if _, ok := ch.cli.pendingDeletions[path]; ok {
 		t.Error("the client kept the pending deletion after the approve")
-	}
-	if len(ch.cli.pendingRemovals) != 0 {
-		t.Errorf("arrival queue = %+v, want it cleared", ch.cli.pendingRemovals)
 	}
 	if !clientHasTab(ch, path) {
 		t.Error("the client closed its own pane: the removal was local, not forwarded")
@@ -566,9 +627,6 @@ func TestClientWithdrawForwardsToDaemon(t *testing.T) {
 	if _, ok := ch.cli.pendingDeletions[path]; ok {
 		t.Error("the client kept the pending deletion after the withdraw")
 	}
-	if len(ch.cli.pendingRemovals) != 0 {
-		t.Errorf("arrival queue = %+v, want it cleared", ch.cli.pendingRemovals)
-	}
 }
 
 // A mirrored dir-removal is answered by Remove forever on the client, which
@@ -587,25 +645,23 @@ func TestClientApproveDirRemovalForwardsToDaemon(t *testing.T) {
 	srv.Handle(ui.Tick{})
 	pumpUntilDirRemoval(t, ch, dir)
 
-	// A directory has no pane to focus, so the mirrored proposal is re-raised
-	// through the gate's own chord before it can be answered.
-	runClient(t, ch, func() { ch.cli.press("ctrl+alt+d") })
-	if !ch.cli.Prompt.Open {
-		t.Fatalf("the mirrored dir-removal did not raise the review")
+	// A directory has no pane to focus, so the mirrored proposal is answered
+	// from the waiting list: ctrl+alt+v opens it and accept forwards the human
+	// answer to the daemon.
+	runClient(t, ch, func() { ch.cli.press("ctrl+alt+v") })
+	if !ch.cli.Picker.Open {
+		t.Fatalf("ctrl+alt+v did not open the waiting list on the client")
 	}
-	if got := ch.cli.Prompt.Title(); got != "Remove directory" {
-		t.Fatalf("prompt title = %q, want Remove directory", got)
+	if got := ch.cli.Picker.Results(); got != 1 {
+		t.Fatalf("waiting list rows = %d, want the mirrored dir-removal", got)
 	}
-	runClient(t, ch, func() { ch.cli.press("right", "enter") })
+	runClient(t, ch, func() { ch.cli.press("ctrl+super+m") })
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("daemon directory still on disk after approve (err=%v)", err)
 	}
 	if _, ok := ch.cli.pendingDirRemovals[dir]; ok {
 		t.Error("the client kept the pending dir-removal after the approve")
-	}
-	if len(ch.cli.pendingRemovals) != 0 {
-		t.Errorf("arrival queue = %+v, want it cleared", ch.cli.pendingRemovals)
 	}
 }
 
@@ -657,5 +713,23 @@ func TestClientApproveOfAStaleMirrorIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(ch.cli.status, "no pending deletion") {
 		t.Errorf("status = %q, want the daemon's not-pending refusal", ch.cli.status)
+	}
+}
+
+// The attached client learns about a publish proposal too: mirrorRemoval stores
+// the wave name so the waiting list can show it, and an accept would forward
+// the decision to the daemon rather than running the pinned outward step
+// locally.
+func TestClientMirrorsPendingPublish(t *testing.T) {
+	srv := controlHarness(t, "hello\n")
+	ch := attachClientAt(t, srv, Options{}, 120, 12)
+	ch.cli.drain()
+
+	ch.cli.mirrorRemoval(control.Proposal{Kind: "publish", Path: "task-1", Author: 7})
+	if _, ok := ch.cli.pendingPublishes["task-1"]; !ok {
+		t.Fatal("the client did not mirror the publish proposal")
+	}
+	if got := ch.cli.waitingNote(); !strings.Contains(got, "1 waiting for you") {
+		t.Errorf("note = %q, want the mirrored publish named", got)
 	}
 }

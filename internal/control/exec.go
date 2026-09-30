@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 )
@@ -51,11 +52,22 @@ func Run(ctx context.Context, argv []string, dir string,
 // setProcessGroup makes the child a leader; it is zero where there are none.
 func RunReport(ctx context.Context, argv []string, dir string,
 	onStart func(pid, pgid int), emit func(stream uint8, b []byte)) (int, error) {
+	return runReportEnv(ctx, argv, dir, nil, onStart, emit)
+}
+
+// runReportEnv is RunReport with env appended to the process environment. A
+// composite step uses it to hand its shell child the RAJ_STEP_<name>_OUT
+// entries of the steps that already ran; an ordinary hook passes none.
+func runReportEnv(ctx context.Context, argv []string, dir string, env []string,
+	onStart func(pid, pgid int), emit func(stream uint8, b []byte)) (int, error) {
 	if len(argv) == 0 {
 		return 0, errors.New("exec needs a command")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	// The command leads its own process group, and Cancel is overridden to
 	// signal the whole group rather than just the process exec returned. A
 	// `sh -c "go test"` is two processes: killing the shell leaves the test

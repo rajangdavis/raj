@@ -11,6 +11,7 @@ import (
 
 	"raj/internal/control"
 	"raj/internal/editor"
+	"raj/internal/intent"
 	"raj/internal/piecetable"
 	"raj/internal/safe"
 	"raj/internal/store"
@@ -53,6 +54,11 @@ func dialControl(addr string) (clientConn, error) {
 type clientFile struct {
 	path string
 	file *editor.File
+	// deleted is the daemon's answer for this path: its file is gone from
+	// disk. It rides the snapshot handoff because the deletion is a fact
+	// about the same buffer the snapshot is for, and installClientFile applies
+	// it to the pane's tab mark.
+	deleted bool
 	// adopted marks a file that changed the client view membership — a host
 	// proposal the client took on, or a daemon tab it newly mirrors — so the
 	// event thread persists the view once it installs.
@@ -76,6 +82,11 @@ type bufferMark struct {
 	moved      uint64
 	superseded uint64
 	dirty      bool
+	// deleted records the daemon saying the file is gone from disk. It is part
+	// of the mark because a deletion moves no version and no review count: a
+	// held snapshot would otherwise stay "current" while the daemon tab
+	// carries the deleted mark, and the client would never fetch the change.
+	deleted bool
 }
 
 // markOf is the mark for a daemon buffer as fetched: the version the snapshot
@@ -87,6 +98,7 @@ func markOf(version uint64, b control.Buffer) bufferMark {
 		moved:      uint64(b.Moved),
 		superseded: uint64(b.Superseded),
 		dirty:      b.Dirty,
+		deleted:    b.Deleted,
 	}
 }
 
@@ -95,7 +107,7 @@ func markOf(version uint64, b control.Buffer) bufferMark {
 func (m bufferMark) matches(b control.Buffer) bool {
 	return m.version == b.Version && m.dirty == b.Dirty &&
 		m.pending == uint64(b.Pending) && m.moved == uint64(b.Moved) &&
-		m.superseded == uint64(b.Superseded)
+		m.superseded == uint64(b.Superseded) && m.deleted == b.Deleted
 }
 
 // hasUnsavedWork reports whether a daemon buffer is one the viewer mirrors: a
@@ -297,6 +309,12 @@ func (a *App) StartClient() {
 	// the client does not show becomes a tab, so a proposal in a file the client
 	// never opened is visible.
 	files = append(files, a.adoptPending(c, byPath, vers, a.clientOwned)...)
+	// The daemon's deleted flag rides the buffers reply, not the snapshot, so
+	// tag each fetched file with it and let the install mark the pane. A path
+	// the daemon did not list decodes as the zero buffer: not deleted.
+	for i := range files {
+		files[i].deleted = byPath[files[i].path].Deleted
+	}
 	for _, cf := range files {
 		a.installClientFile(cf)
 	}
@@ -386,6 +404,18 @@ func (a *App) decodeSnapshot(path string, res control.Response) (*editor.File, e
 		}
 	}
 	return editor.OpenSnapshotSession(path, sess, enc, a.tabWidth), nil
+}
+
+// snapshotDeleted reports whether a snapshot reply said the file it describes is
+// gone from disk. It is sparse: an ordinary snapshot carries no buffer record,
+// and an old server carries none at all, so absence reads as still present.
+func snapshotDeleted(res control.Response, path string) bool {
+	for _, b := range res.Buffers {
+		if b.Path == path && b.Deleted {
+			return true
+		}
+	}
+	return false
 }
 
 // clientRetryMin and clientRetryMax bound the reconnect backoff: the first
@@ -534,6 +564,12 @@ func (a *App) syncClient(c clientConn, res control.Response, vers map[string]buf
 		a.markClientOwned(r.Path)
 		owned[r.Path] = true
 		files = append(files, clientFile{path: r.Path, file: f, adopted: true, reveal: &r})
+	}
+	// Tag each fetched file with the daemon's deleted flag, so the install marks
+	// the pane exactly as the daemon's own tab is marked. A path the daemon did
+	// not list decodes as the zero buffer: not deleted.
+	for i := range files {
+		files[i].deleted = byPath[files[i].path].Deleted
 	}
 	if len(files) > 0 {
 		a.clientMu.Lock()
@@ -788,9 +824,9 @@ func (a *App) drainClient() {
 		}
 		a.installClientFile(cf)
 	}
-	// A removal proposal the watch cycle found becomes visible pending state
-	// the moment its Wake is collected, so the note, the chord and the gate all
-	// see it without the daemon re-announcing it.
+	// A removal or publish proposal the watch cycle found becomes visible
+	// pending state the moment its Wake is collected, so the waiting list, the
+	// note and the gate all see it without the daemon re-announcing it.
 	for _, pr := range removals {
 		a.mirrorRemoval(pr)
 	}
@@ -856,6 +892,7 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	for _, p := range a.Tabs.All() {
 		if p.File.Path == cf.path {
 			a.applyClientFile(p, cf.file)
+			a.applyClientDiskMark(p, cf.deleted)
 			a.revealClientFile(p, cf.reveal)
 			return p
 		}
@@ -871,6 +908,7 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	p.Hints = a.InlayHints
 	p.SetDisplay(a.displayPolicy())
 	a.Tabs.Add(p)
+	a.applyClientDiskMark(p, cf.deleted)
 	a.recordClientSynced(cf.path, cf.file)
 	if cf.reveal != nil {
 		// A reveal is the one install that is meant to move the viewer.
@@ -883,6 +921,24 @@ func (a *App) installClientFile(cf clientFile) *editor.Pane {
 	return p
 }
 
+// applyClientDiskMark copies the daemon's on-disk answer onto a client pane:
+// the changed-on-disk mark, and the reason when the reason is deletion. A
+// client cannot stat the daemon's filesystem, so this is the only way the tab
+// mark reaches it; it is idempotent so an ordinary re-sync does not restate the
+// status.
+func (a *App) applyClientDiskMark(p *editor.Pane, deleted bool) {
+	if p == nil || p.DiskDeleted() == deleted {
+		return
+	}
+	if !deleted {
+		// The daemon has the file back; the mark the deletion set is done.
+		p.ClearDiskStale()
+		return
+	}
+	p.MarkDiskDeleted()
+	a.status = p.File.Name() + " was deleted on disk"
+}
+
 // applyClientFile swaps a tab file for a newer snapshot while keeping what the
 // viewer was looking at: the cursor line and column, and the viewport scrolled
 // by the same number of lines the cursor moved.
@@ -890,7 +946,17 @@ func (a *App) applyClientFile(p *editor.Pane, f *editor.File) {
 	line, col := p.File.LineCol(p.Cursors.Primary().Head)
 	top := p.Viewport.Top
 
-	f.SetDark(a.host.Theme().Dark())
+	// A snapshot that repeats the document the pane already shows must not
+	// rebuild the highlighter: a fresh one is cold, so the file repaints plain
+	// until its tokenise lands, and the watch fetches every buffer whenever any
+	// one of them moves the generation. The file is still swapped, so the
+	// refresh path is unchanged; only the warm spans are carried across.
+	if p.File.Path == f.Path && p.File.Syntax.Ready() &&
+		p.File.Len() == f.Len() && p.File.Text() == f.Text() {
+		f.AdoptSyntax(p.File)
+	} else {
+		f.SetDark(a.host.Theme().Dark())
+	}
 	if a.Tabs.TabWidthPinned() {
 		f.SetTabWidth(a.tabWidth)
 	}
@@ -1269,7 +1335,7 @@ func (a *App) openRemote(path string, focus bool) {
 		return
 	}
 	a.clearClientClosed(path)
-	p := a.installClientFile(clientFile{path: path, file: f})
+	p := a.installClientFile(clientFile{path: path, file: f, deleted: snapshotDeleted(res, path)})
 	if p == nil {
 		return
 	}
@@ -1300,10 +1366,10 @@ func (a *App) adoptPending(c clientConn, byPath map[string]control.Buffer, vers 
 		if pr.Path == "" {
 			continue
 		}
-		if pr.Kind == "delete" || pr.Kind == "rmdir" {
-			// A removal is a workspace-level path fact, not text, so it never
-			// becomes a snapshot: queue it for the event thread, which owns the
-			// pending maps and the arrival queue.
+		if pr.Kind == "delete" || pr.Kind == "rmdir" || pr.Kind == "publish" {
+			// A removal or a publish is a workspace-level fact, not text, so it
+			// never becomes a snapshot: queue it for the event thread, which
+			// owns the pending maps.
 			removals = append(removals, pr)
 			continue
 		}
@@ -1334,12 +1400,13 @@ func (a *App) adoptPending(c clientConn, byPath map[string]control.Buffer, vers 
 	return files
 }
 
-// stageClientRemovals queues daemon removal proposals for the event thread.
-// adoptPending runs on the watch goroutine, and pendingDeletions,
-// pendingDirRemovals and pendingRemovals belong to the event thread, which
-// reads them every frame; the mirror is therefore a handoff the way a snapshot
-// is. A (kind, path) already queued is not appended again, and the Wake makes
-// drainClient collect the queue even on a cycle that rebuilt no pane.
+// stageClientRemovals queues daemon workspace proposals -- a deletion, a
+// dir-removal or a publish -- for the event thread. adoptPending runs on the
+// watch goroutine, and pendingDeletions, pendingDirRemovals and
+// pendingPublishes belong to the event thread, which reads them every frame;
+// the mirror is therefore a handoff the way a snapshot is. A (kind, path)
+// already queued is not appended again, and the Wake makes drainClient collect
+// the queue even on a cycle that rebuilt no pane.
 func (a *App) stageClientRemovals(removals []control.Proposal) {
 	if len(removals) == 0 {
 		return
@@ -1365,11 +1432,11 @@ func (a *App) stageClientRemovals(removals []control.Proposal) {
 	}
 }
 
-// mirrorRemoval installs one daemon removal proposal into the client's pending
-// maps and arrival queue. It runs on the event thread and is idempotent: a key
-// already pending keeps its original author, and notePendingRemoval's own scan
-// keeps the same proposal out of the arrival queue twice, so a watch cycle
-// that repeats an undecided proposal cannot duplicate it.
+// mirrorRemoval installs one daemon workspace proposal -- a deletion, a
+// dir-removal or a publish -- into the client pending maps. It runs on the
+// event thread and is idempotent: a key already pending keeps its original
+// author, so a watch cycle that repeats an undecided proposal cannot duplicate
+// it.
 func (a *App) mirrorRemoval(pr control.Proposal) {
 	switch pr.Kind {
 	case "delete":
@@ -1380,7 +1447,6 @@ func (a *App) mirrorRemoval(pr control.Proposal) {
 			return
 		}
 		a.pendingDeletions[pr.Path] = control.Deletion{Path: pr.Path, Author: pr.Author}
-		a.notePendingRemoval(pr.Path, false)
 		// A proposal for the file already on screen raises the gate now, the
 		// way ProposeDeletion does on the daemon; without clearing the tracked
 		// pane the once-per-focus guard would suppress it.
@@ -1395,7 +1461,17 @@ func (a *App) mirrorRemoval(pr control.Proposal) {
 			return
 		}
 		a.pendingDirRemovals[pr.Path] = control.DirRemoval{Path: pr.Path, Author: pr.Author}
-		a.notePendingRemoval(pr.Path, true)
+	case "publish":
+		// A publish is a pinned outward step, and only the daemon holds the
+		// pins: the client mirrors the wave name and proposer so the waiting
+		// list can show it, and forwards the decision rather than running it.
+		if a.pendingPublishes == nil {
+			a.pendingPublishes = map[string]intent.Publish{}
+		}
+		if _, ok := a.pendingPublishes[pr.Path]; ok {
+			return
+		}
+		a.pendingPublishes[pr.Path] = intent.Publish{Name: pr.Path, Author: pr.Author}
 	}
 }
 
@@ -1736,6 +1812,22 @@ func (a *App) sendDecision(op, path string, group uint64) (control.Response, err
 		req.Group = group
 	}
 	return c.Do(req)
+}
+
+// sendIntent sends an intention command on the decision connection. It is how
+// an attached client decides a publish: the pins and the hook live on the
+// daemon, so a viewer forwards approve or withdraw rather than running the
+// outward step itself.
+func (a *App) sendIntent(cmd intent.Command) (control.Response, error) {
+	c := a.decideClient()
+	if c == nil {
+		return control.Response{}, errors.New("not attached to a daemon")
+	}
+	payload, err := json.Marshal(cmd)
+	if err != nil {
+		return control.Response{}, err
+	}
+	return c.Do(control.Request{Op: "intent", HookJSON: string(payload)})
 }
 
 // sendRemovalDecision sends the human answer for a pending removal on the

@@ -21,7 +21,9 @@ import (
 // encoding should not get a second, subtly different execution path.
 
 // knownOps is what this build understands. It is passed to prog.Decode, which
-// silently drops unknown arguments and refuses unknown verbs.
+// silently drops unknown arguments and refuses unknown verbs. The argument
+// opcodes are listed here; the verb opcodes are added in init from the registry
+// in verbs.go, so the two cannot disagree about what a program can ask for.
 var knownOps = map[byte]bool{
 	prog.OpPath: true, prog.OpBase: true, prog.OpSpan: true, prog.OpText: true,
 	prog.OpAuthor: true, prog.OpToken: true, prog.OpGroup: true,
@@ -29,42 +31,15 @@ var knownOps = map[byte]bool{
 	prog.OpInclude: true, prog.OpExclude: true,
 	prog.OpLine: true, prog.OpCol: true, prog.OpArg: true,
 	prog.OpGitMode: true, prog.OpGitRev: true, prog.OpGitCount: true,
-
-	prog.OpPing: true, prog.OpBuffers: true, prog.OpRead: true, prog.OpOpen: true,
-	prog.OpApply: true, prog.OpSave: true, prog.OpVersion: true,
-	prog.OpGroups: true, prog.OpAccept: true, prog.OpReject: true,
-	prog.OpSearch: true, prog.OpStats: true,
-	prog.OpGoto: true, prog.OpClose: true, prog.OpReload: true,
-	prog.OpDump: true, prog.OpPatch: true,
-	prog.OpDumpID: true,
-	prog.OpLSP:    true, prog.OpLSPMode: true,
-	prog.OpReviewList: true,
-	prog.OpDiff:       true, prog.OpReview: true,
-	prog.OpClear: true, prog.OpExec: true,
-	prog.OpFind:     true,
-	prog.OpSnapshot: true,
-	prog.OpGit:      true,
-	prog.OpReveal:   true,
+	prog.OpDumpID: true, prog.OpLSPMode: true, prog.OpReviewList: true,
 }
 
 // verbNames maps a verb opcode to the op string the handlers already switch on.
 // Deliberately a translation rather than a rename of the handlers: the string
 // ops are what `raj ctl` and every existing test speak, and one encoding
-// arriving should not churn the other.
-var verbNames = map[byte]string{
-	prog.OpPing: "ping", prog.OpBuffers: "buffers", prog.OpRead: "text",
-	prog.OpOpen: "open", prog.OpApply: "apply", prog.OpSave: "save",
-	prog.OpVersion: "version", prog.OpGroups: "groups",
-	prog.OpAccept: "accept", prog.OpReject: "reject",
-	prog.OpSearch: "search", prog.OpStats: "stats",
-	prog.OpGoto: "goto", prog.OpClose: "close", prog.OpReload: "reload",
-	prog.OpDump: "dump", prog.OpPatch: "patch",
-	prog.OpLSP: "lsp", prog.OpDiff: "diff", prog.OpReview: "review",
-	prog.OpClear: "clear", prog.OpExec: "exec", prog.OpFind: "find",
-	prog.OpSnapshot: "snapshot",
-	prog.OpGit:      "git",
-	prog.OpReveal:   "reveal",
-}
+// arriving should not churn the other. It is filled in init from the registry
+// in verbs.go, one row per program verb.
+var verbNames map[byte]string
 
 // Four verbs stay out of programs, and the reasons are different enough to be
 // worth separating.
@@ -119,8 +94,9 @@ func Requests(program []byte, connAuthor uint8) ([]Request, error) {
 		if prog.IsVerb(op.Code) {
 			name, ok := verbNames[op.Code]
 			if !ok {
-				// Unreachable while knownOps and verbNames agree; asserted
-				// rather than assumed, because they are two lists.
+				// Unreachable: knownOps and verbNames are both built from the
+				// registry in verbs.go. Asserted rather than assumed, because
+				// a decode is not where to discover a hole in the registry.
 				return nil, fmt.Errorf("%w: %s", prog.ErrUnknownVerb, prog.Name(op.Code))
 			}
 			req := pending

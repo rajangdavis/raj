@@ -921,7 +921,9 @@ func hunkOverlap(a, b DiffHunk) (int, int, bool) {
 // make the proposal invisible; deferring it keeps the bytes in the edit view,
 // where the planned range can be marked and leased. Only the edit composition
 // defers: AcceptedOnly already excludes a Proposed set, and Annotated stays the
-// session view so read and apply keep one coordinate frame.
+// session view so read and apply keep one coordinate frame. The verification
+// composition, AcceptedAndProposedApplied, does not defer either: it must hold
+// exactly what accepting every proposal would write.
 func (s *Session) deferredDeletions(p Policy) map[uint64]bool {
 	if p != AcceptedAndProposed {
 		return nil

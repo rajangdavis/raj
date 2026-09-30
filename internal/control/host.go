@@ -45,6 +45,13 @@ type BufferHost interface {
 	// Buffers lists what is open.
 	Buffers() []Buffer
 
+	// Screen returns the rows currently drawn on the visible screen, top to
+	// bottom, and the caret's 1-based line and column in cells. Rows are the
+	// drawn screen, not the document: the renderer trims trailing spaces, and
+	// a hidden or off-screen caret reports zero, which the wire reads as
+	// absent. It is a read-only view for verifying what the UI actually draws.
+	Screen() (rows []string, line, col int)
+
 	// Resolve turns a request's path into the buffer's own. An empty path
 	// means the buffer the user is looking at, and only the host knows which
 	// that is — so every check the Guard makes has to happen on the resolved
@@ -1033,22 +1040,23 @@ func (g *Guard) Read(path string, author uint8, start, end, lineStart, lineEnd i
 	return spans, states, v, err
 }
 
-// readSize is the whole-buffer byte length and line count a read reply carries,
-// so a driver that just read the text does not make a second version call for
-// the file length. The values come from the buffer list exactly as the version
-// verb reads them; a name not in the list reports the zero the version verb
-// would.
-func (g *Guard) readSize(path string) (int, int) {
+// readBuffer is the buffer record a read reply carries for a target, or false
+// when the name is not open. Its Bytes and Lines are the whole-buffer numbers a
+// driver needs to append without a second version call, exactly as the version
+// verb reports them, and its Deleted flag is what lets a read of a file that is
+// gone say so on the same reply that carries the text rather than handing the
+// text back as though the file were still there.
+func (g *Guard) readBuffer(path string) (Buffer, bool) {
 	name, err := g.canonical(path)
 	if err != nil {
-		return 0, 0
+		return Buffer{}, false
 	}
 	for _, b := range g.Buffers() {
 		if b.Path == name {
-			return b.Bytes, b.Lines
+			return b, true
 		}
 	}
-	return 0, 0
+	return Buffer{}, false
 }
 
 func (g *Guard) DocSnapshot(path string) ([]byte, uint64, []byte, string, error) {
@@ -1828,7 +1836,11 @@ func readPaths(g *Guard, req Request, start, end, lineStart, lineEnd int) Respon
 			states = append(states, r)
 		}
 		res.Spans = append(res.Spans, spans...)
-		res.Buffers = append(res.Buffers, Buffer{Path: name, Version: v, Bytes: n, Lines: lines})
+		// Carry the buffer's deleted fact along with its size, so a read of a
+		// file that is gone says so rather than handing back text as though
+		// the file were still there.
+		nb, _ := g.readBuffer(name)
+		res.Buffers = append(res.Buffers, Buffer{Path: name, Version: v, Bytes: n, Lines: lines, Deleted: nb.Deleted})
 		names = append(names, name)
 		off += n
 	}
@@ -1848,23 +1860,25 @@ func readPaths(g *Guard, req Request, start, end, lineStart, lineEnd int) Respon
 	return res
 }
 
-// errIntentPublishNotHuman is the refusal for an agent's intent publish. The
-// export half is agent-allowed because inert objects change nothing outward;
-// publish moves a ref and is the user's decision (H5).
-var errIntentPublishNotHuman = "intent publish is the outward step and is the user's decision: an agent may export, not publish"
+// errIntentPublishNotHuman is the refusal for an agent's intent publish
+// --approve. Proposing a publish is inert (it pins a step and runs a dry run),
+// so an agent may prepare one; running it moves a ref or a remote and is the
+// user's decision (H5).
+var errIntentPublishNotHuman = "intent publish --approve is the outward step and is the user's decision: an agent may propose and export, not run a publish"
 
 // dispatchIntent routes the intention op through its explicit admission policy.
 // The owner is stamped from the connection on the server, so a payload that
 // names another writer cannot make the intention theirs. new/add/remove/list/
 // show and export are agent-allowed -- object-writing changes nothing outward
-// and preparing an export for review is the point -- while publish is the
-// outward step and stays human-only (H5). No intent mode is ungated.
+// and preparing an export for review is the point -- while publish --approve
+// is the outward step and stays human-only; proposing a publish is inert and
+// allowed (H5). No intent mode is ungated.
 func dispatchIntent(g *Guard, req Request) Response {
 	var cmd intent.Command
 	if err := json.Unmarshal([]byte(req.HookJSON), &cmd); err != nil {
 		return Response{Err: "intent: " + err.Error()}
 	}
-	if cmd.Mode == "publish" && !g.IsHuman(req.Author) {
+	if cmd.Mode == "publish" && cmd.Approve && !g.IsHuman(req.Author) {
 		return Response{Err: errIntentPublishNotHuman}
 	}
 	cmd.Owner = fmt.Sprintf("%d", req.Author)
@@ -1882,638 +1896,875 @@ func dispatchIntent(g *Guard, req Request) Response {
 // Dispatch turns one decoded request into a response. It is the only place the
 // verbs are interpreted, so the socket adapter and an in-process caller cannot
 // diverge about what an op means.
+//
+// The verbs themselves live in verbs.go, one row each; this looks the name up
+// and runs the row's handler. A name the registry does not know — or one
+// answered before Dispatch, whose row carries no handler — is refused here.
+// That is the answer the old string switch gave for a name that fell off its
+// end, but the set of names is the registry's now, so there is no second list
+// to drift from it.
 func Dispatch(g *Guard, req Request) Response {
-	switch req.Op {
-	case "intent":
-		return dispatchIntent(g, req)
-	case "hook":
-		return dispatchHook(g, req)
-	case "hookprep":
-		// Internal: connection.runHook asks the event thread to admit a hook
-		// and hand back its command, projection and root, then runs the
-		// command off the thread. The wire form is the "hook" op with mode
-		// run; this op is the in-process half and has no wire representation.
-		return dispatchHook(g, Request{HookMode: "run", HookName: req.HookName, Author: req.Author})
-	case "git":
-		return dispatchGit(g, req)
-	case "ping":
-		return Response{OK: true, Root: g.Root(), Roots: g.roots()}
-	case "buffers":
-		return Response{OK: true, Root: g.Root(), Roots: g.roots(), Buffers: g.Buffers()}
+	v, ok := verbByName[req.Op]
+	if !ok || v.handle == nil {
+		return Response{Err: "unknown op " + req.Op}
+	}
+	return v.handle(g, req)
+}
 
-	case "open":
-		if req.Path == "" {
-			return Response{Err: "open needs a path"}
-		}
-		v, created, err := g.Open(req.Path, req.Create)
-		if err != nil {
-			return done(v, err)
-		}
-		res := done(v, nil)
-		res.Created = created
-		if req.Create {
-			// A create is the declaration of intent the spec names: extend
-			// the caller's claim with the file it just made, in the same
-			// canonical spelling claim stores, so no second command is
-			// needed. Canonicalisation cannot normally fail here — Open
-			// already checked the same path in-root — but if it does, the
-			// open still stands and the claim simply did not extend; that
-			// is a warning, not a failed open.
-			name, cerr := g.claimPath(req.Path)
-			if cerr != nil {
-				return Response{OK: true, Version: v, Created: created,
-					ClaimWarnings: []string{"claim not extended: " + cerr.Error()}}
-			}
-			g.addClaims(req.Author, []string{name})
-		}
-		return res
-	case "mkdir":
-		if err := g.Mkdir(req.Path); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "rename":
-		if err := g.Rename(req.Path, req.NewPath, req.Author); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "goto":
-		name, err := g.canonical(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		if err := g.Goto(name, req.Line, req.Col); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "reveal":
-		start, end := -1, -1
-		if req.Start != nil {
-			start = *req.Start
-		}
-		if req.End != nil {
-			end = *req.End
-		}
-		if err := g.Reveal(req.Path, start, end); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "close":
-		if req.Discard {
-			remains, err := g.Discard(req.Path)
-			if err != nil {
-				return Response{Err: err.Error()}
-			}
-			return Response{OK: true, Remains: remains}
-		}
-		name, err := g.canonical(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		if err := g.Close(name); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "find":
-		// Find is a read: it locates a pattern in one buffer and reports its
-		// byte span, so a program can find a position, read the version and
-		// apply against it without a separate search round trip. The query is
-		// validated like a search's, and the matching is the editor's own.
-		if req.Query == nil {
-			return Response{Err: "find needs a query"}
-		}
-		if err := g.CheckQuery(*req.Query); err != nil {
-			return Response{Err: err.Error()}
-		}
-		name, err := g.canonical(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		m, count, found, err := g.Host.Find(name, req.Author, *req.Query)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		// Found is sparse and the span reads from the omitted-zero defaults,
-		// so a match at offset 0 costs no field. Version is always carried: a
-		// caller that found nothing still learns the revision it looked at.
-		return Response{OK: true, Found: found, FindStart: m.ByteStart,
-			FindEnd: m.ByteEnd, FindCount: count, Version: m.Version}
+// dispatchHookPrep answers the "hookprep" verb.
+func dispatchHookPrep(g *Guard, req Request) Response {
+	// Internal: connection.runHook asks the event thread to admit a hook
+	// and hand back its command, projection and root, then runs the
+	// command off the thread. The wire form is the "hook" op with mode
+	// run; this op is the in-process half and has no wire representation.
+	return dispatchHook(g, Request{HookMode: "run", HookName: req.HookName, HookParams: req.HookParams, Author: req.Author})
+}
 
-	case "text":
+// dispatchPing answers the "ping" verb.
+func dispatchPing(g *Guard, req Request) Response {
+	return Response{OK: true, Root: g.Root(), Roots: g.roots()}
+}
 
-		start, end, lineStart, lineEnd := -1, -1, 0, 0
-		if req.Start != nil {
-			start = *req.Start
+// dispatchBuffers answers the "buffers" verb.
+func dispatchBuffers(g *Guard, req Request) Response {
+	return Response{OK: true, Root: g.Root(), Roots: g.roots(), Buffers: g.Buffers()}
+}
+
+// dispatchOpen answers the "open" verb.
+func dispatchOpen(g *Guard, req Request) Response {
+	if req.Path == "" {
+		return Response{Err: "open needs a path"}
+	}
+	v, created, err := g.Open(req.Path, req.Create)
+	if err != nil {
+		return done(v, err)
+	}
+	res := done(v, nil)
+	res.Created = created
+	if req.Create {
+		// A create is the declaration of intent the spec names: extend
+		// the caller's claim with the file it just made, in the same
+		// canonical spelling claim stores, so no second command is
+		// needed. Canonicalisation cannot normally fail here — Open
+		// already checked the same path in-root — but if it does, the
+		// open still stands and the claim simply did not extend; that
+		// is a warning, not a failed open.
+		name, cerr := g.claimPath(req.Path)
+		if cerr != nil {
+			return Response{OK: true, Version: v, Created: created,
+				ClaimWarnings: []string{"claim not extended: " + cerr.Error()}}
 		}
-		if req.End != nil {
-			end = *req.End
+		g.addClaims(req.Author, []string{name})
+	}
+	return res
+}
+
+// dispatchMkdir answers the "mkdir" verb.
+func dispatchMkdir(g *Guard, req Request) Response {
+	if err := g.Mkdir(req.Path); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchRename answers the "rename" verb.
+func dispatchRename(g *Guard, req Request) Response {
+	if err := g.Rename(req.Path, req.NewPath, req.Author); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchGoto answers the "goto" verb.
+func dispatchGoto(g *Guard, req Request) Response {
+	name, err := g.canonical(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if err := g.Goto(name, req.Line, req.Col); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchReveal answers the "reveal" verb.
+func dispatchReveal(g *Guard, req Request) Response {
+	start, end := -1, -1
+	if req.Start != nil {
+		start = *req.Start
+	}
+	if req.End != nil {
+		end = *req.End
+	}
+	if err := g.Reveal(req.Path, start, end); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchClose answers the "close" verb.
+func dispatchClose(g *Guard, req Request) Response {
+	if req.Discard {
+		remains, err := g.Discard(req.Path)
+		if err != nil {
+			return Response{Err: err.Error()}
 		}
+		return Response{OK: true, Remains: remains}
+	}
+	name, err := g.canonical(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if err := g.Close(name); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchFind answers the "find" verb.
+func dispatchFind(g *Guard, req Request) Response {
+	// Find is a read: it locates a pattern in one buffer and reports its
+	// byte span, so a program can find a position, read the version and
+	// apply against it without a separate search round trip. The query is
+	// validated like a search's, and the matching is the editor's own.
+	if req.Query == nil {
+		return Response{Err: "find needs a query"}
+	}
+	if err := g.CheckQuery(*req.Query); err != nil {
+		return Response{Err: err.Error()}
+	}
+	name, err := g.canonical(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	m, count, found, err := g.Host.Find(name, req.Author, *req.Query)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	// Found is sparse and the span reads from the omitted-zero defaults,
+	// so a match at offset 0 costs no field. Version is always carried: a
+	// caller that found nothing still learns the revision it looked at.
+	return Response{OK: true, Found: found, FindStart: m.ByteStart,
+		FindEnd: m.ByteEnd, FindCount: count, Version: m.Version}
+}
+
+// dispatchScreen answers the "screen" verb.
+func dispatchScreen(g *Guard, req Request) Response {
+	// The drawn screen is a read-only view: the visible rows top to
+	// bottom and the caret's 1-based cell. The rows ride in the body as
+	// one Spans run, the same as text, and the cursor reuses the goto
+	// line/col fields, so seeing the UI spends no new header field.
+	rows, line, col := g.Host.Screen()
+	res := Response{OK: true, Line: line, Col: col}
+	if len(rows) > 0 {
+		res.Spans = []Span{{Text: strings.Join(rows, "\n")}}
+	}
+	return res
+}
+
+// dispatchText answers the "text" verb.
+func dispatchText(g *Guard, req Request) Response {
+
+	start, end, lineStart, lineEnd := -1, -1, 0, 0
+	if req.Start != nil {
+		start = *req.Start
+	}
+	if req.End != nil {
+		end = *req.End
+	}
+	if req.LineStart != nil {
+		lineStart = *req.LineStart
+	}
+	if req.LineEnd != nil {
+		lineEnd = *req.LineEnd
+	}
+	if len(req.Paths) > 0 {
+		return readPaths(g, req, start, end, lineStart, lineEnd)
+	}
+	spans, states, v, err := g.Read(req.Path, req.Author, start, end, lineStart, lineEnd, req.Annotated)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	res := Response{OK: true, Spans: spans, Version: v}
+	// The whole file's size, not the returned span's: a driver that read
+	// the text needs the file length to append, and carrying it here is
+	// what removes the second version call. The numbers come from the
+	// buffer list exactly as the version verb reads them, and a file that is
+	// gone adds its record so the reply says so.
+	if b, ok := g.readBuffer(req.Path); ok {
+		res.Bytes, res.Lines = b.Bytes, b.Lines
+		// Only a deleted file adds a record: the ordinary single read keeps
+		// the shape it always had, and this one record is what lets a reader
+		// with no screen know the path it just read is gone from disk.
+		if b.Deleted {
+			res.Buffers = []Buffer{b}
+		}
+	}
+	if len(states) > 0 {
+		data, err := json.Marshal(states)
+		if err != nil {
+			return Response{Err: err.Error()}
+		}
+		res.StatesJSON = string(data)
+	}
+	return res
+}
+
+// dispatchGroups answers the "groups" verb.
+func dispatchGroups(g *Guard, req Request) Response {
+	name, err := g.canonical(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	groups, err := g.Host.Groups(name)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, Groups: groups}
+}
+
+// dispatchDiff answers the "diff" verb.
+func dispatchDiff(g *Guard, req Request) Response {
+	diffs, err := g.Diff(req.Path, req.Author)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if diffs == nil {
+		diffs = []DiffGroup{}
+	}
+	data, err := json.Marshal(diffs)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, DiffJSON: string(data)}
+}
+
+// dispatchReview answers the "review" verb.
+func dispatchReview(g *Guard, req Request) Response {
+	groups, err := g.Review(req.Path, req.ReviewList)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if groups == nil {
+		groups = []Group{}
+	}
+	return Response{OK: true, Groups: groups}
+}
+
+// dispatchDecide answers the "accept" verb.
+func dispatchDecide(g *Guard, req Request) Response {
+	// Accepting lands an agent's proposal, which is the person's decision,
+	// not the writer's, so only the human the save gate admits may accept.
+	// Reject leaves the text pending and stays open to an agent, recorded
+	// under the connection's own author by the chokepoint in connection.one.
+	if req.Op == "accept" && !g.humanAuthor(req.Author) {
+		return Response{Err: errAcceptNotHuman}
+	}
+	name, err := g.canonical(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if req.Group == 0 {
+		return Response{Err: req.Op + " needs a group id; list them with `groups`"}
+	}
+	if err := g.Host.Decide(name, req.Group, req.Op == "accept"); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchClear answers the "clear" verb.
+func dispatchClear(g *Guard, req Request) Response {
+	if req.Group == 0 {
+		return Response{Err: "clear needs a group id; list them with `groups`"}
+	}
+	if err := g.Clear(req.Path, req.Author, req.Group); err != nil {
+		// A wedged clear names the live set that blocked it, in the same
+		// shape a lease refusal uses, so the caller can re-propose instead
+		// of only learning that it failed.
+		var be *BlockError
+		if errors.As(err, &be) {
+			return Response{Err: err.Error(), Conflicts: []Conflict{be.Conflict}}
+		}
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchRevert answers the "revert" verb.
+func dispatchRevert(g *Guard, req Request) Response {
+	if err := g.Revert(req.Path, req.Author); err != nil {
+		// A wedged revert names the live set that blocked it, in the same
+		// shape a lease refusal uses, so the caller learns what to clear
+		// first instead of retrying blind.
+		var be *BlockError
+		if errors.As(err, &be) {
+			return Response{Err: err.Error(), Conflicts: []Conflict{be.Conflict}}
+		}
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchDelete answers the "delete" verb.
+func dispatchDelete(g *Guard, req Request) Response {
+	if req.Withdraw && req.Approve {
+		return Response{Err: errApproveWithdraw}
+	}
+	if req.Approve {
+		if err := g.ApproveDeletion(req.Path, req.Author); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	}
+	if err := g.Delete(req.Path, req.Author, req.Withdraw); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchDeletions answers the "deletions" verb.
+func dispatchDeletions(g *Guard, req Request) Response {
+	return Response{OK: true, Deletions: g.Deletions()}
+}
+
+// dispatchRmdir answers the "rmdir" verb.
+func dispatchRmdir(g *Guard, req Request) Response {
+	if req.Withdraw && req.Approve {
+		return Response{Err: errApproveWithdraw}
+	}
+	if req.Approve {
+		if err := g.ApproveDirRemoval(req.Path, req.Author); err != nil {
+			return Response{Err: err.Error()}
+		}
+		return Response{OK: true}
+	}
+	if err := g.Rmdir(req.Path, req.Author, req.Withdraw); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchRmdirs answers the "rmdirs" verb.
+func dispatchRmdirs(g *Guard, req Request) Response {
+	return Response{OK: true, DirRemovals: g.Rmdirs()}
+}
+
+// dispatchLs answers the "ls" verb.
+func dispatchLs(g *Guard, req Request) Response {
+	entries, err := g.Ls(req.Path, req.Hidden)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, Entries: entries}
+}
+
+// dispatchProposals answers the "proposals" verb.
+func dispatchProposals(g *Guard, req Request) Response {
+	return Response{OK: true, Proposals: g.Proposals()}
+}
+
+// dispatchClaim answers the "claim" verb.
+func dispatchClaim(g *Guard, req Request) Response {
+	claims, warnings, overlaps, err := g.Claim(req.Author, req.Paths, req.ClaimAdd, req.ClaimClear)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, Claims: claims, ClaimWarnings: warnings, ClaimOverlaps: overlaps}
+}
+
+// dispatchStats answers the "stats" verb.
+func dispatchStats(g *Guard, req Request) Response {
+	return Response{OK: true, Stats: g.Stats()}
+}
+
+// dispatchExecCheck answers the "execcheck" verb.
+func dispatchExecCheck(g *Guard, req Request) Response {
+	// Internal: the socket asks on the event thread, then runs the command
+	// off it. Splitting the check from the run is what lets a long command
+	// be cancelled without the editor waiting on it.
+	if req.ExecProjected && req.Dir != "" {
+		return Response{Err: "exec --projected runs at the projected tree root; --dir is not supported"}
+	}
+	dir := req.Dir
+	if req.ExecProjected {
+		// The run directory is the scratch tree the runner builds, not a
+		// workspace directory, so the -dir check has nothing to validate.
+		dir = ""
+	}
+	dirty, err := g.CheckExec(req.Argv, dir)
+	if err != nil {
+		return Response{Err: err.Error(), Stats: g.Stats()}
+	}
+	// Stale buffers ride along with the go-ahead, so the runner can attach
+	// them to the result rather than the caller having to ask separately.
+	res := Response{OK: true, Dirty: dirty}
+	if req.ExecProjected {
+		// The projection and the root ride in-process to the connection
+		// that materialises them; neither is wire-encoded.
+		// Deliberately the display composition: exec --projected runs against the
+		// tree the editor shows, deferral included. The verification surface is
+		// the hook path, whose overlay and revision use ProjectionVerifying.
+		res.Projection = g.Projection(ProjectionWithProposed)
+		res.Root = g.Root()
+		if p, ok := firstOutsideRoot(res.Projection, res.Root); ok {
+			return Response{Err: fmt.Sprintf("exec --projected materialises the primary root %s only; %s is under another workspace root, and multi-root projected exec is not supported", res.Root, p)}
+		}
+	}
+	return res
+}
+
+// dispatchSnapshot answers the "snapshot" verb.
+func dispatchSnapshot(g *Guard, req Request) Response {
+	// The document a client renders itself from. The payload travels as a
+	// JSON string like diff and lsp, because the wire's one text field is
+	// how a structured answer already crosses.
+	encoded, version, encJSON, name, err := g.DocSnapshot(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	res := Response{OK: true, Version: version, SnapshotPath: name,
+		SnapshotJSON: string(encoded), EncodingJSON: string(encJSON)}
+	// A snapshot of a buffer whose file is gone carries its record, so a client
+	// that renders the snapshot directly knows to mark the tab. Sparse: an
+	// ordinary snapshot adds nothing.
+	if b, ok := g.readBuffer(name); ok && b.Deleted {
+		res.Buffers = []Buffer{b}
+	}
+	return res
+}
+
+// dispatchSearchSnapshot answers the "searchsnapshot" verb.
+func dispatchSearchSnapshot(g *Guard, req Request) Response {
+	// Internal: the socket's search path asks for this on the event thread
+	// and then walks off it. It has no wire representation.
+	return Response{OK: true, Searcher: g.Snapshot()}
+}
+
+// dispatchLSPPrep answers the "lspprep" verb.
+func dispatchLSPPrep(g *Guard, req Request) Response {
+	// Internal: the lsp path asks the event thread to sync the document and
+	// locate the server, then runs the request off it. No wire
+	// representation, like snapshot.
+	// The guard gates the path before the host loads it for the server:
+	// without this, lsp was the one verb that reached the filesystem
+	// without the resolved-root check, and a diagnostics request could
+	// read through a symlink escape.
+	name, cerr := g.canonical(req.Path)
+	if cerr != nil {
+		return Response{Err: cerr.Error()}
+	}
+	var caller LSPCaller
+	var err error
+	if req.LSPMode == "inlay-hints" {
+		// A range request: LineStart/LineEnd carry the 1-based inclusive
+		// lines, zero meaning the start or the end of the file. The
+		// position fields are not used.
+		lineStart, lineEnd := 0, 0
 		if req.LineStart != nil {
 			lineStart = *req.LineStart
 		}
 		if req.LineEnd != nil {
 			lineEnd = *req.LineEnd
 		}
-		if len(req.Paths) > 0 {
-			return readPaths(g, req, start, end, lineStart, lineEnd)
+		caller, err = g.Host.LSPInlayHints(name, lineStart, lineEnd)
+	} else if req.LSPMode == "format" || req.LSPMode == "range-format" {
+		// Formatting shares the range encoding with inlay-hints: both zero
+		// means the whole document, and any lines named mean a range over
+		// them. The capability gate and the FormattingOptions live in the
+		// host, which is also where the buffer's indent style is read.
+		lineStart, lineEnd := 0, 0
+		if req.LineStart != nil {
+			lineStart = *req.LineStart
 		}
-		spans, states, v, err := g.Read(req.Path, req.Author, start, end, lineStart, lineEnd, req.Annotated)
-		if err != nil {
-			return Response{Err: err.Error()}
+		if req.LineEnd != nil {
+			lineEnd = *req.LineEnd
 		}
-		res := Response{OK: true, Spans: spans, Version: v}
-		// The whole file's size, not the returned span's: a driver that read
-		// the text needs the file length to append, and carrying it here is
-		// what removes the second version call. The numbers come from the
-		// buffer list exactly as the version verb reads them.
-		res.Bytes, res.Lines = g.readSize(req.Path)
-		if len(states) > 0 {
-			data, err := json.Marshal(states)
-			if err != nil {
-				return Response{Err: err.Error()}
-			}
-			res.StatesJSON = string(data)
+		caller, err = g.Host.LSPFormat(name, lineStart, lineEnd)
+	} else if req.LSPMode == "symbols" {
+		// The query rides the request's generic Query field rather than a
+		// field of its own: the wire already carries a run of query text,
+		// and no other part of an lsp request uses it. The position is not
+		// sent — workspace/symbol is not asked about a place — but the CLI
+		// still requires one for the lsp verb's shape.
+		query := ""
+		if req.Query != nil {
+			query = req.Query.Text
 		}
-		return res
-	case "groups":
-		name, err := g.canonical(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		groups, err := g.Host.Groups(name)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, Groups: groups}
-	case "diff":
-		diffs, err := g.Diff(req.Path, req.Author)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		if diffs == nil {
-			diffs = []DiffGroup{}
-		}
-		data, err := json.Marshal(diffs)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, DiffJSON: string(data)}
-	case "review":
-		groups, err := g.Review(req.Path, req.ReviewList)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		if groups == nil {
-			groups = []Group{}
-		}
-		return Response{OK: true, Groups: groups}
-	case "accept", "reject":
-		// Accepting lands an agent's proposal, which is the person's decision,
-		// not the writer's, so only the human the save gate admits may accept.
-		// Reject leaves the text pending and stays open to an agent, recorded
-		// under the connection's own author by the chokepoint in connection.one.
-		if req.Op == "accept" && !g.humanAuthor(req.Author) {
-			return Response{Err: errAcceptNotHuman}
-		}
-		name, err := g.canonical(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		if req.Group == 0 {
-			return Response{Err: req.Op + " needs a group id; list them with `groups`"}
-		}
-		if err := g.Host.Decide(name, req.Group, req.Op == "accept"); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "clear":
-		if req.Group == 0 {
-			return Response{Err: "clear needs a group id; list them with `groups`"}
-		}
-		if err := g.Clear(req.Path, req.Author, req.Group); err != nil {
-			// A wedged clear names the live set that blocked it, in the same
-			// shape a lease refusal uses, so the caller can re-propose instead
-			// of only learning that it failed.
-			var be *BlockError
-			if errors.As(err, &be) {
-				return Response{Err: err.Error(), Conflicts: []Conflict{be.Conflict}}
-			}
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "revert":
-		if err := g.Revert(req.Path, req.Author); err != nil {
-			// A wedged revert names the live set that blocked it, in the same
-			// shape a lease refusal uses, so the caller learns what to clear
-			// first instead of retrying blind.
-			var be *BlockError
-			if errors.As(err, &be) {
-				return Response{Err: err.Error(), Conflicts: []Conflict{be.Conflict}}
-			}
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "delete":
-		if req.Withdraw && req.Approve {
-			return Response{Err: errApproveWithdraw}
-		}
-		if req.Approve {
-			if err := g.ApproveDeletion(req.Path, req.Author); err != nil {
-				return Response{Err: err.Error()}
-			}
-			return Response{OK: true}
-		}
-		if err := g.Delete(req.Path, req.Author, req.Withdraw); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "deletions":
-		return Response{OK: true, Deletions: g.Deletions()}
-	case "rmdir":
-		if req.Withdraw && req.Approve {
-			return Response{Err: errApproveWithdraw}
-		}
-		if req.Approve {
-			if err := g.ApproveDirRemoval(req.Path, req.Author); err != nil {
-				return Response{Err: err.Error()}
-			}
-			return Response{OK: true}
-		}
-		if err := g.Rmdir(req.Path, req.Author, req.Withdraw); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "rmdirs":
-		return Response{OK: true, DirRemovals: g.Rmdirs()}
-	case "ls":
-		entries, err := g.Ls(req.Path, req.Hidden)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, Entries: entries}
-	case "proposals":
-		return Response{OK: true, Proposals: g.Proposals()}
-	case "claim":
-		claims, warnings, overlaps, err := g.Claim(req.Author, req.Paths, req.ClaimAdd, req.ClaimClear)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, Claims: claims, ClaimWarnings: warnings, ClaimOverlaps: overlaps}
-	case "stats":
-		return Response{OK: true, Stats: g.Stats()}
-	case "execcheck":
-		// Internal: the socket asks on the event thread, then runs the command
-		// off it. Splitting the check from the run is what lets a long command
-		// be cancelled without the editor waiting on it.
-		if req.ExecProjected && req.Dir != "" {
-			return Response{Err: "exec --projected runs at the projected tree root; --dir is not supported"}
-		}
-		dir := req.Dir
-		if req.ExecProjected {
-			// The run directory is the scratch tree the runner builds, not a
-			// workspace directory, so the -dir check has nothing to validate.
-			dir = ""
-		}
-		dirty, err := g.CheckExec(req.Argv, dir)
-		if err != nil {
-			return Response{Err: err.Error(), Stats: g.Stats()}
-		}
-		// Stale buffers ride along with the go-ahead, so the runner can attach
-		// them to the result rather than the caller having to ask separately.
-		res := Response{OK: true, Dirty: dirty}
-		if req.ExecProjected {
-			// The projection and the root ride in-process to the connection
-			// that materialises them; neither is wire-encoded.
-			res.Projection = g.Projection(ProjectionWithProposed)
-			res.Root = g.Root()
-			if p, ok := firstOutsideRoot(res.Projection, res.Root); ok {
-				return Response{Err: fmt.Sprintf("exec --projected materialises the primary root %s only; %s is under another workspace root, and multi-root projected exec is not supported", res.Root, p)}
-			}
-		}
-		return res
-	case "snapshot":
-		// The document a client renders itself from. The payload travels as a
-		// JSON string like diff and lsp, because the wire's one text field is
-		// how a structured answer already crosses.
-		encoded, version, encJSON, name, err := g.DocSnapshot(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, Version: version, SnapshotPath: name,
-			SnapshotJSON: string(encoded), EncodingJSON: string(encJSON)}
-	case "searchsnapshot":
-		// Internal: the socket's search path asks for this on the event thread
-		// and then walks off it. It has no wire representation.
-		return Response{OK: true, Searcher: g.Snapshot()}
-	case "lspprep":
-		// Internal: the lsp path asks the event thread to sync the document and
-		// locate the server, then runs the request off it. No wire
-		// representation, like snapshot.
-		// The guard gates the path before the host loads it for the server:
-		// without this, lsp was the one verb that reached the filesystem
-		// without the resolved-root check, and a diagnostics request could
-		// read through a symlink escape.
-		name, cerr := g.canonical(req.Path)
-		if cerr != nil {
-			return Response{Err: cerr.Error()}
-		}
-		var caller LSPCaller
-		var err error
-		if req.LSPMode == "inlay-hints" {
-			// A range request: LineStart/LineEnd carry the 1-based inclusive
-			// lines, zero meaning the start or the end of the file. The
-			// position fields are not used.
-			lineStart, lineEnd := 0, 0
-			if req.LineStart != nil {
-				lineStart = *req.LineStart
-			}
-			if req.LineEnd != nil {
-				lineEnd = *req.LineEnd
-			}
-			caller, err = g.Host.LSPInlayHints(name, lineStart, lineEnd)
-		} else if req.LSPMode == "format" || req.LSPMode == "range-format" {
-			// Formatting shares the range encoding with inlay-hints: both zero
-			// means the whole document, and any lines named mean a range over
-			// them. The capability gate and the FormattingOptions live in the
-			// host, which is also where the buffer's indent style is read.
-			lineStart, lineEnd := 0, 0
-			if req.LineStart != nil {
-				lineStart = *req.LineStart
-			}
-			if req.LineEnd != nil {
-				lineEnd = *req.LineEnd
-			}
-			caller, err = g.Host.LSPFormat(name, lineStart, lineEnd)
-		} else if req.LSPMode == "symbols" {
-			// The query rides the request's generic Query field rather than a
-			// field of its own: the wire already carries a run of query text,
-			// and no other part of an lsp request uses it. The position is not
-			// sent — workspace/symbol is not asked about a place — but the CLI
-			// still requires one for the lsp verb's shape.
-			query := ""
-			if req.Query != nil {
-				query = req.Query.Text
-			}
-			caller, err = g.Host.LSPWorkspaceSymbols(name, query)
-		} else {
-			caller, err = g.Host.LSP(name, req.Line, req.Col, req.LSPMode)
-		}
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, LSP: caller}
-	case "version":
-		name, err := g.canonical(req.Path)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		v, err := g.Version(name, req.Author)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		// Bytes and lines ride on the same answer so a driver can size a span
-		// or find the end of a file without a read. They come from the buffer
-		// list rather than a new host method, so the interface stays as is.
-		res := Response{OK: true, Version: v}
-		for _, b := range g.Buffers() {
-			if b.Path == name {
-				res.Bytes, res.Lines = b.Bytes, b.Lines
-				break
-			}
-		}
-		return res
-	case "save":
-		v, err := g.Save(req.Path, req.Author, req.Force)
-		return done(v, err)
-	case "land":
-		// Landing accepts by task and then saves, so it is the same human
-		// gesture save is; an agent is refused before any set is touched.
-		if !g.humanAuthor(req.Author) {
-			return Response{Err: errLandNotHuman}
-		}
-		files, exp, err := g.Land(req.LandTask, req.Author)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		res := Response{OK: true, Land: files}
-		if exp != nil {
-			// The export rides as JSON in the generic payload field: the land
-			// report has no field for the object ids, and a client that does
-			// not ask for them still reads the per-buffer list.
-			if data, err := json.Marshal(exp); err == nil {
-				res.HookJSON = string(data)
-			}
-		}
-		return res
-	case "reload":
-		if err := g.Reload(req.Path); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "apply":
-		if req.Base == nil {
-			return Response{Err: "apply needs a base version; read the buffer or ask for its version first"}
-		}
-		if len(req.Hunks) == 0 {
-			v, err := g.Version(req.Path, req.Author)
-			return done(v, err)
-		}
-		v, conflicts, warnings, err := g.apply(req.Path, req.Author, *req.Base, req.Hunks, g.taskOf(req.Author))
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts,
-			Warnings: warnings}
-		if len(conflicts) > 0 {
-			res.Err = fmt.Sprintf("%d of %d hunks could not be placed on the current version",
-				len(conflicts), len(req.Hunks))
-		}
-		return res
-	case "dump":
-		start, end := -1, -1
-		if req.Start != nil {
-			start = *req.Start
-		}
-		if req.End != nil {
-			end = *req.End
-		}
-		id, v, text, hash, err := g.Dump(req.Path, start, end, req.Author)
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true, DumpID: id, Version: v, Hash: hash,
-			Spans: []Span{{Text: text, Author: req.Author}}}
-	case "patch":
-		v, conflicts, warnings, err := g.patch(req.Path, req.Author, req.DumpID, req.PatchText, g.taskOf(req.Author))
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts,
-			Warnings: warnings}
-		if len(conflicts) > 0 {
-			res.Err = fmt.Sprintf("%d of the snapshot's changes could not be placed on the current version",
-				len(conflicts))
-		}
-		return res
+		caller, err = g.Host.LSPWorkspaceSymbols(name, query)
+	} else {
+		caller, err = g.Host.LSP(name, req.Line, req.Col, req.LSPMode)
 	}
-	return Response{Err: "unknown op " + req.Op}
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, LSP: caller}
 }
 
-// dispatchHook answers the hook verb. list and show read the stored rows, put
-// validates and stores one, and rm, enable and disable author. run is the
-// event-thread half of `raj hook run`: it admits the hook, snapshots the
-// projection, and reserves the run on the shared Gate. Authoring is
-// local-only: localOnly refuses put/rm/enable/disable on a TCP connection
-// before Dispatch is reached, while list, show and run cross; run's own
-// boundary is admission, not the transport. Put validates through the hooks
-// domain so an invalid row is refused before the host is asked to store it.
+// dispatchVersion answers the "version" verb.
+func dispatchVersion(g *Guard, req Request) Response {
+	name, err := g.canonical(req.Path)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	v, err := g.Version(name, req.Author)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	// Bytes and lines ride on the same answer so a driver can size a span
+	// or find the end of a file without a read. They come from the buffer
+	// list rather than a new host method, so the interface stays as is.
+	res := Response{OK: true, Version: v}
+	for _, b := range g.Buffers() {
+		if b.Path == name {
+			res.Bytes, res.Lines = b.Bytes, b.Lines
+			break
+		}
+	}
+	return res
+}
+
+// dispatchSave answers the "save" verb.
+func dispatchSave(g *Guard, req Request) Response {
+	v, err := g.Save(req.Path, req.Author, req.Force)
+	return done(v, err)
+}
+
+// dispatchLand answers the "land" verb.
+func dispatchLand(g *Guard, req Request) Response {
+	// Landing accepts by task and then saves, so it is the same human
+	// gesture save is; an agent is refused before any set is touched.
+	if !g.humanAuthor(req.Author) {
+		return Response{Err: errLandNotHuman}
+	}
+	files, exp, err := g.Land(req.LandTask, req.Author)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	res := Response{OK: true, Land: files}
+	if exp != nil {
+		// The export rides as JSON in the generic payload field: the land
+		// report has no field for the object ids, and a client that does
+		// not ask for them still reads the per-buffer list.
+		if data, err := json.Marshal(exp); err == nil {
+			res.HookJSON = string(data)
+		}
+	}
+	return res
+}
+
+// dispatchReload answers the "reload" verb.
+func dispatchReload(g *Guard, req Request) Response {
+	if err := g.Reload(req.Path); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchApply answers the "apply" verb.
+func dispatchApply(g *Guard, req Request) Response {
+	if req.Base == nil {
+		return Response{Err: "apply needs a base version; read the buffer or ask for its version first"}
+	}
+	if len(req.Hunks) == 0 {
+		v, err := g.Version(req.Path, req.Author)
+		return done(v, err)
+	}
+	v, conflicts, warnings, err := g.apply(req.Path, req.Author, *req.Base, req.Hunks, g.taskOf(req.Author))
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts,
+		Warnings: warnings}
+	if len(conflicts) > 0 {
+		res.Err = fmt.Sprintf("%d of %d hunks could not be placed on the current version",
+			len(conflicts), len(req.Hunks))
+	}
+	return res
+}
+
+// dispatchDump answers the "dump" verb.
+func dispatchDump(g *Guard, req Request) Response {
+	start, end := -1, -1
+	if req.Start != nil {
+		start = *req.Start
+	}
+	if req.End != nil {
+		end = *req.End
+	}
+	id, v, text, hash, err := g.Dump(req.Path, start, end, req.Author)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, DumpID: id, Version: v, Hash: hash,
+		Spans: []Span{{Text: text, Author: req.Author}}}
+}
+
+// dispatchPatch answers the "patch" verb.
+func dispatchPatch(g *Guard, req Request) Response {
+	v, conflicts, warnings, err := g.patch(req.Path, req.Author, req.DumpID, req.PatchText, g.taskOf(req.Author))
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	res := Response{OK: len(conflicts) == 0, Version: v, Conflicts: conflicts,
+		Warnings: warnings}
+	if len(conflicts) > 0 {
+		res.Err = fmt.Sprintf("%d of the snapshot's changes could not be placed on the current version",
+			len(conflicts))
+	}
+	return res
+}
+
+// hookMode is one row of the hook-mode table, the one place a hook mode is
+// spelled and the one place its transport rule and its handler live. The names
+// used to be repeated across four switches -- dispatchHook, the connection
+// routing in connection.one, localOnly and remoteRefusal -- with nothing tying
+// them together, so a mode could be added to one and not the others and reach
+// the wrong transport or answer as "unknown mode". One row per mode ends that.
+type hookMode struct {
+	name      string
+	local     bool
+	remoteCtl bool
+	dispatch  func(*Guard, Request) Response
+	conn      func(*connection, Request, func(Response))
+}
+
+// hookModes is every hook mode the server knows. The event-thread handler
+// answers the modes Dispatch serves; the connection handler answers the modes
+// addressed on the connection goroutine before Dispatch. run is the one mode
+// with both: the wire request routes to runHook, and hookprep reaches the
+// event-thread half through dispatchHook. local is the TCP rule authoring and
+// the host-process modes share; remoteCtl marks the ones whose refusal names
+// the control message rather than authoring.
+var hookModes = []hookMode{
+	{name: "list", dispatch: dispatchHookList},
+	{name: "show", dispatch: dispatchHookShow},
+	{name: "put", local: true, dispatch: dispatchHookPut},
+	{name: "rm", local: true, dispatch: dispatchHookRemove},
+	{name: "enable", local: true, dispatch: dispatchHookEnable},
+	{name: "disable", local: true, dispatch: dispatchHookDisable},
+	{name: "run", dispatch: dispatchHookRun, conn: (*connection).runHook},
+	{name: "log", conn: (*connection).hookLog},
+	{name: "ps", conn: (*connection).hookPS},
+	{name: "cancel", local: true, remoteCtl: true, conn: (*connection).hookCancel},
+	{name: "off", local: true, remoteCtl: true, conn: (*connection).hookSwitch},
+	{name: "on", local: true, remoteCtl: true, conn: (*connection).hookSwitch},
+}
+
+// hookModeByName is the lookup the dispatcher, the transport guards and the
+// connection router all share, so none of them can drift about what a mode is.
+var hookModeByName = func() map[string]hookMode {
+	m := make(map[string]hookMode, len(hookModes))
+	for _, h := range hookModes {
+		m[h.name] = h
+	}
+	return m
+}()
+
+// dispatchHook answers the hook verb. It is a lookup: the mode names, their
+// transport rules and their handlers live once, in hookModes. list and show
+// read the stored rows, put validates and stores one, and rm, enable and
+// disable author. run is the event-thread half of `raj hook run`: it admits
+// the hook, snapshots the projection, and reserves the run on the shared Gate.
+// Authoring is local-only: localOnly refuses put/rm/enable/disable on a TCP
+// connection before Dispatch is reached, while list, show and run cross; run's
+// own boundary is admission, not the transport. Put validates through the
+// hooks domain so an invalid row is refused before the host is asked to store
+// it.
 func dispatchHook(g *Guard, req Request) Response {
-	switch req.HookMode {
-	case "list":
-		rows, err := g.Hooks()
-		if err != nil {
-			return Response{Err: err.Error()}
+	m, ok := hookModeByName[req.HookMode]
+	if !ok || m.dispatch == nil {
+		return Response{Err: "hook: unknown mode " + req.HookMode}
+	}
+	return m.dispatch(g, req)
+}
+
+// dispatchHookList answers hook list: every stored row as JSON, an empty array
+// rather than null when there are none.
+func dispatchHookList(g *Guard, req Request) Response {
+	rows, err := g.Hooks()
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if rows == nil {
+		rows = []HookRow{}
+	}
+	data, err := json.Marshal(rows)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, HookJSON: string(data)}
+}
+
+// dispatchHookShow answers hook show: the named row, or a refusal naming it.
+func dispatchHookShow(g *Guard, req Request) Response {
+	if req.HookName == "" {
+		return Response{Err: "hook show needs a name"}
+	}
+	rows, err := g.Hooks()
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	for _, row := range rows {
+		if row.Name != req.HookName {
+			continue
 		}
-		if rows == nil {
-			rows = []HookRow{}
-		}
-		data, err := json.Marshal(rows)
+		data, err := json.Marshal(row)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true, HookJSON: string(data)}
-	case "show":
-		if req.HookName == "" {
-			return Response{Err: "hook show needs a name"}
-		}
-		rows, err := g.Hooks()
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		for _, row := range rows {
-			if row.Name != req.HookName {
-				continue
-			}
-			data, err := json.Marshal(row)
-			if err != nil {
-				return Response{Err: err.Error()}
-			}
-			return Response{OK: true, HookJSON: string(data)}
-		}
-		return Response{Err: fmt.Sprintf("no such hook %q", req.HookName)}
-	case "put":
-		var row HookRow
-		if err := json.Unmarshal([]byte(req.HookJSON), &row); err != nil {
-			return Response{Err: "hook put: " + err.Error()}
-		}
-		hook, err := hooks.Parse(hookRaw(row))
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		// Parse owns the default: an omitted tree is stored as projected, so the
-		// column never holds a value the runner would have to guess at.
-		row.Tree = string(hook.Tree)
-		if err := g.PutHook(row); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "rm", "enable", "disable":
-		if req.HookName == "" {
-			return Response{Err: "hook " + req.HookMode + " needs a name"}
-		}
-		var err error
-		switch req.HookMode {
-		case "rm":
-			err = g.DeleteHook(req.HookName)
-		case "enable":
-			err = g.SetHookEnabled(req.HookName, true)
-		case "disable":
-			err = g.SetHookEnabled(req.HookName, false)
-		}
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	case "run":
-		if req.HookName == "" {
-			return Response{Err: "hook run needs a name"}
-		}
-		rows, err := g.Hooks()
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		// Derived per request, never cached: a put or rm between two runs has
-		// to be visible to the next one, and the store is the authority on what
-		// a hook is.
-		raws := make([]hooks.Raw, len(rows))
-		for i, row := range rows {
-			raws[i] = hookRaw(row)
-		}
-		set, _ := hooks.NewSet(raws)
-		hook, err := set.Admit(req.HookName, g.hookCallerAgent(req.Author))
-		if err != nil {
-			return Response{Err: err.Error()}
-		}
-		if g.HookGate == nil {
-			return Response{Err: "hook run is not available"}
-		}
-		root := g.Root()
-		// A workspace hook runs in the saved root itself, so it must not start
-		// while any buffer is unsaved or holds a pending change set: the run would
-		// test a tree that is not what the editor shows. The check is the same
-		// predicate `raj ctl status` applies, decided here on the event thread. A
-		// projected hook materialises the live composition instead and needs no
-		// such gate.
-		var proj map[string][]byte
-		revision := uint64(0)
-		if hook.Tree == hooks.TreeWorkspace {
-			if blockers := hookWorkspaceBlockers(g.Buffers()); len(blockers) > 0 {
-				return Response{Err: fmt.Sprintf("hook %q runs on the saved workspace, but it is not ready: %s",
-					hook.Name, strings.Join(blockers, "; "))}
-			}
-			// The provenance stamp and the may_write check both need git, so the
-			// work-tree refusal belongs here, before the command starts. The probe
-			// is a filesystem check, not a git call: it runs on the event thread,
-			// which must not spawn a process. A `.git` directory is an ordinary
-			// checkout and a `.git` file is a linked worktree's gitdir pointer;
-			// either is a work tree. The full `git view` still runs off-thread in
-			// the run path.
-			dotGit := filepath.Join(root, ".git")
-			if info, err := os.Stat(dotGit); err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
-				return Response{Err: fmt.Sprintf("hook %q runs on the saved workspace, but it is not a git work tree: %s", hook.Name, root)}
-			}
-			// When ready, the projection is the saved text; hashing it still keys
-			// the per-revision cap on the composition the run saw.
-			revision = projectionRevision(g.Projection(ProjectionWithProposed))
-		} else {
-			proj = g.Projection(ProjectionWithProposed)
-			// A projection that reaches a second workspace root cannot be
-			// materialised from the primary one alone, exactly as for a projected
-			// exec: the scratch tree would silently omit those buffers, so the run
-			// is refused by name rather than run against a partial tree.
-			if p, ok := firstOutsideRoot(proj, root); ok {
-				return Response{Err: fmt.Sprintf("hook run materialises the primary root %s only; %s is under another workspace root, and multi-root projected hook runs are not supported", root, p)}
-			}
-			revision = projectionRevision(proj)
-		}
-		now := time.Now()
-		retryAfter, ok, reason := g.HookGate.Allow(hook.Name, revision, now)
-		if !ok {
-			return Response{Err: fmt.Sprintf("hook %q: %s", hook.Name, reason),
-				RetryAfterMS: int(retryAfter / time.Millisecond)}
-		}
-		// Begin on the event thread, so the very next admission -- this
-		// connection or another -- sees the run in flight. End runs on the
-		// connection goroutine once the command finishes.
-		g.HookGate.Begin(hook.Name, revision, now)
-		return Response{OK: true, Root: root, Projection: proj, HookRevision: revision,
-			HookArgv: hook.Argv, HookShell: hook.Shell, HookTree: string(hook.Tree),
-			HookMayWrite: hook.MayWrite, HookDetach: hook.Detach,
-			HookTimeoutMS: int(hook.Timeout / time.Millisecond),
-			HookBuiltin:   hook.Builtin, HookBuiltinArgs: hook.BuiltinArgs}
-	default:
-		return Response{Err: "hook: unknown mode " + req.HookMode}
 	}
+	return Response{Err: fmt.Sprintf("no such hook %q", req.HookName)}
+}
+
+// dispatchHookPut answers hook put: an invalid row is refused by the hooks
+// domain before the host is asked to store it.
+func dispatchHookPut(g *Guard, req Request) Response {
+	var row HookRow
+	if err := json.Unmarshal([]byte(req.HookJSON), &row); err != nil {
+		return Response{Err: "hook put: " + err.Error()}
+	}
+	hook, err := hooks.Parse(hookRaw(row))
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	// Parse owns the default: an omitted tree is stored as projected, so the
+	// column never holds a value the runner would have to guess at.
+	row.Tree = string(hook.Tree)
+	if err := g.PutHook(row); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchHookRemove answers hook rm.
+func dispatchHookRemove(g *Guard, req Request) Response {
+	if req.HookName == "" {
+		return Response{Err: "hook rm needs a name"}
+	}
+	if err := g.DeleteHook(req.HookName); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchHookEnable and dispatchHookDisable answer hook enable and disable.
+// The missing-name refusal names the mode through req.HookMode, the mode the
+// table routed here.
+func dispatchHookEnable(g *Guard, req Request) Response {
+	return dispatchHookSetEnabled(g, req, true)
+}
+
+func dispatchHookDisable(g *Guard, req Request) Response {
+	return dispatchHookSetEnabled(g, req, false)
+}
+
+func dispatchHookSetEnabled(g *Guard, req Request, on bool) Response {
+	if req.HookName == "" {
+		return Response{Err: "hook " + req.HookMode + " needs a name"}
+	}
+	if err := g.SetHookEnabled(req.HookName, on); err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true}
+}
+
+// dispatchHookRun answers hook run on the event thread: it admits the hook
+// against the Agent flag, resolves declared parameters, refuses a workspace
+// hook whose tree is not what the editor shows, and reserves the run on the
+// shared Gate. The command runs on the connection goroutine; this half never
+// spawns it.
+func dispatchHookRun(g *Guard, req Request) Response {
+	if req.HookName == "" {
+		return Response{Err: "hook run needs a name"}
+	}
+	rows, err := g.Hooks()
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	// Derived per request, never cached: a put or rm between two runs has
+	// to be visible to the next one, and the store is the authority on what
+	// a hook is.
+	raws := make([]hooks.Raw, len(rows))
+	for i, row := range rows {
+		raws[i] = hookRaw(row)
+	}
+	set, _ := hooks.NewSet(raws)
+	hook, err := set.Admit(req.HookName, g.hookCallerAgent(req.Author))
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	// Declared parameters are resolved and validated here, on the event
+	// thread, before the Gate reserves the run: a refusal must not consume a
+	// run and the action must not start. The resolved values carry to the
+	// connection as the RAJ_PARAM_<name> environment of section 4, never as
+	// argv, so an agent names a choice rather than injecting a command.
+	paramValues, err := hook.ResolveParams(req.HookParams)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	if g.HookGate == nil {
+		return Response{Err: "hook run is not available"}
+	}
+	root := g.Root()
+	// A workspace hook runs in the saved root itself, so it must not start
+	// while any buffer is unsaved or holds a pending change set: the run would
+	// test a tree that is not what the editor shows. The check is the same
+	// predicate `raj ctl status` applies, decided here on the event thread. A
+	// projected hook materialises the live composition instead and needs no
+	// such gate.
+	var proj map[string][]byte
+	revision := uint64(0)
+	if hook.Tree == hooks.TreeWorkspace {
+		if blockers := hookWorkspaceBlockers(g.Buffers()); len(blockers) > 0 {
+			return Response{Err: fmt.Sprintf("hook %q runs on the saved workspace, but it is not ready: %s",
+				hook.Name, strings.Join(blockers, "; "))}
+		}
+		// The provenance stamp and the may_write check both need git, so the
+		// work-tree refusal belongs here, before the command starts. The probe
+		// is a filesystem check, not a git call: it runs on the event thread,
+		// which must not spawn a process. A `.git` directory is an ordinary
+		// checkout and a `.git` file is a linked worktree's gitdir pointer;
+		// either is a work tree. The full `git view` still runs off-thread in
+		// the run path.
+		dotGit := filepath.Join(root, ".git")
+		if info, err := os.Stat(dotGit); err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
+			return Response{Err: fmt.Sprintf("hook %q runs on the saved workspace, but it is not a git work tree: %s", hook.Name, root)}
+		}
+		// When ready, the projection is the saved text; hashing it still keys
+		// the per-revision cap on the composition the run saw.
+		revision = projectionRevision(g.Projection(ProjectionVerifying))
+	} else {
+		// The build harness is taken from the accepted tree and only the
+		// sources are projected, so a proposed Makefile or script cannot run:
+		// see hookProjection.
+		proj = g.hookProjection()
+		// A projection that reaches a second workspace root cannot be
+		// materialised from the primary one alone, exactly as for a projected
+		// exec: the scratch tree would silently omit those buffers, so the run
+		// is refused by name rather than run against a partial tree.
+		if p, ok := firstOutsideRoot(proj, root); ok {
+			return Response{Err: fmt.Sprintf("hook run materialises the primary root %s only; %s is under another workspace root, and multi-root projected hook runs are not supported", root, p)}
+		}
+		revision = projectionRevision(proj)
+	}
+	now := time.Now()
+	retryAfter, ok, reason := g.HookGate.Allow(hook.Name, revision, now)
+	if !ok {
+		return Response{Err: fmt.Sprintf("hook %q: %s", hook.Name, reason),
+			RetryAfterMS: int(retryAfter / time.Millisecond)}
+	}
+	// Begin on the event thread, so the very next admission -- this
+	// connection or another -- sees the run in flight. End runs on the
+	// connection goroutine once the command finishes.
+	g.HookGate.Begin(hook.Name, revision, now)
+	return Response{OK: true, Root: root, Projection: proj, HookRevision: revision,
+		HookArgv: hook.Argv, HookShell: hook.Shell, HookTree: string(hook.Tree),
+		HookMayWrite: hook.MayWrite, HookDetach: hook.Detach,
+		HookTimeoutMS: int(hook.Timeout / time.Millisecond),
+		HookBuiltin:   hook.Builtin, HookBuiltinArgs: hook.BuiltinArgs,
+		HookSteps: hook.Steps, HookParamValues: paramValues}
 }
 
 // blockingBuffers returns the buffers that make a workspace unready for a gate:
@@ -2568,7 +2819,7 @@ func (g *Guard) hookCallerAgent(author uint8) bool {
 // validation goes through the same Parse the host applies.
 func hookRaw(row HookRow) hooks.Raw {
 	return hooks.Raw{
-		Name: row.Name, Action: row.Action, Trigger: row.Trigger, Tree: row.Tree, Agent: row.Agent,
+		Name: row.Name, Action: row.Action, Params: row.Params, Trigger: row.Trigger, Tree: row.Tree, Agent: row.Agent,
 		CooldownMS: row.CooldownMS, TimeoutMS: row.TimeoutMS,
 		MayWrite: row.MayWrite, Detach: row.Detach, Enabled: row.Enabled,
 	}

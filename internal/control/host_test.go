@@ -116,6 +116,13 @@ type memHost struct {
 	// it. A bad span never reaches it because the Guard refuses first.
 	reveals []revealCall
 
+	// screenRows, screenLine and screenCol are the canned drawn screen the
+	// screen verb reads: rows top to bottom and the caret's 1-based cell.
+	// Zero values are a blank screen with no drawn caret.
+	screenRows []string
+	screenLine int
+	screenCol  int
+
 	// projection is the canned map Projection hands back. The fake returns a copy
 	// of it for either policy: which policy maps to which composition is the app
 	// host's job, not the fake's.
@@ -192,6 +199,11 @@ func (h *memHost) Buffers() []Buffer {
 			Bytes: len(t), Lines: strings.Count(t, "\n") + 1})
 	}
 	return out
+}
+
+// Screen returns the canned drawn screen, standing in for the app's own.
+func (h *memHost) Screen() ([]string, int, int) {
+	return h.screenRows, h.screenLine, h.screenCol
 }
 
 func (h *memHost) Resolve(path string) (string, error) {
@@ -756,6 +768,29 @@ func TestDispatchOpenReportsCreated(t *testing.T) {
 	res = Dispatch(g, Request{Op: "open", Path: fresh, Author: FirstAgent, Create: true})
 	if !res.OK || res.Created {
 		t.Errorf("second open -create = %+v, want ok and not created", res)
+	}
+}
+
+// screen answers with the drawn rows and the caret cell: the rows travel as
+// one body run joined by newlines, and the cursor reuses the goto fields.
+func TestDispatchScreenReadsRowsAndCursor(t *testing.T) {
+	g, h := guarded(t)
+	h.screenRows = []string{"package a", "", "func f() {}", "  x := 1"}
+	h.screenLine, h.screenCol = 3, 6
+
+	res := Dispatch(g, Request{Op: "screen"})
+	if !res.OK {
+		t.Fatalf("screen = %+v, want ok", res)
+	}
+	if len(res.Spans) != 1 {
+		t.Fatalf("screen spans = %d, want 1", len(res.Spans))
+	}
+	want := "package a\n\nfunc f() {}\n  x := 1"
+	if res.Spans[0].Text != want {
+		t.Errorf("rows = %q, want %q", res.Spans[0].Text, want)
+	}
+	if res.Line != 3 || res.Col != 6 {
+		t.Errorf("cursor = %d,%d, want 3,6", res.Line, res.Col)
 	}
 }
 
@@ -4153,14 +4188,22 @@ func TestDispatchIntentStampsOwnerAndGatesPublish(t *testing.T) {
 		t.Errorf("owner = %q, want the connection's own author %s (server-stamped)", cmd.Owner, want)
 	}
 
+	// Proposing a publish is inert, so an agent may reach the host with it; the
+	// host is the fake here and answers not-implemented.
 	res = Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"publish"}`, Author: agent})
+	if res.OK || !strings.Contains(res.Err, "not implemented") {
+		t.Fatalf("agent propose publish = %+v, want it admitted to the host", res)
+	}
+	// Running a publish is outward: an agent's --approve is refused before the
+	// host.
+	res = Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"publish","approve":true}`, Author: agent})
 	if res.OK || res.Err != errIntentPublishNotHuman {
-		t.Fatalf("agent publish = %+v, want %q", res, errIntentPublishNotHuman)
+		t.Fatalf("agent approve publish = %+v, want %q", res, errIntentPublishNotHuman)
 	}
 	// A human reaches the host, which answers not-implemented, proving the gate
 	// let the outward mode through to the workflow.
-	res = Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"publish"}`, Author: LocalHuman})
+	res = Dispatch(g, Request{Op: "intent", HookJSON: `{"mode":"publish","approve":true}`, Author: LocalHuman})
 	if res.OK || !strings.Contains(res.Err, "not implemented") {
-		t.Fatalf("human publish = %+v, want it admitted to the host", res)
+		t.Fatalf("human approve publish = %+v, want it admitted to the host", res)
 	}
 }

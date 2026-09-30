@@ -122,3 +122,43 @@ func TestUnnamedBufferNeverConflicts(t *testing.T) {
 		t.Fatal("an unnamed buffer cannot conflict with anything")
 	}
 }
+
+// A file that was there when the buffer was stamped and is gone now reads as
+// deleted, while a buffer named for a path that never existed does not: the
+// second has no prior file for its absence to be a change from, and treating
+// it as deleted would put a "write it back?" question in front of every new
+// file.
+func TestDeletedFileIsDistinguishableFromANewOne(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Open(path, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.DeletedOnDisk() {
+		t.Fatal("a file that is present reads as deleted")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if !f.DeletedOnDisk() {
+		t.Error("a removed file did not read as deleted")
+	}
+	if !f.DiskChanged() {
+		t.Error("a removed file did not read as changed")
+	}
+
+	missing, err := Open(filepath.Join(dir, "never.txt"), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.DeletedOnDisk() {
+		t.Error("a buffer for a path that was never on disk read as deleted")
+	}
+	if missing.DiskChanged() {
+		t.Error("a buffer for a path that was never on disk read as changed")
+	}
+}

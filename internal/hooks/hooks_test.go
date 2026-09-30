@@ -29,6 +29,15 @@ func init() {
 	if err := builtin.Register("test.humanonly", testLeaf{name: "test.humanonly"}, builtin.HumanOnly); err != nil {
 		panic(err)
 	}
+	// The intent leaves are H4's; the intention-diff composite test registers
+	// their names as AgentDefault stubs so the definition's shape and gate can
+	// be pinned before the app-side leaves land.
+	if err := builtin.Register("test.intent.resolve", testLeaf{name: "test.intent.resolve"}, builtin.AgentDefault); err != nil {
+		panic(err)
+	}
+	if err := builtin.Register("test.intent.materialise", testLeaf{name: "test.intent.materialise"}, builtin.AgentDefault); err != nil {
+		panic(err)
+	}
 }
 
 // TestParseAccepts walks the shapes Parse must accept: an argv array, the
@@ -355,5 +364,297 @@ func TestAdmitWrongTrigger(t *testing.T) {
 	}}
 	if _, err := set.Admit("scheduled", false); !errors.Is(err, ErrWrongTrigger) {
 		t.Fatalf("Admit(unknown trigger) error = %v; want ErrWrongTrigger", err)
+	}
+}
+
+// TestParseComposite pins the steps action form: an ordered list of named
+// builtin steps parses into Hook.Steps, no single-action field is set, the
+// order is kept, and the effective policy starts AgentDefault.
+func TestParseComposite(t *testing.T) {
+	h, err := Parse(Raw{Name: "git-context", Trigger: "agent", Enabled: true,
+		Action: `{"steps":[
+			{"name":"status","builtin":"test.echo"},
+			{"name":"diff","builtin":"test.echo","args":{"who":"d"}},
+			{"name":"log","builtin":"test.echo","args":{"count":20}}]}`})
+	if err != nil {
+		t.Fatalf("Parse(composite): %v", err)
+	}
+	if h.Argv != nil || h.Shell != "" || h.Builtin != "" || h.BuiltinArgs != nil {
+		t.Fatalf("composite set a single-action field: %+v", h)
+	}
+	if len(h.Steps) != 3 {
+		t.Fatalf("Steps = %+v; want three", h.Steps)
+	}
+	for i, want := range []string{"STATUS", "DIFF", "LOG"} {
+		if got := NormaliseStepName(h.Steps[i].Name); got != want {
+			t.Errorf("step %d normalises to %q; want %q", i, got, want)
+		}
+	}
+	if h.Steps[2].Args["count"] != float64(20) {
+		t.Errorf("log args = %+v; want count 20", h.Steps[2].Args)
+	}
+	if h.BuiltinPolicy != builtin.AgentDefault {
+		t.Errorf("BuiltinPolicy = %v; want AgentDefault", h.BuiltinPolicy)
+	}
+}
+
+// TestCompositePolicyIsTransitive pins the gate's leaf half: a composite whose
+// steps are all AgentDefault leaves is agent-callable; one that names a
+// HumanOnly leaf anywhere in the chain carries HumanOnly and Admit refuses it
+// to an agent however the row's Agent flag reads.
+func TestCompositePolicyIsTransitive(t *testing.T) {
+	set, errs := NewSet([]Raw{
+		{Name: "reads", Trigger: "agent", Agent: true, Enabled: true,
+			Action: `{"steps":[{"name":"a","builtin":"test.echo"},{"name":"b","builtin":"test.echo"}]}`},
+		{Name: "mixed", Trigger: "agent", Agent: true, Enabled: true,
+			Action: `{"steps":[{"name":"a","builtin":"test.echo"},{"name":"b","builtin":"test.humanonly"}]}`},
+	})
+	if len(errs) != 0 {
+		t.Fatalf("NewSet errors: %v", errs)
+	}
+	if _, err := set.Admit("reads", true); err != nil {
+		t.Fatalf("agent on an AgentDefault composite: %v; want admit", err)
+	}
+	if _, err := set.Admit("mixed", true); !errors.Is(err, ErrHumanOnlyLeaf) {
+		t.Fatalf("agent on a composite with a HumanOnly step = %v; want ErrHumanOnlyLeaf", err)
+	}
+	if _, err := set.Admit("mixed", false); err != nil {
+		t.Fatalf("human on a composite with a HumanOnly step: %v; want admit", err)
+	}
+}
+
+// TestStepNameCollisionRejected pins the load-time collision refusal: two step
+// names that normalise to the same variable are refused, naming the variable,
+// because one would otherwise shadow the other's RAJ_STEP output.
+func TestStepNameCollisionRejected(t *testing.T) {
+	_, err := Parse(Raw{Name: "c", Trigger: "agent", Enabled: true,
+		Action: `{"steps":[{"name":"git-status","builtin":"test.echo"},{"name":"git_status","builtin":"test.echo"}]}`})
+	if err == nil {
+		t.Fatal("Parse accepted two step names that collide after normalisation")
+	}
+	if !strings.Contains(err.Error(), "GIT_STATUS") {
+		t.Fatalf("collision refusal = %q; want it to name the colliding variable", err)
+	}
+}
+
+// TestCompositeIntentionDiff pins the intention-diff composite's shape and gate.
+// The intent leaves it chains are H4's; this test registers their names as
+// AgentDefault stubs only long enough to prove the definition parses, keeps its
+// order, and stays agent-callable. The runtime leaves land with the app-side
+// intent projection, deferred from this item.
+func TestCompositeIntentionDiff(t *testing.T) {
+	h, err := Parse(Raw{Name: "intention-diff", Trigger: "agent", Enabled: true,
+		Action: `{"steps":[
+			{"name":"resolve","builtin":"test.intent.resolve"},
+			{"name":"materialise","builtin":"test.intent.materialise"},
+			{"name":"diff","builtin":"test.echo","args":{"base":""}}]}`})
+	if err != nil {
+		t.Fatalf("Parse(intention-diff): %v", err)
+	}
+	if len(h.Steps) != 3 || h.Steps[0].Name != "resolve" ||
+		h.Steps[1].Name != "materialise" || h.Steps[2].Name != "diff" {
+		t.Fatalf("intention-diff steps = %+v; want resolve, materialise, diff", h.Steps)
+	}
+	if h.BuiltinPolicy != builtin.AgentDefault {
+		t.Fatalf("intention-diff policy = %v; want AgentDefault so an agent may run it", h.BuiltinPolicy)
+	}
+}
+
+// TestParamEnvVar pins the environment mapping: the name upper-cased with every
+// character that is not an ASCII letter or digit turned into an underscore.
+// Precondition: none. It fails if the prefix or the normalisation drifts, which
+// would silently move the variable an action reads.
+func TestParamEnvVar(t *testing.T) {
+	for _, tt := range []struct{ name, want string }{
+		{"PHASE", "RAJ_PARAM_PHASE"},
+		{"phase", "RAJ_PARAM_PHASE"},
+		{"phase-name", "RAJ_PARAM_PHASE_NAME"},
+		{"phase_name", "RAJ_PARAM_PHASE_NAME"},
+		{"Attempt2", "RAJ_PARAM_ATTEMPT2"},
+	} {
+		if got := ParamEnvVar(tt.name); got != tt.want {
+			t.Errorf("ParamEnvVar(%q) = %q; want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestParseParamsAccepts walks the three declaration forms and the optional
+// default each may carry, and pins the field every one fills. Precondition:
+// none, Parse is pure. It fails if a form is refused, if the default is dropped
+// or misread, or if the declaration order is not preserved.
+func TestParseParamsAccepts(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []Param
+	}{
+		{"enum required", `["PHASE=enum(check,race)"]`, []Param{
+			{Name: "PHASE", Kind: ParamEnum, Enum: []string{"check", "race"}, Decl: "PHASE=enum(check,race)"}}},
+		{"enum default", `["PHASE=enum(check,race)=check"]`, []Param{
+			{Name: "PHASE", Kind: ParamEnum, Enum: []string{"check", "race"},
+				Default: "check", HasDefault: true, Decl: "PHASE=enum(check,race)=check"}}},
+		{"string required", `["TAG=string(^v[0-9]+$)"]`, []Param{
+			{Name: "TAG", Kind: ParamString, Regex: "^v[0-9]+$", Decl: "TAG=string(^v[0-9]+$)"}}},
+		{"string default with groups", `["TAG=string((a|b)+)=ab"]`, []Param{
+			{Name: "TAG", Kind: ParamString, Regex: "(a|b)+",
+				Default: "ab", HasDefault: true, Decl: "TAG=string((a|b)+)=ab"}}},
+		{"uint required", `["N=uint"]`, []Param{
+			{Name: "N", Kind: ParamUint, Decl: "N=uint"}}},
+		{"uint default", `["N=uint=7"]`, []Param{
+			{Name: "N", Kind: ParamUint, Default: "7", HasDefault: true, Decl: "N=uint=7"}}},
+		{"order preserved", `["B=uint","A=enum(x,y)=x"]`, []Param{
+			{Name: "B", Kind: ParamUint, Decl: "B=uint"},
+			{Name: "A", Kind: ParamEnum, Enum: []string{"x", "y"},
+				Default: "x", HasDefault: true, Decl: "A=enum(x,y)=x"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, err := Parse(Raw{Name: "h", Action: `["true"]`, Params: tt.raw, Trigger: "agent", Enabled: true})
+			if err != nil {
+				t.Fatalf("Parse(params %s) error: %v; want accept", tt.raw, err)
+			}
+			if !reflect.DeepEqual(h.Params, tt.want) {
+				t.Fatalf("Params = %+v; want %+v", h.Params, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseParamsEmpty pins backward compatibility: a row with no params field,
+// an empty array or null all parse as a hook that takes no parameters, so every
+// stored row and every existing caller behaves exactly as before.
+func TestParseParamsEmpty(t *testing.T) {
+	for _, raw := range []string{"", "[]", "null", "  "} {
+		h, err := Parse(Raw{Name: "h", Action: `["true"]`, Params: raw, Trigger: "agent", Enabled: true})
+		if err != nil {
+			t.Fatalf("Parse(Params %q) error: %v; want no parameters", raw, err)
+		}
+		if h.Params != nil {
+			t.Fatalf("Parse(Params %q) = %+v; want none", raw, h.Params)
+		}
+	}
+}
+
+// TestParseParamsRefuses is the malformed-declaration table. Precondition:
+// none. It fails if a bad declaration is accepted, which would store a domain
+// the runner cannot enforce, or if the refusal stops naming the declaration.
+func TestParseParamsRefuses(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  string
+		wantSub string
+	}{
+		{"bad type", `["X=int"]`, "type"},
+		{"empty name", `["=enum(a)"]`, "NAME=type"},
+		{"bad name", `["X Y=uint"]`, "name"},
+		{"empty enum", `["X=enum()"]`, "empty"},
+		{"empty enum member", `["X=enum(a,,b)"]`, "empty"},
+		{"missing paren", `["X=enum(a"]`, "missing )"},
+		{"invalid regex", `["X=string(a**b)"]`, "does not compile"},
+		{"empty regex", `["X=string()"]`, "must not be empty"},
+		{"duplicate name", `["X=uint","X=uint"]`, "both export"},
+		{"colliding names", `["phase-name=uint","PHASE_NAME=uint"]`, "both export"},
+		{"non-uint default", `["X=uint=abc"]`, "default"},
+		{"enum default outside", `["X=enum(a,b)=c"]`, "default"},
+		{"string default mismatch", `["X=string(^a$)=b"]`, "default"},
+		{"not a json array", `X=uint`, "JSON array"},
+		{"scalar json", `"X=uint"`, "JSON array"},
+		{"trailing junk", `["X=uint=7junk"]`, "default"},
+		{"empty declaration", `[""]`, "empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Parse(Raw{Name: "h", Action: `["true"]`, Params: tt.params, Trigger: "agent", Enabled: true})
+			if err == nil {
+				t.Fatalf("Parse(Params %s) = %+v; want an error", tt.params, got)
+			}
+			if tt.wantSub != "" && !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("Parse(Params %s) error = %q; want it to contain %q", tt.params, err, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestResolveParams pins the run-time resolution: every value comes from the
+// declared domain, a missing optional parameter takes its default, an explicit
+// value overrides it, and the output is in declaration order with the env name
+// the action will read.
+func TestResolveParams(t *testing.T) {
+	h, err := Parse(Raw{Name: "cycle", Action: `["true"]`, Trigger: "agent", Enabled: true,
+		Params: `["PHASE=enum(check,race)=check","TAG=string(^v[0-9]+$)","N=uint"]`})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got, err := h.ResolveParams([]string{"PHASE=race", "TAG=v2", "N=07"})
+	if err != nil {
+		t.Fatalf("ResolveParams valid: %v", err)
+	}
+	want := []ParamValue{
+		{Name: "PHASE", Value: "race", Env: "RAJ_PARAM_PHASE"},
+		{Name: "TAG", Value: "v2", Env: "RAJ_PARAM_TAG"},
+		{Name: "N", Value: "07", Env: "RAJ_PARAM_N"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResolveParams = %+v; want %+v", got, want)
+	}
+	// The omitted optional parameter takes its default.
+	got, err = h.ResolveParams([]string{"TAG=v1", "N=3"})
+	if err != nil {
+		t.Fatalf("ResolveParams default: %v", err)
+	}
+	if got[0].Name != "PHASE" || got[0].Value != "check" {
+		t.Fatalf("default PHASE = %+v; want check", got[0])
+	}
+	// An explicit value overrides the default.
+	got, err = h.ResolveParams([]string{"PHASE=race", "TAG=v1", "N=3"})
+	if err != nil {
+		t.Fatalf("ResolveParams override: %v", err)
+	}
+	if got[0].Value != "race" {
+		t.Fatalf("explicit PHASE = %q; want race", got[0].Value)
+	}
+	// ParamEnv renders the same values as process-environment entries.
+	env := ParamEnv(got)
+	if len(env) != 3 || env[0] != "RAJ_PARAM_PHASE=race" || env[2] != "RAJ_PARAM_N=3" {
+		t.Fatalf("ParamEnv = %q; want the resolved entries", env)
+	}
+}
+
+// TestResolveParamsRefuses pins every run-time refusal: an undeclared name, a
+// value outside its domain, and a missing required parameter. Each must be an
+// error so the caller never starts the action. The refusal echoes the
+// declaration so the caller learns the domain it must choose from.
+func TestResolveParamsRefuses(t *testing.T) {
+	h, err := Parse(Raw{Name: "cycle", Action: `["true"]`, Trigger: "agent", Enabled: true,
+		Params: `["PHASE=enum(check,race)=check","TAG=string(^v[0-9]+$)","N=uint"]`})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	tests := []struct {
+		name string
+		in   []string
+		want string
+	}{
+		{"undeclared name", []string{"TAG=v1", "N=1", "WHAT=x"}, "no parameter"},
+		{"enum outside", []string{"PHASE=deploy", "TAG=v1", "N=1"}, "enum(check,race)"},
+		{"regex mismatch", []string{"TAG=nope", "N=1"}, "string(^v[0-9]+$)"},
+		{"uint not a number", []string{"TAG=v1", "N=-1"}, "uint"},
+		{"missing required", []string{"PHASE=race"}, "requires parameter"},
+		{"duplicate supplied", []string{"PHASE=check", "PHASE=race", "TAG=v1", "N=1"}, "more than once"},
+		{"malformed assignment", []string{"PHASE"}, "NAME=value"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := h.ResolveParams(tt.in)
+			if err == nil {
+				t.Fatalf("ResolveParams(%q) = %+v; want a refusal", tt.in, got)
+			}
+			if got != nil {
+				t.Fatalf("ResolveParams(%q) returned %+v alongside an error; want none", tt.in, got)
+			}
+			if tt.want != "" && !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ResolveParams(%q) error = %q; want it to contain %q", tt.in, err, tt.want)
+			}
+		})
 	}
 }

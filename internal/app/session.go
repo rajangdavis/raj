@@ -77,6 +77,21 @@ func (a *App) sessionFingerprint() string {
 	return strings.Join(parts, "\x00")
 }
 
+// markAnnounced records that a tab exists because its buffer was announced --
+// a reveal, a goto, an agent open, or a recovered proposal -- and not because
+// the user opened it. The session keeps such a tab only while it holds a
+// pending change set, so an agent's view cannot grow the tab set a restart
+// restores. OpenFile clears a path when the user opens it for real.
+func (a *App) markAnnounced(path string) {
+	if path == "" {
+		return
+	}
+	if a.announced == nil {
+		a.announced = map[string]bool{}
+	}
+	a.announced[path] = true
+}
+
 // SessionState captures where the workspace is now.
 func (a *App) SessionState() session.State {
 	st := session.State{Active: a.Tabs.Index(), Focus: focusName(a.focus)}
@@ -92,6 +107,15 @@ func (a *App) SessionState() session.State {
 		// skipped too: git invoked the editor, not the user, and a commit
 		// message that reappears next launch is noise.
 		if p.File.Path == "" || isGitPath(p.File.Path) {
+			continue
+		}
+		// A tab that exists only because a buffer was announced -- a reveal, a
+		// goto, an agent open -- is the agent's view, not the user's tab set, so
+		// a clean one is not saved. It stays while it holds a pending change set
+		// (the review the user has to decide) or unsaved content (a resolved
+		// review not yet written), because the session is what reopens the buffer
+		// carrying that work. It drops once the buffer is clean.
+		if a.announced[p.File.Path] && len(p.File.Session().Pending()) == 0 && !p.File.ViewDirty() {
 			continue
 		}
 		hints := p.Hints
@@ -395,6 +419,14 @@ func (a *App) RestoreSession() {
 			continue
 		}
 		a.settle(p)
+		// A restored tab holding an unresolved review is a review tab: mark it so
+		// the session keeps it only while the review lasts, exactly as one
+		// announced during a run would. A tab the user opened and then reviewed
+		// is treated the same way; OpenFile restores its persistence when they
+		// open it again.
+		if len(p.File.Session().Pending()) > 0 {
+			a.markAnnounced(p.File.Path)
+		}
 		p.Wrap = t.Wrap
 		// Hints is tri-state: absent (nil) means the session predates the
 		// field, and settle leaves the app default in place. An explicit value

@@ -366,6 +366,9 @@ func TestExportRecordFields(t *testing.T) {
 	}
 }
 
+// A publish result is not stored: the deterministic branch name is the durable
+// key, and the MR URL is looked up from it, so no store round-trip is tested.
+//
 // TestIntentExportParentedOnBase proves one export parented on the base ref's
 // head, with no chain to a previous export (no stacks: one MR per wave).
 func TestIntentExportParentedOnBase(t *testing.T) {

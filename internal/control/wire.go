@@ -249,6 +249,9 @@ type Header struct {
 	HookMode string
 	HookName string
 	HookJSON string
+	// HookParams names a run's supplied NAME=value parameters, in order. They
+	// are text by construction like HookMode, so they cross in the header.
+	HookParams []string
 	// HookRunID names a run for cancel and is stamped on a run's final frame;
 	// HookRevision, HookHead, HookDirty, HookDurationMS and HookTruncated are
 	// the rest of that stamp. HookOff is the workspace panic switch, and
@@ -563,7 +566,8 @@ func EncodeRequest(req Request) (Header, []byte) {
 		DumpID: req.DumpID, LSPMode: req.LSPMode, ReviewList: req.ReviewList,
 		GitMode: req.GitMode, GitRev: req.GitRev, GitCount: req.GitCount,
 		HookMode: req.HookMode, HookName: req.HookName, HookJSON: req.HookJSON,
-		Annotated: req.Annotated, Create: req.Create, Discard: req.Discard,
+		HookParams: req.HookParams,
+		Annotated:  req.Annotated, Create: req.Create, Discard: req.Discard,
 		ExecProjected: req.ExecProjected,
 		Paths:         req.Paths, ClaimAdd: req.ClaimAdd, ClaimClear: req.ClaimClear,
 		Withdraw: req.Withdraw, Approve: req.Approve, Hidden: req.Hidden, Gen: req.Gen, Force: req.Force,
@@ -617,7 +621,8 @@ func DecodeRequest(f Frame) (Request, error) {
 		DumpID: f.Header.DumpID, LSPMode: f.Header.LSPMode, ReviewList: f.Header.ReviewList,
 		GitMode: f.Header.GitMode, GitRev: f.Header.GitRev, GitCount: f.Header.GitCount,
 		HookMode: f.Header.HookMode, HookName: f.Header.HookName, HookJSON: f.Header.HookJSON,
-		Annotated: f.Header.Annotated, Create: f.Header.Create, Discard: f.Header.Discard,
+		HookParams: f.Header.HookParams,
+		Annotated:  f.Header.Annotated, Create: f.Header.Create, Discard: f.Header.Discard,
 		ExecProjected: f.Header.ExecProjected,
 		Paths:         f.Header.Paths, ClaimAdd: f.Header.ClaimAdd, ClaimClear: f.Header.ClaimClear,
 		Withdraw: f.Header.Withdraw, Approve: f.Header.Approve, Hidden: f.Header.Hidden, Gen: f.Header.Gen, Force: f.Header.Force}
@@ -659,6 +664,7 @@ func EncodeResponse(res Response) (Header, []byte) {
 	h := Header{ID: res.ID, OK: res.OK, Remains: res.Remains, Created: res.Created,
 		Err: res.Err, Root: res.Root, Roots: res.Roots, PID: res.PID,
 		Version: res.Version, Bytes: res.Bytes, Lines: res.Lines,
+		Line: res.Line, Col: res.Col,
 		Found: res.Found, FindStart: res.FindStart, FindEnd: res.FindEnd, FindCount: res.FindCount,
 		Buffers: res.Buffers, Conflicts: res.Conflicts, Warnings: res.Warnings,
 		Files: res.Files, Considered: res.Considered, Capped: res.Capped,
@@ -719,6 +725,7 @@ func DecodeResponse(f Frame) (Response, error) {
 		Created: f.Header.Created, Err: f.Header.Err, Root: f.Header.Root, Roots: f.Header.Roots,
 		PID: f.Header.PID, Version: f.Header.Version,
 		Bytes: f.Header.Bytes, Lines: f.Header.Lines,
+		Line: f.Header.Line, Col: f.Header.Col,
 		Found: f.Header.Found, FindStart: f.Header.FindStart,
 		FindEnd: f.Header.FindEnd, FindCount: f.Header.FindCount,
 		Buffers: f.Header.Buffers, Conflicts: f.Header.Conflicts, Warnings: f.Header.Warnings,

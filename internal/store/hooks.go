@@ -20,7 +20,10 @@ type Hook struct {
 	MayWrite   bool
 	Detach     bool
 	Enabled    bool
-	Updated    int64
+	// Params is the stored JSON array of declared parameters; "[]" means the
+	// hook takes none. The hooks service validates its contents, not the store.
+	Params  string
+	Updated int64
 }
 
 // hookFlag maps a boolean hook field to the 0/1 its INTEGER column stores.
@@ -47,7 +50,11 @@ func (s *Store) PutHook(h Hook) error {
 	if tree == "" {
 		tree = hookTreeProjected
 	}
-	if _, err := s.db.Exec(upsertHook, h.Name, h.Action, h.Trigger, tree, hookFlag(h.Agent),
+	params := h.Params
+	if params == "" {
+		params = hookParamsDefault
+	}
+	if _, err := s.db.Exec(upsertHook, h.Name, h.Action, h.Trigger, tree, params, hookFlag(h.Agent),
 		h.CooldownMS, h.TimeoutMS, hookFlag(h.MayWrite), hookFlag(h.Detach), hookFlag(h.Enabled), time.Now().Unix()); err != nil {
 		return fmt.Errorf("store: put hook %s: %w", h.Name, err)
 	}
@@ -62,7 +69,7 @@ func (s *Store) Hook(name string) (Hook, bool, error) {
 	}
 	var h Hook
 	switch err := s.db.QueryRow(selectHook, name).Scan(
-		&h.Name, &h.Action, &h.Trigger, &h.Tree, &h.Agent, &h.CooldownMS, &h.TimeoutMS,
+		&h.Name, &h.Action, &h.Trigger, &h.Tree, &h.Params, &h.Agent, &h.CooldownMS, &h.TimeoutMS,
 		&h.MayWrite, &h.Detach, &h.Enabled, &h.Updated,
 	); err {
 	case nil:
@@ -87,7 +94,7 @@ func (s *Store) Hooks() ([]Hook, error) {
 	for rows.Next() {
 		var h Hook
 		if err := rows.Scan(
-			&h.Name, &h.Action, &h.Trigger, &h.Tree, &h.Agent, &h.CooldownMS, &h.TimeoutMS,
+			&h.Name, &h.Action, &h.Trigger, &h.Tree, &h.Params, &h.Agent, &h.CooldownMS, &h.TimeoutMS,
 			&h.MayWrite, &h.Detach, &h.Enabled, &h.Updated,
 		); err != nil {
 			return nil, fmt.Errorf("store: scan hook: %w", err)
@@ -114,12 +121,13 @@ func (s *Store) DeleteHook(name string) error {
 
 // The hook statements, one named constant each, mirroring the schema constants.
 const upsertHook = `
-INSERT INTO hooks (name, action, trigger, tree, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO hooks (name, action, trigger, tree, params, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (name) DO UPDATE SET
 	action      = excluded.action,
 	trigger     = excluded.trigger,
 	tree        = excluded.tree,
+	params      = excluded.params,
 	agent       = excluded.agent,
 	cooldown_ms = excluded.cooldown_ms,
 	timeout_ms  = excluded.timeout_ms,
@@ -128,8 +136,8 @@ ON CONFLICT (name) DO UPDATE SET
 	enabled     = excluded.enabled,
 	updated     = excluded.updated`
 
-const selectHook = `SELECT name, action, trigger, tree, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated FROM hooks WHERE name = ?`
+const selectHook = `SELECT name, action, trigger, tree, params, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated FROM hooks WHERE name = ?`
 
-const selectHooks = `SELECT name, action, trigger, tree, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated FROM hooks ORDER BY name`
+const selectHooks = `SELECT name, action, trigger, tree, params, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated FROM hooks ORDER BY name`
 
 const deleteHook = `DELETE FROM hooks WHERE name = ?`

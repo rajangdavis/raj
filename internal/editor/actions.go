@@ -9,14 +9,17 @@ import (
 // Unconsumed actions fall through to the application — a tab switch or a pane
 // focus change is not the editor's business.
 //
-// The switch is deliberately flat and declarative. Movement actions pair with
-// their selecting variants on the same line so the two can never drift apart,
-// which is the usual way editors end up with shift+left behaving differently
-// from left.
+// The actions live in two tables. motionPairs pairs each cursor movement with
+// its selecting variant, one row holding both actions and the single handler
+// that takes the selection flag, so the two cannot drift apart — the usual way
+// editors end up with shift+left behaving differently from left. paneActions
+// holds everything else: the action, its handler, whether it moves a cursor,
+// and whether the view follows the cursor afterwards.
+//
+// One action, one undo step. Without the begin/end below, typing with three
+// cursors takes three presses of cmd+z to reverse, and the intermediate states
+// are ones the user never created.
 func (p *Pane) Handle(a keys.Action) bool {
-	// One action, one undo step. Without this, typing with three cursors takes
-	// three presses of cmd+z to reverse, and the intermediate states are ones
-	// the user never created.
 	p.File.Begin()
 	defer p.File.End()
 
@@ -27,124 +30,104 @@ func (p *Pane) Handle(a keys.Action) bool {
 		p.pushCursorHistory()
 	}
 
-	switch a {
-	// movement
-	case keys.CharLeft:
-		p.CharLeft(false)
-	case keys.SelCharLeft:
-		p.CharLeft(true)
-	case keys.CharRight:
-		p.CharRight(false)
-	case keys.SelCharRight:
-		p.CharRight(true)
-	case keys.LineUp:
-		p.MoveVertical(-1, false)
-	case keys.SelLineUp:
-		p.MoveVertical(-1, true)
-	case keys.LineDown:
-		p.MoveVertical(+1, false)
-	case keys.SelLineDown:
-		p.MoveVertical(+1, true)
-	case keys.LineStart:
-		p.LineStart(false)
-	case keys.SelLineStart:
-		p.LineStart(true)
-	case keys.LineEnd:
-		p.LineEnd(false)
-	case keys.SelLineEnd:
-		p.LineEnd(true)
-	case keys.DocStart:
-		p.DocStart(false)
-	case keys.SelDocStart:
-		p.DocStart(true)
-	case keys.DocEnd:
-		p.DocEnd(false)
-	case keys.SelDocEnd:
-		p.DocEnd(true)
-	case keys.WordLeft:
-		p.WordLeft(false)
-	case keys.SelWordLeft:
-		p.WordLeft(true)
-	case keys.WordRight:
-		p.WordRight(false)
-	case keys.PageUp:
-		p.ScrollPage(-1)
-		return true // the view moved, the cursors did not: do not follow
-	case keys.PageDown:
-		p.ScrollPage(+1)
-		return true
-	case keys.SelPageUp:
-		p.MovePage(-1, true)
-	case keys.SelPageDown:
-		p.MovePage(+1, true)
-	case keys.SelWordRight:
-		p.WordRight(true)
-
-	// editing
-	case keys.Backspace:
-		p.DeleteBackward()
-	case keys.Delete:
-		p.DeleteForward()
-	case keys.DeleteLine:
-		p.DeleteLine()
-	case keys.DeleteToLineEnd:
-		p.DeleteToLineEnd()
-	case keys.LineBelow:
-		p.OpenLineBelow()
-	case keys.LineAbove:
-		p.OpenLineAbove()
-	case keys.Indent:
-		p.Indent()
-	case keys.Outdent:
-		p.Outdent()
-	case keys.SelectAll:
-		p.SelectAll()
-	case keys.FindNext:
-		p.Find.Step(p, +1)
-	case keys.FindPrev:
-		p.Find.Step(p, -1)
-	case keys.SelectLine:
-		p.SelectLine()
-	case keys.MoveLineUp:
-		p.MoveLines(-1)
-	case keys.MoveLineDown:
-		p.MoveLines(+1)
-	case keys.CopyLineUp:
-		p.CopyLines(-1)
-	case keys.CopyLineDown:
-		p.CopyLines(+1)
-	case keys.ToggleComment:
-		p.ToggleComment()
-
-	// history
-	case keys.Undo:
-		p.history(p.File.Undo(p.Author))
-	case keys.Redo:
-		p.history(p.File.Redo(p.Author))
-	case keys.CursorUndo:
-		// Cursor undo returns to a recorded position; an empty history is a
-		// no-op, not an error — see popCursorHistory.
-		p.popCursorHistory()
-
-	// multi-cursor
-	case keys.CursorAbove:
-		p.AddCursorVertical(-1)
-	case keys.CursorBelow:
-		p.AddCursorVertical(+1)
-	case keys.AddNextOccurrence:
-		p.AddNextOccurrence()
-	case keys.AllOccurrences:
-		p.SelectAllOccurrences()
-	case keys.SplitIntoLines:
-		p.SplitIntoLines()
-	case keys.Cancel:
-		p.Cursors.Clear()
-
-	default:
+	fn, follow, ok := lookupAction(a)
+	if !ok {
 		return false
 	}
-	p.FollowCursor()
+	fn(p)
+	if follow {
+		p.FollowCursor()
+	}
 	return true
+}
+
+// motionPair is one cursor movement and its selecting variant. The two share a
+// single handler, told apart by the bool, so the pair cannot drift.
+type motionPair struct {
+	plain keys.Action
+	sel   keys.Action
+	fn    func(*Pane, bool)
+}
+
+// motionPairs is every cursor movement, paired with its selecting variant.
+// PageUp and PageDown are deliberately absent: their plain form scrolls the
+// view without moving the cursors, while their selecting form moves them, so
+// the two do not share a handler and live in paneActions instead.
+var motionPairs = []motionPair{
+	{keys.CharLeft, keys.SelCharLeft, (*Pane).CharLeft},
+	{keys.CharRight, keys.SelCharRight, (*Pane).CharRight},
+	{keys.LineUp, keys.SelLineUp, func(p *Pane, sel bool) { p.MoveVertical(-1, sel) }},
+	{keys.LineDown, keys.SelLineDown, func(p *Pane, sel bool) { p.MoveVertical(+1, sel) }},
+	{keys.LineStart, keys.SelLineStart, (*Pane).LineStart},
+	{keys.LineEnd, keys.SelLineEnd, (*Pane).LineEnd},
+	{keys.DocStart, keys.SelDocStart, (*Pane).DocStart},
+	{keys.DocEnd, keys.SelDocEnd, (*Pane).DocEnd},
+	{keys.WordLeft, keys.SelWordLeft, (*Pane).WordLeft},
+	{keys.WordRight, keys.SelWordRight, (*Pane).WordRight},
+}
+
+// paneAction is one action that is not half of a motion pair. motion says
+// whether the handler moves a cursor; follow says whether the view should
+// follow the cursor once the handler has run.
+type paneAction struct {
+	action keys.Action
+	fn     func(*Pane)
+	motion bool
+	follow bool
+}
+
+// paneActions is every action that is not half of a motion pair.
+var paneActions = []paneAction{
+	// The page chords: the plain form scrolls the view and leaves the cursors
+	// where they are, so it does not follow; the selecting form moves them.
+	{keys.PageUp, func(p *Pane) { p.ScrollPage(-1) }, false, false},
+	{keys.PageDown, func(p *Pane) { p.ScrollPage(+1) }, false, false},
+	{keys.SelPageUp, func(p *Pane) { p.MovePage(-1, true) }, true, true},
+	{keys.SelPageDown, func(p *Pane) { p.MovePage(+1, true) }, true, true},
+
+	// editing
+	{keys.Backspace, (*Pane).DeleteBackward, false, true},
+	{keys.Delete, (*Pane).DeleteForward, false, true},
+	{keys.DeleteLine, (*Pane).DeleteLine, false, true},
+	{keys.DeleteToLineEnd, (*Pane).DeleteToLineEnd, false, true},
+	{keys.LineBelow, (*Pane).OpenLineBelow, false, true},
+	{keys.LineAbove, (*Pane).OpenLineAbove, false, true},
+	{keys.Indent, (*Pane).Indent, false, true},
+	{keys.Outdent, (*Pane).Outdent, false, true},
+	{keys.SelectAll, (*Pane).SelectAll, false, true},
+	{keys.FindNext, func(p *Pane) { p.Find.Step(p, +1) }, false, true},
+	{keys.FindPrev, func(p *Pane) { p.Find.Step(p, -1) }, false, true},
+	{keys.SelectLine, (*Pane).SelectLine, false, true},
+	{keys.MoveLineUp, func(p *Pane) { p.MoveLines(-1) }, false, true},
+	{keys.MoveLineDown, func(p *Pane) { p.MoveLines(+1) }, false, true},
+	{keys.CopyLineUp, func(p *Pane) { p.CopyLines(-1) }, false, true},
+	{keys.CopyLineDown, func(p *Pane) { p.CopyLines(+1) }, false, true},
+	{keys.ToggleComment, (*Pane).ToggleComment, false, true},
+
+	// history
+	{keys.Undo, func(p *Pane) { p.history(p.File.Undo(p.Author)) }, false, true},
+	{keys.Redo, func(p *Pane) { p.history(p.File.Redo(p.Author)) }, false, true},
+	// Cursor undo returns to a recorded position; an empty history is a
+	// no-op, not an error — see popCursorHistory.
+	{keys.CursorUndo, func(p *Pane) { p.popCursorHistory() }, false, true},
+
+	// multi-cursor
+	{keys.CursorAbove, func(p *Pane) { p.AddCursorVertical(-1) }, false, true},
+	{keys.CursorBelow, func(p *Pane) { p.AddCursorVertical(+1) }, false, true},
+	{keys.AddNextOccurrence, (*Pane).AddNextOccurrence, false, true},
+	{keys.AllOccurrences, (*Pane).SelectAllOccurrences, false, true},
+	{keys.SplitIntoLines, (*Pane).SplitIntoLines, false, true},
+	{keys.Cancel, func(p *Pane) { p.Cursors.Clear() }, false, true},
+}
+
+// motionPairFor returns the pair that serves a, if a is either half of one.
+func motionPairFor(a keys.Action) (motionPair, bool) {
+	for _, m := range motionPairs {
+		if a == m.plain || a == m.sel {
+			return m, true
+		}
+	}
+	return motionPair{}, false
 }
 
 // isMotion reports whether a is one of the cursor-moving actions. Only these
@@ -153,16 +136,31 @@ func (p *Pane) Handle(a keys.Action) bool {
 // additions are their own thing rather than movements — sed is how they name
 // themselves, and their undo is a collapse, not a return.
 func isMotion(a keys.Action) bool {
-	switch a {
-	case keys.CharLeft, keys.SelCharLeft, keys.CharRight, keys.SelCharRight,
-		keys.LineUp, keys.SelLineUp, keys.LineDown, keys.SelLineDown,
-		keys.LineStart, keys.SelLineStart, keys.LineEnd, keys.SelLineEnd,
-		keys.DocStart, keys.SelDocStart, keys.DocEnd, keys.SelDocEnd,
-		keys.WordLeft, keys.SelWordLeft, keys.WordRight, keys.SelWordRight,
-		keys.SelPageUp, keys.SelPageDown:
+	if _, ok := motionPairFor(a); ok {
 		return true
 	}
+	for _, ac := range paneActions {
+		if ac.action == a {
+			return ac.motion
+		}
+	}
 	return false
+}
+
+// lookupAction returns the handler for a and whether the view follows the
+// cursor after it runs. Motion pairs are consulted first so the pair's handler
+// is the one used; a pair always follows, since both halves move a cursor.
+func lookupAction(a keys.Action) (fn func(*Pane), follow, ok bool) {
+	if m, paired := motionPairFor(a); paired {
+		selecting := a == m.sel
+		return func(p *Pane) { m.fn(p, selecting) }, true, true
+	}
+	for _, ac := range paneActions {
+		if ac.action == a {
+			return ac.fn, ac.follow, true
+		}
+	}
+	return nil, false, false
 }
 
 // HandleText inserts literal text — a keypress with no action bound, or a

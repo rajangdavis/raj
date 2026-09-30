@@ -56,6 +56,7 @@ var Bindings = []Binding{
 
 	{"edit", Undo, "super+z", "122;9u", "cmd+z", "ctrl+z", ""},
 	{"edit", Redo, "shift+super+z", "122;10u", "cmd+shift+z", "ctrl+shift+z", ""},
+	{"edit", RestoreDeleted, "ctrl+super+z", "122;13u", "cmd+ctrl+z", "", "put the last deleted file back from the workspace trash"},
 	{"edit", Cut, "super+x", "120;9u", "cmd+x", "ctrl+x", ""},
 	{"edit", Copy, "super+c", "99;9u", "cmd+c", "ctrl+shift+c", "ghostty default: copy. raj writes clipboard via OSC 52"},
 	{"edit", SelectAll, "super+a", "97;9u", "cmd+a", "ctrl+a", ""},
@@ -195,7 +196,6 @@ var Bindings = []Binding{
 	{"proposals", ClearRejected, "ctrl+super+k", "107;13u", "cmd+ctrl+k", "ctrl+alt+k", "hard-purge the rejected change set at the caret"},
 	{"proposals", PrevProposed, "ctrl+super+,", "44;13u", "cmd+ctrl+comma", "ctrl+alt+comma", "previous pending change set"},
 	{"proposals", NextProposed, "ctrl+super+.", "46;13u", "cmd+ctrl+period", "ctrl+alt+period", "next pending change set"},
-	{"proposals", PendingRemovals, "ctrl+alt+d", "100;7u", "ctrl+alt+d", "ctrl+alt+d", "re-raise the oldest pending deletion or dir-removal; macOS claims cmd+ctrl+d for Look Up in Dictionary"},
 }
 
 // Reclaim holds chords a terminal keeps for itself, which raj therefore has to
@@ -248,7 +248,7 @@ var Natives = []Native{
 	// the wrap toggle — so report_all delivers it untouched. Accept, reject and
 	// next/prev are ctrl+super chords and live in Bindings, where the encoding
 	// is pinned for both platforms.
-	{"ctrl+alt+v", ReviewProposed, "list the pending change sets and jump to one; not g: that is find-all on Linux"},
+	{"ctrl+alt+v", ReviewProposed, "list every pending proposal in the workspace and jump to one; not g: that is find-all on Linux"},
 }
 
 // Emitted is every chord that needs a line in a terminal config: the ones the

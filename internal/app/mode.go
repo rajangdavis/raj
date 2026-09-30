@@ -113,16 +113,28 @@ func (a *App) reviewRefuses(action keys.Action, text string) bool {
 	return true
 }
 
-// readOnly reports whether the document may not be edited. Review mode is the
-// only read-only state now: an attached client is a normal editor whose local
-// edits are forwarded to the daemon as the human's own accepted text, so
-// leaving Review is what makes it editable rather than a mode that changes
-// nothing.
-func (a *App) readOnly() bool { return a.mode == ModeReview }
+// readOnly reports whether the document may not be edited. Review mode gates
+// the whole surface, and a read-only view gates the one buffer it is: a seam
+// diff pane holds no file's bytes, so no keystroke may change it. An attached
+// client is not read-only -- its local edits are forwarded to the daemon as
+// the human's own accepted text -- so leaving Review is what makes an ordinary
+// buffer editable.
+func (a *App) readOnly() bool {
+	if a.mode == ModeReview {
+		return true
+	}
+	p := a.Tabs.Active()
+	return p != nil && p.File.IsReadOnly()
+}
 
-// readOnlyNote is the status line refusal. Review is the only read-only state,
-// so it names the chord that leaves it.
-func (a *App) readOnlyNote() string { return reviewReadOnlyNote() }
+// readOnlyNote is the status line refusal, worded for what actually holds the
+// buffer: a seam diff, or Review mode and the chord that leaves it.
+func (a *App) readOnlyNote() string {
+	if p := a.Tabs.Active(); p != nil && p.File.IsReadOnly() {
+		return "read-only: this is a seam diff, not the file"
+	}
+	return reviewReadOnlyNote()
+}
 
 // reviewReadOnlyNote is the status line refusal. It names the chord that
 // leaves Review mode, read from the binding table rather than assuming cmd+r.

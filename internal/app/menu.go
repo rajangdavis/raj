@@ -6,7 +6,6 @@ import (
 
 	"raj/internal/editor"
 	"raj/internal/explorer"
-	"raj/internal/piecetable"
 	"raj/internal/ui"
 	"raj/internal/widget"
 )
@@ -302,9 +301,9 @@ func (a *App) chooseMenu(key string) {
 	case menuRename, menuRenameFile:
 		a.renamePath(t.path)
 	case menuDelete, menuDeleteFile:
-		a.proposeDeleteFile(t.path)
+		a.deletePath(t.path)
 	case menuRemoveFolder:
-		a.proposeRemoveFolder(t.path)
+		a.removeFolderPath(t.path)
 	case menuNewFile:
 		a.newFileAt(menuDirFor(t))
 	case menuNewFolder:
@@ -339,10 +338,18 @@ func (a *App) saveTab(path string) {
 	}
 }
 
-// renamePath collects a new name through the shared prompt and moves the file
-// or directory through host.Rename, the same entry point `raj ctl rename`
-// uses. That path carries an open clean buffer with the name, refuses a dirty
-// one, and refreshes the tree.
+// renamePath collects a new name or path through the shared prompt and moves
+// the file or directory through host.Rename, the same entry point
+// `raj ctl rename` uses. The answer may be a bare name, which stays in the
+// file's directory, or a path, which moves it: a relative path is taken
+// against the file's directory and an absolute one as given, and the host
+// canonicalises and in-root-checks whichever arrives. That path carries an
+// open clean buffer with the name, refuses a dirty one, and refreshes the
+// tree.
+//
+// An attached client does not own the filesystem, so its rename is sent to the
+// daemon as the existing rename command -- claim, then rename -- rather than
+// run locally against a path this machine may not have.
 func (a *App) renamePath(path string) {
 	if path == "" {
 		return
@@ -356,16 +363,22 @@ func (a *App) renamePath(path string) {
 		if name == filepath.Base(path) {
 			return
 		}
-		if strings.ContainsRune(name, filepath.Separator) {
-			a.status = "a new name, not a path"
+		next := name
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(path), name)
+		}
+		if next == path {
 			return
 		}
-		next := filepath.Join(filepath.Dir(path), name)
+		if a.attach {
+			a.renameRemote(path, next)
+			return
+		}
 		if err := (host{a: a}).Rename(path, next); err != nil {
 			a.status = "cannot rename: " + err.Error()
 			return
 		}
-		a.status = "renamed to " + name
+		a.status = "renamed to " + filepath.Base(next)
 		a.TouchSession()
 	})
 }
@@ -431,29 +444,6 @@ func (a *App) newFolderAt(dir string) {
 			a.status = "cannot create folder: " + err.Error()
 		}
 	})
-}
-
-// proposeDeleteFile records a deletion proposal. It never unlinks: the
-// propose-then-approve flow in deletion.go is the record and the safety, and
-// the gate prompt is the only place the file can actually go.
-func (a *App) proposeDeleteFile(path string) {
-	if path == "" {
-		return
-	}
-	if err := a.ProposeDeletion(path, uint8(piecetable.User)); err != nil {
-		a.status = "cannot propose deletion: " + err.Error()
-	}
-}
-
-// proposeRemoveFolder records a directory-removal proposal, which raises the
-// gate's listing immediately because a directory has no pane to focus.
-func (a *App) proposeRemoveFolder(path string) {
-	if path == "" {
-		return
-	}
-	if err := a.ProposeDirRemoval(path, uint8(piecetable.User)); err != nil {
-		a.status = "cannot propose removal: " + err.Error()
-	}
 }
 
 // copyPath writes a path to the system clipboard through the same host call

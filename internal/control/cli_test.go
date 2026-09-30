@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"raj/internal/intent"
 	"raj/internal/prog"
 )
 
@@ -102,6 +103,11 @@ type fakeEditor struct {
 	// disk. The fake has no app, so these are set by the test.
 	created bool
 	remains bool
+	// screenRows, screenLine and screenCol are the canned drawn screen the
+	// fake answers the screen verb with, standing in for the app's own.
+	screenRows []string
+	screenLine int
+	screenCol  int
 	// headless names docs the fake reports as loaded with no tab, so the CLI
 	// buffers output can be tested on the field that says so.
 	headless map[string]bool
@@ -185,6 +191,9 @@ type fakeEditor struct {
 	// so a CLI test can assert a flag survived the client, the wire and the
 	// two-phase exec path.
 	lastExecCheck Request
+	// lastIntent is the intent.Command the CLI marshalled and sent, so a test
+	// can assert the --group member parser without a real workspace store.
+	lastIntent intent.Command
 
 	stop chan struct{}
 }
@@ -282,11 +291,19 @@ func (f *fakeEditor) run(req Request) Response {
 		// connection.runHook's event-thread half. It carries the client's run
 		// as an internal op; record a synthesized run request so a CLI test can
 		// assert mode run reached the server.
-		f.lastHook = Request{Op: "hook", HookMode: "run", HookName: req.HookName, Author: req.Author}
+		f.lastHook = Request{Op: "hook", HookMode: "run", HookName: req.HookName, HookParams: req.HookParams, Author: req.Author}
 		return Dispatch(f.policy, req)
 	case "git":
 		f.lastGit = req
 		return Response{OK: true, GitJSON: f.gitJSON}
+	case "intent":
+		// The payload is a JSON intent.Command; record it so a CLI test can
+		// assert the member parser without a real workspace store. The answer
+		// is an empty Result: these tests read the request, not the reply.
+		if err := json.Unmarshal([]byte(req.HookJSON), &f.lastIntent); err != nil {
+			return Response{Err: "intent: " + err.Error()}
+		}
+		return Response{OK: true, HookJSON: "{}"}
 	case "execcheck":
 		f.lastExecCheck = req
 		return Dispatch(f.policy, req)
@@ -317,6 +334,9 @@ func (f *fakeEditor) run(req Request) Response {
 
 		}
 		return Response{OK: true, Root: "/w", Roots: []string{"/w"}, Buffers: bufs}
+	case "screen":
+		return Response{OK: true, Line: f.screenLine, Col: f.screenCol,
+			Spans: []Span{{Text: strings.Join(f.screenRows, "\n")}}}
 	case "text":
 		if len(req.Paths) > 0 {
 			// The multi-target form, mirroring the real Dispatch: one span per
@@ -779,6 +799,73 @@ func TestCLIBuffersEmptyJSONIsAList(t *testing.T) {
 	}
 	if strings.TrimSpace(out) != "[]" {
 		t.Errorf("empty buffers -json = %q, want []", strings.TrimSpace(out))
+	}
+}
+
+// screen prints the drawn rows one per line and carries the cursor in -json.
+func TestCLIScreenPrintsRowsAndCursor(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+	ed.screenRows = []string{"package a", "", "func f() {}"}
+	ed.screenLine, ed.screenCol = 3, 12
+
+	out, errs, code := run(t, "screen")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if out != "package a\n\nfunc f() {}\n" {
+		t.Errorf("screen = %q, want the three rows", out)
+	}
+
+	out, errs, code = run(t, "screen", "-json")
+	if code != 0 {
+		t.Fatalf("json code %d: %s", code, errs)
+	}
+	var got struct {
+		Rows []string `json:"rows"`
+		Line int      `json:"line"`
+		Col  int      `json:"col"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("screen -json: %v (%q)", err, out)
+	}
+	if len(got.Rows) != 3 || got.Rows[2] != "func f() {}" {
+		t.Errorf("rows = %v, want three rows ending in func f() {}", got.Rows)
+	}
+	if got.Line != 3 || got.Col != 12 {
+		t.Errorf("cursor = %d,%d, want 3,12", got.Line, got.Col)
+	}
+}
+
+// screen --until re-reads client-side and exits 0 once the text is drawn.
+func TestCLIScreenUntilAppears(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+	ed.screenRows = []string{"one", "the modal is open", "three"}
+
+	out, errs, code := run(t, "screen", "--until", "the modal is open", "--timeout", "1s")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "the modal is open") {
+		t.Errorf("screen --until output = %q, want the matched row", out)
+	}
+}
+
+// A text that never appears is a timeout: a clear message naming it and a
+// non-zero exit. The wait is short because the fake never changes its screen.
+func TestCLIScreenUntilTimesOut(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x"})
+	ed.screenRows = []string{"one", "two"}
+
+	start := time.Now()
+	out, errs, code := run(t, "screen", "--until", "never-drawn", "--timeout", "50ms")
+	if code == 0 {
+		t.Fatalf("screen --until a missing text exited 0 (out %q)", out)
+	}
+	if !strings.Contains(errs, "never-drawn") {
+		t.Errorf("stderr = %q, want it to name the text", errs)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("timeout took %s, want it bounded by 50ms", elapsed)
 	}
 }
 
@@ -6320,5 +6407,378 @@ func TestCLILandNeedsATask(t *testing.T) {
 	_, errs, code := run(t, "land")
 	if code != 2 || !strings.Contains(errs, "needs a task") {
 		t.Errorf("code %d, stderr %q; want the usage refusal", code, errs)
+	}
+}
+
+// TestPrintIntentShowPrintsNoStoredMR pins the reverted show rendering: a
+// published wave prints only its intention line, because the publish result
+// lives in the publish response and is looked up from the deterministic
+// branch rather than stored.
+func TestPrintIntentShowPrintsNoStoredMR(t *testing.T) {
+	show := intent.Result{
+		Intention: &intent.Intention{Name: "i", Owner: "7", Base: "HEAD", State: "exported"},
+	}
+	var out bytes.Buffer
+	if code := printIntent(show, "show", &out); code != 0 {
+		t.Fatalf("printIntent show = %d", code)
+	}
+	got := out.String()
+	if strings.Contains(got, "http") || strings.Contains(got, "published ") {
+		t.Errorf("show named a stored MR:\n%s", got)
+	}
+	if !strings.Contains(got, "i") {
+		t.Errorf("show did not name the intention:\n%s", got)
+	}
+}
+
+// TestPrintIntentPublishNamesBaseOnce pins the readable publish rendering: the
+// base is one pinned SHA, so the proposal line names it once rather than
+// printing the same value as both the ref and the sha.
+func TestPrintIntentPublishNamesBaseOnce(t *testing.T) {
+	pub := &intent.Publish{
+		Name: "task-1", Commit: "abc1234", BaseRef: "deadbee", BaseSHA: "deadbee",
+		Branch: "raj/wave-task-1", Remote: "origin",
+		RemoteURL: "https://github.com/acme/widgets.git",
+		HookPath:  "examples/hooks/publish-single.sh", HookHash: "cafe",
+	}
+	var out bytes.Buffer
+	if code := printIntent(intent.Result{Publish: pub}, "publish", &out); code != 0 {
+		t.Fatalf("printIntent publish = %d", code)
+	}
+	got := out.String()
+	if n := strings.Count(got, "deadbee"); n != 1 {
+		t.Errorf("publish rendering names the base %d time(s), want 1:\n%s", n, got)
+	}
+	if !strings.Contains(got, "base deadbee; hook examples/hooks/publish-single.sh sha256 cafe") {
+		t.Errorf("publish rendering = %q", got)
+	}
+	if !strings.Contains(got, "argv: ") {
+		t.Errorf("publish rendering dropped argv: %q", got)
+	}
+}
+
+// --group is repeatable, and for intent new/add/remove each occurrence is a
+// member: a bare N is a session-local id the host qualifies against the live
+// buffers, so it arrives on Command.Groups.
+func TestIntentGroupFlagIsMember(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "intent", "new", "wave", "--ref", "HEAD", "--group", "3", "--group", "5")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.lastIntent.Groups; len(got) != 2 || got[0] != 3 || got[1] != 5 {
+		t.Errorf("groups = %v, want [3 5]", got)
+	}
+	if len(ed.lastIntent.Members) != 0 {
+		t.Errorf("members = %v, want none for bare ids", ed.lastIntent.Members)
+	}
+}
+
+// PATH=N is the qualified spelling: the path names the buffer that numbers the
+// id, so two buffers both numbering it are tellable apart, and the member
+// arrives already qualified on Command.Members.
+func TestIntentGroupFlagQualified(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "intent", "new", "wave", "--ref", "HEAD", "--group", "a.go=3")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	want := intent.Member{ID: 3, Path: "a.go"}
+	if len(ed.lastIntent.Members) != 1 || ed.lastIntent.Members[0] != want {
+		t.Errorf("members = %v, want [%+v]", ed.lastIntent.Members, want)
+	}
+	if len(ed.lastIntent.Groups) != 0 {
+		t.Errorf("groups = %v, want none for a qualified member", ed.lastIntent.Groups)
+	}
+}
+
+// One parser serves the flag and the positionals, so a bare positional id joins
+// the flag's bare ids on Groups while a qualified positional joins Members.
+func TestIntentGroupFlagAndPositionalMerge(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "intent", "new", "wave", "--ref", "HEAD", "--group", "3", "5", "a.go=7")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	if got := ed.lastIntent.Groups; len(got) != 2 || got[0] != 3 || got[1] != 5 {
+		t.Errorf("groups = %v, want [3 5]", got)
+	}
+	want := intent.Member{ID: 7, Path: "a.go"}
+	if len(ed.lastIntent.Members) != 1 || ed.lastIntent.Members[0] != want {
+		t.Errorf("members = %v, want [%+v]", ed.lastIntent.Members, want)
+	}
+}
+
+// accept/reject/clear decide exactly one set, so a repeated --group is a usage
+// error naming --all as the bulk spelling.
+func TestDecideRefusesRepeatedGroup(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "accept", "/w/a.go", "--group", "3", "--group", "4")
+	if code != 2 || !strings.Contains(errs, "raj ctl accept: takes one --group; --all decides every pending set") {
+		t.Errorf("code %d, stderr %q", code, errs)
+	}
+}
+
+// A path in the --group value belongs as the positional path, so a qualified
+// --group is refused rather than silently deciding the wrong buffer's set.
+func TestDecideRefusesQualifiedGroup(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "accept", "/w/a.go", "--group", "a.go=3")
+	if code != 2 || !strings.Contains(errs, "raj ctl accept: the path goes positional; --group takes the id") {
+		t.Errorf("code %d, stderr %q", code, errs)
+	}
+}
+
+// --all beside one or more --group values is the alternatives refusal, however
+// many were given and whether bare or qualified: the "takes one --group"
+// wording is only for a repeated --group with no --all, where it must not tell
+// the caller to pass the --all they already passed.
+func TestDecideAllAndSeveralGroupsAreAlternatives(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := run(t, "accept", "/w/a.go", "--all", "--group", "3", "--group", "4")
+	if code != 2 || !strings.Contains(errs, "raj ctl accept: --all and --group are alternatives") {
+		t.Errorf("several bare groups with --all: code %d, stderr %q", code, errs)
+	}
+	_, errs, code = run(t, "clear", "/w/a.go", "--all", "--group", "a.go=3")
+	if code != 2 || !strings.Contains(errs, "raj ctl clear: --all and --group are alternatives") {
+		t.Errorf("a qualified group with --all: code %d, stderr %q", code, errs)
+	}
+	// A single bare id keeps the alternatives refusal it always had.
+	_, errs, code = run(t, "reject", "/w/a.go", "--all", "--group", "7")
+	if code != 2 || !strings.Contains(errs, "raj ctl reject: --all and --group are alternatives") {
+		t.Errorf("a single bare id with --all: code %d, stderr %q", code, errs)
+	}
+	// Without --all, a repeated bare id is still the one-at-a-time refusal.
+	_, errs, code = run(t, "accept", "/w/a.go", "--group", "3", "--group", "4")
+	if code != 2 || !strings.Contains(errs, "raj ctl accept: takes one --group; --all decides every pending set") {
+		t.Errorf("repeated bare groups without --all: code %d, stderr %q", code, errs)
+	}
+}
+
+// Listing another task's sets must not rebind the caller: on groups and intent
+// --task is a filter, so the bind-first hello carries only RAJ_TASK. The
+// server stores that task on the participant, and who reads it back. A writing
+// verb binds beta first, and both filter verbs must leave it there.
+func TestGroupsTaskDoesNotRebind(t *testing.T) {
+	t.Setenv("RAJ_IDENTITY", "raj-task-pin")
+	t.Setenv("RAJ_TASK", "")
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+
+	// storedTask reads the task the server kept for this identity, which is
+	// exactly what the hello carried.
+	storedTask := func() string {
+		t.Helper()
+		out, errs, code := run(t, "who", "-json")
+		if code != 0 {
+			t.Fatalf("who -json: code %d, stderr %q", code, errs)
+		}
+		var people []struct {
+			Identity string `json:"identity"`
+			Task     string `json:"task"`
+		}
+		if err := json.Unmarshal([]byte(out), &people); err != nil {
+			t.Fatalf("who -json: %v (%q)", err, out)
+		}
+		for _, p := range people {
+			if p.Identity == "raj-task-pin" {
+				return p.Task
+			}
+		}
+		t.Fatalf("participant raj-task-pin not listed: %q", out)
+		return ""
+	}
+
+	// A writing verb binds beta first: read forwards the explicit --task, so
+	// the server stores it on this participant.
+	if _, errs, code := run(t, "read", "/w/a.go", "--task", "beta"); code != 0 {
+		t.Fatalf("read --task: code %d, stderr %q", code, errs)
+	}
+	if got := storedTask(); got != "beta" {
+		t.Fatalf("read --task stored task %q, want beta", got)
+	}
+	// The filter verbs must leave it alone. The empty hello they send does not
+	// erase the stored task; with the rebind bug it would be alpha by here.
+	if _, errs, code := run(t, "groups", "--task", "alpha"); code != 0 {
+		t.Fatalf("groups --task: code %d, stderr %q", code, errs)
+	}
+	if got := storedTask(); got != "beta" {
+		t.Errorf("groups --task rebound the caller from beta to %q", got)
+	}
+	if _, errs, code := run(t, "intent", "list", "--task", "alpha"); code != 0 {
+		t.Fatalf("intent list --task: code %d, stderr %q", code, errs)
+	}
+	if got := storedTask(); got != "beta" {
+		t.Errorf("intent --task rebound the caller from beta to %q", got)
+	}
+}
+
+// A path named positionally and given two --at spans must keep both: the first
+// is read once at the positional, and the later entries for the same path must
+// not be dropped with it.
+func TestReadAtRepeatSpansWithPositional(t *testing.T) {
+	var b strings.Builder
+	for i := 1; i <= 60; i++ {
+		fmt.Fprintf(&b, "line%02d\n", i)
+	}
+	newFakeEditor(t, map[string]string{"/w/a.go": b.String()})
+
+	out, errs, code := run(t, "read", "/w/a.go", "--at", "/w/a.go=1,2", "--at", "/w/a.go=50,51")
+	if code != 0 {
+		t.Fatalf("code %d: %s", code, errs)
+	}
+	for _, want := range []string{"line01", "line02", "line50", "line51"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	for _, absent := range []string{"line03", "line49"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("output carried %q, outside both spans:\n%s", absent, out)
+		}
+	}
+
+	// The same path named once must read exactly that one span, not the whole
+	// file with the span appended.
+	out, errs, code = run(t, "read", "/w/a.go", "--at", "/w/a.go=50,51")
+	if code != 0 {
+		t.Fatalf("single span: code %d, stderr %q", code, errs)
+	}
+	for _, want := range []string{"line50", "line51"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("single span missing %q:\n%s", want, out)
+		}
+	}
+	for _, absent := range []string{"line01", "line49"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("single span read more than the span (%q):\n%s", absent, out)
+		}
+	}
+}
+
+// The annotated run for base text carries group=0, which is no change set; the
+// help must say so, and the display must not change to fix it.
+func TestReadUsageNamesBaseRun(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	var out, errs strings.Builder
+	if code := CLI([]string{"help"}, &out, &errs); code != 0 {
+		t.Fatalf("help exit = %d, stderr %q", code, errs.String())
+	}
+	const clause = "group=0 is text no change set wrote (the base); groups lists change sets only"
+	if !strings.Contains(out.String(), clause) {
+		t.Errorf("read usage does not name the base run:\n%s", out.String())
+	}
+	var hout, herrs strings.Builder
+	if code := CLI([]string{"read", "-h"}, &hout, &herrs); code != 0 {
+		t.Fatalf("read -h exit = %d, stderr %q", code, herrs.String())
+	}
+	if !strings.Contains(herrs.String(), "group=0 is text no change set wrote (the base)") {
+		t.Errorf("--annotated help does not name the base run:\n%s", herrs.String())
+	}
+
+	// The bytes are the pin: --annotated must still print the base run as
+	// group=0 state=accepted. The fix is wording only.
+	rout, rerrs, code := run(t, "read", "--annotated", "/w/a.go")
+	if code != 0 {
+		t.Fatalf("read --annotated: code %d, stderr %q", code, rerrs)
+	}
+	if want := "x\nrun off=0 len=2 group=0 state=accepted\n"; rout != want {
+		t.Errorf("read --annotated = %q, want %q", rout, want)
+	}
+}
+
+// Every verb the usage lists starts its own line, and the intent line names
+// every mode intentCmd accepts, so the help cannot drift from the dispatcher.
+func TestCtlUsageOneVerbPerLine(t *testing.T) {
+	newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	var out, errs strings.Builder
+	if code := CLI([]string{"help"}, &out, &errs); code != 0 {
+		t.Fatalf("help exit = %d, stderr %q", code, errs.String())
+	}
+	usage := out.String()
+
+	// The modes come from intentCmd's own refusal, so a new mode cannot be
+	// added without the usage catching up.
+	_, ierrs, code := run(t, "intent")
+	if code != 2 {
+		t.Fatalf("bare intent: code %d, stderr %q", code, ierrs)
+	}
+	const marker = "needs a subcommand: "
+	i := strings.Index(ierrs, marker)
+	if i < 0 {
+		t.Fatalf("bare intent does not list modes: %q", ierrs)
+	}
+	modes := strings.Split(strings.TrimSpace(ierrs[i+len(marker):]), ", ")
+	intentLine := ""
+	for _, line := range strings.Split(usage, "\n") {
+		if strings.HasPrefix(line, "  intent ") {
+			intentLine = line
+			break
+		}
+	}
+	if intentLine == "" {
+		t.Fatalf("usage has no intent line:\n%s", usage)
+	}
+	for _, m := range modes {
+		if !strings.Contains(intentLine, m) {
+			t.Errorf("intent line omits mode %q:\n%s", m, intentLine)
+		}
+	}
+
+	// Each of these verbs begins its own line, so who and state cannot run
+	// together again.
+	for _, verb := range []string{"who", "state", "goto", "close", "register"} {
+		found := false
+		for _, line := range strings.Split(usage, "\n") {
+			if strings.HasPrefix(line, "  "+verb+" ") || line == "  "+verb {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("usage does not start a line with %q:\n%s", verb, usage)
+		}
+	}
+}
+
+// TestPrintIntentDiffRendersStatAndTruncationNote pins the readable `intent
+// diff` rendering: one churn row per file (a binary file as "- -"), the totals
+// line, the patch, the truncation note that makes a capped diff visible, and
+// the empty-diff message.
+func TestPrintIntentDiffRendersStatAndTruncationNote(t *testing.T) {
+	res := intent.Result{Diff: &intent.Diff{
+		Name: "i", Base: "BASE",
+		Stat: intent.Stat{
+			Files: 2, Additions: 5, Deletions: 6,
+			Entries: []intent.DiffEntry{
+				{Path: "a.go", Additions: 5, Deletions: 6},
+				{Path: "logo.png", Binary: true},
+			},
+		},
+		Diff: "patch body\n", Truncated: true, OmittedBytes: 42,
+	}}
+	var out bytes.Buffer
+	if code := printIntent(res, "diff", &out); code != 0 {
+		t.Fatalf("printIntent diff = %d", code)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"5\t6\ta.go",
+		"-\t-\tlogo.png",
+		"2 file(s), 5 insertion(s), 6 deletion(s)",
+		"patch body",
+		"diff truncated: 42 more byte(s) omitted",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("diff rendering missing %q:\n%s", want, got)
+		}
+	}
+
+	empty := intent.Result{Diff: &intent.Diff{Name: "i", Base: "BASE", Stat: intent.Stat{Entries: []intent.DiffEntry{}}}}
+	out.Reset()
+	if code := printIntent(empty, "diff", &out); code != 0 {
+		t.Fatalf("printIntent empty diff = %d", code)
+	}
+	if !strings.Contains(out.String(), "no diff: i matches its base BASE") {
+		t.Errorf("empty diff rendering = %q, want the matches-its-base note", out.String())
 	}
 }

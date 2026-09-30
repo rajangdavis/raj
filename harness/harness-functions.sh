@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # raj harness containers: build + run, one per agent runtime.
 #
 # Source this from your shell:  source ~/Desktop/projects/raj/harness/harness-functions.sh

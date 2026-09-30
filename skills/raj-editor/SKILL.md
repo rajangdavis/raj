@@ -59,6 +59,27 @@ exits 0 when every buffer is saved and holds no pending set, and exits 1 naming
 every dirty or pending buffer when any is. `status --json` carries the same exit
 code with `ready` and a `blocking` list.
 
+## What is on the screen
+
+`read` gives you a buffer's text. `screen` gives you what is actually drawn: the
+tab strip, the status line, a pane that holds no buffer at all. Reach for it
+when the user is talking about what they can see rather than about a file, and
+when you need to confirm an action landed on the screen and not just in the
+model.
+
+    raj ctl screen                  # one line per drawn row
+    raj ctl screen --json           # {rows, line, col}
+    raj ctl screen --until "wave" --timeout 5s
+
+Trailing blank rows are trimmed, so an empty or quiet screen prints nothing
+rather than a wall of blank lines -- that is not a failure. In `--json`, `line`
+and `col` are the caret's cell on the drawn grid, not a buffer position; use
+`read` or `goto` for that. `--until TEXT` polls until the text appears and exits
+non-zero if it never does (default timeout 3s); it is for work that finishes
+after the reply, such as a hook run or a language server. A reply now waits for
+the frame the request produced, so a plain `screen` taken straight after another
+verb already shows its effect.
+
 ## If you are in a container and the editor is not
 
 This is the normal arrangement, not an exotic one. raj runs in the terminal on

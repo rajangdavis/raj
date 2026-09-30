@@ -18,6 +18,7 @@ import (
 	"raj/internal/explorer"
 	"raj/internal/hidden"
 	"raj/internal/hover"
+	"raj/internal/intent"
 	"raj/internal/keys"
 	"raj/internal/lsp"
 	"raj/internal/picker"
@@ -346,6 +347,14 @@ type App struct {
 	sessionSaved time.Time
 	sessionTabs  string
 
+	// announced records the tabs that exist only because a buffer was announced
+	// -- a reveal, a goto, an agent open -- and not because the user opened the
+	// file. Such a tab is the agent's view, so it is not written to the session,
+	// with one exception: a tab holding a pending change set is the review the
+	// user has to decide, and it is persisted until that review is resolved. The
+	// set is in memory; OpenFile clears a path when the user opens it for real.
+	announced map[string]bool
+
 	// compactAt debounces the idle compaction pass so the origin-index walk does
 	// not run on every tick, and compacted records the (session version,
 	// decision generation) each pane was last attempted at. Compact leaves the
@@ -446,11 +455,11 @@ type App struct {
 	clientMu    sync.Mutex
 	clientFiles []clientFile
 	clientLost  string
-	// clientRemovals carries pending delete/rmdir proposals the watch
-	// goroutine found in the daemon rollup. Like clientFiles it is a handoff
-	// to the event thread, which owns pendingDeletions, pendingDirRemovals
-	// and the arrival queue; adoptPending runs off-thread, so it queues here
-	// and drainClient mirrors each into the maps.
+	// clientRemovals carries pending delete, rmdir and publish proposals the
+	// watch goroutine found in the daemon rollup. Like clientFiles it is a
+	// handoff to the event thread, which owns pendingDeletions,
+	// pendingDirRemovals and pendingPublishes; adoptPending runs off-thread,
+	// so it queues here and drainClient mirrors each into the maps.
 	clientRemovals []control.Proposal
 	// clientEdits tracks, per owned client path, the daemon version and text a
 	// pane's local copy was synced from, plus the dirty/running state of a
@@ -488,6 +497,11 @@ type App struct {
 	// tick only bumps Gen when something a client watches actually moved.
 	controlGen  uint64
 	controlHash uint64
+	// controlReplies is the queue of answers drainControl has produced but not
+	// yet delivered. A control reply must follow the frame that reflects its
+	// effect, so drainControl holds each answer here and Draw flushes the
+	// queue after it has presented the frame; see flushControlReplies.
+	controlReplies []controlReply
 
 	// pendingDeletions is the workspace-level set of paths an agent has
 	// proposed to delete, keyed by the canonical path, each carrying the
@@ -506,17 +520,32 @@ type App struct {
 	// removed until the user approves in the review tab.
 	pendingDirRemovals map[string]control.DirRemoval
 
-	// pendingRemovals is the arrival order of pendingDeletions and
-	// pendingDirRemovals, so the re-raise key can present the oldest proposal
-	// first. The maps hold the proposals; this is only the queue. See
-	// removals.go.
-	pendingRemovals []pendingRemoval
+	// pendingList is the rows the waiting list (ctrl+alt+v) is showing: the
+	// App.Proposals rollup captured when the list opened, so a decision chord
+	// can name the selected row back to the same list. Nil while it is closed.
+	pendingList []control.Proposal
+
+	// pendingPublishes is the workspace-level set of H5 publish action
+	// proposals, keyed by the wave name. Like pendingDeletions it is in-memory
+	// and changes nothing outward: it pins the exact commit, base, branch,
+	// remote, hook and argv a human's accept may run, and a restart forgets it.
+	// See publish.go.
+	pendingPublishes map[string]intent.Publish
+
+	// publishRun runs a publish proposal's pinned argv at accept. Nil uses the
+	// real process runner; a test injects one.
+	publishRun publishRunner
 
 	// deletionPromptPane is the active pane the deletion gate last evaluated.
 	// The tracked pane is what makes the gate once per focus: a pane that has
 	// not changed leaves it alone, and focusing the path again re-raises the
 	// question. Nil until the gate has looked at a pane.
 	deletionPromptPane *editor.Pane
+
+	// lastRemoved is the most recent removal parked in the workspace trash, so
+	// the restore-deleted chord can put it back. Only the latest is kept: it
+	// is an undo, not a history. See restoreLastRemoved.
+	lastRemoved removedFile
 
 	// snapshots holds dump results keyed by id, and snapSeq mints the ids. They
 	// are per-author (Patch checks the writer owns the id), and the map lives
@@ -666,6 +695,7 @@ func NewWithRoots(host ui.Host, roots []string, o Options) *App {
 		roots:          wsRoots,
 		visible:        wsRoots,
 		state:          state,
+		announced:      make(map[string]bool),
 		journalWritten: make(map[string]journalStamp),
 		settings:       res,
 		sidebar:        side,
@@ -775,7 +805,10 @@ func (a *App) wireSearchPane(p *search.Pane) {
 	// cannot reach, for the same reason session restore cannot bring it back.
 	p.Buffers = func() search.Docs {
 		var open search.Docs
-		for _, p := range a.Tabs.All() {
+		// Tabs and headless alike: a recovered buffer can hold unsaved text
+		// with no tab, and search that read only the disk would miss it.
+		panes := append(append([]*editor.Pane{}, a.Tabs.All()...), a.headless...)
+		for _, p := range panes {
 			if p.File.Path == "" || !p.File.ViewDirty() {
 				continue
 			}
@@ -843,12 +876,23 @@ func (a *App) syncTheme() {
 // tab and focus stay put.
 func (a *App) OpenFile(path string) {
 	a.openFile(path, true)
+	// The user chose this file, so the tab is theirs and is saved even if the
+	// buffer was announced earlier. Clearing the mark is what lets a tab the user
+	// took over survive a review being resolved.
+	if p := a.Tabs.Active(); p != nil && sameFile(p.File.Path, path) {
+		delete(a.announced, p.File.Path)
+	}
 }
 
 // openFileQuiet opens a path in a tab without moving the active tab or focus.
-// It shares openFile's body, so the two cannot drift.
+// It shares openFile's body, so the two cannot drift, and it marks the tab as
+// announced: an agent asking to show a file is not the user choosing a tab, so
+// the session keeps it only while it holds a review.
 func (a *App) openFileQuiet(path string) {
 	a.openFile(path, false)
+	if p := a.paneFor(path); p != nil {
+		a.markAnnounced(p.File.Path)
+	}
 }
 
 // openFile opens a path in a tab, moving the active tab and focus only when
@@ -1944,50 +1988,71 @@ func (a *App) scope() keys.Scope {
 
 // handleGlobal deals with actions that work regardless of focus. Returns true
 // when the action was consumed.
+//
+// Each case is grouped by concern into one of the handleGlobalX dispatchers
+// below, so every switch stays small. This one chains them in order and keeps
+// the old default: a tab number is consumed here, and anything else falls
+// through to the focused pane. Every action belongs to exactly one dispatcher,
+// so the chain consumes exactly what the single switch used to.
 func (a *App) handleGlobal(action keys.Action) bool {
+	if a.handleGlobalFile(action) ||
+		a.handleGlobalReview(action) ||
+		a.handleGlobalClipboard(action) ||
+		a.handleGlobalSidebar(action) ||
+		a.handleGlobalLSP(action) ||
+		a.handleGlobalToggles(action) {
+		return true
+	}
+	if n, isTab := tabNumber(action); isTab {
+		a.Tabs.Goto(n)
+		a.focusEditor()
+		return true
+	}
+	return false
+}
+
+// handleGlobalFile consumes the session and file actions — quit, save, reload
+// and suspend — along with opening, closing and cycling tabs.
+func (a *App) handleGlobalFile(action keys.Action) bool {
 	switch action {
-	case keys.OpenMenu:
-		a.openContextMenu()
-	case keys.CommandPalette:
-		a.commandPalette()
-	case keys.ToggleDebug:
-		a.Debug.Open = !a.Debug.Open
-		a.Debug.sample()
-	case keys.ToggleInlayHints:
-		a.toggleInlayHints()
-	case keys.ApplyInlayEdit:
-		a.applyInlayEdit()
 	case keys.Quit:
 		a.tryQuit()
 	case keys.Suspend:
 		a.host.Suspend()
 	case keys.Save:
 		a.saveActive(nil)
+	case keys.Reload:
+		a.reloadBuffer()
+	case keys.NewFile:
+		a.newFile()
+	case keys.CloseTab:
+		a.closeTab()
+	case keys.ReopenTab:
+		// Route through OpenFile so a reopened tab gets the same treatment as
+		// any other: theme, highlighting, focus.
+		if path, ok := a.Tabs.PopClosed(); ok {
+			a.OpenFile(path)
+		}
+	case keys.NextTab:
+		a.Tabs.Next()
+		a.focusEditor()
+	case keys.PrevTab:
+		a.Tabs.Prev()
+		a.focusEditor()
+	default:
+		return false
+	}
+	return true
+}
+
+// handleGlobalReview consumes the review-mode actions: accepting and rejecting
+// proposals, the review picker, cycling proposals and the pending removals.
+func (a *App) handleGlobalReview(action keys.Action) bool {
+	switch action {
 	case keys.ToggleReview:
 		a.toggleReview()
-	case keys.ToggleDrawer:
-		// The phone drawer's key fallback. Only the phone profile binds it,
-		// so the ordinary editor never reaches this.
-		a.drawerOpen = !a.drawerOpen
-		if a.drawerOpen {
-			a.drawerSel = 0
-			a.drawerWant = a.drawerOpenWant()
-		}
-		return true
-	case keys.Reload:
-		// Reload replaces the buffer from disk. Refused in Review, and in a
-		// client where the disk is not the daemon: it is not an edit, but it
-		// would replace the daemon snapshot with a stale local copy, and the
-		// forward would then carry that revert back to the daemon.
-		if a.attach || a.readOnly() {
-			if a.attach {
-				a.status = "attach: the daemon buffer is the file; reload is not available"
-			} else {
-				a.status = a.readOnlyNote()
-			}
-			return true
-		}
-		a.reloadActive()
+	case keys.RestoreDeleted:
+		a.restoreLastRemoved()
 	case keys.AcceptProposed:
 		a.reviewProposed(true)
 	case keys.RejectProposed:
@@ -1995,27 +2060,43 @@ func (a *App) handleGlobal(action keys.Action) bool {
 	case keys.ClearRejected:
 		a.clearRejected()
 	case keys.ReviewProposed:
-		a.reviewPicker()
+		a.openProposals()
 	case keys.NextProposed:
 		a.cycleProposed(true)
 	case keys.PrevProposed:
 		a.cycleProposed(false)
-	case keys.PendingRemovals:
-		a.reopenPendingRemoval()
+	default:
+		return false
+	}
+	return true
+}
+
+// handleGlobalClipboard consumes cutting and copying, including the
+// palette-only copy of the active buffer's workspace-relative path.
+func (a *App) handleGlobalClipboard(action keys.Action) bool {
+	switch action {
 	case keys.Cut:
-		// Cut is an edit. Copy stays live; and cut in a dialog's own field is
-		// not the document, so only the editor is refused.
-		if a.readOnly() && a.focus == FocusEditor {
-			a.status = a.readOnlyNote()
-			return true
-		}
-		a.clip(true)
+		a.cut()
 	case keys.Copy:
 		a.clip(false)
 	case keys.CopyRelPath:
 		// Palette-only: the command has no chord, and the palette dispatches
-		// it through this same switch. See keys.Unbound.
+		// it through this same path. See keys.Unbound.
 		a.copyRelativePath()
+	default:
+		return false
+	}
+	return true
+}
+
+// handleGlobalSidebar consumes the sidebar, picker and menu actions: opening a
+// sidebar pane or the file picker, the context menu and the command palette.
+func (a *App) handleGlobalSidebar(action keys.Action) bool {
+	switch action {
+	case keys.OpenMenu:
+		a.openContextMenu()
+	case keys.CommandPalette:
+		a.commandPalette()
 	case keys.FocusExplorer:
 		a.openSidebar(SidebarExplorer)
 	case keys.FocusSearch:
@@ -2024,34 +2105,23 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.openSidebar(SidebarProblems)
 	case keys.Settings:
 		a.openSidebar(SidebarSettings)
-	case keys.ToggleWrap:
-		if p := a.Tabs.Active(); p != nil {
-			p.Wrap = !p.Wrap
-			a.WrapDefault = p.Wrap
-			p.Viewport.Left, p.Viewport.TopRow = 0, 0
-			p.FollowCursor()
-			a.status = "wrap off"
-			if p.Wrap {
-				a.status = "wrap on"
-			}
-		}
-		return true
 	case keys.ToggleSidebar:
 		a.toggleSidebar()
 	case keys.FilePicker:
-		a.Picker.Show()
-		a.focus = FocusPicker
+		a.filePicker()
 	case keys.FindInFile:
-		if p := a.Tabs.Active(); p != nil {
-			if p.Find.Open {
-				p.Find.Handle(p, keys.FindInFile, "")
-			} else {
-				p.Find.Show(p)
-			}
-			a.focus = FocusEditor
-			return true
-		}
+		return a.findInFile()
+	default:
 		return false
+	}
+	return true
+}
+
+// handleGlobalLSP consumes the language-server actions: the goto family, hover,
+// references, signature help and code actions, plus the editing commands that
+// ride the same connection (rename, format, symbols, links).
+func (a *App) handleGlobalLSP(action keys.Action) bool {
+	switch action {
 	case keys.GotoLine:
 		a.gotoLine()
 	case keys.GotoSymbol:
@@ -2074,8 +2144,6 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.codeActions()
 	case keys.RunCodeLens:
 		a.runCodeLens()
-	case keys.ToggleFold:
-		a.toggleFold()
 	case keys.WorkspaceSymbols:
 		a.workspaceSymbols()
 	case keys.Rename:
@@ -2086,30 +2154,117 @@ func (a *App) handleGlobal(action keys.Action) bool {
 		a.formatSelection()
 	case keys.FollowLink:
 		a.followLink()
-	case keys.NewFile:
-		a.newFile()
-	case keys.CloseTab:
-		a.closeTab()
-	case keys.ReopenTab:
-		// Route through OpenFile so a reopened tab gets the same treatment as
-		// any other: theme, highlighting, focus.
-		if path, ok := a.Tabs.PopClosed(); ok {
-			a.OpenFile(path)
-		}
-	case keys.NextTab:
-		a.Tabs.Next()
-		a.focusEditor()
-	case keys.PrevTab:
-		a.Tabs.Prev()
-		a.focusEditor()
 	default:
-		if n, isTab := tabNumber(action); isTab {
-			a.Tabs.Goto(n)
-			a.focusEditor()
-			return true
-		}
 		return false
 	}
+	return true
+}
+
+// handleGlobalToggles consumes the display toggles: debug, inlay hints, the
+// phone drawer, line wrapping and folds.
+func (a *App) handleGlobalToggles(action keys.Action) bool {
+	switch action {
+	case keys.ToggleDebug:
+		a.toggleDebug()
+	case keys.ToggleInlayHints:
+		a.toggleInlayHints()
+	case keys.ApplyInlayEdit:
+		a.applyInlayEdit()
+	case keys.ToggleDrawer:
+		a.toggleDrawer()
+	case keys.ToggleWrap:
+		a.toggleWrap()
+	case keys.ToggleFold:
+		a.toggleFold()
+	default:
+		return false
+	}
+	return true
+}
+
+// ToggleDebug shows or hides the debug overlay and samples it, so it opens on
+// current state.
+func (a *App) toggleDebug() {
+	a.Debug.Open = !a.Debug.Open
+	a.Debug.sample()
+}
+
+// ToggleDrawer is the phone drawer's key fallback. Only the phone profile binds
+// it, so the ordinary editor never reaches this; opening resets the selection
+// and recomputes which entries the drawer wants.
+func (a *App) toggleDrawer() {
+	a.drawerOpen = !a.drawerOpen
+	if a.drawerOpen {
+		a.drawerSel = 0
+		a.drawerWant = a.drawerOpenWant()
+	}
+}
+
+// Reload replaces the buffer from disk. It is refused in Review, and in a
+// client where the disk is not the daemon: it is not an edit, but it would
+// replace the daemon snapshot with a stale local copy, and the forward would
+// then carry that revert back to the daemon. The refusal is still consumed.
+func (a *App) reloadBuffer() {
+	if a.attach || a.readOnly() {
+		if a.attach {
+			a.status = "attach: the daemon buffer is the file; reload is not available"
+		} else {
+			a.status = a.readOnlyNote()
+		}
+		return
+	}
+	a.reloadActive()
+}
+
+// Cut cuts the selection. Cut is an edit, so the editor is refused in Review;
+// copy stays live, and a cut in a dialog's own field is not the document, so
+// only the editor is refused.
+func (a *App) cut() {
+	if a.readOnly() && a.focus == FocusEditor {
+		a.status = a.readOnlyNote()
+		return
+	}
+	a.clip(true)
+}
+
+// ToggleWrap flips line wrapping for the active pane and remembers it as the
+// default for the next one, resetting the scroll so wrapping does not strand
+// the viewport on a column that no longer means the same thing.
+func (a *App) toggleWrap() {
+	p := a.Tabs.Active()
+	if p == nil {
+		return
+	}
+	p.Wrap = !p.Wrap
+	a.WrapDefault = p.Wrap
+	p.Viewport.Left, p.Viewport.TopRow = 0, 0
+	p.FollowCursor()
+	a.status = "wrap off"
+	if p.Wrap {
+		a.status = "wrap on"
+	}
+}
+
+// FilePicker opens the file picker and focuses it.
+func (a *App) filePicker() {
+	a.Picker.Show()
+	a.focus = FocusPicker
+}
+
+// FindInFile opens the in-file find box, or advances it when it is already
+// open, and returns to the editor. It reports false when there is no active
+// pane to search, which lets the action fall through to the focused pane.
+func (a *App) findInFile() bool {
+	p := a.Tabs.Active()
+	if p == nil {
+		return false
+	}
+	if p.Find.Open {
+		p.Find.Handle(p, keys.FindInFile, "")
+	} else {
+		p.Find.Show(p)
+	}
+	a.focus = FocusEditor
 	return true
 }
 
@@ -2709,6 +2864,17 @@ func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 		report(then, false)
 		return
 	}
+	// A read-only view holds no file's bytes -- a seam diff pane -- so there
+	// is nothing to save. Refuse here, before any later step can offer to
+	// create the synthetic path's parent directory: that question is about a
+	// file that will never be written, and answering it would leave a stray
+	// tree behind for a save that could never happen.
+	if p.File.IsReadOnly() {
+		a.status = a.readOnlyNote()
+		report(then, false)
+		return
+	}
+
 	// save_confirm reads before the gate: it is the stored escape hatch, off
 	// means no prompt, and it is a plain settings read, so a degraded UI cannot
 	// hide the switch and make the tree unsaveable. The warning is on every
@@ -2882,6 +3048,28 @@ func (a *App) reloadActive() {
 // touched it. On a dirty buffer it is destructive in the same way Overwrite is,
 // just pointed the other way, so it sits in the middle and asks again.
 func (a *App) conflict(p *editor.Pane, path string, then func(saved bool)) {
+	// A file that is gone is not a file that was rewritten: there is no disk
+	// version to reload and nothing on disk to preserve, so the only answers
+	// are to put the buffer back or to leave it alone. Offering Overwrite or
+	// Reload here would name choices that do not exist.
+	if p.File.DeletedOnDisk() {
+		base := filepath.Base(path)
+		a.confirm("Deleted on disk",
+			base+" was deleted on disk. Write it back?",
+			[]string{prompt.WriteBack, prompt.Cancel}, func(ans string, ok bool) {
+				switch {
+				case !ok || ans == prompt.Cancel:
+					// Leave it deleted and keep the mark, so the tab still says
+					// what happened and the next save asks again.
+					p.MarkDiskDeleted()
+					a.status = "save cancelled — " + base + " was deleted on disk"
+					report(then, false)
+				default:
+					a.write(p, path, true, then)
+				}
+			})
+		return
+	}
 	dirty := p.File.ViewDirty()
 	options := []string{prompt.Overwrite, prompt.Reload, prompt.Cancel}
 	question := filepath.Base(path) + " was modified by another program. " +
@@ -2924,6 +3112,15 @@ func (a *App) conflict(p *editor.Pane, path string, then func(saved bool)) {
 // not treat a reload as permission to carry on and drop the buffer.
 func (a *App) reload(p *editor.Pane, then func(saved bool)) error {
 	name := p.File.Name()
+	// A file that is gone has no version to take. Say that rather than
+	// surfacing the os.ReadFile error as the whole explanation, and keep the
+	// mark so the tab and the save question agree about why.
+	if p.File.DeletedOnDisk() {
+		p.MarkDiskDeleted()
+		a.status = name + " was deleted on disk"
+		report(then, false)
+		return os.ErrNotExist
+	}
 	if err := p.Reload(); err != nil {
 		a.status = "cannot reload: " + err.Error()
 		report(then, false)
@@ -3148,7 +3345,7 @@ func (a *App) tryQuit() {
 		a.quit = true
 		return
 	}
-	dirty := a.Tabs.Dirty()
+	dirty := a.dirtyPanes()
 	if len(dirty) == 0 {
 		a.quit = true
 		return
@@ -3168,6 +3365,20 @@ func (a *App) tryQuit() {
 		})
 }
 
+// dirtyPanes is every open buffer with unsaved work, tabs first and then
+// headless. A buffer restored from its journal can be headless and dirty, so
+// the quit guard and the save walk it feeds must not read Tabs alone: work in a
+// buffer with no tab is still the user's work to decide about.
+func (a *App) dirtyPanes() []*editor.Pane {
+	dirty := a.Tabs.Dirty()
+	for _, p := range a.headless {
+		if p.File.ViewDirty() {
+			dirty = append(dirty, p)
+		}
+	}
+	return dirty
+}
+
 // quitMessage names the file when there is one and counts them when there are
 // several. A list of names would not fit the dialog, and a bare count when only
 // one thing is at stake withholds the only detail that matters.
@@ -3178,20 +3389,28 @@ func quitMessage(dirty []*editor.Pane) string {
 	return "Save changes to " + itoa(len(dirty)) + " files before quitting?"
 }
 
-// saveAllThenQuit walks the dirty tabs, saving each and quitting only if they
-// all land.
+// saveAllThenQuit walks the dirty buffers, tabs and headless alike, saving each
+// and quitting only if they all land.
 //
 // It recurses through the continuation rather than looping, because any of them
 // may be unnamed and stop for a path — and a loop would have run to the end
-// before the first dialog was answered. Each tab is focused before it is saved,
-// so a save-as dialog is asking about the buffer on screen.
+// before the first dialog was answered. Each buffer is on screen before it is
+// saved, so a save-as dialog is asking about the buffer the user can see.
 func (a *App) saveAllThenQuit(dirty []*editor.Pane) {
 	if len(dirty) == 0 {
 		a.quit = true
 		return
 	}
 	p := dirty[0]
-	a.Tabs.Focus(p)
+	// Bring the buffer on screen before saving it: a recovered buffer can be
+	// headless, and a save-as or review prompt must be about the buffer the
+	// user can see. announce shows it and makes it the active tab; a tab is
+	// already in front.
+	if a.isHeadless(p) {
+		a.announce(p)
+	} else {
+		a.Tabs.Focus(p)
+	}
 	a.saveActive(func(saved bool) {
 		if !saved {
 			// Cancelling a path is cancelling the quit. Exiting anyway would
@@ -3422,9 +3641,15 @@ func (a *App) refreshSyntax() {
 // diskCheck marks a tab when its file changed on disk since raj read or wrote
 // it, so the prompt on save stops being a surprise. One stat per open tab, on
 // the idle tick; panes already marked are skipped until the user acts.
+//
+// A file that is gone is marked rather than reloaded: there is no version on
+// disk to take, so the clean-buffer reload would only fail with a status this
+// screen alone sees and leave a tab that still reads as live. The mark carries
+// the reason, and save offers to put the buffer back.
 func (a *App) diskCheck() {
 	// A snapshot buffer has no disk of its own to become stale: the daemon is
-	// the file, and a local stat would only raise a false prompt.
+	// the file, and a local stat would only raise a false prompt. An attached
+	// client learns the daemon's answer over the wire instead.
 	if a.attach {
 		return
 	}
@@ -3433,6 +3658,14 @@ func (a *App) diskCheck() {
 			continue
 		}
 		if p.File.Path == "" || !p.File.DiskChanged() {
+			continue
+		}
+		if p.File.DeletedOnDisk() {
+			// Deleted, not rewritten: the file cannot be reloaded and the
+			// buffer is the only copy left. Mark the tab and say why; save
+			// asks before writing it back.
+			p.MarkDiskDeleted()
+			a.status = p.File.Name() + " was deleted on disk"
 			continue
 		}
 		if p.File.ViewDirty() {

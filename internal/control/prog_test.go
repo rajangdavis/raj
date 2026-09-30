@@ -156,20 +156,52 @@ func TestProgramRoundTripsThroughAFrame(t *testing.T) {
 	}
 }
 
-// Every verb the compiler names has to be one the handlers already answer;
-// two lists that drift produce a request nothing runs.
-func TestEveryVerbNameIsKnown(t *testing.T) {
-	for code, name := range verbNames {
-		if !knownOps[code] {
-			t.Errorf("%s is in verbNames but not knownOps", name)
+// The registry is the one source of truth for a verb: its name, its wire code
+// and its program opcode. This is what fails when a row is added wrong — a
+// duplicate name or code, an opcode prog does not allocate, or a program verb
+// with no row to answer it.
+func TestVerbRegistry(t *testing.T) {
+	names := map[string]bool{}
+	wires := map[byte]bool{}
+	ops := map[byte]bool{}
+	for _, v := range verbs {
+		if names[v.name] {
+			t.Errorf("verb %q is named twice", v.name)
 		}
-	}
-	for code := range knownOps {
-		if !prog.IsVerb(code) {
+		names[v.name] = true
+		if v.wire != 0 {
+			if wires[v.wire] {
+				t.Errorf("wire code %d is used twice", v.wire)
+			}
+			wires[v.wire] = true
+		}
+		if v.op == 0 {
 			continue
 		}
-		if _, ok := verbNames[code]; !ok {
-			t.Errorf("%s is a known verb with no op name", prog.Name(code))
+		if ops[v.op] {
+			t.Errorf("program opcode %#02x is used twice", v.op)
+		}
+		ops[v.op] = true
+		if !prog.IsVerb(v.op) {
+			t.Errorf("verb %q: opcode %#02x is not a program verb", v.name, v.op)
+		}
+		if got := prog.Name(v.op); got != v.name {
+			// text is the one translation: prog names OpRead "read", while the
+			// handlers and raj ctl speak "text". Every other spelling agrees.
+			if v.name != "text" || got != "read" {
+				t.Errorf("verb %q: opcode %#02x is prog's %q", v.name, v.op, got)
+			}
+		}
+	}
+	// Every verb prog allocates has a row: either an op above, or a row with
+	// op 0 that says why it is kept out of programs (watch is the one).
+	for op := 0x80; op <= 0xff; op++ {
+		name := prog.Name(byte(op))
+		if strings.HasPrefix(name, "unknown-verb-") || ops[byte(op)] {
+			continue
+		}
+		if !names[name] {
+			t.Errorf("program verb %s (%#02x) has no row", name, op)
 		}
 	}
 }

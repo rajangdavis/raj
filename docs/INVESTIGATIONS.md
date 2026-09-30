@@ -237,6 +237,22 @@ than trusted because it looks right.
 
 ## Root causes
 
+### Syntax colours blank on a repeated client snapshot
+
+- [x] **A re-sync rebuilt the pane highlighter instead of keeping the warm
+  one.** `applyClientFile`, which runs on every daemon snapshot, called
+  `File.SetDark`, and `SetDark` unconditionally does
+  `f.Syntax = syntax.New(path, dark)`; the fresh highlighter has tokenised
+  nothing, so `Syntax.Ready()` was false and the renderer fallback painted the
+  file plain until its pass landed — the flicker, once per re-sync. The watch
+  fetches every buffer whenever any one of them moves the generation, so an
+  unchanged file arrived on most re-syncs. `File.AdoptSyntax` now carries the
+  warm highlighter across when the snapshot repeats the pane text; the file is
+  still swapped, so refresh behaviour is untouched. The trap: never test
+  "unchanged" with `Session().Version()` across two `File` objects — a freshly
+  decoded snapshot reports version 0 exactly like a new file, so that guard
+  skipped real updates and broke twelve client tests.
+
 ### Syntax colours stuck describing pre-edit text
 
 - [x] **A boolean cannot say which version it went stale against.** The

@@ -220,17 +220,24 @@ below are not scheduled; start with `single`, one MR per wave.
   Tokens stay on the host, where hooks run.
 - **Arrival order:** `single` first (it is `export` + one branch + one PR),
   then `split`, then `stack` (GitHub, then GitLab).
-- **`single` today:** `examples/hooks/publish-single.sh` builds the commit from
-  the saved working tree with a private index (so `.gitignore` decides what is
-  left out and the user's HEAD, index and working tree are never touched),
-  parents it on the base, creates a branch that is not checked out, pushes it
-  and opens the PR with `gh`. `--dry-run`, `--no-push`, `--no-pr`; its test
-  runs against a throwaway repository. Authored as a hook:
+- **`single` today:** `intent land` has already exported the wave's reviewed
+  composition as one commit (S3), and `examples/hooks/publish-single.sh` pushes
+  that exact artifact — never a commit it builds from disk. `intent publish`
+  passes `--commit` (the export's commit) and `--base` (that commit's parent)
+  by value, so a worktree that moves after the export cannot ship; the script
+  reads the artifact's tree, not the worktree, and refuses (exit 13) when the
+  commit is not parented on the base. It creates a branch that is not checked
+  out, fast-forward only, pushes it and prints the pull-request URL (or opens
+  one with `gh pr create`). `--dry-run`, `--no-push`, `--no-pr`; its test runs
+  against a throwaway repository. Authored as a hook:
   `raj hook add publish --tree workspace -- sh examples/hooks/publish-single.sh`.
 - Every strategy is still an action proposal the person accepts (§5); none
   moves a ref or pushes on its own.
 
-## 5b. Split planning — independent changes, decided and then proved *(deferred: no stacks — one MR per wave)*
+## 5b. Split publishing — independent changes, one MR per part *(deferred: no stacks — one MR per wave)*
+
+The planning and proof half of the split idea is built read-only as **§5c**; the
+publishing half stays deferred.
 
 The question a reviewer actually has: *can this mound of change be cut into N
 parts that do not conflict and do not depend on each other, so each can be
@@ -277,6 +284,16 @@ base, which `split` publishes and `stack` can later order.
 Open: hunk-level splitting of one file across parts (needs the conflict edge at
 hunk granularity and a patch per part); how far to trust the language server's
 references versus a compile-only proof; a budget for the proof (N check runs).
+
+## 5c. Seam proof (read-only)
+
+Seam proof: materialise a named seam alone over its base and run the check hook
+(`raj ctl intent prove <name>`), reporting pass or, on failure, the failing
+output tail. There is no graph and no parts: reconciliation already answers
+whether changes can sit together, and a failing proof is itself the detector — a
+member needed a change the seam excludes, or a build unit got split — which the
+user settles by editing the selection. Nothing here publishes or writes an
+intention; 5b's publishing half stays deferred.
 
 ## 6. Summon
 

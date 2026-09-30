@@ -572,12 +572,14 @@ func (t *Tabs) renderPhone(s *ui.Screen, x, y, w int, th widget.Theme, labels []
 func (t *Tabs) labels() []string {
 	counts := map[string]int{}
 	for _, p := range t.panes {
-		counts[p.File.Name()]++
+		counts[p.TabLabel()]++
 	}
 	out := make([]string, len(t.panes))
 	for i, p := range t.panes {
-		name := p.File.Name()
-		if counts[name] > 1 {
+		name := p.TabLabel()
+		// A pane carrying its own label already says what it is, so the
+		// basename disambiguation two same-named files need does not apply.
+		if p.Label == "" && counts[name] > 1 {
 			if dir := filepath.Base(filepath.Dir(p.File.Path)); dir != "." && dir != "/" {
 				name = dir + "/" + name
 			}

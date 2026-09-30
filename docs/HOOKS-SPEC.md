@@ -1,12 +1,17 @@
 # HOOKS-SPEC — user-authored host actions with triggers
 
-Status: v0 implemented. The store v2->v3 and v3->v4 `hooks` table (the v4
-migration adds `tree` and `detach`), the pure `internal/hooks` package (Parse,
+Status: v0 implemented. The store v2->v3, v3->v4 and v9->v10 `hooks` table
+(the v4 migration adds `tree` and `detach`, the v10 migration adds `params`),
+the pure `internal/hooks` package (Parse,
 Admit, Gate, Registry, Log), and the CLI
-`raj hook add|list|show|rm|enable|disable|run|log|ps|cancel|off|on` exist. The
-agent contract is a name-only `run`; authoring, `cancel` and the `off|on` panic
-switch are local-only, while `list`, `show`, `log` and `ps` cross both
-transports. The v0 subset in §5 is what shipped and names what is deferred.
+`raj hook add|list|show|rm|enable|disable|run|log|ps|cancel|off|on` exist,
+`raj hook add --action JSON` authors the builtin and composite forms, and the
+composite `steps` action form with its chain runner and transitive gate
+(§1.3) is built. The agent contract is a name-only `run` with declared
+parameters a caller may name by value; authoring, `cancel`
+and the `off|on` panic switch are local-only, while `list`, `show`, `log` and
+`ps` cross both transports. The v0 subset in §5 is what shipped and names what
+is deferred.
 Relates to the TODO items *format-on-save* and the *workspace-wide `lsp
 diagnostics` sweep before the host gate*, which become instances of this
 substrate rather than special cases.
@@ -17,15 +22,23 @@ A hook is a **user-authored, host-side action with a trigger**. It has a fixed
 action, it is declared once and stored per workspace, and agents may invoke only
 the hooks explicitly allowed to them — and only by name.
 
-    { name, action, trigger, tree, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated }
+    { name, action, params, trigger, tree, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated }
 
 - **action** — argv (JSON array) by default, so there is no shell. A shell string
   only when the *author* chose one. A multi-command script is just argv:
   `["bash","scripts/check.sh"]`.
+- **params** — the declared parameters a caller may name by value (§3). A JSON
+  array of declarations, each `NAME=enum(a,b,c)`, `NAME=string(<regex>)` or
+  `NAME=uint`, optionally `=<default>`. A name is letters, digits, `_` or `-`.
+  A declaration with a default is optional at run time; one without is required.
+  An empty array is a hook that takes none, so a row written before the field
+  behaves exactly as it did.
 - **trigger** — `agent` (invoked by name), `on-save`, `before-gate`. v0 ships
   `agent`.
 - **tree** — `projected` (the default) runs against a scratch tree materialised
-  from the live buffers, accepted and proposed text included. `workspace` runs
+  from the live buffers, accepted and proposed text included, with the make files
+  and `scripts/` pinned to the accepted tree so a proposed harness change cannot
+  run; the sources stay proposed. `workspace` runs
   against the saved workspace root itself, and then only when the workspace is
   ready (§4). Any other value is refused.
 - **detach** — default off. A detached hook starts in its own session, so it
@@ -38,7 +51,9 @@ the hooks explicitly allowed to them — and only by name.
 Two consequences worth stating:
 - There is no separate allowlist concept at the hook level: the per-hook
   `agent` flag is it, further bounded by a builtin leaf's `Policy` (§1.1).
-- The agent never supplies argv, env, or cwd. It supplies a name.
+- The agent never supplies argv, env, or cwd. It supplies a name, and values
+  chosen from the domains the author declared. *An agent names a choice, not a
+  command.*
 
 ### 1.1 Builtin actions
 
@@ -106,20 +121,95 @@ implementation and none extends the read-only `raj ctl git` verb.
   publish (S3), not to object plumbing.
 - A leaf has no working directory, so it resolves the workspace root from an
   explicit `args["root"]`, a root carried on the run context by
-  `gitleaves.WithRoot`, or the process working directory. The dispatch path
-  does not yet pass `prep.Root`; wiring that one line is the open H3 gap.
+  `builtin.WithRoot`, or the process working directory. The run path stamps
+  `prep.Root` on the context before it runs a builtin or a composite step.
 
-Composites and the step-chaining contract -- `RAJ_STEP_<name>_OUT`, fail-fast
-with `{failed_step, stderr}`, the 64 KiB output spill, and load-time rejection
-of two step names that normalise to the same variable -- are **not built**.
-`Parse` has no step form and the runner has no chain engine, so `git-context`
-and `intention-diff` wait; the leaves land first.
+Composites and the step-chaining contract are built (§1.3): `Parse` accepts
+the `steps` action form, the control run path chains the steps, and the
+transitive gate keeps a composite no more agent-callable than its most
+restricted step. `git-context` is the first composite; `intention-diff` is
+expressible in the same form and waits only on the app-side intent leaves that
+resolve and materialise a live intention.
 
-## 2. Storage — the v2 -> v3 and v3 -> v4 migrations
+### 1.3 Composite (step) actions
+
+An action has a fourth form: an ordered list of steps, each a builtin leaf or a
+shell action.
+
+    {"steps": [
+      {"name": "status", "builtin": "git.status"},
+      {"name": "diff",   "builtin": "git.diff"},
+      {"name": "log",    "builtin": "git.log", "args": {"count": 20}}
+    ]}
+
+A step object carries `name` and exactly one of `builtin` (with an optional
+`args` object) or `shell`. The name is required: it labels the step's output.
+`steps` is exclusive with the single-action forms, a step action cannot be
+detached, and an unknown leaf name is refused at parse time exactly as the
+single-builtin form's is.
+
+**Chaining.** The steps run in order. When step `NAME` finishes, its stdout is
+exported to every later step as `RAJ_STEP_<NAME>_OUT`, where `<NAME>` is the
+step name uppercased with every character that is not an ASCII letter or digit
+turned into an underscore. A shell step receives those entries as its process
+environment; a builtin step reads them with `builtin.StepEnv(ctx)`. The run's
+resolved parameters reach every step the same way, under `RAJ_PARAM_<NAME>`:
+a shell step finds them in its environment and a builtin step reads them with
+`builtin.ParamEnv(ctx)`. Two step
+names whose normalised forms collide are refused when the row is loaded, with
+the colliding variable named, so one step can never shadow another's output.
+
+**Fail-fast.** The first step with a nonzero exit stops the chain. The run
+fails and names the step and its stderr (`failed step "<name>": <stderr>`); no
+later step runs.
+
+**Spill.** A step whose output exceeds 64 KiB does not go into the environment.
+It is written to a temp file, and later steps see
+`RAJ_STEP_<NAME>_OUT_FILE=<path>` with `RAJ_STEP_<NAME>_OUT` empty instead of
+the text. The temp directory lives for the run and is removed with it. An empty
+output -- an empty diff, for instance -- is a success: exit zero, no spill.
+
+**The transitive gate.** A composite cannot exceed its leaves. At parse time the
+composite takes the most restricted policy of its builtin steps: if any step's
+leaf registered `HumanOnly` the whole composite is `HumanOnly`, so `Admit`
+refuses it to an agent even when the row's `agent` flag says otherwise. A
+composite of `AgentDefault` leaves is agent-callable when the row allows it; a
+shell step carries no leaf policy and is bound by the row's `agent` flag alone.
+A composite also runs through the same `Admit` and `Gate` as any other hook.
+
+The first composites are `git-context` (`git.status`, `git.diff`, `git.log -n
+20`) and `intention-diff` (`resolve`, `materialise`, `git.diff` over an
+intention). `git-context` runs today. The app-side verb `raj ctl intent diff
+<name>` now answers the same question directly: it materialises the named
+intention alone over its base and prints the change as a stat and unified diff,
+read-only. The composite still parses only once the app-side `intent.resolve`
+and `intent.materialise` leaves land, since resolving a live intention needs
+the app's buffer projection and no hook leaf can reach it.
+
+**Authoring.** `raj hook add` carries the action as raw JSON through
+`--action`; it is the only CLI path to the `builtin` and `steps` forms (an argv
+after `--` and `--shell` cover the other two). The server validates the action
+with `Parse` before it stores the row, so a bad action lands only if `Parse`
+accepts it. `git-context` is authored thus:
+
+    raj hook add git-context --agent --action '{"steps":[{"name":"status","builtin":"git.status"},{"name":"diff","builtin":"git.diff"},{"name":"log","builtin":"git.log","args":{"count":20}}]}'
+
+`raj hook show git-context` echoes the stored row and `raj hook run
+git-context` runs the chain, so the row is a composite, not an opaque blob.
+
+**Deferred: `intention-diff`.** The verb exists now: `raj ctl intent diff
+<name>` materialises a named intention alone over its base and prints the slice
+as a stat and unified diff, so a person can look at it without running a check
+hook. The composite still waits on the app-side `intent.resolve` and
+`intent.materialise` leaves, since its `resolve` and `materialise` steps need
+the app's live projection (`internal/app`) that no hook leaf can reach, and on
+a `git.diff` step that can take a tree object rather than only a ref.
+
+## 2. Storage — the hooks table and its forward migrations
 
 The store already carries a versioned, idempotent migration list. Hooks are
-the **v2 -> v3** table and the **v3 -> v4** `tree` and `detach` columns in the
-same SQLite database.
+the **v2 -> v3** table, the **v3 -> v4** `tree` and `detach` columns, and the
+**v9 -> v10** `params` column, all in the same SQLite database.
 
     CREATE TABLE IF NOT EXISTS hooks (
       name        TEXT PRIMARY KEY,
@@ -139,7 +229,13 @@ statements that backfill every row written before them:
     ALTER TABLE hooks ADD COLUMN tree TEXT NOT NULL DEFAULT 'projected'
     ALTER TABLE hooks ADD COLUMN detach INTEGER NOT NULL DEFAULT 0
 
-The step runs in the transaction that records the version, and an `ADD COLUMN`
+The `params` column is migration **v9 -> v10**, one more `ALTER TABLE` whose
+`'[]'` default backfills every existing row, so a stored hook keeps working and
+takes no parameters:
+
+    ALTER TABLE hooks ADD COLUMN params TEXT NOT NULL DEFAULT '[]'
+
+Each step runs in the transaction that records the version, and an `ADD COLUMN`
 that finds the column already there is skipped, so re-running or racing the
 step is harmless.
 
@@ -154,17 +250,28 @@ step is harmless.
 
 ## 3. The agent contract
 
-One verb: `run <name>`. Name only. Allowed iff the hook exists, `enabled = 1`,
-`agent = 1`, its action is not a `HumanOnly` builtin leaf (§1.1), and it belongs
-to the current workspace. Anything else refuses with the name and the reason.
+One verb: `run <name> [NAME=value ...]`. A name, plus a value for each parameter
+the author declared. Allowed iff the hook exists, `enabled = 1`, `agent = 1`,
+its action is not a `HumanOnly` builtin leaf (§1.1), and it belongs to the
+current workspace. Anything else refuses with the name and the reason. The
+server resolves and validates the parameters before it reserves a run, so a
+refusal never starts the action.
 
-The reply carries: run id, hook name, the revision it ran against, the git state
-it ran against (section 6), exit status, capped output, and a truncated flag.
-Result frames may stream; the last frame is final. A cancelled run reports
-*cancelled*, never a zero exit.
+Each assignment is validated against its declaration: an unknown name, a
+duplicate, a value outside the declared domain, and a missing parameter that has
+no default are all refused, echoing the declaration. A parameter with a default
+may be omitted, and the default is used. A hook that declares none is run with
+no assignments and behaves exactly as before.
 
-There is no verb to define, edit, enable, or run arbitrary commands. A read-only
-`run --list` gives the agent its capabilities so it does not have to guess.
+The reply carries: run id, hook name, the resolved parameter values, the
+revision it ran against, the git state it ran against (section 6), exit status,
+capped output, and a truncated flag. Result frames may stream; the last frame
+is final. A cancelled run reports *cancelled*, never a zero exit.
+
+There is no verb to define, edit, enable, or run arbitrary commands, and no verb
+to pass arbitrary argv, env or cwd: the only values a run may add are the
+declared parameters. A read-only `run --list` gives the agent its capabilities
+so it does not have to guess.
 
 ## 4. Execution
 
@@ -174,9 +281,14 @@ There is no verb to define, edit, enable, or run arbitrary commands. A read-only
   workspace root for a `workspace` hook. A workspace hook is refused unless the
   workspace is ready — no dirty buffer and no pending change set, the predicate
   `raj ctl status` applies — so it only ever builds what the user saved. **env**
-  is inherited from the editor unchanged — no separate PATH and no injected
-  variables — so `make`, `go` and `docker` resolve as they do in the user's
-  shell.
+  is the editor's environment plus the run's resolved parameters as
+  `RAJ_PARAM_<NAME>`, where `<NAME>` is the parameter name upper-cased with
+  every character that is not an ASCII letter or digit turned into `_`; a value
+  rides an environment variable and never an argv element. A hook that declares
+  no parameters injects nothing, so `make`, `go` and `docker` resolve exactly as
+  they do in the user's shell. A builtin leaf has no process, so it reads the
+  same entries from its run context (`builtin.ParamEnv`), exactly as it reads
+  the chain environment.
 - Wall-clock **timeout**, with a **process-group kill** on timeout or cancel so
   children are not orphaned.
 - **Output cap** (bytes) with a truncated flag. Exit status captured even on
@@ -330,14 +442,17 @@ possible later (a git `pre-commit` calling `raj hook run check`), but not in v0.
 
 ## 7. CLI
 
-    raj hook add <name> -- <argv...>     # or --shell "..."
+    raj hook add <name> -- <argv...>     # or --shell "...", or --action JSON
     raj hook add <name> --tree projected|workspace   # default projected
     raj hook add <name> --detach                 # run in its own session
+    raj hook add <name> --param 'NAME=enum(a,b,c)[=default]'   # repeatable
+    raj hook add <name> --param 'NAME=string(<regex>)[=default]'
+    raj hook add <name> --param 'NAME=uint[=default]'
     raj hook list                        # trigger, agent, cooldown, and the panic switch
     raj hook show <name>
     raj hook rm <name>
     raj hook enable|disable <name>
-    raj hook run <name>                  # the human equivalent of the agent verb
+    raj hook run <name> [NAME=value ...]  # the human equivalent of the agent verb
     raj hook log [--show RUN-ID [--tail N]]   # the last 100 runs, or one run's tail
     raj hook ps                          # the runs in flight now
     raj hook cancel <run-id>             # local-only
@@ -347,7 +462,10 @@ Creation defaults to the workspace, matching the settings pane's default scope.
 The CLI is the only way to author hooks; the agent surface is read/execute only.
 Authoring, `cancel` and `off|on` are local-only over the transport; `log` and
 `ps` are reads that cross. The agent's own `run` crosses, bounded by each hook's
-`agent` flag.
+`agent` flag. A run carries only `NAME=value` assignments, parsed positionally
+after the name and validated against the hook's declared parameters; an unknown
+name, a missing required value or one outside its domain is refused before the
+action starts.
 
 ## 8. Lifecycle and who may author
 

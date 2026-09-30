@@ -109,6 +109,9 @@ type hookRunProcess struct {
 	Revision uint64 `json:"revision,omitempty"`
 	Head     string `json:"head,omitempty"`
 	Dirty    string `json:"dirty,omitempty"`
+	// Params are the run's resolved parameter values, recorded so a run
+	// recovered after a restart still names what it ran with.
+	Params []hooks.ParamValue `json:"params,omitempty"`
 }
 
 // readHookRunProcess reads the process record for id. ok is false for an absent
@@ -270,7 +273,8 @@ func (s *Server) recoverHookRuns() {
 		case hasExit:
 			s.addHookResult(hooks.Result{ID: id, Hook: p.Hook, Author: p.Author,
 				Revision: p.Revision, Head: p.Head, Dirty: p.Dirty, Exit: exit,
-				Detach: true, Recovered: true, LogPath: hookRunLogPath(dir, id), PID: p.PID})
+				Detach: true, Recovered: true, LogPath: hookRunLogPath(dir, id), PID: p.PID,
+				Params: p.Params})
 			_ = os.Remove(hookRunExitPath(dir, id))
 			_ = os.Remove(hookRunPidPath(dir, id))
 		case hasPid && hookRunProcessAlive(p.PID):
@@ -282,7 +286,7 @@ func (s *Server) recoverHookRuns() {
 			s.addHookResult(hooks.Result{ID: id, Hook: p.Hook, Author: p.Author,
 				Revision: p.Revision, Head: p.Head, Dirty: p.Dirty, Detach: true, Lost: true,
 				Err:     "lost: the editor restarted and the run left no exit status",
-				LogPath: hookRunLogPath(dir, id), PID: p.PID})
+				LogPath: hookRunLogPath(dir, id), PID: p.PID, Params: p.Params})
 			_ = os.Remove(hookRunPidPath(dir, id))
 		}
 	}
@@ -372,6 +376,7 @@ func (s *Server) logAdoptedCompletion(dir string, id uint64, p hookRunProcess, c
 			ID: id, Hook: p.Hook, Author: p.Author, Revision: p.Revision,
 			Head: p.Head, Dirty: p.Dirty, Exit: code, DurationMS: duration, Detach: true,
 			LogPath: hookRunLogPath(dir, id), PID: p.PID, Recovered: true, Err: errText,
+			Params: p.Params,
 		})
 	}
 	pruneHookRunDir(dir, id)
@@ -396,7 +401,7 @@ func detachedArgv(argv []string, shell string) []string {
 // startDetachedRun starts argv in its own session with its output going to the
 // run's log file. It returns the started command so the caller can install a
 // cancel that kills its process group and reap it when it ends.
-func startDetachedRun(dir string, id uint64, argv []string, runDir string) (*exec.Cmd, string, error) {
+func startDetachedRun(dir string, id uint64, argv []string, runDir string, env []string) (*exec.Cmd, string, error) {
 	if len(argv) == 0 {
 		return nil, "", errors.New("detached hook has no command")
 	}
@@ -408,7 +413,8 @@ func startDetachedRun(dir string, id uint64, argv []string, runDir string) (*exe
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = runDir
 	cmd.Stdout, cmd.Stderr = f, f
-	cmd.Env = append(os.Environ(), "RAJ_HOOK_EXIT="+hookRunExitPath(dir, id))
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(cmd.Env, "RAJ_HOOK_EXIT="+hookRunExitPath(dir, id))
 	setDetachedSession(cmd)
 	if err := cmd.Start(); err != nil {
 		f.Close()
@@ -456,7 +462,8 @@ func (c *connection) runHookDetached(req Request, emit func(Response), prep Resp
 	})
 
 	argv := detachedArgv(prep.HookArgv, prep.HookShell)
-	proc, logPath, serr := startDetachedRun(dir, runID, argv, runDir)
+	paramEnv := hooks.ParamEnv(prep.HookParamValues)
+	proc, logPath, serr := startDetachedRun(dir, runID, argv, runDir, paramEnv)
 	if serr != nil {
 		if cleanup != nil {
 			cleanup()
@@ -471,6 +478,7 @@ func (c *connection) runHookDetached(req Request, emit func(Response), prep Resp
 	writeHookRunProcess(dir, runID, hookRunProcess{
 		PID: proc.Process.Pid, Start: startedAt.UnixNano(), Deadline: deadline, Hook: req.HookName,
 		Author: caller, Revision: prep.HookRevision, Head: prov.Head, Dirty: prov.DirtyDigest,
+		Params: prep.HookParamValues,
 	})
 
 	emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
@@ -551,7 +559,7 @@ func (c *connection) runHookDetached(req Request, emit func(Response), prep Resp
 				ID: runID, Hook: hookName, Author: caller, Revision: prep.HookRevision,
 				Head: prov.Head, Dirty: prov.DirtyDigest, Exit: code,
 				DurationMS: time.Since(startedAt).Milliseconds(), Detach: true,
-				LogPath: logPath, PID: pid, Err: errText,
+				LogPath: logPath, PID: pid, Err: errText, Params: prep.HookParamValues,
 			})
 		}
 		pruneHookRunDir(dir, runID)

@@ -129,6 +129,12 @@ type File struct {
 	// process, and silently writing them over the path would clobber the file.
 	snapshot bool
 
+	// readOnly records that this buffer is a synthetic view rather than a
+	// document: a seam's diff, built into a tab. Nothing on disk is this
+	// buffer's bytes, so Save and SaveOver refuse with ErrReadOnly and the
+	// application refuses an edit before it reaches the buffer.
+	readOnly bool
+
 	// Enc is how the file's bytes are shaped around the text — line endings
 	// and byte order mark — so a save reproduces what was opened.
 	Enc Encoding
@@ -996,6 +1002,9 @@ func (e *UnsavedProposedError) Error() string {
 // since raj last read or wrote it. Overwriting is still available through
 // SaveOver; what is not available is doing it without being asked.
 func (f *File) Save() error {
+	if f.readOnly {
+		return ErrReadOnly
+	}
 	if f.snapshot {
 		return ErrSnapshotReadOnly
 	}
@@ -1008,6 +1017,9 @@ func (f *File) Save() error {
 // SaveOver is Save without the disk-changed check. Only for a caller that has
 // asked and been told to go ahead.
 func (f *File) SaveOver() error {
+	if f.readOnly {
+		return ErrReadOnly
+	}
 	if f.Path == "" {
 		return os.ErrInvalid
 	}
@@ -1097,6 +1109,20 @@ func (f *File) RefreshSyntax() {
 func (f *File) SetDark(dark bool) {
 	f.dark = dark
 	f.Syntax = syntax.New(f.Path, dark)
+}
+
+// AdoptSyntax keeps other's highlighter instead of building a fresh one. The
+// caller must have established that the text is unchanged: the spans are
+// aligned to a document, and adopting them for different text would colour the
+// wrong bytes. It is how the attached client keeps the colours on screen when a
+// re-sync repeats a file it already shows, instead of blanking them until a
+// retokenise lands.
+func (f *File) AdoptSyntax(other *File) {
+	if other == nil || other.Syntax == nil {
+		return
+	}
+	f.dark = other.dark
+	f.Syntax = other.Syntax
 }
 
 // SetPath renames the buffer, which is what a save-as does: the text is

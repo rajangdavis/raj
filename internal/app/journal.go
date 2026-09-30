@@ -516,7 +516,8 @@ func (a *App) closeJournals() {
 
 // restoreJournals rebuilds dirty buffers from their logs at startup. It runs
 // from RestoreSession and replaces the clean File a tab was opened with when a
-// log for that path matches its base.
+// log for that path matches its base; a log whose path the session did not open
+// comes back as a headless buffer rather than a tab.
 func (a *App) restoreJournals() {
 	if !journalEnabled() || a.roots.Len() == 0 || a.NoRestore {
 		return
@@ -536,8 +537,10 @@ func (a *App) restoreJournals() {
 	a.restoreAuthors()
 }
 
-// restoreLog tries to turn one log back into a dirty tab. Every refusal is
-// quiet except the base mismatch, which is the one the user has to know about:
+// restoreLog tries to turn one log back into a dirty buffer. A path the session
+// already opened keeps its tab, and any other comes back headless: a recovered
+// buffer is not a reason to put a file on screen. Every refusal is quiet except
+// the base mismatch, which is the one the user has to know about:
 // it means the file moved under the editor, so the log's ops no longer describe
 // it. The log is archived for inspection rather than deleted, and the clean
 // file stands; a later edit starts a fresh base against the current bytes.
@@ -572,13 +575,18 @@ func (a *App) restoreLog(logPath string) {
 		// the bytes already on disk and holds no decision, so there is
 		// nothing to restore: remove it and do not open a tab, or a tab the
 		// user closed comes back. A log with unsaved work -- ops past the
-		// written baseline, or a pending decision -- still reopens below.
+		// written baseline, or a pending decision -- still restores below.
 		sess := buildSession(l)
 		if sess != nil && a.logIsCleanOnDisk(base, sess, mark, wrote) {
 			_ = os.Remove(logPath)
 			return
 		}
-		opened, err := a.Tabs.Open(base.Path)
+		// The buffer was not one of the session's tabs, so it comes back as a
+		// buffer, not a tab: the log is recovery, and recovery is not a reason
+		// to put a file on screen. A pending set is the exception -- that is
+		// review work the user has to decide, and the end of this function
+		// announces it as a review tab.
+		opened, err := a.loadHeadless(base.Path)
 		if err != nil {
 			return // deleted, binary or too large: nothing to attach the log to
 		}
@@ -649,7 +657,23 @@ func (a *App) restoreLog(logPath string) {
 	// that should be appended to. At this moment matches still holds, so
 	// startTap's reuse branch takes the log; a nil return has set the status.
 	a.startTap(p)
-	a.TouchSession()
+	// A tab the session already opened keeps its membership. A recovered buffer
+	// without one must not be written into the session as if the user had
+	// opened it -- unless it holds a pending change set, which is review work
+	// the user has to decide (spec 10): that one is announced, and announceQuiet
+	// marks it so the session keeps it only while the review lasts. A session
+	// tab restored with a pending set is marked the same way, so a resolved
+	// review drops out instead of becoming a permanent tab.
+	if a.Tabs.Contains(p) {
+		if len(p.File.Session().Pending()) > 0 {
+			a.markAnnounced(p.File.Path)
+		}
+		a.TouchSession()
+		return
+	}
+	if len(p.File.Session().Pending()) > 0 {
+		a.announceQuiet(p)
+	}
 }
 
 // restoredEncoding resolves the shape a restored buffer re-encodes with. A log

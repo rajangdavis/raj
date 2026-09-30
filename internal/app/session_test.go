@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"raj/internal/hidden"
+	"raj/internal/piecetable"
 	"raj/internal/session"
 	"raj/internal/store"
 	"raj/internal/ui"
@@ -30,6 +31,89 @@ func storedSession(t *testing.T, a *App) session.State {
 		return session.State{}
 	}
 	return session.Decode(blob, a.primaryRoot())
+}
+
+// sessionHasTab reports whether the captured session would restore path as a
+// tab.
+func sessionHasTab(st session.State, path string) bool {
+	for _, tab := range st.Tabs {
+		if tab.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// A tab that exists only because a buffer was announced -- a reveal, a goto, an
+// agent open -- is the agent view, not the user tab set. It is on screen, but
+// the session does not keep it, so a long agent run cannot grow the set a
+// restart restores.
+func TestReadOnlyAnnouncementLeavesNoSessionTab(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "root\n")
+	user := h.Tabs.Active().File.Path
+
+	other := filepath.Join(h.primaryRoot(), "other.go")
+	if err := os.WriteFile(other, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.openFileQuiet(other) // what `raj ctl open` does
+
+	p := h.paneFor(other)
+	if p == nil || !h.Tabs.Contains(p) {
+		t.Fatal("the agent open did not put the buffer on screen")
+	}
+	if sessionHasTab(h.SessionState(), other) {
+		t.Fatalf("an agent open was written into the session: %+v",
+			h.SessionState().Tabs)
+	}
+	if got := h.SessionState().Tabs; len(got) != 1 || got[0].Path != user {
+		t.Fatalf("session tabs = %+v, want only the user-opened %s", got, user)
+	}
+}
+
+// A tab that holds a pending change set is the review the user has to decide,
+// so it is a real tab and the session keeps it. Once the review is resolved the
+// tab drops out of the session, so review tabs do not accumulate either.
+func TestReviewTabSurvivesWhilePending(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "root\n")
+
+	other := filepath.Join(h.primaryRoot(), "other.go")
+	if err := os.WriteFile(other, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := h.loadHeadless(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.announceQuiet(p) // the announcement a proposal makes
+	p.File.Begin()
+	p.File.ApplyDiff(piecetable.Agent, p.File.Session().Version(),
+		[]piecetable.Hunk{{Start: 0, End: 0, Text: "// review\n"}})
+	p.File.End()
+	id := p.File.Session().LastGroup()
+	p.File.Session().MarkGroup(id, piecetable.Proposed)
+
+	// While the review is pending the tab is a real tab.
+	if !sessionHasTab(h.SessionState(), other) {
+		t.Fatalf("a review tab was not kept: %+v", h.SessionState().Tabs)
+	}
+	// Accepting is not saving: the accepted text is still unsaved work, so the
+	// tab stays and the session is what reopens it.
+	p.File.Session().AcceptGroup(id)
+	if !sessionHasTab(h.SessionState(), other) {
+		t.Fatalf("an accepted-but-unsaved review lost its session tab: %+v",
+			h.SessionState().Tabs)
+	}
+	// Once the text is on disk the tab is clean and drops out of the session.
+	if err := p.File.SaveOver(); err != nil {
+		t.Fatal(err)
+	}
+	if sessionHasTab(h.SessionState(), other) {
+		t.Fatalf("the saved review still holds a session tab: %+v",
+			h.SessionState().Tabs)
+	}
 }
 
 // The whole point, end to end: leave a workspace somewhere, come back, land

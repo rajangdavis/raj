@@ -17,10 +17,12 @@ import (
 // and states the local-only rule authoring obeys.
 const hookUsage = `usage: raj hook <command> [options]
 
-  add <name> -- ARGV...      store a hook that runs ARGV; --shell S for a shell string
+  add <name> -- ARGV...      store a hook that runs ARGV; --shell S for a shell string,
+                             --action JSON for a builtin or composite (steps) action
   list                       list the workspace's hooks, and whether hooks are off
   show <name>                show one hook
-  run <name>                 run the hook against its tree: projected or workspace
+  run <name> [NAME=value...] run the hook against its tree: projected or workspace,
+                             passing each declared parameter by name
   log [--show RUN-ID [--tail N]]  the last 100 runs, or the tail of one run's log
   ps                         list the runs in flight now
   cancel <run-id>            stop an in-flight run
@@ -29,7 +31,10 @@ const hookUsage = `usage: raj hook <command> [options]
   enable <name>              allow a disabled hook to run
   disable <name>             stop a hook from running
 
-add flags: --agent --cooldown-ms N --timeout-ms N --may-write --tree projected|workspace --detach --disabled
+add flags: --agent --cooldown-ms N --timeout-ms N --may-write --tree projected|workspace
+           --detach --disabled --action JSON
+           --param DECL: NAME=enum(a,b,c), NAME=string(<regex>) or NAME=uint, each
+           with an optional =default that makes it optional at run time
 
 The editor is found automatically, or named with --addr or RAJ_CONTROL_ADDR.
 Authoring (add, rm, enable, disable), cancel and off/on are local-only: a TCP
@@ -41,6 +46,25 @@ reads and cross.
 
 // HookCLI runs one `raj hook` command and returns a process exit code. It dials
 // a running editor exactly as `raj ctl` does, reusing Locate and Dial.
+// stringList is a repeatable string flag: each --param appends one declaration
+// in the order given, so a hook's parameters keep their authored order.
+type stringList []string
+
+// String renders the list for the flag package's usage line.
+func (s *stringList) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ",")
+}
+
+// Set appends one value. It never fails, so a malformed declaration is the
+// server's refusal rather than a parse error in the flag package.
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func HookCLI(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, hookUsage)
@@ -68,6 +92,9 @@ func HookCLI(args []string, stdout, stderr io.Writer) int {
 	show := fs.String("show", "", "log: show the tail of one run's log by run id")
 	tail := fs.Int("tail", 0, "log --show: keep only the last N lines")
 	disabled := fs.Bool("disabled", false, "add: store the hook disabled")
+	action := fs.String("action", "", `add: the action as raw JSON, e.g. a {"steps":[...]} composite`)
+	param := &stringList{}
+	fs.Var(param, "param", `add: declare a parameter (repeatable): NAME=enum(a,b,c), NAME=string(<regex>) or NAME=uint, each with an optional =default`)
 
 	// For add, everything after "--" is the hook's argv and must reach it
 	// intact, exactly as exec treats a command line.
@@ -119,13 +146,19 @@ func HookCLI(args []string, stdout, stderr io.Writer) int {
 
 	switch sub {
 	case "add":
-		return hookAdd(c, fs.Arg(0), argv, *shell, *agent, *cooldown, *timeout, *tree, *mayWrite, *detach, *disabled, stdout, stderr, *asJSON)
+		return hookAdd(c, fs.Arg(0), argv, *shell, *action, *param, *agent, *cooldown, *timeout, *tree, *mayWrite, *detach, *disabled, stdout, stderr, *asJSON)
 	case "list":
 		return hookList(c, stdout, stderr, *asJSON)
 	case "show":
 		return hookShow(c, fs.Arg(0), stdout, stderr, *asJSON)
 	case "run":
-		return hookRun(c, fs.Arg(0), stdout, stderr, *asJSON)
+		// Everything after the name is a NAME=value parameter assignment; a
+		// bare name has none.
+		var params []string
+		if fs.NArg() > 1 {
+			params = fs.Args()[1:]
+		}
+		return hookRun(c, fs.Arg(0), params, stdout, stderr, *asJSON)
 	case "log":
 		return hookLog(c, *show, *tail, stdout, stderr, *asJSON)
 	case "ps":
@@ -142,12 +175,15 @@ func HookCLI(args []string, stdout, stderr io.Writer) int {
 // hookRun runs one hook. The command runs against the hook's own tree on the
 // server -- a projected scratch tree by default, or the saved workspace root --
 // so the output streams exactly as `raj ctl exec`'s does and the exit
-// status is the hook's own; a refusal -- unknown, disabled, agent-only, in
-// flight or cooling -- exits 2, so "the hook failed" and "the hook never ran"
-// stay distinguishable. A detached hook returns before it finishes, so hookRun
-// prints the started line and no completion stamp: the stamp belongs to the run
-// end, which the reply did not wait for.
-func hookRun(c *Client, name string, stdout, stderr io.Writer, asJSON bool) int {
+// status is the hook's own; a refusal -- unknown, disabled, agent-only,
+// undeclared or invalid parameters, in flight or cooling -- exits 2, so "the
+// hook failed" and "the hook never ran" stay distinguishable. params are the
+// NAME=value assignments after the hook name; the server validates each against
+// the hook's declarations before the action starts, so a refusal never runs it.
+// A detached hook returns before it finishes, so hookRun prints the started
+// line and no completion stamp: the stamp belongs to the run end, which the
+// reply did not wait for.
+func hookRun(c *Client, name string, params []string, stdout, stderr io.Writer, asJSON bool) int {
 	if name == "" {
 		fmt.Fprintln(stderr, "raj hook run: needs a name")
 		return 2
@@ -165,7 +201,7 @@ func hookRun(c *Client, name string, stdout, stderr io.Writer, asJSON bool) int 
 			io.WriteString(stdout, b)
 		}
 	}
-	res, err := c.DoExec(Request{Op: "hook", HookMode: "run", HookName: name}, relay)
+	res, err := c.DoExec(Request{Op: "hook", HookMode: "run", HookName: name, HookParams: params}, relay)
 	if err != nil {
 		fmt.Fprintln(stderr, "raj hook run:", err)
 		return 2
@@ -265,6 +301,13 @@ func hookLog(c *Client, show string, tail int, stdout, stderr io.Writer, asJSON 
 	for _, r := range rows {
 		fmt.Fprintf(stdout, "%d\t%s\tauthor=%d\trevision=%d\tHEAD=%s\tdirty=%s\texit=%d\tduration=%dms\ttruncated=%t",
 			r.ID, r.Hook, r.Author, r.Revision, r.Head, r.Dirty, r.Exit, r.DurationMS, r.Truncated)
+		if len(r.Params) > 0 {
+			parts := make([]string, 0, len(r.Params))
+			for _, p := range r.Params {
+				parts = append(parts, p.Name+"="+p.Value)
+			}
+			fmt.Fprintf(stdout, "\tparams=%s", strings.Join(parts, ","))
+		}
 		if r.Detach {
 			fmt.Fprintf(stdout, "\tdetached")
 			if r.PID > 0 {
@@ -373,20 +416,31 @@ func hookSwitch(c *Client, mode string, stdout, stderr io.Writer, asJSON bool) i
 }
 
 // hookAdd builds one HookRow and puts it. The add grammar is the spec's: an
-// argv after "--", or a --shell string, but not both. A new hook defaults to
-// trigger agent, tree projected, agent false (never agent-callable by default),
+// argv after "--", a --shell string, or --action raw JSON (the path to a
+// builtin or a composite steps action), exactly one of the three. The server
+// validates the action with the hooks domain, so a bad --action is not stored.
+// A new hook defaults to trigger agent, tree projected, agent false (never
+// agent-callable by default),
 // enabled true unless --disabled, and zero cooldown and timeout.
-func hookAdd(c *Client, name string, argv []string, shell string, agent bool, cooldown, timeout int, tree string, mayWrite, detach, disabled bool, stdout, stderr io.Writer, asJSON bool) int {
+func hookAdd(c *Client, name string, argv []string, shell, actionJSON string, params []string, agent bool, cooldown, timeout int, tree string, mayWrite, detach, disabled bool, stdout, stderr io.Writer, asJSON bool) int {
 	if name == "" {
 		fmt.Fprintln(stderr, "raj hook add: needs a name")
 		return 2
 	}
-	if shell != "" && len(argv) > 0 {
-		fmt.Fprintln(stderr, "raj hook add: --shell and an argv after -- are mutually exclusive")
+	forms := 0
+	for _, used := range []bool{len(argv) > 0, shell != "", actionJSON != ""} {
+		if used {
+			forms++
+		}
+	}
+	if forms > 1 {
+		fmt.Fprintln(stderr, "raj hook add: --shell, --action and an argv after -- are mutually exclusive")
 		return 2
 	}
 	var action string
 	switch {
+	case actionJSON != "":
+		action = actionJSON
 	case shell != "":
 		data, err := json.Marshal(map[string]string{"shell": shell})
 		if err != nil {
@@ -402,13 +456,24 @@ func hookAdd(c *Client, name string, argv []string, shell string, agent bool, co
 		}
 		action = string(data)
 	default:
-		fmt.Fprintln(stderr, "raj hook add: needs an argv after -- or a --shell string")
+		fmt.Fprintln(stderr, "raj hook add: needs an argv after --, a --shell string or an --action JSON")
 		return 2
+	}
+	// A declaration list crosses as one JSON array, exactly as the action does;
+	// empty means the hook declares no parameters.
+	paramsJSON := ""
+	if len(params) > 0 {
+		data, err := json.Marshal(params)
+		if err != nil {
+			fmt.Fprintln(stderr, "raj hook add:", err)
+			return 1
+		}
+		paramsJSON = string(data)
 	}
 	row := HookRow{
 		Name: name, Action: action, Trigger: "agent", Tree: tree, Agent: agent,
 		CooldownMS: cooldown, TimeoutMS: timeout, MayWrite: mayWrite, Detach: detach,
-		Enabled: !disabled,
+		Enabled: !disabled, Params: paramsJSON,
 	}
 	data, err := json.Marshal(row)
 	if err != nil {
@@ -522,8 +587,12 @@ func printHooks(stdout io.Writer, rows []HookRow) int {
 		if r.Agent {
 			agent = "agent"
 		}
-		fmt.Fprintf(stdout, "%s\ttrigger=%s\ttree=%s\t%s\t%s\tcooldown=%dms\ttimeout=%dms\tmay-write=%t\tdetach=%t\n",
+		line := fmt.Sprintf("%s\ttrigger=%s\ttree=%s\t%s\t%s\tcooldown=%dms\ttimeout=%dms\tmay-write=%t\tdetach=%t",
 			r.Name, r.Trigger, r.Tree, agent, state, r.CooldownMS, r.TimeoutMS, r.MayWrite, r.Detach)
+		if r.Params != "" && r.Params != "[]" {
+			line += "\tparams=" + r.Params
+		}
+		fmt.Fprintln(stdout, line)
 	}
 	return 0
 }

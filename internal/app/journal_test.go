@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,19 @@ func archivedLogs(t *testing.T, a *App) []os.DirEntry {
 		return nil
 	}
 	return entries
+}
+
+// restoredFile finds a restored buffer by path across the tabs and the headless
+// registry. A recovered buffer that was not one of the session's tabs comes
+// back headless, so a test that reached it through Tabs alone would miss it.
+func restoredFile(a *App, path string) *editor.File {
+	if p := a.paneFor(path); p != nil {
+		return p.File
+	}
+	if p, ok := a.findHeadless(path); ok {
+		return p.File
+	}
+	return nil
 }
 
 // TestJournalCaptureWritesBaseStoreAndOps captures one edit and asserts the
@@ -159,8 +173,13 @@ func TestJournalRestoreSkipsChangedFile(t *testing.T) {
 	defer a.closeJournals()
 	a.RestoreSession()
 
-	if a.Pane() == nil {
-		t.Fatal("the changed file did not open")
+	if a.Pane() != nil {
+		t.Errorf("the changed file opened a tab: %q", a.Pane().File.Path)
+	}
+	if hp, ok := a.findHeadless(p.File.Path); !ok {
+		t.Fatal("the changed file did not open as a buffer")
+	} else if got := hp.File.Text(); got != "different\n" {
+		t.Errorf("buffer text = %q, want the file on disk", got)
 	}
 	if !strings.Contains(a.Status(), "changed on disk") {
 		t.Errorf("status = %q, want a note about the changed file", a.Status())
@@ -261,10 +280,14 @@ func TestJournalRestoreSkipsExternalEditAfterSave(t *testing.T) {
 	defer a.closeJournals()
 	a.RestoreSession()
 
-	if a.Pane() == nil {
-		t.Fatal("the changed file did not open")
+	if a.Pane() != nil {
+		t.Errorf("the changed file opened a tab: %q", a.Pane().File.Path)
 	}
-	if got := a.Pane().File.Text(); got != "different\n" {
+	hp, ok := a.findHeadless(p.File.Path)
+	if !ok {
+		t.Fatal("the changed file did not open as a buffer")
+	}
+	if got := hp.File.Text(); got != "different\n" {
 		t.Errorf("restored text = %q, want the file on disk", got)
 	}
 	if !strings.Contains(a.Status(), "changed on disk") {
@@ -385,13 +408,10 @@ func TestJournalSeedTask(t *testing.T) {
 		t.Errorf("restored participant task = %q, want task-3", got.Task)
 	}
 
-	var restored *editor.File
-	for _, tab := range a.Tabs.All() {
-		if tab.File.Path == p.File.Path {
-			restored = tab.File
-			break
-		}
-	}
+	// A recovered buffer that is not a session tab comes back headless, so the
+	// lookup spans both lists: the group's task is what this test is about, not
+	// where the pane lives.
+	restored := restoredFile(a, p.File.Path)
 	if restored == nil {
 		t.Fatal("the restored buffer is not open")
 	}
@@ -477,10 +497,11 @@ func TestJournalArchivesMismatchedLogAndStartsFreshBase(t *testing.T) {
 	defer a.closeJournals()
 	a.RestoreSession()
 
-	if a.Pane() == nil {
-		t.Fatal("the changed file did not open")
+	hp, ok := a.findHeadless(p.File.Path)
+	if !ok {
+		t.Fatal("the changed file did not open as a buffer")
 	}
-	if a.Pane().File.Dirty() {
+	if hp.File.Dirty() {
 		t.Error("the buffer opened dirty; the clean disk should stand")
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
@@ -492,12 +513,12 @@ func TestJournalArchivesMismatchedLogAndStartsFreshBase(t *testing.T) {
 
 	// The first mutation after the rotation lays a fresh base against the bytes
 	// now on disk, not the archived log.
-	f := a.Pane().File
+	f := hp.File
 	f.Begin()
 	f.ApplyDiff(piecetable.User, f.Session().Version(),
 		[]piecetable.Hunk{{Start: 0, End: 0, Text: "Y"}})
 	f.End()
-	a.flushJournal(a.Pane())
+	a.flushJournal(hp)
 
 	l, err := journal.Open(logPath)
 	if err != nil {
@@ -659,8 +680,9 @@ func TestJournalRestoreDropsCleanLeftover(t *testing.T) {
 	}
 }
 
-// A log with unsaved work is crash recovery, not a leftover: restore still
-// opens it as a dirty tab carrying the edits the log recorded.
+// A log with unsaved work is crash recovery, not a leftover. A path the session
+// did not open comes back as a headless buffer carrying the edits the log
+// recorded; recovery does not put a tab on screen.
 func TestJournalRestoreKeepsUnsavedLog(t *testing.T) {
 	t.Setenv(JournalEnv, "1")
 	h := newHarness(t, "base\n")
@@ -678,17 +700,228 @@ func TestJournalRestoreKeepsUnsavedLog(t *testing.T) {
 	defer a.closeJournals()
 	a.RestoreSession()
 
-	if a.Pane() == nil {
-		t.Fatal("a log with unsaved work did not reopen")
+	if a.Pane() != nil {
+		t.Errorf("a log with unsaved work opened a tab: %q", a.Pane().File.Path)
 	}
-	if got := a.Pane().File.Text(); got != want {
+	hp, ok := a.findHeadless(p.File.Path)
+	if !ok {
+		t.Fatal("a log with unsaved work was not restored as a buffer")
+	}
+	if got := hp.File.Text(); got != want {
 		t.Errorf("restored text = %q, want %q", got, want)
 	}
-	if !a.Pane().File.Dirty() {
+	if !hp.File.Dirty() {
 		t.Error("a restored unsaved buffer should read dirty")
 	}
 	if _, err := os.Stat(logPath); err != nil {
-		t.Errorf("the log backing a restored tab went missing: %v", err)
+		t.Errorf("the log backing a restored buffer went missing: %v", err)
+	}
+}
+
+// Restore opens the tabs that were tabs and no others. A workspace whose
+// journal holds more recovered buffers than the session holds tabs comes back
+// with those buffers restored headless, so a daemon started over a long agent
+// run does not present a wall of tabs.
+func TestJournalRestoreOpensTheTabsAndNoOthers(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	root := t.TempDir()
+	tabs := []string{
+		filepath.Join(root, "tab-a.txt"),
+		filepath.Join(root, "tab-b.txt"),
+	}
+	for _, p := range tabs {
+		if err := os.WriteFile(p, []byte("tab\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// More recovered buffers than tabs, and more than the headless cap, so the
+	// test also pins that recovered work is retained rather than announced.
+	recovered := make([]string, 0, headlessMax+2)
+	for i := 0; i < headlessMax+2; i++ {
+		p := filepath.Join(root, fmt.Sprintf("recovered-%d.txt", i))
+		if err := os.WriteFile(p, []byte("base\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		recovered = append(recovered, p)
+	}
+
+	// One run opens the two tabs and saves the session.
+	first := newHarnessAt(t, root)
+	for _, p := range tabs {
+		first.OpenFile(p)
+	}
+	if err := first.SaveSession(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second run edits the other files, leaving each an op log, and never
+	// lands them in the session.
+	second := newHarnessAt(t, root)
+	for _, p := range recovered {
+		second.OpenFile(p)
+		second.typeText("X")
+		second.flushJournal(second.Tabs.Active())
+	}
+	second.closeJournals()
+	// Editing may have ticked a save; the fixture is "more buffers than tabs",
+	// so pin the session back to the two tabs.
+	if err := first.SaveSession(); err != nil {
+		t.Fatal(err)
+	}
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, root, 2)
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	if got := a.Tabs.Count(); got != len(tabs) {
+		t.Fatalf("restored tabs = %d, want only the %d that were tabs", got, len(tabs))
+	}
+	for _, p := range tabs {
+		if _, ok := a.findHeadless(p); ok {
+			t.Errorf("session tab %s was restored headless", p)
+		}
+	}
+	if got := len(a.headless); got != len(recovered) {
+		t.Fatalf("restored headless buffers = %d, want %d", got, len(recovered))
+	}
+	for _, p := range recovered {
+		hp, ok := a.findHeadless(p)
+		if !ok {
+			t.Fatalf("recovered buffer %s was not restored", p)
+		}
+		if got := hp.File.Text(); got != "Xbase\n" {
+			t.Errorf("recovered %s text = %q, want Xbase\\n", p, got)
+		}
+		if !hp.File.Dirty() {
+			t.Errorf("recovered %s should read dirty", p)
+		}
+	}
+}
+
+// A recovered buffer is headless, so a guard that walks Tabs alone would miss
+// its unsaved work. It must still block quit, and a bulk save must reach it:
+// `save --all` walks the buffers rollup, so the rollup naming the dirty
+// headless path and a save of it landing the bytes are the two halves of that
+// command.
+func TestDirtyHeadlessBufferBlocksQuitAndSaves(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	root := t.TempDir()
+
+	// One run creates an op log for a file the session never opens.
+	h := newHarnessAt(t, root)
+	path := filepath.Join(root, "recovered.txt")
+	if err := os.WriteFile(path, []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.OpenFile(path)
+	h.typeText("X")
+	h.flushJournal(h.Tabs.Active())
+	h.closeJournals()
+
+	// The restart brings it back as a dirty buffer, not a tab.
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, root, 2)
+	defer a.CloseState()
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	p, ok := a.findHeadless(path)
+	if !ok {
+		t.Fatal("the recovered buffer was not restored headless")
+	}
+	if !p.File.ViewDirty() {
+		t.Fatal("the recovered headless buffer should read dirty")
+	}
+	if a.Tabs.Contains(p) {
+		t.Fatal("the recovered buffer became a tab")
+	}
+
+	// Quit must ask about it rather than proceed.
+	a.tryQuit()
+	if !a.quitAsked {
+		t.Error("a dirty headless buffer did not block quit")
+	}
+	if a.quit {
+		t.Error("quit proceeded with a dirty headless buffer")
+	}
+
+	// save --all enumerates the buffers rollup, so the rollup must name the
+	// path and a save of it must write the recovered bytes.
+	var sawDirty bool
+	for _, b := range hostOf(a).Buffers() {
+		if b.Path == path {
+			sawDirty = b.Dirty
+		}
+	}
+	if !sawDirty {
+		t.Fatalf("the buffers rollup does not name the dirty headless %s", path)
+	}
+	if _, err := hostOf(a).Save(path, false); err != nil {
+		t.Fatalf("saving the recovered headless buffer: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "Xbase\n" {
+		t.Errorf("saved bytes = %q, want %q", got, "Xbase\n")
+	}
+}
+
+// A recovered buffer holding a pending set is review work, and spec 10 says a
+// pending proposal must be seen: it comes back as an announced review tab, not
+// hidden. It is still named by buffers (pending count) and proposals, and the
+// announcement mark means the session keeps it only while the review lasts. A
+// recovered buffer with no pending set still comes back headless.
+func TestRecoveredProposalComesBackAsAReviewTab(t *testing.T) {
+	t.Setenv(JournalEnv, "1")
+	h := newHarness(t, reviewFixture)
+	p := h.Pane()
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
+	h.flushJournal(p)
+
+	host := ui.NewFakeHost(120, 12)
+	t.Cleanup(func() { host.Close() })
+	a := New(host, h.primaryRoot(), 2)
+	defer a.CloseState()
+	defer a.closeJournals()
+	a.RestoreSession()
+
+	var restored *editor.Pane
+	for _, tab := range a.Tabs.All() {
+		if tab.File.Path == p.File.Path {
+			restored = tab
+		}
+	}
+	if restored == nil {
+		t.Fatal("the recovered proposal did not come back as a review tab")
+	}
+	if _, ok := a.findHeadless(p.File.Path); ok {
+		t.Fatal("the recovered proposal is both a tab and headless")
+	}
+	if !a.announced[p.File.Path] {
+		t.Error("the restored review tab is not marked announced, so it would outlive its review")
+	}
+	pending := 0
+	for _, b := range hostOf(a).Buffers() {
+		if b.Path == p.File.Path {
+			pending = b.Pending
+		}
+	}
+	if pending == 0 {
+		t.Error("buffers does not carry the recovered proposal's pending count")
+	}
+	found := false
+	for _, pr := range hostOf(a).Proposals() {
+		if pr.Path == p.File.Path {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("proposals does not name the recovered set in %s", p.File.Path)
 	}
 }
 

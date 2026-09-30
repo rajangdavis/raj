@@ -324,6 +324,12 @@ picker fields have real selections. raj runs on a patched Ghostty via the
 
 ## Syntax highlighting
 
+- [x] **A repeated client snapshot keeps the warm syntax spans (2026-09-30).**
+  The pane highlighter was rebuilt on every daemon re-sync, so the file
+  repainted plain until the retokenise landed — the flicker. `File.AdoptSyntax`
+  carries the warm spans across when the snapshot repeats the pane text. Root
+  cause in INVESTIGATIONS.md.
+
 - [x] **The token cache is keyed by document version, not by a stale flag.** A
   flag cannot say which text it went stale against, so a pass finishing late
   could install spans for older text on top of a newer result — and, having
@@ -2453,3 +2459,12 @@ proxies accept/reject/clear back to the daemon, refetching the result.
 - [x] **Save notices are the editor's, not the user's (2026-09-27).** `App.notifySaved` posts `PostNotice` (AuthorOriginal) instead of `Tell`, so "from the user" means a person typed it; `control_test`'s save case asserts `From == control.AuthorOriginal`.
 - [x] **`raj chat` UX (2026-09-27).** `RAJ_CHAT_TO` default (no hard-coded target), timestamps via a `chatNow` var, echo of your own lines, `/notices` hiding editor notices by default with a hidden count, `/help`, `/who` with state; pinned by `TestChatHidesNotices`, `TestChatEchoesOwnLine`, `TestChatNoDefaultTarget`, `TestChatUnknownCommand`.
 - [x] **The `srcVersion` data race is fixed (2026-09-27).** The global is guarded by a `sync.RWMutex` with `currentSrcVersion`/`setSrcVersion`; `connection.send` and `warnVersionSkew` read through it and the two tests swap through it, so a test pinning the stamp cannot race a live server goroutine; `check` (fmt/vet/build/test/race) exits 0.
+
+## Gate unification and publish on the exported artifact (2026-09-29)
+
+- [x] **`make check` is green and runs the same gates as CI (2026-09-29).** `CDPATH=` became `CDPATH=''` in the three hook tests (SC1007); `harness/harness-functions.sh` gained `# shellcheck shell=bash` as line 1 (SC2148) and `sh-parse` now picks `bash -n` for that directive or a bash shebang and `sh -n` otherwise; `scripts/baseline.sh` (which wrote the `raj/baseline` ref `intent land` now owns) is deleted; and `check` is `fmt fmt-check sh-parse shellcheck ignored-source vet build test race`, with `.github/workflows/ci.yml` running the same eight steps. `sh-parse`/`shellcheck` skip `git ls-files` entries that are not on disk, so a deleted-but-unstaged file does not fail the gate. Host-verified: `make shellcheck` silent, `make sh-parse` clean, `make check` green.
+- [x] **Publish pushes the exported artifact, not the saved working tree (2026-09-29).** `intent publish` hands the pinned hook `--commit <export commit> --base <its parent>` by value, and `publish-single.sh` requires `--commit`, reads only the artifact's tree (never the worktree), refuses an artifact not parented on the base (exit 13), and drops the working-tree build, the `raj ctl status` readiness gate and `RAJ_PUBLISH_SKIP_STATUS`; `intent.Publish` gained `ExportTree`/`ExportID` pins, so a second export or a changed member seam refuses while an unrelated edit does not. Pinned by `publish-single.test.sh` (the dirty-worktree regression plus the exit matrix) and `internal/app/publish_test.go`.
+
+## Review tabs strand 3.1-3.3: `intent review` (2026-09-30)
+
+- [x] **`raj ctl intent review <name>` opens a seam's files as read-only diff tabs (2026-09-30).** `intentReview` materialises the intention alone over its base (`materialiseIntention`), then for each file in git's own numstat order reads just that file's slice through `Service.DiffTrees`/`DiffTreesPath` and opens an `editor.NewReadOnlyFile` pane labelled by its workspace-relative path; `ErrReadOnly` closes `Save`/`SaveOver` and `App.readOnly()`/`readOnlyNote()` extend the review gate to a read-only view; `Pane.Label`/`TabLabel()` render the tab as the file; the pane is keyed on a synthetic `.raj-seam/<seam>/<rel>.seamdiff` path so it cannot shadow the real buffer in `find`/`paneFor` or be composed into `intentProjection`/`waveProjection`. Pinned by `TestIntentReviewOpensOneReadOnlyTabPerFile`, `TestIntentReviewTabShowsOnlyItsSeamHunks` and `TestIntentReviewTabsDoNotAccumulate`; host `raj hook run check` run 157 exit 0.

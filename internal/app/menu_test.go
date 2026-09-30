@@ -136,11 +136,11 @@ func TestMenuRenameOpensNamePrompt(t *testing.T) {
 	}
 }
 
-// Choosing Delete records a proposal through ProposeDeletion and raises the
-// gate; it must not unlink anything before approval. Without the
-// proposeDeleteFile dispatch the file would be untouched, but so would the
-// proposal; this pins both halves: recorded, and still on disk.
-func TestMenuDeleteProposesBeforeApproval(t *testing.T) {
+// Choosing Delete asks once -- "Delete README.md? [Delete] [Cancel]" -- and
+// then removes the file into the workspace trash: the tree gesture is the
+// person's own hand, so there is no propose-then-approve round trip. Without
+// the deletePath dispatch the row only recorded a proposal and the file stayed.
+func TestMenuDeleteRemovesIntoTrashAfterOneConfirm(t *testing.T) {
 	t.Parallel()
 	h := newWorkspace(t, 120, 24)
 	path := filepath.Join(h.primaryRoot(), "README.md")
@@ -154,23 +154,132 @@ func TestMenuDeleteProposesBeforeApproval(t *testing.T) {
 	menuClick(t, h, "Delete")
 
 	if !h.Prompt.Open {
-		t.Fatal("choosing delete did not open the deletion prompt")
+		t.Fatal("choosing delete did not open a confirm")
 	}
-	if _, ok := h.pendingDeletions[path]; !ok {
-		t.Errorf("no pending deletion recorded for %s; pending = %v", path, h.pendingDeletions)
+	if got := h.Prompt.Title(); got != "Delete file" {
+		t.Errorf("prompt title = %q, want Delete file", got)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the file was deleted before approval: %v", err)
+	if got := h.Prompt.Selected(); got != deleteNow {
+		t.Fatalf("default answer = %q, want %q", got, deleteNow)
 	}
+	if len(h.pendingDeletions) != 0 {
+		t.Errorf("the human delete recorded a proposal: %v", h.pendingDeletions)
+	}
+	h.press("enter")
+	if h.Prompt.Open {
+		t.Fatal("the confirm stayed open after Delete")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still at the original path after Delete (err=%v)", err)
+	}
+	entries, err := os.ReadDir(h.trashDir())
+	if err != nil {
+		t.Fatalf("reading the workspace trash: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("trash holds %d entr(ies), want exactly 1: %+v", len(entries), entries)
+	}
+	if got := h.Tabs.Count(); got != 0 {
+		t.Errorf("tab count = %d, want the buffer gone", got)
+	}
+}
 
-	// Dismissing the gate keeps the proposal and the file: the prompt is the
-	// only place the bytes can actually go.
-	h.press("esc")
-	if _, err := os.Stat(path); err != nil {
-		t.Errorf("dismissing the prompt deleted the file: %v", err)
+// A file with unsaved text offers only Cancel: the tree delete must not discard
+// work that exists nowhere else, and the reason is shown with the question.
+func TestMenuDeleteOffersOnlyCancelWhenDirty(t *testing.T) {
+	t.Parallel()
+	h := newWorkspace(t, 120, 24)
+	path := filepath.Join(h.primaryRoot(), "README.md")
+	h.OpenFile(path)
+	h.typeText("x")
+	h.drain()
+	h.openSidebar("shift+super+e", SidebarExplorer)
+	h.drain()
+
+	col, row := explorerCell(t, h, "README.md")
+	rightClick(h, col, row)
+	menuClick(t, h, "Delete")
+
+	if !h.Prompt.Open {
+		t.Fatal("choosing delete did not open a confirm")
 	}
-	if _, ok := h.pendingDeletions[path]; !ok {
-		t.Error("dismissing the prompt dropped the proposal")
+	if got := h.Prompt.Selected(); got != cancelNow {
+		t.Errorf("answer = %q, want only %q offered", got, cancelNow)
+	}
+	h.drain()
+	if !strings.Contains(h.host.Text(), "Unsaved changes") {
+		t.Errorf("the confirm does not say why Delete is missing:\n%s", h.host.Text())
+	}
+	h.press("enter")
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the dirty file was removed: %v", err)
+	}
+}
+
+// Remove Folder asks once, names how many entries the subtree holds, and then
+// moves the whole directory into the workspace trash.
+func TestMenuRemoveFolderNamesTheCountAndTrashes(t *testing.T) {
+	t.Parallel()
+	h := newWorkspace(t, 120, 24)
+	dir := filepath.Join(h.primaryRoot(), "pkg")
+	h.drain()
+	h.openSidebar("shift+super+e", SidebarExplorer)
+	h.drain()
+
+	col, row := explorerCell(t, h, "pkg")
+	rightClick(h, col, row)
+	menuClick(t, h, "Remove Folder")
+
+	if !h.Prompt.Open {
+		t.Fatal("choosing Remove Folder did not open a confirm")
+	}
+	h.drain()
+	if got := h.host.Text(); !strings.Contains(got, "inside?") {
+		t.Errorf("the confirm does not name the count:\n%s", got)
+	}
+	h.press("enter")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("directory still at the original path after Remove Folder (err=%v)", err)
+	}
+	entries, err := os.ReadDir(h.trashDir())
+	if err != nil {
+		t.Fatalf("reading the workspace trash: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("trash holds %d entr(ies), want the whole directory as one: %+v", len(entries), entries)
+	}
+}
+
+// The restore chord puts the last removal back: after a delete the bytes are in
+// the workspace trash, and the chord moves them back to the original path.
+// Without restoreLastRemoved the trash would be a dead end.
+func TestRestoreDeletedPutsTheFileBack(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, "hello\n")
+	path := h.Pane().File.Path
+	if err := h.App.removeFile(path); err != nil {
+		t.Fatalf("removeFile: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("setup: the file is still at its path (err=%v)", err)
+	}
+	h.dispatch(keys.RestoreDeleted, "")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the restore chord did not put the file back: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != "hello\n" {
+		t.Errorf("restored content = %q, want %q", got, "hello\n")
+	}
+	if got := h.status; got != "restored test.go" {
+		t.Errorf("status = %q, want the restore named", got)
+	}
+	h.dispatch(keys.RestoreDeleted, "")
+	if got := h.status; got != "nothing to restore" {
+		t.Errorf("a second restore said %q, want nothing to restore", got)
 	}
 }
 

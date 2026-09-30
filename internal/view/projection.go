@@ -107,22 +107,35 @@ func BuildFolds(comp string, segs []Seg, user []FoldRange) *Projection {
 }
 
 // buildProjection is the composition-only half of Build. It does not index the
-// rows; BuildFolds hides reader folds first and reindexes once.
+// rows; BuildFolds hides reader folds first and reindexes once. It is three
+// phases, each with its own helper: the session line starts, the piece/fold
+// split of the segments, and the pass that lays comp into rows.
 func buildProjection(comp string, segs []Seg) *Projection {
 	if len(segs) == 0 {
 		return nil
 	}
-	p := &Projection{text: comp}
+	n, starts := projectionStarts(comp, segs)
+	pieces, folds := splitSegs(segs)
+	p := &Projection{text: comp, n: n, starts: starts}
+	c := composer{p: p, comp: comp, starts: starts, pieces: pieces, folds: folds}
+	c.emitRows()
+	return p
+}
+
+// projectionStarts is the first phase: it returns the raw session length and the
+// session line starts the composition pins down.
+//
+// A kept run's newlines are in comp, so its starts come from scanning comp. The
+// hidden run's newline positions are not in comp; place its line starts at the
+// end of the run so the total count, and the lines after the fold, stay right. A
+// run that ends at a line boundary lands on the exact start.
+func projectionStarts(comp string, segs []Seg) (n int, starts []int) {
 	for _, s := range segs {
-		p.n += s.Len
+		n += s.Len
 	}
-	starts := []int{0}
+	starts = []int{0}
 	for _, s := range segs {
 		if s.Fold {
-			// The hidden run's newline positions are not in comp; place its
-			// line starts at the end of the run so the total count, and the
-			// lines after the fold, stay right. A run that ends at a line
-			// boundary lands on the exact start.
 			for k := 1; k <= s.HiddenLines && k <= s.Len; k++ {
 				starts = append(starts, s.Doc+s.Len-s.HiddenLines+k)
 			}
@@ -138,25 +151,29 @@ func buildProjection(comp string, segs []Seg) *Projection {
 				break
 			}
 			i := off + k
-			starts = append(starts, min(s.Doc+i+1, p.n))
+			starts = append(starts, min(s.Doc+i+1, n))
 			off = i + 1
 		}
 	}
-	p.starts = starts
-	p.first = make([]int, len(starts))
-	for i := range p.first {
-		p.first[i] = -1
-	}
+	return n, starts
+}
 
-	// Pieces cover comp: every DLen > 0 seg. Folds are zero-width markers.
-	type piece struct{ disp, dlen, doc, length int }
-	var pieces []piece
-	type foldRun struct {
-		disp        int
-		group       uint64
-		doc, length int
-	}
-	var folds []foldRun
+// piece is one comp-backed run: a seg with DLen > 0. Adjacent kept pieces merge
+// into a single display row at emit time.
+type piece struct{ disp, dlen, doc, length int }
+
+// foldRun is one Fold seg: a zero-width marker in comp, carrying the hidden run
+// it stands for.
+type foldRun struct {
+	disp        int
+	group       uint64
+	doc, length int
+}
+
+// splitSegs is the second phase: the piece/fold split. Pieces cover comp — every
+// DLen > 0 seg; folds are the zero-width markers. Both come out sorted by comp
+// offset, because the row pass indexes them with sort.Search.
+func splitSegs(segs []Seg) (pieces []piece, folds []foldRun) {
 	for _, s := range segs {
 		if s.Fold {
 			folds = append(folds, foldRun{disp: s.Disp, group: s.Group, doc: s.Doc, length: s.Len})
@@ -168,115 +185,142 @@ func buildProjection(comp string, segs []Seg) *Projection {
 	}
 	sort.SliceStable(pieces, func(i, j int) bool { return pieces[i].disp < pieces[j].disp })
 	sort.SliceStable(folds, func(i, j int) bool { return folds[i].disp < folds[j].disp })
+	return pieces, folds
+}
 
-	segAt := func(off int) (piece, bool) {
-		i := sort.Search(len(pieces), func(k int) bool { return pieces[k].disp+pieces[k].dlen > off })
-		if i < len(pieces) && pieces[i].disp <= off && off < pieces[i].disp+pieces[i].dlen {
-			return pieces[i], true
-		}
-		if off == len(comp) && len(pieces) > 0 {
-			return pieces[len(pieces)-1], true
-		}
-		return piece{}, false
+// composer is the third phase: it lays one composition into display rows. It
+// carries what the three row passes share — the projection under construction,
+// the composition text, the session line starts, and the sorted pieces and folds.
+type composer struct {
+	p      *Projection
+	comp   string
+	starts []int
+	pieces []piece
+	folds  []foldRun
+}
+
+// segAt returns the piece covering composition offset off.
+func (c *composer) segAt(off int) (piece, bool) {
+	i := sort.Search(len(c.pieces), func(k int) bool { return c.pieces[k].disp+c.pieces[k].dlen > off })
+	if i < len(c.pieces) && c.pieces[i].disp <= off && off < c.pieces[i].disp+c.pieces[i].dlen {
+		return c.pieces[i], true
 	}
-
-	emit := func(sessionLine, lo, hi int, fold uint64, docA, docB, cA, cB int) {
-		p.lines = append(p.lines, DispLine{SessionLine: sessionLine, Lo: lo, Hi: hi, Fold: fold})
-		p.docLo = append(p.docLo, docA)
-		p.docHi = append(p.docHi, docB)
-		p.compLo = append(p.compLo, cA)
-		p.compHi = append(p.compHi, cB)
-		if sessionLine >= 0 && p.first[sessionLine] < 0 {
-			p.first[sessionLine] = len(p.lines) - 1
-		}
+	if off == len(c.comp) && len(c.pieces) > 0 {
+		return c.pieces[len(c.pieces)-1], true
 	}
+	return piece{}, false
+}
 
-	// emitContent lays [a,b) of comp into rows. Adjacent kept pieces merge into
-	// one row: a composition line restored from several change sets is still one
-	// line. A restore piece starts its own row, drawing bytes the session does
-	// not hold, and a fold splits the call in two. [a,b) never spans a
-	// composition line or a fold: the caller emits each line's fold-free ranges.
-	emitContent := func(a, b int) {
-		// foldAt reports a fold marker at off. A kept run must not merge across
-		// one: the fold owns a display row of its own there.
-		foldAt := func(off int) bool {
-			i := sort.Search(len(folds), func(k int) bool { return folds[k].disp >= off })
-			return i < len(folds) && folds[i].disp == off
-		}
-		for a < b {
-			pc, ok := segAt(a)
-			if !ok {
-				return
-			}
-			end := b
-			if pc.disp+pc.dlen < end {
-				end = pc.disp + pc.dlen
-			}
-			if end <= a {
-				return
-			}
-			if pc.length <= 0 {
-				// A restore run is composition-only: its own row, so it never
-				// shares a session-backed row with kept bytes.
-				emit(-1, a-pc.disp, end-pc.disp, 0, pc.doc, pc.doc, a, end)
-				a = end
-				continue
-			}
-			docA := pc.doc + (a - pc.disp)
-			docB := pc.doc + (end - pc.disp)
-			merged := end
-			// Absorb every following kept piece that continues this run: same
-			// composition line (the caller's range is one line), contiguous in
-			// both composition and session, and not behind a fold. Different
-			// change sets may own the pieces; the row is still one line.
-			for merged < b && !foldAt(merged) {
-				np, ok := segAt(merged)
-				if !ok || np.length <= 0 || np.disp != merged || np.doc != docB {
-					break
-				}
-				nend := b
-				if np.disp+np.dlen < nend {
-					nend = np.disp + np.dlen
-				}
-				if nend <= merged {
-					break
-				}
-				docB = np.doc + (nend - np.disp)
-				merged = nend
-			}
-			sl := projLineOf(starts, docA)
-			ls := projLineStart(starts, sl)
-			emit(sl, docA-ls, docB-ls, 0, docA, docB, a, merged)
-			a = merged
-		}
+// emit appends one row and its byte ranges, and records the row as the session
+// line's first when it is. That first-row index is the one reindex rebuilds.
+func (c *composer) emit(sessionLine, lo, hi int, fold uint64, docA, docB, compA, compB int) {
+	p := c.p
+	p.lines = append(p.lines, DispLine{SessionLine: sessionLine, Lo: lo, Hi: hi, Fold: fold})
+	p.docLo = append(p.docLo, docA)
+	p.docHi = append(p.docHi, docB)
+	p.compLo = append(p.compLo, compA)
+	p.compHi = append(p.compHi, compB)
+	if sessionLine >= 0 && p.first[sessionLine] < 0 {
+		p.first[sessionLine] = len(p.lines) - 1
 	}
+}
 
-	// emitEmpty draws a composition line with no visible bytes. Its kind follows
-	// the run it sits in: session-backed inside a kept run, composition-only
-	// inside a restored one.
-	emitEmpty := func(cs int) {
-		pc, ok := segAt(cs)
-		if !ok && cs > 0 {
-			pc, ok = segAt(cs - 1)
-		}
+// emitContent lays [a,b) of comp into rows. Adjacent kept pieces merge into one
+// row: a composition line restored from several change sets is still one line. A
+// restore piece starts its own row, drawing bytes the session does not hold, and
+// a fold splits the call in two. [a,b) never spans a composition line or a fold:
+// the caller emits each line's fold-free ranges.
+func (c *composer) emitContent(a, b int) {
+	// foldAt reports a fold marker at off. A kept run must not merge across
+	// one: the fold owns a display row of its own there.
+	foldAt := func(off int) bool {
+		i := sort.Search(len(c.folds), func(k int) bool { return c.folds[k].disp >= off })
+		return i < len(c.folds) && c.folds[i].disp == off
+	}
+	for a < b {
+		pc, ok := c.segAt(a)
 		if !ok {
-			emit(-1, 0, 0, 0, 0, 0, cs, cs)
 			return
 		}
-		if pc.length > 0 {
-			doc := max(min(pc.doc+(cs-pc.disp), pc.doc+pc.length), pc.doc)
-			sl := projLineOf(starts, doc)
-			ls := projLineStart(starts, sl)
-			emit(sl, doc-ls, doc-ls, 0, doc, doc, cs, cs)
-		} else {
-			emit(-1, 0, 0, 0, pc.doc, pc.doc, cs, cs)
+		end := b
+		if pc.disp+pc.dlen < end {
+			end = pc.disp + pc.dlen
 		}
+		if end <= a {
+			return
+		}
+		if pc.length <= 0 {
+			// A restore run is composition-only: its own row, so it never
+			// shares a session-backed row with kept bytes.
+			c.emit(-1, a-pc.disp, end-pc.disp, 0, pc.doc, pc.doc, a, end)
+			a = end
+			continue
+		}
+		docA := pc.doc + (a - pc.disp)
+		docB := pc.doc + (end - pc.disp)
+		merged := end
+		// Absorb every following kept piece that continues this run: same
+		// composition line (the caller's range is one line), contiguous in
+		// both composition and session, and not behind a fold. Different
+		// change sets may own the pieces; the row is still one line.
+		for merged < b && !foldAt(merged) {
+			np, ok := c.segAt(merged)
+			if !ok || np.length <= 0 || np.disp != merged || np.doc != docB {
+				break
+			}
+			nend := b
+			if np.disp+np.dlen < nend {
+				nend = np.disp + np.dlen
+			}
+			if nend <= merged {
+				break
+			}
+			docB = np.doc + (nend - np.disp)
+			merged = nend
+		}
+		sl := projLineOf(c.starts, docA)
+		ls := projLineStart(c.starts, sl)
+		c.emit(sl, docA-ls, docB-ls, 0, docA, docB, a, merged)
+		a = merged
+	}
+}
+
+// emitEmpty draws a composition line with no visible bytes. Its kind follows
+// the run it sits in: session-backed inside a kept run, composition-only
+// inside a restored one.
+func (c *composer) emitEmpty(cs int) {
+	pc, ok := c.segAt(cs)
+	if !ok && cs > 0 {
+		pc, ok = c.segAt(cs - 1)
+	}
+	if !ok {
+		c.emit(-1, 0, 0, 0, 0, 0, cs, cs)
+		return
+	}
+	if pc.length > 0 {
+		doc := max(min(pc.doc+(cs-pc.disp), pc.doc+pc.length), pc.doc)
+		sl := projLineOf(c.starts, doc)
+		ls := projLineStart(c.starts, sl)
+		c.emit(sl, doc-ls, doc-ls, 0, doc, doc, cs, cs)
+	} else {
+		c.emit(-1, 0, 0, 0, pc.doc, pc.doc, cs, cs)
+	}
+}
+
+// emitRows is the last phase: it resets the first-row index emit fills, walks
+// the composition line starts, and emits each line's fold-free ranges, with a
+// fold row wherever a fold marker splits one.
+func (c *composer) emitRows() {
+	p := c.p
+	p.first = make([]int, len(c.starts))
+	for i := range p.first {
+		p.first[i] = -1
 	}
 
 	// Composition line starts: one per newline plus the first.
 	compStarts := []int{0}
 	for off := 0; ; {
-		k := strings.IndexByte(comp[off:], '\n')
+		k := strings.IndexByte(c.comp[off:], '\n')
 		if k < 0 {
 			break
 		}
@@ -288,35 +332,33 @@ func buildProjection(comp string, segs []Seg) *Projection {
 	fi := 0
 	for li := 0; li < len(compStarts); li++ {
 		cs := compStarts[li]
-		ce := len(comp)
+		ce := len(c.comp)
 		if li+1 < len(compStarts) {
 			ce = compStarts[li+1] - 1 // the newline position
 		}
 		pos := cs
 		emitted := false
-		for fi < len(folds) && folds[fi].disp < cs {
+		for fi < len(c.folds) && c.folds[fi].disp < cs {
 			fi++
 		}
-		for fi < len(folds) && folds[fi].disp <= ce {
-			fr := folds[fi]
+		for fi < len(c.folds) && c.folds[fi].disp <= ce {
+			fr := c.folds[fi]
 			if fr.disp > pos {
-				emitContent(pos, fr.disp)
+				c.emitContent(pos, fr.disp)
 			}
-			emit(-1, 0, 0, fr.group, fr.doc, fr.doc+fr.length, fr.disp, fr.disp)
+			c.emit(-1, 0, 0, fr.group, fr.doc, fr.doc+fr.length, fr.disp, fr.disp)
 			emitted = true
 			pos = fr.disp
 			fi++
 		}
 		if ce > pos {
-			emitContent(pos, ce)
+			c.emitContent(pos, ce)
 			emitted = true
 		}
 		if !emitted {
-			emitEmpty(cs)
+			c.emitEmpty(cs)
 		}
 	}
-
-	return p
 }
 
 // reindex rebuilds the derived row tables from p.lines: which rows are folds,

@@ -20,6 +20,11 @@ type Pane struct {
 	Author   piecetable.Author
 	Find     Find
 
+	// Label is the tab bar's name for this pane, for a pane whose path is not
+	// what the user should read -- a seam diff pane, keyed on a synthetic
+	// path. Empty means the file's own name.
+	Label string
+
 	// leaseHit is the change set that refused the most recent edit attempt and
 	// leaseBlocked records that a refusal happened, so the application can turn
 	// it into a status note. The key path returns only "consumed", so the pane
@@ -77,6 +82,12 @@ type Pane struct {
 	// diskStale records the file changed on disk since raj read or wrote it,
 	// set by the app idle tick and cleared by save or reload.
 	diskStale bool
+	// diskDeleted records that the file did not just change but went away: it
+	// was there when raj read or wrote it and is gone now. It implies diskStale
+	// (the tab keeps the changed-on-disk mark) and adds the reason, which is
+	// what the save question and the status line need. It is cleared by the
+	// same save or reload that clears the mark.
+	diskDeleted bool
 	// saveRefused records that the last save of this pane was refused. A
 	// refusal is not the same as a clean close: the accepted composition a
 	// save would write may differ from the bytes on screen, so a view that
@@ -153,11 +164,21 @@ func sameCursors(a, b []Cursor) bool {
 // MarkDiskStale records the file changed on disk behind this tab.
 func (p *Pane) MarkDiskStale() { p.diskStale = true }
 
-// ClearDiskStale resets the disk-changed mark after a save or reload.
-func (p *Pane) ClearDiskStale() { p.diskStale = false }
+// MarkDiskDeleted records that the file is gone from disk behind this tab. It
+// marks the tab the same way a rewrite does, and remembers the reason so the
+// save prompt and the status line can say "deleted" rather than "changed".
+func (p *Pane) MarkDiskDeleted() { p.diskStale, p.diskDeleted = true, true }
+
+// ClearDiskStale resets both disk marks after a save or reload: the bytes on
+// disk are the bytes the tab shows again, and the file is back.
+func (p *Pane) ClearDiskStale() { p.diskStale, p.diskDeleted = false, false }
 
 // DiskStale reports whether the file changed on disk since raj read or wrote it.
+// A deleted file is stale too; DiskDeleted says that is the reason.
 func (p *Pane) DiskStale() bool { return p.diskStale }
+
+// DiskDeleted reports whether the file went away from disk behind this tab.
+func (p *Pane) DiskDeleted() bool { return p.diskDeleted }
 
 // MarkSaveRefused records that a save of this pane was refused, so a close
 // asks rather than treating a view that happens to match disk as permission to
@@ -169,6 +190,15 @@ func (p *Pane) ClearSaveRefused() { p.saveRefused = false }
 
 // SaveRefused reports whether the last save attempt on this pane was refused.
 func (p *Pane) SaveRefused() bool { return p.saveRefused }
+
+// TabLabel is the pane's tab label: Label when one is set, and the
+// file's own name otherwise.
+func (p *Pane) TabLabel() string {
+	if p.Label != "" {
+		return p.Label
+	}
+	return p.File.Name()
+}
 
 // NewPane wraps a file for editing.
 func NewPane(f *File) *Pane {

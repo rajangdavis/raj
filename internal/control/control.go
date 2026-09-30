@@ -126,6 +126,11 @@ type Request struct {
 	HookMode string
 	HookName string
 	HookJSON string
+	// HookParams is a run's supplied parameters as NAME=value assignments, in
+	// the caller's order. They are validated against the hook's declarations on
+	// the event thread and never become argv: the server turns each resolved
+	// value into a RAJ_PARAM_<name> environment entry.
+	HookParams []string
 	// HookRunID names an in-flight run for `hook cancel`. It is the id the
 	// final frame's stamp reported and `hook ps` lists.
 	HookRunID uint64
@@ -253,8 +258,11 @@ type Request struct {
 // HookRow is one stored hook as it crosses the control surface. Action is the
 // stored JSON: an argv array, {"shell":"..."} or a builtin object.
 type HookRow struct {
-	Name       string `json:"name"`
-	Action     string `json:"action"`
+	Name   string `json:"name"`
+	Action string `json:"action"`
+	// Params is the stored JSON array of declared parameters; omitted or empty
+	// means the hook declares none.
+	Params     string `json:"params,omitempty"`
 	Trigger    string `json:"trigger"`
 	Tree       string `json:"tree"`
 	Agent      bool   `json:"agent"`
@@ -518,6 +526,13 @@ type Buffer struct {
 	// headless buffer can never hold a pending proposal — a proposal
 	// announces it, which is what puts a tab on screen for review.
 	Headless bool `json:"headless"`
+	// Deleted is true when the file backing this buffer is gone from disk: it
+	// was there when raj read or wrote it and it is not there now. It tells a
+	// buffer that is merely unsaved from one whose file someone removed
+	// underneath it, and it rides its own sparse wire field rather than a
+	// field on the positional hBuffers record, for the same reason Pending,
+	// Superseded and Headless do.
+	Deleted bool `json:"deleted,omitempty"`
 	// Pending is how many change sets in this buffer are still proposed, and
 	// Moved how many of their members a later edit has moved past so no honest
 	// span can be projected. They let one `buffers` call answer "which open
@@ -820,15 +835,19 @@ type Entry struct {
 }
 
 // Proposal is one entry in the unified pending surface: a change set still
-// awaiting a decision, a pending file deletion, or a pending directory
-// removal. Kind names which. Group and Start/End describe a change set;
-// Start/End are -1 when no honest span exists (a set every member of which a
-// later edit has moved past), so a caller knows to ask `diff` instead.
+// awaiting a decision, a pending file deletion, a pending directory removal, or
+// a pending publish. Kind names which. Group and Start/End describe a change
+// set; Start/End are -1 when no honest span exists (a set every member of which
+// a later edit has moved past), so a caller knows to ask `diff` instead. Size
+// is the row magnitude and is kind-dependent: the net byte change for a set,
+// the file byte count for a deletion, the number of files a folder removal
+// would take, and zero for a publish, which names a wave rather than content.
 type Proposal struct {
-	Kind   string `json:"kind"` // "set" | "delete" | "rmdir" | "invalid"
+	Kind   string `json:"kind"` // "set" | "delete" | "rmdir" | "invalid" | "publish"
 	Path   string `json:"path"`
 	Author uint8  `json:"author"`
 	Group  uint64 `json:"group"`
+	Size   int    `json:"size"`
 	Start  int    `json:"start"`
 	End    int    `json:"end"`
 }
@@ -898,6 +917,12 @@ type Response struct {
 	// can size an apply span or find the end of a file without a read.
 	Bytes int
 	Lines int
+	// Line and Col are the caret's 1-based position on the drawn screen, the
+	// screen verb's cursor. They reuse hLine/hCol, the goto fields, so a
+	// read-only view spends no new header code; zero means no caret is drawn,
+	// because it has scrolled out of view or the screen is not showing one.
+	Line int
+	Col  int
 	// Found, FindStart, FindEnd and FindCount are find's answer: whether the
 	// pattern occurred at all, the first match's byte span, and how many
 	// matches the buffer holds (including the first). Found is sparse, so its
@@ -964,6 +989,17 @@ type Response struct {
 	// the fields above. They are sparse: an external hook sends neither.
 	HookBuiltin     string         `json:"-"`
 	HookBuiltinArgs map[string]any `json:"-"`
+	// HookSteps carries a composite action's ordered steps from the event thread
+	// to the connection that runs them, on the same in-process route. It is
+	// sparse: a single builtin or an external hook sends none.
+	HookSteps []hooks.Step `json:"-"`
+
+	// HookParamValues carries a run's resolved declared parameters from the
+	// event thread to the connection that runs it, on the same in-process route.
+	// The run path renders them as RAJ_PARAM_<name> environment entries and
+	// records them in the run log. It is sparse: a hook that declares none sends
+	// none.
+	HookParamValues []hooks.ParamValue `json:"-"`
 
 	// HookRevision is the projection revision the run was admitted at. It
 	// crosses on the final frame too, for a caller that only reads the reply.
@@ -2120,24 +2156,13 @@ func (c *connection) one(req Request, emit func(Response)) {
 	case "hook":
 		// hook run has the same two-phase shape as exec: the decision is made
 		// on the event thread, the command runs off it. log, ps, cancel and
-		// the panic switch never touch the document, so they are answered here
-		// on the connection goroutine; the authoring and read modes are
-		// ordinary parked requests and fall through to submit below.
-		switch req.HookMode {
-		case "run":
-			c.runHook(req, emit)
-			return
-		case "log":
-			c.hookLog(req, emit)
-			return
-		case "ps":
-			c.hookPS(req, emit)
-			return
-		case "cancel":
-			c.hookCancel(req, emit)
-			return
-		case "off", "on":
-			c.hookSwitch(req, emit)
+		// the panic switch never touch the document, so they are answered on
+		// the connection goroutine; the authoring and read modes have no
+		// connection handler and fall through to the event thread below. The
+		// modes are hookModes, the same table dispatchHook and the transport
+		// guards read.
+		if m, ok := hookModeByName[req.HookMode]; ok && m.conn != nil {
+			m.conn(c, req, emit)
 			return
 		}
 	}
@@ -2379,7 +2404,7 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 			caller = LocalHuman
 		}
 	}
-	prep := c.srv.submit(Request{ID: req.ID, Op: "hookprep", HookName: req.HookName, Author: caller})
+	prep := c.srv.submit(Request{ID: req.ID, Op: "hookprep", HookName: req.HookName, HookParams: req.HookParams, Author: caller})
 	if prep.Err != "" {
 		prep.ID, prep.Final = req.ID, true
 		emit(prep)
@@ -2427,9 +2452,14 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 	// cleanup removes a projected run's scratch tree; a detached run hands it
 	// to its completion goroutine, a synchronous one defers it here.
 	var cleanup func()
+	// A builtin leaf runs in-process with no tree. A composite needs one only
+	// when a step is a shell action; a chain of leaves resolves the root from
+	// the run context and needs no working directory either.
+	noTree := prep.HookBuiltin != "" || (len(prep.HookSteps) > 0 && !stepsNeedTree(prep.HookSteps))
 	switch {
-	case prep.HookBuiltin != "":
-		// No tree: a leaf receives its args and the run context, nothing else.
+	case noTree:
+		// No tree: an in-process action receives its args and the run context,
+		// nothing else.
 	case prep.HookTree == string(hooks.TreeWorkspace):
 		svc := git.New(prep.Root)
 		view, verr := svc.View(ctx)
@@ -2485,17 +2515,25 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 	// it, not just a timer around the call.
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// The resolved parameters ride the run context as the builtin in-process
+	// channel, so a leaf reads RAJ_PARAM_<name> the way it reads the chain
+	// environment; a shell or argv action gets the same entries as its process
+	// environment below.
+	runCtx = builtin.WithParamEnv(runCtx, hooks.ParamEnv(prep.HookParamValues))
 
 	if prep.HookBuiltin != "" {
 		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
 			Out: fmt.Sprintf("raj: hook %s ran builtin %s\n", req.HookName, prep.HookBuiltin)})
+	} else if len(prep.HookSteps) > 0 {
+		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
+			Out: fmt.Sprintf("raj: hook %s ran a composite of %d step(s)\n", req.HookName, len(prep.HookSteps))})
 	} else if prep.HookTree == string(hooks.TreeWorkspace) {
 		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
 			Out: fmt.Sprintf("raj: hook %s ran against the saved workspace root at HEAD %s (dirty %s)\n",
 				req.HookName, prov.Head, prov.DirtyDigest)})
 	} else {
 		emit(Response{ID: req.ID, OK: true, Stream: StreamStderr,
-			Out: fmt.Sprintf("raj: hook %s ran against the projected tree at HEAD %s (dirty %s); accepted and proposed text included\n",
+			Out: fmt.Sprintf("raj: hook %s ran against the projected tree at HEAD %s (dirty %s); accepted and proposed text included, with the build harness pinned to the accepted tree\n",
 				req.HookName, prov.Head, prov.DirtyDigest)})
 	}
 
@@ -2533,12 +2571,20 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 	// RAJ_STEP_<name>_OUT sees it exactly as it would see a command's stdout.
 	var code int
 	var rerr error
-	if prep.HookBuiltin != "" {
+	switch {
+	case prep.HookBuiltin != "":
 		// The leaf gets the workspace root the run was admitted with, so it
 		// resolves prep.Root rather than the process working directory.
 		code, rerr = runBuiltinLeaf(builtin.WithRoot(runCtx, prep.Root), prep.HookBuiltin, prep.HookBuiltinArgs, stream)
-	} else {
-		code, rerr = RunReport(runCtx, argv, runDir, onStart, stream)
+	case len(prep.HookSteps) > 0:
+		// A composite runs its steps in order with the admitted root and tree,
+		// and stops at the first nonzero step.
+		code, rerr = runChain(runCtx, prep.HookSteps, prep.Root, runDir, stream)
+	default:
+		// runReportEnv appends the resolved parameters to the process
+		// environment; an empty slice inherits the editor's environment exactly
+		// as before, so a hook that declares none is unchanged.
+		code, rerr = runReportEnv(runCtx, argv, runDir, hooks.ParamEnv(prep.HookParamValues), onStart, stream)
 	}
 
 	outMu.Lock()
@@ -2550,7 +2596,7 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 	// a named error even when the command exited zero. Projected hooks keep
 	// v0's behaviour and are not checked, and a builtin leaf has no tree to move.
 	writeErr := ""
-	if prep.HookBuiltin == "" && prep.HookTree == string(hooks.TreeWorkspace) && !prep.HookMayWrite {
+	if !noTree && prep.HookTree == string(hooks.TreeWorkspace) && !prep.HookMayWrite {
 		after, derr := git.New(prep.Root).StatusDigest(ctx)
 		switch {
 		case derr != nil:
@@ -2588,6 +2634,7 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 			Revision: prep.HookRevision, Head: prov.Head, Dirty: prov.DirtyDigest,
 			Exit: code, DurationMS: time.Since(started).Milliseconds(),
 			Truncated: truncatedFinal, Err: final.Err,
+			Params: prep.HookParamValues,
 		})
 	}
 	emit(final)
@@ -2882,8 +2929,7 @@ func localOnly(req Request) bool {
 	if req.Op != "hook" {
 		return false
 	}
-	switch req.HookMode {
-	case "put", "rm", "enable", "disable", "cancel", "off", "on":
+	if m, ok := hookModeByName[req.HookMode]; ok && m.local {
 		return true
 	}
 	return false
@@ -2893,8 +2939,7 @@ func localOnly(req Request) bool {
 // predicate localOnly decides which requests; this only says why.
 func remoteRefusal(req Request) string {
 	if req.Op == "hook" {
-		switch req.HookMode {
-		case "cancel", "off", "on":
+		if m, ok := hookModeByName[req.HookMode]; ok && m.remoteCtl {
 			return errRemoteHookControl
 		}
 		return errRemoteHook
@@ -2943,23 +2988,51 @@ func (s *Server) reserveAuthor() (uint8, error) {
 	return s.Participants.Reserve()
 }
 
-// srcVersion is the VCS revision this binary was built from, read from the
-// build info the go tool embeds when it builds inside a checkout — confirmed
-// present in the shipped binaries, so no -ldflags stamp is needed. Empty
-// means unknown, and an unknown on either side keeps the handshake check
-// silent.
-var srcVersion = func() string {
+// srcVersion is the version this binary reports. It is stamped at build time
+// with
+//
+//	go build -ldflags "-X raj/internal/control.srcVersion=v1.2.3" ./cmd/raj
+//
+// and falls back to the vcs.revision the go tool embeds when it builds inside
+// a checkout. A tree with no .git has no revision to fall back to, and that is
+// the tree the gate builds on: there the stamp is the only version the binary
+// can name. Empty means unknown, and an unknown on either side keeps the
+// handshake check silent.
+//
+// The variable has no initializer on purpose: -X cannot reach a variable whose
+// initializer is a function call, and an initializer would overwrite the stamp
+// besides. versionOrRevision only fills an empty one, so a stamp survives.
+var srcVersion string
+
+func init() {
+	srcVersion = versionOrRevision(srcVersion, buildSettings())
+}
+
+// buildSettings is the build settings the go tool embedded, or nil when it
+// embedded none — a build from a tree with no .git has no vcs.* setting.
+func buildSettings() []debug.BuildSetting {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
-		return ""
+		return nil
 	}
-	for _, s := range info.Settings {
+	return info.Settings
+}
+
+// versionOrRevision returns stamped when it is non-empty — the value an -X
+// stamp put in srcVersion — and otherwise the vcs.revision among settings. A
+// test calls it directly, because a link-time value cannot be set from a test
+// process.
+func versionOrRevision(stamped string, settings []debug.BuildSetting) string {
+	if stamped != "" {
+		return stamped
+	}
+	for _, s := range settings {
 		if s.Key == "vcs.revision" {
 			return s.Value
 		}
 	}
 	return ""
-}()
+}
 
 // srcVersion is read on every response (connection.send) and by the CLI's skew
 // warning, and a test swaps it to pin the stamp; guard it so a test that pins

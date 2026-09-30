@@ -19,17 +19,21 @@ import (
 //
 // The registry is a slice ordered most recently used first, and it is bounded.
 // A clean headless buffer is always droppable and reloadable, so the cap is a
-// memory bound rather than a correctness one. A headless buffer is never dirty
-// and never holds a pending proposal: the write and caret paths announce first
-// (host.Apply, host.Patch, host.Goto), so dropping one cannot lose work.
+// memory bound rather than a correctness one. A headless buffer is normally
+// clean: the write and caret paths announce first (host.Apply, host.Patch,
+// host.Goto), so a live buffer with work to lose is a tab. The one exception is
+// a buffer restored from its journal that was not one of the session's tabs --
+// recovery is not a reason to put a file on screen, so it comes back headless
+// and is retained rather than announced; dropping it would lose the work.
 const headlessMax = 8
 
 // loadHeadless loads path into the registry, or returns the pane already there.
 //
 // Only a path inside the workspace is loaded. The Guard now pre-checks the
 // resolved root in canonical before it calls Resolve, so this lexical check is
-// the backstop for loadHeadless's one caller: a path outside the tree is
-// refused before any bytes are read. A missing, unreadable, binary or
+// the backstop for loadHeadless's callers -- the control read path and the
+// startup journal restore: a path outside the tree is refused before any bytes
+// are read. A missing, unreadable, binary or
 // oversized file is an error; the caller turns it into the same "no open
 // buffer" a closed path already answered with.
 func (a *App) loadHeadless(path string) (*editor.Pane, error) {
@@ -77,16 +81,23 @@ func (a *App) findHeadless(path string) (*editor.Pane, bool) {
 // refreshHeadless re-reads p from disk when the file moved under it, so a
 // cached headless buffer is not the snapshot it was first loaded from.
 //
-// A headless buffer is clean by definition: the write and caret paths announce
-// it into a tab before they touch it, so there is no unsaved content and no
-// pending proposal a reload could discard. The check is DiskChanged, the same
-// one stat the tab diskCheck pays, so an unchanged file -- the common case --
-// costs one stat and no read. Any stat, read or refusal error keeps the cached
-// copy: with the file gone, unreadable or no longer openable, what raj already
-// holds is the only text there is. Reload replaces the document in place and
-// clamps the caret, so the pane and its File survive for callers holding them.
+// A live headless buffer is clean: the write and caret paths announce it into a
+// tab before they touch it, so there is no unsaved content to discard. A
+// restored buffer can carry recovered work or a pending set, and that case is
+// left alone below. The check is DiskChanged, the same one stat the tab
+// diskCheck pays, so an unchanged file -- the common case -- costs one stat and
+// no read. Any stat, read or refusal error keeps the cached copy: with the file
+// gone, unreadable or no longer openable, what raj already holds is the only
+// text there is. Reload replaces the document in place and clamps the caret, so
+// the pane and its File survive for callers holding them.
 func (a *App) refreshHeadless(p *editor.Pane) {
 	if p == nil || p.File == nil || !p.File.DiskChanged() {
+		return
+	}
+	// A restored buffer can carry unsaved work or a pending proposal. Reloading
+	// it from disk would discard that, so it is left as it was read even when
+	// the file moved underneath it.
+	if p.File.ViewDirty() || len(p.File.Session().Pending()) > 0 {
 		return
 	}
 	_ = p.Reload()
@@ -165,6 +176,9 @@ func (a *App) announceQuiet(p *editor.Pane) {
 	p.AutoPairs = a.AutoPairs
 	p.Hints = a.InlayHints
 	a.Tabs.Add(p)
+	// The tab is the agent's view, not the user's: the session keeps it only
+	// while it holds a pending change set (see SessionState).
+	a.markAnnounced(p.File.Path)
 	if prev != nil && a.Tabs.Contains(prev) {
 		a.Tabs.Focus(prev)
 	}
@@ -174,8 +188,10 @@ func (a *App) announceQuiet(p *editor.Pane) {
 	// buffer (a proposal, a goto), so a note the caller sets afterwards still
 	// wins the status line.
 	a.status = fileWarning(p.File)
-	// A tab appeared, and the session is the set of tabs; losing one to a crash
-	// is a file to find again.
+	// A tab appeared, so mark the session for rewriting. SessionState applies the
+	// persistence rule -- a review tab is saved while it holds a pending set or
+	// unsaved work -- rather than an unrelated structural change deciding when it
+	// is written.
 	a.TouchSession()
 }
 
@@ -207,24 +223,33 @@ func (a *App) unregisterHeadless(p *editor.Pane) {
 // evictHeadless keeps the registry bounded, dropping the oldest clean buffers
 // first.
 //
-// A headless buffer is always clean and never holds a decision -- the write
-// paths announce before a proposal lands, so a set with anything to decide has
-// a tab -- and a clean buffer is exactly the disk bytes, so dropping it costs a
-// re-read rather than work. The dirty and pending checks are belt and braces:
-// if the invariant ever breaks, the buffer is announced instead of dropped, so
-// the failure mode is a tab and never lost text.
+// The cap bounds the clean cache, not the recovered work: a buffer with unsaved
+// content or a pending proposal is retained instead of dropped, and is not
+// announced either. A restored buffer is recovery, not a request to put a file
+// on screen, so a workspace with more recovered buffers than tabs stays a
+// buffer set rather than becoming a wall of tabs. Dropping one would lose work;
+// announcing one would defeat the restore. When only busy buffers remain the
+// registry holds them all.
 func (a *App) evictHeadless() {
-	for len(a.headless) > headlessMax {
-		i := len(a.headless) - 1
-		p := a.headless[i]
-		a.headless = a.headless[:i]
+	if len(a.headless) <= headlessMax {
+		return
+	}
+	kept := make([]*editor.Pane, 0, len(a.headless))
+	clean := 0
+	for _, p := range a.headless {
 		if p.File.ViewDirty() || len(p.File.Session().Pending()) > 0 {
-			a.announce(p)
+			kept = append(kept, p)
+			continue
+		}
+		if clean < headlessMax {
+			kept = append(kept, p)
+			clean++
 			continue
 		}
 		a.rememberPosition(p)
 		a.closeDoc(p)
 	}
+	a.headless = kept
 }
 
 // pathInRoot reports whether path is inside some workspace root, the same

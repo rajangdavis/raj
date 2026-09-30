@@ -445,6 +445,53 @@ func (s *Service) NumStat(ctx context.Context, rev, path string) ([]NumStatEntry
 	if err != nil {
 		return nil, err
 	}
+	return parseNumStat(out), nil
+}
+
+// DiffTrees renders the change between two tree-ish objects -- a commit, a
+// tree object or the empty tree -- as a unified patch and a per-file churn
+// summary, read entirely from git's object database. It reads no worktree and
+// touches no index, so the diff describes exactly the two trees and not
+// whatever the workspace happens to hold. Both arguments are required: a
+// missing tree-ish would silently diff HEAD, which is the wrong answer.
+func (s *Service) DiffTrees(ctx context.Context, base, tree string) (string, []NumStatEntry, error) {
+	if base == "" || tree == "" {
+		return "", nil, errors.New("git: diff trees needs two tree-ish arguments")
+	}
+	patch, err := s.run(ctx, "diff", "--no-color", base, tree)
+	if err != nil {
+		return "", nil, err
+	}
+	stat, err := s.run(ctx, "diff", "--numstat", base, tree)
+	if err != nil {
+		return "", nil, err
+	}
+	return string(patch), parseNumStat(stat), nil
+}
+
+// DiffTreesPath is DiffTrees restricted to one path: the same object-only read
+// with a pathspec, so a caller showing one file's slice of a change does not
+// have to parse the whole patch to get it. It is the existing diff engine with
+// a path filter, not a second one; base and tree are required, as in DiffTrees.
+func (s *Service) DiffTreesPath(ctx context.Context, base, tree, path string) (string, error) {
+	if base == "" || tree == "" {
+		return "", errors.New("git: diff trees needs two tree-ish arguments")
+	}
+	args := []string{"diff", "--no-color", base, tree}
+	if p := s.rel(path); p != "" {
+		args = append(args, "--", p)
+	}
+	out, err := s.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// parseNumStat reads `git diff --numstat` output into per-file churn. A binary
+// file reports "-" for both counts and is marked Binary; a malformed line is
+// skipped rather than guessed at.
+func parseNumStat(out []byte) []NumStatEntry {
 	var entries []NumStatEntry
 	for _, line := range strings.Split(string(out), "\n") {
 		if line == "" {
@@ -463,7 +510,7 @@ func (s *Service) NumStat(ctx context.Context, rev, path string) ([]NumStatEntry
 		}
 		entries = append(entries, e)
 	}
-	return entries, nil
+	return entries
 }
 
 // Log lists commits newest-first. A zero count is git's own default; a

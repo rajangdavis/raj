@@ -16,6 +16,8 @@ saving is the user's gesture. For tests, builds and git use your own shell, and
 first check `raj ctl buffers` for unsaved changes. Direct file tools are removed
 by design.
 
+The user's instruction is the requirement. Build what it says in its own terms: no reframing, and no extra parameters, fallbacks or modes it did not ask for. If it is ambiguous, ask before building. Never assert a limit on your own tools or permissions that you have not just hit. When your change supersedes a file, propose its deletion (raj ctl delete) in the same change rather than leaving both.
+
 Batch your calls: one `raj ctl read A B C` for several files, `search --context`
 instead of search-then-read, reuse the version from `read --json` as `--base`,
 `apply --hunks` for multi-hunk edits, `dump`/`patch` for structural rewrites,

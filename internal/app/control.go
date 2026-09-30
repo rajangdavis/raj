@@ -218,9 +218,12 @@ func (a *App) controlTick() {
 // version does; the decision generation is included so an accept, reject,
 // clear or withdraw — decisions that move the composition without moving the
 // session version — moves it too; view-dirty is included so a bare save that
-// only clears dirty moves it, which neither of the other two does. This is the
-// value clients watch, and it will carry a workspace identity when multi-root
-// lands.
+// only clears dirty moves it, which neither of the other two does; the
+// deleted-on-disk mark is included so a file removed outside the editor moves
+// the generation and wakes the parked watchers — a deletion changes no version,
+// decision or dirty bit, and an attached client cannot stat the daemon's disk,
+// so without it the mark would never be fetched. This is the value clients
+// watch, and it will carry a workspace identity when multi-root lands.
 //
 // It runs on the event thread on every tick, so it stays a cheap fold: ViewDirty
 // caches on the session version and decision generation, so an unchanged buffer
@@ -228,14 +231,14 @@ func (a *App) controlTick() {
 // removal keys are sorted so Go's map iteration order cannot change the hash.
 func (a *App) reviewGeneration() uint64 {
 	h := fnv.New64a()
-	write := func(path string, version, decisions uint64, dirty bool) {
-		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%t\n", path, version, decisions, dirty)
+	write := func(path string, version, decisions uint64, dirty, deleted bool) {
+		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%t\x00%t\n", path, version, decisions, dirty, deleted)
 	}
 	for _, p := range a.Tabs.All() {
-		write(p.File.Path, uint64(p.File.Session().Version()), p.File.DecisionGeneration(), p.File.ViewDirty())
+		write(p.File.Path, uint64(p.File.Session().Version()), p.File.DecisionGeneration(), p.File.ViewDirty(), p.DiskDeleted())
 	}
 	for _, p := range a.headless {
-		write(p.File.Path, uint64(p.File.Session().Version()), p.File.DecisionGeneration(), p.File.ViewDirty())
+		write(p.File.Path, uint64(p.File.Session().Version()), p.File.DecisionGeneration(), p.File.ViewDirty(), p.DiskDeleted())
 	}
 	deletions := make([]string, 0, len(a.pendingDeletions))
 	for path := range a.pendingDeletions {
@@ -293,7 +296,10 @@ func (a *App) drainControl() {
 		// trip. A watch wake overwrites its own Gen with the moment it woke.
 		res.Gen = a.controlGen
 		a.notifySuperseded(p.Req, res)
-		p.Reply(res)
+		// Queue the answer rather than sending it here: the client must not
+		// learn the request was applied before the frame that shows it exists.
+		// Draw flushes the queue once the frame has been presented.
+		a.controlReplies = append(a.controlReplies, controlReply{pending: p, res: res})
 	}
 	// A control-driven change wakes the parked watchers now rather than on the
 	// next idle tick, so a decision on one client reaches the others at the
@@ -305,6 +311,29 @@ func (a *App) drainControl() {
 	// goroutines read it lock-guarded.
 	a.syncWaiting()
 	a.controlTick()
+}
+
+// controlReply is one parked request's answer, held from the event handler
+// until the frame that reflects the request has been presented.
+type controlReply struct {
+	pending *control.Pending
+	res     control.Response
+}
+
+// flushControlReplies delivers, in order, the answers drainControl queued.
+// Draw calls it at its end, after the frame is on the host, so a control reply
+// follows the frame that reflects the effect it acknowledges. This is an
+// ordering guarantee only: each reply is still sent exactly once, and no verb
+// behaves differently beyond one frame of latency.
+func (a *App) flushControlReplies() {
+	if len(a.controlReplies) == 0 {
+		return
+	}
+	replies := a.controlReplies
+	a.controlReplies = nil
+	for _, r := range replies {
+		r.pending.Reply(r.res)
+	}
 }
 
 // notifySuperseded tells the author of each Proposed set that a landed apply or
@@ -348,9 +377,15 @@ func hostOf(a *App) control.BufferHost { return host{a} }
 // Projection composes the live buffers under policy, keyed by absolute editor
 // path. It maps the control policy onto the piecetable policy App.Project takes,
 // so the wire-facing policy never leaks into the composition primitive.
+// ProjectionWithProposed is the display composition, its deferral included;
+// ProjectionVerifying is the verification composition, with proposed deletions
+// applied.
 func (h host) Projection(policy control.ProjectionPolicy) map[string][]byte {
-	if policy == control.ProjectionWithProposed {
+	switch policy {
+	case control.ProjectionWithProposed:
 		return h.a.Project(piecetable.AcceptedAndProposed)
+	case control.ProjectionVerifying:
+		return h.a.Project(piecetable.AcceptedAndProposedApplied)
 	}
 	return h.a.Project(piecetable.AcceptedOnly)
 }
@@ -379,7 +414,14 @@ func (h host) Buffers() []control.Buffer {
 	panes := append(append([]*editor.Pane{}, h.a.Tabs.All()...), h.a.headless...)
 	out := make([]control.Buffer, 0, len(panes))
 	for _, p := range panes {
+		// A read-only view is a local artifact of a diff pane, keyed on a
+		// synthetic .raj-seam path that names nothing a socket client could
+		// read. It is not a file's text, so it is not a buffer on the wire.
+		if p.File.IsReadOnly() {
+			continue
+		}
 		sess := p.File.Session()
+
 		b := control.Buffer{
 			Path:     p.File.Path,
 			Version:  uint64(sess.Version()),
@@ -388,6 +430,11 @@ func (h host) Buffers() []control.Buffer {
 			Lines:    p.File.Lines(),
 			Active:   p == h.a.Tabs.Active(),
 			Headless: h.a.isHeadless(p),
+			// The file behind the buffer is gone. It is the same fact the tab
+			// mark and the save question carry, so a reader with no screen can
+			// tell a buffer that is only unsaved from one whose file no longer
+			// exists.
+			Deleted: p.File.DeletedOnDisk(),
 		}
 		// The pending count is what turns "which open files hold decisions"
 		// from 1 + N `groups` calls into the one `buffers` call. Moved reuses
@@ -418,6 +465,29 @@ func (h host) Buffers() []control.Buffer {
 		out = append(out, b)
 	}
 	return out
+}
+
+// Screen returns the drawn screen the screen verb reads: the visible rows top
+// to bottom, and the caret's 1-based line and column in cells. It reads the
+// screen the last frame left behind, which is honest because a control reply
+// is flushed only after the frame it acknowledges (see flushControlReplies).
+// Rows come from ui.Screen.Row, so trailing spaces are already trimmed, and a
+// caret that is not drawn reports zero, which the wire reads as absent.
+func (h host) Screen() ([]string, int, int) {
+	s := h.a.screen
+	if s == nil {
+		return nil, 0, 0
+	}
+	_, rows := s.Size()
+	out := make([]string, 0, rows)
+	for y := 0; y < rows; y++ {
+		out = append(out, s.Row(y))
+	}
+	line, col := 0, 0
+	if s.CursorShown {
+		line, col = s.CursorY+1, s.CursorX+1
+	}
+	return out, line, col
 }
 
 // canonicalPat}
@@ -880,7 +950,6 @@ func (a *App) ProposeDeletion(path string, author uint8) error {
 		return nil
 	}
 	a.pendingDeletions[path] = control.Deletion{Path: path, Author: author}
-	a.notePendingRemoval(path, false)
 	// A proposal for the file already on screen is raised now rather than at
 	// the next focus: the gate must not wait for a focus change that may never
 	// come. A path open only in the background waits for its turn, so the
@@ -917,7 +986,6 @@ func (a *App) WithdrawDeletion(path string, author uint8) error {
 		return fmt.Errorf("pending deletion of %s was proposed by author %d, not this writer", path, d.Author)
 	}
 	delete(a.pendingDeletions, path)
-	a.clearPendingRemoval(path, false)
 	return nil
 }
 
@@ -979,7 +1047,6 @@ func (a *App) ProposeDirRemoval(path string, author uint8) error {
 		return nil
 	}
 	a.pendingDirRemovals[path] = control.DirRemoval{Path: path, Author: author}
-	a.notePendingRemoval(path, true)
 	// A directory has no pane to focus, so the gate raises immediately rather
 	// than waiting for a focus change that will never come. A question already
 	// on screen is never interrupted; the check runs again on the next
@@ -1003,7 +1070,6 @@ func (a *App) WithdrawDirRemoval(path string, author uint8) error {
 		return fmt.Errorf("pending dir-removal of %s was proposed by author %d, not this writer", path, d.Author)
 	}
 	delete(a.pendingDirRemovals, path)
-	a.clearPendingRemoval(path, true)
 	return nil
 }
 
@@ -1053,7 +1119,7 @@ func (a *App) Proposals() []control.Proposal {
 			at[g.ID] = len(out)
 			out = append(out, control.Proposal{
 				Kind: "set", Path: p.File.Path, Author: uint8(g.Author), Group: g.ID,
-				Start: -1, End: -1,
+				Size: g.Bytes, Start: -1, End: -1,
 			})
 		}
 		for _, d := range sess.DiffPending() {
@@ -1081,17 +1147,47 @@ func (a *App) Proposals() []control.Proposal {
 			}
 			out = append(out, control.Proposal{
 				Kind: "invalid", Path: p.File.Path, Author: uint8(g.Author), Group: g.ID,
-				Start: -1, End: -1,
+				Size: g.Bytes, Start: -1, End: -1,
 			})
 		}
 	}
 	for _, d := range a.Deletions() {
-		out = append(out, control.Proposal{Kind: "delete", Path: d.Path, Author: d.Author, Start: -1, End: -1})
+		out = append(out, control.Proposal{Kind: "delete", Path: d.Path, Author: d.Author, Size: fileBytes(d.Path), Start: -1, End: -1})
 	}
 	for _, d := range a.DirRemovals() {
-		out = append(out, control.Proposal{Kind: "rmdir", Path: d.Path, Author: d.Author, Start: -1, End: -1})
+		out = append(out, control.Proposal{Kind: "rmdir", Path: d.Path, Author: d.Author, Size: dirFileCount(d.Path), Start: -1, End: -1})
+	}
+	for name, pub := range a.pendingPublishes {
+		out = append(out, control.Proposal{Kind: "publish", Path: name, Author: pub.Author, Start: -1, End: -1})
 	}
 	return out
+}
+
+// fileBytes is a file size on disk, or 0 when it cannot be read: the waiting
+// list still lists a proposal whose file has gone rather than dropping it for a
+// stat error.
+func fileBytes(path string) int {
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() {
+		return 0
+	}
+	return int(fi.Size())
+}
+
+// dirFileCount is how many regular files a folder removal would take. A walk
+// error skips the unreadable entry rather than failing the whole count.
+func dirFileCount(dir string) int {
+	n := 0
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			n++
+		}
+		return nil
+	})
+	return n
 }
 
 // ProposeDirRemoval, WithdrawDirRemoval and DirRemovals bridge the BufferHost
@@ -1482,7 +1578,10 @@ func (h host) Patch(path string, author uint8, id uint64, newText string, task s
 // thing that knows that.
 func (h host) Dirty() []control.DirtyBuffer {
 	var out []control.DirtyBuffer
-	for _, p := range h.a.Tabs.All() {
+	// A recovered buffer can be headless and dirty, and an exec reads disk
+	// rather than the buffer, so its disk bytes are stale for that path too.
+	panes := append(append([]*editor.Pane{}, h.a.Tabs.All()...), h.a.headless...)
+	for _, p := range panes {
 		if !p.File.ViewDirty() {
 			continue
 		}
@@ -1511,7 +1610,11 @@ func (h host) Dirty() []control.DirtyBuffer {
 func (h host) Snapshot() control.Searcher {
 	docs := search.Docs{}
 	versions := search.DocVersions{}
-	for _, p := range h.a.Tabs.All() {
+	// A recovered buffer can be headless and dirty; search must see its
+	// unsaved text for the same reason it sees a tab's, or it returns disk
+	// text that is no longer what the editor holds.
+	panes := append(append([]*editor.Pane{}, h.a.Tabs.All()...), h.a.headless...)
+	for _, p := range panes {
 		if p.File.Path == "" {
 			continue
 		}
@@ -1571,14 +1674,14 @@ func (h host) PutHook(row control.HookRow) error {
 	// Every field crosses, Tree and Detach included: a row that loses them here
 	// is stored as a projected, attached hook whatever the author asked for.
 	if _, err := hooks.Parse(hooks.Raw{
-		Name: row.Name, Action: row.Action, Trigger: row.Trigger, Tree: row.Tree,
+		Name: row.Name, Action: row.Action, Params: row.Params, Trigger: row.Trigger, Tree: row.Tree,
 		Agent: row.Agent, CooldownMS: row.CooldownMS, TimeoutMS: row.TimeoutMS,
 		MayWrite: row.MayWrite, Detach: row.Detach, Enabled: row.Enabled,
 	}); err != nil {
 		return err
 	}
 	return h.a.state.PutHook(store.Hook{
-		Name: row.Name, Action: row.Action, Trigger: row.Trigger, Tree: row.Tree,
+		Name: row.Name, Action: row.Action, Params: row.Params, Trigger: row.Trigger, Tree: row.Tree,
 		Agent: row.Agent, CooldownMS: row.CooldownMS, TimeoutMS: row.TimeoutMS,
 		MayWrite: row.MayWrite, Detach: row.Detach, Enabled: row.Enabled,
 	})
@@ -1612,7 +1715,7 @@ func (h host) SetHookEnabled(name string, enabled bool) error {
 // storeHookRow converts one store row to the control surface's shape.
 func storeHookRow(s store.Hook) control.HookRow {
 	return control.HookRow{
-		Name: s.Name, Action: s.Action, Trigger: s.Trigger, Tree: s.Tree,
+		Name: s.Name, Action: s.Action, Params: s.Params, Trigger: s.Trigger, Tree: s.Tree,
 		Agent: s.Agent, CooldownMS: s.CooldownMS, TimeoutMS: s.TimeoutMS,
 		MayWrite: s.MayWrite, Detach: s.Detach, Enabled: s.Enabled,
 	}

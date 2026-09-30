@@ -330,3 +330,72 @@ func TestHooksCRUD(t *testing.T) {
 		t.Fatalf("DeleteHook empty name error = %v, want empty hook name", err)
 	}
 }
+
+// TestHooksParamsMigrationFromV9 covers the v9 -> v10 step: a database written
+// at v9 gains hooks.params, an existing hook row reads the empty declaration
+// default, and a row authored with parameters round-trips. Precondition: a raw
+// v9 database with one hook row written before the column existed. It fails if
+// migrations[9] is missing or the params column is not backfilled.
+func TestHooksParamsMigrationFromV9(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(createSchema); err != nil {
+		t.Fatalf("create schema table: %v", err)
+	}
+	if _, err := raw.Exec(insertSchemaVersion); err != nil {
+		t.Fatalf("initialise version: %v", err)
+	}
+	for _, step := range migrations[:9] {
+		for _, stmt := range step {
+			if _, err := raw.Exec(stmt); err != nil {
+				t.Fatalf("build v9: %v", err)
+			}
+		}
+	}
+	if _, err := raw.Exec(updateSchemaVersion, 9); err != nil {
+		t.Fatalf("record v9: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO hooks (name, action, trigger, tree, agent, cooldown_ms, timeout_ms, may_write, detach, enabled, updated)
+		VALUES ('check', '["true"]', 'agent', 'projected', 1, 0, 0, 0, 0, 1, 1)`); err != nil {
+		t.Fatalf("seed v9 hook: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s := mustOpen(t, path)
+	var version int
+	if err := s.db.QueryRow(selectSchemaVersion).Scan(&version); err != nil {
+		t.Fatalf("read migrated version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("migrated version = %d, want %d", version, schemaVersion)
+	}
+	got, ok, err := s.Hook("check")
+	if err != nil || !ok {
+		t.Fatalf("Hook after migration = ok %v, err %v; want the seeded row", ok, err)
+	}
+	if got.Params != hookParamsDefault {
+		t.Fatalf("migrated hook params = %q, want %q", got.Params, hookParamsDefault)
+	}
+
+	// A declared list round-trips through the new column.
+	const decls = `["PHASE=enum(check,race)=check"]`
+	if err := s.PutHook(Hook{Name: "cycle", Action: `["true"]`, Params: decls, Trigger: "agent", Enabled: true}); err != nil {
+		t.Fatalf("PutHook with params: %v", err)
+	}
+	cy, ok, err := s.Hook("cycle")
+	if err != nil || !ok || cy.Params != decls {
+		t.Fatalf("hook with params = %+v, ok %v, err %v; want params %s", cy, ok, err, decls)
+	}
+	// An empty Params is stored as the empty-array default, not an empty string.
+	if err := s.PutHook(Hook{Name: "plain", Action: `["true"]`, Trigger: "agent"}); err != nil {
+		t.Fatalf("PutHook plain: %v", err)
+	}
+	if pl, _, _ := s.Hook("plain"); pl.Params != hookParamsDefault {
+		t.Fatalf("plain hook params = %q; want %q", pl.Params, hookParamsDefault)
+	}
+}

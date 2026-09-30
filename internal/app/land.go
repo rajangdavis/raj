@@ -40,9 +40,13 @@ func (a *App) intentLand(ctx context.Context, svc *git.Service, cmd intent.Comma
 	if err != nil {
 		return intent.Result{}, fmt.Errorf("intent land: base %q: %w", baseRef, err)
 	}
+	proj, err := a.waveProjection(members)
+	if err != nil {
+		return intent.Result{}, err
+	}
 	res, err := intent.Land(ctx, svc, a.state, intent.Intention{
 		Name: task, Base: baseRef, BaseSHA: base, Members: members, Created: time.Now().UTC(),
-	}, base, a.waveProjection(members))
+	}, base, proj)
 	if err != nil {
 		return intent.Result{}, err
 	}
@@ -74,8 +78,11 @@ func (a *App) waveMembers(task string) []intent.Member {
 
 // waveProjection composes the wave's member buffers, admitting only the wave's
 // member ids per buffer, so a non-member set sharing a file stays out of the
-// landed tree.
-func (a *App) waveProjection(members []intent.Member) intent.Projection {
+// landed tree. Like intentProjection it composes each path from the buffer's
+// base text plus the admitted sets only, so an accepted set belonging to
+// another wave cannot leak into what lands; only non-members are excluded,
+// accepted or otherwise, and a proposed member is still included.
+func (a *App) waveProjection(members []intent.Member) (intent.Projection, error) {
 	admit := make(map[string]map[uint64]bool)
 	for _, m := range members {
 		ids := admit[m.Path]
@@ -99,9 +106,13 @@ func (a *App) waveProjection(members []intent.Member) intent.Projection {
 		if !ok {
 			continue
 		}
-		out[rel] = []byte(pane.File.Session().ProjectWithProposed(ids).Text())
+		text, err := memberSlice(pane.File.Session(), ids)
+		if err != nil {
+			return nil, err
+		}
+		out[rel] = []byte(text)
 	}
-	return out
+	return out, nil
 }
 
 // landBaseRef chooses the ref a landed wave parents on. D-S1 (the forge/trunk

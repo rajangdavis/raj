@@ -39,9 +39,10 @@ func SemanticStyle(name string) (ui.Style, bool) {
 		"enumMember", "namespace", "macro", "decorator":
 		return ui.DefaultStyle.With(ui.Ansi(11)), true // bright yellow
 	case "function", "method", "event":
-		// Every Name* token shares one sub-category, so a function takes
-		// the same yellow as a type, not the blue here.
-		return ui.DefaultStyle.With(ui.Ansi(11)), true
+		// styleFor gives NameFunction and NameAttribute the blue bold role,
+		// not the yellow of the other Name* sub-categories, so match blue
+		// here or the overlay would repaint a function as a type.
+		return ui.DefaultStyle.With(ui.Ansi(12)).Plus(ui.Bold), true
 	case "operator", "punctuation":
 		return ui.DefaultStyle.With(ui.Ansi(7)), true // slightly muted against identifiers
 	case "parameter", "variable", "property":

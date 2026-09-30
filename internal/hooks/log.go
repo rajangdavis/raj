@@ -20,6 +20,10 @@ type Result struct {
 	Exit       int    `json:"exit"`
 	DurationMS int64  `json:"duration_ms"`
 	Truncated  bool   `json:"truncated"`
+	// Params are the resolved declared parameters the run carried, in
+	// declaration order; empty for a hook that declares none. They make a run
+	// auditable and are what a later pin would pin.
+	Params []ParamValue `json:"params,omitempty"`
 	// Detach marks a run started in its own session, whose output went to
 	// LogPath rather than the reply; LogPath and PID name the file and the
 	// process a caller can inspect or stop.

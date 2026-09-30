@@ -126,3 +126,46 @@ func Root(ctx context.Context) (string, bool) {
 // rootKey is the context key WithRoot stores under. It is unexported so only
 // this package writes it.
 type rootKey struct{}
+
+// WithStepEnv returns ctx carrying the composite chain environment a run
+// builds: the RAJ_STEP_<name>_OUT and RAJ_STEP_<name>_OUT_FILE entries of the
+// steps that already ran. A shell step receives them as its process
+// environment; a builtin step reads them with StepEnv, because a leaf has no
+// process to inherit them. The entries are the "KEY=value" strings os/exec
+// takes, so a caller can pass the same slice to either kind of step.
+func WithStepEnv(ctx context.Context, env []string) context.Context {
+	return context.WithValue(ctx, stepEnvKey{}, env)
+}
+
+// StepEnv returns the chain environment WithStepEnv stamped, or nil when the
+// action is not a composite.
+func StepEnv(ctx context.Context) []string {
+	env, _ := ctx.Value(stepEnvKey{}).([]string)
+	return env
+}
+
+// WithParamEnv returns ctx carrying a run's resolved RAJ_PARAM_<name> entries:
+// the parameters a hook declares, with the values the caller supplied or the
+// declared defaults. A shell action receives them as its process environment;
+// a builtin leaf reads them with ParamEnv, because a leaf is in-process and
+// has no environment of its own. The entries are the "KEY=value" strings
+// os/exec takes, so the same slice feeds either kind of action.
+func WithParamEnv(ctx context.Context, env []string) context.Context {
+	return context.WithValue(ctx, paramEnvKey{}, env)
+}
+
+// ParamEnv returns the RAJ_PARAM_<name> entries WithParamEnv stamped, or nil
+// when the run declared no parameters. It is the in-process channel a builtin
+// leaf reads its run parameters from.
+func ParamEnv(ctx context.Context) []string {
+	env, _ := ctx.Value(paramEnvKey{}).([]string)
+	return env
+}
+
+// paramEnvKey is the context key WithParamEnv stores under. It is unexported
+// so only this package writes it.
+type paramEnvKey struct{}
+
+// stepEnvKey is the context key WithStepEnv stores under. It is unexported so
+// only this package writes it.
+type stepEnvKey struct{}

@@ -50,6 +50,7 @@ rather than hidden.
 | --- | --- | --- | --- | --- |
 | undo | `super+z` | cmd+z | ctrl+z | — |
 | redo | `shift+super+z` | cmd+shift+z | ctrl+shift+z | — |
+| restore_deleted | `ctrl+super+z` | cmd+ctrl+z | — | put the last deleted file back from the workspace trash |
 | cut | `super+x` | cmd+x | ctrl+x | — |
 | copy | `super+c` | cmd+c | ctrl+shift+c | ghostty default: copy. raj writes clipboard via OSC 52 |
 | select_all | `super+a` | cmd+a | ctrl+a | — |
@@ -124,7 +125,6 @@ rather than hidden.
 | clear_rejected | `ctrl+super+k` | cmd+ctrl+k | ctrl+alt+k | hard-purge the rejected change set at the caret |
 | prev_proposed | `ctrl+super+,` | cmd+ctrl+comma | ctrl+alt+comma | previous pending change set |
 | next_proposed | `ctrl+super+.` | cmd+ctrl+period | ctrl+alt+period | next pending change set |
-| pending_removals | `ctrl+alt+d` | ctrl+alt+d | ctrl+alt+d | re-raise the oldest pending deletion or dir-removal; macOS claims cmd+ctrl+d for Look Up in Dictionary |
 
 ## Handed back to the terminal
 

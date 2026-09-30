@@ -49,6 +49,38 @@ func TestHookCLIAddArgv(t *testing.T) {
 	}
 }
 
+// TestHookCLIAddAction pins the --action form: the raw JSON reaches the put
+// verbatim, and a composite action stored this way parses back as its steps.
+// This is the only CLI path to a builtin or composite action, so without it a
+// composite could only be authored by hand-editing the store.
+// Precondition: the fake editor answers the hook op through Dispatch, which
+// validates the row with the hooks domain before storing it.
+func TestHookCLIAddAction(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	const action = `{"steps":[{"name":"status","builtin":"git.status"},{"name":"diff","builtin":"git.diff"},{"name":"log","builtin":"git.log","args":{"count":20}}]}`
+	out, errs, code := runHook(t, "add", "git-context", "--agent", "--action", action)
+	if code != 0 {
+		t.Fatalf("add --action exited %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "added git-context") {
+		t.Errorf("add stdout = %q, want an added line", out)
+	}
+	var row HookRow
+	if err := json.Unmarshal([]byte(ed.lastHook.HookJSON), &row); err != nil {
+		t.Fatalf("HookJSON %q: %v", ed.lastHook.HookJSON, err)
+	}
+	if row.Name != "git-context" || row.Action != action || !row.Agent {
+		t.Errorf("row = %+v, want git-context, the raw steps action and agent true", row)
+	}
+	h, err := hooks.Parse(hooks.Raw{Name: row.Name, Action: row.Action, Trigger: row.Trigger, Enabled: row.Enabled})
+	if err != nil {
+		t.Fatalf("stored action does not parse as a composite: %v", err)
+	}
+	if len(h.Steps) != 3 || h.Steps[0].Builtin != "git.status" || h.Steps[2].Builtin != "git.log" {
+		t.Errorf("steps = %+v, want git.status, git.diff, git.log", h.Steps)
+	}
+}
+
 // TestHookCLIAddShellAndFlags pins the --shell form and every add flag.
 // Precondition: the same fake. Without the flag wiring the row's fields stay
 // at their defaults and the assertions fail.
@@ -80,6 +112,9 @@ func TestHookCLIAddRefusals(t *testing.T) {
 	}
 	if _, errs, code := runHook(t, "add", "check", "--shell", "s", "--", "x"); code != 2 || !strings.Contains(errs, "mutually exclusive") {
 		t.Errorf("add with both forms: code %d err %q", code, errs)
+	}
+	if _, errs, code := runHook(t, "add", "check", "--action", `{"shell":"x"}`, "--shell", "s"); code != 2 || !strings.Contains(errs, "mutually exclusive") {
+		t.Errorf("add with --action and --shell: code %d err %q", code, errs)
 	}
 	if _, _, code := runHook(t, "add"); code != 2 {
 		t.Errorf("add with no name exited %d, want 2", code)
@@ -400,5 +435,56 @@ func TestHookCLIRunDetachedPrintsStartOnly(t *testing.T) {
 			t.Fatal("the detached run was never logged as finished")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestHookCLIParamAuthoringAndRun pins the two ends of declared parameters: the
+// repeatable --param flag reaches the stored row as one JSON array, and
+// `raj hook run name NAME=value` carries the assignments in the request the
+// server validates before the action starts.
+func TestHookCLIParamAuthoringAndRun(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, errs, code := runHook(t, "add", "cycle", "--shell", "true",
+		"--param", "PHASE=enum(check,race)=check", "--param", "N=uint")
+	if code != 0 {
+		t.Fatalf("add --param exited %d: %s", code, errs)
+	}
+	var row HookRow
+	if err := json.Unmarshal([]byte(ed.lastHook.HookJSON), &row); err != nil {
+		t.Fatalf("HookJSON %q: %v", ed.lastHook.HookJSON, err)
+	}
+	if row.Params != `["PHASE=enum(check,race)=check","N=uint"]` {
+		t.Fatalf("row.Params = %q; want the two declarations in order", row.Params)
+	}
+	if _, perr := hooks.Parse(hooks.Raw{Name: row.Name, Action: row.Action, Params: row.Params,
+		Trigger: row.Trigger, Enabled: row.Enabled}); perr != nil {
+		t.Fatalf("stored declarations do not parse: %v", perr)
+	}
+
+	// run NAME=value: the assignment crosses to the request.
+	repo := controlGitRepo(t)
+	a := filepath.Join(repo, "a.go")
+	ed2 := newFakeEditor(t, nil)
+	gate := newHookGate(hooks.NewGate(hooks.Options{Floor: time.Nanosecond, PerRevision: 5}))
+	ed2.mu.Lock()
+	ed2.policyMem.root = repo
+	ed2.policyMem.projection = map[string][]byte{a: []byte("package projected\n")}
+	ed2.policyMem.hooks = []HookRow{{Name: "cycle", Action: `["true"]`, Trigger: "agent", Agent: true,
+		Enabled: true, Params: `["PHASE=enum(check,race)=check"]`}}
+	ed2.policy.HookGate = gate
+	ed2.srv.HookGate = gate
+	ed2.mu.Unlock()
+
+	if _, errs, code := runHook(t, "run", "cycle", "PHASE=race"); code != 0 {
+		t.Fatalf("run with a param exited %d: %s", code, errs)
+	}
+	ed2.mu.Lock()
+	got := ed2.lastHook
+	ed2.mu.Unlock()
+	if got.HookMode != "run" || got.HookName != "cycle" {
+		t.Fatalf("request = %+v, want hook run cycle", got)
+	}
+	if len(got.HookParams) != 1 || got.HookParams[0] != "PHASE=race" {
+		t.Fatalf("HookParams = %q; want [PHASE=race]", got.HookParams)
 	}
 }

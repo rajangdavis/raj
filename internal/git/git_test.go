@@ -295,3 +295,31 @@ func TestStatusDigestMovesWithTheWorktree(t *testing.T) {
 		t.Errorf("StatusDigest ignored a file added inside an untracked directory: %q", after)
 	}
 }
+
+// TestDiffTreesReadsTwoObjects is the object-only read an intention diff uses:
+// a commit and a tree object are compared without a worktree read, and the
+// patch and numstat describe exactly the change between them.
+func TestDiffTreesReadsTwoObjects(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, filepath.Join(dir, "a.go"), "package a2\n")
+	runGit(t, dir, "add", "a.go")
+	runGit(t, dir, "commit", "-q", "--no-gpg-sign", "-m", "second")
+
+	svc := New(dir)
+	ctx := context.Background()
+	base := runGit(t, dir, "rev-parse", "HEAD^")
+	tree := runGit(t, dir, "rev-parse", "HEAD^{tree}")
+	patch, stat, err := svc.DiffTrees(ctx, base, tree)
+	if err != nil {
+		t.Fatalf("DiffTrees: %v", err)
+	}
+	if !strings.Contains(patch, "-package a") || !strings.Contains(patch, "+package a2") {
+		t.Errorf("patch = %q, want the change between the two objects", patch)
+	}
+	if len(stat) != 1 || stat[0].Path != "a.go" || stat[0].Additions != 1 || stat[0].Deletions != 1 {
+		t.Errorf("stat = %+v, want one a.go row at 1/1", stat)
+	}
+	if _, _, err := svc.DiffTrees(ctx, "", tree); err == nil {
+		t.Error("DiffTrees with no base must be refused, not defaulted to HEAD")
+	}
+}

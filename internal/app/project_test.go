@@ -137,3 +137,44 @@ func TestHostProjectionMapsPolicy(t *testing.T) {
 		t.Errorf("Projection(ProjectionAccepted) = %v, want App.Project(AcceptedOnly) = %v", got, want)
 	}
 }
+
+// A change set that only deletes text must reach the tree a verification
+// surface materialises like any other. The deleted bytes are live in the
+// session, so the verification composition drops them; the hook projected
+// check reads this same map, so an omission here would make a deletion-only
+// proposal invisible to `check`. The edit-mode composition still defers the
+// deletion so the human sees the bytes before deciding, and AcceptedOnly stays
+// the unagreed disk text: the three policies are deliberately different.
+//
+// Precondition: test.go holds reviewFixture and one proposed hunk deletes
+// "world". A verification composition that kept the deleted run would return
+// "hello world\n" and fail the text assertion; the two other halves pin the
+// deferral and the agreement.
+func TestProjectVerificationAppliesProposedDeletion(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, reviewFixture)
+	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: ""})
+
+	path := h.Pane().File.Path
+	got := h.Project(piecetable.AcceptedAndProposedApplied)
+	if _, ok := got[path]; !ok {
+		t.Fatalf("Project(AcceptedAndProposedApplied) omitted the view-dirty deletion %s; keys = %v", path, projectKeys(got))
+	}
+	if want := "hello \n"; string(got[path]) != want {
+		t.Errorf("Project(AcceptedAndProposedApplied)[%s] = %q, want %q (the deletion applied)", path, got[path], want)
+	}
+	if got := h.Project(piecetable.AcceptedAndProposed); string(got[path]) != reviewFixture {
+		t.Errorf("Project(AcceptedAndProposed)[%s] = %q, want the deferred disk text %q", path, got[path], reviewFixture)
+	}
+	if got := h.Project(piecetable.AcceptedOnly); string(got[path]) != reviewFixture {
+		t.Errorf("Project(AcceptedOnly)[%s] = %q, want the unagreed disk text %q", path, got[path], reviewFixture)
+	}
+
+	host := hostOf(h.App)
+	if got := host.Projection(control.ProjectionVerifying); string(got[path]) != "hello \n" {
+		t.Errorf("Projection(ProjectionVerifying)[%s] = %q, want the applied deletion %q", path, got[path], "hello \n")
+	}
+	if got := host.Projection(control.ProjectionWithProposed); string(got[path]) != reviewFixture {
+		t.Errorf("Projection(ProjectionWithProposed)[%s] = %q, want the deferred disk text %q", path, got[path], reviewFixture)
+	}
+}

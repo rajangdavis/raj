@@ -18,5 +18,16 @@
     { "action": "edit", "resource": "*", "effect": "deny" },
     { "action": "grep", "resource": "*", "effect": "deny" },
     { "action": "glob", "resource": "*", "effect": "deny" }
-  ]
+  ],
+  // v2 assembles the runtime agent registry from these documents and drops a
+  // markdown agent's `mode` on the way, so a markdown `mode: all` or
+  // `mode: subagent` resolves `primary`: raj and review could not be launched
+  // as subagents (the catalog offered only the builtins) while the gate plugin
+  // permits only raj/review, which left no spawnable subagent at all.
+  // Declaring the modes here reaches the runtime; keep them in step with
+  // agents/*.md.
+  "agents": {
+    "raj": { "mode": "all" },
+    "review": { "mode": "all" }
+  }
 }

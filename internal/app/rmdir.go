@@ -104,14 +104,99 @@ func (a *App) dirRemovalSafe(dir string) (bool, string) {
 	return true, ""
 }
 
-// removeDir is the disk half of a dir removal. RAJ_TRASH=1 and only that value
-// renames the whole directory into the workspace trash under a timestamped
-// name; any other value, or unset, is os.RemoveAll.
+// removeDir is the disk half of a dir removal: the whole directory is moved
+// into the workspace trash under a timestamped name. Like a file removal it
+// trashes unconditionally -- the trash is the safety net and the restore chord
+// is its undo.
 func (a *App) removeDir(path string) error {
-	if os.Getenv("RAJ_TRASH") == "1" {
-		return a.moveToTrash(path)
+	return a.moveToTrash(path)
+}
+
+// removeFolderPath is the human's own Remove Folder, dispatched by the context
+// menu. It is one confirm naming how many entries the subtree holds -- the
+// listing the gate shows for a proposal is not shown here; the count is the
+// warning -- and then the whole directory goes into the workspace trash. A
+// buffer inside with unsaved text or an undecided change set offers only
+// Cancel, with the buffer that is in the way named in the question.
+//
+// In the attached client the subtree lives on the daemon, so the same answer
+// sends claim, rmdir and rmdir --approve back to back over the decision
+// connection.
+func (a *App) removeFolderPath(dir string) {
+	if dir == "" {
+		return
 	}
-	return os.RemoveAll(path)
+	n := len(dirRemovalPaths(dir))
+	msg := "Remove folder " + filepath.Base(dir) + " and the " + itemsWord(n) + " inside?"
+	options := []string{deleteNow, cancelNow}
+	if safe, why := a.dirRemovalSafe(dir); !safe {
+		msg += " " + why
+		options = []string{cancelNow}
+	}
+	a.confirm("Remove folder", msg, options, func(answer string, ok bool) {
+		if !ok || answer != deleteNow {
+			return
+		}
+		if a.attach {
+			a.removeFolderRemote(dir)
+			return
+		}
+		a.removeDirDeleted(control.DirRemoval{Path: dir})
+	})
+}
+
+// itemsWord names a count of entries for the confirm's question.
+func itemsWord(n int) string {
+	switch n {
+	case 0:
+		return "0 items"
+	case 1:
+		return "1 item"
+	}
+	return fmt.Sprintf("%d items", n)
+}
+
+// removeFolderRemote carries out the attached client's Remove Folder on the
+// daemon. Guard.Rmdir requires the directory be claimed, so the claim goes
+// first, then the same proposal the agent path uses and the human's approval,
+// back to back. The mirrored pending entry and the client's own panes under the
+// subtree are dropped once the daemon accepts.
+func (a *App) removeFolderRemote(dir string) {
+	c := a.decideClient()
+	if c == nil {
+		a.status = "attach: not connected to a daemon"
+		return
+	}
+	if res, err := c.Do(control.Request{Op: "claim", Paths: []string{dir}}); err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	} else if !res.OK {
+		a.status = res.Err
+		return
+	}
+	if res, err := c.Do(control.Request{Op: "rmdir", Path: dir}); err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	} else if !res.OK {
+		a.status = res.Err
+		return
+	}
+	res, err := c.Do(control.Request{Op: "rmdir", Path: dir, Approve: true})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	a.dropClientRemoval("rmdir", dir)
+	delete(a.pendingDirRemovals, dir)
+	for _, p := range a.panesUnder(dir) {
+		a.closeDeletedPane(p)
+	}
+	a.Explorer.Tree.Refresh()
+	a.status = "removed " + filepath.Base(dir)
 }
 
 // promptDirRemoval asks the human what to do about a pending dir-removal.
@@ -172,7 +257,6 @@ func (a *App) removeDirDeleted(d control.DirRemoval) {
 		a.closeDeletedPane(p)
 	}
 	delete(a.pendingDirRemovals, d.Path)
-	a.clearPendingRemoval(d.Path, true)
 	a.Explorer.Tree.Refresh()
 	a.status = "removed " + filepath.Base(d.Path)
 	a.TouchSession()

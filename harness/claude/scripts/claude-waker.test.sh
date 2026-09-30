@@ -3,7 +3,7 @@
 # turn firing. No docker and no claude: `raj` and `claude` are PATH stubs.
 # POSIX sh, no `timeout` (macOS). Exit non-zero on any mismatch.
 set -eu
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 waker=$here/claude-waker.sh
 fails=0
 fail() { printf 'claude-waker.test: FAIL: %s\n' "$*" >&2; fails=$((fails+1)); }

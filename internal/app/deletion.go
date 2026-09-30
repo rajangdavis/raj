@@ -31,6 +31,12 @@ const (
 	ignoreForNow    = "Ignore for now"
 	removeForever   = "Remove forever"
 	withdrawRemoval = "Withdraw"
+
+	// The two answers to the human's own delete. Unlike the gate above, this is
+	// one confirm and the file goes: the bytes land in the workspace trash and
+	// the restore chord can bring them back.
+	deleteNow = "Delete"
+	cancelNow = "Cancel"
 )
 
 // deletionSafe reports whether p can be removed without discarding work the
@@ -197,25 +203,34 @@ func (a *App) trashDir() string {
 }
 
 // moveToTrash moves path into the workspace trash under a timestamped name
-// rather than unlinking it, so a RAJ_TRASH=1 removal can be recovered by hand.
-// The name keeps the original basename so the directory reads by eye and
-// carries a UTC nanosecond stamp so removing the same name twice does not
-// clobber the earlier copy.
+// rather than unlinking it, so a removal can be recovered -- by the
+// restore-deleted chord, or by hand. The name keeps the original basename so
+// the directory reads by eye and carries a UTC nanosecond stamp so removing
+// the same name twice does not clobber the earlier copy.
 //
 // The trash lives in the XDG state dir now, which is commonly a different
 // filesystem from the workspace, so this goes through moveOrCopy rather than a
 // bare rename. On failure the file is left where it is, the caller reports the
 // error and keeps the proposal, and no bytes are lost.
+//
+// A successful move records the removal in lastRemoved, so the restore chord
+// can put the most recent one back. Only the latest is kept: this is an undo
+// step, not a history.
 func (a *App) moveToTrash(path string) error {
-	dir := a.trashDir()
-	if dir == "" {
+	trash := a.trashDir()
+	if trash == "" {
 		return errors.New("no workspace root")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(trash, 0o700); err != nil {
 		return err
 	}
 	name := filepath.Base(path) + "." + time.Now().UTC().Format("20060102T150405.000000000")
-	return moveOrCopy(path, filepath.Join(dir, name))
+	dst := filepath.Join(trash, name)
+	if err := moveOrCopy(path, dst); err != nil {
+		return err
+	}
+	a.lastRemoved = removedFile{path: path, trash: dst}
+	return nil
 }
 
 // moveOrCopy moves src to dst, falling back to a copy when a rename cannot do
@@ -288,14 +303,12 @@ func copyThenRemove(src, dst string) error {
 	return os.Remove(src)
 }
 
-// removeFile is the disk half of a removal. RAJ_TRASH=1 and only that value
-// moves the file into the workspace trash; any other value, or unset, is the
-// ordinary unlink the editor has always done.
+// removeFile is the disk half of a removal: the file is moved into the
+// workspace trash. RAJ_TRASH no longer decides -- every removal trashes,
+// because the trash is the safety net a delete relies on and the restore chord
+// is its undo, so a removal is never a bare unlink.
 func (a *App) removeFile(path string) error {
-	if os.Getenv("RAJ_TRASH") == "1" {
-		return a.moveToTrash(path)
-	}
-	return os.Remove(path)
+	return a.moveToTrash(path)
 }
 
 // removeDeleted carries out a Remove forever answer: the file leaves its place
@@ -315,7 +328,6 @@ func (a *App) removeDeleted(p *editor.Pane, path string) {
 	}
 	a.closeDeletedPane(p)
 	delete(a.pendingDeletions, path)
-	a.clearPendingRemoval(path, false)
 	a.deletionPromptPane = nil
 	a.Explorer.Tree.Refresh()
 	a.status = "removed " + filepath.Base(path)
@@ -341,4 +353,161 @@ func (a *App) closeDeletedPane(p *editor.Pane) {
 			return
 		}
 	}
+}
+
+// removedFile records one removal parked in the workspace trash: where it came
+// from and where its bytes now live, so restoreLastRemoved can put it back.
+type removedFile struct {
+	path  string // the path it was removed from
+	trash string // its timestamped copy in the trash directory
+}
+
+// restoreLastRemoved puts the last removal back where it came from. It is the
+// human's undo for a delete: the bytes are in the workspace trash and this
+// moves them back to the original path. A path that has reappeared in the
+// meantime is refused rather than overwritten, and a second press after a
+// successful restore says there is nothing to put back.
+func (a *App) restoreLastRemoved() {
+	r := a.lastRemoved
+	if r.path == "" {
+		a.status = "nothing to restore"
+		return
+	}
+	if _, err := os.Stat(r.trash); err != nil {
+		a.lastRemoved = removedFile{}
+		a.status = "cannot restore " + filepath.Base(r.path) + ": " + err.Error()
+		return
+	}
+	if _, err := os.Stat(r.path); err == nil {
+		a.status = "cannot restore " + filepath.Base(r.path) + ": it already exists"
+		return
+	} else if !os.IsNotExist(err) {
+		a.status = "cannot restore " + filepath.Base(r.path) + ": " + err.Error()
+		return
+	}
+	if err := moveOrCopy(r.trash, r.path); err != nil {
+		a.status = "cannot restore " + filepath.Base(r.path) + ": " + err.Error()
+		return
+	}
+	a.lastRemoved = removedFile{}
+	a.Explorer.Tree.Refresh()
+	a.status = "restored " + filepath.Base(r.path)
+	a.TouchSession()
+}
+
+// deletePath is the human's own delete, dispatched by the context menu. It is
+// one confirm -- "Delete <name>? [Delete] [Cancel]" -- and then the file goes
+// into the workspace trash; there is no propose-then-approve round trip for a
+// gesture the person made with their own hands. A buffer with unsaved text or
+// an undecided change set offers only Cancel, because the removal would discard
+// work that exists nowhere else, and the reason is shown with the question.
+//
+// In the attached client the removal is not local: the file lives on the
+// daemon, so the same answer sends propose and approve back to back over the
+// decision connection, which is the one removal path.
+func (a *App) deletePath(path string) {
+	if path == "" {
+		return
+	}
+	p := a.openDeletionPane(path)
+	safe, why := deletionSafe(p)
+	msg := "Delete " + filepath.Base(path) + "?"
+	options := []string{deleteNow, cancelNow}
+	if !safe {
+		msg += " " + why
+		options = []string{cancelNow}
+	}
+	a.confirm("Delete file", msg, options, func(answer string, ok bool) {
+		if !ok || answer != deleteNow {
+			return
+		}
+		if a.attach {
+			a.deleteRemote(path)
+			return
+		}
+		a.removeDeleted(p, path)
+	})
+}
+
+// deleteRemote carries out the attached client's delete on the daemon. The
+// daemon's filesystem is the only one that has the file, so the client sends
+// the same proposal the agent path uses and then the human's approval, back to
+// back. Guard.Delete requires the path be claimed, so the claim goes first, and
+// the approve is admitted only because the decision connection is a durable
+// human. The mirrored pending entry and the client's own pane are dropped once
+// the daemon accepts, so the tree and the tab agree with the removal.
+func (a *App) deleteRemote(path string) {
+	c := a.decideClient()
+	if c == nil {
+		a.status = "attach: not connected to a daemon"
+		return
+	}
+	if res, err := c.Do(control.Request{Op: "claim", Paths: []string{path}}); err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	} else if !res.OK {
+		a.status = res.Err
+		return
+	}
+	if res, err := c.Do(control.Request{Op: "delete", Path: path}); err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	} else if !res.OK {
+		a.status = res.Err
+		return
+	}
+	res, err := c.Do(control.Request{Op: "delete", Path: path, Approve: true})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	a.dropClientRemoval("delete", path)
+	delete(a.pendingDeletions, path)
+	a.deletionPromptPane = nil
+	a.closeDeletedPane(a.openDeletionPane(path))
+	a.Explorer.Tree.Refresh()
+	a.status = "removed " + filepath.Base(path)
+}
+
+// renameRemote sends the attached client's rename to the daemon through the
+// decision connection. The daemon's Guard.Rename is claim-gated on the source
+// path, so the claim goes first, and the rename then moves the file on the
+// machine that has it. The client's own pane, if it shows the old path, follows
+// the name the way a local rename carries it, so the tab is not left pointing
+// at a path that is gone.
+func (a *App) renameRemote(old, next string) {
+	c := a.decideClient()
+	if c == nil {
+		a.status = "attach: not connected to a daemon"
+		return
+	}
+	if res, err := c.Do(control.Request{Op: "claim", Paths: []string{old}}); err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	} else if !res.OK {
+		a.status = res.Err
+		return
+	}
+	res, err := c.Do(control.Request{Op: "rename", Path: old, NewPath: next})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		return
+	}
+	for _, p := range a.Tabs.All() {
+		if p.File != nil && sameFile(old, p.File.Path) {
+			a.closeDoc(p)
+			p.File.SetPath(next)
+			break
+		}
+	}
+	a.Explorer.Tree.Refresh()
+	a.status = "renamed to " + filepath.Base(next)
 }

@@ -173,6 +173,9 @@ func main() {
 	if *install {
 		fail(errors.New("--install needs --config to say which terminal"))
 	}
+	if err := probeFlagError(*runProbe, *checklist, *motions); err != nil {
+		fail(err)
+	}
 	if *runProbe {
 		// The probe lives behind a flag on raj rather than in its own binary so
 		// that testing a terminal needs no second build: whatever raj you are
@@ -297,6 +300,18 @@ func installConfig(target termconf.Target) error {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "raj:", err)
 	os.Exit(1)
+}
+
+// probeFlagError refuses --checklist and --motions without --probe: both only
+// shape the probe, so on their own they would be silently ignored.
+func probeFlagError(runProbe, checklist, motions bool) error {
+	switch {
+	case checklist && !runProbe:
+		return errors.New("--checklist needs --probe")
+	case motions && !runProbe:
+		return errors.New("--motions needs --probe")
+	}
+	return nil
 }
 
 // attachMode reports whether this invocation is a client of a running editor.

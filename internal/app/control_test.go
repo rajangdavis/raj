@@ -3335,3 +3335,77 @@ func TestControlRevealAnnouncesHeadlessAndLoads(t *testing.T) {
 		t.Fatalf("revealed unloaded pane = %q %q", p.File.Path, p.File.Text())
 	}
 }
+
+// TestControlReplyFollowsTheDrawnFrame pins the ordering rule: a reply to a
+// control request must not be delivered before the frame that reflects its
+// effect. drainControl queues the answer and Draw flushes it, so a driver that
+// acts on the answer is guaranteed the screen already shows the action.
+// Against the old ordering -- the reply sent from inside the event handler,
+// before Run had drawn -- the no-reply-until-drawn assertion below fails.
+func TestControlReplyFollowsTheDrawnFrame(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	second := filepath.Join(h.primaryRoot(), "other.go")
+	if err := os.WriteFile(second, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := h.dial(t)
+
+	type result struct {
+		res control.Response
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		res, err := c.c.Do(control.Request{Op: "open", Path: second})
+		got <- result{res, err}
+	}()
+
+	// Pump the event thread, handling the Wake that parks the request, but do
+	// not draw: no frame reflects the open yet.
+	framesBefore := len(h.host.Frames())
+	deadline := time.After(2 * time.Second)
+	woke := false
+	for !woke {
+		select {
+		case e := <-h.host.Events():
+			if _, ok := e.(ui.Wake); ok {
+				woke = true
+			}
+			h.Handle(e)
+		case <-deadline:
+			t.Fatal("the control request never reached the event thread")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	// The handler ran, but no frame has been presented. The reply must not
+	// have arrived; under the old ordering it had.
+	select {
+	case r := <-got:
+		t.Fatalf("reply arrived before any frame was drawn: %+v", r)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if n := len(h.host.Frames()); n != framesBefore {
+		t.Fatalf("a frame was presented without a Draw: %d, want %d", n, framesBefore)
+	}
+
+	// The Draw presents the frame that reflects the open; only then is the
+	// queued reply flushed.
+	h.Draw()
+	select {
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("open: %v", r.err)
+		}
+		if !r.res.OK {
+			t.Fatalf("open = %+v", r.res)
+		}
+	case <-time.After(control.ReplyTimeout):
+		t.Fatal("no reply after the frame was drawn")
+	}
+	if frame := h.host.Text(); !strings.Contains(frame, "other.go") {
+		t.Errorf("the drawn frame does not show the opened file:\n%s", frame)
+	}
+}

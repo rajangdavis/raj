@@ -55,6 +55,12 @@ const (
 	// answers sit next to each other in the same dialog.
 	Reload = "Reload"
 
+	// WriteBack is the affirmative answer to a file that is gone from disk: it
+	// puts the buffer back at the path it came from. Its own word rather than
+	// Overwrite because there is nothing left to overwrite, and "Overwrite"
+	// would describe a collision that no longer exists.
+	WriteBack = "Write it back"
+
 	// Create is the affirmative answer to a directory that does not exist yet.
 	// A separate word from Save because the question is not "save?" — it is
 	// "make this directory?", and answering it makes something on disk that the

@@ -123,6 +123,10 @@ type Command struct {
 	Members []Member `json:"members,omitempty"`
 	Task    string   `json:"task,omitempty"`
 	DryRun  bool     `json:"dry_run,omitempty"`
+	// Approve runs a pending publish proposal (H5). It is the human's
+	// decision: refs, remotes and pushes are outward. Withdraw retracts one.
+	Approve  bool `json:"approve,omitempty"`
+	Withdraw bool `json:"withdraw,omitempty"`
 }
 
 // Result is the answer to a Command. Only the fields the subcommand set are
@@ -135,4 +139,16 @@ type Result struct {
 	Parent     string      `json:"parent,omitempty"`
 	BaseSHA    string      `json:"base_sha,omitempty"`
 	Warning    string      `json:"warning,omitempty"`
+	// Publish is set by the publish subcommand: the pinned action proposal,
+	// or its result once the human accepts it.
+	Publish *Publish `json:"publish,omitempty"`
+	// Proofs is the `intent prove` answer: the seam proof of the named
+	// intention, pass or fail.
+	Proofs []Proof `json:"proofs,omitempty"`
+	// Diff is the `intent diff` answer: the named intention materialised
+	// alone over its base, and the change between that tree and the base.
+	Diff *Diff `json:"diff,omitempty"`
+	// Review is the `intent review` answer: the per-file diff tabs the call
+	// opened in the running editor.
+	Review *Review `json:"review,omitempty"`
 }

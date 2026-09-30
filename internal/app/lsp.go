@@ -107,6 +107,8 @@ type langServer struct {
 // server that needs a config file to start is a setup problem raj should not
 // pretend to solve silently. remark-language-server needs no configuration to
 // start, but reports no diagnostics until a .remarkrc exists.
+// bash-language-server needs no configuration either, but reports no
+// diagnostics unless shellcheck is on PATH.
 var command = map[string][]string{
 	"go":              {"gopls"},
 	"rust":            {"rust-analyzer"},
@@ -119,6 +121,7 @@ var command = map[string][]string{
 	"c":               {"clangd"},
 	"cpp":             {"clangd"},
 	"markdown":        {"remark-language-server", "--stdio"},
+	"shellscript":     {"bash-language-server", "start"},
 }
 
 // serverInitOptions is a language's initializationOptions: the settings a server

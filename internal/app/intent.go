@@ -13,6 +13,7 @@ import (
 	"raj/internal/editor"
 	"raj/internal/git"
 	"raj/internal/intent"
+	"raj/internal/piecetable"
 	"raj/internal/store"
 )
 
@@ -83,6 +84,16 @@ func (a *App) runIntent(ctx context.Context, cmd intent.Command) (intent.Result,
 		}
 		in.Members = append([]intent.Member(nil), in.Members...)
 		return intent.Result{Intention: &in}, nil
+
+	case "prove":
+		return a.intentProve(ctx, svc, set, cmd)
+
+	case "diff":
+		return a.intentDiff(ctx, svc, set, cmd)
+
+	case "review":
+		return a.intentReview(ctx, svc, set, cmd)
+
 	case "materialise":
 		return a.intentMaterialise(ctx, svc, set, cmd)
 	case "export":
@@ -90,7 +101,7 @@ func (a *App) runIntent(ctx context.Context, cmd intent.Command) (intent.Result,
 	case "land":
 		return a.intentLand(ctx, svc, cmd)
 	case "publish":
-		return intent.Result{}, errors.New("intent publish is H5 and not in this wave; export writes the inert objects")
+		return a.intentPublish(ctx, svc, cmd)
 	default:
 		return intent.Result{}, fmt.Errorf("intent: unknown subcommand %q", cmd.Mode)
 	}
@@ -291,10 +302,12 @@ func (a *App) resolveBaseCommit(ctx context.Context, svc *git.Service, set inten
 }
 
 // intentProjection is the member group content over the base. Each path a
-// member group touches is composed from the buffer's agreed text plus the
-// member groups only: a non-member proposed set sharing the file is excluded,
-// so it cannot leak into the tree. For a stacked intention the parent's groups
-// are admitted too — the parent's composition is already in the base tree, and
+// member group touches is composed from the buffer's base text plus the member
+// groups only: every other live set, accepted as well as proposed, is excluded,
+// so no other uncommitted change can leak into the tree. The seam's own members
+// are admitted whether they are accepted or still proposed -- `intent diff`
+// shows the seam either way. For a stacked intention the parent's groups are
+// admitted too — the parent's composition is already in the base tree, and
 // overlaying a shared file without it would revert the parent's hunks. A
 // member the live buffers do not know is the D2 hard error.
 func (a *App) intentProjection(in intent.Intention, set intent.Set) (intent.Projection, error) {
@@ -343,9 +356,38 @@ func (a *App) intentProjection(in intent.Intention, set intent.Set) (intent.Proj
 				paneAdmit[m.ID] = true
 			}
 		}
-		out[rel] = []byte(pane.File.Session().ProjectWithProposed(paneAdmit).Text())
+		text, err := memberSlice(pane.File.Session(), paneAdmit)
+		if err != nil {
+			return nil, err
+		}
+		out[rel] = []byte(text)
 	}
 	return out, nil
+}
+
+// memberSlice composes a session's own base with only the admitted change sets.
+// Every set not admitted is treated as rejected for this composition -- whether
+// it is accepted or still proposed -- so the result is the base plus the admitted
+// sets and nothing else the workspace has committed to. The session is cloned
+// because the projection policy admits accepted sets unconditionally; there is
+// no way to narrow it to a chosen set without changing the live session's
+// decisions, and the clone's decisions are its own.
+func memberSlice(sess *piecetable.Session, admit map[uint64]bool) (string, error) {
+	snap, err := sess.SnapshotState()
+	if err != nil {
+		return "", err
+	}
+	clone, err := piecetable.Restore(snap)
+	if err != nil {
+		return "", err
+	}
+	for _, g := range clone.Groups() {
+		if admit[g.ID] {
+			continue
+		}
+		clone.MarkGroup(g.ID, piecetable.Rejected)
+	}
+	return clone.Project(piecetable.AcceptedAndProposed).Text(), nil
 }
 
 // memberFinder validates a qualified member against the live buffers and

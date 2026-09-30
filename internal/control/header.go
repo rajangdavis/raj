@@ -33,6 +33,14 @@ import (
 // than refused. A header is a description, not a request, and a description
 // with a field this build has never heard of is still one it can act on.
 //
+// The sub-0x80 range is now full. Request fields use 0x01-0x1f, response
+// fields 0x20-0x7f, and 0x00 is unrepresentable in the framing. A code at or
+// above 0x80 is not a verb in a header: decodeHeader passes no known set, so
+// an unknown header code is skipped by the same forward-compatibility rule
+// (the verb rule belongs to programs; see prog.go). The next field needs a
+// freed code, a nested field carrying its own sub-codes, or a change to the
+// range rule; see TODO.md.
+//
 // # Lists
 //
 // Lists go in one field's payload, flat: elements one after another, each field
@@ -83,9 +91,13 @@ const (
 	// sparse field of its own, a sequence of {index, kind, task} records where
 	// kind 0 is a participant and 1 a group, emitted only for records that
 	// have a task. A reader that does not know the field skips it whole rather
-	// than reading a task as the next record's id. It takes the first of the
-	// last two free argument codes below 0x80, leaving 0x1f for a later field.
+	// than reading a task as the next record's id.
 	hTasks = 0x1e
+
+	// hHookParams carries a hook run's supplied NAME=value parameters, one
+	// record per assignment. It is a list like Paths, so it needs no body. It
+	// took the last free code below 0x80; see the range note at the top.
+	hHookParams = 0x1f
 
 	// response fields
 
@@ -136,7 +148,7 @@ const (
 	hDeletions        = 0x4c // deletions: pending removals, one {path, author} per record
 	hMatchLineEnd     = 0x4d // search: sparse byte offset one past each hit line end within the file
 	hDirRemovals      = 0x4e // rmdirs: pending dir-removals, one {path, author} per record
-	hProposals        = 0x4f // proposals: unified pending list, one {kind, path, author, group, start, end} per record
+	hProposals        = 0x4f // proposals: unified pending list, one {kind, path, author, group, size, start, end} per record
 	hMatchVersion     = 0x50 // search: sparse buffer version per hit, in hit order
 	hRemains          = 0x51 // close -discard: a file is still on disk at the discarded buffer's path
 	hCreated          = 0x52 // open: a new buffer was made rather than an existing one focused
@@ -196,6 +208,13 @@ const (
 	// message replayed after its sender has gone is still addressable. A
 	// reader that does not know the field skips it whole.
 	hMessageFrom = 0x7f
+
+	// hBufferDeleted is a sparse field parallel to hBuffers: one path per
+	// buffer whose file is gone from disk. It rides outside the hBuffers
+	// record for the positional-record reason the other per-buffer facts do,
+	// and a reader that does not know the field reads every buffer as still
+	// present, which is all an old build can express.
+	hBufferDeleted = 0x80
 )
 
 // Verbs cross the wire as one byte, not as their name.
@@ -214,40 +233,14 @@ const (
 // patterns, error messages, a participant's identity and display name. Those
 // are content, and a table of codes for content is a table that is always out
 // of date.
-var verbCodes = map[string]byte{
-	"ping": 1, "buffers": 2, "text": 3, "open": 4, "apply": 5, "save": 6,
-	"version": 7, "search": 8, "groups": 9, "accept": 10, "reject": 11,
-	"exec": 12, "execcheck": 13, "stats": 14, "hello": 15, "cancel": 16,
-	"recv": 17, "snapshot": 18, "prog": 19, "reload": 20, "whoami": 21,
-	"who": 22, "send": 23,
-	"goto": 24, "close": 25,
-	"dump": 26, "patch": 27,
-	"lsp": 28, "lspprep": 29,
-	"diff": 30, "review": 31, "clear": 32,
-	"claim":  33,
-	"mkdir":  34,
-	"delete": 35, "deletions": 36,
-	"rename": 37,
-	"rmdir":  38, "rmdirs": 39, "proposals": 40,
-	"revert": 41,
-	"token":  42,
-	"ls":     43,
-	"watch":  44,
-	"git":    45,
-	"hook":   46,
-	"reveal": 47,
-	"state":  48,
-	"land":   49,
-	"intent": 50,
-}
+//
+// The table is built in init from the registry in verbs.go, one row per verb,
+// so a header and a program cannot disagree about what a verb is. header.go
+// owns only how a code is written into a frame.
+var verbCodes = map[string]byte{}
 
-var verbNamesByCode = func() map[byte]string {
-	m := make(map[byte]string, len(verbCodes))
-	for name, code := range verbCodes {
-		m[code] = name
-	}
-	return m
-}()
+// verbNamesByCode inverts verbCodes, for decoding a frame.
+var verbNamesByCode = map[byte]string{}
 
 var kindCodes = map[string]byte{string(KindHuman): 1, string(KindAgent): 2}
 var stateCodes = map[string]byte{"proposed": 1, "accepted": 2, "rejected": 3}
@@ -290,1353 +283,1439 @@ func nameFor(table map[byte]string, c int) string { return table[byte(c)] }
 // a false flag is not sent, which is why the payload is empty rather than a
 // zero byte — and a zero byte is the one thing this encoding does not put in a
 // frame, so that a program still travels through argv.
+//
+// Both directions are driven by headerFields below, so a field cannot be
+// written by one half and forgotten by the other. The table is in emission
+// order: encodeHeader walks it top to bottom, which is what keeps a frame's
+// bytes identical to the per-field form it replaced.
 func encodeHeader(h Header) []byte {
-	var ops []Op8
-	num := func(code byte, v int) {
-		if v != 0 {
-			ops = append(ops, Op8{code, prog.Number(v)})
-		}
+	var ops []prog.Op
+	for _, f := range headerFields {
+		f.encode(&h, &ops)
 	}
-	str := func(code byte, s string) {
-		if s != "" {
-			ops = append(ops, Op8{code, []byte(s)})
-		}
-	}
-	flag := func(code byte, v bool) {
-		if v {
-			ops = append(ops, Op8{code, nil})
-		}
-	}
+	return prog.Encode(ops)
+}
 
-	num(hID, h.ID)
-	if c, ok := code(verbCodes, h.Op); ok {
-		num(hOp, int(c))
-	} else {
-		str(hOpName, h.Op)
-	}
-	str(hPath, h.Path)
-	str(hNewPath, h.NewPath)
-	num(hAuthor, int(h.Author))
-	num(hGen, int(h.Gen))
-	str(hToken, h.Token)
-	if h.Base != nil {
-		// A pointer because zero is a real version and "not stated" is not the
-		// same as version zero: an apply with no base is refused, an apply
-		// based on version zero is the first one against a fresh buffer.
-		ops = append(ops, Op8{hBase, prog.Number(int(*h.Base))})
-	}
-	num(hCancel, h.Cancel)
-	num(hLine, h.Line)
-	num(hCol, h.Col)
-	flag(hReviewList, h.ReviewList)
-	flag(hAnnotated, h.Annotated)
-	flag(hCreate, h.Create)
-	flag(hDiscard, h.Discard)
-	flag(hForce, h.Force)
-	flag(hExecProjected, h.ExecProjected)
-	flag(hClaimAdd, h.ClaimAdd)
-	flag(hClaimClear, h.ClaimClear)
-	flag(hWithdraw, h.Withdraw)
-	flag(hApprove, h.Approve)
-	flag(hHidden, h.Hidden)
+// fieldKind is how a field's value is shaped on the wire.
+type fieldKind uint8
+
+const (
+	kindNum     fieldKind = iota // a sparse number: zero is absent
+	kindStr                      // a sparse string: empty is absent
+	kindFlag                     // a presence flag: false is absent
+	kindOptNum                   // a number that is present even at zero
+	kindStrList                  // a []string in one payload
+	kindList                     // a record list, with its companions, via enc/dec
+	kindOp                       // the verb: a code, or hOpName text
+)
+
+// field is one row of the header codec table.
+//
+// at returns the address of the field it names, so one row drives both
+// encodeHeader and decodeHeader: the encoder reads through it and the decoder
+// writes through it. A kindList row leaves at nil and does its work through
+// enc and dec, which live side by side so the two halves of a list are read
+// together.
+//
+// name labels the field in a malformed-record error. decodeOnly marks a row
+// that exists so an older peer's field is still read: the encoder skips it.
+type field struct {
+	code       byte
+	kind       fieldKind
+	at         func(*Header) any
+	enc        func(*Header, *[]prog.Op)
+	dec        func(*headerDecoder, *prog.Reader) error
+	name       string
+	decodeOnly bool
+}
+
+// headerFields is the one source of truth for the header's fields, in the
+// order encodeHeader emits them.
+var headerFields = []field{
+	{code: hID, kind: kindNum, at: func(h *Header) any { return &h.ID }},
+	// h.Op is the one field that is not a plain value: a verb the registry
+	// knows goes out as its code, a name it does not as hOpName text, and both
+	// decode into h.Op.
+	{code: hOp, kind: kindOp, at: func(h *Header) any { return &h.Op }},
+	{code: hOpName, kind: kindStr, at: func(h *Header) any { return &h.Op }, decodeOnly: true},
+	{code: hPath, kind: kindStr, at: func(h *Header) any { return &h.Path }},
+	{code: hNewPath, kind: kindStr, at: func(h *Header) any { return &h.NewPath }},
+	{code: hAuthor, kind: kindNum, at: func(h *Header) any { return &h.Author }},
+	{code: hGen, kind: kindNum, at: func(h *Header) any { return &h.Gen }},
+	// hGenOut is read from older servers. Before the duplicate write was
+	// dropped, encodeHeader wrote h.Gen twice — as hGen and as hGenOut — and
+	// decodeHeader read both. A peer still in the field may send 0x5e, so the
+	// alias stays decodable; this encoder never emits it, which is what frees
+	// the code once no such peer remains.
+	{code: hGenOut, kind: kindNum, at: func(h *Header) any { return &h.Gen }, decodeOnly: true},
+	{code: hToken, kind: kindStr, at: func(h *Header) any { return &h.Token }},
+	// A pointer because zero is a real version and "not stated" is not the
+	// same as version zero: an apply with no base is refused, an apply based on
+	// version zero is the first one against a fresh buffer.
+	{code: hBase, kind: kindOptNum, at: func(h *Header) any { return &h.Base }},
+	{code: hCancel, kind: kindNum, at: func(h *Header) any { return &h.Cancel }},
+	{code: hLine, kind: kindNum, at: func(h *Header) any { return &h.Line }},
+	{code: hCol, kind: kindNum, at: func(h *Header) any { return &h.Col }},
+	{code: hReviewList, kind: kindFlag, at: func(h *Header) any { return &h.ReviewList }},
+	{code: hAnnotated, kind: kindFlag, at: func(h *Header) any { return &h.Annotated }},
+	{code: hCreate, kind: kindFlag, at: func(h *Header) any { return &h.Create }},
+	{code: hDiscard, kind: kindFlag, at: func(h *Header) any { return &h.Discard }},
+	{code: hForce, kind: kindFlag, at: func(h *Header) any { return &h.Force }},
+	{code: hExecProjected, kind: kindFlag, at: func(h *Header) any { return &h.ExecProjected }},
+	{code: hClaimAdd, kind: kindFlag, at: func(h *Header) any { return &h.ClaimAdd }},
+	{code: hClaimClear, kind: kindFlag, at: func(h *Header) any { return &h.ClaimClear }},
+	{code: hWithdraw, kind: kindFlag, at: func(h *Header) any { return &h.Withdraw }},
+	{code: hApprove, kind: kindFlag, at: func(h *Header) any { return &h.Approve }},
+	{code: hHidden, kind: kindFlag, at: func(h *Header) any { return &h.Hidden }},
 	// The four span fields are pointers for the same reason as Base: zero is a
 	// real offset and "not stated" is not the same as offset zero — a read or
 	// dump with -start 0 asks for the head of the file, an absent one asks for
-	// the whole of it. Emit directly so a stated zero survives the trip.
-	if h.Start != nil {
-		ops = append(ops, Op8{hStart, prog.Number(*h.Start)})
-	}
-	if h.End != nil {
-		ops = append(ops, Op8{hEnd, prog.Number(*h.End)})
-	}
-	if h.LineStart != nil {
-		ops = append(ops, Op8{hLineStart, prog.Number(*h.LineStart)})
-	}
-	if h.LineEnd != nil {
-		ops = append(ops, Op8{hLineEnd, prog.Number(*h.LineEnd)})
-	}
+	// the whole of it. The optional kind keeps a stated zero on the wire.
+	{code: hStart, kind: kindOptNum, at: func(h *Header) any { return &h.Start }},
+	{code: hEnd, kind: kindOptNum, at: func(h *Header) any { return &h.End }},
+	{code: hLineStart, kind: kindOptNum, at: func(h *Header) any { return &h.LineStart }},
+	{code: hLineEnd, kind: kindOptNum, at: func(h *Header) any { return &h.LineEnd }},
+	{code: hGroup, kind: kindNum, at: func(h *Header) any { return &h.Group }},
+	{code: hIdentity, kind: kindStr, at: func(h *Header) any { return &h.Identity }},
+	{code: hName, kind: kindStr, at: func(h *Header) any { return &h.Name }},
+	{code: hKind, kind: kindStr, at: func(h *Header) any { return &h.Kind }},
+	{code: hTask, kind: kindStr, at: func(h *Header) any { return &h.Task }},
+	{code: hLandTask, kind: kindStr, at: func(h *Header) any { return &h.LandTask }},
+	{code: hState, kind: kindStr, at: func(h *Header) any { return &h.State }},
+	{code: hStateOn, kind: kindStr, at: func(h *Header) any { return &h.StateOn }},
+	{code: hStateNote, kind: kindStr, at: func(h *Header) any { return &h.StateNote }},
+	{code: hTo, kind: kindStr, at: func(h *Header) any { return &h.To }},
+	{code: hMessage, kind: kindStr, at: func(h *Header) any { return &h.Message }},
+	{code: hDir, kind: kindStr, at: func(h *Header) any { return &h.Dir }},
+	{code: hExit, kind: kindNum, at: func(h *Header) any { return &h.Exit }},
+	{code: hStream, kind: kindNum, at: func(h *Header) any { return &h.Stream }},
+	{code: hOutLen, kind: kindNum, at: func(h *Header) any { return &h.OutLen }},
+	{code: hFinal, kind: kindFlag, at: func(h *Header) any { return &h.Final }},
+	{code: hOK, kind: kindFlag, at: func(h *Header) any { return &h.OK }},
+	{code: hRemains, kind: kindFlag, at: func(h *Header) any { return &h.Remains }},
+	{code: hCreated, kind: kindFlag, at: func(h *Header) any { return &h.Created }},
+	{code: hErr, kind: kindStr, at: func(h *Header) any { return &h.Err }},
+	{code: hRoot, kind: kindStr, at: func(h *Header) any { return &h.Root }},
+	{code: hRoots, kind: kindStrList, at: func(h *Header) any { return &h.Roots }, name: "roots"},
+	{code: hPID, kind: kindNum, at: func(h *Header) any { return &h.PID }},
+	{code: hVersion, kind: kindNum, at: func(h *Header) any { return &h.Version }},
+	{code: hBytes, kind: kindNum, at: func(h *Header) any { return &h.Bytes }},
+	{code: hLines, kind: kindNum, at: func(h *Header) any { return &h.Lines }},
+	{code: hFound, kind: kindFlag, at: func(h *Header) any { return &h.Found }},
+	{code: hFindStart, kind: kindNum, at: func(h *Header) any { return &h.FindStart }},
+	{code: hFindEnd, kind: kindNum, at: func(h *Header) any { return &h.FindEnd }},
+	{code: hFindCount, kind: kindNum, at: func(h *Header) any { return &h.FindCount }},
+	{code: hFiles, kind: kindNum, at: func(h *Header) any { return &h.Files }},
+	{code: hConsidered, kind: kindNum, at: func(h *Header) any { return &h.Considered }},
+	{code: hCapped, kind: kindFlag, at: func(h *Header) any { return &h.Capped }},
+	{code: hDump, kind: kindNum, at: func(h *Header) any { return &h.DumpID }},
+	{code: hHash, kind: kindStr, at: func(h *Header) any { return &h.Hash }},
+	{code: hSnapshotJSON, kind: kindStr, at: func(h *Header) any { return &h.SnapshotJSON }},
+	{code: hEncodingJSON, kind: kindStr, at: func(h *Header) any { return &h.EncodingJSON }},
+	{code: hSnapshotPath, kind: kindStr, at: func(h *Header) any { return &h.SnapshotPath }},
+	{code: hLSPMode, kind: kindStr, at: func(h *Header) any { return &h.LSPMode }},
+	{code: hLSPJSON, kind: kindStr, at: func(h *Header) any { return &h.LSPJSON }},
+	{code: hGitMode, kind: kindStr, at: func(h *Header) any { return &h.GitMode }},
+	{code: hGitRev, kind: kindStr, at: func(h *Header) any { return &h.GitRev }},
+	{code: hGitCount, kind: kindNum, at: func(h *Header) any { return &h.GitCount }},
+	{code: hGitJSON, kind: kindStr, at: func(h *Header) any { return &h.GitJSON }},
+	{code: hHookMode, kind: kindStr, at: func(h *Header) any { return &h.HookMode }},
+	{code: hHookName, kind: kindStr, at: func(h *Header) any { return &h.HookName }},
+	{code: hHookJSON, kind: kindStr, at: func(h *Header) any { return &h.HookJSON }},
+	{code: hRetryAfterMS, kind: kindNum, at: func(h *Header) any { return &h.RetryAfterMS }},
+	{code: hHookRunID, kind: kindNum, at: func(h *Header) any { return &h.HookRunID }},
+	{code: hHookRevision, kind: kindNum, at: func(h *Header) any { return &h.HookRevision }},
+	{code: hHookHead, kind: kindStr, at: func(h *Header) any { return &h.HookHead }},
+	{code: hHookDirty, kind: kindStr, at: func(h *Header) any { return &h.HookDirty }},
+	{code: hHookDurationMS, kind: kindNum, at: func(h *Header) any { return &h.HookDurationMS }},
+	{code: hHookTruncated, kind: kindFlag, at: func(h *Header) any { return &h.HookTruncated }},
+	{code: hHookOff, kind: kindFlag, at: func(h *Header) any { return &h.HookOff }},
+	{code: hHookLogJSON, kind: kindStr, at: func(h *Header) any { return &h.HookLogJSON }},
+	{code: hHookPSJSON, kind: kindStr, at: func(h *Header) any { return &h.HookPSJSON }},
+	{code: hDiffJSON, kind: kindStr, at: func(h *Header) any { return &h.DiffJSON }},
+	{code: hStatesJSON, kind: kindStr, at: func(h *Header) any { return &h.StatesJSON }},
+	{code: hSrcVersion, kind: kindStr, at: func(h *Header) any { return &h.SrcVersion }},
 
-	num(hGroup, int(h.Group))
-	str(hIdentity, h.Identity)
-	str(hName, h.Name)
-	str(hKind, h.Kind)
-	str(hTask, h.Task)
-	str(hLandTask, h.LandTask)
-	str(hState, h.State)
-	str(hStateOn, h.StateOn)
-	str(hStateNote, h.StateNote)
-
-	str(hTo, h.To)
-	str(hMessage, h.Message)
-	str(hDir, h.Dir)
-	num(hExit, h.Exit)
-	num(hStream, int(h.Stream))
-	num(hOutLen, h.OutLen)
-	flag(hFinal, h.Final)
-	flag(hOK, h.OK)
-	flag(hRemains, h.Remains)
-	flag(hCreated, h.Created)
-	str(hErr, h.Err)
-	str(hRoot, h.Root)
-	if len(h.Roots) > 0 {
-		var w prog.Writer
-		for _, r := range h.Roots {
-			w.Str(r)
-		}
-		ops = append(ops, Op8{hRoots, w.Done()})
-	}
-
-	num(hPID, h.PID)
-	num(hVersion, int(h.Version))
-	num(hBytes, h.Bytes)
-	num(hLines, h.Lines)
-	flag(hFound, h.Found)
-	num(hFindStart, h.FindStart)
-	num(hFindEnd, h.FindEnd)
-	num(hFindCount, h.FindCount)
-	num(hFiles, h.Files)
-	num(hConsidered, h.Considered)
-	flag(hCapped, h.Capped)
-	num(hDump, int(h.DumpID))
-	num(hGenOut, int(h.Gen))
-	str(hHash, h.Hash)
-	str(hSnapshotJSON, h.SnapshotJSON)
-	str(hEncodingJSON, h.EncodingJSON)
-	str(hSnapshotPath, h.SnapshotPath)
-	str(hLSPMode, h.LSPMode)
-	str(hLSPJSON, h.LSPJSON)
-	str(hGitMode, h.GitMode)
-	str(hGitRev, h.GitRev)
-	num(hGitCount, h.GitCount)
-	str(hGitJSON, h.GitJSON)
-	str(hHookMode, h.HookMode)
-	str(hHookName, h.HookName)
-	str(hHookJSON, h.HookJSON)
-	num(hRetryAfterMS, h.RetryAfterMS)
-	num(hHookRunID, int(h.HookRunID))
-	num(hHookRevision, int(h.HookRevision))
-	str(hHookHead, h.HookHead)
-	str(hHookDirty, h.HookDirty)
-	num(hHookDurationMS, int(h.HookDurationMS))
-	flag(hHookTruncated, h.HookTruncated)
-	flag(hHookOff, h.HookOff)
-	str(hHookLogJSON, h.HookLogJSON)
-	str(hHookPSJSON, h.HookPSJSON)
-	str(hDiffJSON, h.DiffJSON)
-	str(hStatesJSON, h.StatesJSON)
-	str(hSrcVersion, h.SrcVersion)
-
-	if len(h.Argv) > 0 {
-		var w prog.Writer
-		for _, a := range h.Argv {
-			w.Str(a)
-		}
-		ops = append(ops, Op8{hArgv, w.Done()})
-	}
-	if len(h.Paths) > 0 {
-		var w prog.Writer
-		for _, p := range h.Paths {
-			w.Str(p)
-		}
-		ops = append(ops, Op8{hPaths, w.Done()})
-	}
-	if q := h.Query; q != nil {
-		var w prog.Writer
-		w.Str(q.Text).Str(q.Include).Str(q.Exclude).Bool(q.Regex).Bool(q.Case).Bool(q.Word)
-		// Path is appended rather than carved into the middle of the record: a
-		// reader that predates it reads the six fields it knows and ignores the
-		// trailing bytes, and a reader that knows it reads the seventh. No
-		// element count to disagree about, so the addition is invisible to the
-		// old end.
-		//
-		// Hidden is appended after Path for the same reason: a reader that
-		// knows it reads one more field, and one that predates it reads what
-		// it knows and leaves the flag false, which is the default walk.
-		w.Str(q.Path).Bool(q.Hidden).Num(q.Context)
-		ops = append(ops, Op8{hQuery, w.Done()})
-	}
-	if len(h.Hunks) > 0 {
-		var w prog.Writer
-		for _, x := range h.Hunks {
-			w.Num(x.Start).Num(x.End).Num(x.Len)
-		}
-		ops = append(ops, Op8{hHunks, w.Done()})
-	}
-	if len(h.Dirty) > 0 {
-		var w prog.Writer
-		for _, d := range h.Dirty {
-			w.Str(d.Path).Bool(d.AgentOnly)
-		}
-		ops = append(ops, Op8{hDirty, w.Done()})
-	}
-	if s := h.Stats; s != (ExecStats{}) {
-		var w prog.Writer
-		w.Num(s.Runs).Num(s.Stale).Num(s.AgentOnly)
-		ops = append(ops, Op8{hStats, w.Done()})
-	}
-	if len(h.Participants) > 0 {
-		var w prog.Writer
-		for _, p := range h.Participants {
-			kind, ok := code(kindCodes, string(p.Kind))
-			w.Num(int(p.ID)).Str(p.Identity).Str(p.Name).Num(int(kind)).Bool(p.Connected)
-			if !ok {
-				// A kind this build does not know still has to arrive; the
-				// zero code means "read the name that follows".
-				w.Str(string(p.Kind))
-			}
-		}
-		ops = append(ops, Op8{hParticipants, w.Done()}) // The working state rides in a field of its own rather than inside the
-		// hParticipants record: records are positional, so an older reader
-		// would read a state code as the next record's id. Every participant
-		// gets a record, so a reader that knows the field reads state for all
-		// of them and one that does not skips it whole.
-		var sts prog.Writer
-		for _, p := range h.Participants {
-			st, _ := code(workCodes, p.State)
-			decl, _ := code(workCodes, p.Declared)
-			sts.Num(int(p.ID)).Num(int(st)).Num(int(decl)).Num(int(p.SinceMS)).Str(p.Note).Str(p.On)
-		}
-		ops = append(ops, Op8{hParticipantState, sts.Done()})
-	}
-	if len(h.Groups) > 0 {
-
-		var w prog.Writer
-		for _, g := range h.Groups {
-			state, ok := code(stateCodes, g.State)
-			w.Num(int(g.ID)).Str(g.Path).Num(int(g.Author)).Num(int(state)).
-				Num(g.Ops).Num(g.Bytes).Num(int(g.First)).Num(int(g.Last)).
-				Num(g.Hunks).Num(g.Moved)
-			if !ok {
-				w.Str(g.State)
-			}
-		}
-		ops = append(ops, Op8{hGroups, w.Done()})
-
-		// Overlap lists ride in their own sparse field, keyed to the groups by
-
-		// position: one count per group, then that many {group, author, start,
-		// end} records. A count is written for every group so the order matches
-		// hGroups, and the field is emitted only when some set overlaps, so a
-		// response with nothing to report is unchanged. A separate field rather
-		// than a wider hGroups record keeps an older reader from reading an
-		// overlap count as the next group's id.
-		var ovs prog.Writer
-		var anyOverlap bool
-		for _, g := range h.Groups {
-			var sets []GroupOverlap
-			if g.Overlaps != nil {
-				sets = g.Overlaps.Sets
-			}
-			ovs.Num(len(sets))
-			for _, o := range sets {
-				ovs.Num(int(o.Group)).Num(int(o.Author)).Num(o.Start).Num(o.End)
-			}
-			if len(sets) > 0 {
-				anyOverlap = true
-			}
-		}
-		if anyOverlap {
-			ops = append(ops, Op8{hGroupOverlaps, ovs.Done()})
-		}
-
-		// Invalid flags ride the same positional, sparse style: a flag per
-		// group, then -- only when the flag is set -- the collider's group,
-		// author and span. The field is emitted only when some group is
-		// invalid, so a response with none is unchanged, and a separate field
-		// rather than a wider hGroups record keeps an older reader from reading
-		// a flag as the next group's id.
-		var invs prog.Writer
-		var anyInvalid bool
-		for _, g := range h.Groups {
-			if !g.Invalid {
-				invs.Num(0)
-				continue
-			}
-			invs.Num(1)
-			var by GroupOverlap
-			if g.InvalidBy != nil {
-				by = *g.InvalidBy
-			}
-			invs.Num(int(by.Group)).Num(int(by.Author)).Num(by.Start).Num(by.End)
-			anyInvalid = true
-		}
-		if anyInvalid {
-			ops = append(ops, Op8{hGroupInvalid, invs.Done()})
-		}
-	}
-	// The task each writer's changes belong to rides in a sparse field of its
-	// own: a sequence of {index, kind, task} records, kind 0 a participant and
-	// 1 a group, emitted only for records that carry a task. A header with
-	// none is byte-for-byte what it always was, and a reader that does not
-	// know the field skips it whole.
-	{
-		var w prog.Writer
-		any := false
-		for _, p := range h.Participants {
-			any = any || p.Task != ""
-		}
-		for _, g := range h.Groups {
-			any = any || g.Task != ""
-		}
-		if any {
-			for i, p := range h.Participants {
-				if p.Task != "" {
-					w.Num(i).Num(0).Str(p.Task)
-				}
-			}
-			for i, g := range h.Groups {
-				if g.Task != "" {
-					w.Num(i).Num(1).Str(g.Task)
-				}
-			}
-			ops = append(ops, Op8{hTasks, w.Done()})
-		}
-	}
-	if len(h.Messages) > 0 {
-		var w prog.Writer
-		for _, m := range h.Messages {
-			w.Num(int(m.From)).Str(m.Text)
-		}
-		ops = append(ops, Op8{hMessages, w.Done()})
-
-		// The sender's reply target rides in its own sparse field, one record
-		// per message, so a reader that knows only hMessages skips it whole and
-		// still reads the text from the participant list.
-		var froms prog.Writer
-		var anyFrom bool
-		for _, m := range h.Messages {
-			froms.Str(m.FromKey).Str(m.FromName)
-			if m.FromKey != "" || m.FromName != "" {
-				anyFrom = true
-			}
-		}
-		if anyFrom {
-			ops = append(ops, Op8{hMessageFrom, froms.Done()})
-		}
-	}
-
-	if len(h.Land) > 0 {
-		var w prog.Writer
-		for _, f := range h.Land {
-			w.Str(f.Path).Num(f.Sets).Bool(f.Saved).Bool(f.Held).Str(f.Err)
-		}
-		ops = append(ops, Op8{hLand, w.Done()})
-	}
-	if len(h.Claims) > 0 {
-		var w prog.Writer
-		for _, p := range h.Claims {
-			w.Str(p)
-		}
-		ops = append(ops, Op8{hClaims, w.Done()})
-	}
-	if len(h.ClaimWarnings) > 0 {
-		var w prog.Writer
-		for _, s := range h.ClaimWarnings {
-			w.Str(s)
-		}
-		ops = append(ops, Op8{hClaimWarnings, w.Done()})
-	}
-	if len(h.ClaimOverlaps) > 0 {
-		var w prog.Writer
-		for _, o := range h.ClaimOverlaps {
-			w.Str(o.Path).Str(o.Identity).Num(int(o.Author))
-		}
-		ops = append(ops, Op8{hClaimOverlaps, w.Done()})
-	}
-	if len(h.Deletions) > 0 {
-		var w prog.Writer
-		for _, d := range h.Deletions {
-			w.Str(d.Path).Num(int(d.Author))
-		}
-		ops = append(ops, Op8{hDeletions, w.Done()})
-	}
-	if len(h.DirRemovals) > 0 {
-		var w prog.Writer
-		for _, d := range h.DirRemovals {
-			w.Str(d.Path).Num(int(d.Author))
-		}
-		ops = append(ops, Op8{hDirRemovals, w.Done()})
-	}
-	if len(h.Proposals) > 0 {
-		var w prog.Writer
-		for _, p := range h.Proposals {
-			w.Str(p.Kind).Str(p.Path).Num(int(p.Author)).Num(int(p.Group)).Num(p.Start).Num(p.End)
-		}
-		ops = append(ops, Op8{hProposals, w.Done()})
-	}
-	if len(h.Reveals) > 0 {
-		var w prog.Writer
-		for _, r := range h.Reveals {
-			w.Str(r.Path).Num(r.Start).Num(r.End)
-		}
-		ops = append(ops, Op8{hReveals, w.Done()})
-	}
-	if len(h.Entries) > 0 {
-		var w prog.Writer
-		for _, e := range h.Entries {
-			// Size is -1 when absent, so a zero-byte regular file keeps its
-			// zero and a directory stays distinguishable from an empty one.
-			size := -1
-			if e.Size != nil {
-				size = int(*e.Size)
-			}
-			w.Str(e.Name).Str(e.Path).Bool(e.Dir).Num(size)
-		}
-		ops = append(ops, Op8{hEntries, w.Done()})
-	}
-
-	if len(h.Buffers) > 0 {
-		var w prog.Writer
-		for _, b := range h.Buffers {
-			w.Str(b.Path).Num(int(b.Version)).Bool(b.Dirty).Num(b.Bytes).Num(b.Lines).Bool(b.Active)
-		}
-		ops = append(ops, Op8{hBuffers, w.Done()})
-
-		// Pending and Moved ride in their own sparse field, one record per
-		// buffer that has either, rather than as two more fields on each
-		// hBuffers record. Records are positional — no element count and no
-		// per-field opcode — so an older reader would read a nonzero pending
-		// count as the next record's path. An unknown argument field, by
-		// contrast, is skipped: an old reader loses the counts and keeps the
-		// buffers, and an old server omits the field so the counts read zero.
-		var counts prog.Writer
-		var any bool
-		for _, b := range h.Buffers {
-			if b.Pending == 0 && b.Moved == 0 {
-				continue
-			}
-			any = true
-			counts.Str(b.Path).Num(b.Pending).Num(b.Moved)
-		}
-		if any {
-			ops = append(ops, Op8{hBufferState, counts.Done()})
-		}
-
-		// The superseded count rides in a field of its own for the same
-		// positional-record reason, and because it is a different fact from
-		// Pending: a buffer can have no pending set and still be one a save
-		// refuses. One record per buffer that has a nonzero count.
-		var superseded prog.Writer
-		var anySuperseded bool
-		for _, b := range h.Buffers {
-			if b.Superseded == 0 {
-				continue
-			}
-			anySuperseded = true
-			superseded.Str(b.Path).Num(b.Superseded)
-		}
-		if anySuperseded {
-			ops = append(ops, Op8{hBufferSuperseded, superseded.Done()})
-		}
-
-		// The path of a headless buffer rides in a sparse field of its own
-		// too, one record per headless buffer. The reason matches the counts
-		// above: an hBuffers record is positional, so a field added inside
-		// one would be read as the next record path by an older reader. An
-		// absent field is skipped whole, so an old client reads every buffer
-		// as tabbed — the only state an old build could make.
-		var headless prog.Writer
-		var anyHeadless bool
-		for _, b := range h.Buffers {
-			if !b.Headless {
-				continue
-			}
-			anyHeadless = true
-			headless.Str(b.Path)
-		}
-		if anyHeadless {
-			ops = append(ops, Op8{hBufferHeadless, headless.Done()})
-		}
-	}
-
-	if len(h.Truncated) > 0 {
-		var w prog.Writer
-		for _, t := range h.Truncated {
-			w.Str(t.Path).Num(t.Shown).Num(t.Total)
-		}
-		ops = append(ops, Op8{hTruncated, w.Done()})
-	}
-	if len(h.Matches) > 0 {
-		var w prog.Writer
-		for _, m := range h.Matches {
-			w.Num(m.Line).Num(m.Col).Num(m.Len).Num(m.PathLen).Num(m.TextLen).
-				Num(m.ByteStart).Num(m.ByteEnd)
-		}
-		ops = append(ops, Op8{hMatches, w.Done()})
-
-		// LineStart rides in its own sparse field rather than as another Num in
-		// the positional hMatches record: appending to a record-shaped field
-		// would misalign an older reader, as it would for hBuffers. It is sent
-		// only when some hit is not at offset zero, the field default, so an
-		// omitted field means every line start was zero.
-		var starts prog.Writer
-		anyStart := false
-		for _, m := range h.Matches {
-			if m.LineStart != 0 {
-				anyStart = true
-			}
-			starts.Num(m.LineStart)
-		}
-		if anyStart {
-			ops = append(ops, Op8{hMatchLineStart, starts.Done()})
-		}
-
-		// LineEnd rides the same sparse way, for the same reason. It is sent
-		// only when some hit's line does not end at offset zero, so an omitted
-		// field means every line end was zero.
-		var ends prog.Writer
-		anyEnd := false
-		for _, m := range h.Matches {
-			if m.LineEnd != 0 {
-				anyEnd = true
-			}
-			ends.Num(m.LineEnd)
-		}
-		if anyEnd {
-			ops = append(ops, Op8{hMatchLineEnd, ends.Done()})
-		}
-
-		// Version rides the same sparse way, one number per hit, sent only when
-		// some hit names a nonzero buffer revision. A hit on a file read from
-		// disk carries zero, which is not a revision any buffer can hold, so an
-		// omitted field means every hit was the disk's.
-		var vers prog.Writer
-		anyVersion := false
-		for _, m := range h.Matches {
-			if m.Version != 0 {
-				anyVersion = true
-			}
-			vers.Num(int(m.Version))
-		}
-		if anyVersion {
-			ops = append(ops, Op8{hMatchVersion, vers.Done()})
-		}
-
-		// Context rides the same sparse way, one string per hit, in hit order.
-		// It is sent only when some hit carries context, so an omitted field
-		// means every hit was the hit line alone; an old reader skips the
-		// argument whole rather than misreading a positional record.
-		var contexts prog.Writer
-		anyContext := false
-		for _, m := range h.Matches {
-			if m.Context != "" {
-				anyContext = true
-			}
-			contexts.Str(m.Context)
-		}
-		if anyContext {
-			ops = append(ops, Op8{hMatchContext, contexts.Done()})
-		}
-	}
-	if len(h.Conflicts) > 0 {
-		var w prog.Writer
-		for _, c := range h.Conflicts {
-			w.Num(c.Index).Num(int(c.At)).Num(c.Hunk.Start).Num(c.Hunk.End).Str(c.Hunk.Text)
-		}
-		ops = append(ops, Op8{hConflicts, w.Done()})
-
-		// The lease owner rides in its own sparse field rather than as another
-		// field on the record. hConflicts records are positional, so an older
-		// reader would read a sixth field as the next record index and misalign
-		// every conflict after it; a separate argument field is skipped whole.
-		// One number per conflict, in order; the field is absent when every
-		// owner is zero, which is the common stale-offset case, so an old
-		// client loses nothing it would have had.
-		var groups prog.Writer
-		var any bool
-		for _, c := range h.Conflicts {
-			if c.Group != 0 {
-				any = true
-			}
-			groups.Num(int(c.Group))
-		}
-		if any {
-			ops = append(ops, Op8{hConflictGroup, groups.Done()})
-		}
-
-		// The lease owner's author and span ride together in one sparse field,
-		// three numbers per conflict, in conflict order, so each pair stays with
-		// its own refusal. It is emitted whenever any conflict names a lease;
-		// the stale-offset conflicts write zeros and an old reader loses
-		// nothing it would have had. A separate field keeps the span out of the
-		// positional hConflicts record, which an older reader would otherwise
-		// read as the next conflict's index.
-		var lease prog.Writer
-		var anyLease bool
-		for _, c := range h.Conflicts {
-			if c.Group != 0 {
-				anyLease = true
-			}
-			lease.Num(int(c.Author)).Num(c.Start).Num(c.End)
-		}
-		if anyLease {
-			ops = append(ops, Op8{hConflictLease, lease.Done()})
-		}
-	}
-	// Warnings ride in their own sparse field: one {group, author, start, end}
-	// record per warning, emitted only when some hunk landed over another
-	// writer's Proposed span. A separate argument field rather than another
-	// field on the positional hConflicts record, so an older reader that does
-	// not know it skips it whole and loses the warnings rather than misreading
-	// the next conflict's index.
-	if len(h.Warnings) > 0 {
-		var w prog.Writer
-		for _, x := range h.Warnings {
-			w.Num(int(x.Group)).Num(int(x.Author)).Num(x.Start).Num(x.End)
-		}
-		ops = append(ops, Op8{hApplyWarnings, w.Done()})
-	}
-	if len(h.Spans) > 0 {
-		var w prog.Writer
-		for _, s := range h.Spans {
-			w.Num(s.Len).Num(int(s.Author))
-		}
-		ops = append(ops, Op8{hSpans, w.Done()})
-	}
-
-	out := make([]prog.Op, len(ops))
-	for i, op := range ops {
-		out[i] = prog.Op{Code: op.code, Payload: op.payload}
-	}
-	return prog.Encode(out)
+	// List fields, in emission order. The record lists name their paired
+	// enc/dec; a []string list is one row. A companion field carries only dec
+	// and is decodeOnly, because its main list's encoder emits it.
+	{code: hArgv, kind: kindStrList, at: func(h *Header) any { return &h.Argv }, name: "argv"},
+	{code: hPaths, kind: kindStrList, at: func(h *Header) any { return &h.Paths }, name: "paths"},
+	{code: hHookParams, kind: kindStrList, at: func(h *Header) any { return &h.HookParams }, name: "hook params"},
+	{code: hQuery, kind: kindList, enc: encodeQuery, dec: decodeQuery, name: "search query"},
+	{code: hHunks, kind: kindList, enc: encodeHunks, dec: decodeHunks, name: "hunks"},
+	{code: hDirty, kind: kindList, enc: encodeDirty, dec: decodeDirty, name: "dirty"},
+	{code: hStats, kind: kindList, enc: encodeStats, dec: decodeStats, name: "stats"},
+	{code: hParticipants, kind: kindList, enc: encodeParticipants, dec: decodeParticipants, name: "participants"},
+	{code: hParticipantState, kind: kindList, dec: decodeParticipantState, name: "participant state", decodeOnly: true},
+	{code: hGroups, kind: kindList, enc: encodeGroups, dec: decodeGroups, name: "groups"},
+	{code: hGroupOverlaps, kind: kindList, dec: decodeGroupOverlaps, name: "group overlaps", decodeOnly: true},
+	{code: hGroupInvalid, kind: kindList, dec: decodeGroupInvalid, name: "group invalid", decodeOnly: true},
+	{code: hTasks, kind: kindList, enc: encodeTasks, dec: decodeTasks, name: "tasks"},
+	{code: hMessages, kind: kindList, enc: encodeMessages, dec: decodeMessages, name: "messages"},
+	{code: hMessageFrom, kind: kindList, dec: decodeMessageFrom, name: "message from", decodeOnly: true},
+	{code: hLand, kind: kindList, enc: encodeLand, dec: decodeLand, name: "land"},
+	{code: hClaims, kind: kindStrList, at: func(h *Header) any { return &h.Claims }, name: "claims"},
+	{code: hClaimWarnings, kind: kindStrList, at: func(h *Header) any { return &h.ClaimWarnings }, name: "claim warnings"},
+	{code: hClaimOverlaps, kind: kindList, enc: encodeClaimOverlaps, dec: decodeClaimOverlaps, name: "claim overlaps"},
+	{code: hDeletions, kind: kindList, enc: encodeDeletions, dec: decodeDeletions, name: "deletions"},
+	{code: hDirRemovals, kind: kindList, enc: encodeDirRemovals, dec: decodeDirRemovals, name: "dir removals"},
+	{code: hProposals, kind: kindList, enc: encodeProposals, dec: decodeProposals, name: "proposals"},
+	{code: hReveals, kind: kindList, enc: encodeReveals, dec: decodeReveals, name: "reveals"},
+	{code: hEntries, kind: kindList, enc: encodeEntries, dec: decodeEntries, name: "entries"},
+	{code: hBuffers, kind: kindList, enc: encodeBuffers, dec: decodeBuffers, name: "buffers"},
+	{code: hBufferState, kind: kindList, dec: decodeBufferState, name: "buffer state", decodeOnly: true},
+	{code: hBufferSuperseded, kind: kindList, dec: decodeBufferSuperseded, name: "buffer superseded", decodeOnly: true},
+	{code: hBufferHeadless, kind: kindList, dec: decodeBufferHeadless, name: "buffer headless", decodeOnly: true},
+	{code: hBufferDeleted, kind: kindList, dec: decodeBufferDeleted, name: "buffer deleted", decodeOnly: true},
+	{code: hTruncated, kind: kindList, enc: encodeTruncated, dec: decodeTruncated, name: "truncated"},
+	{code: hMatches, kind: kindList, enc: encodeMatches, dec: decodeMatches, name: "matches"},
+	{code: hMatchLineStart, kind: kindList, dec: decodeMatchLineStart, name: "match line starts", decodeOnly: true},
+	{code: hMatchLineEnd, kind: kindList, dec: decodeMatchLineEnd, name: "match line ends", decodeOnly: true},
+	{code: hMatchVersion, kind: kindList, dec: decodeMatchVersion, name: "match versions", decodeOnly: true},
+	{code: hMatchContext, kind: kindList, dec: decodeMatchContext, name: "match context", decodeOnly: true},
+	{code: hConflicts, kind: kindList, enc: encodeConflicts, dec: decodeConflicts, name: "conflicts"},
+	{code: hConflictGroup, kind: kindList, dec: decodeConflictGroup, name: "conflict groups", decodeOnly: true},
+	{code: hConflictLease, kind: kindList, dec: decodeConflictLease, name: "conflict lease", decodeOnly: true},
+	{code: hApplyWarnings, kind: kindList, enc: encodeWarnings, dec: decodeWarnings, name: "apply warnings"},
+	{code: hSpans, kind: kindList, enc: encodeSpans, dec: decodeSpans, name: "spans"},
 }
 
-// Op8 is a field on its way into a header. Named rather than inlined so the
-// encode side reads as a list of fields instead of a list of struct literals.
-type Op8 struct {
-	code    byte
-	payload []byte
+// headerFieldsByCode indexes the table for decoding, so decodeHeader looks a
+// code up rather than switching on it. Unknown codes are absent and skipped,
+// which is the header's forward-compatibility rule.
+var headerFieldsByCode = func() map[byte]field {
+	m := make(map[byte]field, len(headerFields))
+	for _, f := range headerFields {
+		m[f.code] = f
+	}
+	return m
+}()
+
+// encode writes one field's op, if it has something to say. It is the whole of
+// a scalar's encode side, and a kindList row hands off to its own encoder.
+func (f field) encode(h *Header, ops *[]prog.Op) {
+	if f.decodeOnly {
+		return
+	}
+	switch f.kind {
+	case kindNum:
+		if v := numAt(f.at(h)); v != 0 {
+			*ops = append(*ops, prog.Op{Code: f.code, Payload: prog.Number(v)})
+		}
+	case kindStr:
+		if s := strAt(f.at(h)); s != "" {
+			*ops = append(*ops, prog.Op{Code: f.code, Payload: []byte(s)})
+		}
+	case kindFlag:
+		if flagAt(f.at(h)) {
+			*ops = append(*ops, prog.Op{Code: f.code})
+		}
+	case kindOptNum:
+		if v, ok := optNumAt(f.at(h)); ok {
+			*ops = append(*ops, prog.Op{Code: f.code, Payload: prog.Number(v)})
+		}
+	case kindStrList:
+		xs := strListAt(f.at(h))
+		if len(xs) > 0 {
+			var w prog.Writer
+			for _, s := range xs {
+				w.Str(s)
+			}
+			*ops = append(*ops, prog.Op{Code: f.code, Payload: w.Done()})
+		}
+	case kindOp:
+		s := strAt(f.at(h))
+		if c, ok := code(verbCodes, s); ok {
+			*ops = append(*ops, prog.Op{Code: hOp, Payload: prog.Number(int(c))})
+		} else if s != "" {
+			*ops = append(*ops, prog.Op{Code: hOpName, Payload: []byte(s)})
+		}
+	case kindList:
+		f.enc(h, ops)
+	}
+}
+
+// The scalar accessors read and write the concrete field a row points at. A
+// row's at returns one of the pointer types below; anything else is a table
+// mistake, so it panics here rather than putting a wrong value on the wire.
+func numAt(p any) int {
+	switch v := p.(type) {
+	case *int:
+		return *v
+	case *int64:
+		return int(*v)
+	case *uint8:
+		return int(*v)
+	case *uint64:
+		return int(*v)
+	}
+	panic("control: header field is not a number")
+}
+
+func setNum(p any, n int) {
+	switch v := p.(type) {
+	case *int:
+		*v = n
+	case *int64:
+		*v = int64(n)
+	case *uint8:
+		*v = uint8(n)
+	case *uint64:
+		*v = uint64(n)
+	default:
+		panic("control: header field is not a number")
+	}
+}
+
+func strAt(p any) string       { return *p.(*string) }
+func flagAt(p any) bool        { return *p.(*bool) }
+func strListAt(p any) []string { return *p.(*[]string) }
+
+func optNumAt(p any) (int, bool) {
+	switch v := p.(type) {
+	case **int:
+		if *v == nil {
+			return 0, false
+		}
+		return **v, true
+	case **uint64:
+		if *v == nil {
+			return 0, false
+		}
+		return int(**v), true
+	}
+	panic("control: header optional field is not a pointer")
+}
+
+func setOptNum(p any, n int) {
+	switch v := p.(type) {
+	case **int:
+		x := n
+		*v = &x
+	case **uint64:
+		x := uint64(n)
+		*v = &x
+	default:
+		panic("control: header optional field is not a pointer")
+	}
 }
 
 // decodeHeader reads what encodeHeader wrote.
 //
-// Unknown fields are dropped by the switch below, not by prog.Decode: nil is
-// passed as the known set, and prog.Decode reads nil as "every opcode is
-// known", so it returns an op for a code this function has no case for and the
-// switch's lack of a default ignores it. Header codes are allocated in the
+// The scalar table decodes by code lookup. An unknown field is dropped rather
+// than refused: nil is passed as the known set to prog.Decode, which reads nil
+// as "every opcode is known", so it returns an op for a code this function has
+// no row for and the lookup misses it. Header codes are allocated in the
 // argument range below 0x80, so the frame is kept rather than refused.
+//
+// The sparse companion fields — a list's extra facts that would misalign an
+// older reader if appended to its positional record — are collected in
+// headerDecoder and merged into the header once every op has been read, so
+// their position relative to their main list does not matter.
 func decodeHeader(b []byte) (Header, error) {
 	ops, err := prog.Decode(b, nil)
 	if err != nil {
 		return Header{}, fmt.Errorf("%w: %v", errBadFrame, err)
 	}
-	var h Header
-	// Buffer pending/moved counts arrive in a field of their own. Collect them
-	// and merge once every op has been read, so their position relative to
-	// hBuffers does not matter.
-	var states []bufferState
-	// Superseded counts arrive in their own sparse field, collected and merged
-	// after every op like the pending counts.
-	var supersededStates []bufferSuperseded
-	// Match line starts arrive in their own sparse field; collect them and
-	// merge after every op, so their position relative to hMatches does not
-	// matter.
-	var lineStarts []int
-	// Match line ends arrive the same sparse way, one number per hit, merged
-	// after every op like the starts.
-	var lineEnds []int
-	// Match buffer versions arrive the same sparse way, one number per hit,
-	// merged after every op like the offsets above.
-	var matchVersions []int
-	// Match context blocks arrive the same sparse way, one string per hit,
-	// merged after every op like the versions above.
-	var matchContexts []string
-	// Conflict lease owners arrive the same way, one number per conflict, so
-	// their position relative to hConflicts does not matter either.
-	var conflictGroups []int
-	// The lease owner's author and span arrive the same sparse way, three
-	// numbers per conflict, merged after every op like the owners.
-	var conflictLeases []conflictLease
-	// Group overlap lists arrive the same way, a count then that many records
-	// per group, merged after every op so their position does not matter.
-	var groupOverlaps [][]GroupOverlap
-	// Invalid flags and their colliders arrive the same way, a flag then (when
-	// set) four numbers per group, merged after every op.
-	var groupInvalid []invalidCollider
-	// Message reply targets arrive the same sparse way, one {key, name} per
-	// message, merged after every op like the fields above.
-	var messageFroms []messageFrom
-
-	// Headless buffer paths arrive the same sparse way: one path per buffer
-	// with no tab, marked on the matching buffers after every op is read.
-	var headless []string // Participant working states arrive in their own sparse field, one record
-	// per participant, collected and merged after every op like the headless
-	// paths above.
-	var participantStates []participantState
-	// Task records arrive in a sparse field of their own, {index, kind, task}
-	// each, so they are collected and applied after every op like the fields
-	// above.
-	participantTasks := map[int]string{}
-	groupTasks := map[int]string{}
+	var d headerDecoder
 	for _, op := range ops {
-		switch op.Code {
-		case hID:
-			h.ID = prog.ReadNumber(op.Payload)
-		case hOp:
-			h.Op = nameFor(verbNamesByCode, prog.ReadNumber(op.Payload))
-		case hOpName:
-			h.Op = string(op.Payload)
-		case hPath:
-			h.Path = string(op.Payload)
-		case hNewPath:
-			h.NewPath = string(op.Payload)
-		case hAuthor:
-			h.Author = uint8(prog.ReadNumber(op.Payload))
-		case hToken:
-			h.Token = string(op.Payload)
-		case hBase:
-			v := uint64(prog.ReadNumber(op.Payload))
-			h.Base = &v
-		case hCancel:
-			h.Cancel = prog.ReadNumber(op.Payload)
-		case hLine:
-			h.Line = prog.ReadNumber(op.Payload)
-		case hCol:
-			h.Col = prog.ReadNumber(op.Payload)
-		case hStart:
-			v := prog.ReadNumber(op.Payload)
-			h.Start = &v
-		case hEnd:
-			v := prog.ReadNumber(op.Payload)
-			h.End = &v
-		case hLineStart:
-			v := prog.ReadNumber(op.Payload)
-			h.LineStart = &v
-		case hLineEnd:
-			v := prog.ReadNumber(op.Payload)
-			h.LineEnd = &v
-		case hReviewList:
-			h.ReviewList = true
-		case hAnnotated:
-			h.Annotated = true
-		case hCreate:
-			h.Create = true
-		case hDiscard:
-			h.Discard = true
-		case hForce:
-			h.Force = true
-		case hExecProjected:
-			h.ExecProjected = true
-		case hClaimAdd:
-			h.ClaimAdd = true
-		case hClaimClear:
-			h.ClaimClear = true
-		case hWithdraw:
-			h.Withdraw = true
-		case hApprove:
-			h.Approve = true
-		case hHidden:
-			h.Hidden = true
+		f, ok := headerFieldsByCode[op.Code]
+		if !ok {
+			continue
+		}
+		if err := f.decodeField(&d, op.Payload); err != nil {
+			return Header{}, err
+		}
+	}
+	return d.finish(), nil
+}
 
-		case hGen:
-			h.Gen = uint64(prog.ReadNumber(op.Payload))
-		case hGroup:
-			h.Group = uint64(prog.ReadNumber(op.Payload))
-		case hIdentity:
-			h.Identity = string(op.Payload)
-		case hName:
-			h.Name = string(op.Payload)
-		case hTask:
-			h.Task = string(op.Payload)
-		case hLandTask:
-			h.LandTask = string(op.Payload)
-		case hState:
-			h.State = string(op.Payload)
-		case hStateOn:
-			h.StateOn = string(op.Payload)
-		case hStateNote:
-			h.StateNote = string(op.Payload)
+// headerDecoder is the in-progress header plus the sparse companion fields'
+// payloads. Each is merged into the header by finish after every op is read.
+type headerDecoder struct {
+	h Header
 
-		case hTo:
-			h.To = string(op.Payload)
-		case hMessage:
-			h.Message = string(op.Payload)
-		case hKind:
-			h.Kind = string(op.Payload)
-		case hDir:
-			h.Dir = string(op.Payload)
-		case hExit:
-			h.Exit = prog.ReadNumber(op.Payload)
-		case hStream:
-			h.Stream = uint8(prog.ReadNumber(op.Payload))
-		case hOutLen:
-			h.OutLen = prog.ReadNumber(op.Payload)
-		case hFinal:
-			h.Final = true
-		case hOK:
-			h.OK = true
-		case hRemains:
-			h.Remains = true
-		case hCreated:
-			h.Created = true
-		case hErr:
-			h.Err = string(op.Payload)
-		case hRoot:
-			h.Root = string(op.Payload)
-		case hRoots:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Roots = append(h.Roots, r.Str())
-			}
-			if err := recordsOK(r, "roots"); err != nil {
-				return Header{}, err
-			}
+	participantStates []participantState
+	participantTasks  map[int]string
+	groupTasks        map[int]string
+	groupOverlaps     [][]GroupOverlap
+	groupInvalid      []invalidCollider
+	messageFroms      []messageFrom
+	bufferStates      []bufferState
+	supersededStates  []bufferSuperseded
+	headless          []string
+	deletedBuffers    []string
+	lineStarts        []int
+	lineEnds          []int
+	matchVersions     []int
+	matchContexts     []string
+	conflictGroups    []int
+	conflictLeases    []conflictLease
+}
 
-		case hPID:
-			h.PID = prog.ReadNumber(op.Payload)
-		case hVersion:
-			h.Version = uint64(prog.ReadNumber(op.Payload))
-		case hBytes:
-			h.Bytes = prog.ReadNumber(op.Payload)
-		case hLines:
-			h.Lines = prog.ReadNumber(op.Payload)
-		case hFound:
-			h.Found = true
-		case hFindStart:
-			h.FindStart = prog.ReadNumber(op.Payload)
-		case hFindEnd:
-			h.FindEnd = prog.ReadNumber(op.Payload)
-		case hFindCount:
-			h.FindCount = prog.ReadNumber(op.Payload)
-		case hFiles:
-			h.Files = prog.ReadNumber(op.Payload)
-		case hConsidered:
-			h.Considered = prog.ReadNumber(op.Payload)
-		case hCapped:
-			h.Capped = true
-		case hDump:
-			h.DumpID = uint64(prog.ReadNumber(op.Payload))
-		case hGenOut:
-			h.Gen = uint64(prog.ReadNumber(op.Payload))
-		case hHash:
-			h.Hash = string(op.Payload)
-		case hSnapshotJSON:
-			h.SnapshotJSON = string(op.Payload)
-		case hEncodingJSON:
-			h.EncodingJSON = string(op.Payload)
-		case hSnapshotPath:
-			h.SnapshotPath = string(op.Payload)
-		case hLSPMode:
-			h.LSPMode = string(op.Payload)
-		case hLSPJSON:
-			h.LSPJSON = string(op.Payload)
-		case hGitMode:
-			h.GitMode = string(op.Payload)
-		case hGitRev:
-			h.GitRev = string(op.Payload)
-		case hGitCount:
-			h.GitCount = prog.ReadNumber(op.Payload)
-		case hGitJSON:
-			h.GitJSON = string(op.Payload)
-		case hHookMode:
-			h.HookMode = string(op.Payload)
-		case hHookName:
-			h.HookName = string(op.Payload)
-		case hHookJSON:
-			h.HookJSON = string(op.Payload)
-		case hRetryAfterMS:
-			h.RetryAfterMS = prog.ReadNumber(op.Payload)
-		case hHookRunID:
-			h.HookRunID = uint64(prog.ReadNumber(op.Payload))
-		case hHookRevision:
-			h.HookRevision = uint64(prog.ReadNumber(op.Payload))
-		case hHookHead:
-			h.HookHead = string(op.Payload)
-		case hHookDirty:
-			h.HookDirty = string(op.Payload)
-		case hHookDurationMS:
-			h.HookDurationMS = int64(prog.ReadNumber(op.Payload))
-		case hHookTruncated:
-			h.HookTruncated = true
-		case hHookOff:
-			h.HookOff = true
-		case hHookLogJSON:
-			h.HookLogJSON = string(op.Payload)
-		case hHookPSJSON:
-			h.HookPSJSON = string(op.Payload)
-		case hDiffJSON:
-			h.DiffJSON = string(op.Payload)
-		case hStatesJSON:
-			h.StatesJSON = string(op.Payload)
-		case hSrcVersion:
-			h.SrcVersion = string(op.Payload)
+// decodeField writes one field's payload through its row. A scalar row writes
+// the field in place; a kindList row calls its paired decoder.
+func (f field) decodeField(d *headerDecoder, payload []byte) error {
+	switch f.kind {
+	case kindNum:
+		setNum(f.at(&d.h), prog.ReadNumber(payload))
+	case kindStr:
+		*f.at(&d.h).(*string) = string(payload)
+	case kindFlag:
+		*f.at(&d.h).(*bool) = true
+	case kindOptNum:
+		setOptNum(f.at(&d.h), prog.ReadNumber(payload))
+	case kindStrList:
+		p := f.at(&d.h).(*[]string)
+		r := prog.NewReader(payload)
+		for r.More() {
+			*p = append(*p, r.Str())
+		}
+		return recordsOK(r, f.name)
+	case kindOp:
+		d.h.Op = nameFor(verbNamesByCode, prog.ReadNumber(payload))
+	case kindList:
+		return f.dec(d, prog.NewReader(payload))
+	}
+	return nil
+}
 
-		case hArgv:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Argv = append(h.Argv, r.Str())
-			}
-			if err := recordsOK(r, "argv"); err != nil {
-				return Header{}, err
-			}
-		case hPaths:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Paths = append(h.Paths, r.Str())
-			}
-			if err := recordsOK(r, "paths"); err != nil {
-				return Header{}, err
-			}
-		case hQuery:
-			r := prog.NewReader(op.Payload)
-			q := SearchQuery{Text: r.Str(), Include: r.Str(), Exclude: r.Str()}
-			q.Regex, q.Case, q.Word = r.Bool(), r.Bool(), r.Bool()
-			// The path is the last field, so a payload from before it existed
-			// leaves q.Path empty rather than an error: the value is absent,
-			// which is the same thing as no scope.
-			q.Path = r.Str()
-			// Hidden is the newest field; a payload from before it existed
-			// leaves it false rather than a frame error, which is the default
-			// walk rather than an include-hidden one.
-			q.Hidden = r.Bool()
-			// Context is the newest field; a payload from before it existed
-			// leaves it zero rather than a frame error, which is the hit line
-			// alone rather than a block around it.
-			q.Context = r.Num()
-			h.Query = &q
-		case hHunks:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Hunks = append(h.Hunks, HunkMeta{Start: r.Num(), End: r.Num(), Len: r.Num()})
-			}
-			if err := recordsOK(r, "hunks"); err != nil {
-				return Header{}, err
-			}
-		case hDirty:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Dirty = append(h.Dirty, DirtyBuffer{Path: r.Str(), AgentOnly: r.Bool()})
-			}
-			if err := recordsOK(r, "dirty"); err != nil {
-				return Header{}, err
-			}
-		case hStats:
-			r := prog.NewReader(op.Payload)
-			h.Stats = ExecStats{Runs: r.Num(), Stale: r.Num(), AgentOnly: r.Num()}
-		case hParticipants:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				p := Participant{ID: uint8(r.Num()), Identity: r.Str(), Name: r.Str()}
-				kind := r.Num()
-				p.Connected = r.Bool()
-				if kind == 0 {
-					p.Kind = Kind(r.Str())
-				} else {
-					p.Kind = Kind(nameFor(kindNamesByCode, kind))
-				}
-				h.Participants = append(h.Participants, p)
-			}
-			if err := recordsOK(r, "participants"); err != nil {
-				return Header{}, err
-			}
-		case hParticipantState:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				participantStates = append(participantStates, participantState{
-					id:       uint8(r.Num()),
-					state:    nameFor(workNamesByCode, r.Num()),
-					declared: nameFor(workNamesByCode, r.Num()),
-					sinceMS:  int64(r.Num()),
-					note:     r.Str(),
-					on:       r.Str(),
-				})
-			}
-			if err := recordsOK(r, "participant state"); err != nil {
-				return Header{}, err
-			}
-		case hTasks:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				index, kind := r.Num(), r.Num()
-				task := r.Str()
-				if kind == 0 {
-					participantTasks[index] = task
-				} else {
-					groupTasks[index] = task
-				}
-			}
-			if err := recordsOK(r, "tasks"); err != nil {
-				return Header{}, err
-			}
-		case hGroups:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				g := Group{ID: uint64(r.Num()), Path: r.Str(), Author: uint8(r.Num())}
-				state := r.Num()
-				g.Ops, g.Bytes = r.Num(), r.Num()
-				g.First, g.Last = uint64(r.Num()), uint64(r.Num())
-				g.Hunks, g.Moved = r.Num(), r.Num()
-				if state == 0 {
-					g.State = r.Str()
-				} else {
-					g.State = nameFor(stateNamesByCode, state)
-				}
-				h.Groups = append(h.Groups, g)
-			}
-			if err := recordsOK(r, "groups"); err != nil {
-				return Header{}, err
-			}
-		case hGroupOverlaps:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				n := r.Num()
-				sets := make([]GroupOverlap, 0, n)
-				for k := 0; k < n; k++ {
-					sets = append(sets, GroupOverlap{
-						Group: uint64(r.Num()), Author: uint8(r.Num()),
-						Start: r.Num(), End: r.Num()})
-				}
-				groupOverlaps = append(groupOverlaps, sets)
-			}
-			if err := recordsOK(r, "group overlaps"); err != nil {
-				return Header{}, err
-			}
-		case hGroupInvalid:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				ic := invalidCollider{invalid: r.Num() != 0}
-				if ic.invalid {
-					by := GroupOverlap{Group: uint64(r.Num()), Author: uint8(r.Num()),
-						Start: r.Num(), End: r.Num()}
-					// A zero group means the set is invalid but no single
-					// collider can be named, not a collider with id zero.
-					if by.Group != 0 {
-						ic.by = &by
-					}
-				}
-				groupInvalid = append(groupInvalid, ic)
-			}
-			if err := recordsOK(r, "group invalid"); err != nil {
-				return Header{}, err
-			}
-		case hApplyWarnings:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Warnings = append(h.Warnings, GroupOverlap{
-					Group: uint64(r.Num()), Author: uint8(r.Num()),
-					Start: r.Num(), End: r.Num()})
-			}
-			if err := recordsOK(r, "apply warnings"); err != nil {
-				return Header{}, err
-			}
-		case hMessages:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Messages = append(h.Messages, Message{From: uint8(r.Num()), Text: r.Str()})
-			}
-			if err := recordsOK(r, "messages"); err != nil {
-				return Header{}, err
-			}
-		case hMessageFrom:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				messageFroms = append(messageFroms, messageFrom{key: r.Str(), name: r.Str()})
-			}
-			if err := recordsOK(r, "message from"); err != nil {
-				return Header{}, err
-			}
-		case hClaims:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Claims = append(h.Claims, r.Str())
-			}
-			if err := recordsOK(r, "claims"); err != nil {
-				return Header{}, err
-			}
-		case hClaimWarnings:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.ClaimWarnings = append(h.ClaimWarnings, r.Str())
-			}
-			if err := recordsOK(r, "claim warnings"); err != nil {
-				return Header{}, err
-			}
-		case hClaimOverlaps:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.ClaimOverlaps = append(h.ClaimOverlaps, ClaimOverlap{
-					Path: r.Str(), Identity: r.Str(), Author: uint8(r.Num())})
-			}
-			if err := recordsOK(r, "claim overlaps"); err != nil {
-				return Header{}, err
-			}
-		case hDeletions:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Deletions = append(h.Deletions, Deletion{
-					Path: r.Str(), Author: uint8(r.Num())})
-			}
-			if err := recordsOK(r, "deletions"); err != nil {
-				return Header{}, err
-			}
-		case hDirRemovals:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.DirRemovals = append(h.DirRemovals, DirRemoval{
-					Path: r.Str(), Author: uint8(r.Num())})
-			}
-			if err := recordsOK(r, "dir removals"); err != nil {
-				return Header{}, err
-			}
-		case hProposals:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Proposals = append(h.Proposals, Proposal{
-					Kind: r.Str(), Path: r.Str(), Author: uint8(r.Num()),
-					Group: uint64(r.Num()), Start: r.Num(), End: r.Num()})
-			}
-			if err := recordsOK(r, "proposals"); err != nil {
-				return Header{}, err
-			}
-		case hLand:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Land = append(h.Land, LandFile{Path: r.Str(), Sets: r.Num(),
-					Saved: r.Bool(), Held: r.Bool(), Err: r.Str()})
-			}
-			if err := recordsOK(r, "land"); err != nil {
-				return Header{}, err
-			}
-		case hReveals:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Reveals = append(h.Reveals, Reveal{Path: r.Str(), Start: r.Num(), End: r.Num()})
-			}
-			if err := recordsOK(r, "reveals"); err != nil {
-				return Header{}, err
-			}
-		case hEntries:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				e := Entry{Name: r.Str(), Path: r.Str(), Dir: r.Bool()}
-				if size := r.Num(); size >= 0 {
-					s := int64(size)
-					e.Size = &s
-				}
-				h.Entries = append(h.Entries, e)
-			}
-			if err := recordsOK(r, "entries"); err != nil {
-				return Header{}, err
-			}
-		case hBuffers:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Buffers = append(h.Buffers, Buffer{
-					Path: r.Str(), Version: uint64(r.Num()), Dirty: r.Bool(),
-					Bytes: r.Num(), Lines: r.Num(), Active: r.Bool()})
-			}
-			if err := recordsOK(r, "buffers"); err != nil {
-				return Header{}, err
-			}
-		case hBufferState:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				states = append(states, bufferState{path: r.Str(), pending: r.Num(), moved: r.Num()})
-			}
-			if err := recordsOK(r, "buffer state"); err != nil {
-				return Header{}, err
-			}
-		case hBufferSuperseded:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				supersededStates = append(supersededStates, bufferSuperseded{path: r.Str(), count: r.Num()})
-			}
-			if err := recordsOK(r, "buffer superseded"); err != nil {
-				return Header{}, err
-			}
-		case hBufferHeadless:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				headless = append(headless, r.Str())
-			}
-			if err := recordsOK(r, "buffer headless"); err != nil {
-				return Header{}, err
-			}
-		case hTruncated:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Truncated = append(h.Truncated, TruncatedFile{
-					Path: r.Str(), Shown: r.Num(), Total: r.Num()})
-			}
-			if err := recordsOK(r, "truncated"); err != nil {
-				return Header{}, err
-			}
-		case hMatches:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Matches = append(h.Matches, MatchMeta{
-					Line: r.Num(), Col: r.Num(), Len: r.Num(),
-					PathLen: r.Num(), TextLen: r.Num(),
-					ByteStart: r.Num(), ByteEnd: r.Num()})
-			}
-			if err := recordsOK(r, "matches"); err != nil {
-				return Header{}, err
-			}
-		case hMatchLineStart:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				lineStarts = append(lineStarts, r.Num())
-			}
-			if err := recordsOK(r, "match line starts"); err != nil {
-				return Header{}, err
-			}
-		case hMatchLineEnd:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				lineEnds = append(lineEnds, r.Num())
-			}
-			if err := recordsOK(r, "match line ends"); err != nil {
-				return Header{}, err
-			}
-		case hMatchVersion:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				matchVersions = append(matchVersions, r.Num())
-			}
-			if err := recordsOK(r, "match versions"); err != nil {
-				return Header{}, err
-			}
-		case hMatchContext:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				matchContexts = append(matchContexts, r.Str())
-			}
-			if err := recordsOK(r, "match context"); err != nil {
-				return Header{}, err
-			}
-		case hConflicts:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Conflicts = append(h.Conflicts, Conflict{
-					Index: r.Num(), At: uint64(r.Num()),
-					Hunk: Hunk{Start: r.Num(), End: r.Num(), Text: r.Str()}})
-			}
-			if err := recordsOK(r, "conflicts"); err != nil {
-				return Header{}, err
-			}
-		case hConflictGroup:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				conflictGroups = append(conflictGroups, r.Num())
-			}
-			if err := recordsOK(r, "conflict groups"); err != nil {
-				return Header{}, err
-			}
-		case hConflictLease:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				conflictLeases = append(conflictLeases, conflictLease{
-					author: r.Num(), start: r.Num(), end: r.Num()})
-			}
-			if err := recordsOK(r, "conflict lease"); err != nil {
-				return Header{}, err
-			}
-		case hSpans:
-			r := prog.NewReader(op.Payload)
-			for r.More() {
-				h.Spans = append(h.Spans, SpanMeta{Len: r.Num(), Author: uint8(r.Num())})
-			}
-			if err := recordsOK(r, "spans"); err != nil {
-				return Header{}, err
-			}
+// finish merges every sparse companion field into the header. Each companion
+// is keyed to its main list by position or by path, so its op may arrive before
+// or after the list it belongs to.
+//
+// The two keyed lists get an index built once here — one buffer lookup by path,
+// one participant lookup by id — rather than a scan per companion, and each
+// merge then walks its own sparse field in one pass.
+func (d *headerDecoder) finish() Header {
+	buffers := indexByPath(d.h.Buffers)
+	participants := indexByID(d.h.Participants)
+	d.mergeParticipants(participants)
+	d.mergeBuffers(buffers)
+	d.mergeMatches()
+	d.mergeConflicts()
+	d.mergeGroups()
+	d.mergeMessages()
+	return d.h
+}
+
+// indexByPath maps each buffer's path to its position. The buffer companions
+// travel by path, so indexing once keeps each of them a single pass. The first
+// row for a path wins, as the scan it replaces did.
+func indexByPath(bs []Buffer) map[string]int {
+	m := make(map[string]int, len(bs))
+	for i, b := range bs {
+		if _, ok := m[b.Path]; !ok {
+			m[b.Path] = i
 		}
 	}
-	for _, ps := range participantStates {
-		for i := range h.Participants {
-			if h.Participants[i].ID == ps.id {
-				h.Participants[i].State = ps.state
-				h.Participants[i].Declared = ps.declared
-				h.Participants[i].SinceMS = ps.sinceMS
-				h.Participants[i].Note = ps.note
-				h.Participants[i].On = ps.on
-				break
-			}
+	return m
+}
+
+// indexByID maps each participant's id to its position, for the same reason:
+// the state and task companions name a participant by id.
+func indexByID(ps []Participant) map[uint8]int {
+	m := make(map[uint8]int, len(ps))
+	for i, p := range ps {
+		if _, ok := m[p.ID]; !ok {
+			m[p.ID] = i
 		}
 	}
-	for _, st := range states {
-		for i := range h.Buffers {
-			if h.Buffers[i].Path == st.path {
-				h.Buffers[i].Pending, h.Buffers[i].Moved = st.pending, st.moved
-				break
-			}
+	return m
+}
+
+// mergeParticipants folds the working state and the task companions into the
+// roster, by id.
+func (d *headerDecoder) mergeParticipants(idx map[uint8]int) {
+	for _, ps := range d.participantStates {
+		if i, ok := idx[ps.id]; ok {
+			d.h.Participants[i].State = ps.state
+			d.h.Participants[i].Declared = ps.declared
+			d.h.Participants[i].SinceMS = ps.sinceMS
+			d.h.Participants[i].Note = ps.note
+			d.h.Participants[i].On = ps.on
 		}
 	}
-	for _, st := range supersededStates {
-		for i := range h.Buffers {
-			if h.Buffers[i].Path == st.path {
-				h.Buffers[i].Superseded = st.count
-				break
-			}
+	for i, task := range d.participantTasks {
+		if i < len(d.h.Participants) {
+			d.h.Participants[i].Task = task
 		}
 	}
-	for _, p := range headless {
-		for i := range h.Buffers {
-			if h.Buffers[i].Path == p {
-				h.Buffers[i].Headless = true
-				break
-			}
+}
+
+// mergeBuffers folds the pending/moved, superseded, headless and deleted
+// companions into the buffer list, by path.
+func (d *headerDecoder) mergeBuffers(idx map[string]int) {
+	for _, st := range d.bufferStates {
+		if i, ok := idx[st.path]; ok {
+			d.h.Buffers[i].Pending, d.h.Buffers[i].Moved = st.pending, st.moved
 		}
 	}
-	for i, ls := range lineStarts {
-		if i < len(h.Matches) {
-			h.Matches[i].LineStart = ls
+	for _, st := range d.supersededStates {
+		if i, ok := idx[st.path]; ok {
+			d.h.Buffers[i].Superseded = st.count
 		}
 	}
-	for i, le := range lineEnds {
-		if i < len(h.Matches) {
-			h.Matches[i].LineEnd = le
+	for _, p := range d.headless {
+		if i, ok := idx[p]; ok {
+			d.h.Buffers[i].Headless = true
 		}
 	}
-	for i, v := range matchVersions {
-		if i < len(h.Matches) {
-			h.Matches[i].Version = uint64(v)
+	for _, p := range d.deletedBuffers {
+		if i, ok := idx[p]; ok {
+			d.h.Buffers[i].Deleted = true
 		}
 	}
-	for i, c := range matchContexts {
-		if i < len(h.Matches) {
-			h.Matches[i].Context = c
+}
+
+// mergeMatches folds the four positional companions into the hit list in one
+// pass. A companion is as long as the list, or shorter when the sender omitted
+// a field that was zero throughout.
+func (d *headerDecoder) mergeMatches() {
+	for i := range d.h.Matches {
+		if i < len(d.lineStarts) {
+			d.h.Matches[i].LineStart = d.lineStarts[i]
+		}
+		if i < len(d.lineEnds) {
+			d.h.Matches[i].LineEnd = d.lineEnds[i]
+		}
+		if i < len(d.matchVersions) {
+			d.h.Matches[i].Version = uint64(d.matchVersions[i])
+		}
+		if i < len(d.matchContexts) {
+			d.h.Matches[i].Context = d.matchContexts[i]
 		}
 	}
-	for i, g := range conflictGroups {
-		if i < len(h.Conflicts) {
-			h.Conflicts[i].Group = uint64(g)
+}
+
+// mergeConflicts folds the lease owner and its author/span into the conflict
+// list in one pass.
+func (d *headerDecoder) mergeConflicts() {
+	for i := range d.h.Conflicts {
+		if i < len(d.conflictGroups) {
+			d.h.Conflicts[i].Group = uint64(d.conflictGroups[i])
+		}
+		if i < len(d.conflictLeases) {
+			l := d.conflictLeases[i]
+			d.h.Conflicts[i].Author = uint8(l.author)
+			d.h.Conflicts[i].Start = l.start
+			d.h.Conflicts[i].End = l.end
 		}
 	}
-	for i, l := range conflictLeases {
-		if i < len(h.Conflicts) {
-			h.Conflicts[i].Author = uint8(l.author)
-			h.Conflicts[i].Start = l.start
-			h.Conflicts[i].End = l.end
+}
+
+// mergeGroups folds the overlap, invalid and task companions into the group
+// list in one pass.
+func (d *headerDecoder) mergeGroups() {
+	for i := range d.h.Groups {
+		if i < len(d.groupOverlaps) && len(d.groupOverlaps[i]) > 0 {
+			d.h.Groups[i].Overlaps = &GroupOverlaps{Sets: d.groupOverlaps[i]}
+		}
+		if i < len(d.groupInvalid) && d.groupInvalid[i].invalid {
+			d.h.Groups[i].Invalid = true
+			d.h.Groups[i].InvalidBy = d.groupInvalid[i].by
+		}
+		if task, ok := d.groupTasks[i]; ok {
+			d.h.Groups[i].Task = task
 		}
 	}
-	for i, sets := range groupOverlaps {
-		if i < len(h.Groups) && len(sets) > 0 {
-			h.Groups[i].Overlaps = &GroupOverlaps{Sets: sets}
+}
+
+// mergeMessages folds the sender reply target into the message list in one
+// pass.
+func (d *headerDecoder) mergeMessages() {
+	for i := range d.h.Messages {
+		if i < len(d.messageFroms) {
+			d.h.Messages[i].FromKey = d.messageFroms[i].key
+			d.h.Messages[i].FromName = d.messageFroms[i].name
 		}
 	}
-	for i, ic := range groupInvalid {
-		if i < len(h.Groups) && ic.invalid {
-			h.Groups[i].Invalid = true
-			h.Groups[i].InvalidBy = ic.by
+}
+
+// --- Query ---
+
+func encodeQuery(h *Header, ops *[]prog.Op) {
+	q := h.Query
+	if q == nil {
+		return
+	}
+	var w prog.Writer
+	w.Str(q.Text).Str(q.Include).Str(q.Exclude).Bool(q.Regex).Bool(q.Case).Bool(q.Word)
+	// Path is appended rather than carved into the middle of the record: a
+	// reader that predates it reads the six fields it knows and ignores the
+	// trailing bytes, and a reader that knows it reads the seventh. No element
+	// count to disagree about, so the addition is invisible to the old end.
+	//
+	// Hidden is appended after Path for the same reason: a reader that knows it
+	// reads one more field, and one that predates it reads what it knows and
+	// leaves the flag false, which is the default walk.
+	w.Str(q.Path).Bool(q.Hidden).Num(q.Context)
+	*ops = append(*ops, prog.Op{Code: hQuery, Payload: w.Done()})
+}
+
+func decodeQuery(d *headerDecoder, r *prog.Reader) error {
+	q := SearchQuery{Text: r.Str(), Include: r.Str(), Exclude: r.Str()}
+	q.Regex, q.Case, q.Word = r.Bool(), r.Bool(), r.Bool()
+	// The path is the last field, so a payload from before it existed leaves
+	// q.Path empty rather than an error: the value is absent, which is the same
+	// thing as no scope. Hidden and Context are newer still, and their absence
+	// reads the same way.
+	q.Path = r.Str()
+	q.Hidden = r.Bool()
+	q.Context = r.Num()
+	d.h.Query = &q
+	return nil
+}
+
+// --- Hunks ---
+
+func encodeHunks(h *Header, ops *[]prog.Op) {
+	if len(h.Hunks) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, x := range h.Hunks {
+		w.Num(x.Start).Num(x.End).Num(x.Len)
+	}
+	*ops = append(*ops, prog.Op{Code: hHunks, Payload: w.Done()})
+}
+
+func decodeHunks(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Hunks = append(d.h.Hunks, HunkMeta{Start: r.Num(), End: r.Num(), Len: r.Num()})
+	}
+	return recordsOK(r, "hunks")
+}
+
+// --- Dirty ---
+
+func encodeDirty(h *Header, ops *[]prog.Op) {
+	if len(h.Dirty) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, x := range h.Dirty {
+		w.Str(x.Path).Bool(x.AgentOnly)
+	}
+	*ops = append(*ops, prog.Op{Code: hDirty, Payload: w.Done()})
+}
+
+func decodeDirty(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Dirty = append(d.h.Dirty, DirtyBuffer{Path: r.Str(), AgentOnly: r.Bool()})
+	}
+	return recordsOK(r, "dirty")
+}
+
+// --- Stats ---
+
+func encodeStats(h *Header, ops *[]prog.Op) {
+	s := h.Stats
+	if s == (ExecStats{}) {
+		return
+	}
+	var w prog.Writer
+	w.Num(s.Runs).Num(s.Stale).Num(s.AgentOnly)
+	*ops = append(*ops, prog.Op{Code: hStats, Payload: w.Done()})
+}
+
+func decodeStats(d *headerDecoder, r *prog.Reader) error {
+	d.h.Stats = ExecStats{Runs: r.Num(), Stale: r.Num(), AgentOnly: r.Num()}
+	return nil
+}
+
+// --- Participants, with their working state ---
+
+func encodeParticipants(h *Header, ops *[]prog.Op) {
+	if len(h.Participants) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, p := range h.Participants {
+		kind, ok := code(kindCodes, string(p.Kind))
+		w.Num(int(p.ID)).Str(p.Identity).Str(p.Name).Num(int(kind)).Bool(p.Connected)
+		if !ok {
+			// A kind this build does not know still has to arrive; the zero
+			// code means "read the name that follows".
+			w.Str(string(p.Kind))
 		}
 	}
-	for i, task := range participantTasks {
-		if i < len(h.Participants) {
-			h.Participants[i].Task = task
+	*ops = append(*ops, prog.Op{Code: hParticipants, Payload: w.Done()})
+	// The working state rides in a field of its own rather than inside the
+	// hParticipants record: records are positional, so an older reader would
+	// read a state code as the next record's id. Every participant gets a
+	// record, so a reader that knows the field reads state for all of them and
+	// one that does not skips it whole.
+	var sts prog.Writer
+	for _, p := range h.Participants {
+		st, _ := code(workCodes, p.State)
+		decl, _ := code(workCodes, p.Declared)
+		sts.Num(int(p.ID)).Num(int(st)).Num(int(decl)).Num(int(p.SinceMS)).Str(p.Note).Str(p.On)
+	}
+	*ops = append(*ops, prog.Op{Code: hParticipantState, Payload: sts.Done()})
+}
+
+func decodeParticipants(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		p := Participant{ID: uint8(r.Num()), Identity: r.Str(), Name: r.Str()}
+		kind := r.Num()
+		p.Connected = r.Bool()
+		if kind == 0 {
+			p.Kind = Kind(r.Str())
+		} else {
+			p.Kind = Kind(nameFor(kindNamesByCode, kind))
+		}
+		d.h.Participants = append(d.h.Participants, p)
+	}
+	return recordsOK(r, "participants")
+}
+
+func decodeParticipantState(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.participantStates = append(d.participantStates, participantState{
+			id:       uint8(r.Num()),
+			state:    nameFor(workNamesByCode, r.Num()),
+			declared: nameFor(workNamesByCode, r.Num()),
+			sinceMS:  int64(r.Num()),
+			note:     r.Str(),
+			on:       r.Str(),
+		})
+	}
+	return recordsOK(r, "participant state")
+}
+
+// --- Groups, with their overlap lists and Invalid flags ---
+
+func encodeGroups(h *Header, ops *[]prog.Op) {
+	if len(h.Groups) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, g := range h.Groups {
+		state, ok := code(stateCodes, g.State)
+		w.Num(int(g.ID)).Str(g.Path).Num(int(g.Author)).Num(int(state)).
+			Num(g.Ops).Num(g.Bytes).Num(int(g.First)).Num(int(g.Last)).
+			Num(g.Hunks).Num(g.Moved)
+		if !ok {
+			w.Str(g.State)
 		}
 	}
-	for i, task := range groupTasks {
-		if i < len(h.Groups) {
-			h.Groups[i].Task = task
+	*ops = append(*ops, prog.Op{Code: hGroups, Payload: w.Done()})
+
+	// Overlap lists ride in their own sparse field, keyed to the groups by
+	// position: one count per group, then that many {group, author, start, end}
+	// records. A count is written for every group so the order matches hGroups,
+	// and the field is emitted only when some set overlaps, so a response with
+	// nothing to report is unchanged. A separate field rather than a wider
+	// hGroups record keeps an older reader from reading an overlap count as the
+	// next group's id.
+	var ovs prog.Writer
+	var anyOverlap bool
+	for _, g := range h.Groups {
+		var sets []GroupOverlap
+		if g.Overlaps != nil {
+			sets = g.Overlaps.Sets
 		}
+		ovs.Num(len(sets))
+		for _, o := range sets {
+			ovs.Num(int(o.Group)).Num(int(o.Author)).Num(o.Start).Num(o.End)
+		}
+		if len(sets) > 0 {
+			anyOverlap = true
+		}
+	}
+	if anyOverlap {
+		*ops = append(*ops, prog.Op{Code: hGroupOverlaps, Payload: ovs.Done()})
 	}
 
-	for i, mf := range messageFroms {
-		if i < len(h.Messages) {
-			h.Messages[i].FromKey, h.Messages[i].FromName = mf.key, mf.name
+	// Invalid flags ride the same positional, sparse style: a flag per group,
+	// then -- only when the flag is set -- the collider's group, author and
+	// span. The field is emitted only when some group is invalid, so a response
+	// with none is unchanged, and a separate field rather than a wider hGroups
+	// record keeps an older reader from reading a flag as the next group's id.
+	var invs prog.Writer
+	var anyInvalid bool
+	for _, g := range h.Groups {
+		if !g.Invalid {
+			invs.Num(0)
+			continue
+		}
+		invs.Num(1)
+		var by GroupOverlap
+		if g.InvalidBy != nil {
+			by = *g.InvalidBy
+		}
+		invs.Num(int(by.Group)).Num(int(by.Author)).Num(by.Start).Num(by.End)
+		anyInvalid = true
+	}
+	if anyInvalid {
+		*ops = append(*ops, prog.Op{Code: hGroupInvalid, Payload: invs.Done()})
+	}
+}
+
+func decodeGroups(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		g := Group{ID: uint64(r.Num()), Path: r.Str(), Author: uint8(r.Num())}
+		state := r.Num()
+		g.Ops, g.Bytes = r.Num(), r.Num()
+		g.First, g.Last = uint64(r.Num()), uint64(r.Num())
+		g.Hunks, g.Moved = r.Num(), r.Num()
+		if state == 0 {
+			g.State = r.Str()
+		} else {
+			g.State = nameFor(stateNamesByCode, state)
+		}
+		d.h.Groups = append(d.h.Groups, g)
+	}
+	return recordsOK(r, "groups")
+}
+
+func decodeGroupOverlaps(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		n := r.Num()
+		sets := make([]GroupOverlap, 0, n)
+		for k := 0; k < n; k++ {
+			sets = append(sets, GroupOverlap{
+				Group: uint64(r.Num()), Author: uint8(r.Num()),
+				Start: r.Num(), End: r.Num()})
+		}
+		d.groupOverlaps = append(d.groupOverlaps, sets)
+	}
+	return recordsOK(r, "group overlaps")
+}
+
+func decodeGroupInvalid(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		ic := invalidCollider{invalid: r.Num() != 0}
+		if ic.invalid {
+			by := GroupOverlap{Group: uint64(r.Num()), Author: uint8(r.Num()),
+				Start: r.Num(), End: r.Num()}
+			// A zero group means the set is invalid but no single collider can
+			// be named, not a collider with id zero.
+			if by.Group != 0 {
+				ic.by = &by
+			}
+		}
+		d.groupInvalid = append(d.groupInvalid, ic)
+	}
+	return recordsOK(r, "group invalid")
+}
+
+// --- Tasks, which span participants and groups ---
+
+func encodeTasks(h *Header, ops *[]prog.Op) {
+	var w prog.Writer
+	any := false
+	for _, p := range h.Participants {
+		any = any || p.Task != ""
+	}
+	for _, g := range h.Groups {
+		any = any || g.Task != ""
+	}
+	if !any {
+		return
+	}
+	// The task each writer's changes belong to rides in a sparse field of its
+	// own: a sequence of {index, kind, task} records, kind 0 a participant and
+	// 1 a group. A header with none is byte-for-byte what it always was, and a
+	// reader that does not know the field skips it whole.
+	for i, p := range h.Participants {
+		if p.Task != "" {
+			w.Num(i).Num(0).Str(p.Task)
 		}
 	}
-	return h, nil
+	for i, g := range h.Groups {
+		if g.Task != "" {
+			w.Num(i).Num(1).Str(g.Task)
+		}
+	}
+	*ops = append(*ops, prog.Op{Code: hTasks, Payload: w.Done()})
+}
+
+func decodeTasks(d *headerDecoder, r *prog.Reader) error {
+	if d.participantTasks == nil {
+		d.participantTasks = map[int]string{}
+		d.groupTasks = map[int]string{}
+	}
+	for r.More() {
+		index, kind := r.Num(), r.Num()
+		task := r.Str()
+		if kind == 0 {
+			d.participantTasks[index] = task
+		} else {
+			d.groupTasks[index] = task
+		}
+	}
+	return recordsOK(r, "tasks")
+}
+
+// --- Messages, with their durable reply targets ---
+
+func encodeMessages(h *Header, ops *[]prog.Op) {
+	if len(h.Messages) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, m := range h.Messages {
+		w.Num(int(m.From)).Str(m.Text)
+	}
+	*ops = append(*ops, prog.Op{Code: hMessages, Payload: w.Done()})
+
+	// The sender's reply target rides in its own sparse field, one record per
+	// message, so a reader that knows only hMessages skips it whole and still
+	// reads the text from the participant list.
+	var froms prog.Writer
+	var anyFrom bool
+	for _, m := range h.Messages {
+		froms.Str(m.FromKey).Str(m.FromName)
+		if m.FromKey != "" || m.FromName != "" {
+			anyFrom = true
+		}
+	}
+	if anyFrom {
+		*ops = append(*ops, prog.Op{Code: hMessageFrom, Payload: froms.Done()})
+	}
+}
+
+func decodeMessages(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Messages = append(d.h.Messages, Message{From: uint8(r.Num()), Text: r.Str()})
+	}
+	return recordsOK(r, "messages")
+}
+
+func decodeMessageFrom(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.messageFroms = append(d.messageFroms, messageFrom{key: r.Str(), name: r.Str()})
+	}
+	return recordsOK(r, "message from")
+}
+
+// --- Land ---
+
+func encodeLand(h *Header, ops *[]prog.Op) {
+	if len(h.Land) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, f := range h.Land {
+		w.Str(f.Path).Num(f.Sets).Bool(f.Saved).Bool(f.Held).Str(f.Err)
+	}
+	*ops = append(*ops, prog.Op{Code: hLand, Payload: w.Done()})
+}
+
+func decodeLand(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Land = append(d.h.Land, LandFile{Path: r.Str(), Sets: r.Num(),
+			Saved: r.Bool(), Held: r.Bool(), Err: r.Str()})
+	}
+	return recordsOK(r, "land")
+}
+
+// --- ClaimOverlaps ---
+
+func encodeClaimOverlaps(h *Header, ops *[]prog.Op) {
+	if len(h.ClaimOverlaps) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, o := range h.ClaimOverlaps {
+		w.Str(o.Path).Str(o.Identity).Num(int(o.Author))
+	}
+	*ops = append(*ops, prog.Op{Code: hClaimOverlaps, Payload: w.Done()})
+}
+
+func decodeClaimOverlaps(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.ClaimOverlaps = append(d.h.ClaimOverlaps, ClaimOverlap{
+			Path: r.Str(), Identity: r.Str(), Author: uint8(r.Num())})
+	}
+	return recordsOK(r, "claim overlaps")
+}
+
+// --- Deletions ---
+
+func encodeDeletions(h *Header, ops *[]prog.Op) {
+	if len(h.Deletions) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, x := range h.Deletions {
+		w.Str(x.Path).Num(int(x.Author))
+	}
+	*ops = append(*ops, prog.Op{Code: hDeletions, Payload: w.Done()})
+}
+
+func decodeDeletions(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Deletions = append(d.h.Deletions, Deletion{Path: r.Str(), Author: uint8(r.Num())})
+	}
+	return recordsOK(r, "deletions")
+}
+
+// --- DirRemovals ---
+
+func encodeDirRemovals(h *Header, ops *[]prog.Op) {
+	if len(h.DirRemovals) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, x := range h.DirRemovals {
+		w.Str(x.Path).Num(int(x.Author))
+	}
+	*ops = append(*ops, prog.Op{Code: hDirRemovals, Payload: w.Done()})
+}
+
+func decodeDirRemovals(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.DirRemovals = append(d.h.DirRemovals, DirRemoval{Path: r.Str(), Author: uint8(r.Num())})
+	}
+	return recordsOK(r, "dir removals")
+}
+
+// --- Proposals ---
+
+func encodeProposals(h *Header, ops *[]prog.Op) {
+	if len(h.Proposals) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, p := range h.Proposals {
+		w.Str(p.Kind).Str(p.Path).Num(int(p.Author)).Num(int(p.Group)).Num(p.Size).Num(p.Start).Num(p.End)
+	}
+	*ops = append(*ops, prog.Op{Code: hProposals, Payload: w.Done()})
+}
+
+func decodeProposals(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Proposals = append(d.h.Proposals, Proposal{
+			Kind: r.Str(), Path: r.Str(), Author: uint8(r.Num()),
+			Group: uint64(r.Num()), Size: r.Num(), Start: r.Num(), End: r.Num()})
+	}
+	return recordsOK(r, "proposals")
+}
+
+// --- Reveals ---
+
+func encodeReveals(h *Header, ops *[]prog.Op) {
+	if len(h.Reveals) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, x := range h.Reveals {
+		w.Str(x.Path).Num(x.Start).Num(x.End)
+	}
+	*ops = append(*ops, prog.Op{Code: hReveals, Payload: w.Done()})
+}
+
+func decodeReveals(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Reveals = append(d.h.Reveals, Reveal{Path: r.Str(), Start: r.Num(), End: r.Num()})
+	}
+	return recordsOK(r, "reveals")
+}
+
+// --- Entries ---
+
+func encodeEntries(h *Header, ops *[]prog.Op) {
+	if len(h.Entries) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, e := range h.Entries {
+		// Size is -1 when absent, so a zero-byte regular file keeps its zero
+		// and a directory stays distinguishable from an empty one.
+		size := -1
+		if e.Size != nil {
+			size = int(*e.Size)
+		}
+		w.Str(e.Name).Str(e.Path).Bool(e.Dir).Num(size)
+	}
+	*ops = append(*ops, prog.Op{Code: hEntries, Payload: w.Done()})
+}
+
+func decodeEntries(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		e := Entry{Name: r.Str(), Path: r.Str(), Dir: r.Bool()}
+		if size := r.Num(); size >= 0 {
+			s := int64(size)
+			e.Size = &s
+		}
+		d.h.Entries = append(d.h.Entries, e)
+	}
+	return recordsOK(r, "entries")
+}
+
+// --- Buffers, with pending/moved, superseded, headless and deleted ---
+
+func encodeBuffers(h *Header, ops *[]prog.Op) {
+	if len(h.Buffers) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, b := range h.Buffers {
+		w.Str(b.Path).Num(int(b.Version)).Bool(b.Dirty).Num(b.Bytes).Num(b.Lines).Bool(b.Active)
+	}
+	*ops = append(*ops, prog.Op{Code: hBuffers, Payload: w.Done()})
+
+	// Pending and Moved ride in their own sparse field, one record per buffer
+	// that has either, rather than as two more fields on each hBuffers record.
+	// Records are positional — no element count and no per-field opcode — so an
+	// older reader would read a nonzero pending count as the next record's
+	// path. An unknown argument field, by contrast, is skipped: an old reader
+	// loses the counts and keeps the buffers, and an old server omits the field
+	// so the counts read zero.
+	var counts prog.Writer
+	var any bool
+	for _, b := range h.Buffers {
+		if b.Pending == 0 && b.Moved == 0 {
+			continue
+		}
+		any = true
+		counts.Str(b.Path).Num(b.Pending).Num(b.Moved)
+	}
+	if any {
+		*ops = append(*ops, prog.Op{Code: hBufferState, Payload: counts.Done()})
+	}
+
+	// The superseded count rides in a field of its own for the same
+	// positional-record reason, and because it is a different fact from
+	// Pending: a buffer can have no pending set and still be one a save
+	// refuses. One record per buffer that has a nonzero count.
+	var superseded prog.Writer
+	var anySuperseded bool
+	for _, b := range h.Buffers {
+		if b.Superseded == 0 {
+			continue
+		}
+		anySuperseded = true
+		superseded.Str(b.Path).Num(b.Superseded)
+	}
+	if anySuperseded {
+		*ops = append(*ops, prog.Op{Code: hBufferSuperseded, Payload: superseded.Done()})
+	}
+
+	// The path of a headless buffer rides in a sparse field of its own too, one
+	// record per headless buffer. The reason matches the counts above: an
+	// hBuffers record is positional, so a field added inside one would be read
+	// as the next record path by an older reader. An absent field is skipped
+	// whole, so an old client reads every buffer as tabbed — the only state an
+	// old build could make.
+	var headless prog.Writer
+	var anyHeadless bool
+	for _, b := range h.Buffers {
+		if !b.Headless {
+			continue
+		}
+		anyHeadless = true
+		headless.Str(b.Path)
+	}
+	if anyHeadless {
+		*ops = append(*ops, prog.Op{Code: hBufferHeadless, Payload: headless.Done()})
+	}
+
+	// The paths of deleted files ride in a sparse field of their own too, one
+	// record per buffer whose file is gone. The reason is the same as the
+	// fields above -- a flag added inside an hBuffers record would be read as
+	// the next record's path by an older reader -- and the absence is read as
+	// "still on disk", which is what every buffer was before this field.
+	var deleted prog.Writer
+	var anyDeleted bool
+	for _, b := range h.Buffers {
+		if !b.Deleted {
+			continue
+		}
+		anyDeleted = true
+		deleted.Str(b.Path)
+	}
+	if anyDeleted {
+		*ops = append(*ops, prog.Op{Code: hBufferDeleted, Payload: deleted.Done()})
+	}
+}
+
+func decodeBuffers(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Buffers = append(d.h.Buffers, Buffer{
+			Path: r.Str(), Version: uint64(r.Num()), Dirty: r.Bool(),
+			Bytes: r.Num(), Lines: r.Num(), Active: r.Bool()})
+	}
+	return recordsOK(r, "buffers")
+}
+
+func decodeBufferState(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.bufferStates = append(d.bufferStates, bufferState{path: r.Str(), pending: r.Num(), moved: r.Num()})
+	}
+	return recordsOK(r, "buffer state")
+}
+
+func decodeBufferSuperseded(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.supersededStates = append(d.supersededStates, bufferSuperseded{path: r.Str(), count: r.Num()})
+	}
+	return recordsOK(r, "buffer superseded")
+}
+
+func decodeBufferHeadless(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.headless = append(d.headless, r.Str())
+	}
+	return recordsOK(r, "buffer headless")
+}
+
+func decodeBufferDeleted(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.deletedBuffers = append(d.deletedBuffers, r.Str())
+	}
+	return recordsOK(r, "buffer deleted")
+}
+
+// --- Truncated ---
+
+func encodeTruncated(h *Header, ops *[]prog.Op) {
+	if len(h.Truncated) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, t := range h.Truncated {
+		w.Str(t.Path).Num(t.Shown).Num(t.Total)
+	}
+	*ops = append(*ops, prog.Op{Code: hTruncated, Payload: w.Done()})
+}
+
+func decodeTruncated(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Truncated = append(d.h.Truncated, TruncatedFile{
+			Path: r.Str(), Shown: r.Num(), Total: r.Num()})
+	}
+	return recordsOK(r, "truncated")
+}
+
+// --- Matches, with line start/end, version and context ---
+
+func encodeMatches(h *Header, ops *[]prog.Op) {
+	if len(h.Matches) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, m := range h.Matches {
+		w.Num(m.Line).Num(m.Col).Num(m.Len).Num(m.PathLen).Num(m.TextLen).
+			Num(m.ByteStart).Num(m.ByteEnd)
+	}
+	*ops = append(*ops, prog.Op{Code: hMatches, Payload: w.Done()})
+
+	// LineStart rides in its own sparse field rather than as another Num in the
+	// positional hMatches record: appending to a record-shaped field would
+	// misalign an older reader. It is sent only when some hit is not at offset
+	// zero, the field default, so an omitted field means every line start was
+	// zero.
+	var starts prog.Writer
+	anyStart := false
+	for _, m := range h.Matches {
+		if m.LineStart != 0 {
+			anyStart = true
+		}
+		starts.Num(m.LineStart)
+	}
+	if anyStart {
+		*ops = append(*ops, prog.Op{Code: hMatchLineStart, Payload: starts.Done()})
+	}
+
+	// LineEnd rides the same sparse way, for the same reason.
+	var ends prog.Writer
+	anyEnd := false
+	for _, m := range h.Matches {
+		if m.LineEnd != 0 {
+			anyEnd = true
+		}
+		ends.Num(m.LineEnd)
+	}
+	if anyEnd {
+		*ops = append(*ops, prog.Op{Code: hMatchLineEnd, Payload: ends.Done()})
+	}
+
+	// Version rides the same sparse way, one number per hit, sent only when
+	// some hit names a nonzero buffer revision. A hit on a file read from disk
+	// carries zero, which is not a revision any buffer can hold, so an omitted
+	// field means every hit was the disk's.
+	var vers prog.Writer
+	anyVersion := false
+	for _, m := range h.Matches {
+		if m.Version != 0 {
+			anyVersion = true
+		}
+		vers.Num(int(m.Version))
+	}
+	if anyVersion {
+		*ops = append(*ops, prog.Op{Code: hMatchVersion, Payload: vers.Done()})
+	}
+
+	// Context rides the same sparse way, one string per hit, in hit order. It
+	// is sent only when some hit carries context, so an omitted field means
+	// every hit was the hit line alone.
+	var contexts prog.Writer
+	anyContext := false
+	for _, m := range h.Matches {
+		if m.Context != "" {
+			anyContext = true
+		}
+		contexts.Str(m.Context)
+	}
+	if anyContext {
+		*ops = append(*ops, prog.Op{Code: hMatchContext, Payload: contexts.Done()})
+	}
+}
+
+func decodeMatches(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Matches = append(d.h.Matches, MatchMeta{
+			Line: r.Num(), Col: r.Num(), Len: r.Num(),
+			PathLen: r.Num(), TextLen: r.Num(),
+			ByteStart: r.Num(), ByteEnd: r.Num()})
+	}
+	return recordsOK(r, "matches")
+}
+
+func decodeMatchLineStart(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.lineStarts = append(d.lineStarts, r.Num())
+	}
+	return recordsOK(r, "match line starts")
+}
+
+func decodeMatchLineEnd(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.lineEnds = append(d.lineEnds, r.Num())
+	}
+	return recordsOK(r, "match line ends")
+}
+
+func decodeMatchVersion(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.matchVersions = append(d.matchVersions, r.Num())
+	}
+	return recordsOK(r, "match versions")
+}
+
+func decodeMatchContext(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.matchContexts = append(d.matchContexts, r.Str())
+	}
+	return recordsOK(r, "match context")
+}
+
+// --- Conflicts, with their lease owner and span ---
+
+func encodeConflicts(h *Header, ops *[]prog.Op) {
+	if len(h.Conflicts) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, c := range h.Conflicts {
+		w.Num(c.Index).Num(int(c.At)).Num(c.Hunk.Start).Num(c.Hunk.End).Str(c.Hunk.Text)
+	}
+	*ops = append(*ops, prog.Op{Code: hConflicts, Payload: w.Done()})
+
+	// The lease owner rides in its own sparse field rather than as another
+	// field on the record. hConflicts records are positional, so an older
+	// reader would read a sixth field as the next record index and misalign
+	// every conflict after it; a separate argument field is skipped whole. One
+	// number per conflict, in order; the field is absent when every owner is
+	// zero, which is the common stale-offset case.
+	var groups prog.Writer
+	var any bool
+	for _, c := range h.Conflicts {
+		if c.Group != 0 {
+			any = true
+		}
+		groups.Num(int(c.Group))
+	}
+	if any {
+		*ops = append(*ops, prog.Op{Code: hConflictGroup, Payload: groups.Done()})
+	}
+
+	// The lease owner's author and span ride together in one sparse field,
+	// three numbers per conflict, in conflict order, so each pair stays with
+	// its own refusal. It is emitted whenever any conflict names a lease; the
+	// stale-offset conflicts write zeros.
+	var lease prog.Writer
+	var anyLease bool
+	for _, c := range h.Conflicts {
+		if c.Group != 0 {
+			anyLease = true
+		}
+		lease.Num(int(c.Author)).Num(c.Start).Num(c.End)
+	}
+	if anyLease {
+		*ops = append(*ops, prog.Op{Code: hConflictLease, Payload: lease.Done()})
+	}
+}
+
+func decodeConflicts(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Conflicts = append(d.h.Conflicts, Conflict{
+			Index: r.Num(), At: uint64(r.Num()),
+			Hunk: Hunk{Start: r.Num(), End: r.Num(), Text: r.Str()}})
+	}
+	return recordsOK(r, "conflicts")
+}
+
+func decodeConflictGroup(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.conflictGroups = append(d.conflictGroups, r.Num())
+	}
+	return recordsOK(r, "conflict groups")
+}
+
+func decodeConflictLease(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.conflictLeases = append(d.conflictLeases, conflictLease{
+			author: r.Num(), start: r.Num(), end: r.Num()})
+	}
+	return recordsOK(r, "conflict lease")
+}
+
+// --- Apply warnings ---
+
+func encodeWarnings(h *Header, ops *[]prog.Op) {
+	if len(h.Warnings) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, x := range h.Warnings {
+		w.Num(int(x.Group)).Num(int(x.Author)).Num(x.Start).Num(x.End)
+	}
+	*ops = append(*ops, prog.Op{Code: hApplyWarnings, Payload: w.Done()})
+}
+
+func decodeWarnings(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Warnings = append(d.h.Warnings, GroupOverlap{
+			Group: uint64(r.Num()), Author: uint8(r.Num()),
+			Start: r.Num(), End: r.Num()})
+	}
+	return recordsOK(r, "apply warnings")
+}
+
+// --- Spans ---
+
+func encodeSpans(h *Header, ops *[]prog.Op) {
+	if len(h.Spans) == 0 {
+		return
+	}
+	var w prog.Writer
+	for _, s := range h.Spans {
+		w.Num(s.Len).Num(int(s.Author))
+	}
+	*ops = append(*ops, prog.Op{Code: hSpans, Payload: w.Done()})
+}
+
+func decodeSpans(d *headerDecoder, r *prog.Reader) error {
+	for r.More() {
+		d.h.Spans = append(d.h.Spans, SpanMeta{Len: r.Num(), Author: uint8(r.Num())})
+	}
+	return recordsOK(r, "spans")
 }
 
 // conflictLease is one lease refusal's owner and span as it crosses the wire:

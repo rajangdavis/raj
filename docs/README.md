@@ -36,6 +36,7 @@ The specs the current push is being built from.
 | doc | kind | purpose | read it when |
 | --- | --- | --- | --- |
 | [KEYBINDINGS.md](KEYBINDINGS.md) | reference | every chord, generated from `keys.Bindings` | you are adding or looking up a keybinding |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | reference | what raj is made of and what each thing is called, described from the tree; spec/code disagreements listed, not decided | you need the parts and their names before touching an unfamiliar subsystem |
 
 ## Active but not this push
 

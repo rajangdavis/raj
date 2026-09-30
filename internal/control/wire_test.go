@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"os"
+	"runtime/debug"
 	"testing"
 
 	"raj/internal/prog"
@@ -289,6 +291,32 @@ func TestBodyCarriesBytesJSONWouldMangle(t *testing.T) {
 			t.Errorf("length changed: %d in, %d out — every offset past this moves",
 				len(s), len(got.Text()))
 		}
+	}
+}
+
+// The screen verb's cursor reuses the goto fields, so it crosses as hLine/hCol
+// rather than as a new field. This is the round trip that notices an encoder
+// or decoder forgetting to map it.
+func TestResponseCarriesTheScreenCursor(t *testing.T) {
+	var buf bytes.Buffer
+	h, body := EncodeResponse(Response{ID: 5, OK: true, Line: 4, Col: 9,
+		Spans: []Span{{Text: "one\ntwo"}}})
+	if err := WriteFrame(&buf, h, body); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Line != 4 || got.Col != 9 {
+		t.Errorf("cursor = %d,%d, want 4,9", got.Line, got.Col)
+	}
+	if got.Text() != "one\ntwo" {
+		t.Errorf("rows = %q, want one\\ntwo", got.Text())
 	}
 }
 
@@ -791,6 +819,54 @@ func TestServerStampsItsBuildRevision(t *testing.T) {
 		if res.SrcVersion != "srv-abc" {
 			t.Errorf("%s: SrcVersion = %q, want the stamped build revision", op, res.SrcVersion)
 		}
+	}
+}
+
+// A binary stamped with -ldflags -X reports the stamp; the vcs.revision the go
+// tool embeds is only the fallback. The projected tree has no .git, so there
+// no revision exists and the stamp is the only version a binary can name. A
+// link-time value cannot be set from a test process, so the precedence init
+// applies is pinned here, with the settings a no-.git build carries.
+func TestStampedVersionWinsOverTheVCSFallback(t *testing.T) {
+	revision := []debug.BuildSetting{{Key: "vcs.revision", Value: "deadbeef"}}
+	cases := []struct {
+		name     string
+		stamped  string
+		settings []debug.BuildSetting
+		want     string
+	}{
+		{"stamp on a tree with no .git", "v9.9.9", nil, "v9.9.9"},
+		{"stamp beats an embedded revision", "v9.9.9", revision, "v9.9.9"},
+		{"revision is the fallback", "", revision, "deadbeef"},
+		{"neither stamp nor revision", "", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := versionOrRevision(tc.stamped, tc.settings); got != tc.want {
+				t.Errorf("versionOrRevision(%q, %v) = %q, want %q",
+					tc.stamped, tc.settings, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLinkedSrcVersionStampIsReported is the link-time half: it fails when a
+// build stamped with -X does not carry the stamp, which the precedence test
+// above can only simulate. It is skipped unless the stamp is named in the
+// environment, so the ordinary gate is unaffected. Run it against a tree with
+// no .git, the case the stamp exists for:
+//
+//	RAJ_SRC_VERSION_STAMP=v9.9.9 go test -buildvcs=false \
+//	  -ldflags "-X raj/internal/control.srcVersion=v9.9.9" \
+//	  -run TestLinkedSrcVersionStampIsReported ./internal/control/
+func TestLinkedSrcVersionStampIsReported(t *testing.T) {
+	want := os.Getenv("RAJ_SRC_VERSION_STAMP")
+	if want == "" {
+		t.Skip("set RAJ_SRC_VERSION_STAMP alongside -X to exercise the link-time stamp")
+	}
+	if got := currentSrcVersion(); got != want {
+		t.Fatalf("currentSrcVersion() = %q, want the -X stamp %q; "+
+			"a function-call initializer would overwrite it", got, want)
 	}
 }
 

@@ -72,7 +72,8 @@ const ctlUsage = `usage: raj ctl <command> [options]
   list                       running editors and their workspaces
   buffers                    files open in the editor; a headless buffer has no tab
   status                     is the workspace ready for a gate? names dirty or pending buffers; exit 1 when not
-  read [path]...             one or more buffer views, loaded on demand; --annotated prints a run line per change set after the text; --start/--end/--lines for a span, shared by every target, --at PATH=LO,HI for a per-path line span, and an out-of-range byte span refuses the call rather than clamping
+  read [path]...             one or more buffer views, loaded on demand; --annotated prints a run line per change set after the text; --start/--end/--lines for a span, shared by every target, --at PATH=LO,HI for a per-path line span, and an out-of-range byte span refuses the call rather than clamping; group=0 is text no change set wrote (the base); groups lists change sets only
+  screen [--until TEXT]      the drawn screen as text, one line per row; --until polls until TEXT appears (--timeout D), --json adds the cursor
   open <path>                show a file: load it and focus a tab; --create makes a buffer for a path not on disk; prints opened or created
   ls [path]                  list a directory's immediate children; a trailing / marks a directory, --hidden includes hidden entries
   mkdir <dir>                create a directory, and any missing parents, under the workspace root
@@ -88,24 +89,26 @@ const ctlUsage = `usage: raj ctl <command> [options]
   proposals [--mine]         every pending proposal: change sets, deletions, dir-removals
 
   claim [path]...            set the working set; --add extends it, --clear releases it
-  goto [path] LINE[:COL]      move the editor's cursor; out-of-range clamps
+  goto [path] LINE[:COL]     move the editor's cursor; out-of-range clamps
   reveal <path> [--start N --end N]
                              put a file in front of the user, and every attached client; --start/--end is a byte span to place the caret at
-  close [path]                close a buffer; refused while it has unsaved work, --discard drops it anyway and reports whether the file remains
+  close [path]               close a buffer; refused while it has unsaved work, --discard drops it anyway and reports whether the file remains
   whoami                     the author id this connection writes as
   register [--as KEY] [--task ID]  mint an explicit identity key; --as and --task bind a chosen one and its work
   token                      the running server's TCP token, read from a local socket
-  who [--live]               everyone writing in this workspace; --live filters to connected  state [set working|blocked|review|idle]
+  who [--live]               everyone writing in this workspace; --live filters to connected
+  state [set working|blocked|review|idle]
                              report or set this connection's working state; --task, --on and --note are optional
 
   recv                       wait for the user, or a peer, to say something, then print it; --peers-only drops the editor's notices and keeps waiting for a person or peer
   send --to WHO [TEXT]       message another agent: WHO is a key, name, id or all; --text-file - reads stdin
   groups [path]              change sets in a buffer, and their state; --task T lists one task's sets across the workspace, each qualified by its buffer path
-  intent SUBCOMMAND          intentions over a base: new|add|remove|list|show|export|materialise; --ref is the base, --group/positional ids are members, --task selects a task's groups; export writes objects only and moves no ref
+  intent SUBCOMMAND          intentions over a base: new|add|remove|list|show|export|materialise|diff|review|publish|prove; --ref is the base, --group/positional ids are members, --task selects a task's groups; export writes objects only and moves no ref; prove materialises a named intention alone over its base and runs the check hook; diff prints that slice as a stat and unified diff; review opens it as one read-only diff tab per file; publish takes --approve or --withdraw
 
   accept [path] --group N    agree to a change set; --all for the buffer's pending ones, --all --everywhere for the workspace's
   reject [path] --group N    mark a set rejected; --all for the buffer's pending ones, --all --everywhere for the workspace's
   clear [path] --group N     hard-purge a rejected change set; --all for the buffer's rejected or invalid ones, --all --everywhere for the workspace's
+  --group N|PATH=N           accept/reject/clear: the change set id; intent new/add/remove: a member, repeatable; PATH=N names a member two buffers both number
 
   revert [path] [--author N] discard your own pieces; the inverse of attribution
   diff [path]                pending change sets as old→new text, for review
@@ -224,18 +227,204 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, ctlUsage)
 		return 2
 	}
-	cmd, rest := args[0], args[1:]
+	o, code, ok := newCtlOpts(args[0], args[1:], stderr)
+	if !ok {
+		return code
+	}
+	if cmd := o.cmd; cmd == "help" || cmd == "-h" || cmd == "--help" {
+		fmt.Fprint(stdout, ctlUsage)
+		return 0
+	}
+	if o.cmd == "list" {
+		return list(stdout, stderr, o.asJSON)
+	}
+	if code := validateCtl(o, stderr); code != 0 {
+		return code
+	}
+	return runCtl(o, stdout, stderr)
+}
 
+// ctlOpts is the parsed state of one `raj ctl` invocation: the command's flag
+// values, plus the operands the flag package left after parsing. Declaring the
+// flags onto it once, in bind, lets a verb handler read o.start instead of
+// closing over a local, and lets the verb table dispatch without a switch that
+// names every verb's flags.
+type ctlOpts struct {
+	cmd  string
+	fs   *flag.FlagSet
+	path string
+	argv []string // exec: the command after --
+	text []string // edit/apply: the body after --
+
+	taskVal   string
+	taskGiven bool
+
+	socket       string
+	addr         string
+	asJSON       bool
+	groupArgs    groupFlag
+	dumpID       uint64
+	identity     string
+	name         string
+	task         string
+	intentRef    string
+	intentDryRun bool
+	dir          string
+	projected    bool
+	query        searchPatternFlag
+	atSpans      atSpanFlag
+	includes     globList
+	excludes     globList
+	searchPath   string
+	regex        bool
+	matchCase    bool
+	word         bool
+	hiddenFlag   bool
+	jsonl        bool
+	base         uint64
+	start        int
+	end          int
+	lines        string
+	gitRev       string
+	gitCount     int
+	context      int
+	annotated    bool
+	create       bool
+	discard      bool
+	force        bool
+	withdraw     bool
+	approve      bool
+	claimAdd     bool
+	claimClear   bool
+	textArg      string
+	progArg      string
+	progHex      string
+	textFile     string
+	hunksFile    string
+	old          string
+	newText      string
+	oldFile      string
+	newFile      string
+	all          bool
+	everywhere   bool
+	mine         bool
+	revertAuthor uint
+	state        string
+	pendingOnly  bool
+	verbatim     bool
+	live         bool
+	stateOn      string
+	stateNote    string
+	wait         time.Duration
+	until        string
+	timeout      time.Duration
+	peersOnly    bool
+	sendTo       string
+}
+
+// ctlFn runs one parsed verb. The Client is already connected and bound, and
+// the opts carry every flag value.
+type ctlFn func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int
+
+// ctlVerb is one row of the CLI's dispatched verb table: the positional
+// operands, spelled as the top-level usage spells them, and the handler. A verb
+// absent from the table takes no positional. help and list are known verbs, but
+// they are answered before the lookup and so have no row here.
+//
+// This table is the CLI's own vocabulary, not the wire registry: edit, run,
+// status, register and mv are commands a person or harness types and are not
+// control operations, so the two are kept apart on purpose.
+type ctlVerb struct {
+	operand string
+	run     ctlFn
+}
+
+// bind declares this command's flags onto o. The names, defaults and usage
+// text are the CLI's public surface: every `raj ctl <verb> --help` prints them,
+// so they move here whole, not reworded.
+func (o *ctlOpts) bind(fs *flag.FlagSet) {
+	fs.StringVar(&o.socket, "socket", "", "path to the editor's control socket")
+	fs.StringVar(&o.addr, "addr", "", "the editor's control address: a socket path, or tcp://host:port")
+	fs.BoolVar(&o.asJSON, "json", false, "machine-readable output")
+	fs.Var(&o.groupArgs, "group", "accept/reject/clear: the change set id; intent new/add/remove: a member, repeatable; `N|PATH=N`, where PATH names a member two buffers both number")
+	fs.Uint64Var(&o.dumpID, "dump", 0, "patch: the snapshot id, from dump")
+	fs.StringVar(&o.identity, "as", "", "identity to write as; the same one reconnecting keeps its author id")
+	fs.StringVar(&o.name, "name", "", "display name for this participant")
+	fs.StringVar(&o.task, "task", "", "the work this connection's writes belong to, stored on the participant; groups: only sets opened under it")
+
+	fs.StringVar(&o.intentRef, "ref", "", "intent new/land: the base ref (publish uses the export's parent)")
+	fs.BoolVar(&o.intentDryRun, "dry-run", false, "intent materialise: report the tree without recording an export")
+	fs.StringVar(&o.dir, "dir", "", "exec: directory to run in, inside the workspace")
+	fs.BoolVar(&o.projected, "projected", false, "exec: run against a materialised projection of the live buffers instead of the worktree")
+	fs.Var(&o.query, "q", "search: the pattern; repeatable, one pattern per -q, any pattern may match")
+	fs.Var(&o.atSpans, "at", "read: PATH=LO,HI, a 1-based inclusive line span for that path; repeatable, one span per entry")
+	fs.Var(&o.includes, "include", "search: globs to search as `GLOB`; repeatable or comma-separated")
+	fs.Var(&o.excludes, "exclude", "search: globs to skip as `GLOB`; repeatable or comma-separated")
+	fs.StringVar(&o.searchPath, "path", "", "search: limit the walk to a directory under the workspace root; the scope itself is searched even when hidden")
+	fs.BoolVar(&o.regex, "regex", false, "search: treat the pattern as a regular expression")
+	fs.BoolVar(&o.matchCase, "case", false, "search: match case")
+	fs.BoolVar(&o.word, "word", false, "search: whole words only")
+	fs.BoolVar(&o.hiddenFlag, "hidden", false, "ls/search: include hidden files and directories")
+	fs.BoolVar(&o.jsonl, "jsonl", false, "search: print each hit as one JSON object per line, as it arrives")
+	fs.Uint64Var(&o.base, "base", 0, "apply: the version the offsets were measured in")
+	fs.IntVar(&o.start, "start", -1, "apply/read: first byte of the span")
+	fs.IntVar(&o.end, "end", -1, "apply/read: one past the last byte of the span")
+	fs.StringVar(&o.lines, "lines", "", "read: a line range, A or A,B (1-based inclusive); wins over --start/--end")
+	fs.StringVar(&o.gitRev, "rev", "", "git: the revision show/diff/numstat read; default HEAD")
+	fs.IntVar(&o.gitCount, "count", 0, "git log: the most commits to list; 0 is git's default")
+	fs.IntVar(&o.context, "context", 0, "search: lines of context before and after each hit; 0 is the hit line alone")
+	fs.BoolVar(&o.annotated, "annotated", false, "read: report the change set and state of each run; --json adds them as states, plain adds run lines after the text; group=0 is text no change set wrote (the base); groups lists change sets only")
+	fs.BoolVar(&o.create, "create", false, "open: make a new buffer for a path that is not on disk yet")
+	fs.BoolVar(&o.discard, "discard", false, "close: discard unsaved changes instead of refusing the close")
+	fs.BoolVar(&o.force, "force", false, "save: overwrite a file that changed on disk, the prompt Overwrite")
+	fs.BoolVar(&o.withdraw, "withdraw", false, "delete/rmdir/intent publish: retract a pending proposal instead of making one")
+	fs.BoolVar(&o.approve, "approve", false, "delete/rmdir/intent publish: carry out a pending proposal, the human answer; human only")
+	fs.BoolVar(&o.claimAdd, "add", false, "claim: extend the current set instead of replacing it")
+	fs.BoolVar(&o.claimClear, "clear", false, "claim: release the whole set")
+	fs.StringVar(&o.textArg, "text", "", "apply: replacement text")
+	fs.StringVar(&o.progArg, "prog", "", "run: the program itself, or @FILE, or - for stdin")
+	fs.StringVar(&o.progHex, "hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
+	fs.StringVar(&o.textFile, "text-file", "", "apply: read --text from a file, or - for stdin")
+	fs.StringVar(&o.hunksFile, "hunks", "", "apply: read hunks from a file of JSON Lines, one {start,end,text} per line, or - for stdin")
+	fs.StringVar(&o.old, "old", "", "edit: the exact existing text to replace")
+	fs.StringVar(&o.newText, "new", "", "edit: the replacement text")
+	fs.StringVar(&o.oldFile, "old-file", "", "edit: read --old from a file, or - for stdin")
+	fs.StringVar(&o.newFile, "new-file", "", "edit: read --new from a file, or - for stdin")
+	fs.BoolVar(&o.all, "all", false, "edit: replace every occurrence; accept/reject/clear: every change set in the active buffer; lsp diagnostics: sweep the changed files; save: every dirty buffer")
+	fs.BoolVar(&o.everywhere, "everywhere", false, "accept/reject/clear: widen a bulk decision from the active buffer to every buffer in the workspace")
+	fs.BoolVar(&o.mine, "mine", false, "groups, proposals, revert: only the connection's own work")
+	fs.UintVar(&o.revertAuthor, "author", 0, "revert: the writer whose pieces to drop; must be your own author id")
+	fs.StringVar(&o.state, "state", "", "groups: only sets in this state: proposed, accepted or rejected")
+	fs.BoolVar(&o.pendingOnly, "pending", false, "groups: only sets still awaiting a decision")
+	fs.BoolVar(&o.verbatim, "verbatim", false, "apply/edit: strip one trailing newline read from a file or stdin")
+	fs.BoolVar(&o.live, "live", false, "who: only participants connected right now, not every id the process has minted")
+	fs.StringVar(&o.stateOn, "on", "", "state set: who the declared state is waiting on — user or another participant's key")
+	fs.StringVar(&o.stateNote, "note", "", "state set: free text to show beside the declared state")
+
+	fs.DurationVar(&o.wait, "wait", 0, "recv: give up after this long; zero waits indefinitely")
+	fs.StringVar(&o.until, "until", "", "screen: poll until this text appears in the drawn rows, then exit 0")
+	fs.DurationVar(&o.timeout, "timeout", screenDefaultWait, "screen/--until: give up after this long")
+	fs.BoolVar(&o.peersOnly, "peers-only", false, "recv: drop the editor's notices (author 0) and keep waiting for a person or peer")
+	fs.StringVar(&o.sendTo, "to", "", "send: the recipient — a key, a name, an author id, or all")
+}
+
+// newCtlOpts builds the flag set for one command and parses rest into it. The
+// returned ok is false when the caller should return code without running the
+// verb: a parse error (code 2), a refused extra operand (its code), or -h,
+// where the flag package has already printed the verb's usage (code 0).
+func newCtlOpts(cmd string, rest []string, stderr io.Writer) (o *ctlOpts, code int, ok bool) {
+	o = &ctlOpts{cmd: cmd}
 	fs := flag.NewFlagSet("raj ctl "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	o.fs = fs
 	fs.Usage = func() {
 		out := fs.Output()
 		fmt.Fprintf(out, "usage: raj ctl %s", cmd)
-		if op := verbOperand[cmd]; op != "" {
+		if op := ctlVerbs[cmd].operand; op != "" {
 			fmt.Fprintf(out, " %s", op)
 		}
 		fmt.Fprintln(out, " [options]")
-		if strings.Contains(verbOperand[cmd], "[path]") && cmd != "claim" {
+		if strings.Contains(ctlVerbs[cmd].operand, "[path]") && cmd != "claim" {
 			note := "\nwith no path, targets the buffer the user is looking at."
 			if cmd == "ls" {
 				note = "\nwith no path, lists the workspace root."
@@ -246,144 +435,81 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(out)
 		PrintFlagUsage(out, fs)
 	}
-	socket := fs.String("socket", "", "path to the editor's control socket")
-	addr := fs.String("addr", "", "the editor's control address: a socket path, or tcp://host:port")
-	asJSON := fs.Bool("json", false, "machine-readable output")
-	group := fs.Uint64("group", 0, "accept/reject/clear: the change set id, from groups")
-	dumpID := fs.Uint64("dump", 0, "patch: the snapshot id, from dump")
-	identity := fs.String("as", "", "identity to write as; the same one reconnecting keeps its author id")
-	name := fs.String("name", "", "display name for this participant")
-	task := fs.String("task", "", "the work this connection's writes belong to, stored on the participant; groups: only sets opened under it")
-
-	intentRef := fs.String("ref", "", "intent new: the base ref")
-	intentDryRun := fs.Bool("dry-run", false, "intent materialise: report the tree without recording an export")
-	dir := fs.String("dir", "", "exec: directory to run in, inside the workspace")
-	projected := fs.Bool("projected", false, "exec: run against a materialised projection of the live buffers instead of the worktree")
-	var query searchPatternFlag
-	fs.Var(&query, "q", "search: the pattern; repeatable, one pattern per -q, any pattern may match")
-	var atSpans atSpanFlag
-	fs.Var(&atSpans, "at", "read: PATH=LO,HI, a 1-based inclusive line span for that path; repeatable, one span per entry")
-	var includes, excludes globList
-	fs.Var(&includes, "include", "search: globs to search as `GLOB`; repeatable or comma-separated")
-	fs.Var(&excludes, "exclude", "search: globs to skip as `GLOB`; repeatable or comma-separated")
-	searchPath := fs.String("path", "", "search: limit the walk to a directory under the workspace root; the scope itself is searched even when hidden")
-	regex := fs.Bool("regex", false, "search: treat the pattern as a regular expression")
-	matchCase := fs.Bool("case", false, "search: match case")
-	word := fs.Bool("word", false, "search: whole words only")
-	hiddenFlag := fs.Bool("hidden", false, "ls/search: include hidden files and directories")
-	jsonl := fs.Bool("jsonl", false, "search: print each hit as one JSON object per line, as it arrives")
-	base := fs.Uint64("base", 0, "apply: the version the offsets were measured in")
-	start := fs.Int("start", -1, "apply/read: first byte of the span")
-	end := fs.Int("end", -1, "apply/read: one past the last byte of the span")
-	lines := fs.String("lines", "", "read: a line range, A or A,B (1-based inclusive); wins over --start/--end")
-	gitRev := fs.String("rev", "", "git: the revision show/diff/numstat read; default HEAD")
-	gitCount := fs.Int("count", 0, "git log: the most commits to list; 0 is git's default")
-	context := fs.Int("context", 0, "search: lines of context before and after each hit; 0 is the hit line alone")
-	annotated := fs.Bool("annotated", false, "read: report the change set and state of each run; --json adds them as states, plain adds run lines after the text")
-	create := fs.Bool("create", false, "open: make a new buffer for a path that is not on disk yet")
-	discard := fs.Bool("discard", false, "close: discard unsaved changes instead of refusing the close")
-	force := fs.Bool("force", false, "save: overwrite a file that changed on disk, the prompt Overwrite")
-	withdraw := fs.Bool("withdraw", false, "delete/rmdir: retract your pending removal instead of proposing one")
-	approve := fs.Bool("approve", false, "delete/rmdir: carry out a pending removal, the human answer; human only")
-	claimAdd := fs.Bool("add", false, "claim: extend the current set instead of replacing it")
-	claimClear := fs.Bool("clear", false, "claim: release the whole set")
-	textArg := fs.String("text", "", "apply: replacement text")
-	progArg := fs.String("prog", "", "run: the program itself, or @FILE, or - for stdin")
-	progHex := fs.String("hex", "", "run: the program as hex, for one whose payloads contain a zero byte")
-	textFile := fs.String("text-file", "", "apply: read --text from a file, or - for stdin")
-	hunksFile := fs.String("hunks", "", "apply: read hunks from a file of JSON Lines, one {start,end,text} per line, or - for stdin")
-	old := fs.String("old", "", "edit: the exact existing text to replace")
-	newText := fs.String("new", "", "edit: the replacement text")
-	oldFile := fs.String("old-file", "", "edit: read --old from a file, or - for stdin")
-	newFile := fs.String("new-file", "", "edit: read --new from a file, or - for stdin")
-	all := fs.Bool("all", false, "edit: replace every occurrence; accept/reject/clear: every change set in the active buffer; lsp diagnostics: sweep the changed files; save: every dirty buffer")
-	everywhere := fs.Bool("everywhere", false, "accept/reject/clear: widen a bulk decision from the active buffer to every buffer in the workspace")
-	mine := fs.Bool("mine", false, "groups, proposals, revert: only the connection's own work")
-	revertAuthor := fs.Uint("author", 0, "revert: the writer whose pieces to drop; must be your own author id")
-	state := fs.String("state", "", "groups: only sets in this state: proposed, accepted or rejected")
-	pendingOnly := fs.Bool("pending", false, "groups: only sets still awaiting a decision")
-	verbatim := fs.Bool("verbatim", false, "apply/edit: strip one trailing newline read from a file or stdin")
-	live := fs.Bool("live", false, "who: only participants connected right now, not every id the process has minted")
-	stateOn := fs.String("on", "", "state set: who the declared state is waiting on — user or another participant's key")
-	stateNote := fs.String("note", "", "state set: free text to show beside the declared state")
-
-	wait := fs.Duration("wait", 0, "recv: give up after this long; zero waits indefinitely")
-	peersOnly := fs.Bool("peers-only", false, "recv: drop the editor's notices (author 0) and keep waiting for a person or peer")
-	sendTo := fs.String("to", "", "send: the recipient — a key, a name, an author id, or all")
+	o.bind(fs)
 	// Everything after "--" is another program's argv and must reach it intact:
 	// `raj ctl exec -- go test -run X` has to give go its own -run, not have it
 	// parsed as ours or shuffled by reorder.
-	var argv []string
 	if cmd == "exec" {
 		if i := indexOf(rest, "--"); i >= 0 {
-			argv, rest = rest[i+1:], rest[:i]
+			o.argv, rest = rest[i+1:], rest[:i]
 		}
 	}
 	// edit and apply take a replacement body that may begin with "-" or "--".
 	// Everything after a "--" is that body, taken literally: it never reaches
 	// reorder or the flag package, so it cannot be read as a flag nor refused
 	// as a stray operand.
-	var textOperands []string
 	if cmd == "edit" || cmd == "apply" {
 		if i := indexOf(rest, "--"); i >= 0 {
-			textOperands = append([]string(nil), rest[i+1:]...)
+			o.text = append([]string(nil), rest[i+1:]...)
 			rest = rest[:i]
 		}
 	}
 	if err := fs.Parse(reorder(fs, rest)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return 0
+			return o, 0, false
 		}
-		return 2
+		return o, 2, false
 	}
-	path := fs.Arg(0)
+	o.path = fs.Arg(0)
 	// taskGiven tells an explicit --task, including an empty one (the
 	// untasked bucket `groups` can filter to), from a command that named no
 	// task at all.
-	taskGiven := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "task" {
-			taskGiven = true
+			o.taskGiven = true
 		}
 	})
 	if code := refuseExtraArgs(cmd, fs, stderr); code != 0 {
-		return code
+		return o, code, false
 	}
+	return o, 0, true
+}
 
+// validateCtl refuses flag combinations before the dial: each names a scope or
+// a pair that has no meaning, and failing before connecting keeps the refusal
+// diagnostic rather than a transport error.
+func validateCtl(o *ctlOpts, stderr io.Writer) int {
 	// save --all is already the whole workspace, so --everywhere names no wider
 	// scope and would be dropped; refuse it like the bare --everywhere case
 	// rather than accept a flag with no effect.
-	if *everywhere && cmd == "save" {
+	if o.everywhere && o.cmd == "save" {
 		fmt.Fprintln(stderr, "raj ctl save: --everywhere names no wider scope; save --all already covers every buffer")
 		return 2
 	}
 	// --everywhere widens a bulk --all and nothing else; on its own it names a
 	// scope with no bulk decision to widen, so refuse it rather than quietly
 	// doing what the bare verb would have.
-	if *everywhere && !*all &&
-		(cmd == "accept" || cmd == "reject" || cmd == "clear") {
-		fmt.Fprintf(stderr, "raj ctl %s: --everywhere widens --all; pass both\n", cmd)
+	if o.everywhere && !o.all &&
+		(o.cmd == "accept" || o.cmd == "reject" || o.cmd == "clear") {
+		fmt.Fprintf(stderr, "raj ctl %s: --everywhere widens --all; pass both\n", o.cmd)
 		return 2
 	}
-
 	// --approve is the human answer and --withdraw retracts a proposal; they
 	// name opposite outcomes for one removal, so refuse the pair here, before
 	// the dial, rather than letting the server pick one.
-	if *approve && *withdraw && (cmd == "delete" || cmd == "rmdir") {
-		fmt.Fprintf(stderr, "raj ctl %s: --approve and --withdraw are opposite answers; pass one\n", cmd)
+	if o.approve && o.withdraw && (o.cmd == "delete" || o.cmd == "rmdir") {
+		fmt.Fprintf(stderr, "raj ctl %s: --approve and --withdraw are opposite answers; pass one\n", o.cmd)
 		return 2
 	}
+	return 0
+}
 
-	if cmd == "help" || cmd == "-h" || cmd == "--help" {
-		fmt.Fprint(stdout, ctlUsage)
-		return 0
-	}
-	if cmd == "list" {
-		return list(stdout, stderr, *asJSON)
-	}
-
+// runCtl connects to the editor and dispatches o.cmd through ctlVerbs. It is
+// the one path every verb takes once its flags parse, so the transport setup
+// lives here rather than being repeated per verb.
+func runCtl(o *ctlOpts, stdout, stderr io.Writer) int {
 	cwd, _ := os.Getwd()
-	sock, err := Locate(firstOf(*addr, *socket), cwd)
+	sock, err := Locate(firstOf(o.addr, o.socket), cwd)
 	if err != nil {
 		fmt.Fprintln(stderr, "raj ctl:", err)
 		return exitUnreachable
@@ -414,10 +540,18 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 	// A harness pins the work with RAJ_TASK, the counterpart to RAJ_IDENTITY,
 	// so a brief generator sets one variable and every command the session
 	// runs carries its task. An explicit --task wins.
-	taskVal := firstOf(*task, os.Getenv("RAJ_TASK"))
-	if cmd != "register" {
-		bind := firstOf(*identity, os.Getenv("RAJ_IDENTITY"))
-		if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: *name, Task: taskVal}); err == nil && hi.Err == "" {
+	o.taskVal = firstOf(o.task, os.Getenv("RAJ_TASK"))
+	// On a filter/selector verb, --task picks what to list rather than what
+	// this connection writes: hello carries only the pinned RAJ_TASK, so
+	// `groups --task T` cannot rebind later untasked writes to T. The verb
+	// itself still receives the explicit --task as its filter below.
+	helloTask := o.taskVal
+	if o.cmd == "groups" || o.cmd == "intent" {
+		helloTask = os.Getenv("RAJ_TASK")
+	}
+	if o.cmd != "register" {
+		bind := firstOf(o.identity, os.Getenv("RAJ_IDENTITY"))
+		if hi, err := c.Do(Request{Op: "hello", Identity: bind, Name: o.name, Task: helloTask}); err == nil && hi.Err == "" {
 			if bind == "" && hi.Identity != "" {
 				adoptedIdentity = hi.Identity
 				fmt.Fprintf(stderr, "set RAJ_IDENTITY=%s\n", hi.Identity)
@@ -426,432 +560,558 @@ func CLI(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	switch cmd {
-	case "buffers":
-		return buffers(c, stdout, stderr, *asJSON)
-	case "status":
-		return status(c, stdout, stderr, *asJSON)
-	case "read":
-		return read(c, fs.Args(), &atSpans, *start, *end, *lines, *annotated, stdout, stderr, *asJSON)
-	case "open":
-		if path == "" {
+	v, found := ctlVerbs[o.cmd]
+	if !found || v.run == nil {
+		fmt.Fprintf(stderr, "raj ctl: unknown command %q\n\n%s", o.cmd, ctlUsage)
+		return 2
+	}
+	return v.run(c, o, stdout, stderr)
+}
+
+// ctlVerbs is every command runCtl can dispatch, one row each. A new raj ctl
+// verb is a handler here, not another case in a switch. The operand text is
+// spelled as the top-level usage spells it, and drives the per-verb --help.
+var ctlVerbs = map[string]ctlVerb{
+	"buffers": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return buffers(c, stdout, stderr, o.asJSON)
+	}},
+	"status": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return status(c, stdout, stderr, o.asJSON)
+	}},
+	"screen": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return screen(c, o.until, o.timeout, stdout, stderr, o.asJSON)
+	}},
+	"read": {operand: "[path]...", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return read(c, o.fs.Args(), &o.atSpans, o.start, o.end, o.lines, o.annotated, stdout, stderr, o.asJSON)
+	}},
+	"open": {operand: "<path>", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		if o.path == "" {
 			fmt.Fprintln(stderr, "raj ctl open: needs a path")
 			return 2
 		}
-		return openCmd(c, path, *create, stdout, stderr, *asJSON)
-	case "mkdir":
-		if path == "" {
+		return openCmd(c, o.path, o.create, stdout, stderr, o.asJSON)
+	}},
+	"mkdir": {operand: "<dir>", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		if o.path == "" {
 			fmt.Fprintln(stderr, "raj ctl mkdir: needs a path")
 			return 2
 		}
-		return simple(c, Request{Op: "mkdir", Path: path}, "created "+path, stdout, stderr, *asJSON)
-	case "ls":
-		return lsCmd(c, path, *hiddenFlag, stdout, stderr, *asJSON)
-	case "rename", "mv":
-		if path == "" || fs.Arg(1) == "" {
-			fmt.Fprintf(stderr, "raj ctl %s: needs an old and a new path\n", cmd)
-			return 2
-		}
-		return renameCmd(c, path, fs.Arg(1), stdout, stderr, *asJSON)
-	case "delete":
-		if path == "" {
+		return simple(c, Request{Op: "mkdir", Path: o.path}, "created "+o.path, stdout, stderr, o.asJSON)
+	}},
+	"ls": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return lsCmd(c, o.path, o.hiddenFlag, stdout, stderr, o.asJSON)
+	}},
+	"rename": {operand: "<old> <new>", run: renameCmdRun},
+	"mv":     {operand: "<old> <new>", run: renameCmdRun},
+	"delete": {operand: "<path>", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		if o.path == "" {
 			fmt.Fprintln(stderr, "raj ctl delete: needs a path")
 			return 2
 		}
-		return deleteCmd(c, path, *withdraw, *approve, stdout, stderr, *asJSON)
-	case "deletions":
-		return deletionsCmd(c, stdout, stderr, *asJSON)
-	case "rmdir":
-		if path == "" {
+		return deleteCmd(c, o.path, o.withdraw, o.approve, stdout, stderr, o.asJSON)
+	}},
+	"deletions": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return deletionsCmd(c, stdout, stderr, o.asJSON)
+	}},
+	"rmdir": {operand: "<dir>", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		if o.path == "" {
 			fmt.Fprintln(stderr, "raj ctl rmdir: needs a directory path")
 			return 2
 		}
-		return rmdirCmd(c, path, *withdraw, *approve, stdout, stderr, *asJSON)
-	case "rmdirs":
-		return rmdirsCmd(c, stdout, stderr, *asJSON)
-	case "proposals":
-		res, err := c.Do(Request{Op: "proposals"})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		props := res.Proposals
+		return rmdirCmd(c, o.path, o.withdraw, o.approve, stdout, stderr, o.asJSON)
+	}},
+	"rmdirs": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return rmdirsCmd(c, stdout, stderr, o.asJSON)
+	}},
+	"proposals": {run: proposalsCmd},
+	"goto":      {operand: "[path] LINE[:COL]", run: gotoCmd},
+	"reveal": {operand: "<path>", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return revealCmd(c, o.path, o.start, o.end, stdout, stderr, o.asJSON)
+	}},
+	"close": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return closeCmd(c, o.path, o.discard, stdout, stderr, o.asJSON)
+	}},
+	"claim": {operand: "[path]...", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return claimCmd(c, o.fs.Args(), o.claimAdd, o.claimClear, stdout, stderr, o.asJSON)
+	}},
+	"save": {operand: "[path]", run: saveCmd},
+	"land": {operand: "<task>", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return landCmd(c, o.path, stdout, stderr, o.asJSON)
+	}},
+	"reload": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return simple(c, Request{Op: "reload", Path: o.path}, "reloaded", stdout, stderr, o.asJSON)
+	}},
+	"exec": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return doExec(c, o.argv, o.dir, o.projected, stdout, stderr, o.asJSON)
+	}},
+	"run": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return runProgram(c, o.progArg, o.progHex, stdout, stderr, o.asJSON)
+	}},
+	"stats": {run: statsCmd},
+	"intent": {operand: "SUBCOMMAND [NAME] [GROUPS...]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return intentCmd(c, o.fs.Args(), o.groupArgs, o.intentRef, o.intentDryRun, o.taskVal, o.approve, o.withdraw, o.asJSON, stdout, stderr)
+	}},
+	"groups": {operand: "[path]", run: groupsCmd},
+	"accept": {operand: "[path]", run: decideCmdRun},
+	"reject": {operand: "[path]", run: decideCmdRun},
+	"clear":  {operand: "[path]", run: clearDecisionCmd},
+	"revert": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return revertCmd(c, o.path, uint8(o.revertAuthor), o.mine, stdout, stderr, o.asJSON)
+	}},
+	"diff": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return diffCmd(c, o.path, stdout, stderr, o.asJSON)
+	}},
+	"review": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return reviewCmd(c, o.path, o.asJSON, stdout, stderr)
+	}},
+	"state": {operand: "[set STATE]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return stateCmd(c, o.fs.Args(), o.stateOn, o.stateNote, stdout, stderr, o.asJSON)
+	}},
+	"who": {run: whoCmd},
+	"recv": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return recv(c, o.identity, o.name, o.wait, o.peersOnly, stdout, stderr, o.asJSON)
+	}},
+	"send": {operand: "[TEXT]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return sendCmd(c, o.sendTo, o.path, o.textArg, o.textFile, o.verbatim, stdout, stderr, o.asJSON)
+	}},
+	"whoami": {run: whoamiCmd},
+	"token":  {run: tokenCmd},
+	"register": {run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return registerCmd(c, o.identity, o.name, o.taskVal, stdout, stderr, o.asJSON)
+	}},
+	"search":  {run: searchCmd},
+	"version": {operand: "[path]", run: versionCmd},
+	"dump": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return dumpCmd(c, o.path, o.start, o.end, stdout, stderr, o.asJSON)
+	}},
+	"patch": {operand: "[path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return patchCmd(c, o.path, o.dumpID, o.textArg, o.textFile, stdout, stderr, o.asJSON)
+	}},
+	"lsp": {operand: "MODE [path] LINE:COL [query]", run: lspCmd},
+	"git": {operand: "MODE [path]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return gitCmd(c, o.fs.Arg(0), o.fs.Arg(1), o.gitRev, o.gitCount, stdout, stderr, o.asJSON)
+	}},
+	"apply": {operand: "[path] [TEXT]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+		return apply(c, o.path, o.base, o.start, o.end, o.textArg, o.textFile, o.hunksFile,
+			o.text, o.verbatim, o.fs, stdout, stderr, o.asJSON)
+	}},
+	"edit": {operand: "[path] [OLD NEW]", run: editCmd},
+}
+
+// proposalsCmd lists every pending proposal: change sets, deletions and
+// dir-removals, grouped by kind unless --json asks for the raw list. --mine
+// keeps only the connection's own work.
+func proposalsCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	res, err := c.Do(Request{Op: "proposals"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	props := res.Proposals
+	if props == nil {
+		props = []Proposal{}
+	}
+	if o.mine {
+		props = mineProposals(props, c.Author())
 		if props == nil {
 			props = []Proposal{}
 		}
-		if *mine {
-			props = mineProposals(props, c.Author())
-			if props == nil {
-				props = []Proposal{}
-			}
-		}
-		if *asJSON {
-			return emit(stdout, props)
-		}
-		if len(props) == 0 {
-			fmt.Fprintln(stdout, "no pending proposals")
-			return 0
-		}
-		for _, k := range []struct{ kind, label string }{
-			{"set", "change sets:"},
-			{"delete", "pending deletions:"},
-			{"rmdir", "pending dir-removals:"},
-			{"invalid", "invalid change sets:"},
-		} {
-			head := false
-			for _, p := range props {
-				if p.Kind != k.kind {
-					continue
-				}
-				if !head {
-					fmt.Fprintln(stdout, k.label)
-					head = true
-				}
-				switch {
-				case p.Kind == "set" && p.Start >= 0:
-					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tbytes %d..%d\n", p.Path, p.Group, p.Author, p.Start, p.End)
-				case p.Kind == "set":
-					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\n", p.Path, p.Group, p.Author)
-				case p.Kind == "invalid":
-					fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tinvalid\n", p.Path, p.Group, p.Author)
-				default:
-					fmt.Fprintf(stdout, "%s\tauthor %d\n", p.Path, p.Author)
-				}
-			}
-		}
+	}
+	if o.asJSON {
+		return emit(stdout, props)
+	}
+	if len(props) == 0 {
+		fmt.Fprintln(stdout, "no pending proposals")
 		return 0
-	case "goto":
-		if pos := fs.Arg(1); pos != "" {
-			line, col, ok := ctlPosition(pos)
-			if !ok {
-				fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
-				return 2
+	}
+	for _, k := range []struct{ kind, label string }{
+		{"set", "change sets:"},
+		{"delete", "pending deletions:"},
+		{"rmdir", "pending dir-removals:"},
+		{"invalid", "invalid change sets:"},
+	} {
+		head := false
+		for _, p := range props {
+			if p.Kind != k.kind {
+				continue
 			}
-			res, err := c.Do(Request{Op: "goto", Path: path, Line: line, Col: col})
-			if code := fail(stderr, res, err); code != 0 {
-				return code
+			if !head {
+				fmt.Fprintln(stdout, k.label)
+				head = true
 			}
-			if *asJSON {
-				return emit(stdout, map[string]any{"ok": true, "line": line, "col": col})
+			switch {
+			case p.Kind == "set" && p.Start >= 0:
+				fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tbytes %d..%d\n", p.Path, p.Group, p.Author, p.Start, p.End)
+			case p.Kind == "set":
+				fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\n", p.Path, p.Group, p.Author)
+			case p.Kind == "invalid":
+				fmt.Fprintf(stdout, "%s\tgroup %d\tauthor %d\tinvalid\n", p.Path, p.Group, p.Author)
+			default:
+				fmt.Fprintf(stdout, "%s\tauthor %d\n", p.Path, p.Author)
 			}
-			where := targetName(c, path, "active buffer")
-			if line > 0 {
-				colText := ""
-				if col > 0 {
-					colText = fmt.Sprintf(":%d", col)
-				}
-				fmt.Fprintf(stdout, "moved %s cursor to %d%s\n", where, line, colText)
-			} else {
-				fmt.Fprintf(stdout, "moved %s cursor to column %d\n", where, col)
-			}
-			return 0
 		}
+	}
+	return 0
+}
+
+// gotoCmd moves the editor's cursor to LINE[:COL]. A missing or malformed
+// position is a usage error; an out-of-range one clamps server-side.
+func gotoCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	pos := o.fs.Arg(1)
+	if pos == "" {
 		fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
 		return 2
-	case "reveal":
-		return revealCmd(c, path, *start, *end, stdout, stderr, *asJSON)
-	case "close":
-		return closeCmd(c, path, *discard, stdout, stderr, *asJSON)
-	case "claim":
-		return claimCmd(c, fs.Args(), *claimAdd, *claimClear, stdout, stderr, *asJSON)
-	case "save":
-		if *all {
-			return saveAll(c, *force, stdout, stderr, *asJSON)
-		}
-		return simple(c, Request{Op: "save", Path: path, Force: *force}, "saved", stdout, stderr, *asJSON)
-	case "land":
-		return landCmd(c, path, stdout, stderr, *asJSON)
-	case "reload":
-		return simple(c, Request{Op: "reload", Path: path}, "reloaded", stdout, stderr, *asJSON)
-	case "exec":
-		return doExec(c, argv, *dir, *projected, stdout, stderr, *asJSON)
-	case "run":
-		return runProgram(c, *progArg, *progHex, stdout, stderr, *asJSON)
-	case "stats":
-		res, err := c.Do(Request{Op: "stats"})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		if *asJSON {
-			return emit(stdout, res.Stats)
-		}
-		fmt.Fprintf(stdout, "runs %d\nran-against-stale-files %d\nstale-but-agent-only %d\n",
-			res.Stats.Runs, res.Stats.Stale, res.Stats.AgentOnly)
-		return 0
-	case "intent":
-		return intentCmd(c, fs.Args(), *intentRef, *intentDryRun, taskVal, *asJSON, stdout, stderr)
-	case "groups":
-		if *state != "" {
-			switch *state {
-			case "proposed", "accepted", "rejected":
-			default:
-				fmt.Fprintf(stderr, "raj ctl groups: --state must be proposed, accepted or rejected, not %q\n", *state)
-				return 2
-			}
-		}
-		if *pendingOnly {
-			if *state != "" && *state != "proposed" {
-				fmt.Fprintln(stderr, "raj ctl groups: --pending and --state conflict unless --state is proposed")
-				return 2
-			}
-			*state = "proposed"
-		}
-		groups, code := groupsForRequest(c, path, taskGiven, *mine, stderr)
-		if code != 0 {
-			return code
-		}
-		res := Response{Groups: groups}
-		if res.Groups == nil {
-			res.Groups = []Group{}
-		}
-		if *state != "" {
-			kept := make([]Group, 0, len(res.Groups))
-			for _, g := range res.Groups {
-				if g.State == *state {
-					kept = append(kept, g)
-				}
-			}
-			res.Groups = kept
-		}
-		// An explicit --task filters by the work each set was opened under; an
-		// empty one is the untasked bucket. Sets of another task are counted
-		// and named below rather than listed, so a partial view is never
-		// mistaken for the whole buffer.
-		otherTasks := 0
-		if taskGiven {
-			kept := make([]Group, 0, len(res.Groups))
-			for _, g := range res.Groups {
-				if g.Task == *task {
-					kept = append(kept, g)
-				} else {
-					otherTasks++
-				}
-			}
-			res.Groups = kept
-		}
-		if *asJSON {
-			return emit(stdout, res.Groups)
-		}
-
-		for _, g := range res.Groups {
-			// A `--task` listing is the qualified member form: the path names
-			// the buffer that numbers the set, so ids that collide across
-			// buffers stay distinct (S3 names a task's groups from here).
-			prefix := ""
-			if taskGiven {
-				prefix = g.Path + "\t"
-			}
-			fmt.Fprintf(stdout, "%s%d\tauthor %d\t%s\t%d ops\t%+d bytes\t%d hunks\t%d moved\n",
-				prefix, g.ID, g.Author, g.State, g.Ops, g.Bytes, g.Hunks, g.Moved)
-			if g.Overlaps != nil {
-				// An overlap is reported, not resolved: two sets still awaiting
-				// a decision that claim the same bytes is a fact the person
-				// deciding them has to see.
-				for _, o := range g.Overlaps.Sets {
-					fmt.Fprintf(stdout, "  overlaps change set %d (author %d) at bytes %d..%d\n",
-						o.Group, o.Author, o.Start, o.End)
-				}
-			}
-			if g.Invalid {
-				// Superseded, not decided: the set is still proposed but every
-				// hunk is gone, so there is nothing to accept. Name the live
-				// edit that consumed it, so clearing that is an actionable next
-				// step rather than a bare state.
-				if g.InvalidBy != nil {
-					fmt.Fprintf(stdout, "  invalid: superseded by change set %d (author %d) at bytes %d..%d\n",
-						g.InvalidBy.Group, g.InvalidBy.Author, g.InvalidBy.Start, g.InvalidBy.End)
-				} else {
-					fmt.Fprintln(stdout, "  invalid: superseded; no colliding set can be named")
-				}
-			}
-		}
-		if taskGiven && otherTasks > 0 {
-			fmt.Fprintf(stdout, "  %d change set(s) belong to another task\n", otherTasks)
-		}
-		return 0
-	case "accept", "reject":
-
-		if *all {
-			return decideAll(c, cmd, path, *mine, *group, *everywhere, stdout, stderr, *asJSON)
-		}
-		return simple(c, Request{Op: cmd, Path: path, Group: *group}, cmd+"ed",
-			stdout, stderr, *asJSON)
-	case "clear":
-		if *all {
-			return decideAll(c, cmd, path, *mine, *group, *everywhere, stdout, stderr, *asJSON)
-		}
-		return clearCmd(c, path, *group, stdout, stderr, *asJSON)
-	case "revert":
-		return revertCmd(c, path, uint8(*revertAuthor), *mine, stdout, stderr, *asJSON)
-	case "diff":
-		return diffCmd(c, path, stdout, stderr, *asJSON)
-	case "review":
-		return reviewCmd(c, path, *asJSON, stdout, stderr)
-	case "state":
-		return stateCmd(c, fs.Args(), *stateOn, *stateNote, stdout, stderr, *asJSON)
-	case "who":
-		res, err := c.Do(Request{Op: "hello", Identity: identityOf(*identity), Name: *name})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		if *live {
-			// Client-side on purpose: the registry's full listing is the
-			// attribution record — a gone participant's text is still in the
-			// document — so the wire answer keeps every row and the flag is a
-			// view, not a change to what the server reports.
-			here := make([]Participant, 0, len(res.Participants))
-			for _, p := range res.Participants {
-				if p.Connected {
-					here = append(here, p)
-				}
-			}
-			res.Participants = here
-		}
-		if *asJSON {
-			return emit(stdout, res.Participants)
-		}
-		for _, p := range res.Participants {
-			since := "never"
-			if p.SinceMS >= 0 {
-				since = fmt.Sprintf("%ds", p.SinceMS/1000)
-			}
-			declared := ""
-			if p.Declared != "" {
-				declared = " declared=" + p.Declared
-			}
-			on := ""
-			if p.On != "" {
-				on = " on=" + p.On
-			}
-			note := ""
-			if p.Note != "" {
-				note = " note=" + p.Note
-			}
-			task := p.Task
-			if task == "" {
-				task = "-"
-			}
-			fmt.Fprintf(stdout, "%d\t%s\t%s\t%s%s\ttask=%s\tsince=%s%s%s\n",
-				p.ID, p.Kind, p.Name, p.State, declared, task, since, on, note)
-
-		}
-		return 0
-	case "recv":
-		return recv(c, *identity, *name, *wait, *peersOnly, stdout, stderr, *asJSON)
-	case "send":
-		return sendCmd(c, *sendTo, path, *textArg, *textFile, *verbatim, stdout, stderr, *asJSON)
-	case "whoami":
-		res, err := c.Do(Request{Op: "ping"})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		if *asJSON {
-			out := map[string]any{"author": res.Author, "root": res.Root}
-			if m := c.Mapper(); m.Active() {
-				// Reported rather than assumed: if paths are being rewritten,
-				// the one thing a caller needs to be able to check is what to.
-				out["root_map"] = m.String()
-			}
-			return emit(stdout, out)
-		}
-		fmt.Fprintf(stdout, "%d\n", res.Author)
-		return 0
-	case "token":
-		// The secret is the server's, not this connection's, so there is
-		// nothing to resolve and no path involved. Printing it alone on the
-		// line is the point: `TOKEN=$(raj ctl token)` should not have to strip
-		// prose. A Unix-only server has no secret and prints an empty line.
-		res, err := c.Do(Request{Op: "token"})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		if *asJSON {
-			return emit(stdout, map[string]any{"token": res.Token})
-		}
-		fmt.Fprintln(stdout, res.Token)
-		return 0
-	case "register":
-		return registerCmd(c, *identity, *name, taskVal, stdout, stderr, *asJSON)
-
-	case "search":
-		// A bare positional is never a path here — search takes none — so it
-		// is the pattern typed in the wrong place, and accepting it silently
-		// would run a different search than the one that was meant.
-		if arg := fs.Arg(0); arg != "" {
-			fmt.Fprintf(stderr, "search: unexpected argument %q — the pattern goes to -q; to limit paths use --include or --path\n", arg)
-			return 2
-		}
-		if *context < 0 {
-			fmt.Fprintln(stderr, "raj ctl search: --context cannot be negative")
-			return 2
-		}
-		return doSearch(c, SearchQuery{Include: includes.wire(), Exclude: excludes.wire(),
-			Path: *searchPath, Hidden: *hiddenFlag, Context: *context,
-			Regex: *regex, Case: *matchCase, Word: *word}, query.patterns(), *jsonl, *asJSON, stdout, stderr)
-	case "version":
-		res, err := c.Do(Request{Op: "version", Path: path})
-		if code := fail(stderr, res, err); code != 0 {
-			return code
-		}
-		if *asJSON {
-			return emit(stdout, map[string]any{
-				"ok": true, "version": res.Version,
-				"bytes": res.Bytes, "lines": res.Lines,
-			})
-		}
-		fmt.Fprintln(stdout, res.Version) // the number is the answer
-		return 0
-	case "dump":
-		return dumpCmd(c, path, *start, *end, stdout, stderr, *asJSON)
-	case "patch":
-		return patchCmd(c, path, *dumpID, *textArg, *textFile, stdout, stderr, *asJSON)
-	case "lsp":
-		// diagnostics may name several files, so one call sweeps them all
-		// rather than a shell loop spending a round trip per file. Every other
-		// mode addresses one path and position.
-		if fs.Arg(0) == "diagnostics" {
-			if *all {
-				if len(fs.Args()) > 1 {
-					fmt.Fprintln(stderr, "raj ctl lsp diagnostics: --all sweeps the changed files; it takes no paths")
-					return 2
-				}
-				paths, code := lspChangedPaths(c, stderr)
-				if code != 0 {
-					return code
-				}
-				if len(paths) == 0 {
-					if *asJSON {
-						return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
-					}
-					fmt.Fprintln(stdout, "no changed files to sweep")
-					return 0
-				}
-				return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
-			}
-			paths := fs.Args()[1:]
-			if len(paths) == 0 {
-				paths = []string{""} // the buffer in front, as with one path
-			}
-			if len(paths) == 1 {
-				// One path keeps the single-path shape exactly, JSON included.
-				return doLSP(c, "diagnostics", paths[0], "", *lines, "", stdout, stderr, *asJSON)
-			}
-			return lspDiagnostics(c, paths, stdout, stderr, *asJSON)
-		}
-		return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), *lines, fs.Arg(3), stdout, stderr, *asJSON)
-	case "git":
-		return gitCmd(c, fs.Arg(0), fs.Arg(1), *gitRev, *gitCount, stdout, stderr, *asJSON)
-	case "apply":
-		return apply(c, path, *base, *start, *end, *textArg, *textFile, *hunksFile,
-			textOperands, *verbatim, fs, stdout, stderr, *asJSON)
-	case "edit":
-		o, n, code := editText(*old, *newText, *oldFile, *newFile, textOperands, *verbatim, stderr)
-		if code != 0 {
-			return code
-		}
-		return edit(c, path, o, n, *all, stdout, stderr, *asJSON)
 	}
-	fmt.Fprintf(stderr, "raj ctl: unknown command %q\n\n%s", cmd, ctlUsage)
-	return 2
+	line, col, ok := ctlPosition(pos)
+	if !ok {
+		fmt.Fprintln(stderr, "raj ctl goto: expects LINE[:COL]")
+		return 2
+	}
+	res, err := c.Do(Request{Op: "goto", Path: o.path, Line: line, Col: col})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if o.asJSON {
+		return emit(stdout, map[string]any{"ok": true, "line": line, "col": col})
+	}
+	where := targetName(c, o.path, "active buffer")
+	if line > 0 {
+		colText := ""
+		if col > 0 {
+			colText = fmt.Sprintf(":%d", col)
+		}
+		fmt.Fprintf(stdout, "moved %s cursor to %d%s\n", where, line, colText)
+	} else {
+		fmt.Fprintf(stdout, "moved %s cursor to column %d\n", where, col)
+	}
+	return 0
+}
+
+// statsCmd reports what the exec policy has cost this session.
+func statsCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	res, err := c.Do(Request{Op: "stats"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if o.asJSON {
+		return emit(stdout, res.Stats)
+	}
+	fmt.Fprintf(stdout, "runs %d\nran-against-stale-files %d\nstale-but-agent-only %d\n",
+		res.Stats.Runs, res.Stats.Stale, res.Stats.AgentOnly)
+	return 0
+}
+
+// groupsCmd lists a buffer's change sets and their state, with --state,
+// --pending, --mine and --task as filters.
+func groupsCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	state := o.state
+	if state != "" {
+		switch state {
+		case "proposed", "accepted", "rejected":
+		default:
+			fmt.Fprintf(stderr, "raj ctl groups: --state must be proposed, accepted or rejected, not %q\n", state)
+			return 2
+		}
+	}
+	if o.pendingOnly {
+		if state != "" && state != "proposed" {
+			fmt.Fprintln(stderr, "raj ctl groups: --pending and --state conflict unless --state is proposed")
+			return 2
+		}
+		state = "proposed"
+	}
+	groups, code := groupsForRequest(c, o.path, o.taskGiven, o.mine, stderr)
+	if code != 0 {
+		return code
+	}
+	res := Response{Groups: groups}
+	if res.Groups == nil {
+		res.Groups = []Group{}
+	}
+	if state != "" {
+		kept := make([]Group, 0, len(res.Groups))
+		for _, g := range res.Groups {
+			if g.State == state {
+				kept = append(kept, g)
+			}
+		}
+		res.Groups = kept
+	}
+	// An explicit --task filters by the work each set was opened under; an
+	// empty one is the untasked bucket. Sets of another task are counted
+	// and named below rather than listed, so a partial view is never
+	// mistaken for the whole buffer.
+	otherTasks := 0
+	if o.taskGiven {
+		kept := make([]Group, 0, len(res.Groups))
+		for _, g := range res.Groups {
+			if g.Task == o.task {
+				kept = append(kept, g)
+			} else {
+				otherTasks++
+			}
+		}
+		res.Groups = kept
+	}
+	if o.asJSON {
+		return emit(stdout, res.Groups)
+	}
+
+	for _, g := range res.Groups {
+		// A `--task` listing is the qualified member form: the path names
+		// the buffer that numbers the set, so ids that collide across
+		// buffers stay distinct (S3 names a task's groups from here).
+		prefix := ""
+		if o.taskGiven {
+			prefix = g.Path + "\t"
+		}
+		fmt.Fprintf(stdout, "%s%d\tauthor %d\t%s\t%d ops\t%+d bytes\t%d hunks\t%d moved\n",
+			prefix, g.ID, g.Author, g.State, g.Ops, g.Bytes, g.Hunks, g.Moved)
+		if g.Overlaps != nil {
+			// An overlap is reported, not resolved: two sets still awaiting
+			// a decision that claim the same bytes is a fact the person
+			// deciding them has to see.
+			for _, ov := range g.Overlaps.Sets {
+				fmt.Fprintf(stdout, "  overlaps change set %d (author %d) at bytes %d..%d\n",
+					ov.Group, ov.Author, ov.Start, ov.End)
+			}
+		}
+		if g.Invalid {
+			// Superseded, not decided: the set is still proposed but every
+			// hunk is gone, so there is nothing to accept. Name the live
+			// edit that consumed it, so clearing that is an actionable next
+			// step rather than a bare state.
+			if g.InvalidBy != nil {
+				fmt.Fprintf(stdout, "  invalid: superseded by change set %d (author %d) at bytes %d..%d\n",
+					g.InvalidBy.Group, g.InvalidBy.Author, g.InvalidBy.Start, g.InvalidBy.End)
+			} else {
+				fmt.Fprintln(stdout, "  invalid: superseded; no colliding set can be named")
+			}
+		}
+	}
+	if o.taskGiven && otherTasks > 0 {
+		fmt.Fprintf(stdout, "  %d change set(s) belong to another task\n", otherTasks)
+	}
+	return 0
+}
+
+// saveCmd saves one buffer, or every dirty buffer with --all.
+func saveCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	if o.all {
+		return saveAll(c, o.force, stdout, stderr, o.asJSON)
+	}
+	return simple(c, Request{Op: "save", Path: o.path, Force: o.force}, "saved", stdout, stderr, o.asJSON)
+}
+
+// decideCmd answers one accept/reject, or every pending set in scope with
+// --all. cmd names the verb so the two share one body.
+func decideCmd(c *Client, cmd, path string, mine, all, everywhere bool, groupArgs groupFlag, asJSON bool, stdout, stderr io.Writer) int {
+	// --all is checked before the single-id parser: beside --all, any --group
+	// at all (however many, bare or qualified) is the alternatives refusal, and
+	// the "takes one --group" wording must never tell a caller to pass the
+	// --all they already passed.
+	if all {
+		return decideAll(c, cmd, path, mine, groupArgs.any(), everywhere, stdout, stderr, asJSON)
+	}
+	groupID, code := groupArgs.decideID(cmd, stderr)
+	if code != 0 {
+		return code
+	}
+	return simple(c, Request{Op: cmd, Path: path, Group: groupID}, cmd+"ed", stdout, stderr, asJSON)
+}
+
+// decideCmdRun adapts decideCmd to accept and reject, whose only difference is
+// the verb name o.cmd carries.
+func decideCmdRun(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	return decideCmd(c, o.cmd, o.path, o.mine, o.all, o.everywhere, o.groupArgs, o.asJSON, stdout, stderr)
+}
+
+// clearDecisionCmd is clear's counterpart to decideCmd: --all purges every
+// rejected or invalid set in scope, otherwise one --group names the set.
+func clearDecisionCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	if o.all {
+		return decideAll(c, "clear", o.path, o.mine, o.groupArgs.any(), o.everywhere, stdout, stderr, o.asJSON)
+	}
+	groupID, code := o.groupArgs.decideID("clear", stderr)
+	if code != 0 {
+		return code
+	}
+	return clearCmd(c, o.path, groupID, stdout, stderr, o.asJSON)
+}
+
+// whoCmd lists everyone writing in the workspace; --live keeps only the
+// currently connected rows, which is a view over the full attribution record.
+func whoCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	res, err := c.Do(Request{Op: "hello", Identity: identityOf(o.identity), Name: o.name})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if o.live {
+		// Client-side on purpose: the registry's full listing is the
+		// attribution record — a gone participant's text is still in the
+		// document — so the wire answer keeps every row and the flag is a
+		// view, not a change to what the server reports.
+		here := make([]Participant, 0, len(res.Participants))
+		for _, p := range res.Participants {
+			if p.Connected {
+				here = append(here, p)
+			}
+		}
+		res.Participants = here
+	}
+	if o.asJSON {
+		return emit(stdout, res.Participants)
+	}
+	for _, p := range res.Participants {
+		since := "never"
+		if p.SinceMS >= 0 {
+			since = fmt.Sprintf("%ds", p.SinceMS/1000)
+		}
+		declared := ""
+		if p.Declared != "" {
+			declared = " declared=" + p.Declared
+		}
+		on := ""
+		if p.On != "" {
+			on = " on=" + p.On
+		}
+		note := ""
+		if p.Note != "" {
+			note = " note=" + p.Note
+		}
+		task := p.Task
+		if task == "" {
+			task = "-"
+		}
+		fmt.Fprintf(stdout, "%d\t%s\t%s\t%s%s\ttask=%s\tsince=%s%s%s\n",
+			p.ID, p.Kind, p.Name, p.State, declared, task, since, on, note)
+	}
+	return 0
+}
+
+// whoamiCmd prints the author id this connection writes as.
+func whoamiCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	res, err := c.Do(Request{Op: "ping"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if o.asJSON {
+		out := map[string]any{"author": res.Author, "root": res.Root}
+		if m := c.Mapper(); m.Active() {
+			// Reported rather than assumed: if paths are being rewritten,
+			// the one thing a caller needs to be able to check is what to.
+			out["root_map"] = m.String()
+		}
+		return emit(stdout, out)
+	}
+	fmt.Fprintf(stdout, "%d\n", res.Author)
+	return 0
+}
+
+// tokenCmd prints the running server's TCP token.
+func tokenCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	// The secret is the server's, not this connection's, so there is
+	// nothing to resolve and no path involved. Printing it alone on the
+	// line is the point: `TOKEN=$(raj ctl token)` should not have to strip
+	// prose. A Unix-only server has no secret and prints an empty line.
+	res, err := c.Do(Request{Op: "token"})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if o.asJSON {
+		return emit(stdout, map[string]any{"token": res.Token})
+	}
+	fmt.Fprintln(stdout, res.Token)
+	return 0
+}
+
+// searchCmd searches the workspace, unsaved edits included. A bare positional
+// is refused because search takes no path there.
+func searchCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	// A bare positional is never a path here — search takes none — so it
+	// is the pattern typed in the wrong place, and accepting it silently
+	// would run a different search than the one that was meant.
+	if args := o.fs.Args(); len(args) > 0 && args[0] != "" {
+		fmt.Fprintf(stderr, "search: unexpected argument %q — the pattern goes to -q; to limit paths use --include or --path\n", args[0])
+		return 2
+	}
+	if o.context < 0 {
+		fmt.Fprintln(stderr, "raj ctl search: --context cannot be negative")
+		return 2
+	}
+	return doSearch(c, SearchQuery{Include: o.includes.wire(), Exclude: o.excludes.wire(),
+		Path: o.searchPath, Hidden: o.hiddenFlag, Context: o.context,
+		Regex: o.regex, Case: o.matchCase, Word: o.word}, o.query.patterns(), o.jsonl, o.asJSON, stdout, stderr)
+}
+
+// versionCmd prints the version a later apply bases on.
+func versionCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	res, err := c.Do(Request{Op: "version", Path: o.path})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	if o.asJSON {
+		return emit(stdout, map[string]any{
+			"ok": true, "version": res.Version,
+			"bytes": res.Bytes, "lines": res.Lines,
+		})
+	}
+	fmt.Fprintln(stdout, res.Version) // the number is the answer
+	return 0
+}
+
+// lspCmd asks the editor's language server. diagnostics may name several files,
+// so one call sweeps them all rather than a shell loop per file; every other
+// mode addresses one path and position.
+func lspCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	fs := o.fs
+	if fs.Arg(0) == "diagnostics" {
+		if o.all {
+			if len(fs.Args()) > 1 {
+				fmt.Fprintln(stderr, "raj ctl lsp diagnostics: --all sweeps the changed files; it takes no paths")
+				return 2
+			}
+			paths, code := lspChangedPaths(c, stderr)
+			if code != 0 {
+				return code
+			}
+			if len(paths) == 0 {
+				if o.asJSON {
+					return lspDiagnostics(c, paths, stdout, stderr, o.asJSON)
+				}
+				fmt.Fprintln(stdout, "no changed files to sweep")
+				return 0
+			}
+			return lspDiagnostics(c, paths, stdout, stderr, o.asJSON)
+		}
+		paths := fs.Args()[1:]
+		if len(paths) == 0 {
+			paths = []string{""} // the buffer in front, as with one path
+		}
+		if len(paths) == 1 {
+			// One path keeps the single-path shape exactly, JSON included.
+			return doLSP(c, "diagnostics", paths[0], "", o.lines, "", stdout, stderr, o.asJSON)
+		}
+		return lspDiagnostics(c, paths, stdout, stderr, o.asJSON)
+	}
+	return doLSP(c, fs.Arg(0), fs.Arg(1), fs.Arg(2), o.lines, fs.Arg(3), stdout, stderr, o.asJSON)
+}
+
+// renameCmdRun moves a file, or mv's alias of the same verb.
+func renameCmdRun(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	if o.path == "" || o.fs.Arg(1) == "" {
+		fmt.Fprintf(stderr, "raj ctl %s: needs an old and a new path\n", o.cmd)
+		return 2
+	}
+	return renameCmd(c, o.path, o.fs.Arg(1), stdout, stderr, o.asJSON)
+}
+
+// editCmd replaces an exact string; the convenience over apply.
+func editCmd(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
+	oldText, newText, code := editText(o.old, o.newText, o.oldFile, o.newFile, o.text, o.verbatim, stderr)
+	if code != 0 {
+		return code
+	}
+	return edit(c, o.path, oldText, newText, o.all, stdout, stderr, o.asJSON)
 }
 
 // claimCmd sets, extends, clears or reports this identity's claim set: the
@@ -1072,6 +1332,7 @@ var argLimit = map[string]struct {
 	"rmdirs":    {0, "rmdirs takes no operands; it lists every pending dir-removal"},
 	"ls":        {1, "ls takes a directory path and nothing else"},
 	"proposals": {0, "proposals takes no operands; --mine limits the list to this identity's own"},
+	"screen":    {0, "screen takes no operands; --until waits for text"},
 	"rename":    {2, "rename takes <old> and <new> paths"},
 	"mv":        {2, "mv takes <old> and <new> paths"},
 	"close":     {1, "close takes a path and nothing else"},
@@ -1094,46 +1355,6 @@ var argLimit = map[string]struct {
 	"git":      {2, "git takes MODE and an optional path"},
 	"token":    {0, "token takes no operands; it reads the running server's TCP token"},
 	"send":     {1, "send takes one message; quote it, or pass --text-file - to read stdin"}, "state": {2, "state takes `set` and a value, or neither to read your own state"},
-}
-
-// verbOperand is each verb's positional operands, spelled as the top-level
-// usage spells them. It exists for the per-verb usage: the flag package prints
-// only flags, so without it `raj ctl edit -h` never shows that edit can take a
-// path, nor that omitting one targets the buffer on screen. A verb absent from
-// the map takes no positional.
-var verbOperand = map[string]string{
-	"read":     "[path]...",
-	"open":     "<path>",
-	"mkdir":    "<dir>",
-	"rename":   "<old> <new>",
-	"mv":       "<old> <new>",
-	"delete":   "<path>",
-	"rmdir":    "<dir>",
-	"ls":       "[path]",
-	"claim":    "[path]...",
-	"goto":     "[path] LINE[:COL]",
-	"reveal":   "<path>",
-	"close":    "[path]",
-	"groups":   "[path]",
-	"intent":   "SUBCOMMAND [NAME] [GROUPS...]",
-	"accept":   "[path]",
-	"reject":   "[path]",
-	"clear":    "[path]",
-	"revert":   "[path]",
-	"diff":     "[path]",
-	"review":   "[path]",
-	"version":  "[path]",
-	"dump":     "[path]",
-	"patch":    "[path]",
-	"apply":    "[path] [TEXT]",
-	"edit":     "[path] [OLD NEW]",
-	"send":     "[TEXT]",
-	"save":     "[path]",
-	"land":     "<task>",
-	"reload":   "[path]",
-	"lsp":      "MODE [path] LINE:COL [query]",
-	"git":      "MODE [path]",
-	"register": "[--as KEY] [--task ID]", "state": "[set STATE]",
 }
 
 // refuseExtraArgs rejects a positional operand the verb does not take, so a
@@ -1573,9 +1794,9 @@ type bulkTarget struct {
 // the per-set decision, the failure record and the final report are the same
 // code the active-buffer form uses, so a refusal in one buffer cannot take
 // another with it.
-func decideAll(c *Client, op, path string, mine bool, group uint64, everywhere bool,
+func decideAll(c *Client, op, path string, mine bool, hasGroup, everywhere bool,
 	stdout, stderr io.Writer, asJSON bool) int {
-	if group != 0 {
+	if hasGroup {
 		fmt.Fprintf(stderr, "raj ctl %s: --all and --group are alternatives\n", op)
 		return 2
 	}
@@ -2996,14 +3217,15 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 // intentCmd runs one `raj ctl intent` subcommand. The request and its answer
 // are a JSON payload on the intent op, which the host resolves against the live
 // buffers and the workspace store.
-func intentCmd(c *Client, args []string, ref string, dryRun bool, task string, asJSON bool, stdout, stderr io.Writer) int {
+func intentCmd(c *Client, args []string, groupArgs groupFlag, ref string, dryRun bool, task string, approve, withdraw, asJSON bool, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "raj ctl intent: needs a subcommand: new, add, remove, list, show, export, materialise")
+		fmt.Fprintln(stderr, "raj ctl intent: needs a subcommand: new, add, remove, list, show, export, materialise, diff, review, publish, prove")
 		return 2
 	}
 	cmd := intent.Command{
 		Mode: args[0],
 		Base: ref, Task: task, DryRun: dryRun,
+		Approve: approve, Withdraw: withdraw,
 	}
 	rest := args[1:]
 	if cmd.Mode != "list" {
@@ -3014,22 +3236,35 @@ func intentCmd(c *Client, args []string, ref string, dryRun bool, task string, a
 		cmd.Name, rest = rest[0], rest[1:]
 	}
 	if cmd.Mode == "new" || cmd.Mode == "add" || cmd.Mode == "remove" {
+		// One parser serves the flag and the positionals: a bare N is a
+		// session-local id the host qualifies against the live buffers, and
+		// PATH=N is a qualified member with no ambiguity left to resolve.
+		// --group is repeatable, and positionals may interleave with it.
+		for _, m := range groupArgs.entries {
+			addMember(&cmd, m)
+		}
 		for _, s := range rest {
-			id, err := strconv.ParseUint(s, 10, 64)
+			m, err := parseMemberArg(s)
 			if err != nil {
-				fmt.Fprintf(stderr, "raj ctl intent %s: group %q is not a number\n", cmd.Mode, s)
+				fmt.Fprintf(stderr, "raj ctl intent %s: %v\n", cmd.Mode, err)
 				return 2
 			}
-			cmd.Groups = append(cmd.Groups, id)
+			addMember(&cmd, m)
 		}
-		if len(cmd.Groups) == 0 && (cmd.Mode == "add" || cmd.Mode == "remove") {
+		if len(cmd.Groups) == 0 && len(cmd.Members) == 0 && (cmd.Mode == "add" || cmd.Mode == "remove") {
 			fmt.Fprintf(stderr, "raj ctl intent %s: needs at least one group id\n", cmd.Mode)
 			return 2
 		}
 	}
 	if cmd.Mode == "publish" {
-		fmt.Fprintln(stderr, "raj ctl intent publish is H5; this wave implements new|add|remove|list|show|export|materialise")
-		return 2
+		if approve && withdraw {
+			fmt.Fprintln(stderr, "raj ctl intent publish: --approve and --withdraw are opposite answers")
+			return 2
+		}
+		if len(rest) > 0 {
+			fmt.Fprintf(stderr, "raj ctl intent publish: unexpected argument %q\n", rest[0])
+			return 2
+		}
 	}
 	payload, err := json.Marshal(cmd)
 	if err != nil {
@@ -3073,6 +3308,75 @@ func printIntent(out intent.Result, mode string, stdout io.Writer) int {
 	case "export":
 		fmt.Fprintf(stdout, "commit %s\nparent %s\nbase %s\ntree %s\n",
 			out.Commit, out.Parent, out.BaseSHA, out.Tree)
+	case "publish":
+		if out.Publish == nil {
+			return 0
+		}
+		p := out.Publish
+		if p.Decided == "" {
+			fmt.Fprintf(stdout, "proposed publish %s: %s -> %s on %s (%s)\n",
+				p.Name, p.Commit, p.Branch, p.Remote, p.RemoteURL)
+			fmt.Fprintf(stdout, "base %s; hook %s sha256 %s\n", p.BaseSHA, p.HookPath, p.HookHash)
+			fmt.Fprintf(stdout, "argv: %s\n", strings.Join(p.Argv, " "))
+			if p.DryRun != "" {
+				fmt.Fprintf(stdout, "dry run:\n%s\n", p.DryRun)
+			}
+			return 0
+		}
+		if p.URL != "" {
+			fmt.Fprintln(stdout, p.URL)
+		}
+		if p.Pushed != "" {
+			fmt.Fprintf(stdout, "pushed %s\n", p.Pushed)
+		}
+		fmt.Fprintf(stdout, "%s: exit %d %s\n", p.Decided, p.ExitCode, p.RemoteRef)
+		if p.Stderr != "" {
+			fmt.Fprintln(stdout, p.Stderr)
+		}
+		if p.Decided != "published" {
+			return 1
+		}
+		return 0
+	case "diff":
+		if out.Diff == nil {
+			return 0
+		}
+		d := out.Diff
+		for _, e := range d.Stat.Entries {
+			if e.Binary {
+				fmt.Fprintf(stdout, "-\t-\t%s\n", e.Path)
+				continue
+			}
+			fmt.Fprintf(stdout, "%d\t%d\t%s\n", e.Additions, e.Deletions, e.Path)
+		}
+		fmt.Fprintf(stdout, "%d file(s), %d insertion(s), %d deletion(s)\n",
+			d.Stat.Files, d.Stat.Additions, d.Stat.Deletions)
+		if d.Diff == "" {
+			fmt.Fprintf(stdout, "no diff: %s matches its base %s\n", d.Name, d.Base)
+			return 0
+		}
+		fmt.Fprint(stdout, d.Diff)
+		if !strings.HasSuffix(d.Diff, "\n") {
+			fmt.Fprintln(stdout)
+		}
+		if d.Truncated {
+			fmt.Fprintf(stdout, "diff truncated: %d more byte(s) omitted\n", d.OmittedBytes)
+		}
+	case "review":
+		if out.Review == nil {
+			return 0
+		}
+		fmt.Fprintf(stdout, "opened %d tab(s) for seam %s\n", len(out.Review.Files), out.Review.Name)
+		for _, p := range out.Review.Files {
+			fmt.Fprintln(stdout, p)
+		}
+	case "prove":
+		for _, pr := range out.Proofs {
+			fmt.Fprintf(stdout, "%s\t%s\n", pr.Check, pr.Name)
+			if pr.Error != "" {
+				fmt.Fprintln(stdout, pr.Error)
+			}
+		}
 	default:
 		if out.Intention == nil {
 			return 0
@@ -3083,7 +3387,6 @@ func printIntent(out intent.Result, mode string, stdout io.Writer) int {
 	}
 	return 0
 }
-
 func list(stdout, stderr io.Writer, asJSON bool) int {
 	found := Discover()
 	if asJSON {
@@ -3138,8 +3441,16 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 		if name == "" {
 			name = "(unnamed buffer, not addressable)"
 		}
+		// A deleted file is not "saved" in any useful sense: the bytes on
+		// screen are the only copy left, and the reader has to be told before
+		// they act on a path they believe is on disk.
 		state := "saved"
-		if b.Dirty {
+		switch {
+		case b.Deleted && b.Dirty:
+			state = "unsaved-changes, deleted-on-disk"
+		case b.Deleted:
+			state = "deleted-on-disk"
+		case b.Dirty:
 			state = "unsaved-changes"
 		}
 		mark := ""
@@ -3153,6 +3464,89 @@ func buffers(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 
 	}
 	return 0
+}
+
+// screen's --until polls client-side: the ordering fix of W1 — a control reply
+// is flushed only after the frame that shows its effect — is what makes a
+// screen read honest, so waiting for a change is a loop of ordinary reads
+// rather than a server-side subscription. The interval is short enough that a
+// frame following a verb is seen within a blink and long enough that a poll
+// does not spin the socket.
+const (
+	screenPollInterval = 20 * time.Millisecond
+	screenDefaultWait  = 3 * time.Second
+)
+
+// screen prints the drawn screen: one line per row, top to bottom. --until
+// re-reads until the text appears in a row and exits 0. Trailing blank rows
+// are trimmed: the bottom of a terminal is almost always blank, a blank row
+// draws nothing, and the cursor's line/col preserves position, so a
+// content-free screen prints nothing rather than a wall of empty lines.
+func screen(c *Client, until string, timeout time.Duration, stdout, stderr io.Writer, asJSON bool) int {
+	if timeout <= 0 {
+		timeout = screenDefaultWait
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		res, err := c.Do(Request{Op: "screen"})
+		if code := fail(stderr, res, err); code != 0 {
+			return code
+		}
+		rows := screenRows(res)
+		if until == "" || screenHasText(rows, until) {
+			if asJSON {
+				return emit(stdout, screenEnvelope(rows, res))
+			}
+			for _, r := range rows {
+				fmt.Fprintln(stdout, r)
+			}
+			return 0
+		}
+		if !time.Now().Before(deadline) {
+			fmt.Fprintf(stderr, "raj ctl screen: %q did not appear on the screen within %s\n", until, timeout)
+			return 1
+		}
+		time.Sleep(screenPollInterval)
+	}
+}
+
+// screenRows splits the one body run the server sends into rows and drops the
+// trailing blanks. The server always sends one span for a non-empty screen,
+// which is where the row count comes from.
+func screenRows(res Response) []string {
+	if len(res.Spans) == 0 {
+		return nil
+	}
+	rows := strings.Split(res.Spans[0].Text, "\n")
+	n := len(rows)
+	for n > 0 && rows[n-1] == "" {
+		n--
+	}
+	return rows[:n]
+}
+
+// screenHasText reports whether any drawn row contains text.
+func screenHasText(rows []string, text string) bool {
+	for _, r := range rows {
+		if strings.Contains(r, text) {
+			return true
+		}
+	}
+	return false
+}
+
+// screenEnvelope is screen's -json shape: the rows and the caret, a map like
+// the other read envelopes. An empty screen is [] rather than null so a script
+// can range over it without a nil check.
+func screenEnvelope(rows []string, res Response) map[string]any {
+	if rows == nil {
+		rows = []string{}
+	}
+	return map[string]any{
+		"rows": rows,
+		"line": res.Line,
+		"col":  res.Col,
+	}
 }
 
 // status answers one question for a gate: is this workspace ready to be built?
@@ -3384,6 +3778,89 @@ func parseAtSpan(s string) (start, end int, ok bool) {
 	return start, end, true
 }
 
+// memberArg is one parsed --group value: a group id, optionally qualified by
+// the workspace-relative path of the buffer that numbers it.
+type memberArg struct {
+	id   uint64
+	path string // empty when the id is bare
+}
+
+// groupFlag accumulates --group entries in the order given. One parser serves
+// the flag and intent's positional members: an entry is N, a bare session-local
+// id, or PATH=N, a qualified member, splitting on the last equals sign exactly
+// as --at does, so a path that contains one stays addressable. A bare id goes to
+// the host to qualify against the live buffers; a qualified path already names
+// the buffer, which is the spelling that tells two buffers both numbering the
+// id apart.
+type groupFlag struct {
+	entries []memberArg
+}
+
+func (g *groupFlag) String() string { return "" }
+
+func (g *groupFlag) Set(v string) error {
+	m, err := parseMemberArg(v)
+	if err != nil {
+		return err
+	}
+	g.entries = append(g.entries, m)
+	return nil
+}
+
+// decideID returns the one bare id accept/reject/clear take. A qualified
+// --group is refused because its path is the positional operand, and a repeated
+// --group is refused because naming several sets is what --all already does.
+func (g *groupFlag) decideID(op string, stderr io.Writer) (uint64, int) {
+	for _, m := range g.entries {
+		if m.path != "" {
+			fmt.Fprintf(stderr, "raj ctl %s: the path goes positional; --group takes the id\n", op)
+			return 0, 2
+		}
+	}
+	if len(g.entries) > 1 {
+		fmt.Fprintf(stderr, "raj ctl %s: takes one --group; --all decides every pending set\n", op)
+		return 0, 2
+	}
+	if len(g.entries) == 1 {
+		return g.entries[0].id, 0
+	}
+	return 0, 0
+}
+
+// any reports whether a --group was given at all, bare or qualified. decideAll
+// refuses beside --all on presence alone: the count and the qualification do
+// not matter there, only that a set was named the bulk form would ignore.
+func (g *groupFlag) any() bool { return len(g.entries) > 0 }
+
+// parseMemberArg parses one N or PATH=N member value. The split is on the last
+// equals sign, exactly as --at does, so a path that contains one stays
+// addressable.
+func parseMemberArg(v string) (memberArg, error) {
+	if i := strings.LastIndexByte(v, '='); i >= 0 {
+		path, digits := v[:i], v[i+1:]
+		id, err := strconv.ParseUint(digits, 10, 64)
+		if path == "" || err != nil {
+			return memberArg{}, fmt.Errorf("group %q: want N or PATH=N", v)
+		}
+		return memberArg{id: id, path: path}, nil
+	}
+	id, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return memberArg{}, fmt.Errorf("group %q is not a number", v)
+	}
+	return memberArg{id: id}, nil
+}
+
+// addMember records one parsed member on cmd: a qualified member on Members, a
+// bare id on Groups for the host to qualify against the live buffers.
+func addMember(cmd *intent.Command, m memberArg) {
+	if m.path != "" {
+		cmd.Members = append(cmd.Members, intent.Member{ID: m.id, Path: m.path})
+		return
+	}
+	cmd.Groups = append(cmd.Groups, m.id)
+}
+
 // readTarget is one path to read and the span to read from it. A nil
 // lineStart means no line span (a whole-file read or a byte span); lineEnd
 // nil reads from lineStart to the end of the file.
@@ -3501,11 +3978,15 @@ func readTargets(paths []string, at *atSpanFlag, lsp, lep, sp, ep *int) []readTa
 	}
 	// One target per --at entry, in the order given, so two spans for one path
 	// both survive instead of collapsing to the last. A path named positionally
-	// was already read once, at its first entry.
+	// was already read once, at its first entry, so skip exactly that entry and
+	// keep its later spans.
+	first := make(map[string]bool, len(at.entries))
 	for _, a := range at.entries {
-		if named[a.path] {
+		if named[a.path] && !first[a.path] {
+			first[a.path] = true
 			continue
 		}
+		first[a.path] = true
 		lo, hi := a.start, a.end
 		out = append(out, readTarget{path: a.path, lineStart: &lo, lineEnd: &hi})
 	}
@@ -3557,6 +4038,12 @@ func readOne(c *Client, path string, t readTarget, annotated bool, stdout, stder
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
+	// The file is gone from disk. The text is still returned below -- the
+	// buffer is the only copy left -- but a caller reading a path it believes
+	// is on disk must be told it is not, before it acts on the text.
+	if meta, ok := deletedTarget(res.Buffers, path); ok {
+		fmt.Fprintf(stderr, "%s was deleted on disk; showing the buffer's text\n", meta)
+	}
 	if asJSON {
 		// Spans are annotated rather than raw: the useful question is "is this
 		// mine", and making every caller re-derive it from two integers is how
@@ -3581,6 +4068,11 @@ func readOne(c *Client, path string, t readTarget, annotated bool, stdout, stder
 		// stays exactly what the editor computed.
 		if res.StatesJSON != "" {
 			out["states"] = json.RawMessage(res.StatesJSON)
+		}
+		// The file is gone from disk; the text below is the buffer's copy.
+		// Sparse, so a reader that does not know the key sees no change.
+		if _, ok := deletedTarget(res.Buffers, path); ok {
+			out["deleted"] = true
 		}
 		addLineSpan(out, t)
 		return emit(stdout, out)
@@ -3677,6 +4169,13 @@ func readMany(c *Client, targets []readTarget, stdout, stderr io.Writer, asJSON 
 			off = end
 		}
 	}
+	// A target whose file is gone is named on stderr first; stdout stays the
+	// text, so a pipeline still gets the bytes it asked for.
+	for i := range targets {
+		if got[i] && metas[i].Deleted {
+			fmt.Fprintf(stderr, "%s was deleted on disk; showing the buffer's text\n", metas[i].Path)
+		}
+	}
 	files := make([]map[string]any, 0, len(targets))
 	for i, t := range targets {
 		if !got[i] {
@@ -3686,6 +4185,9 @@ func readMany(c *Client, targets []readTarget, stdout, stderr io.Writer, asJSON 
 		f := map[string]any{
 			"path": m.Path, "text": texts[i], "version": m.Version,
 			"bytes": m.Bytes, "lines": m.Lines,
+		}
+		if m.Deleted {
+			f["deleted"] = true
 		}
 		addLineSpan(f, t)
 		files = append(files, f)
@@ -3701,6 +4203,22 @@ func readMany(c *Client, targets []readTarget, stdout, stderr io.Writer, asJSON 
 		io.WriteString(stdout, f["text"].(string))
 	}
 	return 0
+}
+
+// deletedTarget reports the path of a read target whose file is gone from
+// disk. want is the path the caller named, or "" for the active buffer; the
+// reply carries the resolved path, so an empty want matches whatever the
+// daemon resolved it to.
+func deletedTarget(metas []Buffer, want string) (string, bool) {
+	for _, b := range metas {
+		if !b.Deleted {
+			continue
+		}
+		if want == "" || b.Path == want {
+			return b.Path, true
+		}
+	}
+	return "", false
 }
 
 // runProgram sends a program and prints one line per verb it ran.

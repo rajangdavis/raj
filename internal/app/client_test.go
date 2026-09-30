@@ -555,6 +555,40 @@ func TestClientLocalEditForwardsOneApply(t *testing.T) {
 	waitClientIdle(t, ch.cli.App, path)
 }
 
+// A re-sync that repeats the document the pane already shows must not rebuild
+// the highlighter: a fresh one is cold, so the file repaints plain until its
+// tokenise lands, and the watch fetches every buffer whenever any one of them
+// moves the generation. The file is still swapped, so a refresh still installs
+// it; only the warm spans are carried across.
+func TestARepeatedSnapshotKeepsTheWarmSyntax(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+	p := ch.cli.Tabs.Active()
+	if p == nil {
+		t.Fatal("client attached with no tab")
+	}
+	p.File.RefreshSyntax()
+	for i := 0; i < 200 && !p.File.Syntax.Ready(); i++ {
+		time.Sleep(time.Millisecond)
+	}
+	if !p.File.Syntax.Ready() {
+		t.Skip("the syntax pass did not finish")
+	}
+	warm := p.File.Syntax
+	path := p.File.Path
+
+	f := editor.NewFile(path, p.File.Text(), 4)
+	if got := ch.cli.installClientFile(clientFile{path: path, file: f}); got == nil {
+		t.Fatal("a repeated snapshot dropped the pane")
+	}
+	if p.File != f {
+		t.Error("a repeated snapshot did not install")
+	}
+	if p.File.Syntax != warm {
+		t.Error("a repeated snapshot rebuilt the syntax highlighter")
+	}
+}
+
 // A watch snapshot must not replace a pane whose local edit has not been
 // acknowledged; once the edit is forwarded and the pane is clean the same
 // snapshot installs.

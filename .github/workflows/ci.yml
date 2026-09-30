@@ -9,8 +9,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           # Newer than the go directive in go.mod on purpose: the README asks
           # for 1.24 or newer on macOS, because older toolchains omit LC_UUID
@@ -21,10 +21,14 @@ jobs:
           cache: true
 
       # Each step is its own line in the log, so a red build says which of the
-      # five gates failed without anyone opening the output. They are the same
+      # eight gates failed without anyone opening the output. They are the same
       # commands `make check` runs locally — see the Makefile, which is the one
-      # place they are written down.
+      # place they are written down. The runner image ships shellcheck, so the
+      # lint gate runs here rather than skipping.
       - run: make fmt-check
+      - run: make sh-parse
+      - run: make shellcheck
+      - run: make ignored-source
       - run: make vet
       - run: make build
       - run: make test

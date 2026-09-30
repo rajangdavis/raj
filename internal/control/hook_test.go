@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1481,5 +1482,214 @@ func TestHookRunDetachedTimeout(t *testing.T) {
 			t.Fatal("the timed-out run stayed registered")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestDispatchHookRunResolvesParams pins the event-thread half of declared
+// parameters: a valid value resolves to the RAJ_PARAM_ entry the connection
+// will deliver, an out-of-domain value is refused before the Gate, and the
+// refusal consumes no run so the next valid run is admitted.
+func TestDispatchHookRunResolvesParams(t *testing.T) {
+	row := testHookRow("check")
+	row.Agent = true
+	row.Params = `["PHASE=enum(check,race)=check"]`
+	g, _ := hookRunFixture(t, row, hooks.Options{Floor: time.Nanosecond, PerRevision: 5})
+
+	res := Dispatch(g, Request{Op: "hook", HookMode: "run", HookName: "check", Author: FirstAgent,
+		HookParams: []string{"PHASE=race"}})
+	if !res.OK {
+		t.Fatalf("valid param run = %+v, want admitted", res)
+	}
+	want := []hooks.ParamValue{{Name: "PHASE", Value: "race", Env: "RAJ_PARAM_PHASE"}}
+	if !reflect.DeepEqual(res.HookParamValues, want) {
+		t.Fatalf("HookParamValues = %+v; want %+v", res.HookParamValues, want)
+	}
+	g.HookGate.End("check")
+
+	bad := Dispatch(g, Request{Op: "hook", HookMode: "run", HookName: "check", Author: FirstAgent,
+		HookParams: []string{"PHASE=deploy"}})
+	if bad.OK || !strings.Contains(bad.Err, "enum(check,race)") {
+		t.Fatalf("bad enum = %+v, want the enum refusal", bad)
+	}
+	next := Dispatch(g, Request{Op: "hook", HookMode: "run", HookName: "check", Author: FirstAgent,
+		HookParams: []string{"PHASE=check"}})
+	if !next.OK {
+		t.Fatalf("run after a param refusal = %+v, want admitted", next)
+	}
+}
+
+// TestDispatchHookRunParamRefusals pins that each invalid parameter set is
+// refused at the prep, names what is wrong, and never hands the connection an
+// action to run.
+func TestDispatchHookRunParamRefusals(t *testing.T) {
+	row := testHookRow("check")
+	row.Agent = true
+	row.Params = `["PHASE=enum(check,race)=check","TAG=string(^v[0-9]+$)","N=uint"]`
+	tests := []struct {
+		name   string
+		params []string
+		want   string
+	}{
+		{"undeclared", []string{"TAG=v1", "N=1", "WHAT=x"}, "no parameter"},
+		{"enum outside", []string{"PHASE=deploy", "TAG=v1", "N=1"}, "enum(check,race)"},
+		{"regex mismatch", []string{"TAG=nope", "N=1"}, "string(^v[0-9]+$)"},
+		{"uint not a number", []string{"TAG=v1", "N=-1"}, "uint"},
+		{"missing required", []string{"PHASE=check"}, "requires parameter"},
+		{"duplicate", []string{"PHASE=check", "PHASE=race", "TAG=v1", "N=1"}, "more than once"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, _ := hookRunFixture(t, row, hooks.Options{})
+			res := Dispatch(g, Request{Op: "hook", HookMode: "run", HookName: "check", Author: FirstAgent,
+				HookParams: tt.params})
+			if res.OK {
+				t.Fatalf("run(%q) = %+v, want a refusal", tt.params, res)
+			}
+			if !strings.Contains(res.Err, tt.want) {
+				t.Fatalf("run(%q) error = %q; want it to contain %q", tt.params, res.Err, tt.want)
+			}
+			if len(res.HookArgv) != 0 || res.HookParamValues != nil {
+				t.Fatalf("a refused run prepared an action: %+v", res)
+			}
+		})
+	}
+}
+
+// hookRunWithParams drives one hook over a real socket against a fresh fake
+// editor with a projection over a real repository, so a projected hook can
+// materialise and run. It returns the final response and the two streams.
+func hookRunWithParams(t *testing.T, row HookRow, params []string) (Response, string, string) {
+	t.Helper()
+	repo := controlGitRepo(t)
+	a := filepath.Join(repo, "a.go")
+	ed := newFakeEditor(t, nil)
+	gate := newHookGate(hooks.NewGate(hooks.Options{Floor: time.Nanosecond, PerRevision: 5}))
+	row.Agent = true
+	ed.mu.Lock()
+	ed.policyMem.root = repo
+	ed.policyMem.projection = map[string][]byte{a: []byte("package projected\n")}
+	ed.policyMem.hooks = []HookRow{row}
+	ed.policy.HookGate = gate
+	ed.srv.HookGate = gate
+	ed.mu.Unlock()
+
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	var out, errOut strings.Builder
+	res, err := c.DoExec(Request{Op: "hook", HookMode: "run", HookName: row.Name, HookParams: params},
+		func(stream uint8, b string) {
+			if stream == StreamStderr {
+				errOut.WriteString(b)
+			} else {
+				out.WriteString(b)
+			}
+		})
+	if err != nil {
+		t.Fatalf("hook run: %v", err)
+	}
+	return res, out.String(), errOut.String()
+}
+
+// TestHookRunDeliversParamEnv proves the value reaches the action as an
+// environment variable and never as argv: a shell action prints the variable,
+// an argv action prints its whole environment, the name is normalised, a
+// declared default fills an omitted value, and a hook with no parameters
+// carries no RAJ_PARAM_ entry at all.
+func TestHookRunDeliversParamEnv(t *testing.T) {
+	t.Run("shell action reads the variable", func(t *testing.T) {
+		row := HookRow{Name: "gate", Action: `{"shell":"printf '%s' \"$RAJ_PARAM_PHASE\""}`, Trigger: "agent",
+			Enabled: true, Params: `["PHASE=enum(check,race)"]`}
+		res, out, _ := hookRunWithParams(t, row, []string{"PHASE=race"})
+		if res.Err != "" || !res.OK {
+			t.Fatalf("run = %+v, want it to run", res)
+		}
+		if got := strings.TrimSpace(out); got != "race" {
+			t.Fatalf("shell saw %q, want race", got)
+		}
+	})
+	t.Run("argv action reads its environment", func(t *testing.T) {
+		row := HookRow{Name: "gate", Action: `["env"]`, Trigger: "agent",
+			Enabled: true, Params: `["PHASE=enum(check,race)"]`}
+		res, out, _ := hookRunWithParams(t, row, []string{"PHASE=race"})
+		if res.Err != "" || !res.OK {
+			t.Fatalf("run = %+v, want it to run", res)
+		}
+		if !strings.Contains(out, "RAJ_PARAM_PHASE=race") {
+			t.Fatalf("argv environment = %q, want RAJ_PARAM_PHASE=race", out)
+		}
+	})
+	t.Run("name is normalised", func(t *testing.T) {
+		row := HookRow{Name: "gate", Action: `["env"]`, Trigger: "agent",
+			Enabled: true, Params: `["phase-name=enum(race)"]`}
+		res, out, _ := hookRunWithParams(t, row, []string{"phase-name=race"})
+		if res.Err != "" || !res.OK {
+			t.Fatalf("run = %+v, want it to run", res)
+		}
+		if !strings.Contains(out, "RAJ_PARAM_PHASE_NAME=race") {
+			t.Fatalf("argv environment = %q, want RAJ_PARAM_PHASE_NAME=race", out)
+		}
+	})
+	t.Run("default fills an omitted value", func(t *testing.T) {
+		row := HookRow{Name: "gate", Action: `["env"]`, Trigger: "agent",
+			Enabled: true, Params: `["PHASE=enum(check,race)=check"]`}
+		res, out, _ := hookRunWithParams(t, row, nil)
+		if res.Err != "" || !res.OK {
+			t.Fatalf("run = %+v, want it to run", res)
+		}
+		if !strings.Contains(out, "RAJ_PARAM_PHASE=check") {
+			t.Fatalf("argv environment = %q, want the declared default RAJ_PARAM_PHASE=check", out)
+		}
+	})
+	t.Run("explicit value overrides the default", func(t *testing.T) {
+		row := HookRow{Name: "gate", Action: `["env"]`, Trigger: "agent",
+			Enabled: true, Params: `["PHASE=enum(check,race)=check"]`}
+		res, out, _ := hookRunWithParams(t, row, []string{"PHASE=race"})
+		if res.Err != "" || !res.OK {
+			t.Fatalf("run = %+v, want it to run", res)
+		}
+		if !strings.Contains(out, "RAJ_PARAM_PHASE=race") {
+			t.Fatalf("argv environment = %q, want the explicit RAJ_PARAM_PHASE=race", out)
+		}
+	})
+	t.Run("no params injects nothing", func(t *testing.T) {
+		row := HookRow{Name: "gate", Action: `["env"]`, Trigger: "agent", Enabled: true}
+		res, out, _ := hookRunWithParams(t, row, nil)
+		if res.Err != "" || !res.OK {
+			t.Fatalf("run = %+v, want it to run", res)
+		}
+		if strings.Contains(out, "RAJ_PARAM_") {
+			t.Fatalf("environment = %q, want no injected RAJ_PARAM_ entry", out)
+		}
+	})
+	t.Run("composite shell step reads the variable", func(t *testing.T) {
+		row := HookRow{Name: "gate",
+			Action:  `{"steps":[{"name":"out","shell":"printf '%s' \"$RAJ_PARAM_PHASE\""}]}`,
+			Trigger: "agent", Enabled: true, Params: `["PHASE=enum(check,race)"]`}
+		res, out, _ := hookRunWithParams(t, row, []string{"PHASE=race"})
+		if res.Err != "" || !res.OK {
+			t.Fatalf("composite run = %+v, want it to run", res)
+		}
+		if got := strings.TrimSpace(out); got != "race" {
+			t.Fatalf("composite shell step saw %q, want race", got)
+		}
+	})
+}
+
+// TestHookRunParamRefusalDoesNotRun proves the safety property end to end: a
+// value outside the declared domain refuses the run and the action never
+// starts, so the marker file it would touch stays absent.
+func TestHookRunParamRefusalDoesNotRun(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran.txt")
+	row := HookRow{Name: "gate", Action: `{"shell":"touch '` + marker + `'"}`, Trigger: "agent",
+		Enabled: true, Params: `["PHASE=enum(check,race)"]`}
+	res, _, _ := hookRunWithParams(t, row, []string{"PHASE=deploy"})
+	if res.Err == "" || !strings.Contains(res.Err, "enum(check,race)") {
+		t.Fatalf("refusal = %+v, want the enum refusal", res)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("the action ran despite the refusal (stat err %v)", err)
 	}
 }

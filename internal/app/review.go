@@ -1,10 +1,16 @@
 package app
 
 import (
+	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strings"
 
+	"raj/internal/control"
 	"raj/internal/editor"
+	"raj/internal/intent"
+	"raj/internal/keys"
 	"raj/internal/picker"
 	"raj/internal/piecetable"
 	"raj/internal/prompt"
@@ -21,8 +27,13 @@ import (
 
 // reviewProposed accepts or rejects the proposed change set at the caret, or
 // every one visible when the caret is not on any of them. The bulk form is
-// the screen rather than the file: what you see is what you decided.
+// the screen rather than the file: what you see is what you decided. While the
+// waiting list is open the chord decides the selected row instead, so accept
+// and reject mean the row under the highlight.
 func (a *App) reviewProposed(accept bool) {
+	if a.decideSelectedProposal(accept) {
+		return
+	}
 	p := a.Tabs.Active()
 	if p == nil {
 		return
@@ -452,41 +463,318 @@ func cycleTarget(groups []editor.PendingMark, caretLine int, onGroup uint64, on,
 	return n - 1
 }
 
-// reviewPicker lists the pending change sets in the quick-open overlay, so a
-// review pass can jump from one to the next and decide each where it sits.
-// It is a third picker mode beside files and symbols: same overlay, different
-// rows, and choosing a row lands the caret on the change.
-func (a *App) reviewPicker() {
-	p := a.Tabs.Active()
-	if p == nil {
-		return
-	}
-	var rows []picker.Proposal
-	seen := map[uint64]bool{}
-	for _, m := range p.PendingMarks() {
-		if seen[m.Group] {
-			continue
-		}
-		// A fold-hidden mark has no row to land on, so the set is listed at the
-		// first mark that is drawn. The Line stays a session line: it is the
-		// document address the picker jumps through.
-		if m.DispLine(p) < 0 {
-			continue
-		}
-		seen[m.Group] = true
-		rows = append(rows, picker.Proposal{
-			Label: fmt.Sprintf("group %d · %s · %+d bytes · %d op(s)",
-				m.Group, a.participantName(m.Author), m.Bytes, m.Ops),
-			Line: m.Line + 1, // the picker counts from 1
-		})
-	}
+// openProposals opens the waiting list: one row for every pending proposal in
+// the workspace -- a change set, a deletion, a folder removal, a publish -- so
+// ctrl+alt+v answers "what is an agent waiting on me for" in one place. The
+// rows read App.Proposals, the same rollup `raj ctl proposals` prints, so the
+// keyboard and the wire cannot disagree about what is waiting. The app keeps
+// the rows it built so a decision chord can name the selected one back.
+func (a *App) openProposals() {
+	rows := a.Proposals()
 	if len(rows) == 0 {
-		a.status = "no proposed changes here"
+		a.pendingList = nil
+		a.status = "nothing waiting for you"
 		return
 	}
-	a.Picker.ShowProposals(p.File.Path, rows)
+	a.pendingList = rows
+	list := make([]picker.Proposal, 0, len(rows))
+	for i, pr := range rows {
+		label, line := a.proposalRow(pr)
+		list = append(list, picker.Proposal{Label: label, Path: pr.Path, Line: line, Index: i})
+	}
+	a.Picker.ShowProposals(list)
 	a.focus = FocusPicker
 	a.status = ""
+}
+
+// proposalRow labels one waiting proposal and reports the 1-based line a text
+// change sits on, so choosing the row can jump there. A proposal that is not
+// text in a buffer -- a deletion, a folder removal, a publish -- has no line.
+func (a *App) proposalRow(pr control.Proposal) (label string, line int) {
+	who := a.participantName(piecetable.Author(pr.Author))
+	name := a.proposalName(pr.Path)
+	switch pr.Kind {
+	case "set", "invalid":
+		verb := "change set"
+		if pr.Kind == "invalid" {
+			verb = "superseded set"
+		}
+		label = fmt.Sprintf("%s · %s %d · %s · %s", who, verb, pr.Group, name, humanBytes(pr.Size))
+		if p := a.proposalSetPane(pr.Path); p != nil {
+			line = firstMarkLine(p, pr.Group)
+		}
+	case "delete":
+		label = fmt.Sprintf("%s · delete · %s · %s", who, name, humanBytes(pr.Size))
+	case "rmdir":
+		label = fmt.Sprintf("%s · remove folder · %s · %s", who, name, fileCount(pr.Size))
+	case "publish":
+		label = fmt.Sprintf("%s · publish · %s", who, name)
+	default:
+		label = fmt.Sprintf("%s · %s · %s", who, pr.Kind, name)
+	}
+	return label, line
+}
+
+// proposalName is the workspace-relative spelling of a proposal path when it
+// lies under the primary root, and the path itself otherwise -- a publish names
+// a wave, not a file, and stays as it is.
+func (a *App) proposalName(path string) string {
+	root := a.primaryRoot()
+	if path == "" || root == "" {
+		return path
+	}
+	if rel, err := filepath.Rel(root, path); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	return path
+}
+
+// proposalSetPane is the pane holding a change set: an open tab or a headless
+// buffer. Proposals includes both, so a decision must reach both.
+func (a *App) proposalSetPane(path string) *editor.Pane {
+	if p := a.paneFor(path); p != nil {
+		return p
+	}
+	for _, p := range a.headless {
+		if p.File.Path == path {
+			return p
+		}
+	}
+	return nil
+}
+
+// firstMarkLine is the 1-based line of the first drawn pending mark for a
+// change set, or 0 when a fold hides every mark or the pane has none. It is the
+// address the list enter jumps through.
+func firstMarkLine(p *editor.Pane, group uint64) int {
+	for _, m := range p.PendingMarks() {
+		if m.Group == group && m.DispLine(p) >= 0 {
+			return m.Line + 1
+		}
+	}
+	return 0
+}
+
+// humanBytes formats a proposal byte size for the list. A negative value is a
+// net removal, so the magnitude is what the row carries; the kind and the set
+// already say which direction it went.
+func humanBytes(n int) string {
+	if n < 0 {
+		n = -n
+	}
+	switch {
+	case n == 0:
+		return "0 bytes"
+	case n < 1024:
+		return fmt.Sprintf("%d bytes", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	}
+}
+
+// fileCount names how many files a folder removal would take.
+func fileCount(n int) string {
+	if n == 1 {
+		return "1 file"
+	}
+	return fmt.Sprintf("%d files", n)
+}
+
+// decideSelectedProposal applies accept or reject to the row the waiting list
+// has selected, and reports whether the list was open so the chord was consumed
+// there. The caret-based review walk must never also run under the overlay.
+func (a *App) decideSelectedProposal(accept bool) bool {
+	if !a.Picker.Open || a.Picker.Mode() != picker.Proposals {
+		return false
+	}
+	idx, ok := a.Picker.SelectedProposal()
+	if !ok || idx < 0 || idx >= len(a.pendingList) {
+		return false
+	}
+	pr := a.pendingList[idx]
+	a.decideProposal(pr, accept)
+	a.closeProposalList()
+	if pr.Kind == "set" || pr.Kind == "invalid" {
+		a.gotoProposal(pr)
+	}
+	return true
+}
+
+// closeProposalList hides the waiting list and hands the keyboard back to the
+// editor, so after a decision the user sees the text the row named.
+func (a *App) closeProposalList() {
+	if a.Picker.Mode() == picker.Proposals {
+		a.Picker.Hide()
+	}
+	if a.focus == FocusPicker {
+		a.focus = FocusEditor
+	}
+}
+
+// gotoProposal opens the file a text proposal names and lands the caret on the
+// change, the same place enter takes. Opening and jumping both write the status
+// line, so the decision status the caller set is restored over them: the user
+// needs to read what was decided, not which file was opened.
+func (a *App) gotoProposal(pr control.Proposal) {
+	if pr.Path == "" {
+		return
+	}
+	line := 0
+	if p := a.proposalSetPane(pr.Path); p != nil {
+		line = firstMarkLine(p, pr.Group)
+	}
+	status := a.status
+	a.OpenFile(pr.Path)
+	if line > 0 {
+		a.jumpTo(line)
+	}
+	a.status = status
+}
+
+// decideProposal carries out one decision on one waiting proposal. It is the
+// one place a list row kind is interpreted, so the local and attached paths
+// cannot drift: a change set goes through decideProposed (reject only marks;
+// clear is a separate chord), a deletion or folder removal through the same
+// approve/withdraw the gate prompt uses, and a publish through the intention
+// command the CLI runs. An attached client forwards every one to the daemon.
+func (a *App) decideProposal(pr control.Proposal, accept bool) {
+	switch pr.Kind {
+	case "set":
+		p := a.proposalSetPane(pr.Path)
+		if p == nil {
+			a.status = "no open buffer for " + filepath.Base(pr.Path)
+			return
+		}
+		if !a.decideProposed(p, pr.Group, accept) {
+			if !a.attach {
+				a.status = fmt.Sprintf("change set %d is no longer awaiting a decision", pr.Group)
+			}
+			return
+		}
+		if accept {
+			a.status = decidedStatus(true, pr.Group)
+			return
+		}
+		// Reject only marks the set; the text stays and clear is the second
+		// gesture. The status names it so the two-step stays discoverable.
+		a.status = fmt.Sprintf("rejected change set %d; %s clears it", pr.Group, chordFor(keys.ClearRejected))
+	case "invalid":
+		p := a.proposalSetPane(pr.Path)
+		if p == nil {
+			a.status = "no open buffer for " + filepath.Base(pr.Path)
+			return
+		}
+		if accept {
+			a.status = fmt.Sprintf("change set %d is superseded; clear it instead", pr.Group)
+			return
+		}
+		a.clearChangeSet(p, pr.Group)
+	case "delete":
+		d, ok := a.pendingDeletionFor(pr.Path)
+		if !ok {
+			a.status = "no pending deletion for " + filepath.Base(pr.Path)
+			return
+		}
+		if accept {
+			if a.attach {
+				a.approveDeletionRemote(d)
+				return
+			}
+			a.removeDeleted(a.openDeletionPane(d.Path), d.Path)
+			return
+		}
+		if a.attach {
+			a.withdrawDeletionRemote(d)
+			return
+		}
+		a.withdrawDeletion(d)
+	case "rmdir":
+		d, ok := a.pendingDirRemovalFor(pr.Path)
+		if !ok {
+			a.status = "no pending dir-removal for " + filepath.Base(pr.Path)
+			return
+		}
+		if accept {
+			if a.attach {
+				a.approveDirRemovalRemote(d)
+				return
+			}
+			a.removeDirDeleted(d)
+			return
+		}
+		if a.attach {
+			a.withdrawDirRemovalRemote(d)
+			return
+		}
+		a.withdrawDirRemoval(d)
+	case "publish":
+		a.decidePublish(pr.Path, accept)
+	default:
+		a.status = "unknown proposal kind " + pr.Kind
+	}
+}
+
+// decidePublish accepts (publishes) or rejects (withdraws) a pending publish.
+// Locally it runs the intention command the CLI runs, so a publish decided from
+// the list is the same outward step; an attached client forwards the decision
+// to the daemon, which owns the refs and the pinned hook.
+func (a *App) decidePublish(name string, accept bool) {
+	cmd := intent.Command{Mode: "publish", Name: name}
+	if accept {
+		cmd.Approve = true
+	} else {
+		cmd.Withdraw = true
+	}
+	if a.attach {
+		res, err := a.sendIntent(cmd)
+		if err != nil {
+			a.status = "attach: " + err.Error()
+			return
+		}
+		if !res.OK {
+			a.status = res.Err
+			return
+		}
+		delete(a.pendingPublishes, name)
+	} else if _, err := a.runIntent(context.Background(), cmd); err != nil {
+		a.status = err.Error()
+		return
+	}
+	if accept {
+		a.status = "publishing " + name
+		return
+	}
+	a.status = "withdrew the publish of " + name
+}
+
+// decideProposal is deliberately the only interpreter of a list row kind:
+// adding a proposal kind means teaching this switch, not every chord.
+//
+// waitingNote is the status-line surface for everything an agent is waiting on
+// the user to decide: one count across every kind, and the chord that opens the
+// list. It is empty with nothing waiting, so the no-pending case draws nothing.
+func (a *App) waitingNote() string {
+	n := a.waitingCount()
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d waiting for you (%s)", n, chordFor(keys.ReviewProposed))
+}
+
+// waitingCount is the cheap count behind waitingNote: the workspace-level maps,
+// plus each buffer pending change sets. It does not walk DiffPending, so it
+// stays a fold the frame can afford.
+func (a *App) waitingCount() int {
+	n := len(a.pendingDeletions) + len(a.pendingDirRemovals) + len(a.pendingPublishes)
+	for _, p := range a.Tabs.All() {
+		n += len(p.File.Session().Pending())
+	}
+	for _, p := range a.headless {
+		n += len(p.File.Session().Pending())
+	}
+	return n
 }
 
 // participantName resolves an author to its display name, from the participant

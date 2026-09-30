@@ -22,11 +22,18 @@ var ErrDiskChanged = errors.New("file changed on disk since it was opened")
 // Path is part of the stamp because a save-as writes somewhere the stamp says
 // nothing about. Comparing against the previous file's mtime would either
 // refuse a legitimate save or, worse, permit one it had not actually checked.
+//
+// existed records whether there was a file at path when the stamp was taken.
+// Without it a missing file is indistinguishable from one raj has never seen:
+// stampOf records a missing file as known, so that a file appearing under a new
+// buffer is caught, and the only other clue is a zero size and a zero mtime
+// that a genuinely empty file could also carry. DeletedOnDisk is the reader.
 type stamp struct {
-	path  string
-	mod   time.Time
-	size  int64
-	known bool
+	path    string
+	mod     time.Time
+	size    int64
+	known   bool
+	existed bool
 }
 
 func stampOf(path string) stamp {
@@ -36,10 +43,11 @@ func stampOf(path string) stamp {
 		// known so that a file appearing underneath a new buffer is caught:
 		// "create a file the tab was about to be saved as" is a real
 		// collision, and treating a missing file as unknown would wave it
-		// through.
+		// through. existed stays false, which is what tells this apart from
+		// a file that was there when the stamp was taken and has since gone.
 		return stamp{path: path, known: true}
 	}
-	return stamp{path: path, mod: info.ModTime(), size: info.Size(), known: true}
+	return stamp{path: path, mod: info.ModTime(), size: info.Size(), known: true, existed: true}
 }
 
 // changed reports whether the file at path differs from what the stamp records.
@@ -58,11 +66,33 @@ func (s stamp) changed(path string) bool {
 
 // DiskChanged reports whether the file has been written by something else since
 // raj last read or wrote it. Cheap enough to call from a tick.
+//
+// A file that is gone reads as changed: its absence is a difference from what
+// the stamp records, and a save has to ask before putting it back.
 func (f *File) DiskChanged() bool {
 	if f.Path == "" {
 		return false
 	}
 	return f.disk.changed(f.Path)
+}
+
+// DeletedOnDisk reports whether the file this buffer was loaded from is gone: it
+// was there when raj last read or wrote it and it is not there now.
+//
+// A buffer that has never been on disk is not "deleted" — an unnamed scratch
+// buffer, or one created for a path that did not exist — because there is no
+// prior file for its absence to be a change from. That distinction is why the
+// stamp records existed: the zero size and zero mtime a missing file leaves
+// behind are also what an empty file carries.
+//
+// One stat per call, the same cost DiskChanged already pays, so the idle tick
+// can call it on every open tab.
+func (f *File) DeletedOnDisk() bool {
+	if f.Path == "" || !f.disk.known || !f.disk.existed {
+		return false
+	}
+	_, err := os.Stat(f.Path)
+	return os.IsNotExist(err)
 }
 
 // stampDisk records the current state of the file as what raj knows about.

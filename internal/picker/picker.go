@@ -51,7 +51,9 @@ const (
 // review pass, and the 1-based line choosing it jumps to.
 type Proposal struct {
 	Label string
+	Path  string
 	Line  int
+	Index int
 }
 
 type Command struct {
@@ -151,6 +153,10 @@ type entry struct {
 	// codeAction is the index a CodeActions row names. The list itself lives
 	// with the caller; the row only carries its position in it.
 	codeAction int
+	// proposal is the index a Proposals row names into the caller own list of
+	// pending proposals. Like codeAction the row carries only its position; the
+	// decision itself stays with the caller.
+	proposal int
 }
 
 type scored struct {
@@ -214,12 +220,11 @@ func (p *Picker) ShowSymbols(path string, syms []symbols.Symbol) {
 // file, for the review pass: the rows are already labelled by the caller,
 // choosing one jumps to the line the change sits on, and accept and reject
 // are the chords that decide it there.
-func (p *Picker) ShowProposals(path string, rows []Proposal) {
-	p.reset(Proposals, "Review change")
-	p.file = path
+func (p *Picker) ShowProposals(rows []Proposal) {
+	p.reset(Proposals, "Pending proposals")
 	p.items = p.items[:0]
 	for _, r := range rows {
-		p.items = append(p.items, entry{label: r.Label, line: r.Line})
+		p.items = append(p.items, entry{label: r.Label, path: r.Path, line: r.Line, proposal: r.Index})
 	}
 	p.filter()
 }
@@ -290,6 +295,16 @@ func (p *Picker) Action() keys.Action { return p.command }
 // the same way Action does for the palette.
 func (p *Picker) ChosenCodeAction() (int, bool) {
 	return p.codeAction, p.codeChosen
+}
+
+// SelectedProposal is the index of the row the selection is on in Proposals
+// mode, and whether there is one. It is how the accept and reject chords reach
+// the row the user highlighted without first closing the list.
+func (p *Picker) SelectedProposal() (int, bool) {
+	if !p.Open || p.mode != Proposals || p.list.Sel < 0 || p.list.Sel >= len(p.shown) {
+		return 0, false
+	}
+	return p.shown[p.list.Sel].proposal, true
 }
 
 // ActiveInput is the query field while the overlay is open.
@@ -553,12 +568,23 @@ func (p *Picker) choose(s scored) string {
 		p.pos, p.path = Position{Line: s.line, Col: s.col}, s.path
 		return s.path
 	}
-	if p.mode == Symbols || p.mode == Proposals {
+	if p.mode == Symbols {
 		if p.file == "" {
 			return ""
 		}
 		p.pos, p.path = Position{Line: s.line}, p.file
 		return p.file
+	}
+	if p.mode == Proposals {
+		// A workspace list spans files, so each row carries its own path. An
+		// empty path is a non-text proposal -- a deletion, a dir-removal, a
+		// publish -- with nowhere to jump; PositionFor then finds no line and
+		// the choice lands on the file the row names alone.
+		if s.path == "" {
+			return ""
+		}
+		p.pos, p.path = Position{Line: s.line}, s.path
+		return s.path
 	}
 	if s.root != "" {
 		return filepath.Join(s.root, s.label)

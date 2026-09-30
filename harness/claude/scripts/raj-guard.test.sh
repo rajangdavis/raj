@@ -7,7 +7,7 @@
 # is non-zero on any mismatch, so `make check` stops on it.
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 guard=$here/raj-guard.sh
 
 fails=0

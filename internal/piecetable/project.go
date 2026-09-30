@@ -29,6 +29,12 @@ const (
 	// AcceptedAndProposed is the edit-mode view: live Accepted and Proposed
 	// edits. A Rejected set is absent.
 	AcceptedAndProposed
+	// AcceptedAndProposedApplied is the verification composition: live Accepted
+	// and Proposed edits with a Proposed deletion-only set applied, exactly what
+	// accepting every proposal would write. AcceptedAndProposed defers such a
+	// set so its bytes stay visible in the editor; a verification surface must
+	// not, or a deletion-only proposal is checked against stale text.
+	AcceptedAndProposedApplied
 	// Annotated is the review view: every live edit, with each run's owning
 	// change set and its state reported by States.
 	Annotated
@@ -171,6 +177,9 @@ func (s *Session) project(p Policy, proposed map[uint64]bool) DerivedProject {
 	// text to show as a proposal, applying it would be the only thing the
 	// reader saw, and the bytes would be gone before the human could decide.
 	// Deferring it keeps the planned range visible and leasable until accept.
+	// Only AcceptedAndProposed defers: deferredDeletions answers nil for
+	// AcceptedAndProposedApplied, the verification view, so the deletion is
+	// applied there exactly as an accept would.
 	deferred := s.deferredDeletions(p)
 	// Invalid sets are Proposed and stale at once: no live member projects into
 	// the present, so the policy excludes the set from the edit and agreed
@@ -533,7 +542,7 @@ func (s *Session) included(o Op, p Policy, invalid map[uint64]bool, proposed map
 	switch p {
 	case AcceptedOnly:
 		return !invalid[o.Group] && s.GroupState(o.Group) == Accepted
-	case AcceptedAndProposed:
+	case AcceptedAndProposed, AcceptedAndProposedApplied:
 		if invalid[o.Group] {
 			return false
 		}

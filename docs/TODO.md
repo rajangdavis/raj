@@ -15,6 +15,65 @@ Nothing active. The phone profile is largely in place and the save-review lag no
 One line per item, grouped by theme; nothing here is scheduled. Numbers live in
 BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 
+### Hooks — see a run while it runs (2026-09-30, user)
+
+- **A run is readable but not pushable.** `raj hook log` (the last 100 runs,
+  with exit, duration and `recovered`), `raj hook ps` (in flight) and
+  `raj hook log --show <id> --tail N` (a live tail, even for a detached run)
+  are all reads that cross TCP, so an agent in a container can already watch a
+  cycle. What is missing is ergonomics: no `--follow` on `--show`; no
+  `hook-finished` event on the bus, so a waker must poll; no opencode tool for
+  `ps`/`log` (the agent shells out); and nothing surfaces runs in flight in
+  `raj ctl status`, the status line or the debug overlay. Add those four, and
+  settle the durable run log (H3: memory plus journal, or SQL) so a history
+  survives a restart rather than only a `recovered` entry.
+
+### Editor — record the drawn screen over time (2026-09-30, user)
+
+- **`screen` reads one frame and nothing records a run of them.** The verb is
+  `screen [--until TEXT]` — the drawn screen as text, `--json` adds the cursor
+  — and that is the whole surface: no `--save`, no frame log, no timestamps.
+  Nor is there a keystroke-injection verb, so an agent can read the screen
+  between buffer-level actions but cannot script an interaction. The gap
+  matters because the flicker fixed 2026-09-30 was invisible to every
+  instrument: no test failed, no diagnostic fired, and it was found only
+  because the user watched the debug overlay field flip. Add `screen --follow`
+  (or `--record`): emit a frame whenever the drawn screen changes, timestamped,
+  so a recording is compact and a temporal or visual bug is answerable.
+  `--until` is already the predicate wait; this is the timeline half. Keep it a
+  read: a key-injection verb would let an agent drive the UI as the user, which
+  crosses the propose/decide line (`accept` and `save` are human-only) and
+  would have to be local-human-only if it is ever added.
+
+### Owner gestures (Track G) — review fallout (2026-09-30)
+
+- **Delete the dead `proposeDeleteFile`/`proposeRemoveFolder`.** G1 left them
+  in `internal/app/menu.go` when a deletion-only change could not be verified
+  through the hook's projected tree; the projection is now pinned by
+  `TestProjectAppliesProposedDeletion`, so they are removable — along with the
+  `piecetable` import that is their last use — once that test is green on the
+  host.
+- **The generated keybinding reference omits `Native` chords.** `keys.Doc()`
+  renders only `Bindings` + `Reclaim`, so the new waiting-list chord
+  `ctrl+alt+v` (`keys.ReviewProposed`, a Native) has no `docs/KEYBINDINGS.md`
+  row. Decide whether `Doc()` should render `Natives`.
+- **The waiting list's enter opens a non-text row's path.** A publish row
+  carries the wave name, so `openFromPicker` tries to open a file named after
+  the wave; a delete or rmdir row has a path but no line to jump to. Make
+  enter a no-op for a row with no text, or gate it on the row kind.
+- **Overlap reporting compares bounding spans.** A large multi-hunk set flags
+  every set inside its span, so this wave produced three "conflicts" that were
+  disjoint hunks (`conflict_test.go` 3/2, `host.go` 2/5, `table.go` 5/3).
+  Compare hunks, or say "encloses" rather than "overlaps".
+- **An invalid deletion-only set is invisible.** `Pending()` drops it, so
+  neither the waiting list nor `raj ctl proposals` can show it, and its
+  projection is unpinned (`AGENT-FEEDBACK`, invalid-set wave). Pin the
+  projection and give it a review row.
+- **Author ids are reused while their pending sets are live.** A fresh
+  `register` was assigned author 130, writer G1's id, so `--mine` adopted G1's
+  pending sets and a `revert --author 130` from that connection would have
+  discarded them. Do not reuse an id any pending journal op names.
+
 ### Layered proposals
 
 - One jump path: move `host.Goto` onto `jumpToSessionLine`, or state why the
@@ -182,7 +241,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 ### Control socket and agent surface
 
 - **After a daemon restart a named identity can send under a throwaway token key (2026-09-28).** The cycle announced as key `raj-cycle` (author 130) before the restart and closed as the SAME author 130 but under a `tok_...` key after it: the author row survived the restart (L3.3) but the named key did not rebind for the post-restart send, so a reply to the closing report targets a discarded key. Rebind the key on reconnect, or re-hello the `--as` key after a dial failure, or make the client refuse to send under an adopted token when an explicit `--as` was given. *A restart must not change who a name points at.*
-- **Hooks take no arguments; add declared, validated parameters (2026-09-28).** `run` is name-only by design — the agent never supplies argv, env or cwd — so a hook like `cycle` cannot be pointed at one segment, and retrying the announce step means re-running the whole check/build/restart. Extend the contract with DECLARED parameters: the author declares `--param NAME=enum(a,b,c)|string(regex)|uint`, the agent supplies `name NAME=value`, the server validates the value against the declaration and passes it as an environment variable (`RAJ_PARAM_<NAME>`), never as argv. The safety property holds — the agent selects from a declared domain, it does not inject a command — and one `cycle` hook then covers every segment (and split/stack publish, deploy, and the rest). *An agent should name a choice, not a command.*
+- **Hooks take no arguments; add declared, validated parameters (2026-09-28).** `run` is name-only by design — the agent never supplies argv, env or cwd — so a hook like `cycle` cannot be pointed at one segment, and retrying the announce step means re-running the whole check/build/restart. Extend the contract with DECLARED parameters: the author declares `--param NAME=enum(a,b,c)|string(regex)|uint`, the agent supplies `name NAME=value`, the server validates the value against the declaration and passes it as an environment variable (`RAJ_PARAM_<NAME>`), never as argv. The safety property holds — the agent selects from a declared domain, it does not inject a command — and one `cycle` hook then covers every segment (and split/stack publish, deploy, and the rest). *An agent should name a choice, not a command.* **Done 2026-09-28:** declared, validated parameters landed — a `params` column (store v9->v10), repeatable `raj hook add --param`, `raj hook run <name> NAME=value`, a default making a declared parameter optional so an argument-less caller still runs the hook, and `RAJ_PARAM_<NAME>` delivery to argv, shell, builtin and `steps` actions; `docs/HOOKS-SPEC.md` §1, §2, §3, §4 and §7 updated.
 - **The registry leaks a durable row per anonymous handshake (2026-09-27).** `who` shows 122 participants after a day of agent traffic, most `tok_...` rows: a `raj ctl` invocation that arrives with no identity appears to leave a durable participant row rather than the reserved, row-less id the skill documents, so it grows without bound and inflates `who`/`Drivers()`. Confirm and reap, or make the adopted-token path row-less. *An anonymous handshake is not a participant.*
 - **Mail is confirmed at the next Park, not after the prompt (2026-09-28).** The store marks a batch delivered when the identity parks again, so a reader that exits 0 and dies before prompting the session loses that batch while the daemon lives, and a daemon restart between hand-off and confirm replays it for a duplicate. There is no client ack for the hand-off. Carry the delivered row ids in the recv response and add a `confirm` op the client sends after the prompt succeeds, or let a re-park on the same connection re-request an unconfirmed batch. *A hand-off is not a delivery.*
 - Three nested header strings are still JSON (`DiffJSON`, `LSPJSON`,
@@ -248,6 +307,42 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - **One generic op-scoped JSON slot on the wire (2026-09-27).** Hook, Git, Diff
   and LSP each carry their own JSON field and response code; collapse them onto
   one op-scoped slot and free three to four response codes.
+- **The 0x01-0x7f header space is full (2026-09-28).** `hHookParams = 0x1f`
+  took the last free request code: request fields use 0x01-0x1f, response fields
+  0x20-0x7f, and 0x00 is unrepresentable in the framing. (The original premise
+  was wrong - a code at or above 0x80 does *not* read as a verb in a header;
+  that is a program rule, and `decodeHeader` passes no known set, so an unknown
+  header code at or above 0x80 is skipped.) A new header field needs a freed
+  code (the op-scoped slot above frees three or four), a nested field carrying
+  its own sub-codes, or a change to the range rule;
+  `TestUnknownHeaderFieldIsSkipped` splices 0x80 because no free argument code
+  remains. *A full code space is a design problem, not a numbering one.*
+- **`hGenOut 0x5e` is a duplicate, free once nothing emits it (2026-09-29).**
+  `encodeHeader` wrote `h.Gen` twice - as `hGen` 0x1a and as `hGenOut` 0x5e -
+  and `decodeHeader` read both into the same field. The `hGenOut` write is
+  dropped, so nothing emits it; decoding it stays, so a peer that still sends
+  it keeps working. What frees the code is that drop: once no build that emits
+  0x5e remains in the field, the response code can be reused.
+- **`hFindCount 0x58` is written but never read (2026-09-29).** `host.go` fills
+  it in find's answer and `wire.go` carries it, but no `raj ctl` client reads
+  it (`cli.go` and `client.go` hold no reference), so the response code is
+  reclaimable. What frees it is dropping the `FindCount` write in `host.go`
+  (or giving `find` a reader such as `--count`, which would keep the code).
+- **The builtin in-process environment is two parallel mechanisms (2026-09-28).**
+  `builtin.WithStepEnv`/`StepEnv` and `builtin.WithParamEnv`/`ParamEnv` are the
+  same context-value pattern twice, carrying the same `[]string` of `KEY=value`
+  entries; a builtin leaf reads both, and `runChainStep` concatenates them for a
+  shell step. One `WithEnv`/`Env` channel carrying a single combined slice would
+  serve both, leave a shell step nothing to merge, and give a third source
+  nowhere to duplicate. Leaves in `internal/control/hookbuiltin_test.go` read
+  each getter.
+- **`intent prove` runs the check hook's argv directly, bypassing parameter
+  validation (2026-09-28).** `app.runCheckHook` parses the stored row and runs
+  `h.Argv`, so a required parameter on `check` would be silently omitted where
+  the server would refuse; it is safe today only because `check` is
+  `["make","check"]` with no declarations. Resolve through the same path, or
+  refuse a `check` hook that declares a required parameter, so prove and the
+  gate cannot diverge. *One hook, two runners, one contract.*
 - **Intention membership uses bare session-local group ids (2026-09-27).** A
   group id is unique only within a buffer/session; two buffers can both number
   a group 1, and `Intention.Members` is `[group ids]` alone, so the app resolves
@@ -266,14 +361,37 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - **A rejected set pins a buffer dirty that a save cannot clean (2026-09-28).**
   A buffer held one accepted set and two rejected sets; saves wrote the agreed
   composition, `raj ctl diff` was empty and disk matched, yet `status` stayed
-  dirty across two saves, so publish-single.sh refused forever. Rejected text
-  stays in the view only, and `clear` (claim-gated: path positional, id via
-  `--group`) is the only disposal. Now `status` names the count and the hook
-  prints the reason; `reject` still does not reverse text.
+  dirty across two saves, so the old publish-single.sh readiness gate refused
+  forever (that gate is retired; the dirtiness is not). Rejected text stays in
+  the view only, and `clear` (claim-gated: path positional, id via `--group`)
+  is the only disposal. Now `status` names the count; `reject` still does not
+  reverse text.
 - **Zero-op sets accumulated (2026-09-28).** One buffer listed seven
   `0 ops, +0 bytes, 0 hunks` sets: clear left a tombstone when it reversed every
   member out, and an apply could commit a no-op replacement. Clear now drops the
   set from the `groups` listing and ApplyDiff skips a rebased no-op hunk.
+- **Retroactive wave-to-MR discovery (2026-09-28).** The publish result is NOT
+  stored; the mapping is recovered instead. The branch name is deterministic
+  (`raj/wave-<wave>`), the pushed sha is `git rev-parse origin/raj/wave-<wave>`
+  after a fetch (the remote-tracking ref IS the record), and the MR URL is a
+  lookup: `gh pr list --head raj/wave-<wave>` (or the GitHub API
+  `GET /repos/<owner>/<repo>/pulls?head=<owner>:raj/wave-<wave>`), with
+  `.../pull/new/<branch>` to create one. Add `intent show <wave>
+  --remote-status` (or a discovery subcommand) that derives the branch name,
+  asks the remote whether it exists, and prints sha + URL. Record nothing till
+  then.
+- **The container ctl can predate the editor (2026-09-28).** The `raj ctl` in a
+  harness container is a build from an older commit, so verbs exist on one side
+  only (`--action`, `intent`) and `exec` is refused over TCP - there is no
+  workaround from inside. Fix: a build/redeploy step that rebuilds the container
+  image AND the editor from the same commit, and/or make the existing
+  commit-skew warning actionable - fail loudly with "rebuild the container"
+  instead of "unknown command".
+
+- **`MaterialiseTree` has no direct test (2026-09-28).** It is the core of both
+  export and prove yet is only compile-covered. Add a direct git unit test next
+  pass - a temp repo and a projection, asserting the tree object and that the
+  index and worktree are untouched. Not a probe.
 
 ### Client mode and attach
 
@@ -311,6 +429,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   human patch today. *A refusal should be a decision, not an oversight.*
 - **A TCP attach client does not read back its granted kind, so it forwards edits that can only be proposals.** `hello` downgrades a human request over anything but the unix socket to an agent (`internal/control/control.go`), but the client still forwards its local edits as the person; `host.Apply` admits the agent text as a proposal, so an edit the client believes it accepted lands pending for review. Read the granted kind back from the hello reply (the participant row for the client author) and keep the client read-only when it is not `KindHuman`, or label the forward as a proposal. *A client must not offer an edit the daemon will not land.*
 - **The LSP servers are not re-rooted on attach.** `adoptVisibleRoots` rebuilds the explorer, search and picker over the daemon set, but `newServers` is only called from the constructor (`internal/app/app.go`), so a client whose daemon primary differs starts servers against a workspace it is not showing. Decide whether adoption re-resolves the servers or LSP stays launch-rooted by design. *A client should not offer a workspace it does not render.*
+- **An attached client runs its own language servers, and nothing is mirrored (2026-09-29).** `cmd/raj/main.go` skips only the eager warm-up in attach mode (`if !opts.Attach { a.WarmServers() }`); a server still starts lazily when the client's idle tick calls `servers.for_` (`internal/app/lsp.go`), which spawns from the client's own table, roots and PATH. None of the ~25 `a.attach` branches in `internal/app` gate LSP, so the client's diagnostics and inlay stores are filled by its own server and the client wire carries neither. Consequences: a client with no server on PATH draws no marks while the daemon has a full set, and a clean buffer is read from the client's disk (`syncDirtyPane` opens only dirty ones) - which on a remote or phone client is not the daemon's. Fix shape: the daemon owns LSP for attached clients - push its diagnostics and hints over the watch and stop calling `for_` when attached. That is also the only route to a comparable client-frame rebuild (client-mirror plan): today a frame whose client drew LSP marks answers `NOT COMPARABLE` with the reason `client-owned language server`, and moving ownership turns that into a real comparison as a side effect. No stamp compares across the two processes regardless - document versions are per sync connection and the server publishes without one, dated only by a process-local arrival sequence. Open: whether `adoptVisibleRoots` hands the client the daemon's absolute paths, so a same-host client's server reads the same disk. *A client should not compute what the daemon already knows.*
 
 ### UI, terminals and rough edges
 
@@ -357,8 +476,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - A coordinate-convention guard so a 1-based/0-based assertion fails where it is
   written.
 - A format-on-save ordering regression test through the wake path.
-- `TestEveryVerbHasACode`'s verb list omits nine verbs, so its guard is only
-  true if the list is also edited.
 - `TestGuardRefusesSymlinkEscape`'s text/open/apply assertions are vacuous;
   make them reach the check or drop them.
 - **The settings pane's click hit test is read-verified only.**
@@ -378,7 +495,15 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - The container `raj` can lag the editor; rework the release/rebuild step or
   make an empty `srcVersion` detectable. Named again 2026-09-24: `raj ctl git`
   was unknown in-container after the `git` verb landed in source (the image has
-  since been rebuilt).
+  since been rebuilt). Named again 2026-09-28: `raj hook run --param`/RAJ_PARAM
+  was absent in-container during the declared-parameters review, so the changed
+  CLI could not be driven, and `raj ctl exec` is refused over TCP so the
+  host-built binary is not a fallback.
+- **`scripts/call-runs.mjs` cannot read the opencode V2 store (2026-09-28).**
+  It queries the V1 `part`/`message` tables ("no such table: part"); the store
+  is the V2 `session_message`/`session_v2` schema, so the review contract's
+  per-run tool-use metrics cannot be produced by the documented command. Point
+  it at `session_message.data` or pin the opencode version.
 - The standing between-wave reconciler needs a thin wrapper so the pass is
   invoked rather than remembered.
 - A saved buffer can still carry proposed sets after a rebuild and restart;
@@ -468,10 +593,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   from `/tmp` and handed `/work/...` is refused (wave 2, 2026-09-17);
   `RAJ_ROOT_MAP` is the workaround. Make root inference cwd-independent or
   state the run-from-root requirement.
-- `OpReload` is in `prog.names` but neither `knownOps` nor `verbNames`;
-  reconcile the three opcode tables.
-- `find` has no `verbCodes` wire code; add it and add the verb to
-  `TestEveryVerbHasACode`.
 - `exec` in a program cannot set a working directory (no `OpDir`).
 - The hover-anchor cross-cutting test is blocked on a fake-LSP-server seam.
 - Two encoding-classifier edge cases: `ff fe 00 00` checked as UTF-32LE before
@@ -760,3 +881,100 @@ Found while landing the H3 leaves; all three hit in one sitting.
   silently never appears is worse than a gesture that is refused. Decide
   which it is and make one of them true. The same question applies to
   `rmdir` and to any future approval that is not a save.
+
+## Between-wave review — `intent diff` follow-ups (2026-09-28)
+
+Found by the review pass on the `raj ctl intent diff` wave; none blocks the
+wave, which stands.
+
+- **A truncated `intent diff` is not pinned through `--json`.** `capIntentDiff`
+  is unit-tested and `truncated`/`omitted_bytes` are `omitempty`, so the two
+  forms are distinguishable, but nothing asserts the JSON keys; the new
+  `printIntent` test pins the printed note only. Add a marshal assertion.
+- **The container `raj` client stays stale**, so a new `raj ctl` surface cannot
+  be driven from a review session and `exec` is refused over TCP. Known; hit
+  again by `intent diff`.
+- **A seam's diff and proof include other seams' accepted work.** The contract
+  in `internal/app/seam.go` is "materialise it alone over its base (its members
+  only, no other uncommitted change)", but `intentProjection` composes each
+  touched path from the buffer's AGREED text plus the member groups, and the
+  agreed text already carries every accepted-but-uncommitted set, whichever
+  seam it belongs to. So with seams A and B both accepted in one file, A's
+  review shows B's hunks and A's proof checks B's code. It hits both `intent
+  diff` and `intent prove`, which share `materialiseIntention`. The existing
+  pin cannot see it: `TestIntentDiffShowsMemberSliceNotWorkspace` dirties the
+  worktree and proposes one seam, so the agreed text is the members. Fix by
+  composing from the base blob plus the chain's members, and pin it with a
+  two-seam case (both accepted in a shared file; A's diff must not contain B's
+  hunk). Independent of the Q12 answer.
+
+  **Closed 2026-09-30:** the code is already the fix. `memberSlice`
+  (`internal/app/intent.go:372`) is the single entry point: it clones the
+  session and marks every non-admitted set `Rejected`, so the composition is
+  the base plus the chain's members only, and both `intentProjection` and
+  `waveProjection` compose through it. The only thing missing was the pin:
+  `TestIntentReviewTabShowsOnlyItsSeamHunks` exercises the same composition
+  through `intent review`; the direct `intent diff`/`intent prove` two-seam pin
+  is re-scoped in `docs/dev/DEBT-PLAN.md` (D1).
+
+## Between-wave review — shellcheck/gates + publish artifact (2026-09-29)
+
+Found by the review pass on the two waves that made `make check` green and
+moved publish onto the exported artifact; neither blocks the waves, which stand.
+
+- **`docs/ARCHITECTURE.md` §6 still lists a resolved disagreement.** Its bullet
+  ("The `publish-single.sh` header describes building its own commit from the
+  working tree on disk; `intent/land.go` says 'publish only pushes a commit that
+  already exists'. Neither says which commit ships when both apply.") is no
+  longer true: the header now pushes the artifact (the export's commit) and the
+  working-tree build is gone. Remove the bullet. (This file belongs to another
+  writer; filed here rather than edited.)
+- **The publish PR target is auto-detected from `@{upstream}` with no fallback
+  (2026-09-29).** `publish-single.sh` takes `base_branch` from the current
+  branch's upstream; the machine path always passes `--base` as a raw SHA, so
+  the `--base <branch-name>` fallback never fires and a checkout with no
+  upstream leaves it empty, making `gh pr create --base ""` fail (exit 9) after
+  the branch is already pushed. Escalated, not decided: derive the target from
+  the remote default (`refs/remotes/<remote>/HEAD`), carry the export's base
+  *ref name* (not only its SHA) through `intent.Publish`, or refuse before the
+  push with a named diagnostic — but do not hardcode `main`. See
+  `docs/dev/AGENT-FEEDBACK.md`.
+- **`Publish.BaseRef` is now a copy of `BaseSHA`.** `proposePublish` sets
+  `BaseRef: rec.BaseSHA, BaseSHA: rec.BaseSHA`, so the JSON `base_ref` field
+  carries a SHA and the only reader (`CheckPins`' `CheckBranch`) sees the
+  base-equality rule become a no-op. Collapse the two fields (drop `base_ref`)
+  or carry the export's base ref name. (Low.)
+
+## Quality gates — duplication and cyclomatic complexity (2026-09-29, user)
+
+- **Add clone detection and cyclomatic-complexity analysis as pinned deps, `make` targets, and hooks.** Ask: analyzers for duplication and complexity, wired into the Makefile, then run as `raj` hooks the way `check` is (`["make","check"]`).
+  - Shape: pin the tools in `go.mod` behind a `//go:build tools` file so `go run <pkg>` uses the pinned version and the shipped binary carries nothing; `make cyclo` (`gocyclo -over N ./...`), `make dupl` (`dupl -threshold N ./...`), and a `quality` target running both; then hook rows naming those.
+  - Two single-purpose tools against `golangci-lint`: the latter is one dep but a large tree, and these two linters are all that is wanted from it. Decide, because it also brings a config surface.
+  - Calibrate before gating: set the threshold where the tree is today and ratchet, or `check` goes red on its first run. Two phases - a report target first, thresholds into `check` once the numbers are known.
+  - Expect legitimate findings: the mirror packages, the control verb handlers and the per-platform hosts duplicate by construction, and the big render/state functions are long deliberately; a raw count reads as noise, so ratchet or allowlist rather than chase zero.
+  - Enumerate with `./...`, not `git ls-files`: the projected gate tree has no `.git` (the same reason `sh-parse` no-ops there), and follow `shellcheck`'s tool-absent precedent - one line, skip - unless a pinned module dep makes the tool always resolvable from the module cache.
+  - Hook authoring is the human gesture: the targets and any hook body can land first; the rows are the user's to add.
+
+## X1 runner image follow-ups (2026-09-30)
+
+Found while re-briefing X1 (`harness/Dockerfile.runner`); none blocks it.
+
+- **A new-path proposal is lost or invisible after a restart.** With the
+  journal off (`RAJ_JOURNAL` unset, the default) a restart drops pending sets
+  outright. With it on, the sets survive but `proposals` does not enumerate a
+  journal-only path and `read` refuses it ("no open buffer for that path")
+  until some other action loads the path; then the journal restores every set,
+  so recovery depends on someone happening to touch the path and an agent
+  cannot find its own reviewed work. Seen with the X1 runner Dockerfile
+  (groups 1-3 restored, then superseded by group 4). Loss by default,
+  discoverability with the journal; related to "A new file is invisible until
+  it is saved" above.
+- **CI and `go.mod` disagree on the Go version.** `go.mod` declares
+  `go 1.25.0`; `.github/workflows/ci.yml` pins `go-version: '1.24'` and its
+  comment calls that newer than `go.mod`. It is not, and 1.24 toolchain-switches
+  up to 1.25.0 anyway. One of the two is wrong; the runner ships 1.25.0 because
+  `GOTOOLCHAIN=local` plus `--network none` forbids the switch.
+- **`docs/HOOKS-SPEC.md` §10 lists four cycle images.** X1 adds a fifth
+  (`runner`) to the `scripts/raj-cycle.sh` allow-list; the spec is stale.
+- **`RAJ_CYCLE_IMAGES` still defaults to `opencode`**, so the runner image is
+  built only when named. Whether every cycle builds it is an owner/X2 call.

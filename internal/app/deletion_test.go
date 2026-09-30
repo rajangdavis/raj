@@ -299,10 +299,11 @@ func TestRemoveForeverTrashesWhenEnabled(t *testing.T) {
 	}
 }
 
-// Any value other than the exact "1" -- unset, or a near miss like "0" or
-// "true" -- is the ordinary hard unlink, and nothing lands in the state trash.
-func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
-	for _, val := range []string{"", "0", "true", "yes"} {
+// A removal always parks the bytes in the workspace trash; RAJ_TRASH no longer
+// decides. D-G1 makes the trash the safety net a delete relies on and the
+// restore chord its undo, so no value of the variable produces a bare unlink.
+func TestRemovalTrashesRegardlessOfEnv(t *testing.T) {
+	for _, val := range []string{"", "0", "true", "1"} {
 		t.Run("RAJ_TRASH="+val, func(t *testing.T) {
 			t.Setenv("RAJ_TRASH", val)
 			h := newHarness(t, "hello\n")
@@ -316,10 +317,12 @@ func TestRemoveForeverUnlinksWithoutTrash(t *testing.T) {
 				t.Errorf("file still on disk after Remove forever (err=%v)", err)
 			}
 			trash := filepath.Join(session.StateDir(h.primaryRoot()), "trash")
-			if entries, err := os.ReadDir(trash); err == nil {
-				t.Errorf("trash dir exists with %d entr(ies) for RAJ_TRASH=%q; want none", len(entries), val)
-			} else if !os.IsNotExist(err) {
-				t.Errorf("reading trash dir: %v", err)
+			entries, err := os.ReadDir(trash)
+			if err != nil {
+				t.Fatalf("reading trash dir %s: %v", trash, err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("trash holds %d entr(ies) for RAJ_TRASH=%q, want 1: %+v", len(entries), val, entries)
 			}
 		})
 	}

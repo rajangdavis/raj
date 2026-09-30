@@ -81,6 +81,50 @@ func TestProjectDefersProposedDeletionUntilAccept(t *testing.T) {
 	}
 }
 
+// AcceptedAndProposedApplied is the verification composition: it admits the
+// same sets as AcceptedAndProposed but never defers a deletion-only proposal,
+// so a gate checking a proposed deletion sees what accepting it would write.
+// The display policy still holds the bytes back until the human decides.
+func TestProjectAppliedPolicyAppliesProposedDeletion(t *testing.T) {
+	s := NewSession(NewNaive("ABC"))
+	s.Begin()
+	s.Delete(User, 1, 1) // "B"
+	s.End()
+	id := s.LastGroup()
+	s.MarkGroup(id, Proposed)
+
+	if got := s.Project(AcceptedAndProposedApplied).Text(); got != "AC" {
+		t.Fatalf("verification composition %q, want the deletion applied as %q", got, "AC")
+	}
+	if got := s.Project(AcceptedAndProposed).Text(); got != "ABC" {
+		t.Fatalf("display composition %q, want the deferred %q", got, "ABC")
+	}
+	if got := s.Project(AcceptedOnly).Text(); got != "ABC" {
+		t.Fatalf("agreed composition %q, want the unagreed %q", got, "ABC")
+	}
+
+	s.AcceptGroup(id)
+	if got := s.Project(AcceptedAndProposedApplied).Text(); got != "AC" {
+		t.Fatalf("verification composition after accept = %q, want %q", got, "AC")
+	}
+
+	s.MarkGroup(id, Rejected)
+	if got := s.Project(AcceptedAndProposedApplied).Text(); got != "ABC" {
+		t.Fatalf("verification composition after reject = %q, want the restored %q", got, "ABC")
+	}
+
+	// A proposed insertion is admitted too, so the verification policy is not
+	// the agreed composition under another name.
+	t2 := NewSession(NewNaive("AB"))
+	t2.Begin()
+	t2.Insert(Agent, 1, "xy")
+	t2.End()
+	t2.MarkGroup(t2.LastGroup(), Proposed)
+	if got := t2.Project(AcceptedAndProposedApplied).Text(); got != "AxyB" {
+		t.Fatalf("verification composition %q, want the proposed insertion admitted as %q", got, "AxyB")
+	}
+}
+
 // The three policies are three different answers on a journal with a proposed
 // set: the agreed composition hides it, edit mode shows it, review mode shows
 // it and says so.
@@ -466,7 +510,7 @@ func foldProjectOracle(orig string, s *Session, p Policy) projOracle {
 		switch p {
 		case AcceptedOnly:
 			return s.GroupState(o.Group) == Accepted
-		case AcceptedAndProposed:
+		case AcceptedAndProposed, AcceptedAndProposedApplied:
 			st := s.GroupState(o.Group)
 			return st == Accepted || st == Proposed
 		case Annotated:
@@ -749,7 +793,7 @@ func FuzzProjectAgainstOracle(f *testing.F) {
 			}
 
 			now := s.Buffer().Slice(0, s.Buffer().Len())
-			for _, p := range []Policy{AcceptedOnly, AcceptedAndProposed, Annotated} {
+			for _, p := range []Policy{AcceptedOnly, AcceptedAndProposed, AcceptedAndProposedApplied, Annotated} {
 				proj := s.Project(p) // no panic is part of the contract, always
 				orc := foldProjectOracle(orig, s, p)
 

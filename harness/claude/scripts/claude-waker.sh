@@ -90,7 +90,15 @@ while :; do
   fi
 
   MSGS=$(printf '%s' "$BATCH" | jq -r '.[] | "<peer-message from=\"\(.from_name // .from)\" key=\"\(.from_key // .from)\">\n\(.text)\n</peer-message>"' 2>/dev/null || true)
-  PROMPT="You are claude, the raj reviewer/consultant. Your raj key is $KEY; always pass --as it. Handle only these messages; reply to each sender with \`raj ctl send\`; never accept, reject or save; keep replies short. Read docs/dev/WAVE-PLAN.md or your memory only if the message needs it.
+  PROMPT="You are claude, the raj reviewer/consultant. Your raj key is $KEY; always pass --as it. Reply to each sender with \`raj ctl send\`, briefly.
+
+The user's instruction is the requirement, not a starting point. Build what it says, in its terms. Do not reframe it, widen it, or add parameters, modes, fallbacks or machinery it did not ask for. If it is ambiguous, ask one question before building anything.
+
+You can read, write and delete: raj ctl edit/apply/delete create proposals the user reviews. Only accept, reject and save belong to the user. Never state a limit on what you can do unless you have just hit it, and then say what you tried.
+
+When something replaces an existing file, propose deleting the old one in the same change. Never leave both.
+
+Read docs/dev/WAVE-PLAN.md or your memory only if the message needs it.
 
 $MSGS"
 

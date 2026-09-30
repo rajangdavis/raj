@@ -38,6 +38,7 @@ Agents and scripts use `raj ctl`:
 
     $ raj ctl buffers                    # what is open
     $ raj ctl read internal/app/app.go   # read a buffer (or a closed file)
+    $ raj ctl screen --until "modal"     # the drawn screen; poll for the text
     $ raj ctl apply file.go --base N ...  # land an edit as a proposal
     $ raj ctl save file.go
 
@@ -395,6 +396,7 @@ open-and-save byte round trip.
   checked-in copy is stale.
 - `docs/ATTACH-DESIGN.md` — the workspace host and attach design: the daemon, the local-render client, and what remains.
 - `docs/MOBILE-REVIEW-SPEC.md` — the `--phone` profile: touch tabs, transient status, a review bar, ctrl aliases for super.
+- `docs/ARCHITECTURE.md` — what raj is made of, and what each thing is called.
 
 ## Configuration
 

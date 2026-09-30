@@ -76,6 +76,11 @@ const (
 	Backspace       Action = "backspace"
 	Delete          Action = "delete"
 
+	// RestoreDeleted puts the last removal back where it came from. Every
+	// delete parks the bytes in the workspace trash, so this is the undo for
+	// the gesture the human made with their own hands.
+	RestoreDeleted Action = "restore_deleted"
+
 	// multi-cursor
 	CursorAbove       Action = "cursor_above"
 	CursorBelow       Action = "cursor_below"
@@ -209,8 +214,4 @@ const (
 	ReviewProposed Action = "review_proposed"
 	NextProposed   Action = "next_proposed"
 	PrevProposed   Action = "prev_proposed"
-	// PendingRemovals re-raises the oldest pending deletion or dir-removal
-	// after the gate prompt was missed or dismissed. It is the persistent
-	// surface for a proposal that is not a change set.
-	PendingRemovals Action = "pending_removals"
 )

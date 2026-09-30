@@ -165,6 +165,35 @@ func (s *Service) seedPaths(ctx context.Context, includeIgnored bool) ([]string,
 	return paths, nil
 }
 
+// MaterialiseTree checks tree into dir, a fresh scratch directory, without
+// touching the worktree or the user's index: the tree is read into a temporary
+// index and checked out under dir. It is how a seam proof builds base+one
+// intention alone, with no other uncommitted change leaking in. The caller owns
+// dir and removes it.
+func (s *Service) MaterialiseTree(ctx context.Context, tree, dir string) error {
+	if _, err := s.repoRoot(ctx); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "raj-index-")
+	if err != nil {
+		return fmt.Errorf("git: temp index: %w", err)
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+	env := []string{"GIT_INDEX_FILE=" + tmp.Name()}
+	if _, err := s.runEnv(ctx, env, nil, "read-tree", tree); err != nil {
+		return err
+	}
+	prefix := dir
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	if _, err := s.runEnv(ctx, env, nil, "checkout-index", "-a", "-f", "--prefix="+prefix); err != nil {
+		return err
+	}
+	return nil
+}
+
 // splitZ splits NUL-terminated git output into records.
 func splitZ(b []byte) []string {
 	var out []string

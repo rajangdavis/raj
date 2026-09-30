@@ -3,7 +3,7 @@ package store
 // schemaVersion is the version this build writes. Open migrates a database
 // forward to it and refuses one that is newer, so an older binary never
 // silently downgrades state written by a newer one.
-const schemaVersion = 8
+const schemaVersion = 10
 
 // createSchema and its companions are idempotent so that two Opens racing on a
 // fresh database both succeed: the loser either sees the table already made or
@@ -25,6 +25,11 @@ const updateSchemaVersion = `UPDATE schema SET version = ?`
 // tree. It repeats the hooks domain's TreeProjected value because the store
 // keeps its columns as plain text and does not import the policy package.
 const hookTreeProjected = "projected"
+
+// hookParamsDefault is the hooks.params default: the JSON empty declaration
+// array. A row written before the v9 -> v10 column takes no parameters, which
+// is the behaviour every hook had before declared parameters existed.
+const hookParamsDefault = "[]"
 
 // migrations holds one statement list per version step: migrations[v] moves a
 // database from version v to v+1, applied in a transaction with the version
@@ -173,6 +178,21 @@ var migrations = [][]string{
 		   AND json_type(groups_json) = 'array'
 		   AND json_array_length(groups_json) > 0
 		   AND json_type(groups_json, '$[0]') = 'integer'`,
+	},
+	// v8 -> v9: retained as a no-op. v9 once added the intent_publishes table;
+	// a publish's result now lives only in the response, so this build stops
+	// creating and using the table. The version stays 9 rather than stepping
+	// back, so a database a build with the table already stamped v9 is read as
+	// current rather than refused; the table, if it exists, is left in place and
+	// is never read or written again.
+	nil,
+	// v9 -> v10: a hook's declared parameters. One JSON array of declarations
+	// per row; the default '[]' backfills every row written before this step,
+	// so an existing hook takes no parameters and behaves exactly as it did.
+	// The array is decoded and validated by internal/hooks, not here, because
+	// the store keeps its columns as plain text.
+	{
+		`ALTER TABLE hooks ADD COLUMN params TEXT NOT NULL DEFAULT '[]'`,
 	},
 }
 
