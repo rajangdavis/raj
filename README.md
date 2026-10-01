@@ -437,7 +437,7 @@ You can build the cli with
 $ go build ./cmd/raj
 ```
 
-On macOS, use Go 1.24 or newer. Older toolchains omit `LC_UUID` when linking
+On macOS, use Go 1.25 or newer. Older toolchains omit `LC_UUID` when linking
 internally, and macOS identifies a binary by that UUID when it remembers a
 granted permission — so on macOS 15 and later the local-network access a
 non-loopback `--control-addr` listener needs is asked for again every launch
