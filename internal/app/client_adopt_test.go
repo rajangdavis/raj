@@ -646,11 +646,11 @@ func TestClientApproveDirRemovalForwardsToDaemon(t *testing.T) {
 	pumpUntilDirRemoval(t, ch, dir)
 
 	// A directory has no pane to focus, so the mirrored proposal is answered
-	// from the waiting list: ctrl+alt+v opens it and accept forwards the human
+	// from the waiting list: ctrl+super+v opens it and accept forwards the human
 	// answer to the daemon.
-	runClient(t, ch, func() { ch.cli.press("ctrl+alt+v") })
+	runClient(t, ch, func() { ch.cli.press("ctrl+super+v") })
 	if !ch.cli.Picker.Open {
-		t.Fatalf("ctrl+alt+v did not open the waiting list on the client")
+		t.Fatalf("ctrl+super+v did not open the waiting list on the client")
 	}
 	if got := ch.cli.Picker.Results(); got != 1 {
 		t.Fatalf("waiting list rows = %d, want the mirrored dir-removal", got)

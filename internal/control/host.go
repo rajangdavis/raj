@@ -20,11 +20,11 @@ import (
 
 // BufferHost is the vocabulary, with no transport in it.
 //
-// docs/HARNESS-BROKER-AGENT.md puts the transport last and the interface second, for
-// a reason worth restating: a socket is one adapter over this, an in-process
-// call is another, and adding either must change nothing above this line. The
-// tests use the in-process path, so what they exercise is the same code the
-// socket reaches.
+// docs/archive/HARNESS-BROKER-AGENT.md puts the transport last and the
+// interface second, for a reason worth restating: a socket is one adapter over
+// this, an in-process call is another, and adding either must change nothing
+// above this line. The tests use the in-process path, so what they exercise is
+// the same code the socket reaches.
 //
 // The document's three parties are compressed to two here. The broker was a
 // separate process that validated tool calls and forwarded them; it holds no

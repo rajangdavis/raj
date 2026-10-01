@@ -21,8 +21,8 @@ import (
 // document and waits. A deletion has no such representation -- there is
 // nothing to read that says what is about to be gone -- so `delete` records a
 // pending path instead, and this file is the prompt that turns that record
-// into either an unlink the human asked for or a proposal that comes back the
-// next time the file is focused. The folder verbs are a later pass.
+// into either a removal the human asked for or a proposal that comes back the
+// next time the file is focused; rmdir.go widens the same gate to a subtree.
 
 // The two answers the deletion prompt offers. Remove forever is offered only
 // when the buffer is clean of both unsaved text and undecided change sets;
@@ -193,8 +193,8 @@ func (a *App) promptDeletion(p *editor.Pane, d control.Deletion) {
 	a.confirm("Delete file", msg, options, done)
 }
 
-// trashDir is where RAJ_TRASH=1 sends a removed file: a trash/ directory in
-// the workspace's XDG state dir, alongside the store and the op logs.
+// trashDir is where a removal parks the bytes: a trash/ directory in the
+// workspace's XDG state dir, alongside the store and the op logs.
 func (a *App) trashDir() string {
 	if a.roots.Len() == 0 {
 		return ""
@@ -311,10 +311,10 @@ func (a *App) removeFile(path string) error {
 	return a.moveToTrash(path)
 }
 
-// removeDeleted carries out a Remove forever answer: the file leaves its place
-// on disk -- unlinked, or moved to the trash under RAJ_TRASH=1 -- the buffer is
-// dropped the way any close drops one, the proposal is cleared, and the tree is
-// refreshed so the name is gone from it too.
+// removeDeleted carries out a Remove forever answer: the file is moved into the
+// workspace trash, the buffer is dropped the way any close drops one, the
+// proposal is cleared, and the tree is refreshed so the name is gone from it
+// too.
 //
 // A failed removal keeps the proposal rather than dropping a buffer whose file
 // is still there; the next focus asks again.

@@ -123,6 +123,11 @@ type Command struct {
 	Members []Member `json:"members,omitempty"`
 	Task    string   `json:"task,omitempty"`
 	DryRun  bool     `json:"dry_run,omitempty"`
+	// Title and Body are the artifact commit message, used by next (and
+	// export); the seam pane will prompt for them, and the socket carries them
+	// meanwhile. An empty Title falls back to the intention name.
+	Title string `json:"title,omitempty"`
+	Body  string `json:"body,omitempty"`
 	// Approve runs a pending publish proposal (H5). It is the human's
 	// decision: refs, remotes and pushes are outward. Withdraw retracts one.
 	Approve  bool `json:"approve,omitempty"`
@@ -151,4 +156,10 @@ type Result struct {
 	// Review is the `intent review` answer: the per-file diff tabs the call
 	// opened in the running editor.
 	Review *Review `json:"review,omitempty"`
+	// Next is the `intent next` answer: the export just written for a seam,
+	// and the branch publish would push it on.
+	Next *Next `json:"next,omitempty"`
+	// Group is the `intent group` answer: the seam created or extended from
+	// one task's change sets, and what the call left out and why.
+	Group *Grouping `json:"group,omitempty"`
 }

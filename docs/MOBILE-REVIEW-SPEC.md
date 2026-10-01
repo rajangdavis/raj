@@ -53,8 +53,8 @@ a test asserts every `super` binding either gets an alias or is reported.
 
 Chords, gestures, a second program or renderer, editing document text from
 the bar, and the remaining detach/reattach and concurrent-view stages of
-`docs/ATTACH-DESIGN.md`. (The attach client itself landed; `--phone` selects
-this profile within it.)
+`docs/archive/ATTACH-DESIGN.md`. (The attach client itself landed; `--phone`
+selects this profile within it.)
 
 ## Verification
 

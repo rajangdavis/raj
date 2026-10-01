@@ -28,10 +28,11 @@ import (
 // else — the JSON form carried every field name in every frame whether or not
 // the verb used it.
 //
-// All codes are in the argument range, below 0x80, which makes the
-// forward-compatibility rule right for free: an unknown field is skipped rather
-// than refused. A header is a description, not a request, and a description
-// with a field this build has never heard of is still one it can act on.
+// Codes are in the argument range, below 0x80, except where that range is
+// exhausted -- see the note below -- which makes the forward-compatibility rule
+// right for free: an unknown field is skipped rather than refused. A header is a
+// description, not a request, and a description with a field this build has
+// never heard of is still one it can act on.
 //
 // The sub-0x80 range is now full. Request fields use 0x01-0x1f, response
 // fields 0x20-0x7f, and 0x00 is unrepresentable in the framing. A code at or

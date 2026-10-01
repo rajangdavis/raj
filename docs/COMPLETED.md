@@ -2468,3 +2468,119 @@ proxies accept/reject/clear back to the daemon, refetching the result.
 ## Review tabs strand 3.1-3.3: `intent review` (2026-09-30)
 
 - [x] **`raj ctl intent review <name>` opens a seam's files as read-only diff tabs (2026-09-30).** `intentReview` materialises the intention alone over its base (`materialiseIntention`), then for each file in git's own numstat order reads just that file's slice through `Service.DiffTrees`/`DiffTreesPath` and opens an `editor.NewReadOnlyFile` pane labelled by its workspace-relative path; `ErrReadOnly` closes `Save`/`SaveOver` and `App.readOnly()`/`readOnlyNote()` extend the review gate to a read-only view; `Pane.Label`/`TabLabel()` render the tab as the file; the pane is keyed on a synthetic `.raj-seam/<seam>/<rel>.seamdiff` path so it cannot shadow the real buffer in `find`/`paneFor` or be composed into `intentProjection`/`waveProjection`. Pinned by `TestIntentReviewOpensOneReadOnlyTabPerFile`, `TestIntentReviewTabShowsOnlyItsSeamHunks` and `TestIntentReviewTabsDoNotAccumulate`; host `raj hook run check` run 157 exit 0.
+
+## Review tabs strand 3.5: `intent next` (2026-09-30)
+
+- [x] **`raj ctl intent next <name> [--title T] [--body B]` builds the seam artifact and reports the branch and commit publish would push (2026-09-30).** `intentNext` (internal/app/intent.go) refuses an empty seam before writing, then exports through the one `intentExport` path (materialise the members alone over the pinned base, one inert commit, one export row) and answers `intent.Next` (`Name`/`Branch`/`Commit`/`Parent`/`BaseSHA`/`Tree`), with `Branch` = `intent.BranchForWave` and `Commit` = the row `store.LastExport` returns that `proposePublish` reads; `intent.Message{Title,Body}` renders the commit message (an empty title falls back to `intention <name>`), `intent.Command` gained `Title`/`Body`, and `baseCommit` wraps an unresolvable base as `intent: <name>: base "<ref>" does not resolve to a commit`. Pinned by `TestIntentNextExportsSeamSliceAndReportsBranchAndCommit`, `TestIntentNextEmptySeamRefused` and `TestIntentNextMissingBaseRefusedCleanly`; host `raj hook run check` run 162 exit 0.
+
+## Document review: TODO items found already done (2026-10-01)
+
+Moved out of `docs/TODO.md` by a document review pass. Each line says what it
+was checked against. "Checked" means the code or test was found in the tree at
+HEAD `702a0aaa` plus the uncommitted files. This pass ran no tests and could
+not read the hook run log (`raj hook log` was denied to the reviewer), so no
+line here claims a green run.
+
+- [x] **Hooks take declared, validated parameters (2026-09-28).** The TODO item's own closing note: "declared, validated parameters landed — a `params` column (store v9->v10), repeatable `raj hook add --param`, `raj hook run <name> NAME=value`, a default making a declared parameter optional so an argument-less caller still runs the hook, and `RAJ_PARAM_<NAME>` delivery to argv, shell, builtin and `steps` actions". Checked: `RAJ_PARAM_<name>` delivery in `internal/control/control.go:132`, `:999`, `:2519`, and its test at `internal/control/hook_test.go:1489`. Not checked: the store version bump and the spec sections the note names.
+- [x] **Zero-op change sets no longer pile up (2026-09-28).** One buffer listed seven `0 ops, +0 bytes, 0 hunks` sets. Checked: an apply skips a no-op hunk (`internal/app/control.go:1409`, pinned at `internal/app/control_test.go:600`; the CLI refuses a batch of only no-ops, `internal/control/cli.go:2472`). **Unverified:** the other half of the TODO's claim, that `clear` drops the emptied set from the `groups` listing. No test for it was found by name.
+- [x] **A seam's diff and proof show only that seam's changes (closed 2026-09-30).** With two seams accepted in one file, one seam's review showed the other's hunks. Checked: `memberSlice` is the single composition point (`internal/app/intent.go:420`; the TODO said `:372`, the file has grown), and `TestIntentReviewTabShowsOnlyItsSeamHunks` exists (`internal/app/intent_review_test.go:80`). Still open, and tracked in `docs/dev/DEBT-PLAN.md` (D1): a direct two-seam test for `intent diff` and `intent prove`.
+- [x] **The two unused delete helpers are gone (2026-09-30).** `proposeDeleteFile` and `proposeRemoveFolder` no longer appear in any `.go` file, and `internal/app/menu.go` no longer imports `piecetable`. Checked by searching the tree. Disagreement: the TODO said removal waited on `TestProjectAppliesProposedDeletion` going green on the host; no test of that name exists in the tree.
+- [x] **Saving a new file creates its missing folder, after asking (item dated 2026-09-28).** Checked: the ordinary save path calls `ensureParent` (`internal/app/app.go:2925`, `:2972`, defined `:3147`), pinned in `internal/app/saveas_test.go:183`.
+- [x] **In-file find and replace was already recorded above** ("In-file find & replace, empty-document backspace panic, sidebar pad (2026-09-17)"). The TODO still called it "the next wave"; that line was stale and is removed. Checked: `Find.replaceAll` at `internal/editor/find.go:206`, `TestFindReplaceAll` at `internal/editor/edit_test.go:257`.
+
+## Document review: in the tree but never recorded here (2026-10-01)
+
+The plan's status block says the details of these are in this file. They were
+not. Recorded now from the tree, with the same limit as above: found in code
+committed at `702a0aaa`, not run by this pass.
+
+- [x] **Deleting a file from the editor moves it to the workspace trash, and one key puts it back.** Checked: `keys.RestoreDeleted` bound to cmd+ctrl+z, "put the last deleted file back from the workspace trash" (`internal/keys/table.go:59`), handled at `internal/app/app.go:2054`, pinned by `TestRestoreDeletedPutsTheFileBack` (`internal/app/menu_test.go:256`).
+- [x] **One list of everything waiting on you (ctrl+alt+v).** Checked: `keys.ReviewProposed` handled at `internal/app/app.go:2062`; the status line reads "4 waiting for you (ctrl+alt+v)" in `internal/app/removals_test.go:38`; the attached client shows the same note (`internal/app/client_adopt_test.go:506`).
+- [x] **A file deleted outside the editor is marked, and saving it asks first.** Checked: "was deleted on disk. Write it back?" at `internal/app/app.go:3058`, the status at `:3120` and `:3668`, the attached client at `internal/app/client.go:939`, pinned at `internal/app/conflict_test.go:314`.
+- [x] **A proposed change cannot alter what `check` runs.** A projected hook run takes the build scripts from the accepted tree. Checked: `pinHarness` at `internal/control/materialise.go:174` and the run message "with the build harness pinned to the accepted tree" at `internal/control/control.go:2536`.
+
+## Document audit: every TODO item and wave-plan row judged (2026-10-01)
+
+The earlier pass on this date checked only items that looked done. This pass
+judged all of them: 217 items in `docs/TODO.md` and 76 rows in
+`docs/dev/WAVE-PLAN.md`. "Checked" means the code or test was read in the tree
+at HEAD `702a0aaa` plus the uncommitted files. This pass ran no tests and could
+not read the hook run log, so no line here claims a green run.
+
+Moved out of `docs/TODO.md` because the tree shows them done:
+
+- [x] **The settings chord no longer slips the macOS reserved-chord guard.** The TODO said `super+,` was bound while the test maps were keyed on `super+comma`. Checked: no `super+,` binding is left in `internal/keys/table.go`; `internal/keys/macos_test.go:105-113` asserts a `super+comma` entry catches `super+,`; `internal/keys/settings_test.go:46-53` asserts no comma chord reaches the settings pane.
+- [x] **Saving with agent proposals pending asks first.** Checked: the confirm is described at `internal/app/app.go:2859` ("Save anyway is the default and the confirm never blocks") and pinned at `internal/app/app_test.go:1195-1211`, which expects "Save anyway" and "Review".
+- [x] **A cancelled `exec` kills the whole process group.** Checked: `setProcessGroup(cmd)` at `internal/control/exec.go:77`; `setProcessGroup` and `killProcessGroup` at `internal/control/exec_unix.go:26-43`. Other platforms get a no-op (`internal/control/exec_other.go:11`).
+- [x] **Intention members are qualified by path.** Checked: `store.IntentionMember{ID, Path}` at `internal/store/intent.go:17-21`, pinned by `TestIntentionMembersRoundTripAndLegacy` (`internal/store/store_test.go:566`); `raj ctl` usage documents `--group PATH=N` for "a member two buffers both number".
+- [x] **The per-root language-server test waits 30 s, not 5 s.** The TODO offered "widen the handshake wait" as one fix. Checked: `waitLiveServers` at `internal/app/lsp_test.go:1541-1549`. Not checked: whether it still flakes.
+- [x] **The save guard has an escape that survives a restart.** Checked: the stored setting `save_check` (`internal/app/settings.go:23`), default off, "Off is the default and the escape hatch" (`internal/app/settings_test.go:822-827`), and `SaveOver` writes with it off (`internal/editor/savecheck_test.go:128`).
+- [x] **A refused save keeps the tab.** Checked: `TestRefusedSaveKeepsTheTabAndCloseStillPrompts` and `TestRefusedSaveWithTheViewMatchingDiskStillPromptsOnClose` (`internal/app/closetab_refusal_test.go:18`, `:76`).
+- [x] **Repeating `--include` or `--exclude` adds to the list.** Checked: `globList` at `internal/control/cli.go:2156-2172`.
+- [x] **`read --at` keeps two spans of one file.** Checked: `atSpanFlag` holds an ordered slice (`internal/control/cli.go:3797-3819`), pinned by `TestCLIReadAtKeepsRepeatedPathSpans` (`internal/control/cli_test.go:6219`).
+- [x] **A change set's task survives the journal restore.** Checked: `internal/app/journal.go:922-959` rebuilds the task map and calls `SetGroupTask`; asserted at `internal/app/journal_test.go:418`.
+- [x] **A participant's task is on the wire and in the journal's author table.** Checked: `TestParticipantTaskRoundTrip` (`internal/control/header_test.go:484`) and `Task: row.Task` in `collectAuthors` (`internal/app/journal.go:746-751`).
+- [x] **`raj --help` hides the `--daemon` alias and opens with a usage line.** Two TODO items. Checked: `cmd/raj/main.go:101-102` prints `usage: raj [options] [file|dir]` and passes `"daemon"` as a hidden name to `control.PrintFlagUsage`; `MarkHidden` no longer appears in `cmd/raj/main.go`.
+- [x] **`daemon list --json` prints `[]` when nothing runs.** Checked: `entries = []Entry{}` before the marshal (`internal/daemon/daemon.go:926-928`).
+- [x] **Complexity and duplication analysers have `make` targets.** Checked: `cyclo`, `dupl` and `quality` in `Makefile:1` and `:143-189`, pinned by version in the `go run` path. Still open and left in the TODO: thresholds inside `check`, and hook rows (not checked; hook rows are not readable to this reviewer).
+- [x] **One owner per hot file per wave is a written rule.** Checked: `docs/dev/WAVE-PLAN.md`, "How a wave runs".
+
+Removed from `docs/TODO.md` as a duplicate of an entry already above:
+
+- The multi-path `lsp diagnostics` statusless entry ("Journal byte digest, diagnostics sweep and hover seam (2026-09-23)"). Checked: `TestCLILSPDiagnosticsBatchStatuslessEntryGetsAStatus` (`internal/control/cli_test.go:5778`).
+
+Decision records moved here from `docs/TODO.md` word for word, because that
+file is for open work:
+
+- **DECIDED (user, 2026-09-17): keep the linewise paste text-suffix rule.** `PasteClip` keeps keying on `strings.HasSuffix(Text, "\n")`, so a characterwise selection ending exactly after a newline still pastes below the line; the `Linewise` flag on `Clip` alternative is not taken.
+- **Decided (2026-09-22): `--workspace` and an explicit `--control-addr` are mutually exclusive.** The label already names the daemon and its address, so a typed address is a second, contradictory source; the Unix socket is preferred over TCP because it needs no token. *An attach names the workspace, not the port.*
+
+Wave-plan rows found in the tree and never recorded in this file:
+
+- [x] **0.4 The Claude guard gates spawning.** Checked: `harness/claude/scripts/raj-guard.sh:43-57` allows only `raj:raj` and `raj:review`.
+- [x] **H0 (in part) The `check` hook exists on the host.** Checked: this file records `raj hook run check` runs 157 and 162. Not checked: the `test` and `fmt` rows.
+- [x] **H1 Hook run log, `ps`, `cancel`, and the `off`/`on` switch.** Checked: `internal/control/hookcli.go:118` and `internal/control/host.go:2547-2550`; the final frame carries run id, revision, HEAD and a truncated flag (`internal/control/control.go:2611`).
+- [x] **H3 Git leaves as builtin hooks, and composite steps.** Checked: `internal/hooks/builtin/gitleaves/` and the step environment in `internal/hooks/builtin/registry.go:130-165`. Not checked: each leaf by name.
+- [x] **H4 Intentions and inert export.** Checked: `intentExport` at `internal/app/intent.go:219`.
+- [x] **H5 Publish as a proposal the owner approves.** Checked: `proposePublish` at `internal/app/publish.go:58`.
+- [x] **L1 Hooks that run in the workspace.** Checked: `TreeWorkspace` at `internal/hooks/hooks.go:57-59`, used at `internal/control/host.go:2719`.
+- [x] **L2 Detached runs.** Checked: the `detach` column (`internal/store/hooks.go:124`) and `TestHookRunDetachedReturnsAndLogs` (`internal/control/hook_test.go:1176`).
+- [x] **L3 `scripts/raj-cycle.sh`.** Checked: the script and its test are in `scripts/`.
+- [x] **L5 Mail survives a restart.** Checked: the `mail` table (`internal/store/schema.go:111`) and the replay on hello (`internal/control/control.go:1849`).
+- [x] **L7 `raj ctl land <task>`.** Checked: the verb is in the `raj ctl` usage, human only; the commit on land is described at `internal/control/host.go:1351`.
+- [x] **W1 Working states.** Checked: `raj ctl state` and the state column of `who` are in the `raj ctl` usage. The code location was not looked up.
+- [x] **S3 Commit on land.** Checked: `internal/app/land.go:16` (one commit, parented on the base ref, moves `raj/baseline`).
+
+## Landed plans read against the tree before archiving (2026-10-01)
+
+Each line answers a question its plan left open, from the code at HEAD
+`702a0aaa` plus the uncommitted files. No test was run for this entry.
+
+- [x] **L5 durable mail took at-least-once delivery.** The plan
+  (`docs/dev/L5-DURABLE-MAIL.md`, decision 4) left at-most-once against
+  at-least-once open. Checked: rows handed to a reader are held in
+  `m.handed` and stamped by `MarkMailDelivered` only at that reader's next
+  `Park` (`internal/control/mailbox.go:190-216`), so a client that takes a
+  batch and dies gets it again. The other three decisions as built: a full box
+  refuses the send (`Post`, same file); editor notices are not persisted
+  (`msg.From != AuthorOriginal`); delivered rows are pruned at start
+  (`PruneDeliveredMail`, `internal/store/mail.go:107`). Who chose
+  at-least-once is not recorded here.
+- [x] **L7's bundled agent-working indicator is built.** Checked:
+  `internal/app/activity.go` — `refreshActivity` on the idle tick,
+  `activitySegment` for the desktop status line (`● name state · pending N`),
+  `phoneActivityText` for the phone review bar, and `flashAgentChange` for the
+  phone overlay. The optional per-tab dot was not looked for. The bundled save
+  confirm is the "Saving with agent proposals pending asks first" entry above.
+- [x] **Author ids are reclaimed by recycling, not at compaction.** The open
+  question in `docs/HARNESS-BROKER-AGENT.md` proposed reclaiming at compaction.
+  What landed is the "Phase 2 — handshake batch" entry above: gone ids are
+  recycled at the 255 cap, skipping id 1.
+- [x] **F3b-ii D1 exports.** `Pane.DispPos`, `Pane.DocAt`, `Pane.DisplayLines`
+  and `File.DecisionGeneration` are exported (`internal/editor/pane.go:404`,
+  `:425`, `:288`; `internal/editor/file.go:886`). The two D-items that did not
+  land are in `docs/TODO.md`, "Folded from landed design docs".
+
+- [x] **F3b-ii consumer seams on the display map (folded from `F3B-II-DESIGN.md`, 2026-10-01).** A record of what the design established, not a test run. D1's map was wired at the composition seam and left unwired at the consumer seams: `drawDiagnosticMarks`/`drawProposalMarks` use `DispOfDocLine` (`internal/app/render.go:217`, `:276`, `:337`); session restore and the inlay window clamp on `DisplayLines` (`internal/app/session.go:151`, `internal/app/inlay.go:164`).
+- [x] **Cycle recreates dropped harness containers (folded from `L4-RESTART-RESUME.md`, 2026-09-27).** `step_ensure` (`scripts/raj-cycle.sh:406`) recreates a named container that is not running and leaves a running one alone.
+- [x] **The claim spec matches the forward-claim code (2026-10-01).** `docs/archive/CLAIM-SPEC.md` §3 now describes the forward claim (`Guard.Claim` warns only on a non-`IsNotExist` stat error; `saveNamed`/`ensureParent` answers the parent at save time), §5 and §10 no longer call the parent case open, and the spec was archived with its remaining open items folded to `docs/TODO.md`, "Folded from landed spec remainders".

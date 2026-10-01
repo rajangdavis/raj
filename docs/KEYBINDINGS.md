@@ -120,6 +120,7 @@ rather than hidden.
 | action | chord | macOS | Linux | notes |
 | --- | --- | --- | --- | --- |
 | toggle_review | `super+r` | cmd+r | ctrl+r | toggle review mode: the document is read-only while on; reload moved to cmd+shift+r |
+| review_proposed | `ctrl+super+v` | cmd+ctrl+v | ctrl+alt+v | list every pending proposal in the workspace and jump to one; not g: that is find-all on Linux |
 | accept_proposed | `ctrl+super+m` | cmd+ctrl+m | ctrl+alt+m | accept the proposed change set at the caret |
 | reject_proposed | `ctrl+super+/` | cmd+ctrl+slash | ctrl+alt+slash | reject the proposed change set at the caret |
 | clear_rejected | `ctrl+super+k` | cmd+ctrl+k | ctrl+alt+k | hard-purge the rejected change set at the caret |

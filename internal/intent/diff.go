@@ -43,3 +43,15 @@ type Review struct {
 	Base  string   `json:"base"`
 	Files []string `json:"files"`
 }
+
+// Next is the `intent next` answer: the artifact a seam would push. Commit is
+// the export the command just wrote - the same row publish reads from the
+// store - and Branch is the name publish would push it under.
+type Next struct {
+	Name    string `json:"name"`
+	Branch  string `json:"branch"`
+	Commit  string `json:"commit"`
+	Parent  string `json:"parent,omitempty"`
+	BaseSHA string `json:"base_sha,omitempty"`
+	Tree    string `json:"tree,omitempty"`
+}

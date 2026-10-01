@@ -7,7 +7,7 @@
 # ignored paths are non-source passes. Needs only git.
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 script=$here/no-ignored-source.sh
 fails=0
 fail() { printf 'no-ignored-source.test: FAIL %s\n' "$*" >&2; fails=$((fails + 1)); }

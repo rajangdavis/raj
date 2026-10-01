@@ -1,7 +1,93 @@
-# NEXT-STEPS — a review pass
+# NEXT-STEPS — where we are, and the goal behind it
 
-Date: 2026-09-23. A review artifact, not a commitment. Nothing here is
-implemented or scheduled until you say so.
+## Where we are
+
+Written 2026-10-01 from the code and from git, not from memory: the last
+commit is `702a0aaa` on `main` (2026-09-30), with 17 files changed since and
+not committed (14 edited, 3 new). Each line below says what it was checked
+against. This pass ran no tests and could not read the hook run log
+(`raj hook log` was denied to the reviewer), so nothing here claims a passing
+run that it did not see.
+
+This section is the one place that answers "where are we". The plan
+(`docs/dev/WAVE-PLAN.md`, which is not in git) keeps its commit stamp and
+points here. That arrangement is proposed by the reviewer, not a rule of the
+owner's. His instruction, relayed 2026-10-01 by `raj-f070b379`: "have claude do
+a document review pass TODO's => completed, NEXT_STEPS where are we?"
+
+### Live (in the last commit)
+
+- **Agents propose, you decide.** Unchanged: only you accept, save, approve a
+  deletion or approve a publish.
+- **Agents can check their own work before you look.** They run the `check`
+  hook on a copy of the tree that includes their proposed text, and a proposal
+  cannot change what that check runs. Checked: `internal/control/materialise.go:174`,
+  `internal/control/control.go:2536`.
+- **Changes can be grouped into a named seam, reviewed as read-only diff tabs,
+  turned into a commit, and published when you approve.** Checked: the
+  `internal/intent` package (`export.go`, `publish.go`, `seam.go`, `land.go`)
+  and the `intent review` entry in `docs/COMPLETED.md`.
+- **Deleting, renaming and restoring files works from the editor itself.**
+  A delete goes to the workspace trash and cmd+ctrl+z puts it back; ctrl+alt+v
+  lists everything waiting on you; a file deleted outside the editor is marked.
+  Checked: see the last section of `docs/COMPLETED.md` for the file and line of
+  each.
+
+### In flight (written, not committed)
+
+- **Build a seam from one task's changes in one command** (`raj ctl intent
+  group --task T`). The code and eight tests are in the uncommitted files
+  (`internal/intent/group.go`, `intentGroup` in `internal/app/intent.go`,
+  `internal/app/intent_group_test.go`). It is not in `docs/COMPLETED.md`, and
+  the plan's status block listed its files without saying what they do. Unverified: whether
+  any check run has passed with it.
+- **Say what publishing a seam would push, before pushing** (`raj ctl intent
+  next`). Written and recorded in `docs/COMPLETED.md` with check run 162. The
+  full cycle after it, run 163, failed on a shell-script lint error. The one-line
+  fix for that error is in the uncommitted files
+  (`examples/hooks/no-ignored-source.test.sh`). A later full cycle passed, by
+  another agent's report (raj-f070b379, 2026-10-01): cycle `20260930-172533`,
+  run 169, check and build ok at `702a0aaa`, and the workspace shell lint
+  passed in run 168. The reviewer has not read those runs.
+- **Review fixes to the delete and remove-folder work.** What is uncommitted
+  in `internal/app/deletion.go`, `rmdir.go` and their tests is comment wording
+  only (the trash is now always used; the comments still described the old
+  opt-in). If the review asked for more than that, it is not among the 17 files.
+- **This document pass.** Proposed edits to this file, `docs/TODO.md`,
+  `docs/COMPLETED.md` and the plan, waiting for you to accept and save.
+
+### Next
+
+Taken from the plan's status block; an order the agents proposed, not one the
+owner is on record choosing.
+
+1. A passing full cycle on the tree as it stands. Reported done by run 169
+   (see "In flight"); confirm it covered the 17 files as they are now.
+2. Commit the uncommitted work.
+3. The cleanup queue in `docs/dev/DEBT-PLAN.md`.
+4. The container setup for running the editor and agents (the plan's Track R).
+
+### Waiting on you
+
+- **Accept or reject this pass's document edits.**
+- **The 17 uncommitted files are more than one piece of work.** Split them
+  before committing, or commit them together?
+- **Which Go version is right?** CI pins 1.24 (`.github/workflows/ci.yml:20`);
+  `go.mod:3` says 1.25.0.
+- **Where should a merge request point when the branch has no upstream?**
+  Today the publish script has nothing to fall back on (`docs/TODO.md`, the
+  publish artifact review).
+- **Should rejecting a text change remove the text in one step?** Today
+  rejecting marks it and a second step clears it.
+- **One open question looks already answered by the code.** The plan asks
+  whether you want the workspace trash or a key that puts the last deleted file
+  back. The tree has both. If that is what you wanted, the question can go.
+
+## Background: the goal review of 2026-09-23
+
+Everything from here down was written 2026-09-23 as a review artifact, not a
+commitment. It is kept for the reasoning. Where a status line below disagrees
+with "Where we are" above, the section above is right.
 
 ## The goal
 
@@ -35,15 +121,8 @@ The three services deliver it: `HOOKS-SPEC.md` runs and gates the actions,
 
 ## 1. Where each thread stands
 
-| Thread | Status | Artefact |
-| --- | --- | --- |
-| Layered proposals | Spec'd (draft 2026-09-11 + §12 decisions); phase 0 persistence landed; the invalid-set Phase 1c gaps landed (2026-09-23) | `docs/LAYERED-PROPOSALS-SPEC.md`, `TODO` Now |
-| Hooks (host commands) | Spec written 2026-09-23, awaiting review | `docs/HOOKS-SPEC.md` |
-| Git compatibility | Spec carved 2026-09-23 (`GIT-COMPATIBILITY.md`); the hook sketch is the iteration point | `docs/GIT-COMPATIBILITY.md` |
-| Change organisation | Spec carved 2026-09-23 (`CHANGES-ORGANIZATION.md`): intentions, tension, export, publish, summon, resolve | `docs/CHANGES-ORGANIZATION.md` |
-| Workspace / multi-ticket / multi-agent | Designs exist; the workspace shape is unsettled (`no work trees`) | `HARNESS-BROKER-AGENT.md`, `ATTACH-DESIGN.md` |
-| `TODO` Now list | 5 open items (phone profile, save-review lag, shape-only external edit, hover panel, …) | `docs/TODO.md` |
-| Career / marketing | Separate track, not this repo | jobsearch notes |
+The table that stood here was dated 2026-09-23 and is replaced by "Where we
+are" at the top of this file.
 
 ## 2. The convergence
 
@@ -107,11 +186,80 @@ that implements it is scheduled.
 
 ## Direction: harness adapters and multi-harness recursion
 
-Carved into `docs/HARNESS-ADAPTERS.md` (2026-09-24): the adapter contract, the
+Carved into `docs/dev/HARNESS-ADAPTERS.md` (2026-09-24): the adapter contract, the
 stage/hook recursion and the convergence feature. The sequencing below still
 applies.
 
+## Direction: workspace host, attach and concurrent views
+
+Folded from `docs/ATTACH-DESIGN.md` (2026-10-01); the source design note is
+archived. One workspace-scoped **host** owns the model; later `raj` instances
+attach to it rather than starting a second editor. Detach/reattach is the
+mobile story (an SSH drop or a screen lock becomes a detach, not a lost
+session) and concurrent clients are the phone-and-laptop story. Stage 2 has
+landed as a **local-render client**: `raj --attach` loads the daemon's tabs
+from `snapshot`, follows `watch`, and owns its cursor and viewport but no model
+(`internal/app/client.go`); decisions proxy back. Concurrent views (stage 3)
+and detach/reattach remain unscheduled.
+
+- **The host is an explicit daemon (decided 2026-09-18).** `raj --daemon` runs a
+  workspace headless and owns the model, session and control socket with no
+  terminal, so agents can drive it and clients can attach. `--visible DIR`
+  (repeatable, or `--workspace DIR`) scopes what the workspace exposes.
+- **Discovery.** A second `raj` in the same workspace finds the host; a stale
+  socket is told apart from a live one by a handshake, not by mtime. The socket
+  lives under `$XDG_RUNTIME_DIR/raj/`, keyed by the workspace state key.
+- **`--attach` means mirror the daemon (decided 2026-09-20).** There is no
+  review-tabs mode: an attached client mirrors the daemon's real tabs
+  continuously, adopts any host buffer holding a pending change set, and keeps
+  both current. The `--review-tabs` flag and
+  `Options.ReviewTabs`/`ReviewTabsSet` are removed; `ProfileFlags(phone,
+  ctrlAliases, ctrlAliasesSet)` resolves only the
+  `--phone`-implies-`--ctrl-aliases` rule.
+- **A local client close is a snooze, not a mute (decided 2026-09-20).** It
+  hides the tab until that buffer's facts (version or review state) change,
+  then it returns. Closed marks are per client and saved with the per-client
+  view, with a legacy list-of-paths fallback that re-adds the path because it
+  carries no facts to match.
+- **The phone profile puts review first:** the queue of pending change sets, a
+  compact diff and a decision row, with printable-key commands, never a chord
+  or a swipe.
+- **Stage 3 — concurrent views (unscheduled).** Option B (thin clients render
+  locally and sync through ops, each owning its cursor, viewport and
+  projection) or option C (one host, many sized views at per-client sizes),
+  only after the input/render protocol exists and has been lived with. A
+  second *writer* is not the hard part; a second *viewer* is. Per-client
+  viewports and projections are a renderer project, not plumbing.
+- **What that stage needs:** detach/reattach with the model untouched;
+  input/render channels and per-client size; agents keep the control socket
+  while a client is attached, and a host with no client still runs; the local
+  Unix socket stays the trust boundary (a TCP attach is a separate decision).
+
+Open questions (from the source; none scheduled):
+
+- **Socket home.** `XDG_RUNTIME_DIR` (per-login, cleared on logout) versus the
+  XDG state dir (survives). A stale socket must fail loudly, not hang.
+- **Host with no client.** Keep owning the model for agents, or exit?
+- **One client or many** in v1. One with a clear refusal is the safe default; a
+  read-only mirror is the cheap second step.
+- **Detach gesture.** A chord on the laptop, a motion on the phone — the
+  motions probe is what tells us which gesture is available.
+- **TCP attach.** A remote console is a different security posture; do not
+  assume it.
+- **Startup.** `raj` becomes the host when none exists and `raj --attach` fails
+  when none does. Whether the host is the process that owns a client terminal
+  or a separate daemon was the first thing to decide; 2026-09-18 resolved it as
+  the daemon.
+
+Not in scope: tmux parity (windows, panes), remote multi-host, collaborative
+cursors, and session branching/forking.
+
 ## 4. Sequencing (dependency order)
+
+Checked 2026-10-01: steps 1 to 3 are built, not ahead of us. Step 1 is the
+`internal/git` package and `raj ctl git`; step 2 is `raj hook`; step 3 is the
+`internal/intent` package. Step 4 is still undecided. The list is left as
+written.
 
 0. **Soundness first — done (2026-09-23).** The invalid-set Phase 1c gaps are
    closed: an invalid set is named, counted and disposed, and a save disposes
@@ -157,6 +305,11 @@ across all history.
   discovery fix has a concrete shape.
 
 ## 5. Decisions needed before implementation
+
+Checked 2026-10-01: questions 1 and 5 have been overtaken by the work (hooks
+and seams are built, and a hook runs on a materialised tree). No dated answer
+from the owner was found for questions 3 and 4, so they are left open as
+written.
 
 1. Confirm **organising changes** as the next push, ahead of the `TODO` Now bugs
    and the phone profile.

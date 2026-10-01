@@ -1,10 +1,11 @@
 # File lifecycle — design note and verb spec
 
 Status: built 2026-09-13/14 (rebuilt and host-verified). Companion to
-`docs/CLAIM-SPEC.md` (the claim gate the lifecycle verbs are gated on). W4a
+`docs/archive/CLAIM-SPEC.md` (the claim gate the lifecycle verbs are gated
+on). W4a
 (`mkdir`), W4b (`delete` + prompt gate + `RAJ_TRASH`) and W4c-1 (`rename`/`mv`
-for files) are in the binary; W4c-2 (`rmdir`/folder deletion) and directory
-rename remain.
+for files) are in the binary; W4c-2 (`rmdir`/folder deletion) is also in the
+binary; directory rename remains (folded to `docs/TODO.md`, 2026-10-01).
 
 ## 1. Scope and staging
 
@@ -13,9 +14,9 @@ rename remain.
 - **W4b `delete <path>`** — a *review primitive* (this note). A file is not
   unlinked until the user approves, because a deletion has no text-diff
   representation and is not recoverable like an edit.
-- **W4c `rename`/`rmdir`** — W4c-1 (`rename` files) landed 2026-09-14; W4c-2
-  (`rmdir`/folder deletion) remains deferred. Both reason about open buffers,
-  so `rmdir` gets its own pass.
+- **W4c `rename`/`rmdir`** — W4c-1 (`rename` files) landed 2026-09-14, and
+  W4c-2 (`rmdir`/folder deletion) has since landed too. Both reason about open
+  buffers, so `rmdir` had its own pass.
 
 ## 2. Pending deletions
 
@@ -72,22 +73,23 @@ rename remain.
 - `delete` is a socket write of a path, not of text; it must still run through
   the `Guard` so `run --prog` cannot bypass the claim check.
 
-## 6. Verb surface (built — delete/deletions; rmdir in §11)
+## 6. Verb surface (built — delete/deletions and rmdir; §11)
 
 - `raj ctl delete <path>` — record a pending deletion (claim-gated).
 - `raj ctl delete --withdraw <path>` — withdraw a pending removal; a human may
   withdraw any, an agent only its own.
 - `raj ctl deletions` — list pending deletions (path, author), so a driver
   can see them without opening the file. (A timestamp is a later nicety.)
-- Approval is the **human prompt** (section 3). No socket accept/reject in v1:
-  the whole point is that the human, on seeing the file, decides.
+- Approval is the **human prompt** (section 3), or the human-only
+  `delete --approve` for an attached client; the whole point is that the human,
+  on seeing the file, decides.
 - `run --prog` reachability is out of scope for v1 (as with `mkdir`).
 
 ## 7. Folders
 
-- Specced 2026-09-14 as `rmdir` (section 11); the review "tab" won out over the
-  earlier review-mode popup sketch. A read-only tab lists the subtree and a
-  footer offers `[remove] [cancel]`.
+- Specced 2026-09-14 and since built as `rmdir` (section 11); the review "tab"
+  won out over the earlier review-mode popup sketch. A read-only tab lists the
+  subtree and a footer offers `[remove] [cancel]`.
 
 ## 8. Work items
 
@@ -100,7 +102,7 @@ rename remain.
 4. `RAJ_TRASH=1` -> `.raj/trash/`.
 5. Docs: skill and README.
 
-## 9. Open questions
+## 9. Open questions (folded to `docs/TODO.md`, 2026-10-01)
 
 - A permanent dismiss/reject answer (v1 is Ignore only).
 - Whether a driver should ever be able to accept/reject over the socket, or the
@@ -131,7 +133,7 @@ Staged: **W4c-1 files**, then W4c-2 directories. `rename <old> <new>` (alias
   dst)`, since on such a filesystem the new spelling resolves to the source.
 - Not open -> plain `os.Rename`.
 
-## 11. W4c-2 — `rmdir` (specced 2026-09-14; to be built)
+## 11. W4c-2 — `rmdir` (specced 2026-09-14; built)
 
 `rmdir` is `delete` widened from a file to a directory: the same propose-then-
 review discipline, the same pending-state shape, the same prompt-gate question,
@@ -145,9 +147,9 @@ than a one-file prompt.
 - `raj ctl rmdir --withdraw <dir>` — withdraw a pending removal; a human may
   withdraw any, an agent only its own; no-op when absent.
 - `raj ctl rmdirs` — list pending dir-removals (dir, author).
-- Approval is the human **remove** answer in the review tab; no socket
-  accept/reject in v1. `run --prog` reachability is out of scope, as with
-  `mkdir`/`delete`.
+- Approval is the human **remove** answer in the review tab, or the human-only
+  `rmdir --approve` for an attached client; no agent may pass it. `run --prog`
+  reachability is out of scope, as with `mkdir`/`delete`.
 
 **Claim gate.** `claim <dir>` records the directory path as a set entry and
 also walks the subtree to claim each file under it (a snapshot at claim time —
@@ -155,7 +157,7 @@ a file created under the dir afterwards is not auto-claimed). `rmdir <dir>` is
 one `claimCheck` on the directory itself. Decision 1, option (a)-with-auto-
 expand, over "every file
 individually claimed" (onerous) and over ungated (unsafe); the same choice is
-recorded in `docs/CLAIM-SPEC.md` §3.
+recorded in `docs/archive/CLAIM-SPEC.md` §3.
 
 **Pending dir-removals** are workspace-level, in-memory, per author, keyed by
 directory path — a sibling map to `pendingDeletions`, since the unit is a
@@ -179,5 +181,6 @@ unit); any other value, or unset, is `os.RemoveAll`. Open buffers under the
 tree are dropped the way `closeDeletedPane` drops a deleted file buffer, and
 the tree and session are refreshed.
 
-**Left for later.** Per-entry (partial) removal; a permanent dismiss answer; a
-socket accept/reject; `run --prog` reachability; directory rename.
+**Left for later (folded to `docs/TODO.md`, 2026-10-01).** Per-entry (partial)
+removal; a permanent dismiss answer; a socket accept/reject; `run --prog`
+reachability; directory rename.

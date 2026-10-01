@@ -24,6 +24,7 @@ type groupRef struct {
 	Path   string
 	Task   string
 	Author uint8
+	State  piecetable.GroupState
 }
 
 // Intent answers an `intent` control request. The request and its answer are
@@ -94,10 +95,15 @@ func (a *App) runIntent(ctx context.Context, cmd intent.Command) (intent.Result,
 	case "review":
 		return a.intentReview(ctx, svc, set, cmd)
 
+	case "group":
+		return a.intentGroup(ctx, svc, set, cmd)
+
 	case "materialise":
 		return a.intentMaterialise(ctx, svc, set, cmd)
 	case "export":
 		return a.intentExport(ctx, svc, set, cmd, map[string]bool{})
+	case "next":
+		return a.intentNext(ctx, svc, set, cmd)
 	case "land":
 		return a.intentLand(ctx, svc, cmd)
 	case "publish":
@@ -231,7 +237,7 @@ func (a *App) intentExport(ctx context.Context, svc *git.Service, set intent.Set
 		warn, _ := intent.Drift(ctx, svc, in)
 		return intent.Result{Tree: tree, Parent: base, BaseSHA: base, Warning: warn}, nil
 	}
-	res, err := intent.Export(ctx, svc, in, base, proj)
+	res, err := intent.Export(ctx, svc, in, base, proj, intent.Message{Title: cmd.Title, Body: cmd.Body})
 	if err != nil {
 		return intent.Result{}, err
 	}
@@ -253,6 +259,41 @@ func (a *App) intentExport(ctx context.Context, svc *git.Service, set intent.Set
 	}, nil
 }
 
+// intentNext builds a named seam artifact for the push. It exports the
+// intention through the one export path intent export uses - materialise the
+// members alone over the pinned base, write one inert commit and record the
+// export row - taking the commit title and body from the caller, then reports
+// the branch publish would name and the commit it would carry. It is strand
+// 3.5: it builds the export; the push itself is a separate confirm.
+//
+// An empty seam is refused before anything is written: a commit of nothing
+// would record an artifact with no slice. The message comes over the socket
+// now (--title/--body); the editor-side prompt lands with the seam pane.
+func (a *App) intentNext(ctx context.Context, svc *git.Service, set intent.Set, cmd intent.Command) (intent.Result, error) {
+	in, ok := set[cmd.Name]
+	if !ok {
+		return intent.Result{}, fmt.Errorf("intent next: no such intention %q", cmd.Name)
+	}
+	if len(in.Members) == 0 {
+		return intent.Result{}, fmt.Errorf("intent next: intention %q has no members, so there is no artifact to export", cmd.Name)
+	}
+	res, err := a.intentExport(ctx, svc, set, cmd, map[string]bool{})
+	if err != nil {
+		return intent.Result{}, err
+	}
+	return intent.Result{
+		Warning: res.Warning,
+		Next: &intent.Next{
+			Name:    in.Name,
+			Branch:  intent.BranchForWave(in.Name),
+			Commit:  res.Commit,
+			Parent:  res.Parent,
+			BaseSHA: res.BaseSHA,
+			Tree:    res.Tree,
+		},
+	}, nil
+}
+
 // baseCommit resolves in's base to the commit its ref pinned at creation. An
 // intention's base is a ref only (no stacks: one MR per wave); a row without a
 // pinned SHA falls back to reading the ref now.
@@ -260,7 +301,11 @@ func (a *App) baseCommit(ctx context.Context, svc *git.Service, in intent.Intent
 	if in.BaseSHA != "" {
 		return in.BaseSHA, nil
 	}
-	return svc.RevParse(ctx, in.Base)
+	sha, err := svc.RevParse(ctx, in.Base)
+	if err != nil {
+		return "", fmt.Errorf("intent: %s: base %q does not resolve to a commit: %w", in.Name, in.Base, err)
+	}
+	return sha, nil
 }
 
 // resolveBaseCommit is DEFERRED (no stacks: one MR per wave): it resolves an
@@ -541,7 +586,7 @@ func (a *App) allGroups() []groupRef {
 			continue
 		}
 		for _, g := range pane.File.Session().Groups() {
-			out = append(out, groupRef{ID: g.ID, Path: pane.File.Path, Task: g.Task, Author: uint8(g.Author)})
+			out = append(out, groupRef{ID: g.ID, Path: pane.File.Path, Task: g.Task, State: g.State, Author: uint8(g.Author)})
 		}
 	}
 	return out
@@ -583,4 +628,209 @@ func intentionToRow(in intent.Intention) store.IntentionRow {
 		Members: members,
 		State:   string(in.State), BaseSHA: in.BaseSHA, Created: in.Created.UnixMilli(),
 	}
+}
+
+// intentGroup creates or extends a seam from one task's change sets. It is the
+// review agent's grouping gesture (Q16): the task is the seam's reason (Q1), so
+// `intent group NAME --task T` takes the task's pending sets across the
+// workspace, each qualified by its buffer path.
+//
+// Scope is PENDING (Proposed) sets only: a grouping pass runs before approval
+// and groups the proposals still awaiting a decision, so an accepted or
+// rejected set is reported as not-pending rather than re-opened. It is
+// idempotent -- a re-run adds nothing and reports the same members -- and it
+// never guesses a dependency: a set already in another seam is reported, not
+// moved, and two seams that touch one file are reported as an overlap, never
+// stacked (Q10).
+func (a *App) intentGroup(ctx context.Context, svc *git.Service, set intent.Set, cmd intent.Command) (intent.Result, error) {
+	if cmd.Name == "" {
+		return intent.Result{}, errors.New("intent group: needs a name")
+	}
+	if cmd.Task == "" {
+		return intent.Result{}, errors.New("intent group: needs --task T; a seam is one task's sets")
+	}
+	if len(cmd.Members) > 0 || len(cmd.Groups) > 0 {
+		return intent.Result{}, errors.New("intent group: takes a task, not explicit members")
+	}
+	existing, exists := set[cmd.Name]
+	if exists && existing.Task != "" && existing.Task != cmd.Task {
+		return intent.Result{}, fmt.Errorf("intent group: %q is the task %q and cannot also be %q", cmd.Name, existing.Task, cmd.Task)
+	}
+	// A task with no sets at all has nothing to group: refuse by name rather
+	// than create an empty seam nobody can explain.
+	var refs []groupRef
+	for _, g := range a.allGroups() {
+		if g.Task == cmd.Task {
+			refs = append(refs, g)
+		}
+	}
+	if len(refs) == 0 {
+		return intent.Result{}, fmt.Errorf("intent group: task %q has no change sets to group", cmd.Task)
+	}
+
+	// A set another seam already names is not this seam's to move, however the
+	// task reads. A bare member (no path) is the same set when this buffer
+	// numbers its id, so it counts too.
+	held := map[intent.Member]string{}
+	heldBare := map[uint64]string{}
+	for name, in := range set {
+		if name == cmd.Name {
+			continue
+		}
+		for _, m := range in.Members {
+			if m.Path == "" {
+				if prev, ok := heldBare[m.ID]; !ok || name < prev {
+					heldBare[m.ID] = name
+				}
+				continue
+			}
+			if prev, ok := held[m]; !ok || name < prev {
+				held[m] = name
+			}
+		}
+	}
+	// Two live panes numbering the same {id, path} cannot be told apart, so the
+	// member is refused rather than resolved to one of them.
+	count := map[intent.Member]int{}
+	for _, g := range refs {
+		if m, ok := a.memberFor(g); ok {
+			count[m]++
+		}
+	}
+
+	group := intent.Grouping{Name: cmd.Name, Task: cmd.Task, Created: !exists, DryRun: cmd.DryRun}
+	for _, g := range refs {
+		m, ok := a.memberFor(g)
+		if !ok || count[m] > 1 {
+			group.Skipped = append(group.Skipped, intent.Skip{
+				Member: intent.Member{ID: g.ID},
+				Reason: intent.SkipAmbiguousPath,
+			})
+			continue
+		}
+		if existing.Has(m) {
+			continue // already a member: a re-run adds nothing
+		}
+		if seam, ok := held[m]; ok {
+			group.Skipped = append(group.Skipped, intent.Skip{Member: m, Reason: intent.SkipOtherSeam, Seam: seam})
+			continue
+		}
+		if seam, ok := heldBare[m.ID]; ok {
+			group.Skipped = append(group.Skipped, intent.Skip{Member: m, Reason: intent.SkipOtherSeam, Seam: seam})
+			continue
+		}
+		if g.State != piecetable.Proposed {
+			group.Skipped = append(group.Skipped, intent.Skip{Member: m, Reason: intent.SkipNotPending, State: g.State.String()})
+			continue
+		}
+		group.Added = append(group.Added, m)
+	}
+	group.Members = append(append([]intent.Member(nil), existing.Members...), group.Added...)
+	group.Changed = len(group.Added) > 0
+	group.Overlaps = seamOverlaps(group.Members, set, cmd.Name)
+
+	// The base: an existing seam keeps the base it was pinned to, a new one
+	// takes --ref or auto-detects the primary branch. A base that names another
+	// intention would be a stack, which is deferred, so it is refused rather
+	// than guessed.
+	base := cmd.Base
+	baseSHA := ""
+	if exists {
+		base, baseSHA = existing.Base, existing.BaseSHA
+		if cmd.Base != "" && cmd.Base != existing.Base {
+			return intent.Result{}, fmt.Errorf("intent group: %q is over base %q; --ref %q cannot move it", cmd.Name, existing.Base, cmd.Base)
+		}
+	} else {
+		if base == "" {
+			detected, err := a.detectBaseRef(ctx, svc)
+			if err != nil {
+				return intent.Result{}, err
+			}
+			base = detected
+		}
+		if _, ok := set[base]; ok {
+			return intent.Result{}, fmt.Errorf("intent group: base %q names an intention; a stacked seam is deferred, so pass a git ref", base)
+		}
+		sha, err := svc.RevParse(ctx, base)
+		if err != nil {
+			return intent.Result{}, fmt.Errorf("intent group: base %q does not resolve to a commit: %w", base, err)
+		}
+		baseSHA = sha
+	}
+	group.Base, group.BaseSHA = base, baseSHA
+
+	if cmd.DryRun {
+		return intent.Result{Group: &group}, nil
+	}
+	if exists {
+		existing.Add(group.Added...)
+		if existing.Task == "" {
+			existing.Task = cmd.Task
+		}
+		if err := a.state.PutIntention(intentionToRow(existing)); err != nil {
+			return intent.Result{}, err
+		}
+		return intent.Result{Group: &group}, nil
+	}
+	in := intent.New(cmd.Name, cmd.Owner, base, baseSHA, group.Added, time.Now())
+	in.Task = cmd.Task
+	if err := a.state.PutIntention(intentionToRow(in)); err != nil {
+		return intent.Result{}, err
+	}
+	return intent.Result{Group: &group}, nil
+}
+
+// detectBaseRef names the seam's base when the caller gives no --ref: the
+// current branch's upstream leaf, then the checked-out branch. It never
+// hardcodes a trunk name (Q9).
+func (a *App) detectBaseRef(ctx context.Context, svc *git.Service) (string, error) {
+	if up, err := svc.Upstream(ctx); err == nil && up != "" {
+		if i := strings.LastIndex(up, "/"); i >= 0 && i+1 < len(up) {
+			return up[i+1:], nil
+		}
+		return up, nil
+	}
+	view, err := svc.View(ctx)
+	if err != nil {
+		return "", fmt.Errorf("intent group: no --ref and no primary branch to detect: %w", err)
+	}
+	if view.Branch != "" {
+		return view.Branch, nil
+	}
+	return "", errors.New("intent group: no --ref and no primary branch to detect; pass --ref BASE")
+}
+
+// seamOverlaps names every file this seam touches that another seam also
+// touches. It reports only: the plan's rule is that a legitimate conflict is a
+// review agent's job to catch, so an overlap is never silently stacked (Q10).
+func seamOverlaps(members []intent.Member, set intent.Set, self string) []intent.Overlap {
+	paths := make(map[string]bool, len(members))
+	for _, m := range members {
+		paths[m.Path] = true
+	}
+	var out []intent.Overlap
+	seen := map[intent.Overlap]bool{}
+	for name, in := range set {
+		if name == self {
+			continue
+		}
+		for _, m := range in.Members {
+			if m.Path == "" || !paths[m.Path] {
+				continue
+			}
+			o := intent.Overlap{Path: m.Path, Seam: name}
+			if seen[o] {
+				continue
+			}
+			seen[o] = true
+			out = append(out, o)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return out[i].Seam < out[j].Seam
+	})
+	return out
 }

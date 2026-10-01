@@ -131,8 +131,8 @@ func TestRemoveForeverRemovesDirAndClosesBuffers(t *testing.T) {
 	}
 }
 
-// RAJ_TRASH=1 moves the whole directory into the workspace trash under a
-// timestamped name, recoverable as a unit, instead of removing it.
+// A removal moves the whole directory into the workspace trash under a
+// timestamped name, recoverable as a unit.
 func TestRemoveForeverTrashesDir(t *testing.T) {
 	t.Setenv("RAJ_TRASH", "1")
 	h := newHarness(t, "hello\n")

@@ -103,7 +103,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   recv                       wait for the user, or a peer, to say something, then print it; --peers-only drops the editor's notices and keeps waiting for a person or peer
   send --to WHO [TEXT]       message another agent: WHO is a key, name, id or all; --text-file - reads stdin
   groups [path]              change sets in a buffer, and their state; --task T lists one task's sets across the workspace, each qualified by its buffer path
-  intent SUBCOMMAND          intentions over a base: new|add|remove|list|show|export|materialise|diff|review|publish|prove; --ref is the base, --group/positional ids are members, --task selects a task's groups; export writes objects only and moves no ref; prove materialises a named intention alone over its base and runs the check hook; diff prints that slice as a stat and unified diff; review opens it as one read-only diff tab per file; publish takes --approve or --withdraw
+  intent SUBCOMMAND          intentions over a base: new|add|remove|list|show|export|materialise|diff|review|next|publish|prove|group; --ref is the base, --group/positional ids are members, --task selects a task's groups or names the task group builds a seam from; group creates or extends that seam from the task's pending sets, idempotently, and reports the sets it did not take and the files another seam shares, never stacking; export writes objects only and moves no ref; next exports the artifact and reports the branch and commit it would push (--title/--body); prove materialises a named intention alone over its base and runs the check hook; diff prints that slice as a stat and unified diff; review opens it as one read-only diff tab per file; publish takes --approve or --withdraw
 
   accept [path] --group N    agree to a change set; --all for the buffer's pending ones, --all --everywhere for the workspace's
   reject [path] --group N    mark a set rejected; --all for the buffer's pending ones, --all --everywhere for the workspace's
@@ -269,6 +269,8 @@ type ctlOpts struct {
 	task         string
 	intentRef    string
 	intentDryRun bool
+	intentTitle  string
+	intentBody   string
 	dir          string
 	projected    bool
 	query        searchPatternFlag
@@ -350,10 +352,12 @@ func (o *ctlOpts) bind(fs *flag.FlagSet) {
 	fs.Uint64Var(&o.dumpID, "dump", 0, "patch: the snapshot id, from dump")
 	fs.StringVar(&o.identity, "as", "", "identity to write as; the same one reconnecting keeps its author id")
 	fs.StringVar(&o.name, "name", "", "display name for this participant")
-	fs.StringVar(&o.task, "task", "", "the work this connection's writes belong to, stored on the participant; groups: only sets opened under it")
+	fs.StringVar(&o.task, "task", "", "the work this connection's writes belong to, stored on the participant; groups: only sets opened under it; intent group: the task whose sets become the seam")
 
-	fs.StringVar(&o.intentRef, "ref", "", "intent new/land: the base ref (publish uses the export's parent)")
-	fs.BoolVar(&o.intentDryRun, "dry-run", false, "intent materialise: report the tree without recording an export")
+	fs.StringVar(&o.intentRef, "ref", "", "intent new/group/land: the base ref (publish uses the export's parent); group auto-detects the primary branch when omitted")
+	fs.BoolVar(&o.intentDryRun, "dry-run", false, "intent materialise/group: report without recording anything")
+	fs.StringVar(&o.intentTitle, "title", "", "intent next: the artifact commit title line; empty uses the intention name")
+	fs.StringVar(&o.intentBody, "body", "", "intent next: the artifact commit body")
 	fs.StringVar(&o.dir, "dir", "", "exec: directory to run in, inside the workspace")
 	fs.BoolVar(&o.projected, "projected", false, "exec: run against a materialised projection of the live buffers instead of the worktree")
 	fs.Var(&o.query, "q", "search: the pattern; repeatable, one pattern per -q, any pattern may match")
@@ -649,7 +653,7 @@ var ctlVerbs = map[string]ctlVerb{
 	}},
 	"stats": {run: statsCmd},
 	"intent": {operand: "SUBCOMMAND [NAME] [GROUPS...]", run: func(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
-		return intentCmd(c, o.fs.Args(), o.groupArgs, o.intentRef, o.intentDryRun, o.taskVal, o.approve, o.withdraw, o.asJSON, stdout, stderr)
+		return intentCmd(c, o.fs.Args(), o.groupArgs, o.intentRef, o.intentDryRun, o.taskVal, o.approve, o.withdraw, o.intentTitle, o.intentBody, o.asJSON, stdout, stderr)
 	}},
 	"groups": {operand: "[path]", run: groupsCmd},
 	"accept": {operand: "[path]", run: decideCmdRun},
@@ -3217,15 +3221,16 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 // intentCmd runs one `raj ctl intent` subcommand. The request and its answer
 // are a JSON payload on the intent op, which the host resolves against the live
 // buffers and the workspace store.
-func intentCmd(c *Client, args []string, groupArgs groupFlag, ref string, dryRun bool, task string, approve, withdraw, asJSON bool, stdout, stderr io.Writer) int {
+func intentCmd(c *Client, args []string, groupArgs groupFlag, ref string, dryRun bool, task string, approve, withdraw bool, title, body string, asJSON bool, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "raj ctl intent: needs a subcommand: new, add, remove, list, show, export, materialise, diff, review, publish, prove")
+		fmt.Fprintln(stderr, "raj ctl intent: needs a subcommand: new, add, remove, list, show, export, materialise, diff, review, next, publish, prove, group")
 		return 2
 	}
 	cmd := intent.Command{
 		Mode: args[0],
 		Base: ref, Task: task, DryRun: dryRun,
 		Approve: approve, Withdraw: withdraw,
+		Title: title, Body: body,
 	}
 	rest := args[1:]
 	if cmd.Mode != "list" {
@@ -3255,6 +3260,20 @@ func intentCmd(c *Client, args []string, groupArgs groupFlag, ref string, dryRun
 			fmt.Fprintf(stderr, "raj ctl intent %s: needs at least one group id\n", cmd.Mode)
 			return 2
 		}
+	}
+	if cmd.Mode == "group" {
+		if cmd.Task == "" {
+			fmt.Fprintln(stderr, "raj ctl intent group: needs --task T; a seam is one task's sets")
+			return 2
+		}
+		if len(groupArgs.entries) > 0 || len(rest) > 0 {
+			fmt.Fprintln(stderr, "raj ctl intent group: takes a task, not --group or positional ids")
+			return 2
+		}
+	}
+	if cmd.Mode == "next" && len(rest) > 0 {
+		fmt.Fprintf(stderr, "raj ctl intent next: unexpected argument %q; pass the commit message with --title and --body\n", rest[0])
+		return 2
 	}
 	if cmd.Mode == "publish" {
 		if approve && withdraw {
@@ -3286,6 +3305,15 @@ func intentCmd(c *Client, args []string, groupArgs groupFlag, ref string, dryRun
 		return emit(stdout, out)
 	}
 	return printIntent(out, cmd.Mode, stdout)
+}
+
+// memberString renders a qualified member the way --group accepts it: PATH=N,
+// or a bare N when the member carries no path.
+func memberString(m intent.Member) string {
+	if m.Path != "" {
+		return fmt.Sprintf("%s=%d", m.Path, m.ID)
+	}
+	return fmt.Sprintf("%d", m.ID)
 }
 
 // printIntent renders an intent result for a person: one line for a listing, a
@@ -3370,6 +3398,44 @@ func printIntent(out intent.Result, mode string, stdout io.Writer) int {
 		for _, p := range out.Review.Files {
 			fmt.Fprintln(stdout, p)
 		}
+	case "group":
+		if out.Group == nil {
+			return 0
+		}
+		g := out.Group
+		what := "extended"
+		if g.Created {
+			what = "created"
+		}
+		if g.DryRun {
+			fmt.Fprintf(stdout, "dry run: would %s seam %s over %s (%d added, %d skipped)\n",
+				what, g.Name, g.Base, len(g.Added), len(g.Skipped))
+		} else {
+			fmt.Fprintf(stdout, "%s seam %s over %s (%d added, %d skipped)\n",
+				what, g.Name, g.Base, len(g.Added), len(g.Skipped))
+		}
+		for _, m := range g.Members {
+			fmt.Fprintf(stdout, "  member %s\n", memberString(m))
+		}
+		for _, s := range g.Skipped {
+			switch {
+			case s.Seam != "":
+				fmt.Fprintf(stdout, "  skipped %s: %s (in seam %s)\n", memberString(s.Member), s.Reason, s.Seam)
+			case s.State != "":
+				fmt.Fprintf(stdout, "  skipped %s: %s (%s)\n", memberString(s.Member), s.Reason, s.State)
+			default:
+				fmt.Fprintf(stdout, "  skipped %s: %s\n", memberString(s.Member), s.Reason)
+			}
+		}
+		for _, o := range g.Overlaps {
+			fmt.Fprintf(stdout, "  overlap %s: also in seam %s\n", o.Path, o.Seam)
+		}
+	case "next":
+		if out.Next == nil {
+			return 0
+		}
+		n := out.Next
+		fmt.Fprintf(stdout, "branch %s\ncommit %s\nbase %s\n", n.Branch, n.Commit, n.BaseSHA)
 	case "prove":
 		for _, pr := range out.Proofs {
 			fmt.Fprintf(stdout, "%s\t%s\n", pr.Check, pr.Name)

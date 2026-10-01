@@ -241,10 +241,10 @@ func (a *App) promptDirRemoval(d control.DirRemoval) {
 	a.Prompt.Review("Remove directory", msg, rows, options, nil, done)
 }
 
-// removeDirDeleted carries out a Remove forever answer: the directory leaves
-// its place on disk -- RemoveAll-ed, or moved to the trash under RAJ_TRASH=1 --
-// every open buffer inside it is dropped, the proposal is cleared, and the tree
-// is refreshed so the names are gone from it too.
+// removeDirDeleted carries out a Remove forever answer: the whole directory is
+// moved into the workspace trash, every open buffer inside it is dropped, the
+// proposal is cleared, and the tree is refreshed so the names are gone from it
+// too.
 //
 // A failed removal keeps the proposal rather than dropping buffers whose files
 // are still there; the next proposal asks again.

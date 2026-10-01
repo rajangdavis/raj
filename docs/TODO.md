@@ -8,12 +8,42 @@ if it needs the history it belongs in a spec or INVESTIGATIONS.
 
 ## Now
 
-Nothing active. The phone profile is largely in place and the save-review lag no longer reproduces (2026-09-27); the open work is in Later, below.
+Nothing is listed here on purpose. What is live, in flight, next and waiting on the owner is in `docs/NEXT-STEPS.md` ("Where we are"); this file is the backlog only.
 
 ## Later
 
 One line per item, grouped by theme; nothing here is scheduled. Numbers live in
 BENCHMARKS.md and decisions in INVESTIGATIONS.md.
+
+### Hooks — a projected check cannot see shell scripts (2026-09-30, user)
+
+- **`make check` skips `sh-parse` and `shellcheck` in a projected tree.** Both
+  lint the tracked shell scripts (`git ls-files` filtered to `*.sh`), and a
+  scratch tree has no `.git`, so a projected run prints "no tracked shell
+  scripts" and passes — while the workspace `cycle` lints them and can fail.
+  That is what happened on 2026-09-30: strand 3.5 went through check run 162
+  green, then cycle 163 died at `shellcheck` (SC1007 in
+  `examples/hooks/no-ignored-source.test.sh`). A full cycle afterwards, run
+  169, reported check and build ok (reported by the orchestrator 2026-10-01;
+  the reviewer cannot read the run log), so that line is not failing now. The
+  blind spot is still there. Fix one of: give the projected tree enough git
+  provenance for its tracked-file query to answer, or have the projected check
+  lint the workspace's tracked scripts directly (they are pinned to the
+  accepted tree anyway, per H7). *A gate that skips half its work in the tree
+  agents verify is the half that bites at the cycle.*
+
+### Harness — measure call counts, do not ask for them (2026-09-30, user)
+
+- **Self-reported call counts are wrong in both directions.** The `raj-gate`
+  ledger (`~/.local/share/opencode/raj-tool-ledger.jsonl`) records every tool
+  call with its session id, so the true number is a query away; but every brief
+  asks the agent for "your call count" and the agent estimates. One wave of
+  evidence: G1 said ~95, measured **203** (2.1x under); G3 said ~180, measured
+  216; the Track G reviewer said ~146, measured 121. The tool-budget discipline
+  is built on these numbers, so the orchestrator should read them from the
+  ledger by session id and report the measured figure. `call-runs.mjs` is not
+  the answer here: it cannot read this container's `opencode.db` (no `part`
+  table), so the ledger is the only reliable source.
 
 ### Hooks — see a run while it runs (2026-09-30, user)
 
@@ -47,12 +77,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 
 ### Owner gestures (Track G) — review fallout (2026-09-30)
 
-- **Delete the dead `proposeDeleteFile`/`proposeRemoveFolder`.** G1 left them
-  in `internal/app/menu.go` when a deletion-only change could not be verified
-  through the hook's projected tree; the projection is now pinned by
-  `TestProjectAppliesProposedDeletion`, so they are removable — along with the
-  `piecetable` import that is their last use — once that test is green on the
-  host.
 - **The generated keybinding reference omits `Native` chords.** `keys.Doc()`
   renders only `Bindings` + `Reclaim`, so the new waiting-list chord
   `ctrl+alt+v` (`keys.ReviewProposed`, a Native) has no `docs/KEYBINDINGS.md`
@@ -111,22 +135,10 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   and the attachment model (loaded vs announced, headless read).
 
 ### Editor and LSP
-- **In-file find & replace is the next wave.** The find bar is live; the
-  replace half, its chords and its undo story are the intended next step.
-  *The next wave has its item on the list.*
 - Symbols are found by leading keyword, not parsed; per-language scanning is the
   next step (tree-sitter is the direction).
 - The reserved-chord tables are short; extend them whenever another collision is
   found the hard way.
-- **The `super+comma` keys in the macOS reserved/terminal test maps never
-  match the bound chord `super+,`, so the settings chord slips both guards.**
-  `internal/keys/table.go` binds `super+,` (the cmd+comma Preferences chord,
-  reclaimed with a `kkp_on` line) while `internal/keys/macos_test.go` keys
-  `reserved` and `terminal` on `super+comma`; `TestNoMacOSSystemShortcuts` and
-  `TestTerminalDefaultsAreAcknowledged` are vacuous for it. Decide whether
-  cmd+comma is reclaimable — fix the key to `super+,` and drop it from the
-  macOS-reserved set (its note already acknowledges the terminal) — or move the
-  chord. *A reserved-chord guard that cannot see the chord is not a guard.*
 - Autoscroll at the 150 ms idle tick is visibly stepped; a faster tick while a
   drag is held would smooth it.
 - A press on a list does not drag it; rubber-band selection and drag-to-reorder
@@ -217,7 +229,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 
 ### Saving, buffer and journal
 
-- **A save with pending agent proposals is silent, and it approves them (2026-09-28).** The save gesture *is* the approval, so saving while agents are mid-work accepts their partial proposals with no signal — and the user suspects they have been doing exactly that. Warn before the save when the buffer (or workspace) holds pending sets: name the authors and count, and offer save-anyway / review-first. A non-blocking confirm, never a refusal — a check that can block its own fix is the earlier save-guard deadlock. The surface (in-editor confirm vs a status warning vs a before-gate advisory) is a UX call. *Approval without a look is not a review.*
 - Owner and group are not preserved (needs a root-capable machine: `tmp.Chown`,
   `EPERM` ignored, a root-gated test).
 - `IsBinary` has no production caller; delete it and its test, or document it as
@@ -241,7 +252,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 ### Control socket and agent surface
 
 - **After a daemon restart a named identity can send under a throwaway token key (2026-09-28).** The cycle announced as key `raj-cycle` (author 130) before the restart and closed as the SAME author 130 but under a `tok_...` key after it: the author row survived the restart (L3.3) but the named key did not rebind for the post-restart send, so a reply to the closing report targets a discarded key. Rebind the key on reconnect, or re-hello the `--as` key after a dial failure, or make the client refuse to send under an adopted token when an explicit `--as` was given. *A restart must not change who a name points at.*
-- **Hooks take no arguments; add declared, validated parameters (2026-09-28).** `run` is name-only by design — the agent never supplies argv, env or cwd — so a hook like `cycle` cannot be pointed at one segment, and retrying the announce step means re-running the whole check/build/restart. Extend the contract with DECLARED parameters: the author declares `--param NAME=enum(a,b,c)|string(regex)|uint`, the agent supplies `name NAME=value`, the server validates the value against the declaration and passes it as an environment variable (`RAJ_PARAM_<NAME>`), never as argv. The safety property holds — the agent selects from a declared domain, it does not inject a command — and one `cycle` hook then covers every segment (and split/stack publish, deploy, and the rest). *An agent should name a choice, not a command.* **Done 2026-09-28:** declared, validated parameters landed — a `params` column (store v9->v10), repeatable `raj hook add --param`, `raj hook run <name> NAME=value`, a default making a declared parameter optional so an argument-less caller still runs the hook, and `RAJ_PARAM_<NAME>` delivery to argv, shell, builtin and `steps` actions; `docs/HOOKS-SPEC.md` §1, §2, §3, §4 and §7 updated.
 - **The registry leaks a durable row per anonymous handshake (2026-09-27).** `who` shows 122 participants after a day of agent traffic, most `tok_...` rows: a `raj ctl` invocation that arrives with no identity appears to leave a durable participant row rather than the reserved, row-less id the skill documents, so it grows without bound and inflates `who`/`Drivers()`. Confirm and reap, or make the adopted-token path row-less. *An anonymous handshake is not a participant.*
 - **Mail is confirmed at the next Park, not after the prompt (2026-09-28).** The store marks a batch delivered when the identity parks again, so a reader that exits 0 and dies before prompting the session loses that batch while the daemon lives, and a daemon restart between hand-off and confirm replays it for a duplicate. There is no client ack for the hand-off. Carry the delivered row ids in the recv response and add a `confirm` op the client sends after the prompt succeeds, or let a re-park on the same connection re-request an unconfirmed batch. *A hand-off is not a delivery.*
 - Three nested header strings are still JSON (`DiffJSON`, `LSPJSON`,
@@ -252,8 +262,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   apart.
 - Journal persistence of `claim` remains; the client `watch` push landed (see COMPLETED).
 - Nothing reads the `exec` stale-run counter yet.
-- A cancelled `exec` can orphan children; a process group and group kill,
-  platform-specific.
 - No flush mechanics for v2 (temp-file-plus-rename per dirty file).
 - Nothing is encrypted; the token authenticates but frames are plaintext.
 - Path inference is a single question; a real answer resolves paths relative to
@@ -343,21 +351,10 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   `["make","check"]` with no declarations. Resolve through the same path, or
   refuse a `check` hook that declares a required parameter, so prove and the
   gate cannot diverge. *One hook, two runners, one contract.*
-- **Intention membership uses bare session-local group ids (2026-09-27).** A
-  group id is unique only within a buffer/session; two buffers can both number
-  a group 1, and `Intention.Members` is `[group ids]` alone, so the app resolves
-  a member id to one path and a task spanning two buffers with colliding ids
-  cannot be named correctly. Proposed shape: qualify membership, e.g.
-  `{path, group id}` pairs (or a `path:group` key) resolved per buffer, so a
-  multi-buffer task is unambiguous. VERDICT: this BLOCKS S3 for multi-buffer
-  waves - S3's premise is "a wave's groups are one intention by task", and a
-  wave touches many buffers - unless membership is qualified first or folded
-  into S3's spec carve. It only degrades single-buffer intentions.
 - **S3's carve must name the qualified member type (2026-09-28).** The
-  qualified-membership item (`intent.Member` / `store.IntentionMember`, resolved
-  against the buffer at its path) is a defect in H4's landed type, not part of
-  S3; S3's carve must take a task's members from `groups --task`'s qualified
-  listing and name the qualified member type.
+  qualified member type now exists (`store.IntentionMember`, checked
+  2026-10-01). What is left is for S3's carve: take a task's members from
+  `groups --task`'s qualified listing and name that type.
 - **A rejected set pins a buffer dirty that a save cannot clean (2026-09-28).**
   A buffer held one accepted set and two rejected sets; saves wrote the agreed
   composition, `raj ctl diff` was empty and disk matched, yet `status` stayed
@@ -366,10 +363,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   the view only, and `clear` (claim-gated: path positional, id via `--group`)
   is the only disposal. Now `status` names the count; `reject` still does not
   reverse text.
-- **Zero-op sets accumulated (2026-09-28).** One buffer listed seven
-  `0 ops, +0 bytes, 0 hunks` sets: clear left a tombstone when it reversed every
-  member out, and an apply could commit a no-op replacement. Clear now drops the
-  set from the `groups` listing and ApplyDiff skips a rebased no-op hunk.
 - **Retroactive wave-to-MR discovery (2026-09-28).** The publish result is NOT
   stored; the mapping is recovered instead. The branch name is deterministic
   (`raj/wave-<wave>`), the pushed sha is `git rev-parse origin/raj/wave-<wave>`
@@ -455,13 +448,8 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - Profile switching in iTerm2 is not clean; deferred, what is there works.
 - `cmd+shift+r` to reopen closed tabs, only if Ghostty actually binds it (check
   `+list-keybinds` first).
-- Name an owner for the hot files each wave (a per-wave ownership rule, not a
-  tool).
 
 ### Tests and workflow
-- **`TestServersArePerRootForRunningAndLive` flakes under load (2026-09-26).** `internal/app/lsp_test.go:1609` fails with `language server handshake did not complete` after ~9 s when the host is busy (seen once in a `raj hook run check` while other hook runs were active; the same revision passed `raj hook run test` right after). Now that agents run `check` themselves, a timing flake reads as their bug. Widen the handshake wait or drive it off a readiness signal instead of wall clock. *A gate an agent trusts must not flake.*
-- **A save guard can refuse its own remediation, deadlocking the build (2026-09-25).** `SaveOver` runs `CheckSaveText` on the accepted composition before writing, so when the *guard itself* (or a file that references its new symbols) has a false positive, `raj ctl save` refuses every buffer, including `internal/editor/savecheck.go` and `internal/control/wire.go` whose stale disk copy the host then cannot compile: `bldraj` fails, so the corrected buffer cannot be saved because the old guard is still compiled into the running daemon. There is no verb that writes a buffer past the guard. A guard must never be able to block the build it is part of: gate it behind a restart-safe escape (a stored setting read before the guard, or a `save --no-check` for the user), and never default a heuristic guard on without an escape hatch that survives a stale binary. *A check that can refuse its own fix is a deadlock, not a safeguard.*
-- **A refused save must not close the tab (2026-09-25).** The user pressed save on a file the guard refused (status `save refused: …`) and the tab closed. The refusal path in `finishWrite` calls `runThens(thens, false)` and returns, and `closeTabAt` closes without prompting when `a.attach || !p.File.ViewDirty()`, so a transient/incorrect clean flag on the refusal path can drop the tab. Pin with a test that drives the human save gesture on a refused composition and asserts the tab still exists, the status names the refusal, and a following close still prompts. *A refusal that discards the work it refused is worse than the refusal.*
 
 - **The control fake `ping`/`buffers` replies drift from the shipped `Dispatch` (2026-09-22).** `fakeEditor.run` hand-writes the reply literals, so when `Dispatch` learned `Roots` the fake did not and `TestRootsClearsOnSetLessReply` failed the host gate. Build the fake `ping`/`buffers` replies from one helper (or the same reply constructor) so a new header field cannot land in `Dispatch` alone. *A fixture hand-copied from the wire drifts from it.*
 - **`TestStopAllStopsEveryRoot` does not assert its two servers are distinct.** A fixture that reused one server for both roots would still pass (both `live` lookups return the same pointer, `stopAll` stops it, both `Start` calls return `ErrClosed`), so the test pins "the servers we saw are stopped", not "every root was stopped". Assert `live[0] != live[1]` and `len(h.servers.byID) == 2` before stopping. *A regression test that a reused server passes is half a test.*
@@ -498,7 +486,9 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   since been rebuilt). Named again 2026-09-28: `raj hook run --param`/RAJ_PARAM
   was absent in-container during the declared-parameters review, so the changed
   CLI could not be driven, and `raj ctl exec` is refused over TCP so the
-  host-built binary is not a fallback.
+  host-built binary is not a fallback. Hit again
+  2026-09-28 by `intent diff` (the between-wave review could not drive the new
+  surface).
 - **`scripts/call-runs.mjs` cannot read the opencode V2 store (2026-09-28).**
   It queries the V1 `part`/`message` tables ("no such table: part"); the store
   is the V2 `session_message`/`session_v2` schema, so the review contract's
@@ -573,10 +563,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   "literal and case-sensitive unless `--regex` or `--case`" is backwards.
   Correct the skill (or the default) so a case-sensitive search is what a
   driver gets.
-- **DECIDED (user, 2026-09-17): keep the linewise paste text-suffix
-  rule.** `PasteClip` keeps keying on `strings.HasSuffix(Text, "\n")`, so a
-  characterwise selection ending exactly after a newline still pastes below
-  the line; the `Linewise` flag on `Clip` alternative is not taken.
 - **Find's smart-case fold can shift byte offsets (medium).** `hasUpper`
   only sees ASCII `A-Z`, so any all-lowercase query takes the `strings.ToLower`
   branch; Go's simple fold is not byte-length-preserving for runes such as
@@ -635,22 +621,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   but also accepts a file and searches just it. The usage hint says to use
   `--include` or `--path` without saying which is for one file. Document the
   split, or make `--path` accept a file explicitly and say so.
-- **Repeating `--include` or `--exclude` searches only the last glob
-  (2026-09-25).** They are plain `flag.String` values
-  (`internal/control/cli.go:233-234`), so `--include *.go --include *.md`
-  searches only the last glob, with no warning and a plausible partial result,
-  while the documented comma form `--include *.go,*.md` searches both. `-q`
-  and `--at` are documented repeatable, so the asymmetry invites the mistake.
-  Make the two flags accumulate (split on comma and append, as `-q` does), or
-  state not-repeatable, last-wins in usage and the skill. *A verification tool
-  must not under-report silently.*
-
-- **A multi-path `lsp diagnostics` entry for a statusless answer carries no
-  status (2026-09-22).** An old server's `{}` parses, so the entry is emitted
-  with `path` only (`status`/`detail` are `omitempty`) and exit 1, where the
-  single-path form refuses with a rebuild-to-match-ctl version-skew message.
-  Give a parsed-but-statusless entry the same `lspStatusError` status and
-  detail, so every entry in the batch answers with a status.
 
 - **`search`'s per-file cap is not configurable and `capped` stays false
   (2026-09-24).** A file with more matches than the per-file limit reports the
@@ -664,16 +634,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   for that path: 380,580` rather than naming the span malformed; the flag's own
   refusal is good, so the positional path should recognise a bare `LO,HI`.
   (Reproduced against the running editor.)
-- **One file at two `--at` spans collapses to the last span (2026-09-25).**
-  `read --at a.go=1,2 --at a.go=20,21` returns only the 20,21 region:
-  `atSpanFlag.Set` keys `index` by path and overwrites the earlier entry, and
-  `readTargets` dedupes by path, so the CLI never emits two targets for one
-  file. Cross-file `--at` frames both, and the `text` op carries a target per
-  span, so the wire is not at fault — this is CLI-side. The flag is documented
-  "repeatable", so a per-span same-path form (key by path+span, one target per
-  entry, keeping the positional one-read dedup) would close it; two disjoint
-  regions of one file currently cost two calls. Raw-recorded 2026-09-22; promoted
-  here.
 - **A bulk decision line names only a per-buffer group id (2026-09-24).**
   `decideAll` prints `accepted change set 3`; under `--all --everywhere` the id
   is per-buffer, so two buffers' set 3 are indistinguishable in the output.
@@ -685,21 +645,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   the skill name `/tmp` as the fallback. *A pre-approved path that is
   unwritable is worse than no path named.*
 
-- **Group tasks are lost on the gated journal restore (2026-09-24).**
-  `NewRestoredSession` (`internal/piecetable/session.go`) takes `groupState`
-  but no `groupTask`, and `buildSession` (`internal/app/journal.go`) rebuilds a
-  session from base/Op/Decision records only, so a task set with
-  `SetGroupTask` is gone after a `RAJ_JOURNAL` restore; the in-memory snapshot
-  carries `GroupTask`, the journal does not. Record the task in the journal or
-  state the loss. *A manifest keyed on the journal's task must survive the
-  journal's own restore.*
-- **`Participant.Task` is not on the wire and not seeded across restart
-  (2026-09-24).** The header's participant record writes
-  id/identity/name/kind/connected (`internal/control/header.go`), and
-  `restoredAuthors`/`Registry.Seed` (`internal/app/journal.go`,
-  `internal/control/participant.go`) carry no task, so a reconnecting agent
-  keeps its task only by re-running `register --task`. Add the field to the
-  participant wire record and the journal author table.
 - **The opencode plugin computes the task but does not inject `--task`
   (2026-09-24).** `plugins/raj-gate.ts` reads `taskOf(sessionID)` for the
   ledger; putting `--task <session>` on the `raj ctl register` call (or setting
@@ -735,17 +680,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 ### Flag usage printing
 
 
-- **The `--daemon` alias is not hidden.** The init in `cmd/raj/main.go` guards
-  `flag.FlagSet.MarkHidden` behind an interface assertion, but released Go has
-  no `MarkHidden` and no `Flag.Hidden`/`hidden` field, so the assertion never
-  fires and `control.flagHidden` can never be true. Live `raj --help` prints
-  `--daemon daemon run`, the backquoted `` `daemon run` `` taken as the value
-  placeholder. Decide: hide it by name in `editorUsage`, or accept it visible
-  and delete the dead guard and the false comment. Escalated 2026-09-20.
-- **The editor `--help` lost its header.** `editorUsage` calls only
-  `control.PrintFlagUsage`, so `raj --help` opens on the flag list with no
-  `usage: raj [options] [file|dir]` line where the default printed
-  `Usage of <path>:`. Decide whether to add one. Escalated 2026-09-20 (UX).
 - **A custom `flag.Value` prints the placeholder `value` in `-h` (2026-09-22).**
   `-q` and `--at` became `flag.Value`s, and `flag.UnquoteUsage` names an
   unknown Value type `value`, so `raj ctl read -h` says `--at value` and
@@ -772,19 +706,9 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   until it re-claims; both a subagent and this review pass paid a retry for it.
   Warn when a replace would drop a non-empty set, or make `--add` the default
   with an explicit `--replace`. Escalated 2026-09-20.
-- **CLAIM-SPEC still describes the missing-path warn/skip the code deliberately dropped.** `docs/CLAIM-SPEC.md` §3 says a path that is neither on disk nor an open buffer is "warned per-path and skipped", and §10 leaves the `open --create` missing-parent case open, but `Guard.Claim` now keeps a not-on-disk path as a forward claim (it warns only on a non-`IsNotExist` stat error) and `saveNamed`/`ensureParent` answers the parent at save time. Reconcile the spec with the forward-claim choice, or restore the warn. *A spec that contradicts the code is a decision lost.*
 
 ### Daemon list and labels
 
-- **`daemon list --json` emits `null` when no daemon runs.** `json.MarshalIndent`
-  of a nil `[]Entry` is `null`, so a script must special-case the empty list;
-  marshal `[]Entry{}` (or render `[]`) instead. *An empty list is `[]`, not
-  `null`.*
-- **Decided (2026-09-22): `--workspace` and an explicit `--control-addr` are
-  mutually exclusive.** The label already names the daemon and its address, so
-  a typed address is a second, contradictory source; the Unix socket is
-  preferred over TCP because it needs no token. The attach itself is done — see
-  COMPLETED.md. *An attach names the workspace, not the port.*
 - **`restartCLI`'s label carry-over has no test.** The carry-versus-override
   decision lives in the CLI function, which has no `Ops`/`Runner` seam and can
   only be driven by a real spawn, so `restart --workspace` and the label
@@ -866,11 +790,6 @@ Found while landing the H3 leaves; all three hit in one sitting.
   accepted-but-unsaved and look identical to work still in progress. A save-all
   gesture, or a status line naming how many buffers hold accepted-unsaved
   changes, would close it.
-- **Saving a new file does not create its parent directory.** A buffer for
-  `a/b/c.go` whose `a/b` is absent has nowhere to write; `raj ctl mkdir` was the
-  workaround. Saving should create missing parents, or the refusal should say so
-  instead of failing at the write.
-
 
 - **A proposed removal never surfaced in the phone client (2026-09-28).**
   `raj ctl delete scratch-l7-ui.md` proposed a removal; the phone client
@@ -891,31 +810,6 @@ wave, which stands.
   is unit-tested and `truncated`/`omitted_bytes` are `omitempty`, so the two
   forms are distinguishable, but nothing asserts the JSON keys; the new
   `printIntent` test pins the printed note only. Add a marshal assertion.
-- **The container `raj` client stays stale**, so a new `raj ctl` surface cannot
-  be driven from a review session and `exec` is refused over TCP. Known; hit
-  again by `intent diff`.
-- **A seam's diff and proof include other seams' accepted work.** The contract
-  in `internal/app/seam.go` is "materialise it alone over its base (its members
-  only, no other uncommitted change)", but `intentProjection` composes each
-  touched path from the buffer's AGREED text plus the member groups, and the
-  agreed text already carries every accepted-but-uncommitted set, whichever
-  seam it belongs to. So with seams A and B both accepted in one file, A's
-  review shows B's hunks and A's proof checks B's code. It hits both `intent
-  diff` and `intent prove`, which share `materialiseIntention`. The existing
-  pin cannot see it: `TestIntentDiffShowsMemberSliceNotWorkspace` dirties the
-  worktree and proposes one seam, so the agreed text is the members. Fix by
-  composing from the base blob plus the chain's members, and pin it with a
-  two-seam case (both accepted in a shared file; A's diff must not contain B's
-  hunk). Independent of the Q12 answer.
-
-  **Closed 2026-09-30:** the code is already the fix. `memberSlice`
-  (`internal/app/intent.go:372`) is the single entry point: it clones the
-  session and marks every non-admitted set `Rejected`, so the composition is
-  the base plus the chain's members only, and both `intentProjection` and
-  `waveProjection` compose through it. The only thing missing was the pin:
-  `TestIntentReviewTabShowsOnlyItsSeamHunks` exercises the same composition
-  through `intent review`; the direct `intent diff`/`intent prove` two-seam pin
-  is re-scoped in `docs/dev/DEBT-PLAN.md` (D1).
 
 ## Between-wave review — shellcheck/gates + publish artifact (2026-09-29)
 
@@ -947,17 +841,16 @@ moved publish onto the exported artifact; neither blocks the waves, which stand.
 
 ## Quality gates — duplication and cyclomatic complexity (2026-09-29, user)
 
-- **Add clone detection and cyclomatic-complexity analysis as pinned deps, `make` targets, and hooks.** Ask: analyzers for duplication and complexity, wired into the Makefile, then run as `raj` hooks the way `check` is (`["make","check"]`).
-  - Shape: pin the tools in `go.mod` behind a `//go:build tools` file so `go run <pkg>` uses the pinned version and the shipped binary carries nothing; `make cyclo` (`gocyclo -over N ./...`), `make dupl` (`dupl -threshold N ./...`), and a `quality` target running both; then hook rows naming those.
-  - Two single-purpose tools against `golangci-lint`: the latter is one dep but a large tree, and these two linters are all that is wanted from it. Decide, because it also brings a config surface.
-  - Calibrate before gating: set the threshold where the tree is today and ratchet, or `check` goes red on its first run. Two phases - a report target first, thresholds into `check` once the numbers are known.
-  - Expect legitimate findings: the mirror packages, the control verb handlers and the per-platform hosts duplicate by construction, and the big render/state functions are long deliberately; a raw count reads as noise, so ratchet or allowlist rather than chase zero.
-  - Enumerate with `./...`, not `git ls-files`: the projected gate tree has no `.git` (the same reason `sh-parse` no-ops there), and follow `shellcheck`'s tool-absent precedent - one line, skip - unless a pinned module dep makes the tool always resolvable from the module cache.
-  - Hook authoring is the human gesture: the targets and any hook body can land first; the rows are the user's to add.
+- **Complexity and duplication analysers: the gate half is left.** The `make
+  cyclo`, `make dupl` and `make quality` targets exist (`Makefile:143-189`,
+  checked 2026-10-01). Left: measure the tree, set the thresholds, then put
+  them in `check`; and the hook rows, which are the owner's to add. Whether
+  rows exist was not checked (the reviewer cannot list hooks).
 
-## X1 runner image follow-ups (2026-09-30)
+## Restart and CI follow-ups (2026-09-30)
 
-Found while re-briefing X1 (`harness/Dockerfile.runner`); none blocks it.
+Found while briefing the runner image. That image has since been dropped
+(`harness/` holds no `Dockerfile.runner`, checked 2026-10-01); these outlived it.
 
 - **A new-path proposal is lost or invisible after a restart.** With the
   journal off (`RAJ_JOURNAL` unset, the default) a restart drops pending sets
@@ -972,9 +865,142 @@ Found while re-briefing X1 (`harness/Dockerfile.runner`); none blocks it.
 - **CI and `go.mod` disagree on the Go version.** `go.mod` declares
   `go 1.25.0`; `.github/workflows/ci.yml` pins `go-version: '1.24'` and its
   comment calls that newer than `go.mod`. It is not, and 1.24 toolchain-switches
-  up to 1.25.0 anyway. One of the two is wrong; the runner ships 1.25.0 because
-  `GOTOOLCHAIN=local` plus `--network none` forbids the switch.
-- **`docs/HOOKS-SPEC.md` §10 lists four cycle images.** X1 adds a fifth
-  (`runner`) to the `scripts/raj-cycle.sh` allow-list; the spec is stale.
-- **`RAJ_CYCLE_IMAGES` still defaults to `opencode`**, so the runner image is
-  built only when named. Whether every cycle builds it is an owner/X2 call.
+  up to 1.25.0 anyway. One of the two is wrong. Still true 2026-10-01
+  (`ci.yml:20`, `go.mod:3`); it waits on the owner to say which wins.
+- **`scripts/raj-cycle.sh` still allows the dropped `runner` image
+  (2026-10-01).** Its header comment (line 27) and its allow-list (lines
+  273-274) name `runner`, but the image's Dockerfile is gone, so naming it in
+  `RAJ_CYCLE_IMAGES` would pass the check and then fail the build. Remove it
+  from both. This replaces two older items here (the cycle-image list in
+  `docs/HOOKS-SPEC.md` and the `RAJ_CYCLE_IMAGES` default), which were about
+  adding the image and are moot.
+
+## Between-wave review — review-tabs strand 3.5 (`intent next`) (2026-09-30)
+
+Found by the review pass on strand 3.5; the wave stands (check run 162 exit 0).
+
+- **The hook run-stamp `dirty` is the workspace status digest, not the projected
+  tree the run built (2026-09-30).** The final frame (`HookDirty`) and the "ran
+  against the projected tree ... (dirty ...)" line print
+  `Provenance.DirtyDigest`, and for a projected run that is
+  `git status --porcelain --untracked-files=all` of the *workspace root*
+  (`materialiseWith`, internal/control/materialise.go; `Service.StatusDigest`,
+  internal/git/git.go) — not the projection the run verified. On a clean
+  workspace it is `e3b0c442...` (sha256 of the empty string), so a projected
+  run that verified a projection carrying proposals reads as "nothing was
+  verified". Evidence: check run 161 reported `HEAD 702a0aaa... dirty
+  e3b0c442...` while verifying a projection with proposals; run 162, the same
+  HEAD and saved tree, reported `dirty 61dcd448...` once the workspace had
+  acquired unrelated dirt, which a projection digest could not do. Either make
+  the field reflect the projection the run built, or rename/document it (for
+  example `workspace-dirty`) so it cannot be read as the verified content's
+  state. (Low, but misleading at the gate.)
+
+  **Decided 2026-09-30 (user):** rename the commit field to `base-commit-sha`
+  (the value `HEAD` carries today) and drop `dirty` entirely; the workspace
+  digest pins nothing a run needs. Add `intention-sha` — a hash over the seam
+  base commit plus its members — but only for seam-scoped runs (today `intent
+  prove`), so a proof names the reviewed slice and the publish step can cite it.
+  The larger half: `intent prove` does not go through the hook runner at all
+  (`runCheckHook`, internal/app/seam.go, execs the check hook argv directly), so
+  a proof has no receipt today and needs one first. No hook script changes: the
+  stamp is printed by internal/control/control.go, and no `*.sh` reads it.
+
+## Folded from landed design docs (2026-10-01)
+
+Open remainders read against the tree before their source documents are
+archived. Proposed by the reviewer; nothing here is scheduled.
+
+- **Lease checks rerun the projection on every edit (from
+  `docs/F3B-II-DESIGN.md` §3, D2).** The design moves lease enforcement to the
+  `File.Begin()`/`End()` change-set boundary, reading a cached projection. That
+  did not land: `Pane.leaseBlocks` (`internal/editor/pane.go:844`) and
+  `File.Insert`/`Delete` (`internal/editor/file.go:696`, `:710`) each call
+  `File.Leased`, and `Session.Leased` (`internal/piecetable/project.go`) calls
+  `s.Project(Annotated)` on every call once the session has decisions. Check
+  once per user action at the change-set boundary against the cached
+  projection; keep a cheap guard in `File.Insert`/`Delete`. Not measured.
+- **The projection fuzz does not cover wrap (from `docs/F3B-II-DESIGN.md` §3,
+  "D1 fuzz oracle").** `FuzzProjectionInvariants`
+  (`internal/view/projection_test.go:547`) drives random sessions and
+  segmentations through `checkProjectionInvariants`. The design also asks for
+  wrap on and off and a real journal of proposed sets with random accept and
+  reject; the file has no mention of wrap. The other D1 leftovers landed:
+  `Pane.DispPos`, `Pane.DocAt`, `Pane.DisplayLines`
+  (`internal/editor/pane.go:404`, `:425`, `:288`) and
+  `File.DecisionGeneration` (`internal/editor/file.go:886`).
+- **How long must the journal retain old versions? (from
+  `docs/HARNESS-BROKER-AGENT.md`, "Open questions").** `ApplyDiff` rebases
+  from an arbitrary base, so the journal has to keep everything back to the
+  oldest version any agent still holds. Compaction has to answer it. No entry
+  in `docs/INVESTIGATIONS.md` covers it (searched 2026-10-01: "retention",
+  "retain", "arbitrary base").
+
+- **Fold summary (from `docs/F3B-II-DESIGN.md` §4).** Is `⋯ rejected · N bytes ⋯`
+  the right marker, or should it preview the first hidden line, name the author,
+  or say `N hidden lines`? Should an `Invalid` fold (phase 1c) read differently?
+- **Search across hidden text (from `docs/F3B-II-DESIGN.md` §4).** `search` runs
+  over the buffer view (`Search.Buffers` snapshots `File.Text()`), so it returns
+  hits inside rejected/hidden runs. Skip them, or return them labelled with
+  their state (spec §6 says label, not silently return)? Which composition
+  should a whole-workspace search index?
+- **Selection across a fold (from `docs/F3B-II-DESIGN.md` §4).** A selection
+  whose anchor is before a fold and head after it spans hidden bytes. Does
+  copy/cut include them or exclude them, and is a delete across a fold refused
+  by the lease (it should be)? May a drag endpoint rest on a fold row?
+- **Mouse on a fold row (from `docs/F3B-II-DESIGN.md` §4).** A click today lands
+  at the hidden run's session start. Should it instead do nothing, or
+  reveal/decide the set (for example, jump to Review)? What do drag and
+  autoscroll past a fold do?
+
+## Review pass — verb surface and doc drift (2026-10-01)
+
+Raw findings in `docs/dev/AGENT-FEEDBACK.md`, "2026-10-01 — between-wave review".
+
+- **Confirm and fix `raj ctl edit` targeting the wrong buffer.** A wave
+  reported `edit` applying against the focused buffer instead of its named
+  path. Four review probes resolved the named path correctly, so capture the
+  exact invocation first; if real it is a silent wrong-file write.
+- **`claim` state is keyed by author id, which two live connections can
+  share.** A parallel connection's `claim` replaced this one's set mid-run.
+  Make the claim set per-connection, or refuse a second live owner of an author
+  id, so a co-tenant cannot silently drop claims. Related to the existing
+  "claim with a bare path silently replaces the working set".
+- **Repoint `docs/dev/RECURSIVE-RAJ.md` at the moved paths.** §7b names
+  `docs/REVIEW-AGENT.md` and `docs/AGENT-FEEDBACK.md`; both live under
+  `docs/dev/` (§10 repeats the contract path). The docs wave repointed three
+  files but missed this one.
+- **Re-read the archived design docs for open remainders that were not
+  folded.** `HARNESS-BROKER-AGENT.md` questions 1 and 4, and ATTACH-DESIGN's
+  phone-input/review-console analysis, are not in TODO or COMPLETED; the
+  archived sources retain them.
+
+## Folded from landed spec remainders (2026-10-01)
+
+Open remainders read out of CURSOR-VIEWPORT-SPEC, FILE-LIFECYCLE-SPEC and
+CLAIM-SPEC before those specs were archived (2026-10-01). Proposed by the
+review pass; nothing here is scheduled. Directory rename and `run --prog`
+reachability for the file-lifecycle verbs are already Later items above, and the
+CLAIM-SPEC §3 spec-vs-code contradiction is the "Claim surface" item above.
+
+- **A redo can split a rune (from `docs/archive/CURSOR-VIEWPORT-SPEC.md`).**
+  Reproduce with `specSeeds` at 400: wrap=false, seed 245, step 51. The spec
+  pointed at TODO for this but no item existed.
+- **Mouse positioning is unspecified (from
+  `docs/archive/CURSOR-VIEWPORT-SPEC.md`).** No mouse exists yet; decide when
+  one lands.
+- **The viewport rule for an agent edit that lands off screen is undecided
+  (from `docs/archive/CURSOR-VIEWPORT-SPEC.md`).** A keystroke follows the
+  cursor; an agent hunk should probably not yank the view. Nothing decides it.
+- **File-lifecycle leftovers (from `docs/archive/FILE-LIFECYCLE-SPEC.md`
+  §9/§11).** Per-entry (partial) directory removal; a permanent dismiss/reject
+  answer (v1 is Ignore only); whether a driver may accept/reject over the
+  socket; and where pending deletions surface (`who`, the status line, or both).
+- **Claim-set durability across a restart (from
+  `docs/archive/CLAIM-SPEC.md` §7).** Persist the per-identity claim set through
+  the op log / `Registry.Seed`, with an expiry/invalidation decision; today it
+  is in-memory and resets.
+- **Is a socket `save` gated? (from `docs/archive/CLAIM-SPEC.md` §10).** The
+  recommended treatment is recorded (not gated: it writes the accepted
+  composition and is the user's gesture), but it was never made an explicit
+  decision.

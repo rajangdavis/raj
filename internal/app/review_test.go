@@ -328,16 +328,16 @@ func TestProposalCycleWithoutProposals(t *testing.T) {
 	}
 }
 
-// ctrl+alt+v lists the pending change sets in the picker, and choosing one
+// ctrl+super+v lists the pending change sets in the picker, and choosing one
 // lands the caret on the line the change sits on.
 func TestReviewPickerJumpsToTheChange(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, reviewFixture)
 	propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 
-	h.press("ctrl+alt+v")
+	h.press("ctrl+super+v")
 	if !h.Picker.Open || h.Focused() != FocusPicker {
-		t.Fatal("ctrl+alt+v did not open the review picker")
+		t.Fatal("ctrl+super+v did not open the review picker")
 	}
 	if h.Picker.Results() != 1 {
 		t.Fatalf("picker results = %d, want 1", h.Picker.Results())

@@ -191,6 +191,7 @@ var Bindings = []Binding{
 	// chords pinned in Bindings rather than Natives, so the CSI-u encoding is
 	// explicit for both platforms instead of inferred from report_all.
 	{"proposals", ToggleReview, "super+r", "114;9u", "cmd+r", "ctrl+r", "toggle review mode: the document is read-only while on; reload moved to cmd+shift+r"},
+	{"proposals", ReviewProposed, "ctrl+super+v", "118;13u", "cmd+ctrl+v", "ctrl+alt+v", "list every pending proposal in the workspace and jump to one; not g: that is find-all on Linux"},
 	{"proposals", AcceptProposed, "ctrl+super+m", "109;13u", "cmd+ctrl+m", "ctrl+alt+m", "accept the proposed change set at the caret"},
 	{"proposals", RejectProposed, "ctrl+super+/", "47;13u", "cmd+ctrl+slash", "ctrl+alt+slash", "reject the proposed change set at the caret"},
 	{"proposals", ClearRejected, "ctrl+super+k", "107;13u", "cmd+ctrl+k", "ctrl+alt+k", "hard-purge the rejected change set at the caret"},
@@ -243,12 +244,6 @@ var Natives = []Native{
 	{"pgdown", PageDown, ""},
 	{"backspace", Backspace, ""},
 	{"delete", Delete, ""},
-	// Reviewing proposals. ctrl+alt+v needs no config line — no terminal claims
-	// it, and ctrl suppresses macOS option-composition the same way it does for
-	// the wrap toggle — so report_all delivers it untouched. Accept, reject and
-	// next/prev are ctrl+super chords and live in Bindings, where the encoding
-	// is pinned for both platforms.
-	{"ctrl+alt+v", ReviewProposed, "list every pending proposal in the workspace and jump to one; not g: that is find-all on Linux"},
 }
 
 // Emitted is every chord that needs a line in a terminal config: the ones the

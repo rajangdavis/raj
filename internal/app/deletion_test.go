@@ -117,7 +117,8 @@ func TestIgnoreLeavesFileAndProposal(t *testing.T) {
 	}
 }
 
-// Remove forever unlinks the file, drops the buffer and clears the proposal.
+// Remove forever moves the file into the workspace trash, drops the buffer and
+// clears the proposal.
 func TestRemoveForeverUnlinksAndDropsBuffer(t *testing.T) {
 	t.Setenv("RAJ_TRASH", "")
 	h := newHarness(t, "hello\n")
@@ -257,9 +258,9 @@ func TestDeletionSafeOnCleanBuffer(t *testing.T) {
 	}
 }
 
-// RAJ_TRASH=1 moves the removed file into the workspace trash rather than
-// unlinking it, under a timestamped name that keeps the original basename. The
-// removal still drops the buffer and clears the proposal.
+// A removal parks the bytes in the workspace trash under a timestamped name
+// that keeps the original basename. It still drops the buffer and clears the
+// proposal.
 func TestRemoveForeverTrashesWhenEnabled(t *testing.T) {
 	t.Setenv("RAJ_TRASH", "1")
 	h := newHarness(t, "hello\n")

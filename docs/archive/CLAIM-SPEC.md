@@ -36,15 +36,17 @@ stays `Session.Leased`'s reactive job).
 
 - `raj ctl claim <path>...` — set the working set (replace). Relative/absolute/
   editor spellings resolve as every verb does; each path is validated in-root.
-  A path that is neither on disk nor an already-open buffer is warned per-path
-  and skipped; a path that exists on disk, or that is already open (a buffer
-  created with `open --create` before it is saved), is claimed and the command
-  succeeds.
+  A path that is neither on disk nor an already-open buffer is kept as a
+  forward claim — a deliberate change since 2026-09-27: `Guard.Claim` warns
+  only on a non-`IsNotExist` stat error, and the parent directory is answered
+  at save time by `saveNamed`/`ensureParent`. A path that exists on disk, or
+  that is already open (a buffer created with `open --create` before it is
+  saved), is claimed and the command succeeds.
 - `raj ctl claim <dir>` — a directory operand walks the subtree and claims each
   file under it (a snapshot at claim time; a file created afterwards is not
   auto-claimed). The directory path is also held as a set entry, so `rmdir
   <dir>` is one `claimCheck` on the dir itself (see
-  `docs/FILE-LIFECYCLE-SPEC.md` §11).
+  `docs/archive/FILE-LIFECYCLE-SPEC.md` §11).
 - `raj ctl claim --add <path>...` — extend the current set.
 - `raj ctl claim -clear` — release it.
 - `raj ctl claim` (no operands) — report the current set (and other live
@@ -69,8 +71,8 @@ stays `Session.Leased`'s reactive job).
   files; name one".
 - `save` is the human approval gesture, not an agent write. Recommended
   treatment: a socket `save` is NOT gated, because it writes the accepted
-  composition and is the user's decision — still an open question (section
-  10).
+  composition and is the user's decision; the explicit decision is folded
+  to `docs/TODO.md` (2026-10-01), since it was never made in so many words.
 - The existing per-author read-before-write gate is unchanged and still
   applies on top.
 
@@ -78,15 +80,16 @@ stays `Session.Leased`'s reactive job).
 
 - `open --create` auto-extends (section 3).
 - A created file whose parent directory does not exist is a mkdir problem —
-  see the lifecycle plan; for now the parent-dir handling of `open --create` is
-  an open implementation point.
+  see the lifecycle plan. The parent-dir handling of `open --create` is a
+  forward claim answered at save time by `ensureParent` (section 3); it is
+  settled, not open.
 
 ## 6. File lifecycle
 
-`mkdir`, `delete` and `rename` are built (2026-09-13/14); `rmdir` is specced
-(`docs/FILE-LIFECYCLE-SPEC.md` §11) and being built. The concrete, built
-semantics live in `docs/FILE-LIFECYCLE-SPEC.md`; the proposed rules below are
-kept as the decision history they became:
+`mkdir`, `delete` and `rename` landed 2026-09-13/14, and `rmdir` is built too;
+its design lives in `docs/archive/FILE-LIFECYCLE-SPEC.md` §11. The concrete,
+built semantics live there; the proposed rules below are kept as the decision
+history they became:
 
 - `mkdir <dir>` — create a directory (with missing parents). Dirs are not text
   and are not claimed; proposed rule: allowed anywhere under the workspace
@@ -109,10 +112,9 @@ kept as the decision history they became:
 
 - Now: in-memory per identity, reset on editor restart; the agent re-claims
   after a restart.
-- Later (explicitly deferred): persist the claim set through the op log /
-  `Registry.Seed` so a durable identity's claim survives a restart, with a
-  decision on expiry/invalidation. Note `docs/TODO.md`'s registry/durability
-  item.
+- Later (explicitly deferred, folded to `docs/TODO.md`, 2026-10-01): persist
+  the claim set through the op log / `Registry.Seed` so a durable identity's
+  claim survives a restart, with a decision on expiry/invalidation.
 
 ## 8. Implementation sketch
 
@@ -135,12 +137,11 @@ kept as the decision history they became:
 5. Journal persistence of claims (later).
 6. Docs: skill/agent briefs and README.
 
-## 10. Open questions
+## 10. Open questions (folded to `docs/TODO.md`, 2026-10-01)
 
-- delete immediate vs review proposal.
-- are dirs claimable; does a claim imply the parent dir.
-- rename: does the set follow automatically.
-- is a socket `save` gated.
-- how overlap is surfaced to a second claimant (`who`, or a future `watch`
-  push).
-- interaction with `open --create` when the parent directory is missing.
+Most of these are decided by the built code: delete is a review proposal, not
+immediate (FILE-LIFECYCLE); `claim <dir>` claims the directory and its subtree,
+and rename follows `old -> new`; overlap is reported by `claim`, which names the
+other live claimants. What remains folded to TODO: whether a socket `save` is
+gated, and claim-set durability (section 7). The missing-parent `open --create`
+case is answered at save time (section 3).

@@ -40,27 +40,12 @@ The specs the current push is being built from.
 
 ## Active but not this push
 
-Referenced by open TODO Now items, but not part of the current push.
+Open designs that are not part of the current push.
 
 | doc | kind | purpose | read it when |
 | --- | --- | --- | --- |
 | [AGENT-COORDINATION-SPEC.md](AGENT-COORDINATION-SPEC.md) | direction | chat, tasks, a roster and agent supervision inside raj, built from the primitives it already has; bring-your-own workflow | you are designing agent chat, tasks, or raj starting agents |
 | [MOBILE-REVIEW-SPEC.md](MOBILE-REVIEW-SPEC.md) | spec | the `--phone` profile (which implies `--attach`): touch tabs, transient status, a review bar, ctrl aliases for super | you are changing the phone layout or its controls |
-| [F3B-II-DESIGN.md](F3B-II-DESIGN.md) | design | the presentation half: folds and the display map | you are changing how proposals are rendered |
-
-## Landed — kept for reference
-
-Behaviour that shipped; retained for the design record. A landed doc is deleted
-once its content is folded into a dated record — git keeps the history, and
-`internal/docsindex` enforces that a `retired` row has no file.
-
-| doc | kind | purpose | read it when |
-| --- | --- | --- | --- |
-| [ATTACH-DESIGN.md](ATTACH-DESIGN.md) | landed design | workspace-scoped host and the local-render attach client that landed, plus the remaining detach/reattach and concurrent-view direction | you are designing multi-instance, a shared session or phone+laptop views |
-| [HARNESS-BROKER-AGENT.md](HARNESS-BROKER-AGENT.md) | landed design | how an agent authors changes against the live buffer | you are designing the agent/broker boundary |
-| [CURSOR-VIEWPORT-SPEC.md](CURSOR-VIEWPORT-SPEC.md) | landed spec | cursor and viewport position invariants | you are touching movement, scroll or their tests |
-| [FILE-LIFECYCLE-SPEC.md](FILE-LIFECYCLE-SPEC.md) | landed spec | create/delete/rename design and verbs | you are changing file-lifecycle verbs |
-| [CLAIM-SPEC.md](CLAIM-SPEC.md) | landed spec | the claim gate and its verb | you are changing claims or any claim-gated verb |
 
 ## This file
 
@@ -74,14 +59,15 @@ NEXT-STEPS.md is the master: direction, sequencing and design live there until a
 piece is scheduled. A new file is the exception, not the default.
 
 - something that happened (a fix, a measurement, a decision, feedback) → a
-  dated entry in COMPLETED / BENCHMARKS / INVESTIGATIONS / AGENT-FEEDBACK,
-  never a new file;
+  dated entry in COMPLETED / BENCHMARKS / INVESTIGATIONS, or in
+  `docs/dev/AGENT-FEEDBACK.md` for feedback, never a new file;
 - open work → TODO;
 - direction and design, scheduled or not → NEXT-STEPS.md;
 - a scheduled subsystem's contract → carve a `*-SPEC.md` out of NEXT-STEPS when
   that wave starts, and add a row here. Never create a file for an unscheduled
   idea;
-- one-shot audit/review → a dated section in AGENT-FEEDBACK, not a file;
+- one-shot audit/review → a dated section in `docs/dev/AGENT-FEEDBACK.md`, not a
+  file;- one-shot audit/review → a dated section in AGENT-FEEDBACK, not a file;
 - a landed spec or design stays in this index (grouped under Landed) until its
   content is folded into a record; then the file is deleted and the row marked
   `retired` — never moved into a subdirectory, which the flat index cannot name.
@@ -89,3 +75,11 @@ piece is scheduled. A new file is the exception, not the default.
 Dev-process documents live under `docs/dev/` and are deliberately outside this
 index: they are not part of the product, and a row here cannot name a path in a
 subdirectory.
+- a landed spec or design stays in this index under Reference until its open
+  remainder is folded into a record or the TODO; then the file moves to
+  `docs/archive/` and its row is deleted. `docs/archive/` has no index.
+
+Dev-process documents live under `docs/dev/` and are deliberately outside this
+index: they are not part of the product, and a row here cannot name a path in a
+subdirectory. A landed dev document moves to `docs/dev/archive/`, not to
+`docs/archive/`: `docs/dev/` is git-ignored and `docs/archive/` is tracked.

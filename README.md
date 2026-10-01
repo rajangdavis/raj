@@ -388,13 +388,13 @@ open-and-save byte round trip.
 - `docs/COMPLETED.md` — what works, and what has been fixed
 - `docs/BENCHMARKS.md` — measured numbers
 - `docs/INVESTIGATIONS.md` — terminal findings, root causes, decisions
-- `docs/HARNESS-BROKER-AGENT.md` — how an agent should author changes against the
+- `docs/archive/HARNESS-BROKER-AGENT.md` — how an agent should author changes against the
   live buffer. Design record; the control socket is a partial step toward it.
-- `docs/CURSOR-VIEWPORT-SPEC.md` — the position invariants, and the properties that assert them
+- `docs/archive/CURSOR-VIEWPORT-SPEC.md` — the position invariants, and the properties that assert them
 - `docs/KEYBINDINGS.md` — every chord, generated from `keys.Bindings` so it cannot
   drift. Regenerate with `raj --keys > docs/KEYBINDINGS.md`; a test fails if the
   checked-in copy is stale.
-- `docs/ATTACH-DESIGN.md` — the workspace host and attach design: the daemon, the local-render client, and what remains.
+- `docs/archive/ATTACH-DESIGN.md` — the workspace host and attach design: the daemon, the local-render client, and what remains.
 - `docs/MOBILE-REVIEW-SPEC.md` — the `--phone` profile: touch tabs, transient status, a review bar, ctrl aliases for super.
 - `docs/ARCHITECTURE.md` — what raj is made of, and what each thing is called.
 

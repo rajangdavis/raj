@@ -193,7 +193,7 @@ func TestMaterialiseTreeMatchesGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Export(ctx, svc, in, base, sel)
+	res, err := Export(ctx, svc, in, base, sel, Message{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +378,7 @@ func TestIntentExportParentedOnBase(t *testing.T) {
 	base := headSHA(t, svc)
 	in := New("i", "owner", "HEAD", base, nil, time.Unix(2, 0))
 
-	res, err := Export(ctx, svc, in, base, Projection{"a.go": []byte("one\n")})
+	res, err := Export(ctx, svc, in, base, Projection{"a.go": []byte("one\n")}, Message{})
 	if err != nil {
 		t.Fatal(err)
 	}

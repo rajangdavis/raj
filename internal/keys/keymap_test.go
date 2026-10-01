@@ -237,6 +237,53 @@ func TestWrapToggleChordIsNotBareAlt(t *testing.T) {
 	}
 }
 
+// No review chord may be option+letter: macOS composes option+letter into a
+// character before the application sees it, so the key never arrives, and
+// ctrl+alt+letter is the same mistake wearing a ctrl. The review list was lost
+// that way once; this keeps a ctrl+alt chord from coming back for it.
+func TestReviewChordsAreNotOptionLetter(t *testing.T) {
+	review := []Action{
+		ToggleReview, ReviewProposed, AcceptProposed, RejectProposed,
+		ClearRejected, PrevProposed, NextProposed,
+	}
+	chord := map[Action]string{}
+	for _, b := range Bindings {
+		chord[b.Action] = b.Chord
+	}
+	for _, b := range Reclaim {
+		chord[b.Action] = b.Chord
+	}
+	for _, n := range Natives {
+		chord[n.Action] = n.Chord
+	}
+	for _, a := range review {
+		c, ok := chord[a]
+		if !ok {
+			t.Errorf("%s is not bound in any table", a)
+			continue
+		}
+		if isOptionLetter(c) {
+			t.Errorf("%s is bound to %s, an option+letter chord macOS composes away", a, c)
+		}
+	}
+}
+
+// isOptionLetter reports whether a chord's key is a single letter carrying alt,
+// the shape macOS composes into a character before sending it.
+func isOptionLetter(chord string) bool {
+	parts := strings.Split(chord, "+")
+	key := parts[len(parts)-1]
+	if len(key) != 1 || key < "a" || key > "z" {
+		return false
+	}
+	for _, p := range parts[:len(parts)-1] {
+		if p == "alt" {
+			return true
+		}
+	}
+	return false
+}
+
 // cmd+l must reach the editor as SelectLine rather than falling through as the
 // letter "l": the chord is claimed by the table, so the emitters carry it.
 func TestSelectLineChordResolves(t *testing.T) {
@@ -334,10 +381,9 @@ func TestReclaimRoundTrip(t *testing.T) {
 	}
 }
 
-// The proposal review chords are commands, not typed text. Accept, reject and
-// the next/prev cycle are ctrl+super chords in Bindings — no terminal claims
-// them, but the encoding is pinned there for both platforms — while review
-// stays a Native ctrl+alt chord. This pins that each resolves in the editor
+// The proposal review chords are commands, not typed text. Every one is a
+// ctrl+super chord in Bindings — no terminal claims them, but the encoding is
+// pinned there for both platforms. This pins that each resolves in the editor
 // scope under its canonical chord name.
 func TestProposalReviewChordsResolve(t *testing.T) {
 	k := NewKeymap()
@@ -349,7 +395,7 @@ func TestProposalReviewChordsResolve(t *testing.T) {
 		{"ctrl+super+/", RejectProposed},
 		{"ctrl+super+,", PrevProposed},
 		{"ctrl+super+.", NextProposed},
-		{"ctrl+alt+v", ReviewProposed},
+		{"ctrl+super+v", ReviewProposed},
 	}
 	for _, c := range cases {
 		if got := k.Lookup(Editor, c.chord); got != c.want {
@@ -373,7 +419,7 @@ func TestProposalChordsResolveFromCSIu(t *testing.T) {
 		{"reject", "\x1b[47;13u", RejectProposed},
 		{"prev", "\x1b[44;13u", PrevProposed},
 		{"next", "\x1b[46;13u", NextProposed},
-		{"review", "\x1b[118;7u", ReviewProposed},
+		{"review", "\x1b[118;13u", ReviewProposed},
 	}
 	for _, c := range cases {
 		if a, _, ok := k.Resolve(Editor, mustParse(t, c.seq)); !ok || a != c.want {

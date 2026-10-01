@@ -91,10 +91,10 @@ noticeable cursor bug an editor can have.
 - **The line index desynced after a multi-cursor redo.** `applyToIndex` read the
   inserted span back out of the document, which is only correct for the last op
   in a batch. Fixed by scanning the op's pieces.
-- **Redo can split a rune.** Still open — see TODO.md. Reproduce by raising
-  `specSeeds` in `spec_test.go` to 400: wrap=false, seed 245, step 51.
+- **Redo can split a rune.** Folded to TODO.md (2026-10-01). Reproduce by
+  raising `specSeeds` in `spec_test.go` to 400: wrap=false, seed 245, step 51.
 
-## What is not specified yet
+## What is not specified yet (folded to `docs/TODO.md`, 2026-10-01)
 
 Mouse positioning (no mouse yet), and the rules for a viewport that has been
 scrolled away when an *agent* edit lands off screen — an agent hunk should

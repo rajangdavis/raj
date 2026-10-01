@@ -520,7 +520,7 @@ type App struct {
 	// removed until the user approves in the review tab.
 	pendingDirRemovals map[string]control.DirRemoval
 
-	// pendingList is the rows the waiting list (ctrl+alt+v) is showing: the
+	// pendingList is the rows the waiting list (ctrl+super+v) is showing: the
 	// App.Proposals rollup captured when the list opened, so a decision chord
 	// can name the selected row back to the same list. Nil while it is closed.
 	pendingList []control.Proposal
@@ -2898,16 +2898,28 @@ func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 // acts on the daemon; a named buffer writes in place and an unnamed one asks
 // where to go first.
 func (a *App) saveNow(p *editor.Pane, then func(saved bool)) {
+	// An unnamed buffer has no path to write, and an attached client has no
+	// daemon buffer to save either: the empty path the remote save would carry
+	// is resolved by the daemon to the buffer the user is looking at -- some
+	// other file -- and the snapshot read-back then replaces this pane's text
+	// with that file's, losing the typed work no forward ever sent. The guard
+	// therefore runs before the attach branch: a local buffer keeps its
+	// save-as, an attached one is refused for want of a daemon path.
+	if p.File.Path == "" {
+		if a.attach {
+			a.status = "attach: this buffer has no path; an unnamed buffer has no daemon file to save"
+			report(then, false)
+			return
+		}
+		a.saveAs(p, then)
+		return
+	}
 	if a.attach {
 		// A local edit still inside the forward debounce would otherwise be
 		// saved after it, so flush the pending forward first; the save then
 		// sees the daemon text this client just placed.
 		a.flushClientEdit(p)
 		a.saveRemote(p, then)
-		return
-	}
-	if p.File.Path == "" {
-		a.saveAs(p, then)
 		return
 	}
 	a.saveNamed(p, then)

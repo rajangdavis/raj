@@ -1295,6 +1295,16 @@ func (a *App) warnClientEdit(path, note string) {
 // the one that writes: it refuses while proposals await the user, and that
 // refusal is the status here, with the snapshot copy left alone.
 func (a *App) saveRemote(p *editor.Pane, then func(saved bool)) {
+	// An unnamed buffer has no daemon path to name. Sending an empty one would
+	// let the daemon resolve it to the buffer the user is looking at -- an
+	// unrelated file -- save that, and then the read-back below would put that
+	// file's text over this pane. saveNow refuses before reaching here; this
+	// keeps the wire invariant even if a later caller forgets.
+	if p.File.Path == "" {
+		a.status = "attach: this buffer has no path; an unnamed buffer has no daemon file to save"
+		report(then, false)
+		return
+	}
 	res, err := a.sendDecision("save", p.File.Path, 0)
 	if err != nil {
 		a.status = "attach: " + err.Error()

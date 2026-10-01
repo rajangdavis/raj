@@ -11,7 +11,7 @@ import (
 )
 
 // The waiting list: everything an agent has proposed -- change sets, file
-// deletions, folder removals and publishes -- is one list on ctrl+alt+v, with a
+// deletions, folder removals and publishes -- is one list on ctrl+super+v, with a
 // count in the status line. It replaces the old ctrl+alt+d removal queue, so
 // there is no separate removal surface any more. Reject still only marks a text
 // change; clear is the second gesture that purges it.
@@ -35,13 +35,13 @@ func TestWaitingListShowsEveryKind(t *testing.T) {
 	}
 
 	h.Draw()
-	if got := h.host.Text(); !strings.Contains(got, "4 waiting for you (ctrl+alt+v)") {
+	if got := h.host.Text(); !strings.Contains(got, "4 waiting for you (ctrl+super+v)") {
 		t.Fatalf("status line = %q, want the waiting count:\n%s", got, h.host.Text())
 	}
 
-	h.press("ctrl+alt+v")
+	h.press("ctrl+super+v")
 	if !h.Picker.Open || h.Focused() != FocusPicker {
-		t.Fatal("ctrl+alt+v did not open the waiting list")
+		t.Fatal("ctrl+super+v did not open the waiting list")
 	}
 	if got := h.Picker.Results(); got != 4 {
 		t.Fatalf("list rows = %d, want 4", got)
@@ -77,7 +77,7 @@ func TestWaitingListEnterOpensTheProposalFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h.press("ctrl+alt+v")
+	h.press("ctrl+super+v")
 	if h.Picker.Results() != 1 {
 		t.Fatalf("list rows = %d, want 1", h.Picker.Results())
 	}
@@ -98,7 +98,7 @@ func TestWaitingListAcceptDeletionRemovesTheFile(t *testing.T) {
 	path := proposeDeletion(t, h)
 	h.press("enter") // Ignore
 
-	h.press("ctrl+alt+v")
+	h.press("ctrl+super+v")
 	h.press("ctrl+super+m") // accept
 
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -119,7 +119,7 @@ func TestWaitingListRejectDeletionWithdraws(t *testing.T) {
 	path := proposeDeletion(t, h)
 	h.press("enter") // Ignore
 
-	h.press("ctrl+alt+v")
+	h.press("ctrl+super+v")
 	h.press("ctrl+super+/") // reject
 
 	if _, err := os.Stat(path); err != nil {
@@ -138,7 +138,7 @@ func TestWaitingListRejectChangeSetStaysTwoStep(t *testing.T) {
 	h := newHarness(t, reviewFixture)
 	id := propose(t, h, piecetable.Hunk{Start: reviewAt, End: reviewAt + len(reviewOld), Text: reviewNew})
 
-	h.press("ctrl+alt+v")
+	h.press("ctrl+super+v")
 	if h.Picker.Results() != 1 {
 		t.Fatalf("list rows = %d, want 1", h.Picker.Results())
 	}

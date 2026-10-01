@@ -465,7 +465,7 @@ func cycleTarget(groups []editor.PendingMark, caretLine int, onGroup uint64, on,
 
 // openProposals opens the waiting list: one row for every pending proposal in
 // the workspace -- a change set, a deletion, a folder removal, a publish -- so
-// ctrl+alt+v answers "what is an agent waiting on me for" in one place. The
+// ctrl+super+v answers "what is an agent waiting on me for" in one place. The
 // rows read App.Proposals, the same rollup `raj ctl proposals` prints, so the
 // keyboard and the wire cannot disagree about what is waiting. The app keeps
 // the rows it built so a decision chord can name the selected one back.
