@@ -874,6 +874,38 @@ Found while briefing the runner image. That image has since been dropped
   from both. This replaces two older items here (the cycle-image list in
   `docs/HOOKS-SPEC.md` and the `RAJ_CYCLE_IMAGES` default), which were about
   adding the image and are moot.
+- **The watch answer can pair an old buffer list with a newer generation
+  (2026-10-01, CI).** `connection.watch` (`internal/control/control.go:2289-2296`)
+  takes the buffer list on the event thread, then reads `c.srv.Gen()` again on
+  the connection goroutine for the reply. A bump between the two sends a list
+  from before the change stamped with the generation after it; the client
+  parks on that generation (`internal/app/client.go:442`) and sleeps through
+  the change until something else moves. This is the reasoned cause of
+  `TestClientWatchAddsDaemonTabOpenedAfterAttach` failing on CI
+  (`client_tabs_test.go:194`, tabs = [] for the whole 3s): the open bumps, the
+  typed edit bumps again, and a slow connection goroutine reads the second
+  generation over a clean list. Not reproduced - nothing here runs Linux - so
+  it is confirmed only by a green CI push. It is timing, not Linux: no file
+  watcher exists (`editor/stamp.go` is stat-based) and the path has no
+  platform code. Not from the 2026-10-01 client work: `control.go` is
+  unchanged since 702a0aaa and `client.go` changed only in `saveRemote`.
+  Fix in the code: read the generation once before the `submit` and send that
+  one, so the reply's generation is never newer than its list (an older one
+  only costs a spare wake).
+- **`TestDerivedListeningOverASocket` passes only where `RAJ_CONTROL_TOKEN`
+  is exported (2026-10-01, CI).** It dials a TCP editor
+  (`internal/control/tcp_test.go:1332-1343`) without the
+  `t.Setenv(TokenEnv, ed.srv.Token())` every other dialing TCP test has.
+  `Dial` reads the token from the environment (`client.go:173`) and so does
+  the server (`control.go:1656`): with the variable exported (inferred for the
+  owner's Mac and its hooks, not checked) both ends agree by accident; on CI the
+  server mints one and the client presents none. Fix in the test: add the
+  `t.Setenv` line after `newTCPEditor`. The code is right.
+- **CI prints "mailbox: dropped 4 oldest undelivered message(s) for raj-a over
+  the 16 bound" (2026-10-01).** Expected output, not a loss:
+  `TestMailboxReplayDropsOverflowOldestFirst` (`mailbox_test.go:356`) seeds
+  `MailboxDepth+4` rows for `raj-a` and the replay logs the drop
+  (`mailbox.go:440`). Nothing to fix; silence it only if the noise matters.
 
 ## Between-wave review — review-tabs strand 3.5 (`intent next`) (2026-09-30)
 

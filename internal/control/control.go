@@ -2288,12 +2288,13 @@ func (c *connection) watch(req Request, emit func(Response)) {
 		_, ch, cancel := c.srv.watchRegister()
 		if c.srv.Gen() != req.Gen {
 			cancel()
+			gen := c.srv.Gen()
 			list := c.srv.submit(Request{ID: req.ID, Op: "buffers"})
 			if list.Err != "" {
 				emit(Response{ID: req.ID, Err: list.Err, Final: true})
 				return
 			}
-			emit(Response{ID: req.ID, OK: true, Gen: c.srv.Gen(),
+			emit(Response{ID: req.ID, OK: true, Gen: gen,
 				Buffers: list.Buffers, Reveals: c.srv.revealsSince(req.Gen), Final: true})
 			return
 		}

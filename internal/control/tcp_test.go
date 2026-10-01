@@ -1332,6 +1332,7 @@ func TestRepeatHelloOnOneConnectionDoesNotLeakPresence(t *testing.T) {
 // clock is injected so the window moves without a sleep.
 func TestDerivedListeningOverASocket(t *testing.T) {
 	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
 	var clock int64
 	ed.srv.Participants.now = func() time.Time { return time.Unix(0, atomic.LoadInt64(&clock)) }
 
