@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"raj/internal/git"
 )
@@ -157,5 +158,90 @@ func TestCLIGitUnknownMode(t *testing.T) {
 	_, errs, code := run(t, "git", "bogus")
 	if code != 2 || !strings.Contains(errs, "want status") {
 		t.Errorf("git bogus: code %d err %q", code, errs)
+	}
+}
+
+// A git query runs on the connection goroutine, not the event thread. The fake
+// event loop holds its git handler on gitHold; with the query off-thread the
+// loop is free to answer a ping on another connection. On the old path the
+// query was handled by the event thread, so the ping queued behind the held
+// query and timed out.
+func TestGitRunsOffTheEventThread(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.gitJSON = gitJSON(t, git.Result{Mode: "status"})
+	ed.gitStarted = make(chan struct{})
+	ed.gitHold = make(chan struct{})
+
+	first, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	gitDone := make(chan Response, 1)
+	go func() {
+		res, err := first.Do(Request{Op: "git", GitMode: "status"})
+		if err != nil {
+			res.Err = "transport: " + err.Error()
+		}
+		gitDone <- res
+	}()
+	select {
+	case <-ed.gitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the git query never started")
+	}
+
+	// The event thread is free: a ping on a second connection is answered
+	// while the git query is still held.
+	second, err := Dial(ed.srv.Path())
+	if err != nil {
+		close(ed.gitHold)
+		t.Fatal(err)
+	}
+	defer second.Close()
+	pong := make(chan error, 1)
+	go func() {
+		_, err := second.Do(Request{Op: "ping"})
+		pong <- err
+	}()
+	select {
+	case err := <-pong:
+		if err != nil {
+			close(ed.gitHold)
+			t.Fatalf("ping while git held: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(ed.gitHold)
+		t.Fatal("the event thread was blocked by the held git query")
+	}
+	close(ed.gitHold)
+	if res := <-gitDone; !res.OK || res.Err != "" {
+		t.Fatalf("held git query = %+v, want OK", res)
+	}
+}
+
+// A git query that never returns is cut off by the connection deadline, so a
+// hung git cannot hold the connection forever. The gitQueryTimeout test seam
+// keeps the test fast.
+func TestGitQueryTimesOut(t *testing.T) {
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "package a\n"})
+	ed.gitJSON = gitJSON(t, git.Result{Mode: "status"})
+	ed.srv.gitQueryTimeout = 50 * time.Millisecond
+	ed.gitHold = make(chan struct{}) // never closed: the query hangs
+
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.readTimeout = 2 * time.Second
+
+	res, err := c.Do(Request{Op: "git", GitMode: "status"})
+	if err != nil {
+		t.Fatalf("git: %v", err)
+	}
+	if res.OK || !strings.Contains(res.Err, "deadline") {
+		t.Fatalf("timed-out git = %+v, want a deadline refusal", res)
 	}
 }

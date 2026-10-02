@@ -2828,18 +2828,44 @@ func hookRaw(row HookRow) hooks.Raw {
 	}
 }
 
+// gitTimeout bounds one read-only git query. The socket path runs it off the
+// event thread, under this deadline; the direct Dispatch path in tests is
+// bounded by it too. A hung git must not hold a connection or the editor.
+const gitTimeout = 30 * time.Second
+
 // dispatchGit answers the read-only git verb. Git runs host-side against the
 // workspace root and moves no ref: status, diff, show, numstat and log only
 // read. The service rides on the Guard so a test can inject a fake runner or a
 // service aimed at a temp repository; a nil one builds a real service over the
 // workspace root.
+
 func dispatchGit(g *Guard, req Request) Response {
 	svc := g.Git
 	if svc == nil {
 		svc = git.New(g.Root())
 	}
-	result, err := svc.Call(context.Background(), git.Query{
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+	result, err := svc.Call(ctx, git.Query{
 		Mode: req.GitMode, Path: req.Path, Rev: req.GitRev, Count: req.GitCount})
+	return gitResultResponse(result, err)
+}
+
+// dispatchGitPrep answers the "gitprep" verb: connection.git asks the event
+// thread for the read-only service, then runs the query itself, off the event
+// thread and under gitTimeout. No process starts here, so a slow repository
+// never holds the editor. It is wireless and internal, like hookprep.
+func dispatchGitPrep(g *Guard, req Request) Response {
+	svc := g.Git
+	if svc == nil {
+		svc = git.New(g.Root())
+	}
+	return Response{OK: true, Git: svc}
+}
+
+// gitResultResponse renders one git query's outcome the way the wire carries
+// it: an Err, or the marshalled Result in GitJSON.
+func gitResultResponse(result *git.Result, err error) Response {
 	if err != nil {
 		return Response{Err: err.Error()}
 	}

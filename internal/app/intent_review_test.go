@@ -1,188 +1,228 @@
 package app
 
 import (
-	"errors"
-	"os"
+	"context"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
-	"raj/internal/editor"
 	"raj/internal/intent"
 	"raj/internal/piecetable"
 )
 
-// reviewTabPanes returns the seam diff panes among the open tabs, keyed by the
-// file label they carry.
-func reviewTabPanes(t *testing.T, h *harness) map[string]*editor.Pane {
+// intentWalkFixture commits a.go and b.go, proposes one member group on each,
+// and stores an intention whose members are ordered b then a: the opposite of
+// file order. It is what makes the walk order and the file order
+// distinguishable, which is the whole point of the owner's first answer.
+func intentWalkFixture(t *testing.T) (string, *harness) {
 	t.Helper()
-	out := map[string]*editor.Pane{}
+	dir, h := intentRoot(t)
+	gA := proposeOn(t, h, "a.go", piecetable.Hunk{Start: 0, End: len("package a\n"), Text: "package a2\n"})
+	gB := proposeOn(t, h, "b.go", piecetable.Hunk{Start: 0, End: len("package b\n"), Text: "package b2\n"})
+	doIntent(t, h, intent.Command{Mode: "new", Name: "i", Base: "HEAD", Groups: []uint64{gB, gA}})
+	return dir, h
+}
+
+// A review walks the intention's sets in the intention's own order, not in file
+// order, and the answer records both orders: Sets follows the intention (b then
+// a), Files is file-sorted (a then b) for a diff renderer. It fails if the walk
+// re-sorts to file order. It also pins the owner's complaint: no read-only seam
+// tab per file -- the walk follows files one at a time, in the real buffers.
+func TestIntentReviewWalksSetsInIntentionOrder(t *testing.T) {
+	dir, h := intentWalkFixture(t)
+	// Make the other file active first, so moving to the first set's file is
+	// the walk's doing and not a leftover from the fixture.
+	h.OpenFile(filepath.Join(dir, "a.go"))
+
+	res := doIntent(t, h, intent.Command{Mode: "review", Name: "i"})
+	if res.Walk == nil {
+		t.Fatal("intent review returned no walk")
+	}
+	if len(res.Walk.Sets) != 2 {
+		t.Fatalf("Walk.Sets = %+v, want the two members", res.Walk.Sets)
+	}
+	if res.Walk.Sets[0].Path != "b.go" || res.Walk.Sets[1].Path != "a.go" {
+		t.Errorf("walk order = %+v, want the intention's order b.go then a.go", res.Walk.Sets)
+	}
+	if want := []string{"a.go", "b.go"}; !reflect.DeepEqual(res.Walk.Files, want) {
+		t.Errorf("Walk.Files = %v, want file order %v", res.Walk.Files, want)
+	}
+	if h.App.mode != ModeReview {
+		t.Errorf("mode = %v, want Review", h.App.mode)
+	}
+	if got := h.Pane().File.Path; got != filepath.Join(dir, "b.go") {
+		t.Errorf("active file = %s, want the first set's file b.go", got)
+	}
 	for _, p := range h.Tabs.All() {
 		if p.File.IsReadOnly() {
-			out[p.Label] = p
+			t.Errorf("walk opened read-only tab %q; a review must not open a tab per file", p.Label)
 		}
 	}
-	return out
 }
 
-// A seam whose members touch two files opens one read-only tab per file, each
-// holding only its own file's hunks. `intent review` did not exist before this
-// change, so the call is the entry-point pin; it also fails if a file's pane is
-// writable (a save succeeds) or if one file's tab shows another's hunks.
-func TestIntentReviewOpensOneReadOnlyTabPerFile(t *testing.T) {
-	_, h := intentDiffFixture(t)
-	before := h.Tabs.Count()
+// Accepting the set in front advances the walk and follows it to the next set's
+// file. The accepted text stays (a decision is not an edit); no set is marked
+// red because nothing was rejected.
+func TestIntentReviewAcceptFollowsToTheNextFile(t *testing.T) {
+	dir, h := intentWalkFixture(t)
+	doIntent(t, h, intent.Command{Mode: "review", Name: "i"}) // starts on b.go
 
-	res := doIntent(t, h, intent.Command{Mode: "review", Name: "i"})
-	if res.Review == nil {
-		t.Fatal("intent review returned no review")
+	h.press("ctrl+super+m")
+	if h.App.walk == nil {
+		t.Fatal("accepting the last-but-one set must not end the walk")
 	}
-	if len(res.Review.Files) != 2 {
-		t.Fatalf("Review.Files = %v, want the two seam files", res.Review.Files)
+	if h.App.walk.Cursor != 1 {
+		t.Fatalf("cursor = %d, want the walk advanced to 1", h.App.walk.Cursor)
 	}
-	if got := h.Tabs.Count(); got != before+2 {
-		t.Fatalf("tabs = %d, want %d: one per seam file", got, before+2)
+	if got := h.Pane().File.Path; got != filepath.Join(dir, "a.go") {
+		t.Errorf("active file after accept = %s, want the next set's file a.go", got)
 	}
-	panes := reviewTabPanes(t, h)
-	aPane, ok := panes["a.go"]
-	if !ok {
-		t.Fatalf("no read-only tab labelled a.go: %v", panes)
+	if got := paneAt(t, h, "b.go").File.Text(); got != "package b2\n" {
+		t.Errorf("accepted b.go = %q, accepting must not change it", got)
 	}
-	bPane, ok := panes["b.go"]
-	if !ok {
-		t.Fatalf("no read-only tab labelled b.go: %v", panes)
+	if len(h.App.walk.red) != 0 {
+		t.Errorf("red = %v, want none: nothing was rejected", h.App.walk.red)
 	}
-	// The pane is read-only: its save is refused with the read-only reason,
-	// and it is keyed on a synthetic path rather than the file it shows.
-	if err := aPane.File.Save(); !errors.Is(err, editor.ErrReadOnly) {
-		t.Errorf("Save on a seam diff = %v, want editor.ErrReadOnly", err)
-	}
-	if !strings.Contains(aPane.File.Text(), "-package a") || !strings.Contains(aPane.File.Text(), "+package a2") {
-		t.Errorf("a.go tab does not hold its own hunk:\n%s", aPane.File.Text())
-	}
-	if strings.Contains(aPane.File.Text(), "package b2") {
-		t.Errorf("a.go tab shows b.go's hunk:\n%s", aPane.File.Text())
-	}
-	if !strings.Contains(bPane.File.Text(), "-package b") || !strings.Contains(bPane.File.Text(), "+package b2") {
-		t.Errorf("b.go tab does not hold its own hunk:\n%s", bPane.File.Text())
-	}
-	if strings.Contains(bPane.File.Text(), "package a2") {
-		t.Errorf("b.go tab shows a.go's hunk:\n%s", bPane.File.Text())
+	if !strings.Contains(h.Status(), "a.go") {
+		t.Errorf("status = %q, want the new position", h.Status())
 	}
 }
 
-// A file in two seams shows only the seam being reviewed: another ACCEPTED set
-// in the same file is not a member, so its text must not reach the tab. It
-// fails if the composition starts from the agreed text instead of the base plus
-// the seam's members -- the defect memberSlice closed -- and it fails before
-// the change because the subcommand does not exist.
-func TestIntentReviewTabShowsOnlyItsSeamHunks(t *testing.T) {
-	_, h := intentDiffFixture(t)
-	// A second set on b.go, accepted but not a member of seam i. It is landed
-	// after the intention was created, exactly as another agent's accepted
-	// work would arrive.
-	b := paneAt(t, h, "b.go")
-	other := proposeOn(t, h, "b.go", piecetable.Hunk{
-		Start: b.File.Len(), End: b.File.Len(), Text: "// other seam\n",
-	})
-	b.File.Session().AcceptGroup(other)
+// Rejecting mid-walk keeps going, and a rejection the probe calls red is marked
+// rather than stopping the walk. Reject on this review surface also takes the
+// rejected set's text out, because the probe reads the composition without it:
+// b.go is back to its base after the reject. The probe is injected, so the
+// marking is proven without a language server.
+func TestIntentReviewRejectKeepsWalkingAndMarksRed(t *testing.T) {
+	dir, h := intentWalkFixture(t)
+	doIntent(t, h, intent.Command{Mode: "review", Name: "i"}) // starts on b.go
 
+	probed := ""
+	h.App.walk.probe = func(paths []string) []string {
+		probed = strings.Join(paths, ",")
+		return paths
+	}
+	h.press("ctrl+super+/")
+
+	if probed != filepath.Join(dir, "b.go") {
+		t.Errorf("probe files = %q, want the rejected set's file b.go", probed)
+	}
+	if !h.App.walk.red[0] {
+		t.Error("a rejection the probe called red must be marked on the set")
+	}
+	if h.App.walk.Cursor != 1 {
+		t.Fatalf("cursor = %d, want the walk to keep going to 1", h.App.walk.Cursor)
+	}
+	if got := h.Pane().File.Path; got != filepath.Join(dir, "a.go") {
+		t.Errorf("active file after reject = %s, want a.go", got)
+	}
+	if !strings.Contains(h.Status(), "red") {
+		t.Errorf("status = %q, want the red rejection surfaced", h.Status())
+	}
+	if got := paneAt(t, h, "b.go").File.Text(); got != "package b\n" {
+		t.Errorf("rejected b.go = %q, want the base: a walk reject takes the text out", got)
+	}
+}
+
+// A rejection the probe calls clean is not marked, and the walk still advances.
+func TestIntentReviewRejectCleanKeepsWalkingUnmarked(t *testing.T) {
+	_, h := intentWalkFixture(t)
 	doIntent(t, h, intent.Command{Mode: "review", Name: "i"})
-	panes := reviewTabPanes(t, h)
-	bPane, ok := panes["b.go"]
-	if !ok {
-		t.Fatalf("no read-only tab labelled b.go: %v", panes)
+	h.App.walk.probe = func([]string) []string { return nil }
+
+	h.press("ctrl+super+/")
+	if len(h.App.walk.red) != 0 {
+		t.Errorf("red = %v, want none for a clean reject", h.App.walk.red)
 	}
-	if !strings.Contains(bPane.File.Text(), "+package b2") {
-		t.Errorf("b.go tab is missing the seam hunk:\n%s", bPane.File.Text())
-	}
-	if strings.Contains(bPane.File.Text(), "other seam") {
-		t.Errorf("b.go tab shows another seam's accepted hunk:\n%s", bPane.File.Text())
+	if h.App.walk.Cursor != 1 {
+		t.Fatalf("cursor = %d, want the walk to keep going", h.App.walk.Cursor)
 	}
 }
 
-// The seam diff tabs obey the announced-tab rule: they are the agent's view,
-// so the session keeps them only while they hold pending work or unsaved text.
-// They hold neither, so they do not accumulate into the restored tab set. It
-// fails before the change because the subcommand does not exist, and it fails
-// if the panes are not marked announced.
-func TestIntentReviewTabsDoNotAccumulate(t *testing.T) {
-	_, h := intentDiffFixture(t)
-	before := h.SessionState().Tabs
-
-	res := doIntent(t, h, intent.Command{Mode: "review", Name: "i"})
-	if res.Review == nil || len(res.Review.Files) != 2 {
-		t.Fatalf("review = %+v, want two files", res.Review)
-	}
-	panes := reviewTabPanes(t, h)
-	if len(panes) != 2 {
-		t.Fatalf("read-only tabs = %d, want 2", len(panes))
-	}
-	for label, p := range panes {
-		if !h.announced[p.File.Path] {
-			t.Errorf("seam tab %s is not marked announced, so it would outlive the review", label)
-		}
-		if sessionHasTab(h.SessionState(), p.File.Path) {
-			t.Errorf("seam tab %s was written into the session", label)
-		}
-	}
-	if got := len(h.SessionState().Tabs); got != len(before) {
-		t.Fatalf("session tabs = %d, want the %d user tabs unchanged: %+v",
-			got, len(before), h.SessionState().Tabs)
-	}
-}
-
-// A save gesture on a read-only view is refused where the save path decides,
-// before it can offer to create the synthetic path's parent directory. It fails
-// if cmd+s reaches ensureParent: that opens a "Create directory" confirm for
-// .raj-seam/<seam>, so the status is not the read-only note, a prompt is left
-// open, and the directory is one keystroke from being made for a save that can
-// never happen.
-func TestIntentReviewSaveGestureRefusedCleanly(t *testing.T) {
-	dir, h := intentDiffFixture(t)
+// The waiting list, while a walk runs, shows the intention first and its sets
+// in the intention's order; accepting the intention row exports it. Export is
+// inert (objects only), so it is the safe action the review surface can offer;
+// this is the "see the intention and act on it" half.
+func TestIntentWalkWaitingListShowsTheIntentionAndExports(t *testing.T) {
+	_, h := intentWalkFixture(t)
 	doIntent(t, h, intent.Command{Mode: "review", Name: "i"})
-	panes := reviewTabPanes(t, h)
-	p, ok := panes["a.go"]
-	if !ok {
-		t.Fatalf("no read-only tab labelled a.go: %v", panes)
-	}
-	h.Tabs.Focus(p)
-	h.press("super+s")
 
-	if got := h.Status(); got != "read-only: this is a seam diff, not the file" {
-		t.Errorf("status after cmd+s on a seam pane = %q, want the read-only note", got)
+	h.press("ctrl+super+v")
+	if !h.App.Picker.Open {
+		t.Fatal("the waiting list did not open")
 	}
-	if h.Prompt.Open {
-		t.Errorf("cmd+s on a seam pane opened %q; the save must be refused before any parent-directory offer", h.Prompt.Title())
+	if len(h.App.pendingList) != 3 {
+		t.Fatalf("rows = %d, want the intention plus two sets: %+v", len(h.App.pendingList), h.App.pendingList)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".raj-seam")); !os.IsNotExist(err) {
-		t.Errorf(".raj-seam exists (%v) after a save on a read-only view; nothing may be created", err)
+	if h.App.pendingList[0].Kind != "intent" {
+		t.Fatalf("first row = %+v, want the intention row", h.App.pendingList[0])
+	}
+	if h.App.pendingList[1].Kind != "walk-set" || h.App.pendingList[1].Path == "" {
+		t.Errorf("second row = %+v, want the first walk set", h.App.pendingList[1])
+	}
+
+	h.press("ctrl+super+m") // accept the selected row: export the intention
+	show := doIntent(t, h, intent.Command{Mode: "show", Name: "i"})
+	if show.Intention == nil || show.Intention.State != intent.Exported {
+		t.Fatalf("intention = %+v, want an exported state after the action row", show.Intention)
+	}
+	if !strings.Contains(h.Status(), "exported") {
+		t.Errorf("status = %q, want the export reported", h.Status())
 	}
 }
 
-// A read-only view is a local artifact of the diff pane: its synthetic
-// .raj-seam path names nothing a socket client could read. `buffers` is the
-// socket's view of the workspace, so it must carry only real files, and those
-// byte-for-byte unchanged. It fails if host.Buffers lists the seam panes.
-func TestIntentReviewBuffersHideSeamPanes(t *testing.T) {
-	_, h := intentDiffFixture(t)
-	before := hostOf(h.App).Buffers()
-	if len(before) != 2 {
-		t.Fatalf("fixture: buffers = %+v, want the two real buffers", before)
+// Next and previous wrap within the walk, so a review never dead-ends and a
+// rejected set can be revisited.
+func TestIntentReviewStepWraps(t *testing.T) {
+	_, h := intentWalkFixture(t)
+	doIntent(t, h, intent.Command{Mode: "review", Name: "i"}) // b.go
+	h.press("ctrl+super+,")                                   // prev from set 0 wraps to the last
+	if h.App.walk.Cursor != 1 {
+		t.Fatalf("cursor after prev from 0 = %d, want 1 (wrap)", h.App.walk.Cursor)
 	}
+	h.press("ctrl+super+.") // next from the last wraps to the first
+	if h.App.walk.Cursor != 0 {
+		t.Fatalf("cursor after next from the last = %d, want 0 (wrap)", h.App.walk.Cursor)
+	}
+}
 
+// Leaving Review ends the walk, so its chords stop intercepting accept and
+// reject in Edit mode.
+func TestLeavingReviewEndsTheWalk(t *testing.T) {
+	_, h := intentWalkFixture(t)
 	doIntent(t, h, intent.Command{Mode: "review", Name: "i"})
-	after := hostOf(h.App).Buffers()
-	if len(after) != len(before) {
-		t.Fatalf("buffers = %d after intent review, want the %d real buffers: %+v", len(after), len(before), after)
+	h.press("super+r")
+	if h.App.walk != nil {
+		t.Error("leaving Review must end the walk")
 	}
-	for _, b := range after {
-		if strings.Contains(b.Path, ".raj-seam") {
-			t.Errorf("buffers lists the read-only view %q; a client cannot use that path", b.Path)
-		}
+	if h.App.mode != ModeEdit {
+		t.Errorf("mode = %v, want Edit", h.App.mode)
 	}
-	if !reflect.DeepEqual(before, after) {
-		t.Errorf("real buffers changed across intent review:\nbefore %+v\nafter  %+v", before, after)
+}
+
+// The empty and unknown refusals keep their wording, so a typo is refused by
+// name rather than walked as an empty review.
+func TestIntentReviewEmptyAndUnknownRefused(t *testing.T) {
+	_, h := intentRoot(t)
+	doIntent(t, h, intent.Command{Mode: "new", Name: "empty", Base: "HEAD"})
+	if _, err := h.App.runIntent(context.Background(), intent.Command{Mode: "review", Name: "empty"}); err == nil || !strings.Contains(err.Error(), "member") {
+		t.Errorf("reviewing an empty intention = %v, want a refusal naming its empty membership", err)
+	}
+	if _, err := h.App.runIntent(context.Background(), intent.Command{Mode: "review", Name: "missing"}); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Errorf("reviewing an unknown intention = %v, want a refusal naming it", err)
+	}
+}
+
+// A walk resolving a member no live buffer numbers is refused rather than
+// silently dropping the set: a review must not skip a set it cannot show.
+func TestIntentReviewMissingMemberRefused(t *testing.T) {
+	_, h := intentWalkFixture(t)
+	// Store a member on a path no buffer holds: the walk must refuse it.
+	doIntent(t, h, intent.Command{Mode: "new", Name: "ghost", Base: "HEAD",
+		Members: []intent.Member{{ID: 99, Path: "missing.go"}}})
+	_, err := h.App.runIntent(context.Background(), intent.Command{Mode: "review", Name: "ghost"})
+	if err == nil || !strings.Contains(err.Error(), "not in any live buffer") {
+		t.Errorf("reviewing an intention with a missing member = %v, want a refusal", err)
 	}
 }

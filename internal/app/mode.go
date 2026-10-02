@@ -30,6 +30,10 @@ const (
 func (a *App) toggleReview() {
 	if a.mode == ModeReview {
 		a.mode = ModeEdit
+		// Leaving Review ends any intention walk: its decisions and its chords
+		// belong to the review surface, and a walk left armed would keep
+		// intercepting accept/reject in Edit mode.
+		a.walk = nil
 		a.status = "edit mode"
 		return
 	}
@@ -46,6 +50,13 @@ func (a *App) EnterReview() {
 	// A completion popup would accept into the document on the next tab, so it
 	// is closed on the way in.
 	a.hideCompletion()
+	if a.walk != nil {
+		// A walk is already running: entering Review (re)points at the set in
+		// front of the walk, not at the active buffer's first pending set, so
+		// the chord resumes the walk rather than starting a second one.
+		a.walkFocus(a.walk.Cursor)
+		return
+	}
 	p := a.Tabs.Active()
 	if p == nil {
 		a.status = "no proposed changes"
@@ -194,6 +205,9 @@ func reviewProgress(p *editor.Pane) (reachable, unplaced int) {
 // placed, and the real shortcuts. The chords come from the binding table, not
 // from the shorthand in the design, so rebinding one moves the keybar with it.
 func (a *App) reviewBar() string {
+	if a.walk != nil {
+		return a.walkBar()
+	}
 	total, unplaced := 0, 0
 	current := 0
 	if p := a.Tabs.Active(); p != nil {

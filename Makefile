@@ -194,7 +194,7 @@ quality: cyclo dupl
 # vuln.go.dev, so it needs the network, which the sandbox and the projected
 # tree do not have. CI has both, so it runs there as its own step. Pinned here,
 # like gocyclo and dupl, so `go run <pkg>@<version>` adds nothing to the product
-# build; v1.7.0 rather than the latest because its go directive is 1.25.0, the
-# version CI pins (v1.8.0 needs Go 1.26 and CI runs GOTOOLCHAIN=local).
+# build; v1.7.0 is pinned so CI cannot change tool mid-flight. v1.8.0 is now
+# resolvable under the 1.27.1 pin, so bumping it is a deliberate future choice.
 vuln:
 	$(GOVULNCHECK) ./...

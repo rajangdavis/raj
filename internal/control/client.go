@@ -81,6 +81,9 @@ const (
 	answerDefault = 10 * time.Second
 	answerProg    = 60 * time.Second
 	answerLSP     = 30 * time.Second
+	// answerGit outlasts the server's gitTimeout so a slow repository yields
+	// git's own refusal rather than the silent-peer diagnosis.
+	answerGit = 60 * time.Second
 )
 
 // answerBudget is how long op may wait for an answer before the
@@ -94,6 +97,8 @@ func answerBudget(op string) time.Duration {
 		return answerProg
 	case "lsp":
 		return answerLSP
+	case "git":
+		return answerGit
 	default:
 		return answerDefault
 	}

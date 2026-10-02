@@ -2603,3 +2603,38 @@ found in the tree. The plan's own status block is `docs/dev/DEBT-PLAN.md` §4.
 - [x] **L — one `control.LSPModes` list (2026-10-01 wave).** `internal/control/lspmodes.go` (new) is the one list; the CLI usage line and mode gate derive from it (`internal/control/cli.go`), and `TestEveryLSPModeReachesItsHostMethod` (`internal/app/lsp_test.go`) covers the client and host halves in place of the two hand-listed tests it deleted.
 - [x] **D3 — `syntax.go`'s dead chroma cases (2026-10-01 wave).** `styleFor` uses `InSubCategory` for `LiteralString`/`LiteralNumber` and drops the four shadowed `Name*` cases; `SemanticStyle`'s "number" role is bright cyan, matching `styleFor`. Closes `docs/TODO.md`'s "dead chroma cases" bullet. Pinned by `TestSemanticStyleMatchesChromaRoles`.
 - [x] **Track C1/C4 — security in CI (in the worktree, uncommitted 2026-10-01).** `Makefile`'s pinned `vuln` target; `ci.yml`'s SHA-pinned actions, `permissions: contents: read` and the `make vuln` step.
+
+## TODO reconciliation (2026-10-02)
+
+Recorded by `raj-claude` from the tree at HEAD `c79329eb`, read through
+`raj ctl`. No test was run; "done" means the code or test was found in the
+tree at the place named. Each entry was an open item in `docs/TODO.md`.
+
+- [x] **CI and `go.mod` agree on the Go version.** `.github/workflows/ci.yml`
+  pins `go-version: '1.25.0'` and `go.mod` declares `go 1.25.0`; the comment
+  beside the pin says why it must be at least the `go` directive.
+- [x] **The watch answer no longer pairs an old buffer list with a newer
+  generation.** `connection.watch` reads `gen := c.srv.Gen()` once before the
+  `buffers` submit and sends that value
+  (`internal/control/control.go:2291-2298`), the fix the item named. The
+  reveal half of the same race is still open and stays in `docs/TODO.md`.
+- [x] **`TestDerivedListeningOverASocket` sets the token.** The test now calls
+  `t.Setenv(TokenEnv, ed.srv.Token())` right after `newTCPEditor`
+  (`internal/control/tcp_test.go:1334-1335`).
+- [x] **The CI line "mailbox: dropped 4 oldest undelivered message(s)" is
+  expected output.** It comes from `TestMailboxReplayDropsOverflowOldestFirst`
+  seeding `MailboxDepth+4` rows; the item said nothing needed fixing, so it is
+  recorded here instead of kept as open work.
+- [x] **`docs/dev/RECURSIVE-RAJ.md` names the moved paths.** It points at
+  `docs/dev/REVIEW-AGENT.md` (`:345`, `:411`); a search for the old
+  `docs/REVIEW-AGENT.md` and `docs/AGENT-FEEDBACK.md` spellings finds none.
+- [x] **`lsp diagnostics` no longer answers `ok` for a file gopls cannot
+  associate with a package.** `hasNoPackageDiagnostic`
+  (`internal/app/diagnostics.go:92`) feeds `diagnosticsStatus`, so a "No
+  packages found for open file" reading is not `ok`. Landed with the
+  2026-09-25 tooling wave (T2); the TODO item outlived it.
+- [x] **An attached client adopts a daemon tab opened after it connected.**
+  Pinned by `TestClientWatchAddsDaemonTabOpenedAfterAttach`
+  (`internal/app/client_tabs_test.go:158`), the test the 2026-10-01 CI note
+  already runs. Closes `docs/dev/WAVE-PLAN.md` 6.1. The watch cycle's own
+  code was not re-read line by line.

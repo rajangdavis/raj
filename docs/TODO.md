@@ -113,7 +113,12 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   daemon restart cleared it). The fast-failing prove did not wedge, so the
   suspect is a prove that reaches materialise + a write-hook/build — the
   "a gate that can block the thing it runs in" shape. Reproduce with a clean
-  passing prove on a durable seam before fixing.
+  passing prove on a durable seam before fixing. Root cause read 2026-10-02:
+  `host.Intent` runs `runIntent(context.Background(), ...)` on the event thread
+  (`internal/app/intent.go:43`) and `runCheckHook` is a synchronous `cmd.Run()`
+  with no timeout (`internal/app/seam.go:113`), so the editor is blocked for the
+  whole check while the client is told "timed out waiting for the editor" after
+  5 s. See the 2026-10-02 audit section below.
 - **`intent group --task T` cannot build a seam from agent sets.** `groups
   --task <session>` answers `N change set(s) belong to another task` because a
   set's `Task` is not its session id, so the documented seam builder has
@@ -416,8 +421,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 
 ### Client mode and attach
 
-- **An attached client never adopts a daemon tab created after it connected (2026-09-25).** `StartClient` mirrors a new dirty daemon tab into `clientOwned`, but `syncClient` (the watch cycle) only re-fetches marks of already-owned paths, so a tab an agent opens or dirties after the client connected stays invisible until reconnect. Run the mirror in `syncClient` too, or push a membership frame. *A viewer that only learns its tabs at connect is stale by construction.*
-
 - **A snapshot cannot capture mid-transaction.** `SnapshotState` omits
   `Session.depth`, so a snapshot taken between `Begin` and `End` loses the open
   undo transaction and the restored session groups those edits differently.
@@ -695,16 +698,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   `--hunks` accept a raw body, or point the briefs at `dump`/`patch` for a
   structural rewrite.
 
-- **`lsp diagnostics` reports `status: ok` for a file gopls cannot
-  associate with a package (2026-09-25).** In the B2 `internal/hooks` wave,
-  `gate_test.go` and `registry_test.go` — members of a brand-new package whose
-  files are unsaved buffers — each answered `ok` with a severity-2 `No packages
-  found for open file` inside their diagnostics list, so a status-only sweep
-  reads them as clean. `read`, `open`, a `--all` sweep, a wait and `mkdir
-  internal/hooks` did not clear it. Report the unassociated state as an error
-  (or set `status` from the diagnostic) so a verification sweep cannot count a
-  file it never checked; the host save stays the only whole-package check.
-
 ### Flag usage printing
 
 
@@ -890,11 +883,6 @@ Found while briefing the runner image. That image has since been dropped
   (groups 1-3 restored, then superseded by group 4). Loss by default,
   discoverability with the journal; related to "A new file is invisible until
   it is saved" above.
-- **CI and `go.mod` disagree on the Go version.** `go.mod` declares
-  `go 1.25.0`; `.github/workflows/ci.yml` pins `go-version: '1.24'` and its
-  comment calls that newer than `go.mod`. It is not, and 1.24 toolchain-switches
-  up to 1.25.0 anyway. One of the two is wrong. Still true 2026-10-01
-  (`ci.yml:20`, `go.mod:3`); it waits on the owner to say which wins.
 - **`scripts/raj-cycle.sh` still allows the dropped `runner` image
   (2026-10-01).** Its header comment (line 27) and its allow-list (lines
   273-274) name `runner`, but the image's Dockerfile is gone, so naming it in
@@ -902,38 +890,13 @@ Found while briefing the runner image. That image has since been dropped
   from both. This replaces two older items here (the cycle-image list in
   `docs/HOOKS-SPEC.md` and the `RAJ_CYCLE_IMAGES` default), which were about
   adding the image and are moot.
-- **The watch answer can pair an old buffer list with a newer generation
-  (2026-10-01, CI).** `connection.watch` (`internal/control/control.go:2289-2296`)
-  takes the buffer list on the event thread, then reads `c.srv.Gen()` again on
-  the connection goroutine for the reply. A bump between the two sends a list
-  from before the change stamped with the generation after it; the client
-  parks on that generation (`internal/app/client.go:442`) and sleeps through
-  the change until something else moves. This is the reasoned cause of
-  `TestClientWatchAddsDaemonTabOpenedAfterAttach` failing on CI
-  (`client_tabs_test.go:194`, tabs = [] for the whole 3s): the open bumps, the
-  typed edit bumps again, and a slow connection goroutine reads the second
-  generation over a clean list. Not reproduced - nothing here runs Linux - so
-  it is confirmed only by a green CI push. It is timing, not Linux: no file
-  watcher exists (`editor/stamp.go` is stat-based) and the path has no
-  platform code. Not from the 2026-10-01 client work: `control.go` is
-  unchanged since 702a0aaa and `client.go` changed only in `saveRemote`.
-  Fix in the code: read the generation once before the `submit` and send that
-  one, so the reply's generation is never newer than its list (an older one
-  only costs a spare wake).
-- **`TestDerivedListeningOverASocket` passes only where `RAJ_CONTROL_TOKEN`
-  is exported (2026-10-01, CI).** It dials a TCP editor
-  (`internal/control/tcp_test.go:1332-1343`) without the
-  `t.Setenv(TokenEnv, ed.srv.Token())` every other dialing TCP test has.
-  `Dial` reads the token from the environment (`client.go:173`) and so does
-  the server (`control.go:1656`): with the variable exported (inferred for the
-  owner's Mac and its hooks, not checked) both ends agree by accident; on CI the
-  server mints one and the client presents none. Fix in the test: add the
-  `t.Setenv` line after `newTCPEditor`. The code is right.
-- **CI prints "mailbox: dropped 4 oldest undelivered message(s) for raj-a over
-  the 16 bound" (2026-10-01).** Expected output, not a loss:
-  `TestMailboxReplayDropsOverflowOldestFirst` (`mailbox_test.go:356`) seeds
-  `MailboxDepth+4` rows for `raj-a` and the replay logs the drop
-  (`mailbox.go:440`). Nothing to fix; silence it only if the noise matters.
+- **A reveal can be delivered twice on a generation race (2026-09-25, low).**
+  `connection.watch` (`internal/control/control.go:2291-2298`) reads the
+  generation once before the buffer list (the 2026-10-01 fix), but still calls
+  `revealsSince(req.Gen)` afterwards, so a `PublishReveal` landing between the
+  two rides this reply and the next. The effect is idempotent (caret and
+  focus). Fix: have `revealsSince` return the generation it snapshotted under
+  the same lock and send that one.
 
 ## Between-wave review — review-tabs strand 3.5 (`intent next`) (2026-09-30)
 
@@ -1026,10 +989,6 @@ Raw findings in `docs/dev/AGENT-FEEDBACK.md`, "2026-10-01 — between-wave revie
   Make the claim set per-connection, or refuse a second live owner of an author
   id, so a co-tenant cannot silently drop claims. Related to the existing
   "claim with a bare path silently replaces the working set".
-- **Repoint `docs/dev/RECURSIVE-RAJ.md` at the moved paths.** §7b names
-  `docs/REVIEW-AGENT.md` and `docs/AGENT-FEEDBACK.md`; both live under
-  `docs/dev/` (§10 repeats the contract path). The docs wave repointed three
-  files but missed this one.
 - **Re-read the archived design docs for open remainders that were not
   folded.** `HARNESS-BROKER-AGENT.md` questions 1 and 4, and ATTACH-DESIGN's
   phone-input/review-console analysis, are not in TODO or COMPLETED; the
@@ -1064,3 +1023,152 @@ CLAIM-SPEC §3 spec-vs-code contradiction is the "Claim surface" item above.
   recommended treatment is recorded (not gated: it writes the accepted
   composition and is the user's gesture), but it was never made an explicit
   decision.
+
+## Security audit — control plane (2026-10-02)
+
+Read-only audit at HEAD `c79329eb` by `raj-claude`; nothing was built or run
+(no Go toolchain, no source mount). Only the `git --rev` item was confirmed
+live; the rest are read from the code. Detail and the list of what was not
+read: `docs/dev/AGENT-FEEDBACK.md`, "Code audit — control plane (2026-10-02)".
+Plan: `docs/dev/WAVE-PLAN.md`, Track A. Proposed by the auditor; nothing here
+is scheduled.
+
+- **A crafted frame crashes the editor before the token check (critical).**
+  `Frame.Split` tests `off+n > len(f.Body)` (`internal/control/wire.go:485`),
+  which overflows for a hunk length near 2^63 and then slices out of range.
+  `DecodeRequest` runs before `authorised`, on a bare `go s.serve`
+  (`internal/control/control.go:1710`), so the process dies without restoring
+  the terminal. Compare `n > len(f.Body)-off`, and run `serve` under
+  `safe.Go` or a per-connection recover. *A length field is input.*
+- **A TCP `hello` naming identity `local` becomes the local human (critical).**
+  The registry seeds the human row as `local`
+  (`internal/control/participant.go:166`) and `join` returns the existing row
+  for a matching identity (`:215`); the kind downgrade in `serve` applies only
+  to a new row. Author 1 then passes `humanAuthor` for save, accept, land and
+  removal approval. Refuse reserved identities and refuse joining a human row
+  from TCP.
+- **The `git` verb passes `--rev` to git as an option (high, confirmed).**
+  `Diff`, `Show` and `NumStat` put the revision before `--`
+  (`internal/git/git.go:404`, `:426`, `:440`); `raj ctl git show --rev
+  '--version'` answered `fatal: unrecognized argument: --version`. With
+  `--output=<path>` a diff is written to any file the user can write. Refuse a
+  revision that starts with `-`, or pass `--end-of-options`.
+- **`rename` and `mkdir` change the disk at once, `.git` included (high).**
+  `Guard.Rename` (`internal/control/host.go:715`) needs only a self-granted
+  claim and `host.Rename` is an `os.Rename`; nothing excludes `.git`, so an
+  executable script can be moved to `.git/hooks/pre-commit`. Make rename a
+  proposal like delete, and refuse `.git` as a destination.
+- **`reload` and `close --discard` have no author gate (high).**
+  `Guard.Reload` (`internal/control/host.go:1479`) and `Guard.Discard`
+  (`:1023`) check the path only, so any agent can drop the user's unsaved
+  text and other writers' pending sets; discard also removes the journal.
+  Gate both on the human, or refuse a buffer holding text the caller did not
+  write.
+- **`intent prove` and `intent land` are open to agents (high).**
+  `dispatchIntent` (`internal/control/host.go:1876`) gates only
+  `publish --approve`. `prove` runs the `check` argv outside admission — the
+  enabled flag, the agent flag, `hook off`, the timeout and the log
+  (`internal/app/seam.go:89`) — and `land` commits a task's sets, proposed
+  ones included, and moves `raj/baseline` without the human gate `raj ctl
+  land` has. Route prove through the hook runner and gate the `land` mode.
+  Extends "`intent prove` runs the check hook's argv directly" above.
+- **A checkout's `.raj/state.db` is adopted on first open (high).**
+  `migrateState` (`internal/app/session.go:263`) moves the legacy database
+  into the state directory when none exists there, which is every fresh
+  clone, so a repository can ship hook rows marked agent-callable. Ask before
+  adopting, or drop the `hooks` rows on migration.
+- **A dead writer wedges the connection (medium).** The writer goroutine
+  returns on the first `WriteFrame` error (`internal/control/control.go:1753`)
+  and stops draining; a handler blocked in `c.out <-` (`:1986`) never returns,
+  so `wg.Wait` hangs, the participant stays connected and a hook run keeps its
+  gate. A reply over 64 MiB triggers it every time. Keep draining after the
+  error, or select on `done` in `send`.
+- **Author ids can be exhausted without a token (medium).** `reserveAuthor`
+  runs at accept (`internal/control/control.go:1722`), there is no read
+  deadline, and `ReadFrame` allocates up to 64 MiB before the token check
+  (`internal/control/wire.go:530`). About 250 idle connections refuse every
+  new client and force recycling of disconnected writers' rows. Reserve after
+  the first authorised frame and set a handshake deadline.
+- **A stale pid file can kill an unrelated process group (medium).** An
+  adopted run is matched by pid alone (`internal/control/hookruns.go:280`) and
+  killed with `kill(-pid, SIGKILL)` on cancel or a passed deadline (`:313`,
+  `:356`); `daemon stop` sends SIGTERM the same way
+  (`internal/daemon/daemon.go:486`). Record and compare the process start
+  time.
+- **An identity is a label, not a credential (medium).** Any token holder can
+  `hello` as another agent's key, read its mail, write as it and withdraw its
+  proposals. Same family as "`claim` state is keyed by author id" above.
+  Decide whether a key is bound to its first connection or carries a secret.
+- **The `git` verb runs on the event thread with no timeout (medium).**
+  `dispatchGit` (`internal/control/host.go:2841`) uses `context.Background()`,
+  so a large diff, or `log` with no count, stalls the editor.
+- **A request that timed out still runs (medium).** `submit` answers "timed
+  out waiting for the editor" after 5 s (`internal/control/control.go:3183`)
+  but the queued request executes later, so a client is told an apply failed
+  that then lands. Drop a timed-out request at `Take`, or say "still queued".
+- **Small ones.** Hook string parameters match unanchored
+  (`internal/hooks/hooks.go:610`), so `[a-z]+` accepts `abc; rm`; `accept` on
+  an unknown group id answers OK (`internal/app/control.go:1945`); `cmd` in
+  `runHookDetached` is read by the cancel closure without a lock
+  (`internal/control/hookruns.go:459`); `Materialise` skips symlinks, so a
+  projected tree differs from the worktree; the socket falls back to
+  `/tmp/raj-<uid>` without checking who owns the directory
+  (`internal/control/control.go:1541`); the LSP reader runs outside
+  `safe.Recover` (`internal/lsp/conn.go:147`).
+
+## Feedback sweep leftovers (2026-10-02)
+
+Found by reading every section of `docs/dev/AGENT-FEEDBACK.md` against this
+file on 2026-10-02. Each was reported there and had no item here. Not
+re-verified against the tree unless a file and line is given; re-check before
+briefing.
+
+- **Clearing a superseded overlapping set can drop the surviving set's hunks
+  (2026-09-30, high).** On `internal/app/app.go` a 17-hunk keeper reconciled
+  to 3 after fourteen byte-identical duplicates were rejected and cleared; the
+  saved file lost the overlapping hunks. Until fixed, diff the keeper against
+  disk after any disposal. *A cleared set must not take hunks out of the set
+  that survives it.*
+- **A projected run does not see pending deletions or renames (2026-09-25).**
+  `Project` composes buffer text only, so a `delete`/`rmdir` proposal is
+  absent from the scratch tree a hook or `exec --projected` verifies. Decide
+  whether the projection takes a removal input.
+- **`diff`'s `old` side is not one base for a multi-op set (2026-09-17).**
+  Hunks of one set showed `old` blocks from different versions, so a rewrite
+  cannot be judged from `diff`. Decide what `old` means when a set's members
+  were recorded at different versions.
+- **cmd+s on a seam review tab offers to create `.raj-seam/<seam>/`
+  (2026-09-30).** `savePane` does not consult `readOnly`, so the save reaches
+  `ensureParent` before `ErrReadOnly` refuses. Short-circuit a read-only pane.
+- **The waiting count can disagree with the waiting list (2026-09-30).**
+  `waitingCount()` sums `Pending()`, which drops invalid sets, while
+  `Proposals()` lists them. Count the invalid Proposed sets too, or say why
+  not.
+- **A forwarded human edit lands over an agent's proposal (2026-09-22,
+  decision).** An attached human gets the agent's advisory lease, while the
+  local keyboard is refused by `EditLeased`. Decide which rule an attached
+  human takes.
+- **`intent next --dry-run` reports a branch for a commit it did not write
+  (2026-09-30, low).** Refuse `--dry-run` for `next`, or omit the branch when
+  the commit is empty.
+- **The own-draft refusal names "another writer" when every overlapping set is
+  the caller's (2026-09-23, low).** The wording at
+  `internal/control/cli.go:3129` assumes a peer.
+- **A whole-line paste is chosen by a trailing newline (2026-09-17,
+  decision).** A characterwise selection that ends at a line boundary pastes
+  linewise. Carry a `Linewise` flag on `Clip`, or keep the suffix rule.
+- **Settings pane loose ends (2026-09-18, low).** Closing it with escape does
+  not `TouchSession()`; the wrap chord updates `WrapDefault` but not
+  `a.settings.Wrap`; `settingOrigins` ignores a launch flag; a failed settings
+  read is silent.
+- **Weak tests named by reviews and never filed.**
+  `TestReviewGenerationStableWhenIdle` passes by chance half the time
+  (2026-09-20); `TestStateKeyMatchesSessionStateDir` is a tautology
+  (2026-09-21); `TestPingRootsEmptyWithoutARoot` also passes with the wiring
+  missing (2026-09-22); `TestClientLocalEditForwardsOneApply` checks only the
+  last apply (2026-09-22); `TestAttachWorkspace` does not assert the ambiguity
+  text (2026-09-22); no test pins that a reconnect does not replay reveals
+  (2026-09-25); `projectUnapply`, the benchmark prototype, does not fold the
+  overlap separator rule its doc claims (2026-09-26);
+  `scripts/raj-cycle.test.sh` has no test for the image allow-list
+  (2026-09-30).

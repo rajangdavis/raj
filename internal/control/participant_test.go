@@ -690,3 +690,47 @@ func TestWorkingStatesDerivedAndDeclared(t *testing.T) {
 		t.Errorf("closed connection = %q, want gone", got)
 	}
 }
+
+// The local human row is seeded as identity "local" with display name "you".
+// Neither is a durable identity a hello may claim: before the fix
+// Join("local", ...) returned author 1, which passes the human gate. The
+// refusal applies whatever kind is requested, because the keyboard is not a
+// socket.
+func TestJoinRefusesAReservedIdentity(t *testing.T) {
+	r := NewRegistry()
+	for _, identity := range []string{"local", "you"} {
+		if _, err := r.Join(identity, "impostor", KindAgent); err == nil {
+			t.Errorf("Join(%q) as an agent succeeded; reserved identities must be refused", identity)
+		}
+		if _, err := r.Join(identity, "impostor", KindHuman); err == nil {
+			t.Errorf("Join(%q) as a human succeeded; reserved identities must be refused", identity)
+		}
+	}
+	// The seeded human row is untouched.
+	if p, ok := r.Get(LocalHuman); !ok || p.Identity != "local" || !p.Connected {
+		t.Errorf("the local human row = %+v ok=%v, want the seeded connected row", p, ok)
+	}
+}
+
+// An existing human row is not inherited by a join that does not claim to be
+// human. serve forces a TCP caller to KindAgent, so this is the rule that keeps
+// a durable human (a second human or an attached client) off the TCP path, and
+// an agent from taking a human identity.
+func TestJoinRefusesAHumanRowAsAnAgent(t *testing.T) {
+	r := NewRegistry()
+	human, err := r.Join("client:desk", "desk", KindHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Join("client:desk", "desk", KindAgent); err == nil {
+		t.Error("an agent-kind join took over the human row")
+	}
+	if p, ok := r.Get(human); !ok || p.Kind != KindHuman {
+		t.Errorf("the human row changed: %+v ok=%v", p, ok)
+	}
+	// A human claim still rejoins its own row, which an attached client needs.
+	again, err := r.Join("client:desk", "desk", KindHuman)
+	if err != nil || again != human {
+		t.Errorf("a human rejoin = id %d err %v, want the same row %d", again, err, human)
+	}
+}

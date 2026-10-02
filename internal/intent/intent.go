@@ -154,8 +154,11 @@ type Result struct {
 	// alone over its base, and the change between that tree and the base.
 	Diff *Diff `json:"diff,omitempty"`
 	// Review is the `intent review` answer: the per-file diff tabs the call
-	// opened in the running editor.
+	// opened in the running editor. Deprecated in favour of Walk.
 	Review *Review `json:"review,omitempty"`
+	// Walk is the `intent review` answer now: the set-by-set review walk the
+	// call started, in the intention's own order.
+	Walk *Walk `json:"walk,omitempty"`
 	// Next is the `intent next` answer: the export just written for a seam,
 	// and the branch publish would push it on.
 	Next *Next `json:"next,omitempty"`

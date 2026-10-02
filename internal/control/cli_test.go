@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"raj/internal/git"
 	"raj/internal/intent"
 	"raj/internal/prog"
 )
@@ -180,6 +181,12 @@ type fakeEditor struct {
 	// CLI test can assert the verb parses and prints without a real repo.
 	lastGit Request
 	gitJSON string
+	// gitStarted, when non-nil, is closed when a git query begins; gitHold,
+	// when non-nil, holds the query open until a test closes it or its context
+	// is done. Together they let a test block a git query and prove the event
+	// thread still serves other requests.
+	gitStarted chan struct{}
+	gitHold    chan struct{}
 	// lastReveal records the reveal request, so a CLI test can assert the path
 	// and span the verb sent without a real editor.
 	lastReveal Request
@@ -196,6 +203,30 @@ type fakeEditor struct {
 	lastIntent intent.Command
 
 	stop chan struct{}
+}
+
+// fakeGitCaller answers a git query from the fake editor's canned gitJSON,
+// standing in for the real service on the connection's off-event-thread path.
+// A pointer receiver keeps started and hold shared across the call.
+type fakeGitCaller struct {
+	result  git.Result
+	started chan struct{}
+	hold    chan struct{}
+}
+
+func (g *fakeGitCaller) Call(ctx context.Context, _ git.Query) (*git.Result, error) {
+	if g.started != nil {
+		close(g.started)
+	}
+	if g.hold != nil {
+		select {
+		case <-g.hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	r := g.result
+	return &r, nil
 }
 
 func newFakeEditor(t *testing.T, docs map[string]string) *fakeEditor {
@@ -295,7 +326,26 @@ func (f *fakeEditor) run(req Request) Response {
 		return Dispatch(f.policy, req)
 	case "git":
 		f.lastGit = req
+		if f.gitStarted != nil {
+			close(f.gitStarted)
+		}
+		if f.gitHold != nil {
+			<-f.gitHold
+		}
 		return Response{OK: true, GitJSON: f.gitJSON}
+	case "gitprep":
+		// connection.git's event-thread half: hand back a caller that answers
+		// from the canned gitJSON, so the off-thread query path can be driven
+		// without a repository. gitStarted/gitHold let a test hold the query
+		// open and check the event thread still serves other requests.
+		f.lastGit = req
+		var r git.Result
+		if f.gitJSON != "" {
+			if err := json.Unmarshal([]byte(f.gitJSON), &r); err != nil {
+				return Response{Err: "fake git: " + err.Error()}
+			}
+		}
+		return Response{OK: true, Git: &fakeGitCaller{result: r, started: f.gitStarted, hold: f.gitHold}}
 	case "intent":
 		// The payload is a JSON intent.Command; record it so a CLI test can
 		// assert the member parser without a real workspace store. The answer
@@ -1896,6 +1946,7 @@ func TestAnswerBudgetPerVerb(t *testing.T) {
 		{"apply", 10 * time.Second},
 		{"prog", 60 * time.Second},
 		{"lsp", 30 * time.Second},
+		{"git", 60 * time.Second},
 	}
 	for _, c := range cases {
 		if got := answerBudget(c.op); got != c.want {
@@ -1907,7 +1958,8 @@ func TestAnswerBudgetPerVerb(t *testing.T) {
 	if answerBudget("ping") >= answerBudget("read") {
 		t.Error("ping is not shorter than the default; a squatter would not be named quickly")
 	}
-	if answerBudget("prog") <= answerBudget("read") || answerBudget("lsp") <= answerBudget("read") {
+	if answerBudget("prog") <= answerBudget("read") || answerBudget("lsp") <= answerBudget("read") ||
+		answerBudget("git") <= answerBudget("read") {
 		t.Error("a heavy verb is not more generous than the default; a slow answer would be cut off")
 	}
 }

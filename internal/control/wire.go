@@ -482,7 +482,12 @@ func (f Frame) Split(lengths []int) ([][]byte, error) {
 	out := make([][]byte, 0, len(lengths))
 	off := 0
 	for i, n := range lengths {
-		if n < 0 || off+n > len(f.Body) {
+		// n > len(f.Body)-off, not off+n > len(f.Body): a hunk length is
+		// attacker-controlled input, and off+n overflows to a negative int for
+		// a length near 2^63, which would pass the test and then panic slicing
+		// the body. The subtraction cannot underflow because off never exceeds
+		// len(f.Body).
+		if n < 0 || n > len(f.Body)-off {
 			return nil, fmt.Errorf("%w: run %d wants %d bytes at %d of %d",
 				errBadFrame, i, n, off, len(f.Body))
 		}

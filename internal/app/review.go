@@ -34,6 +34,13 @@ func (a *App) reviewProposed(accept bool) {
 	if a.decideSelectedProposal(accept) {
 		return
 	}
+	if a.walk != nil {
+		// A walk decides the set in front of it, not the set under the caret:
+		// the cursor is the intention's ordered position, which is what the
+		// user is looking at.
+		a.walkDecide(accept)
+		return
+	}
 	p := a.Tabs.Active()
 	if p == nil {
 		return
@@ -404,6 +411,12 @@ func proposalGroups(p *editor.Pane) []editor.PendingMark {
 // starting point only: inside a set it steps from that set, and between sets it
 // steps to the nearest one in the direction of travel.
 func (a *App) cycleProposed(forward bool) {
+	if a.walk != nil {
+		// While a walk runs, next/prev step the intention's sets, not the
+		// active buffer's pending sets: the walk order is the review order.
+		a.walkStep(forward)
+		return
+	}
 	pos, total, ok := a.cycleProposedTo(forward)
 	if !ok {
 		a.status = "no proposed changes"
@@ -470,6 +483,10 @@ func cycleTarget(groups []editor.PendingMark, caretLine int, onGroup uint64, on,
 // keyboard and the wire cannot disagree about what is waiting. The app keeps
 // the rows it built so a decision chord can name the selected one back.
 func (a *App) openProposals() {
+	if a.walk != nil {
+		a.openWalkList()
+		return
+	}
 	rows := a.Proposals()
 	if len(rows) == 0 {
 		a.pendingList = nil
@@ -509,6 +526,27 @@ func (a *App) proposalRow(pr control.Proposal) (label string, line int) {
 		label = fmt.Sprintf("%s · remove folder · %s · %s", who, name, fileCount(pr.Size))
 	case "publish":
 		label = fmt.Sprintf("%s · publish · %s", who, name)
+	case "walk-set":
+		state := "proposed"
+		if p := a.proposalSetPane(pr.Path); p != nil {
+			state = p.File.Session().GroupState(pr.Group).String()
+			line = groupLine(p, pr.Group)
+		}
+		label = fmt.Sprintf("change set %d · %s · %s", pr.Group, name, state)
+		if a.walkRedSet(pr.Group) {
+			label += " · RED"
+		}
+	case "intent":
+		inName, inBase := "", ""
+		state := string(intent.Open)
+		if a.walk != nil {
+			inName, inBase = a.walk.Name, a.walk.Base
+			if a.walk.State != "" {
+				state = string(a.walk.State)
+			}
+		}
+		label = fmt.Sprintf("intention %s · base %s · %s · %s exports it",
+			inName, inBase, state, chordFor(keys.AcceptProposed))
 	default:
 		label = fmt.Sprintf("%s · %s · %s", who, pr.Kind, name)
 	}
@@ -594,6 +632,14 @@ func (a *App) decideSelectedProposal(accept bool) bool {
 		return false
 	}
 	pr := a.pendingList[idx]
+	if pr.Kind == "walk-set" {
+		// The row names a set in the walk; deciding it moves the cursor there
+		// and routes through the walk, so the list and the cursor cannot
+		// disagree about which set was decided.
+		a.walkDecideAt(pr.Group, accept)
+		a.closeProposalList()
+		return true
+	}
 	a.decideProposal(pr, accept)
 	a.closeProposalList()
 	if pr.Kind == "set" || pr.Kind == "invalid" {
@@ -711,6 +757,14 @@ func (a *App) decideProposal(pr control.Proposal, accept bool) {
 		a.withdrawDirRemoval(d)
 	case "publish":
 		a.decidePublish(pr.Path, accept)
+	case "intent":
+		if !accept {
+			a.status = "export is the safe action for an intention; accept to export " + pr.Path
+			return
+		}
+		a.exportIntention(pr.Path)
+	case "walk-set":
+		a.walkDecideAt(pr.Group, accept)
 	default:
 		a.status = "unknown proposal kind " + pr.Kind
 	}
@@ -878,4 +932,416 @@ func (a *App) reviewRows(p *editor.Pane, pending []piecetable.Group) (rows []str
 		lines = append(lines, firstLine[g.ID])
 	}
 	return rows, lines
+}
+
+// ---------- the intention review walk ----------
+//
+// `intent review` used to open one read-only tab per file a seam changed: a
+// pile of files to close rather than a review. The walk replaces that with an
+// ordered cursor over the intention's own change sets, in the order the owner
+// put them in. The set in front of the cursor is decided with the same accept
+// and reject chords the in-buffer review uses, and the view follows to that
+// set's file and span. Accept advances; reject also advances, so one pass walks
+// the whole intention.
+//
+// The walk is a ModeReview surface: the document stays read-only while it runs,
+// so a review cannot become an accidental edit. It lives beside the in-buffer
+// review walk (cycleProposed) rather than replacing it; with no walk active,
+// next/prev still step the active buffer's pending sets in document order.
+
+// walkSet is one change set the walk can land on: the group id, the absolute
+// path of the buffer that numbers it, and the workspace-relative path the
+// intention stores.
+type walkSet struct {
+	Group uint64
+	Path  string // absolute, for opening
+	Rel   string // workspace-relative, for the intention's own spelling
+}
+
+// intentWalk is the ordered cursor over one intention's change sets. It is the
+// review surface for an intention: the cursor names the set in front of the
+// user, the view follows it to that set's file and span, accept and reject act
+// on it, and a rejected set whose file no longer type-checks is marked rather
+// than stopping the walk.
+type intentWalk struct {
+	Name  string
+	Base  string
+	State intent.State
+	// Sets is the intention's members in the intention's own order -- the walk
+	// order. A set's file order is a rendering concern; the walk follows the
+	// intention because that carries the dependencies between sets.
+	Sets   []walkSet
+	Cursor int
+	// red records the set indexes whose rejection left error diagnostics in the
+	// file the set touched. The walk keeps going; the mark is the thing to come
+	// back to, and the end-of-walk check is the authority.
+	red map[int]bool
+	// probe is the validity probe run after a rejection. Nil means the editor's
+	// own published diagnostics (walkDiagnostics). Tests inject a fake so the
+	// mark is provable without a language server.
+	probe func(paths []string) []string
+}
+
+// startIntentWalk builds the walk over in's members in the intention's order
+// and points the review surface at the first set. It replaces the per-file diff
+// tabs `intent review` used to open. Each member must resolve to a live group;
+// a member no buffer numbers is an error rather than a set silently dropped
+// from the walk.
+func (a *App) startIntentWalk(in intent.Intention) (*intent.Walk, error) {
+	if len(in.Members) == 0 {
+		return nil, fmt.Errorf("intent review: intention %q has no members, so there is no seam to walk", in.Name)
+	}
+	sets, err := a.walkSets(in)
+	if err != nil {
+		return nil, err
+	}
+	a.walk = &intentWalk{
+		Name:  in.Name,
+		Base:  in.Base,
+		State: in.State,
+		Sets:  sets,
+		red:   map[int]bool{},
+	}
+	a.mode = ModeReview
+	a.hideCompletion()
+	a.walkFocus(0)
+
+	// Files in file order: a diff renders in file order even though the walk
+	// follows the intention. Sorted and de-duplicated, it is the other order
+	// the owner asked for, recorded once here rather than re-derived by a
+	// renderer.
+	files := make([]string, 0, len(sets))
+	seen := map[string]bool{}
+	for _, s := range sets {
+		if !seen[s.Rel] {
+			seen[s.Rel] = true
+			files = append(files, s.Rel)
+		}
+	}
+	sort.Strings(files)
+	out := &intent.Walk{Name: in.Name, Base: in.Base, Files: files}
+	for _, s := range sets {
+		out.Sets = append(out.Sets, intent.WalkSet{Path: s.Rel, Group: s.Group})
+	}
+	return out, nil
+}
+
+// walkSets resolves each member of in to the live buffer that numbers it, in
+// the intention's order. It reuses memberFinder, so a bare legacy member and a
+// path-qualified one resolve the same way the projection resolves them, and an
+// id two buffers number stays refused rather than guessed.
+func (a *App) walkSets(in intent.Intention) ([]walkSet, error) {
+	find := a.memberFinder()
+	paneBy := map[intent.Member]*editor.Pane{}
+	for _, g := range a.allGroups() {
+		m, ok := a.memberFor(g)
+		if !ok {
+			continue
+		}
+		if _, seen := paneBy[m]; seen {
+			continue
+		}
+		if p := a.proposalSetPane(g.Path); p != nil {
+			paneBy[m] = p
+		}
+	}
+	out := make([]walkSet, 0, len(in.Members))
+	for _, m := range in.Members {
+		live, ok := find(m)
+		if !ok {
+			return nil, fmt.Errorf("intent review: %s: change set %d is not in any live buffer", in.Name, m.ID)
+		}
+		p := paneBy[live]
+		if p == nil {
+			return nil, fmt.Errorf("intent review: %s: change set %d has no open buffer", in.Name, m.ID)
+		}
+		out = append(out, walkSet{Group: live.ID, Path: p.File.Path, Rel: live.Path})
+	}
+	return out, nil
+}
+
+// walkFocus points the review surface at set i: it opens that set's file, lands
+// the caret on the set's span and writes the walk status. i wraps, so next past
+// the last set returns to the first and a review never dead-ends. A set whose
+// pane is gone is reported and the cursor stays put.
+func (a *App) walkFocus(i int) {
+	if a.walk == nil || len(a.walk.Sets) == 0 {
+		return
+	}
+	n := len(a.walk.Sets)
+	i = ((i % n) + n) % n
+	a.walk.Cursor = i
+	s := a.walk.Sets[i]
+	p := a.proposalSetPane(s.Path)
+	if p == nil {
+		a.status = fmt.Sprintf("intention %s: %s is no longer open", a.walk.Name, s.Rel)
+		return
+	}
+	// The file the set lives in is shown the way a goto shows it -- the user is
+	// being taken there -- and the caret lands on the set's span. One file at a
+	// time, as the cursor moves; not one tab per file up front.
+	a.OpenFile(p.File.Path)
+	if line := groupLine(p, s.Group); line > 0 {
+		jumpToSessionLine(p, line)
+	}
+	a.status = a.walkStatus()
+}
+
+// walkStep moves the cursor one set forward or back and follows it. The ends
+// wrap, so one pass is a cycle.
+func (a *App) walkStep(forward bool) {
+	if a.walk == nil {
+		return
+	}
+	next := a.walk.Cursor + 1
+	if !forward {
+		next = a.walk.Cursor - 1
+	}
+	a.walkFocus(next)
+}
+
+// walkDecide accepts or rejects the set in front of the walk and steps to the
+// next. Accept leaves the text. Reject, on this review surface, also takes the
+// text out in one gesture: the point of rejecting mid-walk is to see the
+// composition without the set, and the validity probe is read off that
+// composition. A rejection that leaves error diagnostics in the file the set
+// touched is marked rather than stopping the walk.
+func (a *App) walkDecide(accept bool) {
+	w := a.walk
+	if w == nil {
+		return
+	}
+	i := w.Cursor
+	s := w.Sets[i]
+	p := a.proposalSetPane(s.Path)
+	if p == nil {
+		a.status = fmt.Sprintf("intention %s: %s is no longer open", w.Name, s.Rel)
+		return
+	}
+	if !a.decideProposed(p, s.Group, accept) {
+		if !a.attach {
+			a.status = fmt.Sprintf("change set %d is no longer awaiting a decision", s.Group)
+		}
+		return
+	}
+	if accept {
+		a.walkFocus(i + 1)
+		a.status = fmt.Sprintf("accepted change set %d · %s", s.Group, a.walkStatus())
+		return
+	}
+	a.walkRejectClear(p, s)
+	red := a.walkProbeSet(i, p, s)
+	a.walkFocus(i + 1)
+	if red {
+		a.status = fmt.Sprintf("rejected change set %d · tree red in %s · %s", s.Group, s.Rel, a.walkStatus())
+		return
+	}
+	a.status = fmt.Sprintf("rejected change set %d · %s", s.Group, a.walkStatus())
+}
+
+// walkDecideAt points the walk at the set with group id g and decides it, so a
+// decision taken from the waiting list lands on the same set the list row named
+// rather than on whatever the cursor happened to be.
+func (a *App) walkDecideAt(g uint64, accept bool) {
+	if a.walk == nil {
+		return
+	}
+	for i, s := range a.walk.Sets {
+		if s.Group == g {
+			a.walk.Cursor = i
+			a.walkDecide(accept)
+			return
+		}
+	}
+}
+
+// walkRejectClear takes the rejected set's text out, so the composition the
+// probe reads is the one the review just chose. Reject alone only marks; in the
+// walk the second gesture is folded in, because a review that keeps the text it
+// rejected cannot show what rejecting it does. A set a later edit has wedged
+// cannot be cleared and is reported; the walk still advances.
+func (a *App) walkRejectClear(p *editor.Pane, s walkSet) {
+	if ok, _ := p.File.ClearGroup(s.Group); !ok {
+		a.status = fmt.Sprintf("rejected change set %d; later edits overlap it, so its text stays", s.Group)
+		return
+	}
+	p.Cursors.Normalize()
+	a.Explorer.Tree.MarkChanged(p.File.Path)
+}
+
+// walkProbeSet runs the validity probe over the file the rejected set touched
+// and records the set as red when the probe names it.
+//
+// The default probe is the editor's own published diagnostics: it catches a
+// type error the server has already reported in the changed file. It cannot
+// catch a duplicate declaration in another file, a test that no longer
+// compiles, or anything the server has not republished since the edit -- a
+// cross-file or build-level break is exactly the class it misses. The
+// authoritative read is the check hook, offered at the end of the walk rather
+// than after every step.
+func (a *App) walkProbeSet(i int, p *editor.Pane, s walkSet) bool {
+	w := a.walk
+	probe := w.probe
+	if probe == nil {
+		probe = a.walkDiagnostics
+	}
+	if len(probe([]string{p.File.Path})) == 0 {
+		return false
+	}
+	w.red[i] = true
+	return true
+}
+
+// walkDiagnostics is the cheap validity probe: the error diagnostics the editor
+// already holds for the given paths. It reads the store rather than asking a
+// server, so it never blocks the event loop and never starts a server; that is
+// also why it can miss a problem the server has not republished yet.
+func (a *App) walkDiagnostics(paths []string) []string {
+	var out []string
+	for _, path := range paths {
+		for _, d := range a.diags.forPath(path) {
+			if severityRank(d.Severity) == 0 {
+				out = append(out, path)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// walkRedSet reports whether the walk has marked the set with group id g as a
+// rejection that left the tree red. The waiting list reads it through the same
+// group id the row carries.
+func (a *App) walkRedSet(g uint64) bool {
+	if a.walk == nil {
+		return false
+	}
+	for i, s := range a.walk.Sets {
+		if s.Group == g {
+			return a.walk.red[i]
+		}
+	}
+	return false
+}
+
+// walkStatus is the one-line report for the walk: which intention, its base and
+// export state, which set of how many, in which file, and any rejection the
+// probe marked red.
+func (a *App) walkStatus() string {
+	w := a.walk
+	if w == nil || len(w.Sets) == 0 {
+		return ""
+	}
+	s := w.Sets[w.Cursor]
+	state := string(w.State)
+	if state == "" {
+		state = string(intent.Open)
+	}
+	out := fmt.Sprintf("intention %s · base %s · %s · set %d/%d · %s",
+		w.Name, w.Base, state, w.Cursor+1, len(w.Sets), s.Rel)
+	if n := len(w.red); n > 0 {
+		out += fmt.Sprintf(" · %d red (check at the end)", n)
+	}
+	return out
+}
+
+// walkBar is the Review-mode status line while a walk runs. It names the
+// intention and the cursor position, and offers the same chords the in-buffer
+// review uses, so the walk answers the keys a review already knows.
+func (a *App) walkBar() string {
+	w := a.walk
+	if w == nil || len(w.Sets) == 0 {
+		return "Review"
+	}
+	s := w.Sets[w.Cursor]
+	state := string(w.State)
+	if state == "" {
+		state = string(intent.Open)
+	}
+	parts := []string{
+		fmt.Sprintf("Review %s · base %s · %s", w.Name, w.Base, state),
+		fmt.Sprintf("%d/%d %s", w.Cursor+1, len(w.Sets), s.Rel),
+	}
+	if n := len(w.red); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d red", n))
+	}
+	parts = append(parts,
+		chordFor(keys.PrevProposed)+"/"+chordFor(keys.NextProposed)+" move",
+		chordFor(keys.AcceptProposed)+" accept",
+		chordFor(keys.RejectProposed)+" reject",
+		chordFor(keys.ToggleReview)+" edit")
+	return strings.Join(parts, " · ")
+}
+
+// openWalkList is the waiting list while an intention walk runs: the walk's
+// sets in the intention's own order, with the intention itself as the first row
+// so its base, its export state and its safe action (export) are reachable from
+// the surface the walk uses. Accept on the intention row exports it, which is
+// inert -- objects only. The human-only actions (prove, publish) are reported
+// from their own surface rather than forced in here.
+func (a *App) openWalkList() {
+	w := a.walk
+	rows := make([]control.Proposal, 0, len(w.Sets)+1)
+	rows = append(rows, control.Proposal{Kind: "intent", Path: w.Name, Start: -1, End: -1})
+	for _, s := range w.Sets {
+		rows = append(rows, control.Proposal{Kind: "walk-set", Path: s.Path, Group: s.Group, Start: -1, End: -1})
+	}
+	a.pendingList = rows
+	list := make([]picker.Proposal, 0, len(rows))
+	for i, pr := range rows {
+		label, line := a.proposalRow(pr)
+		list = append(list, picker.Proposal{Label: label, Path: pr.Path, Line: line, Index: i})
+	}
+	// The intention row names an intention, not a file: enter on it must not
+	// try to open one. Accept is the export; the row's chord is in its label.
+	list[0].Path = ""
+	a.Picker.ShowProposals(list)
+	a.focus = FocusPicker
+	a.status = ""
+}
+
+// exportIntention runs the inert export for the walked intention. Export writes
+// objects only -- no ref, no worktree, no index -- so it is the safe action the
+// review surface can trigger. The human-only actions are left to their own
+// surfaces.
+func (a *App) exportIntention(name string) {
+	cmd := intent.Command{Mode: "export", Name: name}
+	if a.attach {
+		res, err := a.sendIntent(cmd)
+		if err != nil {
+			a.status = "attach: " + err.Error()
+			return
+		}
+		if !res.OK {
+			a.status = res.Err
+			return
+		}
+	} else if _, err := a.runIntent(context.Background(), cmd); err != nil {
+		a.status = err.Error()
+		return
+	}
+	if a.walk != nil && a.walk.Name == name {
+		// The walk's own copy of the state would otherwise read "open" for the
+		// rest of the pass after the export succeeded.
+		a.walk.State = intent.Exported
+	}
+	a.status = "exported " + name
+}
+
+// groupLine is the 1-based line to land on for a change set, proposed or not. A
+// proposed set comes from PendingMarks; a decided one has no pending mark left,
+// so its first Annotated run names the line. Zero means the set has no live
+// text to land on.
+func groupLine(p *editor.Pane, id uint64) int {
+	for _, m := range p.PendingMarks() {
+		if m.Group == id && m.DispLine(p) >= 0 {
+			return m.Line + 1
+		}
+	}
+	for _, r := range p.File.Session().Project(piecetable.Annotated).States() {
+		if r.Group == id {
+			return p.File.LineOf(r.Off) + 1
+		}
+	}
+	return 0
 }

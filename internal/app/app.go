@@ -267,7 +267,14 @@ type App struct {
 	// dialogs deep still lands back where the user was.
 	promptReturn Focus
 	mode         Mode
-	status       string
+	// walk is the active intention review walk: an ordered cursor over one
+	// intention's change sets, or nil when no walk is running. It is what makes
+	// accept/reject/next/prev act on the intention's order rather than the
+	// active buffer's document order, and what the review bar and the waiting
+	// list read to show the intention a set belongs to. Cleared when Review
+	// mode ends.
+	walk   *intentWalk
+	status string
 	// phone is the launch profile: taller scrollable tab chips, no status
 	// strip, and a review action bar. It is fixed at construction, so no
 	// stored setting can turn it on or off.

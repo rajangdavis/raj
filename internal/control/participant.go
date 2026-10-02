@@ -112,6 +112,16 @@ const LocalHuman uint8 = 1
 // MaxParticipants is the ceiling the one-byte author id imposes.
 const MaxParticipants = 255
 
+// reservedIdentities are the names the registry keeps for the local human. The
+// keyboard row is seeded with identity "local" and display name "you"; a hello
+// naming either is refused before any lookup, so a client holding the shared
+// TCP token cannot rebind itself onto the human row and then pass the human
+// gate for save, accept and land.
+var reservedIdentities = map[string]bool{
+	"local": true,
+	"you":   true,
+}
+
 // Registry is the author table, and it holds two kinds of row.
 //
 // The first is a durable identity — a harness session id, a user name — mapped
@@ -212,8 +222,20 @@ func (r *Registry) setJoined(fn func(uint8)) {
 // happens in Join, after the unlock, because the hook reads the registry back
 // and would otherwise deadlock on the lock it was called under.
 func (r *Registry) join(identity, name string, kind Kind) (uint8, bool, error) {
+	if reservedIdentities[identity] {
+		return 0, false, fmt.Errorf("participant: %q is a reserved identity", identity)
+	}
 	if id, ok := r.byIdentity[identity]; ok {
 		p := r.byID[id]
+		// A human row is the person at the keyboard or an attached human
+		// client; a caller that is not claiming to be human (a TCP caller is
+		// always forced to an agent kind by serve) must not inherit it. The
+		// request kind is otherwise ignored for an existing row, which is the
+		// defect: joining "local" or a declared human identity returned the
+		// human row and its author id.
+		if p.Kind == KindHuman && kind != KindHuman {
+			return 0, false, fmt.Errorf("participant: %q is a human identity; only the local socket may join it", identity)
+		}
 		r.conns[id]++
 		p.Connected = true
 		// Announce only a row the editor does not already have: an ordinary

@@ -15,13 +15,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # At least the go directive in go.mod (1.25.0): a lower pin fails
+          # At least the go directive in go.mod (1.27.1): a lower pin fails
           # outright under GOTOOLCHAIN=local. Also at least the minimum the
           # README gives macOS users, because older toolchains omit LC_UUID
           # when linking internally and macOS then re-asks for local-network
           # permission on every launch. Building here with what the docs tell
           # people to use is the only way that stays true.
-          go-version: '1.25.0'
+          go-version: '1.27.1'
           cache: true
 
       # Each step is its own line in the log, so a red build says which gate

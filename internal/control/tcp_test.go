@@ -1,6 +1,8 @@
 package control
 
 import (
+	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1529,5 +1531,140 @@ func TestLandRefusesAnAgentOverTCP(t *testing.T) {
 	}
 	if ed.policyMem.saves != 0 {
 		t.Errorf("the refused land reached the host: %d save(s)", ed.policyMem.saves)
+	}
+}
+
+// A crafted frame whose second hunk length is near 2^63 must not crash the
+// server. Frame.Split tested off+n > len(f.Body); off+n wraps negative for a
+// large enough n, so the test passed and the slice below panicked. The frame
+// is sent without a token on purpose: DecodeRequest runs before the token
+// check, which is why the crash needed no credentials. After the fix the frame
+// is answered with an error and the same connection, and the server, carries
+// on.
+func TestServerSurvivesAnOverflowingHunkLength(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, addr := ParseAddr(ed.srv.Path())
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Two hunks: the first consumes two body bytes so off==2, the second names
+	// a length that makes off+n wrap. 2^63-2 is the largest positive value the
+	// varint carries (prog.Varint).
+	bad := Header{ID: 7, Op: "apply", Hunks: []HunkMeta{
+		{Start: 0, End: 0, Len: 2},
+		{Start: 0, End: 0, Len: math.MaxInt64 - 1},
+	}}
+	if err := WriteFrame(conn, bad, []byte{0, 0}); err != nil {
+		t.Fatalf("writing the crafted frame: %v", err)
+	}
+	f, err := ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("the server did not answer the crafted frame: %v", err)
+	}
+	res, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ID != 7 || res.Err == "" {
+		t.Fatalf("answer to the crafted frame = %+v, want an error for id 7", res)
+	}
+
+	// The connection and the server are still alive: a valid request on the
+	// same socket is answered.
+	h, body := EncodeRequest(Request{ID: 8, Op: "ping", Token: ed.srv.Token()})
+	if err := WriteFrame(conn, h, body); err != nil {
+		t.Fatal(err)
+	}
+	f, err = ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("the server stopped serving after the crafted frame: %v", err)
+	}
+	res, err = DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK || res.ID != 8 {
+		t.Fatalf("ping after the crafted frame = %+v, want OK", res)
+	}
+}
+
+// The human row is seeded with identity "local". A TCP caller that says hello
+// as "local" must be refused: joining the existing row returns author 1, and
+// author 1 passes the human gate for save, accept and land. Before the fix the
+// hello returns OK and the connection writes as the local human.
+func TestHelloOverTCPRefusesTheReservedLocalIdentity(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	t.Setenv(TokenEnv, ed.srv.Token())
+	c, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "hello", Identity: "local", Name: "impostor"})
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	if res.OK || res.Err == "" {
+		t.Fatalf("a TCP hello as the reserved identity succeeded: %+v", res)
+	}
+	if id := c.Author(); id == LocalHuman {
+		t.Fatalf("the connection bound the local human author %d", id)
+	}
+	// The human row is still the local keyboard, connected.
+	if p, ok := ed.srv.Participants.Get(LocalHuman); !ok || !p.Connected {
+		t.Fatalf("the local human row = %+v ok=%v, want it connected and untouched", p, ok)
+	}
+}
+
+// A durable human row is not joinable from TCP either, even under an identity
+// that is not reserved: joining the row returns its author id and passes the
+// human gate. The row is created over the local socket, which is the human
+// trust boundary; the same identity over TCP must be refused.
+func TestHelloOverTCPCannotJoinAHumanRow(t *testing.T) {
+	sock := controlSock(t, "human.sock")
+	ed := newFakeEditorAddrs(t, []string{sock, "tcp://127.0.0.1:0"},
+		map[string]string{"/w/a.go": "x\n"})
+	paths := ed.srv.Paths()
+	if len(paths) != 2 {
+		t.Fatalf("Paths() = %v, want two addresses", paths)
+	}
+
+	desk, err := Dial(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer desk.Close()
+	hi, err := desk.Do(Request{Op: "hello", Identity: "client:desk", Name: "desk",
+		Kind: string(KindHuman)})
+	if err != nil || !hi.OK {
+		t.Fatalf("human hello over the socket: res=%+v err=%v", hi, err)
+	}
+	humanID := desk.Author()
+	if humanID == 0 || ed.srv.Participants.IsAgent(humanID) {
+		t.Fatalf("the socket human bound author %d, which reads as an agent", humanID)
+	}
+
+	t.Setenv(TokenEnv, ed.srv.Token())
+	remote, err := Dial(paths[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	res, err := remote.Do(Request{Op: "hello", Identity: "client:desk", Name: "desk"})
+	if err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	if res.OK || res.Err == "" {
+		t.Fatalf("a TCP hello joined the human row: %+v", res)
+	}
+	if id := remote.Author(); id == humanID {
+		t.Fatalf("the TCP connection bound the human author %d", id)
+	}
+	if p, ok := ed.srv.Participants.Get(humanID); !ok || ed.srv.Participants.IsAgent(humanID) || !p.Connected {
+		t.Fatalf("the human row = %+v ok=%v, want a connected human", p, ok)
 	}
 }

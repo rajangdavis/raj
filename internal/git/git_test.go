@@ -323,3 +323,54 @@ func TestDiffTreesReadsTwoObjects(t *testing.T) {
 		t.Error("DiffTrees with no base must be refused, not defaulted to HEAD")
 	}
 }
+
+// optionRunner records the git invocations, standing in for a git binary that
+// would act on an option. It returns success, so without the guard the call
+// succeeds and is recorded.
+type optionRunner struct{ calls []string }
+
+func (r *optionRunner) Run(_ context.Context, dir string, stdin []byte, args ...string) ([]byte, error) {
+	r.calls = append(r.calls, strings.Join(args, " "))
+	return []byte(""), nil
+}
+
+// A revision that begins with a dash is an option injection: git parses any
+// argument before `--` as an option, so a rev of --output=/some/path made
+// `git diff --no-color --output=/some/path` write an arbitrary file, and
+// --version reached the git flag parser. checkRev refuses it at the boundary,
+// and this proves every revision entry point refuses before spawning git.
+func TestCallRefusesAnOptionAsRevision(t *testing.T) {
+	const rev = "--output=/tmp/owned"
+	runner := &optionRunner{}
+	svc := NewWithRunner("/w", runner)
+	for _, mode := range []string{"diff", "show", "numstat"} {
+		if _, err := svc.Call(context.Background(), Query{Mode: mode, Rev: rev}); err == nil {
+			t.Errorf("Call(%s, rev=%q) was accepted", mode, rev)
+		}
+	}
+	if _, err := svc.Diff(context.Background(), rev, "a.go"); err == nil {
+		t.Errorf("Diff(rev=%q) was accepted", rev)
+	}
+	if _, err := svc.Show(context.Background(), rev, "a.go"); err == nil {
+		t.Errorf("Show(rev=%q) was accepted", rev)
+	}
+	if _, err := svc.NumStat(context.Background(), rev, "a.go"); err == nil {
+		t.Errorf("NumStat(rev=%q) was accepted", rev)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("git ran anyway: %v", runner.calls)
+	}
+}
+
+// A real revision still passes the guard, so the refusal is not a blanket
+// rejection of the rev field.
+func TestCheckRevAllowsRealRevisions(t *testing.T) {
+	for _, rev := range []string{"", "HEAD", "HEAD~1", "refs/heads/main", "abc123", "v1.2.3"} {
+		if err := checkRev(rev); err != nil {
+			t.Errorf("checkRev(%q) = %v, want it allowed", rev, err)
+		}
+	}
+	if err := checkRev("-x"); err == nil {
+		t.Error("checkRev(-x) accepted an option")
+	}
+}

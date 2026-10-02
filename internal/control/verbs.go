@@ -112,10 +112,15 @@ var verbs = []verb{
 	// program can find, read and apply in one frame.
 	{name: "find", wire: 52, op: prog.OpFind, handle: dispatchFind},
 
-	// Wireless internal ops. connection.runHook and connection.search ask the
-	// event thread for these in-process; no header spells them, so wire 0.
+	// Wireless internal ops. connection.runHook, connection.search and
+	// connection.git ask the event thread for these in-process; no header
+	// spells them, so wire 0.
 	{name: "hookprep", handle: dispatchHookPrep},
 	{name: "searchsnapshot", handle: dispatchSearchSnapshot},
+	// gitprep is the event-thread half of git: it resolves the read-only
+	// service, and connection.git runs the query off the thread. No program
+	// names it, like execcheck and lspprep.
+	{name: "gitprep", handle: dispatchGitPrep},
 }
 
 // verbByName is the Dispatch lookup. The tables derived below are all built in

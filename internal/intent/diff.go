@@ -38,10 +38,40 @@ type Diff struct {
 // Review is the `intent review` answer: the seam's diff tabs opened in the
 // running editor, one per file the seam changes, named by their
 // workspace-relative paths in the order they were opened.
+//
+// Deprecated: `intent review` now starts a Walk over the intention's sets
+// (below) instead of opening a tab per file. The type stays for callers that
+// still read it; the walk answer is Walk.
 type Review struct {
 	Name  string   `json:"name"`
 	Base  string   `json:"base"`
 	Files []string `json:"files"`
+}
+
+// Walk is the `intent review` answer for the review walk: the intention's
+// change sets in the intention's own order (the walk order), the distinct
+// files they touch in file order (the order a diff renders), and the base the
+// walk is over. Sets[0] is the set the walk opened on.
+//
+// The two orders are deliberately different. A walk follows the intention:
+// the order the owner chose when the intention was built, which carries the
+// dependencies between sets. A diff reads in file order: git's own numstat
+// order, so two hunks in one file sit together. Files records the second so a
+// renderer can present one and walk the other without re-deriving either.
+type Walk struct {
+	Name  string    `json:"name"`
+	Base  string    `json:"base"`
+	Sets  []WalkSet `json:"sets"`
+	Files []string  `json:"files"`
+}
+
+// WalkSet is one change set in a Walk: the group id qualified by the
+// workspace-relative path of the buffer that numbers it, and the group's
+// lifecycle state when the walk opened.
+type WalkSet struct {
+	Path  string `json:"path"`
+	Group uint64 `json:"group"`
+	State string `json:"state,omitempty"`
 }
 
 // Next is the `intent next` answer: the artifact a seam would push. Commit is

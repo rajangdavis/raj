@@ -794,6 +794,14 @@ type LSPCaller interface {
 	Run(ctx context.Context) (json []byte, err error)
 }
 
+// GitCaller runs one read-only git query. The event thread hands one back from
+// the internal "gitprep" op after resolving the service, and the query runs on
+// the connection's goroutine, off the event thread, so a slow repository never
+// stalls the editor. It never crosses the wire, like Searcher.
+type GitCaller interface {
+	Call(ctx context.Context, q git.Query) (*git.Result, error)
+}
+
 // ClaimOverlap names another identity that has claimed a path this one also
 // claims. Claims are not locks, so two writers may hold the same file; this
 // is how the second one learns who else is there. Identity is resolved from
@@ -963,6 +971,11 @@ type Response struct {
 	// wire: it is how the event thread hands a consistent view of the open
 	// buffers to a walk that runs off it.
 	Searcher Searcher
+	// Git is returned by the internal "gitprep" op. It never crosses the wire:
+	// it is how the event thread hands the read-only git service to the
+	// connection that runs the query off it. The json tag keeps it out of
+	// runProgram --json, the one path that marshals a whole Response.
+	Git GitCaller `json:"-"`
 	// Exit is a finished command's status, and Dirty the buffers that stopped
 	// one from starting.
 	Exit  int
@@ -1212,6 +1225,11 @@ type Server struct {
 	// Read under mu in serve and written under mu by a test, so the seam has a
 	// happens-before edge even when it is set after the accept loops start.
 	heartbeat time.Duration
+
+	// gitQueryTimeout is a test seam: the deadline a connection runs one git
+	// query under, with the zero value leaving it on gitTimeout. Read only by
+	// the connection goroutine that owns the query, so no lock is needed.
+	gitQueryTimeout time.Duration
 
 	// watch generation. gen moves on the event thread; a parked watch compares
 	// it against the Gen its request carried and wakes when they differ. The
@@ -1712,6 +1730,19 @@ func (s *Server) accept(ln net.Listener, network string) {
 }
 
 func (s *Server) serve(conn net.Conn, network string) {
+	// A panic on one connection is that connection's failure, not the
+	// server's: recover it, report it, and let the connection end. The
+	// recover is registered first so it runs last, after the connection is
+	// closed and the author id released; the cleanup must not be skipped.
+	// Continuing the read loop instead would parse a stream whose position is
+	// unknown, so this deliberately ends the connection rather than carrying
+	// on with it.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "raj: control connection from %s panicked: %v\n%s",
+				conn.RemoteAddr(), r, debug.Stack())
+		}
+	}()
 	defer conn.Close()
 	// Each connection is one writer, assigned an author id for its lifetime.
 	// Attribution is therefore a property of who is connected rather than of
@@ -2165,6 +2196,12 @@ func (c *connection) one(req Request, emit func(Response)) {
 			m.conn(c, req, emit)
 			return
 		}
+	case "git":
+		// git spawns a process, so the event thread only resolves the service
+		// (the internal gitprep op) and the query runs here, off it, under a
+		// deadline. See connection.git.
+		c.git(req, emit)
+		return
 	}
 	res := c.srv.submit(req)
 	// A hook list reports the panic switch alongside the rows, so a reader
@@ -2751,6 +2788,43 @@ func (c *connection) lsp(req Request, emit func(Response)) {
 		return
 	}
 	emit(Response{ID: req.ID, OK: true, LSPJSON: string(data), Final: true})
+}
+
+// git runs one read-only git query off the event thread, under a deadline. The
+// event thread only resolves the service (the internal gitprep op) and starts
+// no process; the query runs here, on the connection's goroutine, so a slow
+// repository cannot stall the editor. A cancel or the deadline ends the
+// process.
+func (c *connection) git(req Request, emit func(Response)) {
+	prep := c.srv.submit(Request{ID: req.ID, Op: "gitprep", Path: req.Path,
+		GitMode: req.GitMode, GitRev: req.GitRev, GitCount: req.GitCount})
+	if prep.Err != "" || prep.Git == nil {
+		if prep.Err == "" {
+			prep.Err = "git is not available"
+		}
+		emit(Response{ID: req.ID, Err: prep.Err, Final: true})
+		return
+	}
+	timeout := c.srv.gitQueryTimeout
+	if timeout <= 0 {
+		timeout = gitTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	c.mu.Lock()
+	c.running[req.ID] = cancel
+	c.mu.Unlock()
+	defer func() {
+		cancel()
+		c.mu.Lock()
+		delete(c.running, req.ID)
+		c.mu.Unlock()
+	}()
+	result, err := prep.Git.Call(ctx, git.Query{
+		Mode: req.GitMode, Path: req.Path, Rev: req.GitRev, Count: req.GitCount})
+	res := gitResultResponse(result, err)
+	res.ID = req.ID
+	res.Final = true
+	emit(res)
 }
 
 // search is the streaming path, and the only op that leaves the event thread.

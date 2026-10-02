@@ -395,9 +395,25 @@ func (s *Service) Call(ctx context.Context, q Query) (*Result, error) {
 	}
 }
 
+// checkRev refuses a revision that begins with '-' before it can reach git's
+// option parser. git treats any argument before `--` as an option, so a
+// revision like `--output=/some/path` or `--version` is not a revision at all:
+// `git diff --no-color --output=...` writes an arbitrary file and `git show
+// --version` runs git's own flag handling. A revision is a name git resolves,
+// never an option, so a leading dash is refused at the boundary.
+func checkRev(rev string) error {
+	if strings.HasPrefix(rev, "-") {
+		return fmt.Errorf("git: %q is not a revision: a revision may not begin with %q", rev, "-")
+	}
+	return nil
+}
+
 // Diff renders the change between rev (default HEAD) and the worktree as a
 // unified patch. Reading it moves nothing.
 func (s *Service) Diff(ctx context.Context, rev, path string) (string, error) {
+	if err := checkRev(rev); err != nil {
+		return "", err
+	}
 	if rev == "" {
 		rev = "HEAD"
 	}
@@ -416,6 +432,9 @@ func (s *Service) Diff(ctx context.Context, rev, path string) (string, error) {
 // REV:PATH` -- the committed text, no checkout; without one it is `git show
 // REV`, HEAD by default.
 func (s *Service) Show(ctx context.Context, rev, path string) (string, error) {
+	if err := checkRev(rev); err != nil {
+		return "", err
+	}
 	if rev == "" {
 		rev = "HEAD"
 	}
@@ -434,6 +453,9 @@ func (s *Service) Show(ctx context.Context, rev, path string) (string, error) {
 
 // NumStat parses `git diff --numstat` into per-file churn.
 func (s *Service) NumStat(ctx context.Context, rev, path string) ([]NumStatEntry, error) {
+	if err := checkRev(rev); err != nil {
+		return nil, err
+	}
 	if rev == "" {
 		rev = "HEAD"
 	}
