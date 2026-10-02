@@ -30,18 +30,16 @@ func SemanticStyle(name string) (ui.Style, bool) {
 	case "string", "regexp":
 		return ui.DefaultStyle.With(ui.Ansi(10)), true // bright green
 	case "number":
-		// The LiteralString case spans every Literal* token, so a number
-		// takes the same green as a string, not the cyan here.
-		return ui.DefaultStyle.With(ui.Ansi(10)), true
+		return ui.DefaultStyle.With(ui.Ansi(14)), true // bright cyan
 	case "keyword", "modifier":
 		return ui.DefaultStyle.With(ui.Ansi(13)).Plus(ui.Bold), true // bright magenta, the anchor
 	case "type", "class", "enum", "interface", "struct", "typeParameter",
 		"enumMember", "namespace", "macro", "decorator":
 		return ui.DefaultStyle.With(ui.Ansi(11)), true // bright yellow
 	case "function", "method", "event":
-		// styleFor gives NameFunction and NameAttribute the blue bold role,
-		// not the yellow of the other Name* sub-categories, so match blue
-		// here or the overlay would repaint a function as a type.
+		// styleFor gives NameFunction the blue bold role, not the yellow
+		// of the base Name tokens, so match blue here or the overlay would
+		// repaint a function as a type.
 		return ui.DefaultStyle.With(ui.Ansi(12)).Plus(ui.Bold), true
 	case "operator", "punctuation":
 		return ui.DefaultStyle.With(ui.Ansi(7)), true // slightly muted against identifiers

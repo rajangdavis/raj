@@ -71,40 +71,78 @@ func (a *App) pointer(ev ui.Mouse) {
 	l := a.layout(cols, rows)
 
 	if ev.Motion {
-		// A drag only ever extends a selection in the document. Dragging
-		// through a list would have to mean either scrolling or a range
-		// selection, and neither pane has a range to select.
-		if a.drag && ev.Button == keys.MouseLeft {
-			if p := a.Tabs.Active(); p != nil {
-				x, y, _ := a.editorCell(l, p, ev.Col, ev.Row)
-				p.DragTo(x, y)
-				// Remembered so the tick can keep extending to a pointer that
-				// has stopped moving. Held outside the pane, that is the whole
-				// gesture: the hand is still and the text is what moves.
-				a.dragCol, a.dragRow = ev.Col, ev.Row
-				a.autoscroll = a.beyondEdge(l, p, ev.Row)
-			}
-			return
-		}
-		a.pointerHint(l, ev.Col, ev.Row)
+		a.pointerMove(l, ev)
 		return
 	}
+	// From here the press is routed in the order things are drawn, reversed:
+	// the overlays first, then the dialogs, then the drawer, then the panes.
+	// Each step reports whether it consumed the press.
+	if a.pointerOverlays(l, cols, ev) {
+		return
+	}
+	if a.pointerModal(cols, rows, ev) {
+		return
+	}
+	if a.pointerDrawer(ev) {
+		return
+	}
+	a.pointerSurfaces(l, cols, ev)
+}
 
-	// The menu is drawn over everything but a dialog, so it takes the press
-	// first, before the button split: any click off it dismisses it. A
-	// left-click on a row chooses it; any other press closes it and is
-	// swallowed, so a click that misses the menu cannot focus or open what is
-	// under it.
-	if a.Menu.Open() && !a.Prompt.Open {
-		if ev.Button == keys.MouseLeft {
-			if key, ok := a.Menu.RowAt(ev.Col, ev.Row, a.menuCol, a.menuRow); ok {
-				a.chooseMenu(key)
-				return
-			}
+// pointerMove handles a motion event: a drag extends a selection in the
+// document, and any other motion only arms the hint tooltip.
+func (a *App) pointerMove(l Layout, ev ui.Mouse) {
+	// A drag only ever extends a selection in the document. Dragging
+	// through a list would have to mean either scrolling or a range
+	// selection, and neither pane has a range to select.
+	if a.drag && ev.Button == keys.MouseLeft {
+		if p := a.Tabs.Active(); p != nil {
+			x, y, _ := a.editorCell(l, p, ev.Col, ev.Row)
+			p.DragTo(x, y)
+			// Remembered so the tick can keep extending to a pointer that
+			// has stopped moving. Held outside the pane, that is the whole
+			// gesture: the hand is still and the text is what moves.
+			a.dragCol, a.dragRow = ev.Col, ev.Row
+			a.autoscroll = a.beyondEdge(l, p, ev.Row)
 		}
-		a.closeMenu()
 		return
 	}
+	a.pointerHint(l, ev.Col, ev.Row)
+}
+
+// pointerOverlays routes a press among the surfaces drawn above the panes and
+// reports whether one consumed it.
+func (a *App) pointerOverlays(l Layout, cols int, ev ui.Mouse) bool {
+	if a.pointerMenu(ev) {
+		return true
+	}
+	return a.pointerButtons(l, cols, ev)
+}
+
+// pointerMenu handles a press while the menu is open. The menu is drawn over
+// everything but a dialog, so it takes the press first, before the button
+// split: any click off it dismisses it. A left-click on a row chooses it; any
+// other press closes it and is swallowed, so a click that misses the menu
+// cannot focus or open what is under it.
+func (a *App) pointerMenu(ev ui.Mouse) bool {
+	if !a.Menu.Open() || a.Prompt.Open {
+		return false
+	}
+	if ev.Button == keys.MouseLeft {
+		if key, ok := a.Menu.RowAt(ev.Col, ev.Row, a.menuCol, a.menuRow); ok {
+			a.chooseMenu(key)
+			return true
+		}
+	}
+	a.closeMenu()
+	return true
+}
+
+// pointerButtons handles the mouse buttons the menu does not: middle-click
+// closes a tab, a right-click (or its ctrl+left substitute) opens a context
+// menu, and any other button does nothing. It reports whether the press was
+// consumed.
+func (a *App) pointerButtons(l Layout, cols int, ev ui.Mouse) bool {
 	// Middle-click closes a tab. There is no × drawn on a tab to aim at, and
 	// adding one would spend a column of every label on a target that is
 	// missed as often as it is hit at sidebar widths; middle-click is what
@@ -113,7 +151,7 @@ func (a *App) pointer(ev ui.Mouse) {
 		if i, ok := a.Tabs.HitTest(0, cols, ev.Col); ok && ev.Row >= l.TabY && ev.Row < l.TabY+a.Tabs.StripRows() {
 			a.closeTabAt(i)
 		}
-		return
+		return true
 	}
 	// A right-click is the context-menu gesture. It resolves against the
 	// geometry the last frame drew, and the overlay order is the draw order
@@ -127,60 +165,74 @@ func (a *App) pointer(ev ui.Mouse) {
 	if ev.Button == keys.MouseRight ||
 		(ev.Button == keys.MouseLeft && ev.Mods&keys.ModCtrl != 0 && a.menuTargetAt(l, ev)) {
 		a.rightClick(l, ev)
-		return
+		return true
 	}
-	if ev.Button != keys.MouseLeft {
-		return // middle-click was handled above; other buttons do nothing
-	}
+	return ev.Button != keys.MouseLeft // middle-click was handled above; other buttons do nothing
+}
 
-	switch {
-	case a.Prompt.Open:
+// pointerModal handles a press while a dialog or the picker is open, and
+// reports whether it was consumed. A dialog takes every press while it is
+// open. A picker takes a press inside it; a press outside dismisses it and is
+// not consumed, so it belongs to whatever it landed on.
+func (a *App) pointerModal(cols, rows int, ev ui.Mouse) bool {
+	if a.Prompt.Open {
 		// A dialog takes every press while it is open, including the ones
 		// outside it. Clicking off a modal question cannot dismiss it — the
 		// question has to be answered, and the answer decides what happens to
 		// the thing being asked about.
 		a.Prompt.ClickAt(cols, rows, ev.Col, ev.Row)
 		a.settlePrompt()
-		return
-	case a.Picker.Open:
+		return true
+	}
+	if a.Picker.Open {
 		path, inside := a.Picker.ClickAt(cols, rows, ev.Col, ev.Row)
 		if path != "" {
 			a.openFromPicker(path)
 		}
 		if inside {
-			return
+			return true
 		}
 		// A press outside an open picker dismisses it, the way clicking off a
 		// menu does, and then belongs to whatever it landed on.
 		a.Picker.Hide()
 		a.focus = FocusEditor
 	}
+	return false
+}
 
-	// The phone action drawer owns the bottom row and, while open, the panel
-	// above it. A tap on a button dispatches it and leaves the panel up, so a
-	// review pass is a run of taps rather than an open/dispatch/open cycle; a
-	// tap on the handle toggles it; a tap elsewhere collapses an open panel and
-	// is swallowed rather than falling through to the editor behind it.
-	if a.phone && a.drawerHandle.h > 0 {
-		if a.drawerOpen {
-			if b, ok := a.drawerAt(ev.Col, ev.Row); ok {
-				a.drawerDispatch(b)
-				return
-			}
-			if ev.Row >= a.drawerPanelTop && ev.Row < a.drawerPanelTop+a.drawerPanelRows {
-				return // the panel background, not a button: keep it open
-			}
-			a.drawerOpen = false
-			return
-		}
-		if ev.Row >= a.drawerHandle.y && ev.Row < a.drawerHandle.y+a.drawerHandle.h {
-			a.drawerOpen = true
-			a.drawerSel = 0
-			a.drawerWant = a.drawerOpenWant()
-			return
-		}
+// pointerDrawer handles a press when the phone action drawer owns the bottom
+// row and, while open, the panel above it, and reports whether it was
+// consumed. A tap on a button dispatches it and leaves the panel up, so a
+// review pass is a run of taps rather than an open/dispatch/open cycle; a tap
+// on the handle toggles it; a tap elsewhere collapses an open panel and is
+// swallowed rather than falling through to the editor behind it.
+func (a *App) pointerDrawer(ev ui.Mouse) bool {
+	if !a.phone || a.drawerHandle.h == 0 {
+		return false
 	}
+	if a.drawerOpen {
+		if b, ok := a.drawerAt(ev.Col, ev.Row); ok {
+			a.drawerDispatch(b)
+			return true
+		}
+		if ev.Row >= a.drawerPanelTop && ev.Row < a.drawerPanelTop+a.drawerPanelRows {
+			return true // the panel background, not a button: keep it open
+		}
+		a.drawerOpen = false
+		return true
+	}
+	if ev.Row >= a.drawerHandle.y && ev.Row < a.drawerHandle.y+a.drawerHandle.h {
+		a.drawerOpen = true
+		a.drawerSel = 0
+		a.drawerWant = a.drawerOpenWant()
+		return true
+	}
+	return false
+}
 
+// pointerSurfaces routes a press among the panes in draw order: the tab bar,
+// then the sidebar, then the editor.
+func (a *App) pointerSurfaces(l Layout, cols int, ev ui.Mouse) {
 	if ev.Row >= l.TabY && ev.Row < l.TabY+a.Tabs.StripRows() {
 		if i, ok := a.Tabs.HitTest(0, cols, ev.Col); ok {
 			a.Tabs.Goto(i + 1)

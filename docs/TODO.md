@@ -98,6 +98,36 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   pending sets and a `revert --author 130` from that connection would have
   discarded them. Do not reuse an id any pending journal op names.
 
+### Seams (intent) — trial findings (2026-10-01)
+
+- **A seam is only as durable as the journal it indexes.** The intention row
+  (name/owner/base/members) survives a daemon restart, but the change sets its
+  members name do not, so after a restart `intent prove <name>` refuses with
+  `dependent group(s) [...] need member group N in <path>, which is missing`
+  and every pre-restart seam is dangling by construction. Until the durable
+  journal lands (`Durable log`, below), treat a seam as a single-session object.
+  Detail: `docs/dev/AGENT-FEEDBACK.md`, "seam-layer trial (2026-10-01)".
+- **`intent prove` may wedge the editor it drives.** One prove ran the `check`
+  hook (`gofmt -w cmd internal`) inside the projected tree and was still in
+  `go vet`/`make` when the control socket stopped answering (`i/o timeout`; a
+  daemon restart cleared it). The fast-failing prove did not wedge, so the
+  suspect is a prove that reaches materialise + a write-hook/build — the
+  "a gate that can block the thing it runs in" shape. Reproduce with a clean
+  passing prove on a durable seam before fixing.
+- **`intent group --task T` cannot build a seam from agent sets.** `groups
+  --task <session>` answers `N change set(s) belong to another task` because a
+  set's `Task` is not its session id, so the documented seam builder has
+  nothing to select; the workaround is `intent new --ref BASE <PATH=N...>`
+  by hand. Same root as the D-6 "plugin should inject `--task`" item.
+- **`intent new` requires `--ref BASE` with no default** and no hint until it is
+  passed. Decide a default (the current HEAD, as `materialise` resolves) or
+  state the requirement in the usage.
+- **CLI `--json` shapes for the intent verbs are not uniform.** `intent show
+  --json` nests under `{"intention": ...}` (singular), `intent list --json`
+  under `{"intentions": ...}`, `groups --json` is a bare array. Two writers and
+  the orchestrator each guessed wrong once; document the shapes or normalise
+  them.
+
 ### Layered proposals
 
 - One jump path: move `host.Goto` onto `jumpToSessionLine`, or state why the
@@ -151,8 +181,6 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
 - A stale chord in a test passes vacuously (`TestDefinitionWithoutAServerIsHarmless`
   presses the retired `alt+super+d`); decide whether the harness fails loudly
   and tests read `keys.Bindings`.
-- `syntax.go`'s dead chroma cases and the colours their comments describe
-  (upgrade chroma or narrow the cases to specific token types).
 - The LSP campaign's deliberate follow-ons: `semanticTokens/range` and delta,
   refresh requests, `codeAction/resolve`, lazy `codeLens/resolve`,
   `documentLink` rendering, `signatureHelp` triggers, `onTypeFormatting`

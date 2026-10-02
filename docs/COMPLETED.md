@@ -2584,3 +2584,22 @@ Each line answers a question its plan left open, from the code at HEAD
 - [x] **F3b-ii consumer seams on the display map (folded from `F3B-II-DESIGN.md`, 2026-10-01).** A record of what the design established, not a test run. D1's map was wired at the composition seam and left unwired at the consumer seams: `drawDiagnosticMarks`/`drawProposalMarks` use `DispOfDocLine` (`internal/app/render.go:217`, `:276`, `:337`); session restore and the inlay window clamp on `DisplayLines` (`internal/app/session.go:151`, `internal/app/inlay.go:164`).
 - [x] **Cycle recreates dropped harness containers (folded from `L4-RESTART-RESUME.md`, 2026-09-27).** `step_ensure` (`scripts/raj-cycle.sh:406`) recreates a named container that is not running and leaves a running one alone.
 - [x] **The claim spec matches the forward-claim code (2026-10-01).** `docs/archive/CLAIM-SPEC.md` §3 now describes the forward claim (`Guard.Claim` warns only on a non-`IsNotExist` stat error; `saveNamed`/`ensureParent` answers the parent at save time), §5 and §10 no longer call the parent case open, and the spec was archived with its remaining open items folded to `docs/TODO.md`, "Folded from landed spec remainders".
+
+## Between-wave review: DEBT-PLAN queue and the 2026-10-01 wave (2026-10-01)
+
+Recorded by the between-wave review pass from the tree at HEAD `26631fd0` plus
+the worktree. No test was run by this pass; "landed" means the code or test was
+found in the tree. The plan's own status block is `docs/dev/DEBT-PLAN.md` §4.
+
+- [x] **R0 — the cyclo/dupl check.** `Makefile` has `cyclo`, `dupl` and `quality`, `CYCLO_OVER`/`DUPL_THRESHOLD`/`FAIL`, and no `//gocyclo:ignore` directive remains.
+- [x] **A — the verb registry.** `internal/control/verbs.go` is the one `verbs` slice; `Dispatch` is a `verbByName` lookup (`internal/control/host.go:1906`); `verbCodes`/`verbNames`/`knownOps` are derived in `init`; `find` got wire code 52.
+- [x] **B — header scalar table and paired list codecs.** `internal/control/header.go` `type field` (`:323`) drives encode/decode beside the paired `encode*`/`decode*` helpers.
+- [x] **C — the CLI verb table.** `internal/control/cli.go` `ctlOpts` (`:252`), `ctlFn` (`:329`) and `ctlVerbs`; the `switch cmd` is gone.
+- [x] **T1 — buildProjection split.** `internal/view/projection.go:113` is three phases (`projectionStarts`, `splitSegs`, `composer.emitRows`).
+- [x] **T2 — handleGlobal split.** `internal/app/app.go:1997` chains `handleGlobalFile`/`Review`/`Clipboard`/`Sidebar`/`LSP`/`Toggles`.
+- [x] **T3 — the motion-pair table.** `internal/editor/actions.go:46` `motionPair` and `motionPairFor`; `actions_test.go` asserts every pair.
+- [x] **D1 — the seam-projection two-seam pins.** `TestIntentDiffExcludesOtherAcceptedSeam` and `TestIntentProveExcludesOtherAcceptedSeam` (`internal/app/intent_diff_test.go`).
+- [x] **D2 — the build version stamp.** `Makefile`'s `VERSION_LDFLAGS` writes `raj/internal/control.srcVersion`; `wire_test.go:767`/`:853` pin the round trip and the `-X` stamp.
+- [x] **L — one `control.LSPModes` list (2026-10-01 wave).** `internal/control/lspmodes.go` (new) is the one list; the CLI usage line and mode gate derive from it (`internal/control/cli.go`), and `TestEveryLSPModeReachesItsHostMethod` (`internal/app/lsp_test.go`) covers the client and host halves in place of the two hand-listed tests it deleted.
+- [x] **D3 — `syntax.go`'s dead chroma cases (2026-10-01 wave).** `styleFor` uses `InSubCategory` for `LiteralString`/`LiteralNumber` and drops the four shadowed `Name*` cases; `SemanticStyle`'s "number" role is bright cyan, matching `styleFor`. Closes `docs/TODO.md`'s "dead chroma cases" bullet. Pinned by `TestSemanticStyleMatchesChromaRoles`.
+- [x] **Track C1/C4 — security in CI (in the worktree, uncommitted 2026-10-01).** `Makefile`'s pinned `vuln` target; `ci.yml`'s SHA-pinned actions, `permissions: contents: read` and the `make vuln` step.

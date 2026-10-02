@@ -5,7 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"raj/internal/complete"
 	"raj/internal/editor"
 	"raj/internal/lsp"
 	"raj/internal/picker"
@@ -298,45 +297,26 @@ func (a *App) applyCodeActionEdit(we lsp.WorkspaceEdit) {
 	// loaded leaves the workspace unchanged rather than half fixed. An open
 	// buffer is used as-is; an unopened file is loaded headlessly and announced
 	// as a tab, the same trade a rename makes.
-	type target struct {
-		pane  *editor.Pane
-		edits []complete.Edit
-	}
-	targets := make([]target, 0, len(we.Docs))
-	var loaded []*editor.Pane
-	for _, d := range we.Docs {
-		p, ok := a.paneByPath(d.Path)
-		if !ok {
-			q, err := a.loadHeadless(d.Path)
-			if err != nil {
-				for _, l := range loaded {
-					a.dropHeadless(l)
-				}
-				a.status = "the code action would change " + d.Path +
-					", which is not open and cannot be loaded; nothing was changed"
-				return
-			}
-			p = q
-			loaded = append(loaded, q)
-		}
-		doc := lsp.NewDocument(p.File.Text())
-		edits := make([]complete.Edit, 0, len(d.Edits))
-		for _, te := range d.Edits {
-			start, end := doc.Span(te.Range)
-			edits = append(edits, complete.Edit{Start: start, End: end, Text: te.NewText})
-		}
-		targets = append(targets, target{pane: p, edits: edits})
+	targets, loaded, ok := a.resolveEditTargets(we.Docs, func(path string) string {
+		return "the code action would change " + path +
+			", which is not open and cannot be loaded; nothing was changed"
+	})
+	if !ok {
+		return
 	}
 
 	// The leases are checked for every target before any edit lands, so a
 	// change set the user has not decided refuses the whole action rather than
-	// leaving one file fixed and another untouched.
+	// leaving one file fixed and another untouched. The buffers loaded to
+	// resolve the action are dropped again, since the refusal means nothing
+	// was changed.
 	for _, t := range targets {
-		for _, e := range t.edits {
-			if group, leased := t.pane.File.EditLeased(e.Start, e.End-e.Start); leased {
-				a.status = leaseNote(group)
-				return
+		if group, leased := editsLeased(t.pane, t.edits); leased {
+			for _, l := range loaded {
+				a.dropHeadless(l)
 			}
+			a.status = leaseNote(group)
+			return
 		}
 	}
 

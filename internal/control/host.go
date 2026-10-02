@@ -2206,21 +2206,33 @@ func dispatchRevert(g *Guard, req Request) Response {
 	return Response{OK: true}
 }
 
-// dispatchDelete answers the "delete" verb.
-func dispatchDelete(g *Guard, req Request) Response {
+// dispatchWithdrawApprove is the shared shape of the "delete" and "rmdir"
+// verbs: approve and withdraw name opposite answers to one removal, so a
+// request carrying both is refused before either is attempted. approve carries
+// the proposal out; otherwise act proposes it, or retracts it when the request
+// sets withdraw.
+func dispatchWithdrawApprove(req Request, approve, act func() error) Response {
 	if req.Withdraw && req.Approve {
 		return Response{Err: errApproveWithdraw}
 	}
 	if req.Approve {
-		if err := g.ApproveDeletion(req.Path, req.Author); err != nil {
+		if err := approve(); err != nil {
 			return Response{Err: err.Error()}
 		}
 		return Response{OK: true}
 	}
-	if err := g.Delete(req.Path, req.Author, req.Withdraw); err != nil {
+	if err := act(); err != nil {
 		return Response{Err: err.Error()}
 	}
 	return Response{OK: true}
+}
+
+// dispatchDelete answers the "delete" verb.
+func dispatchDelete(g *Guard, req Request) Response {
+	return dispatchWithdrawApprove(req,
+		func() error { return g.ApproveDeletion(req.Path, req.Author) },
+		func() error { return g.Delete(req.Path, req.Author, req.Withdraw) },
+	)
 }
 
 // dispatchDeletions answers the "deletions" verb.
@@ -2230,19 +2242,10 @@ func dispatchDeletions(g *Guard, req Request) Response {
 
 // dispatchRmdir answers the "rmdir" verb.
 func dispatchRmdir(g *Guard, req Request) Response {
-	if req.Withdraw && req.Approve {
-		return Response{Err: errApproveWithdraw}
-	}
-	if req.Approve {
-		if err := g.ApproveDirRemoval(req.Path, req.Author); err != nil {
-			return Response{Err: err.Error()}
-		}
-		return Response{OK: true}
-	}
-	if err := g.Rmdir(req.Path, req.Author, req.Withdraw); err != nil {
-		return Response{Err: err.Error()}
-	}
-	return Response{OK: true}
+	return dispatchWithdrawApprove(req,
+		func() error { return g.ApproveDirRemoval(req.Path, req.Author) },
+		func() error { return g.Rmdir(req.Path, req.Author, req.Withdraw) },
+	)
 }
 
 // dispatchRmdirs answers the "rmdirs" verb.

@@ -464,21 +464,19 @@ func (h *Highlighter) styleFor(t chroma.TokenType) ui.Style {
 	switch {
 	case t.InCategory(chroma.Comment):
 		return st.With(ui.Ansi(8)).Plus(ui.Italic) // dim, recedes
-	case t.InCategory(chroma.LiteralString):
+	case t.InSubCategory(chroma.LiteralString):
 		return st.With(ui.Ansi(10)) // bright green
-	case t.InCategory(chroma.LiteralNumber):
+	case t.InSubCategory(chroma.LiteralNumber):
 		return st.With(ui.Ansi(14)) // bright cyan
 	case t.InCategory(chroma.Literal):
 		return st.With(ui.Ansi(14))
 	case t == chroma.KeywordType, t.InSubCategory(chroma.NameClass),
-		t == chroma.NameNamespace, t == chroma.NameBuiltin, t == chroma.KeywordConstant:
+		t == chroma.NameBuiltin, t == chroma.KeywordConstant:
 		return st.With(ui.Ansi(11)) // bright yellow
 	case t.InCategory(chroma.Keyword):
 		return st.With(ui.Ansi(13)).Plus(ui.Bold) // bright magenta, the anchor
-	case t == chroma.NameFunction, t == chroma.NameAttribute:
+	case t == chroma.NameFunction:
 		return st.With(ui.Ansi(12)).Plus(ui.Bold) // bright blue
-	case t == chroma.NameDecorator, t == chroma.NameLabel:
-		return st.With(ui.Ansi(11))
 	case t.InCategory(chroma.Operator), t.InCategory(chroma.Punctuation):
 		return st.With(ui.Ansi(7)) // slightly muted against identifiers
 	case t.InCategory(chroma.Error):

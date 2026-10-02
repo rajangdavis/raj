@@ -164,20 +164,6 @@ func TestSignatureHelpCapabilityGate(t *testing.T) {
 	}
 }
 
-// The host LSP gate accepts the signature mode. Without it wired into the mode
-// switch, host.LSP refuses it as "unknown lsp mode" before a server is ever
-// asked — the failure is in raj, not in the absence of a server.
-func TestSignatureHelpModeIsAcceptedByHostLSP(t *testing.T) {
-	h := newHarness(t, "package main\n")
-	hs := host{a: h.App}
-	_, err := hs.LSP(h.Pane().File.Path, 1, 1, "signature")
-	// Whether a server is installed or not, the one wrong answer is a refusal
-	// of the mode itself: "no server" and a live caller are both correct here.
-	if err != nil && strings.Contains(err.Error(), "unknown lsp mode") {
-		t.Errorf("the signature mode was refused as unknown: %v", err)
-	}
-}
-
 // A signature answer opens the hover panel with the active signature and its
 // documentation, and does not move the caret: a signature help is something you
 // read, not a jump. It reuses the panel rather than a second widget.
@@ -438,15 +424,106 @@ func TestSiblingJumpCapabilityGates(t *testing.T) {
 	}
 }
 
-// The host LSP gate accepts the three sibling modes. Without them wired into the
-// mode switch, host.LSP refuses each as "unknown lsp mode" before a server is
-// asked — the failure is in raj, not in the absence of a server.
-func TestSiblingJumpModesAreAcceptedByHostLSP(t *testing.T) {
+// lspRouteRecorder wraps the real host and records which dispatch method each
+// mode reached, so the one-list test can tell host.LSP from the four modes that
+// have a host method of their own.
+type lspRouteRecorder struct {
+	control.BufferHost
+	lsp     []string
+	inlay   int
+	format  int
+	symbols int
+}
+
+func (r *lspRouteRecorder) LSP(path string, line, col int, mode string) (control.LSPCaller, error) {
+	r.lsp = append(r.lsp, mode)
+	return r.BufferHost.LSP(path, line, col, mode)
+}
+
+func (r *lspRouteRecorder) LSPInlayHints(path string, lineStart, lineEnd int) (control.LSPCaller, error) {
+	r.inlay++
+	return r.BufferHost.LSPInlayHints(path, lineStart, lineEnd)
+}
+
+func (r *lspRouteRecorder) LSPFormat(path string, lineStart, lineEnd int) (control.LSPCaller, error) {
+	r.format++
+	return r.BufferHost.LSPFormat(path, lineStart, lineEnd)
+}
+
+func (r *lspRouteRecorder) LSPWorkspaceSymbols(path, query string) (control.LSPCaller, error) {
+	r.symbols++
+	return r.BufferHost.LSPWorkspaceSymbols(path, query)
+}
+
+// control.LSPModes is the one list of modes `raj ctl lsp` accepts. This test
+// holds both halves of that contract. The client half: the CLI's own usage
+// names every mode, because its lsp line is derived from the list, so a mode
+// the client would refuse cannot hide in it. The host half: every mode driven
+// through control.Dispatch's lspprep path reaches host.LSP or the host method
+// internal/control/host.go routes it to first — inlay-hints, format,
+// range-format and symbols never fall through to host.LSP — and none comes back
+// "unknown lsp mode". The routing stays split on purpose; this test pins each
+// side of it instead of merging them.
+func TestEveryLSPModeReachesItsHostMethod(t *testing.T) {
+	var help, herr strings.Builder
+	if code := control.CLI([]string{"help"}, &help, &herr); code != 0 {
+		t.Fatalf("raj ctl help = %d, stderr %q", code, herr.String())
+	}
+	wantModes := strings.Join(control.LSPModes[:len(control.LSPModes)-1], ", ") +
+		" or " + control.LSPModes[len(control.LSPModes)-1]
+	lspLine := ""
+	for _, line := range strings.Split(help.String(), "\n") {
+		if strings.HasPrefix(line, "  lsp MODE ") {
+			lspLine = line
+			break
+		}
+	}
+	if lspLine == "" {
+		t.Fatalf("usage has no lsp MODE line:\n%s", help.String())
+	}
+	if !strings.HasSuffix(lspLine, wantModes) {
+		t.Errorf("client usage lsp line = %q, want it to end %q", lspLine, wantModes)
+	}
+
 	h := newHarness(t, "package main\n")
-	hs := host{a: h.App}
-	for _, mode := range []string{"declaration", "type-definition", "implementation"} {
-		if _, err := hs.LSP(h.Pane().File.Path, 1, 1, mode); err != nil && strings.Contains(err.Error(), "unknown lsp mode") {
-			t.Errorf("%s was refused as unknown: %v", mode, err)
+	path := h.Pane().File.Path
+	rec := &lspRouteRecorder{BufferHost: host{h.App}}
+	g := control.NewGuard(rec)
+	ownMethod := map[string]bool{
+		"inlay-hints": true, "format": true, "range-format": true, "symbols": true,
+	}
+	for _, mode := range control.LSPModes {
+		res := control.Dispatch(g, control.Request{
+			Op: "lspprep", Path: path, LSPMode: mode, Line: 1, Col: 1,
+		})
+		if strings.Contains(res.Err, "unknown lsp mode") {
+			t.Errorf("mode %q came back unknown from the host: %s", mode, res.Err)
+		}
+	}
+	for _, mode := range control.LSPModes {
+		if ownMethod[mode] {
+			continue
+		}
+		reached := false
+		for _, m := range rec.lsp {
+			if m == mode {
+				reached = true
+				break
+			}
+		}
+		if !reached {
+			t.Errorf("mode %q did not reach host.LSP (reached %v)", mode, rec.lsp)
+		}
+	}
+	if rec.inlay != 1 || rec.format != 2 || rec.symbols != 1 {
+		t.Errorf("own-method dispatch = inlay %d, format %d, symbols %d; want 1, 2, 1",
+			rec.inlay, rec.format, rec.symbols)
+	}
+	for _, mode := range []string{"inlay-hints", "format", "range-format", "symbols"} {
+		for _, m := range rec.lsp {
+			if m == mode {
+				t.Errorf("mode %q fell through to host.LSP; it has a host method of its own", mode)
+			}
 		}
 	}
 }

@@ -2,10 +2,14 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"raj/internal/lsp"
+	"raj/internal/piecetable"
 )
 
 // A code-action answer lists in the picker, and choosing a row applies the
@@ -297,5 +301,39 @@ func TestClientCapabilitiesAdvertiseCodeActionLiterals(t *testing.T) {
 	}
 	if _, ok := ca["codeActionLiteralSupport"]; !ok {
 		t.Error("codeActionLiteralSupport is not advertised")
+	}
+}
+
+// A code action refused over a lease must not leave the buffers it loaded to
+// resolve the action behind. The unopened target exists only for an action
+// that is not going to happen, so a refusal that keeps it registered is a
+// headless leak the user never opened. The rename path already dropped its
+// loaded buffers; this pins the code-action path to the same behaviour.
+func TestChooseCodeActionRefusalDropsHeadlessBuffers(t *testing.T) {
+	t.Parallel()
+	h := newWorkspace(t, 120, 30)
+	main := filepath.Join(h.primaryRoot(), "main.go")
+	other := filepath.Join(h.primaryRoot(), "pkg", "other.go")
+	h.OpenFile(main)
+	id := propose(t, h, piecetable.Hunk{Start: 0, End: 7, Text: "PACKAGE"})
+	text := h.text()
+	otherText, _ := os.ReadFile(other)
+
+	h.lspGen = 1
+	h.park(lspAnswer{gen: 1, kind: answerCodeAction, actions: []lsp.CodeAction{{
+		Title: "Add the fix",
+		Edit: &lsp.WorkspaceEdit{Docs: []lsp.DocumentEdits{
+			{Path: main, Edits: []lsp.TextEdit{{Range: renameRangeOf(t, text, "PACKAGE"), NewText: "package"}}},
+			{Path: other, Edits: []lsp.TextEdit{{Range: renameRangeOf(t, string(otherText), "unrelated"), NewText: "related"}}},
+		}},
+	}}})
+	h.applyAnswer()
+	h.press("enter")
+
+	if !strings.Contains(h.Status(), fmt.Sprintf("change set %d", id)) {
+		t.Errorf("status = %q, want the lease refusal naming set %d", h.Status(), id)
+	}
+	if _, ok := h.findHeadless(other); ok {
+		t.Error("a refused code action left a headless buffer behind")
 	}
 }

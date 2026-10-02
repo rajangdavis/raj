@@ -7,11 +7,12 @@ import "raj/internal/prog"
 // A verb has three faces: the name its handlers and `raj ctl` speak, the wire
 // code a header carries in its place, and the program opcode a compiled batch
 // uses. Those used to live in separate tables — verbCodes in header.go,
-// knownOps and verbNames in prog.go — with the Dispatch switch as a fourth
+// knownOps and verbByOp in prog.go — with the Dispatch switch as a fourth
 // spelling and a test as a fifth, and they drifted: watch was in the program
 // names and in neither control table, and find had no wire code at all, so it
 // crossed as text. One row per verb ends that. The tables are derived from
-// this slice in init; a new verb is a row and a handler, and nothing else.
+// this slice in init; a new verb is a row and a handler, and nothing else. The
+// finish a program verb applies to its arguments rides the row too.
 //
 // The faces are absent differently:
 //
@@ -30,6 +31,7 @@ type verb struct {
 	wire   byte
 	op     byte
 	handle func(*Guard, Request) Response
+	finish func(*Request, *Hunk, []string)
 }
 
 // verbs is every verb, ordered by wire code, then the wireless internal ops.
@@ -48,7 +50,7 @@ var verbs = []verb{
 	{name: "accept", wire: 10, op: prog.OpAccept, handle: dispatchDecide},
 	{name: "reject", wire: 11, op: prog.OpReject, handle: dispatchDecide},
 	// exec runs a command off the event thread once execcheck admits it.
-	{name: "exec", wire: 12, op: prog.OpExec},
+	{name: "exec", wire: 12, op: prog.OpExec, finish: finishArgv},
 	// execcheck is the event-thread half of exec: it decides, and the
 	// connection runs the command off the thread. No program names it.
 	{name: "execcheck", wire: 13, handle: dispatchExecCheck},
@@ -72,8 +74,8 @@ var verbs = []verb{
 	{name: "send", wire: 23},
 	{name: "goto", wire: 24, op: prog.OpGoto, handle: dispatchGoto},
 	{name: "close", wire: 25, op: prog.OpClose, handle: dispatchClose},
-	{name: "dump", wire: 26, op: prog.OpDump, handle: dispatchDump},
-	{name: "patch", wire: 27, op: prog.OpPatch, handle: dispatchPatch},
+	{name: "dump", wire: 26, op: prog.OpDump, handle: dispatchDump, finish: finishSpan},
+	{name: "patch", wire: 27, op: prog.OpPatch, handle: dispatchPatch, finish: finishPatch},
 	// lsp runs off the event thread; lspprep is its event-thread admission.
 	{name: "lsp", wire: 28, op: prog.OpLSP},
 	{name: "lspprep", wire: 29, handle: dispatchLSPPrep},
@@ -100,7 +102,7 @@ var verbs = []verb{
 	// hook authoring is local-only and its run is two-phase, so no program
 	// names it; the wire form is a direct frame or `raj hook`.
 	{name: "hook", wire: 46, handle: dispatchHook},
-	{name: "reveal", wire: 47, op: prog.OpReveal, handle: dispatchReveal},
+	{name: "reveal", wire: 47, op: prog.OpReveal, handle: dispatchReveal, finish: finishSpan},
 	// state is the participant roster, which connection.one owns.
 	{name: "state", wire: 48},
 	{name: "land", wire: 49, handle: dispatchLand},
@@ -124,7 +126,7 @@ func init() {
 	verbByName = make(map[string]verb, len(verbs))
 	verbCodes = make(map[string]byte, len(verbs))
 	verbNamesByCode = make(map[byte]string, len(verbs))
-	verbNames = make(map[byte]string, len(verbs))
+	verbByOp = make(map[byte]verb, len(verbs))
 	for _, v := range verbs {
 		verbByName[v.name] = v
 		if v.wire != 0 {
@@ -133,7 +135,7 @@ func init() {
 		}
 		if v.op != 0 {
 			knownOps[v.op] = true
-			verbNames[v.op] = v.name
+			verbByOp[v.op] = v
 		}
 	}
 }

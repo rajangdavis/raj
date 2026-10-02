@@ -67,7 +67,7 @@ const (
 	exitConnLost    = 5
 )
 
-const ctlUsage = `usage: raj ctl <command> [options]
+var ctlUsage = `usage: raj ctl <command> [options]
 
   list                       running editors and their workspaces
   buffers                    files open in the editor; a headless buffer has no tab
@@ -119,7 +119,7 @@ const ctlUsage = `usage: raj ctl <command> [options]
   version [path]             the version a later apply bases on
   dump [path]                snapshot a span (or the whole file) for later patch
   patch [path] --dump N      replace a snapshot's text; the editor diffs and applies
-  lsp MODE [path] LINE:COL   hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics, inlay-hints, symbols, format, range-format or document-symbols
+  lsp MODE [path] LINE:COL   ` + lspModesSentence() + `
   lsp diagnostics [path...]  cached diagnostics for one or more files; --all sweeps the changed files
   lsp symbols [path] LINE:COL [query]
                              project-wide symbols matching query, from the language server
@@ -1167,13 +1167,13 @@ func claimCmd(c *Client, paths []string, add, clear bool, stdout, stderr io.Writ
 	return 0
 }
 
-// deleteCmd proposes a pending deletion, withdraws one this identity proposed,
-// or carries out a pending one when approve is set. The file stays until then:
-// delete is a review primitive, and the user approves the removal in the
-// editor. The path is claim-gated in the Guard, so an agent can only propose
-// removing a file it declared.
-func deleteCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "delete", Path: path, Withdraw: withdraw, Approve: approve})
+// proposeRemoval is the shared shape of deleteCmd and rmdirCmd: a review verb
+// that proposes a pending removal, withdraws one this identity proposed, or
+// carries out a pending one when approve is set. noun names the pending thing
+// ("deletion", "dir-removal"), gerund the act ("deleting", "removing"), and
+// tail the promise that what stays stays until the user approves.
+func proposeRemoval(c *Client, op, path string, withdraw, approve bool, stdout, stderr io.Writer, asJSON bool, noun, gerund, tail string) int {
+	res, err := c.Do(Request{Op: op, Path: path, Withdraw: withdraw, Approve: approve})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
@@ -1181,14 +1181,51 @@ func deleteCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io
 		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw, "approve": approve})
 	}
 	if approve {
-		fmt.Fprintf(stdout, "approved the pending deletion of %s\n", path)
+		fmt.Fprintf(stdout, "approved the pending %s of %s\n", noun, path)
 		return 0
 	}
 	if withdraw {
-		fmt.Fprintf(stdout, "withdrew the pending deletion of %s\n", path)
+		fmt.Fprintf(stdout, "withdrew the pending %s of %s\n", noun, path)
 		return 0
 	}
-	fmt.Fprintf(stdout, "proposed deleting %s; the file stays until the user approves\n", path)
+	fmt.Fprintf(stdout, "proposed %s %s; %s\n", gerund, path, tail)
+	return 0
+}
+
+// deleteCmd proposes a pending deletion, withdraws one this identity proposed,
+// or carries out a pending one when approve is set. The file stays until then:
+// delete is a review primitive, and the user approves the removal in the
+// editor. The path is claim-gated in the Guard, so an agent can only propose
+// removing a file it declared.
+func deleteCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io.Writer, asJSON bool) int {
+	return proposeRemoval(c, "delete", path, withdraw, approve, stdout, stderr, asJSON,
+		"deletion", "deleting", "the file stays until the user approves")
+}
+
+// listRemovals is the shared shape of deletionsCmd and rmdirsCmd: ask the host
+// for one kind of pending removal and print it, one path-plus-author line each,
+// or the host's own list when --json was asked. pick selects the list from the
+// reply, none is the line an empty list prints, and line renders one entry. The
+// element type stays concrete so the JSON form is the host's struct, unchanged.
+func listRemovals[T any](c *Client, op string, stdout, stderr io.Writer, asJSON bool, pick func(Response) []T, none string, line func(T) string) int {
+	res, err := c.Do(Request{Op: op})
+	if code := fail(stderr, res, err); code != 0 {
+		return code
+	}
+	items := pick(res)
+	if items == nil {
+		items = []T{}
+	}
+	if asJSON {
+		return emit(stdout, items)
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(stdout, none)
+		return 0
+	}
+	for _, d := range items {
+		fmt.Fprint(stdout, line(d))
+	}
 	return 0
 }
 
@@ -1196,25 +1233,10 @@ func deleteCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io
 // proposed it, so a driver can see them without opening the file. The listing
 // is ungated; whether a caller may withdraw one is the Guard's business.
 func deletionsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "deletions"})
-	if code := fail(stderr, res, err); code != 0 {
-		return code
-	}
-	deletions := res.Deletions
-	if deletions == nil {
-		deletions = []Deletion{}
-	}
-	if asJSON {
-		return emit(stdout, deletions)
-	}
-	if len(deletions) == 0 {
-		fmt.Fprintln(stdout, "no pending deletions")
-		return 0
-	}
-	for _, d := range deletions {
-		fmt.Fprintf(stdout, "%s\t(proposed by author %d)\n", d.Path, d.Author)
-	}
-	return 0
+	return listRemovals(c, "deletions", stdout, stderr, asJSON,
+		func(r Response) []Deletion { return r.Deletions },
+		"no pending deletions",
+		func(d Deletion) string { return fmt.Sprintf("%s\t(proposed by author %d)\n", d.Path, d.Author) })
 }
 
 // rmdirCmd proposes a pending dir-removal, withdraws one this identity
@@ -1223,23 +1245,8 @@ func deletionsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
 // removal in the review tab. The path is claim-gated in the Guard, with the
 // directory itself as the claim entry (§11).
 func rmdirCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "rmdir", Path: path, Withdraw: withdraw, Approve: approve})
-	if code := fail(stderr, res, err); code != 0 {
-		return code
-	}
-	if asJSON {
-		return emit(stdout, map[string]any{"ok": true, "path": path, "withdraw": withdraw, "approve": approve})
-	}
-	if approve {
-		fmt.Fprintf(stdout, "approved the pending dir-removal of %s\n", path)
-		return 0
-	}
-	if withdraw {
-		fmt.Fprintf(stdout, "withdrew the pending dir-removal of %s\n", path)
-		return 0
-	}
-	fmt.Fprintf(stdout, "proposed removing %s; the directory stays until the user approves\n", path)
-	return 0
+	return proposeRemoval(c, "rmdir", path, withdraw, approve, stdout, stderr, asJSON,
+		"dir-removal", "removing", "the directory stays until the user approves")
 }
 
 // rmdirsCmd lists the pending dir-removals, naming the directory and the
@@ -1247,25 +1254,10 @@ func rmdirCmd(c *Client, path string, withdraw, approve bool, stdout, stderr io.
 // The listing is ungated; whether a caller may withdraw one is the Guard's
 // business.
 func rmdirsCmd(c *Client, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "rmdirs"})
-	if code := fail(stderr, res, err); code != 0 {
-		return code
-	}
-	removals := res.DirRemovals
-	if removals == nil {
-		removals = []DirRemoval{}
-	}
-	if asJSON {
-		return emit(stdout, removals)
-	}
-	if len(removals) == 0 {
-		fmt.Fprintln(stdout, "no pending dir-removals")
-		return 0
-	}
-	for _, d := range removals {
-		fmt.Fprintf(stdout, "%s\t(proposed by author %d)\n", d.Path, d.Author)
-	}
-	return 0
+	return listRemovals(c, "rmdirs", stdout, stderr, asJSON,
+		func(r Response) []DirRemoval { return r.DirRemovals },
+		"no pending dir-removals",
+		func(d DirRemoval) string { return fmt.Sprintf("%s\t(proposed by author %d)\n", d.Path, d.Author) })
 }
 
 // lsCmd lists a directory's children, one per line, with a trailing slash on
@@ -2832,12 +2824,8 @@ func printGit(stdout io.Writer, r git.Result) int {
 // answer's `symbols` field carries them. document-symbols asks about the file
 // itself and returns its outline as `documentSymbols`, nested.
 func doLSP(c *Client, mode, path, pos, lines, query string, stdout, stderr io.Writer, asJSON bool) int {
-	switch mode {
-	case "hover", "definition", "declaration", "type-definition", "implementation",
-		"references", "completion", "signature", "diagnostics", "inlay-hints", "symbols",
-		"format", "range-format", "document-symbols":
-	default:
-		fmt.Fprintln(stderr, "raj ctl lsp: mode must be hover, definition, declaration, type-definition, implementation, references, completion, signature, diagnostics, inlay-hints, symbols, format, range-format or document-symbols")
+	if !lspModeKnown(mode) {
+		fmt.Fprintf(stderr, "raj ctl lsp: mode must be %s\n", lspModesSentence())
 		return 2
 	}
 	line, col := 0, 0
@@ -3322,135 +3310,181 @@ func printIntent(out intent.Result, mode string, stdout io.Writer) int {
 	if out.Warning != "" {
 		fmt.Fprintln(stdout, "warning:", out.Warning)
 	}
-	switch mode {
-	case "list":
-		if len(out.Intentions) == 0 {
-			fmt.Fprintln(stdout, "no intentions")
-			return 0
-		}
-		for _, in := range out.Intentions {
-			fmt.Fprintf(stdout, "%s\tbase %s\t%s\t%d group(s)\n", in.Name, in.Base, in.State, len(in.Members))
-		}
-	case "materialise":
-		fmt.Fprintln(stdout, out.Tree)
-	case "export":
-		fmt.Fprintf(stdout, "commit %s\nparent %s\nbase %s\ntree %s\n",
-			out.Commit, out.Parent, out.BaseSHA, out.Tree)
-	case "publish":
-		if out.Publish == nil {
-			return 0
-		}
-		p := out.Publish
-		if p.Decided == "" {
-			fmt.Fprintf(stdout, "proposed publish %s: %s -> %s on %s (%s)\n",
-				p.Name, p.Commit, p.Branch, p.Remote, p.RemoteURL)
-			fmt.Fprintf(stdout, "base %s; hook %s sha256 %s\n", p.BaseSHA, p.HookPath, p.HookHash)
-			fmt.Fprintf(stdout, "argv: %s\n", strings.Join(p.Argv, " "))
-			if p.DryRun != "" {
-				fmt.Fprintf(stdout, "dry run:\n%s\n", p.DryRun)
-			}
-			return 0
-		}
-		if p.URL != "" {
-			fmt.Fprintln(stdout, p.URL)
-		}
-		if p.Pushed != "" {
-			fmt.Fprintf(stdout, "pushed %s\n", p.Pushed)
-		}
-		fmt.Fprintf(stdout, "%s: exit %d %s\n", p.Decided, p.ExitCode, p.RemoteRef)
-		if p.Stderr != "" {
-			fmt.Fprintln(stdout, p.Stderr)
-		}
-		if p.Decided != "published" {
-			return 1
+	if fn, ok := intentPrinters[mode]; ok {
+		return fn(out, stdout)
+	}
+	return printIntentIntention(out, stdout)
+}
+
+// intentPrinters is every mode printIntent renders per subcommand, one row
+// each. A new intent subcommand that prints is a printer here, not another
+// case in a switch; the single-intention modes (show, new, add, remove, land)
+// share printIntentIntention.
+var intentPrinters = map[string]func(intent.Result, io.Writer) int{
+	"list":        printIntentList,
+	"materialise": printIntentMaterialise,
+	"export":      printIntentExport,
+	"publish":     printIntentPublish,
+	"diff":        printIntentDiff,
+	"review":      printIntentReview,
+	"group":       printIntentGroup,
+	"next":        printIntentNext,
+	"prove":       printIntentProve,
+}
+
+func printIntentList(out intent.Result, stdout io.Writer) int {
+	if len(out.Intentions) == 0 {
+		fmt.Fprintln(stdout, "no intentions")
+		return 0
+	}
+	for _, in := range out.Intentions {
+		fmt.Fprintf(stdout, "%s\tbase %s\t%s\t%d group(s)\n", in.Name, in.Base, in.State, len(in.Members))
+	}
+	return 0
+}
+
+func printIntentMaterialise(out intent.Result, stdout io.Writer) int {
+	fmt.Fprintln(stdout, out.Tree)
+	return 0
+}
+
+func printIntentExport(out intent.Result, stdout io.Writer) int {
+	fmt.Fprintf(stdout, "commit %s\nparent %s\nbase %s\ntree %s\n",
+		out.Commit, out.Parent, out.BaseSHA, out.Tree)
+	return 0
+}
+
+func printIntentPublish(out intent.Result, stdout io.Writer) int {
+	if out.Publish == nil {
+		return 0
+	}
+	p := out.Publish
+	if p.Decided == "" {
+		fmt.Fprintf(stdout, "proposed publish %s: %s -> %s on %s (%s)\n",
+			p.Name, p.Commit, p.Branch, p.Remote, p.RemoteURL)
+		fmt.Fprintf(stdout, "base %s; hook %s sha256 %s\n", p.BaseSHA, p.HookPath, p.HookHash)
+		fmt.Fprintf(stdout, "argv: %s\n", strings.Join(p.Argv, " "))
+		if p.DryRun != "" {
+			fmt.Fprintf(stdout, "dry run:\n%s\n", p.DryRun)
 		}
 		return 0
-	case "diff":
-		if out.Diff == nil {
-			return 0
-		}
-		d := out.Diff
-		for _, e := range d.Stat.Entries {
-			if e.Binary {
-				fmt.Fprintf(stdout, "-\t-\t%s\n", e.Path)
-				continue
-			}
-			fmt.Fprintf(stdout, "%d\t%d\t%s\n", e.Additions, e.Deletions, e.Path)
-		}
-		fmt.Fprintf(stdout, "%d file(s), %d insertion(s), %d deletion(s)\n",
-			d.Stat.Files, d.Stat.Additions, d.Stat.Deletions)
-		if d.Diff == "" {
-			fmt.Fprintf(stdout, "no diff: %s matches its base %s\n", d.Name, d.Base)
-			return 0
-		}
-		fmt.Fprint(stdout, d.Diff)
-		if !strings.HasSuffix(d.Diff, "\n") {
-			fmt.Fprintln(stdout)
-		}
-		if d.Truncated {
-			fmt.Fprintf(stdout, "diff truncated: %d more byte(s) omitted\n", d.OmittedBytes)
-		}
-	case "review":
-		if out.Review == nil {
-			return 0
-		}
-		fmt.Fprintf(stdout, "opened %d tab(s) for seam %s\n", len(out.Review.Files), out.Review.Name)
-		for _, p := range out.Review.Files {
-			fmt.Fprintln(stdout, p)
-		}
-	case "group":
-		if out.Group == nil {
-			return 0
-		}
-		g := out.Group
-		what := "extended"
-		if g.Created {
-			what = "created"
-		}
-		if g.DryRun {
-			fmt.Fprintf(stdout, "dry run: would %s seam %s over %s (%d added, %d skipped)\n",
-				what, g.Name, g.Base, len(g.Added), len(g.Skipped))
-		} else {
-			fmt.Fprintf(stdout, "%s seam %s over %s (%d added, %d skipped)\n",
-				what, g.Name, g.Base, len(g.Added), len(g.Skipped))
-		}
-		for _, m := range g.Members {
-			fmt.Fprintf(stdout, "  member %s\n", memberString(m))
-		}
-		for _, s := range g.Skipped {
-			switch {
-			case s.Seam != "":
-				fmt.Fprintf(stdout, "  skipped %s: %s (in seam %s)\n", memberString(s.Member), s.Reason, s.Seam)
-			case s.State != "":
-				fmt.Fprintf(stdout, "  skipped %s: %s (%s)\n", memberString(s.Member), s.Reason, s.State)
-			default:
-				fmt.Fprintf(stdout, "  skipped %s: %s\n", memberString(s.Member), s.Reason)
-			}
-		}
-		for _, o := range g.Overlaps {
-			fmt.Fprintf(stdout, "  overlap %s: also in seam %s\n", o.Path, o.Seam)
-		}
-	case "next":
-		if out.Next == nil {
-			return 0
-		}
-		n := out.Next
-		fmt.Fprintf(stdout, "branch %s\ncommit %s\nbase %s\n", n.Branch, n.Commit, n.BaseSHA)
-	case "prove":
-		for _, pr := range out.Proofs {
-			fmt.Fprintf(stdout, "%s\t%s\n", pr.Check, pr.Name)
-			if pr.Error != "" {
-				fmt.Fprintln(stdout, pr.Error)
-			}
-		}
-	default:
-		if out.Intention == nil {
-			return 0
-		}
-		in := out.Intention
-		fmt.Fprintf(stdout, "%s\towner %s\tbase %s\t%s\t%d group(s)\n",
-			in.Name, in.Owner, in.Base, in.State, len(in.Members))
 	}
+	if p.URL != "" {
+		fmt.Fprintln(stdout, p.URL)
+	}
+	if p.Pushed != "" {
+		fmt.Fprintf(stdout, "pushed %s\n", p.Pushed)
+	}
+	fmt.Fprintf(stdout, "%s: exit %d %s\n", p.Decided, p.ExitCode, p.RemoteRef)
+	if p.Stderr != "" {
+		fmt.Fprintln(stdout, p.Stderr)
+	}
+	if p.Decided != "published" {
+		return 1
+	}
+	return 0
+}
+
+func printIntentDiff(out intent.Result, stdout io.Writer) int {
+	if out.Diff == nil {
+		return 0
+	}
+	d := out.Diff
+	for _, e := range d.Stat.Entries {
+		if e.Binary {
+			fmt.Fprintf(stdout, "-\t-\t%s\n", e.Path)
+			continue
+		}
+		fmt.Fprintf(stdout, "%d\t%d\t%s\n", e.Additions, e.Deletions, e.Path)
+	}
+	fmt.Fprintf(stdout, "%d file(s), %d insertion(s), %d deletion(s)\n",
+		d.Stat.Files, d.Stat.Additions, d.Stat.Deletions)
+	if d.Diff == "" {
+		fmt.Fprintf(stdout, "no diff: %s matches its base %s\n", d.Name, d.Base)
+		return 0
+	}
+	fmt.Fprint(stdout, d.Diff)
+	if !strings.HasSuffix(d.Diff, "\n") {
+		fmt.Fprintln(stdout)
+	}
+	if d.Truncated {
+		fmt.Fprintf(stdout, "diff truncated: %d more byte(s) omitted\n", d.OmittedBytes)
+	}
+	return 0
+}
+
+func printIntentReview(out intent.Result, stdout io.Writer) int {
+	if out.Review == nil {
+		return 0
+	}
+	fmt.Fprintf(stdout, "opened %d tab(s) for seam %s\n", len(out.Review.Files), out.Review.Name)
+	for _, p := range out.Review.Files {
+		fmt.Fprintln(stdout, p)
+	}
+	return 0
+}
+
+func printIntentGroup(out intent.Result, stdout io.Writer) int {
+	if out.Group == nil {
+		return 0
+	}
+	g := out.Group
+	what := "extended"
+	if g.Created {
+		what = "created"
+	}
+	if g.DryRun {
+		fmt.Fprintf(stdout, "dry run: would %s seam %s over %s (%d added, %d skipped)\n",
+			what, g.Name, g.Base, len(g.Added), len(g.Skipped))
+	} else {
+		fmt.Fprintf(stdout, "%s seam %s over %s (%d added, %d skipped)\n",
+			what, g.Name, g.Base, len(g.Added), len(g.Skipped))
+	}
+	for _, m := range g.Members {
+		fmt.Fprintf(stdout, "  member %s\n", memberString(m))
+	}
+	for _, s := range g.Skipped {
+		switch {
+		case s.Seam != "":
+			fmt.Fprintf(stdout, "  skipped %s: %s (in seam %s)\n", memberString(s.Member), s.Reason, s.Seam)
+		case s.State != "":
+			fmt.Fprintf(stdout, "  skipped %s: %s (%s)\n", memberString(s.Member), s.Reason, s.State)
+		default:
+			fmt.Fprintf(stdout, "  skipped %s: %s\n", memberString(s.Member), s.Reason)
+		}
+	}
+	for _, o := range g.Overlaps {
+		fmt.Fprintf(stdout, "  overlap %s: also in seam %s\n", o.Path, o.Seam)
+	}
+	return 0
+}
+
+func printIntentNext(out intent.Result, stdout io.Writer) int {
+	if out.Next == nil {
+		return 0
+	}
+	n := out.Next
+	fmt.Fprintf(stdout, "branch %s\ncommit %s\nbase %s\n", n.Branch, n.Commit, n.BaseSHA)
+	return 0
+}
+
+func printIntentProve(out intent.Result, stdout io.Writer) int {
+	for _, pr := range out.Proofs {
+		fmt.Fprintf(stdout, "%s\t%s\n", pr.Check, pr.Name)
+		if pr.Error != "" {
+			fmt.Fprintln(stdout, pr.Error)
+		}
+	}
+	return 0
+}
+
+func printIntentIntention(out intent.Result, stdout io.Writer) int {
+	if out.Intention == nil {
+		return 0
+	}
+	in := out.Intention
+	fmt.Fprintf(stdout, "%s\towner %s\tbase %s\t%s\t%d group(s)\n",
+		in.Name, in.Owner, in.Base, in.State, len(in.Members))
 	return 0
 }
 func list(stdout, stderr io.Writer, asJSON bool) int {

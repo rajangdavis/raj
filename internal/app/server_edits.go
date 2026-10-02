@@ -5,6 +5,7 @@ import (
 
 	"raj/internal/complete"
 	"raj/internal/editor"
+	"raj/internal/lsp"
 )
 
 // applyServerEdits applies a batch of server range replacements to a pane as one
@@ -67,4 +68,45 @@ func editsLeased(p *editor.Pane, edits []complete.Edit) (group uint64, leased bo
 		}
 	}
 	return 0, false
+}
+
+// editTarget is one document a server edit will touch: the pane holding it and
+// the complete.Edit batch to apply.
+type editTarget struct {
+	pane  *editor.Pane
+	edits []complete.Edit
+}
+
+// resolveEditTargets resolves every document before any edit lands: an open
+// buffer is used as-is; an unopened file is loaded headlessly and recorded in
+// the returned loaded slice so the caller can announce it on success or drop it
+// again on a later refusal. A document that cannot be loaded refuses the whole
+// batch: every buffer loaded for the attempt is dropped again, status is set to
+// refuse(path), and ok is false. The conversion from the server's LSP ranges to
+// byte spans lives here, once, so both server-edit callers share it.
+func (a *App) resolveEditTargets(docs []lsp.DocumentEdits, refuse func(path string) string) (targets []editTarget, loaded []*editor.Pane, ok bool) {
+	targets = make([]editTarget, 0, len(docs))
+	for _, d := range docs {
+		p, found := a.paneByPath(d.Path)
+		if !found {
+			q, err := a.loadHeadless(d.Path)
+			if err != nil {
+				for _, l := range loaded {
+					a.dropHeadless(l)
+				}
+				a.status = refuse(d.Path)
+				return nil, nil, false
+			}
+			p = q
+			loaded = append(loaded, q)
+		}
+		doc := lsp.NewDocument(p.File.Text())
+		edits := make([]complete.Edit, 0, len(d.Edits))
+		for _, te := range d.Edits {
+			start, end := doc.Span(te.Range)
+			edits = append(edits, complete.Edit{Start: start, End: end, Text: te.NewText})
+		}
+		targets = append(targets, editTarget{pane: p, edits: edits})
+	}
+	return targets, loaded, true
 }

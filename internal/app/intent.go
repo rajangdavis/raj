@@ -643,38 +643,71 @@ func intentionToRow(in intent.Intention) store.IntentionRow {
 // moved, and two seams that touch one file are reported as an overlap, never
 // stacked (Q10).
 func (a *App) intentGroup(ctx context.Context, svc *git.Service, set intent.Set, cmd intent.Command) (intent.Result, error) {
-	if cmd.Name == "" {
-		return intent.Result{}, errors.New("intent group: needs a name")
+	existing, exists, err := intentGroupValidate(cmd, set)
+	if err != nil {
+		return intent.Result{}, err
 	}
-	if cmd.Task == "" {
-		return intent.Result{}, errors.New("intent group: needs --task T; a seam is one task's sets")
-	}
-	if len(cmd.Members) > 0 || len(cmd.Groups) > 0 {
-		return intent.Result{}, errors.New("intent group: takes a task, not explicit members")
-	}
-	existing, exists := set[cmd.Name]
-	if exists && existing.Task != "" && existing.Task != cmd.Task {
-		return intent.Result{}, fmt.Errorf("intent group: %q is the task %q and cannot also be %q", cmd.Name, existing.Task, cmd.Task)
-	}
-	// A task with no sets at all has nothing to group: refuse by name rather
-	// than create an empty seam nobody can explain.
-	var refs []groupRef
-	for _, g := range a.allGroups() {
-		if g.Task == cmd.Task {
-			refs = append(refs, g)
-		}
-	}
+	refs := a.groupTaskRefs(cmd.Task)
 	if len(refs) == 0 {
 		return intent.Result{}, fmt.Errorf("intent group: task %q has no change sets to group", cmd.Task)
 	}
+	held, heldBare := a.seamHolders(set, cmd.Name)
+	count := a.memberCounts(refs)
 
-	// A set another seam already names is not this seam's to move, however the
-	// task reads. A bare member (no path) is the same set when this buffer
-	// numbers its id, so it counts too.
+	group := intent.Grouping{Name: cmd.Name, Task: cmd.Task, Created: !exists, DryRun: cmd.DryRun}
+	group.Added, group.Skipped = a.groupAdded(refs, existing, held, heldBare, count)
+	group.Members = append(append([]intent.Member(nil), existing.Members...), group.Added...)
+	group.Changed = len(group.Added) > 0
+	group.Overlaps = seamOverlaps(group.Members, set, cmd.Name)
+
+	base, baseSHA, err := a.groupBase(ctx, svc, set, existing, exists, cmd)
+	if err != nil {
+		return intent.Result{}, err
+	}
+	group.Base, group.BaseSHA = base, baseSHA
+
+	return a.persistGroup(cmd, existing, exists, group, base, baseSHA)
+}
+
+// intentGroupValidate checks the group arguments and the existing-seam task
+// conflict before anything is read; it returns the seam already under the
+// name, if any.
+func intentGroupValidate(cmd intent.Command, set intent.Set) (existing intent.Intention, exists bool, err error) {
+	if cmd.Name == "" {
+		return intent.Intention{}, false, errors.New("intent group: needs a name")
+	}
+	if cmd.Task == "" {
+		return intent.Intention{}, false, errors.New("intent group: needs --task T; a seam is one task's sets")
+	}
+	if len(cmd.Members) > 0 || len(cmd.Groups) > 0 {
+		return intent.Intention{}, false, errors.New("intent group: takes a task, not explicit members")
+	}
+	existing, exists = set[cmd.Name]
+	if exists && existing.Task != "" && existing.Task != cmd.Task {
+		return intent.Intention{}, false, fmt.Errorf("intent group: %q is the task %q and cannot also be %q", cmd.Name, existing.Task, cmd.Task)
+	}
+	return existing, exists, nil
+}
+
+// groupTaskRefs collects every change set the task owns across the workspace.
+func (a *App) groupTaskRefs(task string) []groupRef {
+	var refs []groupRef
+	for _, g := range a.allGroups() {
+		if g.Task == task {
+			refs = append(refs, g)
+		}
+	}
+	return refs
+}
+
+// seamHolders maps every set another seam already names to that seam's name. A
+// bare member (no path) is the same set when this buffer numbers its id, so it
+// counts too.
+func (a *App) seamHolders(set intent.Set, self string) (map[intent.Member]string, map[uint64]string) {
 	held := map[intent.Member]string{}
 	heldBare := map[uint64]string{}
 	for name, in := range set {
-		if name == cmd.Name {
+		if name == self {
 			continue
 		}
 		for _, m := range in.Members {
@@ -689,20 +722,31 @@ func (a *App) intentGroup(ctx context.Context, svc *git.Service, set intent.Set,
 			}
 		}
 	}
-	// Two live panes numbering the same {id, path} cannot be told apart, so the
-	// member is refused rather than resolved to one of them.
+	return held, heldBare
+}
+
+// memberCounts counts how many of refs resolve to each member. Two live panes
+// numbering the same {id, path} cannot be told apart, so a count above one is
+// refused rather than resolved to one of them.
+func (a *App) memberCounts(refs []groupRef) map[intent.Member]int {
 	count := map[intent.Member]int{}
 	for _, g := range refs {
 		if m, ok := a.memberFor(g); ok {
 			count[m]++
 		}
 	}
+	return count
+}
 
-	group := intent.Grouping{Name: cmd.Name, Task: cmd.Task, Created: !exists, DryRun: cmd.DryRun}
+// groupAdded decides each ref: the members to add and the sets to report as
+// skipped, in the order the refs were listed. The skip precedence is fixed:
+// ambiguous, already a member, held by another seam (path-qualified then bare),
+// then not pending.
+func (a *App) groupAdded(refs []groupRef, existing intent.Intention, held map[intent.Member]string, heldBare map[uint64]string, count map[intent.Member]int) (added []intent.Member, skipped []intent.Skip) {
 	for _, g := range refs {
 		m, ok := a.memberFor(g)
 		if !ok || count[m] > 1 {
-			group.Skipped = append(group.Skipped, intent.Skip{
+			skipped = append(skipped, intent.Skip{
 				Member: intent.Member{ID: g.ID},
 				Reason: intent.SkipAmbiguousPath,
 			})
@@ -712,53 +756,58 @@ func (a *App) intentGroup(ctx context.Context, svc *git.Service, set intent.Set,
 			continue // already a member: a re-run adds nothing
 		}
 		if seam, ok := held[m]; ok {
-			group.Skipped = append(group.Skipped, intent.Skip{Member: m, Reason: intent.SkipOtherSeam, Seam: seam})
+			skipped = append(skipped, intent.Skip{Member: m, Reason: intent.SkipOtherSeam, Seam: seam})
 			continue
 		}
 		if seam, ok := heldBare[m.ID]; ok {
-			group.Skipped = append(group.Skipped, intent.Skip{Member: m, Reason: intent.SkipOtherSeam, Seam: seam})
+			skipped = append(skipped, intent.Skip{Member: m, Reason: intent.SkipOtherSeam, Seam: seam})
 			continue
 		}
 		if g.State != piecetable.Proposed {
-			group.Skipped = append(group.Skipped, intent.Skip{Member: m, Reason: intent.SkipNotPending, State: g.State.String()})
+			skipped = append(skipped, intent.Skip{Member: m, Reason: intent.SkipNotPending, State: g.State.String()})
 			continue
 		}
-		group.Added = append(group.Added, m)
+		added = append(added, m)
 	}
-	group.Members = append(append([]intent.Member(nil), existing.Members...), group.Added...)
-	group.Changed = len(group.Added) > 0
-	group.Overlaps = seamOverlaps(group.Members, set, cmd.Name)
+	return added, skipped
+}
 
-	// The base: an existing seam keeps the base it was pinned to, a new one
-	// takes --ref or auto-detects the primary branch. A base that names another
-	// intention would be a stack, which is deferred, so it is refused rather
-	// than guessed.
-	base := cmd.Base
-	baseSHA := ""
+// groupBase resolves the seam's base: an existing seam keeps the base it was
+// pinned to, a new one takes --ref or auto-detects the primary branch. A base
+// that names another intention would be a stack, which is deferred, so it is
+// refused rather than guessed.
+func (a *App) groupBase(ctx context.Context, svc *git.Service, set intent.Set, existing intent.Intention, exists bool, cmd intent.Command) (base, baseSHA string, err error) {
+	base = cmd.Base
+	baseSHA = ""
 	if exists {
 		base, baseSHA = existing.Base, existing.BaseSHA
 		if cmd.Base != "" && cmd.Base != existing.Base {
-			return intent.Result{}, fmt.Errorf("intent group: %q is over base %q; --ref %q cannot move it", cmd.Name, existing.Base, cmd.Base)
+			return "", "", fmt.Errorf("intent group: %q is over base %q; --ref %q cannot move it", cmd.Name, existing.Base, cmd.Base)
 		}
 	} else {
 		if base == "" {
 			detected, err := a.detectBaseRef(ctx, svc)
 			if err != nil {
-				return intent.Result{}, err
+				return "", "", err
 			}
 			base = detected
 		}
 		if _, ok := set[base]; ok {
-			return intent.Result{}, fmt.Errorf("intent group: base %q names an intention; a stacked seam is deferred, so pass a git ref", base)
+			return "", "", fmt.Errorf("intent group: base %q names an intention; a stacked seam is deferred, so pass a git ref", base)
 		}
 		sha, err := svc.RevParse(ctx, base)
 		if err != nil {
-			return intent.Result{}, fmt.Errorf("intent group: base %q does not resolve to a commit: %w", base, err)
+			return "", "", fmt.Errorf("intent group: base %q does not resolve to a commit: %w", base, err)
 		}
 		baseSHA = sha
 	}
-	group.Base, group.BaseSHA = base, baseSHA
+	return base, baseSHA, nil
+}
 
+// persistGroup records the seam: a dry run reports only, an existing seam is
+// extended in place, and a new one is created. The base is resolved and
+// validated by groupBase, so a stack is never guessed here.
+func (a *App) persistGroup(cmd intent.Command, existing intent.Intention, exists bool, group intent.Grouping, base, baseSHA string) (intent.Result, error) {
 	if cmd.DryRun {
 		return intent.Result{Group: &group}, nil
 	}

@@ -238,34 +238,12 @@ func (a *App) applyRename(r lspAnswer) {
 	// cannot be loaded — missing, outside the workspace, binary, unreadable —
 	// refuses the whole rename rather than leaving a symbol half-renamed, and
 	// the buffers loaded for the attempt are dropped again.
-	type target struct {
-		pane  *editor.Pane
-		edits []complete.Edit
-	}
-	targets := make([]target, 0, len(r.edit.Docs))
-	var loaded []*editor.Pane
-	for _, d := range r.edit.Docs {
-		p, ok := a.paneByPath(d.Path)
-		if !ok {
-			q, err := a.loadHeadless(d.Path)
-			if err != nil {
-				for _, l := range loaded {
-					a.dropHeadless(l)
-				}
-				a.status = "rename would change " + d.Path +
-					", which is not open and cannot be loaded; nothing was changed"
-				return
-			}
-			p = q
-			loaded = append(loaded, q)
-		}
-		doc := lsp.NewDocument(p.File.Text())
-		spans := make([]complete.Edit, 0, len(d.Edits))
-		for _, e := range d.Edits {
-			lo, hi := doc.Span(e.Range)
-			spans = append(spans, complete.Edit{Start: lo, End: hi, Text: e.NewText})
-		}
-		targets = append(targets, target{pane: p, edits: spans})
+	targets, loaded, ok := a.resolveEditTargets(r.edit.Docs, func(path string) string {
+		return "rename would change " + path +
+			", which is not open and cannot be loaded; nothing was changed"
+	})
+	if !ok {
+		return
 	}
 
 	// The leases are checked for every target before any text changes. A rename

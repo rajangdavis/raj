@@ -1,4 +1,4 @@
-.PHONY: build check fmt fmt-check sh-parse shellcheck ignored-source vet test race smoke test-times test-pkgs cyclo dupl quality
+.PHONY: build check fmt fmt-check sh-parse shellcheck ignored-source vet test race smoke test-times test-pkgs cyclo dupl quality vuln
 
 # VERSION is the version a built binary reports. The link line below stamps it
 # into control's srcVersion, the variable the running editor puts on every
@@ -142,6 +142,7 @@ test-pkgs:
 # stays out - sh-parse no-ops on the projected tree for the same reason.
 GOCYCLO ?= go run github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
 DUPL ?= go run github.com/mibk/dupl@v1.1.0
+GOVULNCHECK ?= go run golang.org/x/vuln/cmd/govulncheck@v1.7.0
 # go list, not git ls-files: the gate also runs on a projected tree with no
 # .git, the same reason sh-parse no-ops there.
 DUPL_FILES = go list -f '{{$$d := .Dir}}{{range .GoFiles}}{{$$d}}/{{.}}{{"\n"}}{{end}}' ./...
@@ -187,3 +188,13 @@ dupl:
 
 # quality is the report: both analyzers, one command.
 quality: cyclo dupl
+
+# vuln runs govulncheck over the module. It is deliberately not in check: the
+# pinned tool comes from the module proxy and the vulnerability database from
+# vuln.go.dev, so it needs the network, which the sandbox and the projected
+# tree do not have. CI has both, so it runs there as its own step. Pinned here,
+# like gocyclo and dupl, so `go run <pkg>@<version>` adds nothing to the product
+# build; v1.7.0 rather than the latest because its go directive is 1.25.0, the
+# version CI pins (v1.8.0 needs Go 1.26 and CI runs GOTOOLCHAIN=local).
+vuln:
+	$(GOVULNCHECK) ./...

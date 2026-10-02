@@ -3,11 +3,17 @@
 ## Where we are
 
 Written 2026-10-01 from the code and from git, not from memory: the last
-commit is `702a0aaa` on `main` (2026-09-30), with 17 files changed since and
-not committed (14 edited, 3 new). Each line below says what it was checked
-against. This pass ran no tests and could not read the hook run log
-(`raj hook log` was denied to the reviewer), so nothing here claims a passing
-run that it did not see.
+commit is `26631fd0` on `main` (2026-10-01, "Fix CI hopefully, tested on
+Linux"). The worktree is dirty: `git status` lists **7 tracked files modified
+and 1 new untracked** — the security-in-CI work (`.github/workflows/ci.yml`,
+`Makefile`, this file) and this wave's changes (`internal/control/lspmodes.go`
+new; `internal/control/cli.go`, `internal/app/lsp_test.go`,
+`internal/syntax/syntax.go`, `internal/syntax/semantic.go`). (The earlier "17
+files / 14 edited, 3 new" reading and the `702a0aaa` stamp are stale:
+`f80a2c1`, `4fbf11e` and `26631fd` landed on top.) Each line below says what
+it was checked against. This pass ran no tests and could not read the hook run
+log (`raj hook log` was denied to the reviewer), so nothing here claims a
+passing run that it did not see.
 
 This section is the one place that answers "where are we". The plan
 (`docs/dev/WAVE-PLAN.md`, which is not in git) keeps its commit stamp and
@@ -35,50 +41,38 @@ a document review pass TODO's => completed, NEXT_STEPS where are we?"
 
 ### In flight (written, not committed)
 
-- **Build a seam from one task's changes in one command** (`raj ctl intent
-  group --task T`). The code and eight tests are in the uncommitted files
-  (`internal/intent/group.go`, `intentGroup` in `internal/app/intent.go`,
-  `internal/app/intent_group_test.go`). It is not in `docs/COMPLETED.md`, and
-  the plan's status block listed its files without saying what they do. Unverified: whether
-  any check run has passed with it.
-- **Say what publishing a seam would push, before pushing** (`raj ctl intent
-  next`). Written and recorded in `docs/COMPLETED.md` with check run 162. The
-  full cycle after it, run 163, failed on a shell-script lint error. The one-line
-  fix for that error is in the uncommitted files
-  (`examples/hooks/no-ignored-source.test.sh`). A later full cycle passed, by
-  another agent's report (raj-f070b379, 2026-10-01): cycle `20260930-172533`,
-  run 169, check and build ok at `702a0aaa`, and the workspace shell lint
-  passed in run 168. The reviewer has not read those runs.
-- **Review fixes to the delete and remove-folder work.** What is uncommitted
-  in `internal/app/deletion.go`, `rmdir.go` and their tests is comment wording
-  only (the trash is now always used; the comments still described the old
-  opt-in). If the review asked for more than that, it is not among the 17 files.
+- **Security in CI (Track C1 and C4).** `Makefile`'s pinned `govulncheck`
+  `vuln` target and `ci.yml`'s SHA-pinned actions, `permissions: contents:
+  read` and the `make vuln` step are in the worktree, not committed. C2 and C3
+  are owner-only GitHub settings.
+- **This wave (2026-10-01).** Item L — one exported `control.LSPModes` drives
+  the CLI usage line and mode gate — and item D3 — the chroma/semantic colour
+  fixes — landed and are saved. Both are recorded in `docs/COMPLETED.md`.
 - **This document pass.** Proposed edits to this file, `docs/TODO.md`,
-  `docs/COMPLETED.md` and the plan, waiting for you to accept and save.
+  `docs/COMPLETED.md` and the plans, waiting for you to accept and save.
 
 ### Next
 
 Taken from the plan's status block; an order the agents proposed, not one the
 owner is on record choosing.
 
-1. A passing full cycle on the tree as it stands. Reported done by run 169
-   (see "In flight"); confirm it covered the 17 files as they are now.
-2. Commit the uncommitted work.
-3. The cleanup queue in `docs/dev/DEBT-PLAN.md`.
+1. A passing full cycle on the tree as it stands, covering the security-in-CI
+   work and this wave.
+2. Commit the security-in-CI work and this wave.
+3. Item Q in `docs/dev/DEBT-PLAN.md` (the 41–40 group: `(*App).pointer`,
+   `printIntent`, `(*App).intentGroup`, `Requests`).
 4. The container setup for running the editor and agents (the plan's Track R).
 
 ### Waiting on you
 
 - **Accept or reject this pass's document edits.**
-- **The 17 uncommitted files are more than one piece of work.** Split them
-  before committing, or commit them together?
-- **Which Go version is right?** CI pins 1.24 (`.github/workflows/ci.yml:20`);
-  `go.mod:3` says 1.25.0.
+- **The uncommitted work is more than one piece of work** (security-in-CI plus
+  this wave). Split it before committing, or commit it together?
+- ~~**Which Go version is right?**~~ **Resolved 2026-10-01:** `ci.yml` now pins
+  `go-version: '1.25.0'`, matching `go.mod:3`.
 - **Where should a merge request point when the branch has no upstream?**
   Today the publish script has nothing to fall back on (`docs/TODO.md`, the
   publish artifact review).
-- **Should rejecting a text change remove the text in one step?** Today
-  rejecting marks it and a second step clears it.
 - **One open question looks already answered by the code.** The plan asks
   whether you want the workspace trash or a key that puts the last deleted file
   back. The tree has both. If that is what you wanted, the question can go.
