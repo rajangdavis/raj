@@ -850,7 +850,7 @@ func defaultChatKeyFile() string {
 		return filepath.Join(dir, "raj", "chat-key")
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".raj-chat-key")
+		return filepath.Join(home, ".chat-key")
 	}
-	return ".raj-chat-key"
+	return ".chat-key"
 }

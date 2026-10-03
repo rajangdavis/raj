@@ -427,6 +427,13 @@ type App struct {
 	// workspace keep separate tab sets. It is the --name value when given, else
 	// the profile (phone, else attach).
 	attachKey string
+	// attachedAsAgent records that the daemon granted this attached client a
+	// non-human kind, so an edit forwarded from here lands as a proposal. It is
+	// set once by StartClient before Run and read on the event thread, so it
+	// needs no lock; leaving Review keeps saying the edits are proposals rather
+	// than silently turning them into the client's own text. False for a local
+	// editor and for a local-socket client, which stay editable.
+	attachedAsAgent bool
 	// clientStop is closed by CloseClient to tell the watch goroutine that the
 	// transport error it is about to see is an orderly shutdown, not news.
 	clientStop chan struct{}
@@ -627,20 +634,16 @@ func NewWithRoots(host ui.Host, roots []string, o Options) *App {
 	root := wsRoots.Primary()
 	// The store opens before the tab set because settings decide the tab
 	// width; it is also where the session and positions live. State lives in
-	// the XDG state dir, outside the workspace, so a failed migration or an
-	// unwritable state dir is not fatal: the editor runs on the built-in
-	// defaults with persistence off, and the failure is left for the status
-	// line below.
+	// the XDG state dir, outside the workspace, so an unwritable state dir is
+	// not fatal: the editor runs on the built-in defaults with persistence
+	// off, and the failure is left for the status line below.
 	var state *store.Store
 	var stateErr error
-	var migErr error
-	var hidErr error
 	if root != "" && !o.Standalone {
 		if dir := session.StateDirForRoots(wsRoots.All()); dir != "" {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				stateErr = err
 			} else {
-				migErr = migrateState(wsRoots.All())
 				if s, err := store.Open(filepath.Join(dir, "state.db")); err != nil {
 					stateErr = err
 				} else {
@@ -648,13 +651,6 @@ func NewWithRoots(host ui.Host, roots []string, o Options) *App {
 				}
 			}
 		}
-	}
-	// The workspace's hidden configuration moved out of the project into XDG,
-	// so a workspace still holding the legacy .raj/hidden gets a copy at the
-	// workspace file before any pane loads its rules. It runs whether or not
-	// the store could open: it is configuration, not state.
-	if root != "" {
-		hidErr = migrateHiddenConfig(wsRoots.All())
 	}
 	user, workspace := settingScopes(state)
 	res, bad := resolveSettings(defaultSettings(o.TabWidth), user, workspace)
@@ -768,23 +764,6 @@ func NewWithRoots(host ui.Host, roots []string, o Options) *App {
 		}
 		a.status += "state: " + stateErr.Error()
 	}
-	// A legacy state directory that would not move is not fatal either: the
-	// editor runs against the new location and the old files are left behind.
-	if migErr != nil {
-		if a.status != "" {
-			a.status += "; "
-		}
-		a.status += "state migration: " + migErr.Error()
-	}
-	// A legacy hide file that would not copy is the same kind of problem: the
-	// editor runs against whatever configuration it could read, and the failure
-	// is said once rather than being fatal.
-	if hidErr != nil {
-		if a.status != "" {
-			a.status += "; "
-		}
-		a.status += "config migration: " + hidErr.Error()
-	}
 	if len(bad) > 0 {
 		if a.status != "" {
 			a.status += "; "
@@ -834,11 +813,17 @@ func (a *App) wireSearchPane(p *search.Pane) {
 // because the daemon owns the workspace's state database and two processes must
 // not open it. It is what an attach does with the daemon's root set: the client
 // shows the daemon's workspace while its saved view lives beside its own store.
-// A set that cannot be canonicalised (empty, or two nested roots) is ignored,
-// leaving the launch-root workspace in place.
+// A set that cannot be canonicalised alone is normally ignored, leaving the
+// launch-root workspace in place. The one exception is a set that nests with
+// the view roots: the wire can hand back the daemon's set with a root rebased
+// beside the launch root, and once the two are a nested pair neither can be
+// drawn, so the launch root would win and the daemon's workspace vanish. Then
+// the view roots are dropped from the candidate set and what remains, the
+// daemon's own set, is adopted instead. The view roots themselves are never
+// touched, so the store stays keyed by them.
 func (a *App) adoptVisibleRoots(roots []string) bool {
-	vr, err := ws.New(roots...)
-	if err != nil || vr.Len() == 0 {
+	vr, ok := visibleRootsFor(roots, a.roots.All())
+	if !ok {
 		return false
 	}
 	a.visible = vr
@@ -852,6 +837,43 @@ func (a *App) adoptVisibleRoots(roots []string) bool {
 	a.Picker = picker.NewRoots(vr.All())
 	a.Picker.Tall = a.phone
 	return true
+}
+
+// visibleRootsFor picks the visible set an attach renders from the root set it
+// reported and the client's view roots. A reported set that is already
+// canonical, disjoint from or identical to the view roots, is returned as is.
+// When it cannot be canonicalised because a root nests inside another, the view
+// roots are removed and the remainder is tried: a set that nests with the
+// launch root is the daemon's set unioned with the launch root, and the
+// daemon's own set is what the client is meant to render. A remainder that is
+// still nested is not canonical either, and is refused so the caller keeps its
+// existing workspace.
+func visibleRootsFor(reported, view []string) (ws.Roots, bool) {
+	if vr, err := ws.New(reported...); err == nil && vr.Len() > 0 {
+		return vr, true
+	}
+	vr, err := ws.New(withoutRoots(reported, view)...)
+	if err != nil || vr.Len() == 0 {
+		return ws.Roots{}, false
+	}
+	return vr, true
+}
+
+// withoutRoots returns paths with every entry equal to a view root removed,
+// keeping the order of what remains. It always returns a fresh slice, so a
+// caller cannot alias its input.
+func withoutRoots(paths, view []string) []string {
+	drop := make(map[string]bool, len(view))
+	for _, v := range view {
+		drop[v] = true
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if !drop[p] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // syncTheme adopts the terminal's measured background once the OSC query has
@@ -2905,17 +2927,16 @@ func (a *App) savePane(p *editor.Pane, then func(saved bool)) {
 // acts on the daemon; a named buffer writes in place and an unnamed one asks
 // where to go first.
 func (a *App) saveNow(p *editor.Pane, then func(saved bool)) {
-	// An unnamed buffer has no path to write, and an attached client has no
-	// daemon buffer to save either: the empty path the remote save would carry
-	// is resolved by the daemon to the buffer the user is looking at -- some
-	// other file -- and the snapshot read-back then replaces this pane's text
-	// with that file's, losing the typed work no forward ever sent. The guard
-	// therefore runs before the attach branch: a local buffer keeps its
-	// save-as, an attached one is refused for want of a daemon path.
+	// An empty path has no buffer to write. The remote save would carry it to
+	// the daemon, which resolves it to the buffer the user is looking at --
+	// some other file -- and the snapshot read-back would then replace this
+	// pane's text with that file's, losing the typed work no forward ever
+	// sent. So an unnamed buffer never reaches saveRemote: locally it asks for
+	// a path, and an attached one asks for a path and creates the file on the
+	// daemon, where the workspace it belongs to lives.
 	if p.File.Path == "" {
 		if a.attach {
-			a.status = "attach: this buffer has no path; an unnamed buffer has no daemon file to save"
-			report(then, false)
+			a.saveAsRemote(p, then)
 			return
 		}
 		a.saveAs(p, then)

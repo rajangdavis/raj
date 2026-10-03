@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -87,11 +88,14 @@ type BufferHost interface {
 	// CloseDiscard removes a buffer without saving, discarding unsaved
 	// changes and any pending change sets. It is the machine form of the
 	// editor's close-without-save, for a driver that has decided not to keep
-	// the work; the file on disk is left exactly as it is. remains reports
-	// whether that file is still on disk afterwards, so a driver that
-	// recreated the content under a new name learns the old name is left
-	// behind rather than only from the editor's status line.
-	CloseDiscard(path string) (remains bool, err error)
+	// the work; the file on disk is left exactly as it is. author is the
+	// writer asking, and the host refuses when any unsaved run in the buffer
+	// was not written by that writer: discarding the user's text is not an
+	// agent's to do. remains reports whether that file is still on disk
+	// afterwards, so a driver that recreated the content under a new name
+	// learns the old name is left behind rather than only from the editor's
+	// status line.
+	CloseDiscard(path string, author uint8) (remains bool, err error)
 
 	// Mkdir creates a directory and any missing parents under the workspace
 	// root. It is a filesystem change rather than a buffer one, so it names a
@@ -184,6 +188,14 @@ type BufferHost interface {
 	// index.
 	Intent(payload string) (string, error)
 
+	// ProveTree materialises the named intention alone over its base into a
+	// scratch tree and returns the tree's directory and object id. The
+	// connection runs the check hook there through the one hook runner and
+	// removes the directory; a failure removes it here and returns no
+	// directory. It is the event-thread half of `intent prove`, so the
+	// materialise happens where the model is owned and the command runs off it.
+	ProveTree(name string) (dir string, tree string, err error)
+
 	// Read returns the document as authored spans AND the version they were
 	// read at.
 	//
@@ -248,9 +260,12 @@ type BufferHost interface {
 	Save(path string, force bool) (uint64, error)
 
 	// Reload takes the buffer version on disk, matching the editor Reload
-	// gesture. There is no human at the socket to ask, so it never prompts: a
-	// dirty buffer is reloaded and its unsaved changes are discarded.
-	Reload(path string) error
+	// gesture. author is the writer asking, and the host refuses when any
+	// unsaved run in the buffer was not written by that writer: reloading
+	// discards unsaved text, so an agent may drop only its own. There is no
+	// human at the socket to ask, so a refusal is the answer rather than a
+	// prompt.
+	Reload(path string, author uint8) error
 
 	// Groups lists the change sets in a buffer, oldest first.
 	Groups(path string) ([]Group, error)
@@ -384,6 +399,17 @@ var (
 	ErrOutsideoot = errors.New("path is outside the workspace")
 )
 
+// errApproveRenameNotHuman is the rename gate's wording, the removal gate's
+// contract applied to a move: carrying out a rename is the user's action, not
+// the agent's that proposed it.
+const errApproveRenameNotHuman = "renaming a file is the user's action: an agent's rename proposal is carried out when the user approves it; withdraw it to leave the file alone"
+
+// errIntentLandNotHuman is the `intent land` gate. The land mode commits a
+// task's change sets, proposed ones included, and moves raj/baseline; that is
+// the same human decision the `land` verb makes, so an agent may not reach it
+// through the intent door.
+const errIntentLandNotHuman = "land is the user's one-gesture approval: an agent's sets are landed when the user runs it, not when the writer asks"
+
 // SymlinkEscapeEnv is the opt-out from the resolved-root check: any non-empty
 // value other than "0" or "false" restores the behaviour before the check,
 // where a symlink inside the workspace may name a target outside it. Unset or
@@ -440,11 +466,16 @@ type Guard struct {
 	mu     sync.Mutex
 	read   map[uint8]map[string]bool
 	claims map[uint8]map[string]bool
-	stats  ExecStats
+	// renames holds the pending rename proposals agents have made, keyed by the
+	// OLD canonical path. It is the rename analogue of the app's
+	// pendingDeletions: an agent proposes, the human approves, and nothing
+	// moves until then. In-memory like claims, and lost on restart.
+	renames map[string]renameProposal
+	stats   ExecStats
 }
 
 func NewGuard(h BufferHost) *Guard {
-	return &Guard{Host: h, read: map[uint8]map[string]bool{}, claims: map[uint8]map[string]bool{}}
+	return &Guard{Host: h, read: map[uint8]map[string]bool{}, claims: map[uint8]map[string]bool{}, renames: map[string]renameProposal{}}
 }
 
 // markRead records that author has seen name, so that author's later write is
@@ -693,6 +724,9 @@ func (g *Guard) Mkdir(path string) error {
 	if err := g.inRootResolved(path); err != nil {
 		return err
 	}
+	if err := checkProtected(path); err != nil {
+		return err
+	}
 	return g.Host.Mkdir(path)
 }
 
@@ -712,6 +746,29 @@ func (g *Guard) Mkdir(path string) error {
 // `a.go -> A.go` impossible there, so it is allowed and the host uses the
 // two-step rename. On success the caller's claim set follows old to new, so the
 // working set names the file that now exists; on failure it is left untouched.
+
+// protectedComponents are path components no verb may create, move into, move
+// out of, or remove: the checkout's own control directory. `.git` holds the
+// object database and hooks/ (an executable script moved there would run on the
+// next commit). The check is case-insensitive so a variant on a
+// case-insensitive filesystem is refused too.
+var protectedComponents = map[string]bool{".git": true}
+
+// checkProtected refuses path when any component is a protected directory.
+func checkProtected(path string) error {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if protectedComponents[strings.ToLower(part)] {
+			return fmt.Errorf("%s is under a protected path (%s); raj does not write there", path, part)
+		}
+	}
+	return nil
+}
+
+// CheckProtected reports whether path is under a protected directory. It is
+// checkProtected exported for the app's own local rename, so the menu gesture
+// refuses the same paths the socket does.
+func CheckProtected(path string) error { return checkProtected(path) }
+
 func (g *Guard) Rename(old, new string, author uint8) error {
 	if old == "" {
 		return errors.New("rename needs an old path")
@@ -727,25 +784,154 @@ func (g *Guard) Rename(old, new string, author uint8) error {
 	if err != nil {
 		return err
 	}
+	if err := checkProtected(src); err != nil {
+		return err
+	}
+	if err := checkProtected(dst); err != nil {
+		return err
+	}
+	// A human's own rename is the approval gesture: the person at the keyboard
+	// or a durable joined human (an attached client) moves the file directly.
+	// Every other caller is an agent -- a durable agent, a provisional
+	// connection, or a shell client with no human identity -- and its rename is
+	// a proposal the human answers. Nothing moves until then, and .git is
+	// refused above whatever the caller's kind.
+	if g.humanAuthor(author) {
+		if err := g.checkRenameDest(src, dst); err != nil {
+			return err
+		}
+		if err := g.Host.Rename(src, dst); err != nil {
+			return err
+		}
+		g.clearRename(src)
+		g.renameClaim(author, src, dst)
+		return nil
+	}
 	if err := g.claimCheck(author, src); err != nil {
 		return err
 	}
-	if dstInfo, derr := os.Stat(dst); derr == nil {
-		// Refuse unless the destination is the same file as the source, which
-		// is what a case-only rename looks like on a case-insensitive
-		// filesystem. There the two spellings resolve to one file, and
-		// refusing would make the case change impossible to express.
+	if err := g.checkRenameDest(src, dst); err != nil {
+		return err
+	}
+	return g.proposeRename(src, dst, author)
+}
+
+// renameProposal is one pending rename: the old and new canonical paths and the
+// agent that proposed it.
+type renameProposal struct {
+	Old, New string
+	Author   uint8
+}
+
+// checkRenameDest refuses a destination that already exists unless it is the
+// same file as the source, which is what a case-only rename looks like on a
+// case-insensitive filesystem. There the two spellings resolve to one file, and
+// refusing would make the case change impossible to express.
+func (g *Guard) checkRenameDest(src, dst string) error {
+	dstInfo, derr := os.Stat(dst)
+	if derr == nil {
 		srcInfo, serr := os.Stat(src)
 		if serr != nil || !os.SameFile(srcInfo, dstInfo) {
 			return fmt.Errorf("%s already exists", dst)
 		}
-	} else if !os.IsNotExist(derr) {
+		return nil
+	}
+	if !os.IsNotExist(derr) {
 		return derr
 	}
-	if err := g.Host.Rename(src, dst); err != nil {
+	return nil
+}
+
+// proposeRename records an agent's rename as a pending proposal. It is
+// idempotent: a second proposal for the same old path leaves the original in
+// place, so two agents racing do not rewrite who asked.
+func (g *Guard) proposeRename(src, dst string, author uint8) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.renames == nil {
+		g.renames = map[string]renameProposal{}
+	}
+	if _, ok := g.renames[src]; ok {
+		return nil
+	}
+	g.renames[src] = renameProposal{Old: src, New: dst, Author: author}
+	return nil
+}
+
+// clearRename drops any pending proposal for the old path; called when a human
+// carries the rename out directly.
+func (g *Guard) clearRename(src string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.renames, src)
+}
+
+// ApproveRename carries out the pending rename an agent proposed for old. It
+// is the human answer, so only the local keyboard row or a durable joined
+// human may ask; an agent, a provisional connection and the file-as-loaded are
+// refused. The destination must match the proposal, so a stale approval cannot
+// move the file somewhere the agent never asked for.
+func (g *Guard) ApproveRename(old, new string, author uint8) error {
+	if !g.humanAuthor(author) {
+		return errors.New(errApproveRenameNotHuman)
+	}
+	src, err := g.claimPath(old)
+	if err != nil {
 		return err
 	}
-	g.renameClaim(author, src, dst)
+	dst := src
+	if new != "" {
+		dst, err = g.claimPath(new)
+		if err != nil {
+			return err
+		}
+	}
+	if err := checkProtected(src); err != nil {
+		return err
+	}
+	if err := checkProtected(dst); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	p, ok := g.renames[src]
+	g.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no pending rename for %s", src)
+	}
+	if new != "" && p.New != dst {
+		return fmt.Errorf("pending rename of %s is to %s, not %s", src, p.New, dst)
+	}
+	if err := g.checkRenameDest(p.Old, p.New); err != nil {
+		return err
+	}
+	if err := g.Host.Rename(p.Old, p.New); err != nil {
+		return err
+	}
+	g.renameClaim(p.Author, p.Old, p.New)
+	g.clearRename(p.Old)
+	return nil
+}
+
+// WithdrawRename retracts the pending rename for old when author proposed it,
+// or when author is a human: a person may retract any pending rename, while an
+// agent may retract only its own. A path that is not pending is a no-op.
+func (g *Guard) WithdrawRename(old string, author uint8) error {
+	src, err := g.claimPath(old)
+	if err != nil {
+		return err
+	}
+	g.mu.Lock()
+	p, ok := g.renames[src]
+	if !ok {
+		g.mu.Unlock()
+		return nil
+	}
+	if p.Author != author && !g.humanAuthor(author) {
+		g.mu.Unlock()
+		return fmt.Errorf("pending rename of %s was proposed by author %d, not this writer", src, p.Author)
+	}
+	delete(g.renames, src)
+	g.mu.Unlock()
 	return nil
 }
 
@@ -1019,13 +1205,15 @@ func (g *Guard) Close(path string) error {
 // Discard closes a buffer without saving, discarding unsaved changes and any
 // pending change sets. It is not a text write — nothing is written and no
 // offset is checked — so it does not run the claim gate; the file on disk is
-// left exactly as it is.
-func (g *Guard) Discard(path string) (bool, error) {
+// left exactly as it is. author is the writer asking, and the host refuses
+// when any unsaved run in the buffer is not that writer's: discarding the
+// user's text is not an agent's to do.
+func (g *Guard) Discard(path string, author uint8) (bool, error) {
 	name, err := g.canonical(path)
 	if err != nil {
 		return false, err
 	}
-	return g.Host.CloseDiscard(name)
+	return g.Host.CloseDiscard(name, author)
 }
 
 func (g *Guard) Read(path string, author uint8, start, end, lineStart, lineEnd int, annotated bool) ([]Span, []StateRun, uint64, error) {
@@ -1475,13 +1663,15 @@ func (g *Guard) landExport(task, warning string) (*LandExport, error) {
 
 // Reload takes the on-disk version for a buffer. It is a read of the disk into
 // the model, not a text write, so it runs no claim gate; the host owns the
-// reload and the dirty-buffer wording.
-func (g *Guard) Reload(path string) error {
+// reload, the writer-own refusal and the dirty-buffer wording. author is the
+// writer asking: reloading discards unsaved text, so an agent may drop only
+// its own.
+func (g *Guard) Reload(path string, author uint8) error {
 	name, err := g.canonical(path)
 	if err != nil {
 		return err
 	}
-	return g.Host.Reload(name)
+	return g.Host.Reload(name, author)
 }
 
 // Clear hard-purges a rejected change set, addressed by group rather than by
@@ -1881,6 +2071,15 @@ func dispatchIntent(g *Guard, req Request) Response {
 	if cmd.Mode == "publish" && cmd.Approve && !g.IsHuman(req.Author) {
 		return Response{Err: errIntentPublishNotHuman}
 	}
+	if cmd.Mode == "land" && !g.IsHuman(req.Author) {
+		return Response{Err: errIntentLandNotHuman}
+	}
+	if cmd.Mode == "proveprep" {
+		// Internal: connection.prove materialises the seam through the
+		// wireless proveprep op, which never crosses the wire. A raw intent
+		// frame cannot ask for a scratch tree.
+		return Response{Err: "intent: proveprep is internal"}
+	}
 	cmd.Owner = fmt.Sprintf("%d", req.Author)
 	payload, err := json.Marshal(cmd)
 	if err != nil {
@@ -1917,7 +2116,8 @@ func dispatchHookPrep(g *Guard, req Request) Response {
 	// and hand back its command, projection and root, then runs the
 	// command off the thread. The wire form is the "hook" op with mode
 	// run; this op is the in-process half and has no wire representation.
-	return dispatchHook(g, Request{HookMode: "run", HookName: req.HookName, HookParams: req.HookParams, Author: req.Author})
+	return dispatchHook(g, Request{HookMode: "run", HookName: req.HookName, HookParams: req.HookParams, Author: req.Author,
+		HookPrepared: req.HookPrepared, HookRunDir: req.HookRunDir, HookRevision: req.HookRevision})
 }
 
 // dispatchPing answers the "ping" verb.
@@ -1967,10 +2167,23 @@ func dispatchMkdir(g *Guard, req Request) Response {
 	return Response{OK: true}
 }
 
-// dispatchRename answers the "rename" verb.
+// dispatchRename answers the "rename" verb. A plain request is an agent's
+// proposal (or a human's own move); --approve carries out the pending proposal
+// and --withdraw retracts one, both under the Guard's human-or-proposer rule.
 func dispatchRename(g *Guard, req Request) Response {
-	if err := g.Rename(req.Path, req.NewPath, req.Author); err != nil {
-		return Response{Err: err.Error()}
+	switch {
+	case req.Withdraw:
+		if err := g.WithdrawRename(req.Path, req.Author); err != nil {
+			return Response{Err: err.Error()}
+		}
+	case req.Approve:
+		if err := g.ApproveRename(req.Path, req.NewPath, req.Author); err != nil {
+			return Response{Err: err.Error()}
+		}
+	default:
+		if err := g.Rename(req.Path, req.NewPath, req.Author); err != nil {
+			return Response{Err: err.Error()}
+		}
 	}
 	return Response{OK: true}
 }
@@ -2005,7 +2218,7 @@ func dispatchReveal(g *Guard, req Request) Response {
 // dispatchClose answers the "close" verb.
 func dispatchClose(g *Guard, req Request) Response {
 	if req.Discard {
-		remains, err := g.Discard(req.Path)
+		remains, err := g.Discard(req.Path, req.Author)
 		if err != nil {
 			return Response{Err: err.Error()}
 		}
@@ -2458,7 +2671,7 @@ func dispatchLand(g *Guard, req Request) Response {
 
 // dispatchReload answers the "reload" verb.
 func dispatchReload(g *Guard, req Request) Response {
-	if err := g.Reload(req.Path); err != nil {
+	if err := g.Reload(req.Path, req.Author); err != nil {
 		return Response{Err: err.Error()}
 	}
 	return Response{OK: true}
@@ -2710,6 +2923,27 @@ func dispatchHookRun(g *Guard, req Request) Response {
 	if g.HookGate == nil {
 		return Response{Err: "hook run is not available"}
 	}
+	if req.HookPrepared {
+		// An intention proof: the event thread already materialised the seam
+		// and the connection is pointing the one runner at it, so there is no
+		// live projection to build and no workspace readiness to check. The
+		// command runs in the seam directory (Root) and must run to completion
+		// for the proof to have a verdict, so detach is forced off.
+		revision := req.HookRevision
+		now := time.Now()
+		retryAfter, ok, reason := g.HookGate.Allow(req.HookName, revision, now)
+		if !ok {
+			return Response{Err: fmt.Sprintf("hook %q: %s", req.HookName, reason),
+				RetryAfterMS: int(retryAfter / time.Millisecond)}
+		}
+		g.HookGate.Begin(req.HookName, revision, now)
+		return Response{OK: true, Root: req.HookRunDir, HookPrepared: true, HookRevision: revision,
+			HookArgv: hook.Argv, HookShell: hook.Shell, HookTree: string(hooks.TreeProjected),
+			HookMayWrite: hook.MayWrite, HookDetach: false,
+			HookTimeoutMS: int(hook.Timeout / time.Millisecond),
+			HookBuiltin:   hook.Builtin, HookBuiltinArgs: hook.BuiltinArgs,
+			HookSteps: hook.Steps, HookParamValues: paramValues}
+	}
 	root := g.Root()
 	// A workspace hook runs in the saved root itself, so it must not start
 	// while any buffer is unsaved or holds a pending change set: the run would
@@ -2768,6 +3002,95 @@ func dispatchHookRun(g *Guard, req Request) Response {
 		HookTimeoutMS: int(hook.Timeout / time.Millisecond),
 		HookBuiltin:   hook.Builtin, HookBuiltinArgs: hook.BuiltinArgs,
 		HookSteps: hook.Steps, HookParamValues: paramValues}
+}
+
+// proveCommandName reads the intention name out of an intent-prove payload.
+func proveCommandName(hookJSON string) string {
+	var cmd intent.Command
+	if err := json.Unmarshal([]byte(hookJSON), &cmd); err != nil {
+		return ""
+	}
+	return cmd.Name
+}
+
+// isProveIntent reports whether an intent request is the prove subcommand. The
+// connection uses it to route prove through the hook runner instead of the
+// event thread.
+func isProveIntent(hookJSON string) bool {
+	var cmd intent.Command
+	if err := json.Unmarshal([]byte(hookJSON), &cmd); err != nil {
+		return false
+	}
+	return cmd.Mode == "prove"
+}
+
+// dispatchProvePrep answers the internal "proveprep" op: it materialises the
+// named intention alone over its base on the event thread and returns the
+// scratch directory and a stable revision for the Gate. It does NOT admit the
+// check hook or run anything; connection.prove then points the one hook runner
+// at the directory, so admission, the gate, the timeout and the run log are the
+// runner's own.
+func dispatchProvePrep(g *Guard, req Request) Response {
+	name := proveCommandName(req.HookJSON)
+	if name == "" {
+		return Response{Err: "intent prove: needs an intention name"}
+	}
+	dir, tree, err := g.Host.ProveTree(name)
+	if err != nil {
+		return Response{Err: err.Error()}
+	}
+	return Response{OK: true, Root: dir, HookRevision: hashRevision(tree)}
+}
+
+// hashRevision turns a seam's tree object id into the revision the hook Gate
+// keys the run by, so two proves of the same seam share a revision and a proof
+// after an edit does not.
+func hashRevision(tree string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(tree))
+	return h.Sum64()
+}
+
+// connection.prove runs `intent prove` through the one hook runner. The event
+// thread materialises the seam and returns its directory; the runner then
+// admits the check hook, holds the shared Gate, applies the hook's timeout,
+// records the run in the shared log and runs the command here, off the event
+// thread. The result is the intent.Result a client expects, not the hook
+// stream, so the frames are captured and reshaped.
+func (c *connection) prove(req Request, emit func(Response)) {
+	name := proveCommandName(req.HookJSON)
+	if name == "" {
+		emit(Response{ID: req.ID, Err: "intent prove: needs an intention name", Final: true})
+		return
+	}
+	prep := c.srv.submit(Request{ID: req.ID, Op: "proveprep", HookJSON: req.HookJSON, Author: req.Author})
+	if prep.Err != "" {
+		prep.ID, prep.Final = req.ID, true
+		emit(prep)
+		return
+	}
+	dir, revision := prep.Root, prep.HookRevision
+	defer os.RemoveAll(dir)
+	runReq := Request{ID: req.ID, Op: "hook", HookMode: "run", HookName: "check",
+		HookPrepared: true, HookRunDir: dir, HookRevision: revision, Author: req.Author}
+	var out strings.Builder
+	var exit int
+	var runErr string
+	c.runHook(runReq, func(r Response) {
+		if r.Out != "" {
+			out.WriteString(r.Out)
+		}
+		if r.Final {
+			exit, runErr = r.Exit, r.Err
+		}
+	})
+	proof := intent.ProofFor(name, exit, out.String(), errors.New(runErr))
+	data, err := json.Marshal(intent.Result{Proofs: []intent.Proof{proof}})
+	if err != nil {
+		emit(Response{ID: req.ID, Err: "intent prove: " + err.Error(), Final: true})
+		return
+	}
+	emit(Response{ID: req.ID, OK: true, HookJSON: string(data), Final: true})
 }
 
 // blockingBuffers returns the buffers that make a workspace unready for a gate:

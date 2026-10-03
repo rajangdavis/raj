@@ -8,20 +8,17 @@ import (
 	"testing"
 	"time"
 
-	"raj/internal/hidden"
 	"raj/internal/piecetable"
 	"raj/internal/session"
-	"raj/internal/store"
 	"raj/internal/ui"
 )
 
-// storedSession is the session the app store holds, for the tests that used
-// to read session.json directly. With no store it falls back to the file, so
-// the helper is the same read either way.
+// storedSession is the session the app store holds. With no store there is
+// nothing to read.
 func storedSession(t *testing.T, a *App) session.State {
 	t.Helper()
 	if a.state == nil {
-		return session.Load(a.primaryRoot())
+		return session.State{}
 	}
 	blob, ok, err := a.state.Session()
 	if err != nil {
@@ -212,152 +209,11 @@ func TestRestoreSkipsMissingFiles(t *testing.T) {
 	}
 }
 
-// A workspace written by a build before the store has only session.json. The
-// first restore adopts it into the database and removes the file; a second run
-// reads the database, so a regression to the file path would come up empty.
-func TestLegacySessionJSONMigratesToTheStore(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	f := filepath.Join(root, "a.go")
-	os.WriteFile(f, []byte("x\n"), 0o644)
-
-	if err := session.Save(root, session.State{
-		Tabs:   []session.Tab{{Path: f, Cursor: 0, Top: 0}},
-		Active: 0,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(session.StateDir(root), "state.db")); !os.IsNotExist(err) {
-		t.Fatalf("state.db exists before the first run: %v", err)
-	}
-
-	first := newHarnessAt(t, root)
-	first.RestoreSession()
-	if got := first.Tabs.Active(); got == nil || got.File.Path != f {
-		t.Fatalf("first restore did not adopt the legacy session: %v", got)
-	}
-	if st := storedSession(t, first.App); len(st.Tabs) != 1 || st.Tabs[0].Path != f {
-		t.Errorf("store was not populated by the migration: %+v", st.Tabs)
-	}
-	if _, err := os.Stat(session.File(root)); !os.IsNotExist(err) {
-		t.Errorf("legacy session.json survived the migration: %v", err)
-	}
-
-	second := newHarnessAt(t, root)
-	second.RestoreSession()
-	if got := second.Tabs.Active(); got == nil || got.File.Path != f {
-		t.Fatalf("second restore did not use the store: %v", got)
-	}
-}
-
-// The workspace's state lives in the XDG state dir now, so the first run of a
-// build that keeps it there moves the legacy .raj database and op logs across.
-// .raj/hidden is workspace config, not state: migrateState leaves it alone, and
-// the separate config migration copies it to XDG while leaving it in place.
-func TestLegacyStateMovesToStateDir(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	root := t.TempDir()
-	legacy := session.Dir(root)
-	if err := os.MkdirAll(filepath.Join(legacy, "logs"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "hidden"), []byte("dist/\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "logs", "buffer.log"), []byte("log"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A real database at the legacy path, closed first so the file it moves is
-	// valid SQLite rather than a marker.
-	seed, err := store.Open(filepath.Join(legacy, "state.db"))
-	if err != nil {
-		t.Fatalf("seed legacy store: %v", err)
-	}
-	seed.Close()
-
-	newHarnessAt(t, root) // New runs the migration before it opens a store
-
-	stateDir := session.StateDir(root)
-	for _, name := range []string{"state.db", filepath.Join("logs", "buffer.log")} {
-		if _, err := os.Stat(filepath.Join(stateDir, name)); err != nil {
-			t.Errorf("%s did not move into the state dir: %v", name, err)
-		}
-	}
-	for _, name := range []string{"state.db", filepath.Join("logs", "buffer.log")} {
-		if _, err := os.Stat(filepath.Join(legacy, name)); !os.IsNotExist(err) {
-			t.Errorf("legacy %s survived the migration: %v", name, err)
-		}
-	}
-	if got, err := os.ReadFile(filepath.Join(legacy, "hidden")); err != nil || string(got) != "dist/\n" {
-		t.Errorf("the legacy .raj/hidden was touched: %q, err=%v", got, err)
-	}
-}
-
-// The database's WAL and SHM sidecars travel with it, so a crashed writer's
-// un-checkpointed transactions survive the move to the state dir.
-func TestMigrateStateMovesDatabaseSidecars(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	legacy := session.Dir(root)
-	if err := os.MkdirAll(legacy, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The contents are irrelevant to the move, and calling migrateState
-	// directly keeps SQLite from trying to read a synthetic WAL.
-	for _, name := range []string{"state.db", "state.db-wal", "state.db-shm"} {
-		if err := os.WriteFile(filepath.Join(legacy, name), []byte(name), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := migrateState([]string{root}); err != nil {
-		t.Fatalf("migrateState: %v", err)
-	}
-	stateDir := session.StateDir(root)
-	for _, name := range []string{"state.db", "state.db-wal", "state.db-shm"} {
-		if _, err := os.Stat(filepath.Join(stateDir, name)); err != nil {
-			t.Errorf("%s did not move into the state dir: %v", name, err)
-		}
-		if _, err := os.Stat(filepath.Join(legacy, name)); !os.IsNotExist(err) {
-			t.Errorf("legacy %s survived the migration: %v", name, err)
-		}
-	}
-}
-
-// A sidecar with no database to attach to stays put: moving a WAL without its
-// database would be worse than leaving the stale file behind.
-func TestMigrateStateLeavesOrphanSidecar(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	legacy := session.Dir(root)
-	if err := os.MkdirAll(legacy, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "state.db-wal"), []byte("orphan"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := migrateState([]string{root}); err != nil {
-		t.Fatalf("migrateState: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(session.StateDir(root), "state.db-wal")); !os.IsNotExist(err) {
-		t.Errorf("an orphan sidecar was moved: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(legacy, "state.db-wal")); err != nil {
-		t.Errorf("an orphan sidecar was removed: %v", err)
-	}
-}
-
 // A state directory that cannot be created is not fatal: the editor still
-// starts, just without persistence, and the legacy files are left alone.
+// starts, just without persistence.
 func TestStateDirFailureDoesNotStopStartup(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	legacy := filepath.Join(session.Dir(root), "state.db")
-	if err := os.MkdirAll(session.Dir(root), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacy, []byte("legacy"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	// A regular file where the workspace's state directory belongs makes
 	// MkdirAll fail, standing in for an unwritable state home.
 	blocker := session.StateDir(root)
@@ -378,107 +234,10 @@ func TestStateDirFailureDoesNotStopStartup(t *testing.T) {
 	if a.state != nil {
 		t.Error("a store opened despite an unusable state dir")
 	}
-	if _, err := os.Stat(legacy); err != nil {
-		t.Errorf("a failed state setup moved the legacy database anyway: %v", err)
-	}
 }
 
-// The workspace hide file moved out of the project into XDG, so the first run
-// of a build that reads it there copies a legacy .raj/hidden into the workspace
-// file and leaves the legacy file where it was.
-func TestLegacyHiddenConfigMovesToXDG(t *testing.T) {
-	cfg := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", cfg)
-	root := t.TempDir()
-	legacy := filepath.Join(session.Dir(root), "hidden")
-	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacy, []byte("dist/\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := migrateHiddenConfig([]string{root}); err != nil {
-		t.Fatalf("migrateHiddenConfig: %v", err)
-	}
-
-	dst := hidden.WorkspaceFile([]string{root})
-	if dst == "" {
-		t.Fatal("WorkspaceFile returned nothing")
-	}
-	if got, err := os.ReadFile(dst); err != nil || string(got) != "dist/\n" {
-		t.Errorf("workspace file = %q, err=%v; want the copied config", got, err)
-	}
-	if got, err := os.ReadFile(legacy); err != nil || string(got) != "dist/\n" {
-		t.Errorf("legacy file was touched: %q, err=%v", got, err)
-	}
-}
-
-// A destination that already exists is never overwritten by a stale legacy
-// file: the workspace file the user is actually using wins.
-func TestLegacyHiddenConfigDoesNotOverwrite(t *testing.T) {
-	cfg := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", cfg)
-	root := t.TempDir()
-	legacy := filepath.Join(session.Dir(root), "hidden")
-	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacy, []byte("legacy/\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dst := hidden.WorkspaceFile([]string{root})
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dst, []byte("current/\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := migrateHiddenConfig([]string{root}); err != nil {
-		t.Fatalf("migrateHiddenConfig: %v", err)
-	}
-	if got, err := os.ReadFile(dst); err != nil || string(got) != "current/\n" {
-		t.Errorf("workspace file = %q, err=%v; want it unchanged", got, err)
-	}
-}
-
-// A migration that cannot write its destination is not fatal: the editor still
-// starts, against whatever configuration it could read.
-func TestHiddenConfigMigrationFailureIsNotFatal(t *testing.T) {
-	cfg := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", cfg)
-	root := t.TempDir()
-	legacy := filepath.Join(session.Dir(root), "hidden")
-	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacy, []byte("dist/\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A regular file where the workspaces directory belongs makes MkdirAll
-	// fail, standing in for an unwritable config home.
-	if err := os.MkdirAll(filepath.Join(cfg, "raj"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cfg, "raj", "workspaces"), []byte("not a directory"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	host := ui.NewFakeHost(80, 24)
-	t.Cleanup(func() { host.Close() })
-	a := New(host, root, 2)
-	t.Cleanup(a.CloseState)
-	if a == nil {
-		t.Fatal("New returned nil")
-	}
-	if _, err := os.Stat(hidden.WorkspaceFile([]string{root})); err == nil {
-		t.Error("a failed config migration wrote a destination anyway")
-	}
-}
-
-// A fresh launch over a clean project must not create .raj in it: the workspace
-// config and the state both live outside the project now.
+// A fresh launch over a clean project writes no state into it: everything the
+// editor persists lives under the XDG state home.
 func TestFreshLaunchLeavesProjectClean(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	root := t.TempDir()
@@ -486,6 +245,7 @@ func TestFreshLaunchLeavesProjectClean(t *testing.T) {
 	if err := os.WriteFile(f, []byte("package a\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	before := dirEntries(t, root)
 
 	host := ui.NewFakeHost(80, 24)
 	t.Cleanup(func() { host.Close() })
@@ -496,17 +256,32 @@ func TestFreshLaunchLeavesProjectClean(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(filepath.Join(root, ".raj")); !os.IsNotExist(err) {
-		t.Errorf("a fresh launch created .raj in the project: %v", err)
+	if after := dirEntries(t, root); strings.Join(after, "\n") != strings.Join(before, "\n") {
+		t.Errorf("a fresh launch changed the project directory: %v -> %v", before, after)
 	}
 	if _, err := os.Stat(filepath.Join(session.StateDir(root), "state.db")); err != nil {
 		t.Errorf("the saved state is not under the XDG state dir: %v", err)
 	}
 }
 
-// A save populates the database and writes no session.json, and a second app
-// over the same root restores the tab and cursor from it. This is the round
-// trip that replaces the file in ordinary use.
+// dirEntries lists the names directly under dir, in ReadDir's sorted order, so
+// a test can compare a project directory before and after a launch.
+func dirEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// A save populates the database, and a second app over the same root restores
+// the tab and cursor from it. This is the ordinary-use round trip through the
+// store.
 func TestSaveSessionWritesTheStore(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -519,9 +294,6 @@ func TestSaveSessionWritesTheStore(t *testing.T) {
 	first.Tabs.Active().Viewport.Top = 2
 	if err := first.SaveSession(); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := os.Stat(session.File(root)); !os.IsNotExist(err) {
-		t.Errorf("SaveSession wrote session.json: %v", err)
 	}
 	st := storedSession(t, first.App)
 	if len(st.Tabs) != 1 || st.Tabs[0].Path != f || st.Tabs[0].Cursor != 4 {
@@ -823,9 +595,6 @@ func TestSessionTickIsInertWhenNothingChanged(t *testing.T) {
 	if _, ok, err := a.state.Session(); err != nil || ok {
 		t.Errorf("an idle editor wrote a session (ok=%v, err=%v)", ok, err)
 	}
-	if _, err := os.Stat(session.File(root)); !os.IsNotExist(err) {
-		t.Error("an idle editor wrote a session file")
-	}
 }
 
 // --no-restore still disables writing, including from the tick.
@@ -841,9 +610,6 @@ func TestSessionTickRespectsNoRestore(t *testing.T) {
 	a.sessionTick(time.Now())
 	if _, ok, err := a.state.Session(); err != nil || ok {
 		t.Errorf("--no-restore wrote a session (ok=%v, err=%v)", ok, err)
-	}
-	if _, err := os.Stat(session.File(root)); !os.IsNotExist(err) {
-		t.Error("--no-restore wrote a session file")
 	}
 }
 
@@ -1088,24 +854,23 @@ func TestScrollRestoresIndependentOfTerminalSize(t *testing.T) {
 	}
 }
 
-// A session written before the ratio existed restores by its plain Top, so a
-// saved position from an older build still lands where it used to.
-func TestScrollRestoresLegacyJSONByTop(t *testing.T) {
+// A stored session written before the ratio existed restores by its plain
+// Top, so a saved position from an older build still lands where it used to.
+func TestScrollRestoresTopWhenRatioAbsent(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
 	writeLines(t, f, 100)
 
-	p := session.File(root)
-	os.MkdirAll(filepath.Dir(p), 0o700)
-	body := `{"version":1,"tabs":[{"path":"` + f + `","cursor":0,"top":40}],"active":0}`
-	os.WriteFile(p, []byte(body), 0o600)
-
-	second := newHarnessAt(t, root)
-	second.RestoreSession()
-	second.drain()
-	if got := second.Tabs.Active().Viewport.Top; got != 40 {
-		t.Errorf("legacy restore top = %d, want 40", got)
+	body := []byte(`{"version":1,"tabs":[{"path":"` + f + `","cursor":0,"top":40}],"active":0}`)
+	a := newHarnessAt(t, root)
+	if err := a.state.PutSession(body); err != nil {
+		t.Fatal(err)
+	}
+	a.RestoreSession()
+	a.drain()
+	if got := a.Tabs.Active().Viewport.Top; got != 40 {
+		t.Errorf("old-format restore top = %d, want 40", got)
 	}
 }
 
@@ -1137,38 +902,34 @@ func TestSessionPersistsPaneHints(t *testing.T) {
 	}
 }
 
-// When the store already holds a session, a session.json left behind by an
-// earlier migration (or one whose os.Remove failed) is stale and is removed,
-// so it cannot linger next to the source of truth. The store's state is what
-// restores.
-func TestStaleSessionJSONIsRemovedWhenStoreHasOne(t *testing.T) {
+// A store session is the only source of session state: a save writes the tab
+// set, and a file's position is retrievable from its own row for the path (the
+// rows outlive the tab set, so a closed tab is still remembered).
+func TestStoreSessionIsTheOnlySource(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	f := filepath.Join(root, "a.go")
-	os.WriteFile(f, []byte("x\n"), 0o644)
+	os.WriteFile(f, []byte("line one\nline two\n"), 0o644)
 
-	// Populate the store through a normal save, then leave a stale file as a
-	// failed migration would.
 	first := newHarnessAt(t, root)
 	first.OpenFile(f)
+	first.Tabs.Active().Cursors.Set(4, 4)
 	if err := first.SaveSession(); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Save(root, session.State{
-		Tabs:   []session.Tab{{Path: f}},
-		Active: 0,
-	}); err != nil {
-		t.Fatal(err)
+	st := storedSession(t, first.App)
+	if len(st.Tabs) != 1 || st.Tabs[0].Path != f {
+		t.Fatalf("the tab set did not reach the store: %+v", st.Tabs)
 	}
-	if _, err := os.Stat(session.File(root)); err != nil {
-		t.Fatalf("setup: stale session.json not written: %v", err)
+	if st.Tabs[0].Cursor != 4 {
+		t.Fatalf("the session blob did not carry the cursor: %+v", st.Tabs)
 	}
-
+	cursor, _, ok, err := first.state.Position(f)
+	if err != nil || !ok || cursor != 4 {
+		t.Fatalf("position row for %s = %d/%v, err %v; want cursor 4", f, cursor, ok, err)
+	}
 	second := newHarnessAt(t, root)
 	second.RestoreSession()
-	if _, err := os.Stat(session.File(root)); !os.IsNotExist(err) {
-		t.Errorf("stale session.json survived a restore from the store: %v", err)
-	}
 	if got := second.Tabs.Active(); got == nil || got.File.Path != f {
 		t.Fatalf("restore from the store = %v, want %s", got, f)
 	}

@@ -48,7 +48,10 @@ func (s *Store) Slice(a Author, start, length int) []byte {
 		return nil
 	}
 	b := s.texts[a]
-	if start < 0 || start+length > len(b) {
+	// Addition-free bounds: start+length overflows and wraps negative for a
+	// start near MaxInt, and a negative length slices with high < low. Both
+	// are refusals, not panics.
+	if start < 0 || length < 0 || start > len(b) || length > len(b)-start {
 		return nil
 	}
 	return b[start : start+length]

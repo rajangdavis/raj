@@ -77,7 +77,7 @@ var ctlUsage = `usage: raj ctl <command> [options]
   open <path>                show a file: load it and focus a tab; --create makes a buffer for a path not on disk; prints opened or created
   ls [path]                  list a directory's immediate children; a trailing / marks a directory, --hidden includes hidden entries
   mkdir <dir>                create a directory, and any missing parents, under the workspace root
-  rename <old> <new>         move a file within the workspace, carrying an open clean buffer; alias: mv
+  rename <old> <new>         move a file (a human) or propose the move for the user to approve (an agent); --approve/--withdraw answer a pending proposal; alias: mv
   delete <path>              propose deleting a file for the user to review; claim-gated
   delete --withdraw <path>   retract a pending deletion you proposed
   delete --approve <path>    carry out a pending deletion (the human answer; human only)
@@ -1106,7 +1106,7 @@ func renameCmdRun(c *Client, o *ctlOpts, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "raj ctl %s: needs an old and a new path\n", o.cmd)
 		return 2
 	}
-	return renameCmd(c, o.path, o.fs.Arg(1), stdout, stderr, o.asJSON)
+	return renameCmd(c, o.path, o.fs.Arg(1), o.approve, o.withdraw, stdout, stderr, o.asJSON)
 }
 
 // editCmd replaces an exact string; the convenience over apply.
@@ -1292,15 +1292,25 @@ func lsCmd(c *Client, path string, all bool, stdout, stderr io.Writer, asJSON bo
 // with it. Two paths cross the wire: the old in Path and the new in NewPath.
 // The Guard gates the old on the caller's claim set and refuses a destination
 // that already exists, so this is the same working-set discipline as a write.
-func renameCmd(c *Client, old, newPath string, stdout, stderr io.Writer, asJSON bool) int {
-	res, err := c.Do(Request{Op: "rename", Path: old, NewPath: newPath})
+// A human (the keyboard or an attached client) moves directly; an agent's
+// rename is a pending proposal, and --approve/--withdraw are the human's
+// answers to it.
+func renameCmd(c *Client, old, newPath string, approve, withdraw bool, stdout, stderr io.Writer, asJSON bool) int {
+	res, err := c.Do(Request{Op: "rename", Path: old, NewPath: newPath, Approve: approve, Withdraw: withdraw})
 	if code := fail(stderr, res, err); code != 0 {
 		return code
 	}
 	if asJSON {
-		return emit(stdout, map[string]any{"ok": true, "old": old, "new": newPath})
+		return emit(stdout, map[string]any{"ok": true, "old": old, "new": newPath, "approve": approve, "withdraw": withdraw})
 	}
-	fmt.Fprintf(stdout, "renamed %s to %s\n", old, newPath)
+	switch {
+	case approve:
+		fmt.Fprintf(stdout, "approved the pending rename of %s to %s\n", old, newPath)
+	case withdraw:
+		fmt.Fprintf(stdout, "withdrew the pending rename of %s\n", old)
+	default:
+		fmt.Fprintf(stdout, "renamed %s to %s\n", old, newPath)
+	}
 	return 0
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"raj/internal/editor"
 	"raj/internal/intent"
 	"raj/internal/piecetable"
+	"raj/internal/prompt"
 	"raj/internal/safe"
 	"raj/internal/store"
 	"raj/internal/ui"
@@ -28,6 +30,10 @@ type clientConn interface {
 	// server that does not send one. The client adopts it as its visible
 	// workspace once the handshake succeeds.
 	Roots() []string
+	// Kind is the participant kind the daemon granted this connection on the
+	// hello reply, learned from the response; "" means an older daemon that
+	// sent none, which the attach path reads as unknown and fails open.
+	Kind() control.Kind
 	Close() error
 }
 
@@ -151,10 +157,11 @@ func markFromFile(f *editor.File) bufferMark {
 }
 
 // helloRequest is the hello every client connection sends: the watch and the
-// decision connections join the same durable human identity, so text the
-// client writes is attributed to the person at the remote keyboard rather than
-// to a fresh agent. The identity is derived from the client view key, so two
-// clients of one workspace stay separate people.
+// decision connections ask to join the same durable identity, so two clients of
+// one workspace stay separate people. It asks for the human kind, but that is
+// only a request: the daemon grants it on the local socket and downgrades it to
+// an agent on TCP, and the granted kind comes back on the reply for the attach
+// to read (see clientConn.Kind).
 func (a *App) helloRequest() control.Request {
 	key := a.attachKey
 	if key == "" {
@@ -165,10 +172,11 @@ func (a *App) helloRequest() control.Request {
 }
 
 // joinClient says hello on a freshly dialed connection, binding it to the
-// client's durable human identity before any document verb runs. A failure is
-// returned so the caller can close the connection and report the status; the
-// daemon-side registry then makes host.isAgent false for this author, which is
-// what lands a local edit as accepted text rather than a proposal.
+// client's durable identity before any document verb runs. A failure is
+// returned so the caller can close the connection and report the status. The
+// daemon grants the human kind only on the local socket, so a local client's
+// edit lands as accepted text while a TCP client's arrives as a proposal; the
+// granted kind is what c.Kind reports and what StartClient's mode follows.
 func (a *App) joinClient(c clientConn) error {
 	res, err := c.Do(a.helloRequest())
 	if err != nil {
@@ -181,11 +189,12 @@ func (a *App) joinClient(c clientConn) error {
 }
 
 // StartClient connects to the daemon this app was launched to attach to, loads
-// its open documents as tabs, enters Review and arms a watch. It runs before
-// Run; the connection and the buffer marks then belong to the watch goroutine,
-// so the client lock serialises its requests. A failure at any step is a status
-// line, not a crash: an attach with no daemon says why and leaves an empty
-// editor rather than taking the terminal down.
+// its open documents as tabs, starts in the mode the kind the daemon grants
+// calls for, and arms a watch. It runs before Run; the connection and the buffer
+// marks then belong to the watch goroutine, so the client lock serialises its
+// requests. A failure at any step is a status line, not a crash: an attach with
+// no daemon says why and leaves an empty editor rather than taking the terminal
+// down.
 func (a *App) StartClient() {
 	// The dot starts red and turns green only once the daemon answers: an
 	// attach that fails before it ever connects must not look healthy.
@@ -352,10 +361,18 @@ func (a *App) StartClient() {
 	if a.Tabs.Active() != nil {
 		a.focus = FocusEditor
 	}
-	// A client is a viewer: Review is the only mode in which an edit cannot
-	// reach the daemon document, and it is where a watcher proposal is meant
-	// to be read.
-	a.EnterReview()
+	// The mode follows the kind the daemon granted on hello, read from the
+	// watch connection that just helloed. A client on the editor's own machine
+	// -- the local Unix socket, including one reached over SSH there -- is
+	// granted KindHuman and stays fully editable, exactly as before. A client
+	// on another machine (TCP) is downgraded to KindAgent and starts in
+	// Review, the client's read-only gate, with a status that names it. Any
+	// other kind, including the empty kind an older daemon's hello reply
+	// carries, is unknown and fails open to ModeEdit, so a field we cannot
+	// read can never silently lock a local client out of editing.
+	mode, agent := attachStartMode(c.Kind())
+	a.mode = mode
+	a.attachedAsAgent = agent
 	if a.Tabs.Active() == nil {
 		// An attach with nothing to show says so rather than presenting an
 		// empty editor as if it were the daemon's workspace.
@@ -364,12 +381,46 @@ func (a *App) StartClient() {
 	if len(dropped) > 0 {
 		a.status = "attach: dropped " + strings.Join(dropped, ", ")
 	}
+	if agent {
+		// The gate note outranks the attach housekeeping messages: it is the
+		// one line that says why a typed edit will not land as this client's
+		// own text.
+		a.status = attachAgentNote
+	}
+	// A workspace that differs from the launch roots is named last, so the
+	// housekeeping above cannot bury which workspace the client is showing.
+	a.noteAttachedRoots()
 	a.setClientConnected(true)
 	safe.Go(func() {
 		defer close(a.clientDone)
 		a.watchLoop(c, res.Gen, vers)
 	})
 }
+
+// attachStartMode maps the participant kind the daemon granted an attached
+// client on hello to the mode it starts in and whether it must keep saying its
+// edits arrive as proposals. KindHuman -- the editor's own Unix socket, which
+// includes a client run over SSH on that machine -- stays fully editable in
+// ModeEdit. KindAgent -- a client on another machine, over TCP, downgraded
+// because only the local socket is the person's own connection -- starts in
+// Review, the client's read-only gate. Anything else, including the empty kind
+// an older daemon sends, is unknown and fails open to ModeEdit: a kind we
+// cannot name must never silently lock a local client out of editing.
+func attachStartMode(kind control.Kind) (mode Mode, agent bool) {
+	if kind == control.KindAgent {
+		return ModeReview, true
+	}
+	return ModeEdit, false
+}
+
+// attachAgentNote is the status an agent-kind attach starts with: it names the
+// read-only gate and what a typed edit would become, not only the mode.
+const attachAgentNote = "attached as an agent: read-only; edits would land as proposals"
+
+// attachAgentEditNote is the status when an agent-kind client leaves Review
+// with cmd+r. Leaving is allowed, but the note must still say its edits arrive
+// as proposals rather than as its own text.
+const attachAgentEditNote = "edit mode: attached as an agent; edits land as proposals"
 
 // fetchSnapshot reads one buffer whole document and builds its pane file. The
 // decode and the build happen here, off the event thread, so a large document
@@ -729,6 +780,34 @@ func sameRootSet(got, want []string) bool {
 	return true
 }
 
+// noteAttachedRoots names the visible workspace in the status line when it
+// differs from the roots this client was launched with. A client launched in a
+// parent of the daemon's workspace otherwise renders a tree with no line
+// saying which workspace it is; the note is what makes the next such report
+// self-explaining. When the visible and launch sets agree the line is left
+// untouched, and any message already there is kept after the note so attach
+// housekeeping is not lost.
+func (a *App) noteAttachedRoots() {
+	if note := clientRootsNote(a.visible.All(), a.roots.All()); note != "" {
+		if a.status == "" {
+			a.status = note
+		} else {
+			a.status = note + "; " + a.status
+		}
+	}
+}
+
+// clientRootsNote is the status for a visible workspace that differs from the
+// roots the client was launched with: "attached to <root>[, <root>...]". It is
+// empty when the two sets agree, which is the ordinary attach where the launch
+// root already is the workspace.
+func clientRootsNote(visible, launch []string) string {
+	if sameRootSet(visible, launch) {
+		return ""
+	}
+	return "attached to " + strings.Join(visible, ", ")
+}
+
 // publishClient swaps in a connection pair and closes the old ones. The
 // decision connection is read on the event thread, so the swap is under
 // clientConnMu; closing the old pair after the swap means a decision in flight
@@ -815,7 +894,9 @@ func (a *App) drainClient() {
 		a.status = note
 	}
 	if len(roots) > 0 && !sameRootSet(a.visible.All(), roots) {
-		a.adoptVisibleRoots(roots)
+		if a.adoptVisibleRoots(roots) {
+			a.noteAttachedRoots()
+		}
 	}
 	adopted := false
 	for _, cf := range files {
@@ -1322,6 +1403,140 @@ func (a *App) saveRemote(p *editor.Pane, then func(saved bool)) {
 	}
 	a.status = "saved " + p.File.Name()
 	report(then, true)
+}
+
+// saveAsRemote is the attached form of saveAs. The client owns no bytes and its
+// own filesystem is not the daemon's, so a path must be resolved in the daemon's
+// workspace: the prompt is seeded at the visible (daemon) root, and a relative
+// answer is joined to that root exactly as the local save-as joins to the local
+// one. The write itself is a daemon sequence, because only the daemon can create
+// the file.
+func (a *App) saveAsRemote(p *editor.Pane, then func(saved bool)) {
+	root := a.visible.Primary()
+	a.askPath("Save as", root+string(filepath.Separator), func(answer string, ok bool) {
+		if !ok || answer == "" {
+			a.status = "save cancelled"
+			report(then, false)
+			return
+		}
+		path := answer
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		a.writeRemoteAs(p, path, then)
+	})
+}
+
+// writeRemoteAs writes the pane's typed text to path on the daemon. The client
+// cannot stat the daemon's disk, so an open without create asks whether the path
+// is already held; a held path raises the same overwrite question the local
+// save-as asks, and only its answer proceeds to the write.
+func (a *App) writeRemoteAs(p *editor.Pane, path string, then func(saved bool)) {
+	c := a.decideClient()
+	if c == nil {
+		a.status = "attach: not connected to a daemon"
+		report(then, false)
+		return
+	}
+	probe, err := c.Do(control.Request{Op: "open", Path: path})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		report(then, false)
+		return
+	}
+	if !probe.OK {
+		// Not a buffer and not a file on the daemon: the path is new.
+		a.writeRemoteText(c, p, path, then)
+		return
+	}
+	a.confirm("File exists", filepath.Base(path)+" already exists. Overwrite?",
+		[]string{prompt.Overwrite, prompt.Cancel}, func(ans string, ok bool) {
+			if !ok || ans != prompt.Overwrite {
+				a.status = "save cancelled"
+				report(then, false)
+				return
+			}
+			a.writeRemoteText(c, p, path, then)
+		})
+}
+
+// writeRemoteText creates or reuses the daemon buffer at path, replaces its
+// whole text with the pane's typed text, and saves. The open carries create so
+// the daemon claims the path for this human writer, and the version read that
+// follows satisfies the read-before-write gate; the replacement is the whole
+// buffer, so a new file and an overwritten one take the same path.
+func (a *App) writeRemoteText(c clientConn, p *editor.Pane, path string, then func(saved bool)) {
+	text := p.File.Text()
+	opened, err := c.Do(control.Request{Op: "open", Path: path, Create: true})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		report(then, false)
+		return
+	}
+	if !opened.OK {
+		a.status = opened.Err
+		report(then, false)
+		return
+	}
+	ver, err := c.Do(control.Request{Op: "version", Path: path})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		report(then, false)
+		return
+	}
+	if !ver.OK {
+		a.status = ver.Err
+		report(then, false)
+		return
+	}
+	base := opened.Version
+	res, err := c.Do(control.Request{Op: "apply", Path: path, Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: ver.Bytes, Text: text}}})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		report(then, false)
+		return
+	}
+	if !res.OK {
+		a.status = res.Err
+		report(then, false)
+		return
+	}
+	saved, err := c.Do(control.Request{Op: "save", Path: path})
+	if err != nil {
+		a.status = "attach: " + err.Error()
+		report(then, false)
+		return
+	}
+	if !saved.OK {
+		a.status = saved.Err
+		report(then, false)
+		return
+	}
+	a.adoptRemotePath(p, path, saved.Version, text)
+	a.status = "saved " + p.File.Name()
+	report(then, true)
+}
+
+// adoptRemotePath names a client pane that has just been saved to a daemon path.
+// The pane keeps the typed text; the edit tracker is rekeyed from the unnamed
+// buffer to the path at the version the save produced, so the next local edit
+// rebases on the saved text, and the path joins the owned set so the view
+// persists it.
+func (a *App) adoptRemotePath(p *editor.Pane, path string, version uint64, text string) {
+	p.File.SetPath(path)
+	a.clientMu.Lock()
+	if a.clientEdits == nil {
+		a.clientEdits = map[string]*clientEdit{}
+	}
+	delete(a.clientEdits, "")
+	a.clientEdits[path] = &clientEdit{version: version, synced: text}
+	a.clientMu.Unlock()
+	a.markClientOwned(path)
+	a.saveClientView()
+	if a.Explorer != nil && a.Explorer.Tree != nil {
+		a.Explorer.Tree.Refresh()
+	}
 }
 
 // openRemote opens a workspace path on the client by snapshot alone. The

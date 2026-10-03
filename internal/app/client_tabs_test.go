@@ -134,13 +134,20 @@ func TestClientWatchDoesNotAdoptACleanDaemonTab(t *testing.T) {
 func TestClientKeepsMirroredTabWhenDaemonDiscards(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	path := srv.Tabs.Active().File.Path
-	srv.typeText("X")
+	// Dirtied by the discarding writer's own text: close --discard may drop
+	// only the caller's own unsaved runs (D-A2).
+	c := srv.dial(t)
+	read := c.do(srv, control.Request{Op: "text"})
+	base := read.Version
+	if r := c.do(srv, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "X"}}}); !r.OK {
+		t.Fatalf("setup apply = %+v", r)
+	}
 	ch := attachClient(t, srv)
 	ch.cli.drain()
 	if got := ch.cli.Tabs.Count(); got != 1 {
 		t.Fatalf("setup: client tabs = %d, want the mirrored dirty tab", got)
 	}
-	c := srv.dial(t)
 	if r := c.do(srv, control.Request{Op: "close", Path: path, Discard: true}); !r.OK {
 		t.Fatalf("close -discard = %+v", r)
 	}

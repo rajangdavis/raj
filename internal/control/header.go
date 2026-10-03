@@ -169,7 +169,7 @@ const (
 	hEncodingJSON     = 0x60 // snapshot: the file encoding, as JSON
 	hSnapshotPath     = 0x61 // snapshot: the buffer's own path
 	hRoots            = 0x62 // a reply's whole workspace root set, primary first
-	hKind             = 0x63 // hello: the participant kind, absent meaning agent
+	hKind             = 0x63 // hello: the participant kind; a request asks to join as it (absent means agent), a reply states the kind actually granted
 	hGitMode          = 0x64 // git: status, diff, show, numstat or log
 	hGitRev           = 0x65 // git: the revision show/diff/numstat read; absent means HEAD
 	hGitCount         = 0x66 // git: the most log entries to list

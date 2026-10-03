@@ -65,7 +65,7 @@ func writeAtomic(path string, data []byte) error {
 	}
 
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".raj-*")
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}

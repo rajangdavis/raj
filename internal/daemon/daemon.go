@@ -44,6 +44,12 @@ type State struct {
 	// Roots is the workspace roots the daemon serves, stored so `daemon list`
 	// can name the workspace without guessing from the state-dir key.
 	Roots []string `json:"roots,omitempty"`
+
+	// StartToken identifies the process instance behind PID: an OS start-time
+	// token captured when the record was written. It stops a recycled pid from
+	// being signalled as the daemon that wrote the record. Zero when the OS
+	// could not answer.
+	StartToken int64 `json:"start_token,omitempty"`
 }
 
 // Paths are the daemon files for one workspace state dir. Every field is empty
@@ -172,6 +178,55 @@ func Alive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// processStartToken returns an opaque token that identifies the process
+// instance behind pid: the kernel start time for that pid, in clock ticks,
+// from /proc/<pid>/stat. Two processes that have held the same pid at
+// different times have different tokens, so a pid file whose token no longer
+// matches is stale. ok is false when the OS cannot answer (no /proc, an
+// unreadable or malformed stat line).
+func processStartToken(pid int) (int64, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+2 >= len(s) {
+		return 0, false
+	}
+	fields := strings.Fields(s[i+2:])
+	if len(fields) < 20 {
+		return 0, false
+	}
+	token, err := strconv.ParseInt(fields[19], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return token, true
+}
+
+// ownsPID reports whether pid is the process the record described: it must be
+// alive and, when both the record and the OS carry a start token, the tokens
+// must match. A record with no token (one written by an older build) falls back
+// to liveness, and an OS that cannot answer the token question cannot prove a
+// mismatch.
+func ownsPID(life func(int) bool, start func(int) (int64, bool), pid int, token int64) bool {
+	if !life(pid) {
+		return false
+	}
+	if token == 0 {
+		return true
+	}
+	got, ok := start(pid)
+	if !ok {
+		return true
+	}
+	return got == token
+}
+
 // Detached builds the command that runs a daemon in the background: the
 // re-exec argv, a new session so a terminal signal does not reach it, /dev/null
 // as stdin, and the workspace log for both output streams. It opens nothing
@@ -191,6 +246,9 @@ type Ops struct {
 	Alive  func(pid int) bool
 	Signal func(pid int, sig syscall.Signal) error
 	Spawn  func(cmd *exec.Cmd) (int, error)
+	// Start returns the OS start-time token for pid, the identity behind a
+	// recycled pid. A nil field falls back to processStartToken.
+	Start func(pid int) (int64, bool)
 }
 
 func (o Ops) life() func(int) bool {
@@ -223,6 +281,13 @@ func (o Ops) spawn() func(*exec.Cmd) (int, error) {
 		}
 		return cmd.Process.Pid, nil
 	}
+}
+
+func (o Ops) start() func(int) (int64, bool) {
+	if o.Start != nil {
+		return o.Start
+	}
+	return processStartToken
 }
 
 // Runner starts, stops and reports the daemon for a workspace root set. A test
@@ -302,7 +367,8 @@ func (r Runner) Start() (int, error) {
 		return 0, err
 	}
 	if pid, ok := ReadPID(paths.PID); ok {
-		if r.Ops.life()(pid) {
+		s, _ := ReadState(paths.State)
+		if ownsPID(r.Ops.life(), r.Ops.start(), pid, s.StartToken) {
 			return 0, fmt.Errorf("daemon: already running (pid %d)", pid)
 		}
 	}
@@ -479,7 +545,8 @@ func (r Runner) Stop() (bool, error) {
 		return false, nil
 	}
 	life := r.Ops.life()
-	if !life(pid) {
+	s, _ := ReadState(paths.State)
+	if !ownsPID(life, r.Ops.start(), pid, s.StartToken) {
 		paths.removeAll()
 		return false, nil
 	}
@@ -528,11 +595,15 @@ func (r Runner) Status() (State, bool) {
 		return State{}, false
 	}
 	pid, ok := ReadPID(paths.PID)
-	if !ok || !r.Ops.life()(pid) {
+	if !ok {
 		paths.removeAll()
 		return State{}, false
 	}
 	s, _ := ReadState(paths.State)
+	if !ownsPID(r.Ops.life(), r.Ops.start(), pid, s.StartToken) {
+		paths.removeAll()
+		return State{}, false
+	}
 	s.PID = pid
 	return s, true
 }
@@ -547,6 +618,11 @@ func Record(roots []string, s State) error {
 	}
 	if len(roots) > 0 {
 		s.Roots = append([]string(nil), roots...)
+	}
+	if s.StartToken == 0 {
+		if token, ok := processStartToken(s.PID); ok {
+			s.StartToken = token
+		}
 	}
 	if err := WritePID(paths.PID, s.PID); err != nil {
 		return err
@@ -625,6 +701,7 @@ func listDir(dir string, ops Ops) ([]Entry, error) {
 		return nil, err
 	}
 	life := ops.life()
+	start := ops.start()
 	var out []Entry
 	for _, de := range entries {
 		if !de.IsDir() {
@@ -636,7 +713,7 @@ func listDir(dir string, ops Ops) ([]Entry, error) {
 		if !ok {
 			continue
 		}
-		if s.PID <= 0 || !life(s.PID) {
+		if s.PID <= 0 || !ownsPID(life, start, s.PID, s.StartToken) {
 			os.Remove(statePath)
 			os.Remove(filepath.Join(keyDir, "daemon.pid"))
 			continue

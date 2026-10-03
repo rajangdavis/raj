@@ -2638,3 +2638,34 @@ tree at the place named. Each entry was an open item in `docs/TODO.md`.
   (`internal/app/client_tabs_test.go:158`), the test the 2026-10-01 CI note
   already runs. Closes `docs/dev/WAVE-PLAN.md` 6.1. The watch cycle's own
   code was not re-read line by line.
+
+## A9 security waves (2026-10-03)
+
+Three implementation waves from the read-only A9 audits, verified by the host
+`raj hook run check` on the projected tree (exit 0, every package `ok`).
+
+- [x] **A9 codec — a crafted snapshot no longer panics.** Addition-free bounds
+  in `checkRecs` (`internal/piecetable/snapshot.go`) and `Store.Slice`
+  (`internal/piecetable/store.go`); `buildSession` validates `Pos` and every
+  persisted `Del`/`Ins` piece before replay (`internal/app/journal.go`,
+  `checkJournalRecs`/`journalPieceFits`); `Restore` refuses a `NextGroup` below
+  the snapshot's highest group; `migrate` refuses a negative schema version and
+  `applyMigration` bounds its index (`internal/store/store.go`). Pinned by
+  `TestSnapshotRefusesCraftedInsert`, `TestStoreSliceRefusesOverflowingSpan`,
+  `TestSnapshotRefusesGroupReuse`,
+  `TestBuildSessionRefusesOverflowingJournalPiece`,
+  `TestNegativeSchemaVersionIsRefused`.
+- [x] **A9 waker — peer content cannot forge the user marker.**
+  `plugins/raj-mail.ts` (and `plugins/v2/raj-mail.ts`) escape `&` first then
+  `<>"`, wrap peers with the literal `from="peer"`, grammar-gate `from_key`,
+  and escape the editor branch while the `from === 1` user branch stays raw;
+  `usedKey` tokenises with `shellWords` (quote/escape aware) and `learn`
+  refuses to switch a session key on a later `--as`. A 30-assertion Node
+  harness of the extracted source passed on both copies in review.
+- [x] **Client — Edit default and daemon-side unnamed save-as.**
+  `internal/app/client.go` starts an attached client in `ModeEdit` and adds
+  `saveAsRemote`/`writeRemoteAs`/`writeRemoteText`/`adoptRemotePath`;
+  `saveNow` routes an empty path on attach to `saveAsRemote`. Pinned by
+  `TestAttachedClientEditsOutsideReview`, `TestClientRefusesTypingInReview`,
+  `TestAttachedUnnamedSaveAsWritesDaemonFile`,
+  `TestLocalUnnamedSaveStillPromptsForAPath`.

@@ -26,8 +26,8 @@ type harness struct {
 
 // TestMain points XDG_STATE_HOME at a temp dir for the whole package, so the
 // tests that open a workspace store write their state there instead of into
-// the user's real state home. The editor's state lives outside .raj now, so a
-// test root no longer contains it, and this is what keeps the suite hermetic.
+// the user's real state home. A test root holds no editor state, and this is
+// what keeps the suite hermetic.
 func TestMain(m *testing.M) {
 	state, err := os.MkdirTemp("", "raj-test-state-")
 	if err != nil {

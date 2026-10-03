@@ -137,6 +137,35 @@ func Restore(snap Snapshot) (*Session, error) {
 		}
 	}
 
+	// The snapshot carries the session's next group id. A crafted value below
+	// the highest id already in the journal (or in a decision, task or compacted
+	// origin) would make the next edit join an existing change set, so refuse it
+	// rather than overwrite the counter replayed from the ops. Equality is safe:
+	// new commits increment before use, so the next id is one past this value.
+	var maxGroup uint64
+	for _, o := range snap.Journal {
+		if o.Group > maxGroup {
+			maxGroup = o.Group
+		}
+	}
+	for g := range snap.GroupState {
+		if g > maxGroup {
+			maxGroup = g
+		}
+	}
+	for g := range snap.GroupTask {
+		if g > maxGroup {
+			maxGroup = g
+		}
+	}
+	for _, c := range snap.Compacted {
+		if c.Group > maxGroup {
+			maxGroup = c.Group
+		}
+	}
+	if snap.NextGroup < maxGroup {
+		return nil, fmt.Errorf("piecetable: snapshot next group %d is below journal group %d", snap.NextGroup, maxGroup)
+	}
 	texts := make([][]byte, len(snap.Store))
 	for i, t := range snap.Store {
 		texts[i] = append([]byte(nil), t...)
@@ -187,7 +216,10 @@ func checkRecs(recs []PieceRec, store [][]byte) error {
 		if r.Buf < 0 || r.Buf >= len(store) {
 			return fmt.Errorf("buffer %d is outside the store", r.Buf)
 		}
-		if r.Start < 0 || r.Length < 0 || r.Start+r.Length > len(store[r.Buf]) {
+		// The bound is addition-free: start+length wraps negative for a start
+		// near MaxInt and slips past a signed guard. A negative length would
+		// slice with high < low, so it is refused too.
+		if r.Start < 0 || r.Length < 0 || r.Start > len(store[r.Buf]) || r.Length > len(store[r.Buf])-r.Start {
 			return fmt.Errorf("span %d..%d is outside buffer %d", r.Start, r.Start+r.Length, r.Buf)
 		}
 	}

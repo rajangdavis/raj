@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,7 +21,11 @@ type scriptedConn struct {
 	snaps   map[string]control.Response
 	// roots is the workspace root set this scripted daemon reports, so a test
 	// can drive the attach adoption path without a real server.
-	roots  []string
+	roots []string
+	// kind is the participant kind this scripted daemon grants on hello, so a
+	// test can drive the attach mode selection without a real transport. Empty
+	// stands for an older daemon that grants nothing.
+	kind   control.Kind
 	done   chan struct{}
 	closed atomic.Bool
 }
@@ -31,6 +36,8 @@ func newScriptedConn(gen uint64, buffers []control.Buffer, snaps map[string]cont
 
 func (s *scriptedConn) Do(req control.Request) (control.Response, error) {
 	switch req.Op {
+	case "hello":
+		return control.Response{OK: true, Kind: string(s.kind)}, nil
 	case "buffers":
 		return control.Response{OK: true, Gen: s.gen, Buffers: s.buffers}, nil
 	case "snapshot":
@@ -49,6 +56,8 @@ func (s *scriptedConn) Do(req control.Request) (control.Response, error) {
 func (s *scriptedConn) ResolveRoots(string) (control.Mapper, error) { return control.Mapper{}, nil }
 
 func (s *scriptedConn) Roots() []string { return s.roots }
+
+func (s *scriptedConn) Kind() control.Kind { return s.kind }
 
 func (s *scriptedConn) Close() error {
 	if s.closed.CompareAndSwap(false, true) {
@@ -261,5 +270,127 @@ func TestClientReconnectAdoptsChangedRoots(t *testing.T) {
 	h.drain()
 	if got := (host{a}).Roots(); !sameStrings(got, []string{rootB, rootC}) {
 		t.Errorf("host roots = %q, want the reconnected daemon's %q", got, []string{rootB, rootC})
+	}
+}
+
+// attachScripted starts an attached app against a scripted connection, so a
+// test can drive the attach mode selection without a real daemon or transport.
+// The fake's kind is the grant the app reads, standing in for a Unix or TCP
+// hello the in-process harness cannot tell apart here.
+func attachScripted(t *testing.T, conn *scriptedConn) *harness {
+	t.Helper()
+	setClientDial(t, func(string) (clientConn, error) { return conn, nil })
+	host := ui.NewFakeHost(120, 30)
+	t.Cleanup(func() { host.Close() })
+	a := NewWithOptions(host, t.TempDir(), Options{Attach: true, AttachAddr: "scripted"})
+	t.Cleanup(a.CloseClient)
+	a.StartClient()
+	return &harness{App: a, host: host}
+}
+
+// scriptedSnapshot builds the one snapshot a scripted daemon serves, so a mode
+// test has a tab to type into without a real buffer on disk.
+func scriptedSnapshot(t *testing.T, text string) control.Response {
+	t.Helper()
+	sess := piecetable.NewSession(piecetable.NewDoc(text, 0))
+	snap, err := sess.SnapshotState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := snap.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return control.Response{OK: true, Version: 1, SnapshotJSON: string(encoded)}
+}
+
+// attachStartMode is the whole decision: only a kind the daemon positively
+// granted as non-human starts read-only. An unknown kind -- an older daemon
+// that sends none, or a name this build does not know -- fails open to Edit,
+// which is what keeps a missing field from locking a local client out.
+func TestAttachStartMode(t *testing.T) {
+	cases := []struct {
+		name  string
+		kind  control.Kind
+		mode  Mode
+		agent bool
+	}{
+		{"human grant", control.KindHuman, ModeEdit, false},
+		{"agent grant", control.KindAgent, ModeReview, true},
+		{"unknown kind name", control.Kind("robot"), ModeEdit, false},
+		{"no kind from an older daemon", "", ModeEdit, false},
+	}
+	for _, c := range cases {
+		mode, agent := attachStartMode(c.kind)
+		if mode != c.mode || agent != c.agent {
+			t.Errorf("%s: attachStartMode(%q) = (%v, %v), want (%v, %v)",
+				c.name, c.kind, mode, agent, c.mode, c.agent)
+		}
+	}
+}
+
+// A non-human grant -- the TCP client's downgraded kind -- starts in Review,
+// the client's read-only gate, with a status that names it, and refuses typing.
+// The scripted connection stands in for the TCP transport the in-process
+// harness cannot fake: what the app does is a function of the granted kind, and
+// the granted kind is what is scripted.
+func TestAttachedAgentClientStartsReadOnly(t *testing.T) {
+	const path = "/w/a.go"
+	conn := newScriptedConn(1,
+		[]control.Buffer{{Path: path, Version: 1, Dirty: true}},
+		map[string]control.Response{path: scriptedSnapshot(t, "package a\n")})
+	conn.kind = control.KindAgent
+	h := attachScripted(t, conn)
+
+	if h.mode != ModeReview {
+		t.Fatalf("mode = %v, want Review for an agent grant", h.mode)
+	}
+	if !h.attachedAsAgent {
+		t.Error("an agent grant was not recorded on the app")
+	}
+	if !strings.Contains(h.status, "attached as an agent") {
+		t.Errorf("status = %q, want the agent attach note", h.status)
+	}
+	p := h.Tabs.Active()
+	if p == nil {
+		t.Fatal("the scripted agent attach showed no tab")
+	}
+	h.focusEditor()
+	before := p.File.Text()
+	h.typeText("x")
+	if p.File.Text() != before {
+		t.Errorf("Review accepted an edit from an agent client: %q", p.File.Text())
+	}
+
+	// Leaving the read-only gate is allowed, but the status must still say the
+	// edits arrive as proposals rather than as this client's own text.
+	h.toggleReview()
+	if h.mode != ModeEdit {
+		t.Fatalf("mode = %v after leaving Review, want Edit", h.mode)
+	}
+	if !strings.Contains(h.status, "edits land as proposals") {
+		t.Errorf("status after leaving Review = %q, want the proposals note", h.status)
+	}
+}
+
+// An unknown granted kind -- the empty kind an older daemon's hello reply
+// carries -- must keep today's editable behaviour rather than going read-only
+// on a guess, so a message this build cannot read can never silently lock a
+// local client out of editing.
+func TestAttachUnknownKindFailsOpenToEdit(t *testing.T) {
+	const path = "/w/a.go"
+	conn := newScriptedConn(1,
+		[]control.Buffer{{Path: path, Version: 1, Dirty: true}},
+		map[string]control.Response{path: scriptedSnapshot(t, "package a\n")})
+	h := attachScripted(t, conn)
+
+	if h.mode != ModeEdit {
+		t.Fatalf("mode = %v, want Edit for an unknown grant", h.mode)
+	}
+	if h.attachedAsAgent {
+		t.Error("an unknown grant was flagged as an agent")
+	}
+	if strings.Contains(h.status, "attached as an agent") {
+		t.Errorf("an unknown grant shows the agent note: %q", h.status)
 	}
 }

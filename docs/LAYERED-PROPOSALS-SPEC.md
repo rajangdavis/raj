@@ -451,9 +451,10 @@ Resolved 2026-09-12 (supersedes 2, 4 and 6; retires the promote rule):
 
 Still open:
 
-- **Store path and forkability.** The state dir is `.raj/`, always, repository
-  or not. Forkability of the store is still open, as is how the journal might
-  be exported; SQLite remains deferred behind the record interface.
+- **Store path and forkability.** The state dir is the XDG state directory,
+  keyed by the root set, always — repository or not. Forkability of the store is
+  still open, as is how the journal might be exported; SQLite remains deferred
+  behind the record interface.
 
 ## 13. Alternatives considered
 

@@ -891,3 +891,41 @@ func TestResponseCarriesMatchContext(t *testing.T) {
 		t.Errorf("match = %+v, want %+v", got.Matches[0], want[0])
 	}
 }
+
+// Kind rides the header on the hello reply, so the one thing that can go wrong
+// is EncodeResponse or DecodeResponse dropping it -- which compiles and
+// silently leaves an attach client unable to tell a local human grant from a
+// downgraded agent one. It is sparse: a reply that grants no kind, or a server
+// that does not know the field, decodes to the empty kind, which a client
+// reads as unknown and fails open.
+func TestResponseCarriesGrantedKind(t *testing.T) {
+	h, body := EncodeResponse(Response{ID: 9, OK: true, Final: true, Kind: string(KindHuman)})
+	got, err := DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != string(KindHuman) {
+		t.Errorf("kind = %q, want %q", got.Kind, string(KindHuman))
+	}
+
+	// An agent grant crosses the same way.
+	h, body = EncodeResponse(Response{ID: 9, OK: true, Final: true, Kind: string(KindAgent)})
+	got, err = DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != string(KindAgent) {
+		t.Errorf("kind = %q, want %q", got.Kind, string(KindAgent))
+	}
+
+	// Sparse: a reply that grants no kind decodes to the empty, unknown kind,
+	// which is the fail-open case a client keeps its existing behaviour for.
+	h, body = EncodeResponse(Response{ID: 9, OK: true, Final: true})
+	got, err = DecodeResponse(Frame{Header: h, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "" {
+		t.Errorf("kind = %q, want empty", got.Kind)
+	}
+}

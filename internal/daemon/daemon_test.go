@@ -1032,6 +1032,87 @@ func TestStopSucceedsWhenRecordClearedDespiteLife(t *testing.T) {
 	}
 }
 
+// A pidfile whose process is alive but is not the daemon that wrote the record
+// (a recycled pid) must not be signalled: the record start token no longer
+// matches the live process, so the stale files are cleaned and stop is a
+// no-op.
+func TestStopDoesNotSignalAReusedPid(t *testing.T) {
+	root := stateRoot(t)
+	paths := ForRoot(root)
+	if err := WritePID(paths.PID, 31337); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteState(paths.State, State{PID: 31337, StartToken: 111}); err != nil {
+		t.Fatal(err)
+	}
+	signalled := false
+	r := Runner{Roots: []string{root}, Ops: Ops{
+		Alive:  func(int) bool { return true },
+		Start:  func(int) (int64, bool) { return 222, true },
+		Signal: func(int, syscall.Signal) error { signalled = true; return nil },
+	}}
+	stopped, err := r.Stop()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped {
+		t.Error("Stop reported a stop for a recycled pid")
+	}
+	if signalled {
+		t.Error("Stop signalled a pid that is not the recorded process")
+	}
+	for _, f := range []string{paths.PID, paths.State} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("stale %s was not removed", f)
+		}
+	}
+}
+
+// status reads a record whose process is alive but is not the daemon that wrote
+// it as stopped: the start token mismatch proves the pid was recycled.
+func TestStatusDoesNotReportAReusedPid(t *testing.T) {
+	root := stateRoot(t)
+	paths := ForRoot(root)
+	if err := WritePID(paths.PID, 606); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteState(paths.State, State{PID: 606, StartToken: 111}); err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{Roots: []string{root}, Ops: Ops{
+		Alive: func(int) bool { return true },
+		Start: func(int) (int64, bool) { return 222, true },
+	}}
+	if _, running := r.Status(); running {
+		t.Fatal("a recycled pid read as the running daemon")
+	}
+	if _, err := os.Stat(paths.PID); !os.IsNotExist(err) {
+		t.Error("stale pidfile was not removed")
+	}
+}
+
+// list drops a record whose live pid is not the process that wrote it, so a
+// recycled pid never appears as a running daemon.
+func TestListDirSkipsReusedPid(t *testing.T) {
+	dir := t.TempDir()
+	keyDir := writeDaemon(t, dir, "raj-recycled-abcd", State{PID: 4242, StartToken: 111}, true)
+	entries, err := listDir(dir, Ops{
+		Alive: func(int) bool { return true },
+		Start: func(int) (int64, bool) { return 222, true },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("entries = %+v, want none", entries)
+	}
+	for _, name := range []string{"daemon.json", "daemon.pid"} {
+		if _, err := os.Stat(filepath.Join(keyDir, name)); !os.IsNotExist(err) {
+			t.Errorf("stale %s was not removed", name)
+		}
+	}
+}
+
 // Restart refuses to start a second daemon when the old one will not stop: the
 // Stop error is returned and Spawn must not run, so a wedged daemon cannot be
 // silently replaced.

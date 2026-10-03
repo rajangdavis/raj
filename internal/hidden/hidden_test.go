@@ -3,7 +3,6 @@ package hidden
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -27,13 +26,6 @@ func TestDefaults(t *testing.T) {
 		// never asks, having skipped .git whole; a caller holding a path asks
 		// per component, and the ".git" component above answers.
 		{".git/config", false, false},
-		// .raj is hidden whole now: the workspace configuration it used to
-		// hold lives in XDG, so nothing inside it is repository content. An
-		// entry under it is judged as one entry and does not match the .raj
-		// rule; a walk never asks, having skipped .raj.
-		{".raj", true, true},
-		{".raj/logs", true, false},
-		{".raj/hidden", false, false},
 		{"node_modules", true, true},
 		{"vendor", true, true},
 		{".DS_Store", false, true},
@@ -53,42 +45,6 @@ func TestDefaults(t *testing.T) {
 		if got := r.Hidden(c.path, c.dir); got != c.want {
 			t.Errorf("Hidden(%q, dir=%v) = %v, want %v", c.path, c.dir, got, c.want)
 		}
-	}
-}
-
-// .raj is the editor's scratch, and the workspace configuration that used to
-// live at .raj/hidden now lives outside the project, so the whole directory is
-// hidden. Nothing un-hides .raj/hidden: the legacy path is not special-cased.
-func TestRajesOwnStateIsHidden(t *testing.T) {
-	isolate(t)
-	r := Default()
-	if !r.Hidden(".raj", true) {
-		t.Fatal(".raj is not hidden")
-	}
-	for _, p := range r.Patterns() {
-		if strings.HasPrefix(p, "!") && strings.Contains(p, ".raj") {
-			t.Errorf("default un-hides %q; .raj must be hidden whole", p)
-		}
-	}
-	// Hidden judges one entry at a time, so a path into the directory is
-	// reached only by asking about each component in turn — which is what
-	// search's eligible does for a buffer the walk never visited. One of them
-	// has to answer, or the path is not hidden at all.
-	under := []string{".raj", "hidden"}
-	hidden := false
-	for i := range under {
-		if r.Hidden(strings.Join(under[:i+1], "/"), i < len(under)-1) {
-			hidden = true
-			break
-		}
-	}
-	if !hidden {
-		t.Error("a file under .raj never met a hidden component")
-	}
-	// Adding a rule extends the defaults; it does not replace them.
-	if !r.Hidden(".git", true) || !r.Hidden("node_modules", true) ||
-		r.Hidden(".github", true) || r.Hidden(".gitlab-ci.yml", false) {
-		t.Error("the other defaults changed")
 	}
 }
 
@@ -172,9 +128,6 @@ func TestLoadReadsWorkspaceFile(t *testing.T) {
 	}
 	if !r.Hidden(".git", true) {
 		t.Error("defaults were replaced rather than extended")
-	}
-	if !r.Hidden(".raj", true) {
-		t.Error("the .raj default went missing")
 	}
 	if len(r.Sources) != 1 {
 		t.Errorf("Sources = %v, want the one workspace file", r.Sources)
@@ -271,7 +224,6 @@ func TestEverythingHidesNothing(t *testing.T) {
 		{".git", true},
 		{"node_modules", true},
 		{"vendor", true},
-		{".raj/trash", true},
 		{"a.log", false},
 	} {
 		if r.Hidden(c.path, c.dir) {

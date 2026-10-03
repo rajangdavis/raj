@@ -30,7 +30,6 @@ package session
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,7 +59,7 @@ type Tab struct {
 
 // State is a whole workspace's remembered position.
 type State struct {
-	// Version guards against a format change. A file from a different version
+	// Version guards against a format change. A blob from a different version
 	// is ignored rather than migrated: this is view state, and the cost of
 	// starting fresh is one scroll.
 	Version  int      `json:"version"`
@@ -82,8 +81,7 @@ const Version = 1
 // StateDir is the workspace's state directory in the XDG state home:
 // $XDG_STATE_HOME/raj/workspaces/<key>. The session database, the op logs and
 // the trash live here, outside the workspace, so a checkout stays clean and
-// state survives a read-only or bare workspace. `.raj` is only the legacy
-// location an older build wrote; the one-shot migrations read it and move on.
+// state survives a read-only or bare workspace.
 //
 // The key is a readable slug of the root's base name plus a short digest of
 // the absolute cleaned root, so two workspaces with the same name do not share
@@ -149,86 +147,6 @@ func stateHome() string {
 	return filepath.Join(home, ".local", "state")
 }
 
-// Dir is the workspace's legacy state directory: always .raj, whether or not
-// the workspace is a repository. State and the workspace config live outside
-// the workspace now, so .raj is read only by the one-shot migrations that
-// move what an older build left here.
-//
-// There is no migration from the old .git/raj: a workspace that has one starts
-// fresh under .raj, and the old directory is left untouched.
-func Dir(root string) string {
-	if root == "" {
-		return ""
-	}
-	return filepath.Join(root, ".raj")
-}
-
-// File is where a legacy workspace's session lives, relative to its root. It
-// is read only to adopt a session.json written before the store existed, and
-// removed once that session has been written to the store. Nothing writes it.
-func File(root string) string {
-	dir := Dir(root)
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "session.json")
-}
-
-// Save writes the state. Temp file plus rename, so an interrupted write leaves
-// the previous session rather than a truncated file that fails to parse.
-func Save(root string, st State) error {
-	path := File(root)
-	if path == "" {
-		return errors.New("session: no workspace root")
-	}
-	data, err := Encode(st)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// Load reads the state and validates it against the filesystem. A missing,
-// unreadable, malformed or wrong-version file is an empty state and no error:
-// there is nothing a caller could usefully do differently, and failing to start
-// because a scratch file is corrupt would be absurd.
-func Load(root string) State {
-	return LoadForRoots([]string{root})
-}
-
-// LoadForRoots is Load for a workspace root set. The legacy session file still
-// lives at the primary root (the first of the set), exactly where it always
-// did, but every path it carries is validated against every root rather than
-// against the primary alone.
-func LoadForRoots(roots []string) State {
-	path := File(firstRoot(roots))
-	if path == "" {
-		return State{}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return State{}
-	}
-	return DecodeForRoots(data, roots)
-}
-
-// firstRoot is the primary of a set: the root the workspace was opened on, or
-// "" when the set is empty. It mirrors workspace.Roots.Primary without
-// depending on the type, because session takes the roots as plain strings.
-func firstRoot(roots []string) string {
-	if len(roots) == 0 {
-		return ""
-	}
-	return roots[0]
-}
-
 // containsAny reports whether path is equal to or inside any root, with the
 // same component-wise rule workspace.Roots.Contains applies. It is stated here
 // rather than calling that method because session takes plain strings and does
@@ -252,10 +170,10 @@ func containsAny(roots []string, path string) bool {
 }
 
 // Decode parses a state blob and validates it against root. It is the read
-// half of the codec, shared by Load and the store: a blob from the database is
-// the same JSON as the file, so it gets the same version check and the same
-// clamp-and-drop validation. A malformed or wrong-version blob is an empty
-// state, never an error.
+// half of the codec shared with the store and the single-root caller: a blob
+// from the database gets the same version check and the same clamp-and-drop
+// validation. A malformed or wrong-version blob is an empty state, never an
+// error.
 func Decode(data []byte, root string) State {
 	return DecodeForRoots(data, []string{root})
 }
@@ -271,10 +189,8 @@ func DecodeForRoots(data []byte, roots []string) State {
 	return st.validate(roots)
 }
 
-// Encode renders a state as the JSON blob stored on disk and in the store. It
+// Encode renders a state as the JSON blob stored in the workspace database. It
 // stamps the current version so a caller cannot persist a state without one.
-// The bytes are the JSON the file form has always carried: the store is a
-// different place, not a different format.
 func Encode(st State) ([]byte, error) {
 	st.Version = Version
 	return json.MarshalIndent(st, "", "  ")
@@ -288,7 +204,7 @@ func (st State) validate(roots []string) State {
 		if t.Path == "" || !filepath.IsAbs(t.Path) || seen[t.Path] {
 			continue
 		}
-		// Within the workspace: a session file is on disk and editable, so a
+		// Within the workspace: a session blob is on disk and editable, so a
 		// path in it is untrusted input like any other. A path matching no
 		// root is dropped, because a session is a hint.
 		if !containsAny(roots, t.Path) {

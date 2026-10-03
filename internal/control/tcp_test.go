@@ -1,6 +1,7 @@
 package control
 
 import (
+	"errors"
 	"math"
 	"net"
 	"os"
@@ -676,6 +677,12 @@ func TestHelloOverTCPDowngradesAHuman(t *testing.T) {
 	if id := human.Author(); id == 0 || !ed.srv.Participants.IsAgent(id) {
 		t.Errorf("a human request over TCP bound author %d, want an agent", id)
 	}
+	if res.Kind != string(KindAgent) {
+		t.Errorf("a human request over TCP was granted kind %q, want %q", res.Kind, KindAgent)
+	}
+	if got := human.Kind(); got != KindAgent {
+		t.Errorf("client kind after a TCP human hello = %q, want %q", got, KindAgent)
+	}
 
 	agent, err := Dial(ed.srv.Path())
 	if err != nil {
@@ -688,6 +695,12 @@ func TestHelloOverTCPDowngradesAHuman(t *testing.T) {
 	}
 	if id := agent.Author(); !ed.srv.Participants.IsAgent(id) {
 		t.Errorf("absent kind bound author %d, which does not read as an agent", id)
+	}
+	if res.Kind != string(KindAgent) {
+		t.Errorf("an agent hello was granted kind %q, want %q", res.Kind, KindAgent)
+	}
+	if got := agent.Kind(); got != KindAgent {
+		t.Errorf("client kind after an agent hello = %q, want %q", got, KindAgent)
 	}
 }
 
@@ -713,6 +726,12 @@ func TestHelloOverTheSocketDeclaresAHuman(t *testing.T) {
 	}
 	if id := human.Author(); id == 0 || ed.srv.Participants.IsAgent(id) {
 		t.Errorf("human hello over the socket bound author %d, which reads as an agent", id)
+	}
+	if res.Kind != string(KindHuman) {
+		t.Errorf("a human hello over the socket was granted kind %q, want %q", res.Kind, KindHuman)
+	}
+	if got := human.Kind(); got != KindHuman {
+		t.Errorf("client kind after a socket human hello = %q, want %q", got, KindHuman)
 	}
 }
 
@@ -1666,5 +1685,225 @@ func TestHelloOverTCPCannotJoinAHumanRow(t *testing.T) {
 	}
 	if p, ok := ed.srv.Participants.Get(humanID); !ok || ed.srv.Participants.IsAgent(humanID) || !p.Connected {
 		t.Fatalf("the human row = %+v ok=%v, want a connected human", p, ok)
+	}
+}
+
+// A crafted frame must not take other connections down with it. The overflow
+// test above proves the server and the offending connection carry on; this pins
+// the isolation the per-connection recover exists for: a connection already in
+// conversation and one opened afterwards both keep serving. Before the fix the
+// panic ran on the reading goroutine with no recover, so it killed the whole
+// process and every connection died with it.
+func TestCraftedFrameLeavesOtherConnectionsServing(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, addr := ParseAddr(ed.srv.Path())
+	t.Setenv(TokenEnv, ed.srv.Token())
+
+	// A bystander bound and used before the crafted frame arrives.
+	bystander, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bystander.Close()
+	if res, err := bystander.Do(Request{Op: "ping"}); err != nil || !res.OK {
+		t.Fatalf("bystander ping before the crafted frame: %v %+v", err, res)
+	}
+
+	bad, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Close()
+	// The same crafted frame as TestServerSurvivesAnOverflowingHunkLength: the
+	// second hunk length makes off+n wrap in the unfixed Split, so the bounds
+	// test passed and the slice below panicked on the reading goroutine.
+	header := Header{ID: 7, Op: "apply", Hunks: []HunkMeta{
+		{Start: 0, End: 0, Len: 2},
+		{Start: 0, End: 0, Len: math.MaxInt64 - 1},
+	}}
+	if err := WriteFrame(bad, header, []byte{0, 0}); err != nil {
+		t.Fatalf("writing the crafted frame: %v", err)
+	}
+	f, err := ReadFrame(bad)
+	if err != nil {
+		t.Fatalf("the server did not answer the crafted frame: %v", err)
+	}
+	res, err := DecodeResponse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ID != 7 || res.Err == "" {
+		t.Fatalf("answer to the crafted frame = %+v, want an error for id 7", res)
+	}
+
+	// The connection that was already open is untouched by the other one's bad
+	// frame; the server is still accepting, so a client that connects now is
+	// served too.
+	if res, err := bystander.Do(Request{Op: "ping"}); err != nil || !res.OK {
+		t.Fatalf("bystander ping after the crafted frame: %v %+v", err, res)
+	}
+	fresh, err := Dial(ed.srv.Path())
+	if err != nil {
+		t.Fatalf("the server stopped accepting after the crafted frame: %v", err)
+	}
+	defer fresh.Close()
+	if res, err := fresh.Do(Request{Op: "ping"}); err != nil || !res.OK {
+		t.Fatalf("fresh connection ping after the crafted frame: %v %+v", err, res)
+	}
+}
+
+// failWriteListener hands the server a real TCP connection whose writes fail at
+// once. A real socket can absorb every frame of a small response before it
+// notices the peer is gone, so the writer's first failure has to be injected to
+// be deterministic; the read path and the request are still the shipped ones.
+type failWriteListener struct{ net.Listener }
+
+func (l failWriteListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return failWriteConn{Conn: c}, nil
+}
+
+type failWriteConn struct{ net.Conn }
+
+var errTestWriteFailed = errors.New("test: write failed")
+
+func (c failWriteConn) Write([]byte) (int, error) { return 0, errTestWriteFailed }
+
+// A connection whose socket has failed must not wedge its handler. The writer
+// used to return on the first WriteFrame error, so a handler still emitting
+// frames blocked on the out channel, wg.Wait never returned, and the connection
+// never released its author id. With the writer draining past the failure, the
+// handler finishes and the id comes back.
+func TestAFailedWriterKeepsDraining(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped := failWriteListener{Listener: ln}
+	ed.srv.lns = append(ed.srv.lns, wrapped)
+	go ed.srv.accept(wrapped, "tcp")
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+
+	// A program of pings: one frame each, well past the writer's 64-frame
+	// buffer, so a writer that stops draining leaves the program blocked in
+	// send. The connection is authenticated but not bound, so its id is a
+	// reservation with no row; only teardown frees it.
+	ops := make([]prog.Op, 200)
+	for i := range ops {
+		ops[i] = prog.Op{Code: prog.OpPing}
+	}
+	h, body := EncodeRequest(Request{Op: "prog", Program: prog.Encode(ops), Token: ed.srv.Token()})
+	if err := WriteFrame(raw, h, body); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until the whole program has run. Only a writer that keeps draining
+	// past the failed socket lets all 200 replies out; one that returned on the
+	// first write error leaves the program blocked on the 64-frame out channel,
+	// so this wait times out with the handler wedged in send.
+	completed := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		ed.mu.Lock()
+		n := len(ed.authors)
+		ed.mu.Unlock()
+		if n >= 200 {
+			completed = true
+			break
+		}
+	}
+	if !completed {
+		ed.mu.Lock()
+		n := len(ed.authors)
+		ed.mu.Unlock()
+		t.Fatalf("the program stalled after %d of 200 pings: a writer that stops draining on a failed socket wedges the handler in send", n)
+	}
+
+	// A completed program means the handler returned; teardown must then free
+	// the provisional id.
+	raw.Close()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		id, rerr := ed.srv.Participants.Reserve()
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		ed.srv.Participants.Release(id)
+		if id == FirstAgent {
+			return
+		}
+	}
+	t.Fatal("a connection whose writer failed did not tear down: its author id is still reserved after the peer left; a handler is wedged in send")
+}
+
+// An unauthenticated connection must not consume an author id. serve used to
+// reserve one at accept, so an idle TCP peer — one that connects and never
+// sends a frame — held a byte of the one-byte space until it disconnected; a
+// few hundred of them refuse every real writer. The reservation now waits for
+// the token check, so the first free id is still FirstAgent afterward.
+func TestAnIdleUnauthenticatedConnectionDoesNotBurnAnAuthorID(t *testing.T) {
+	ed := newTCPEditor(t, map[string]string{"/w/a.go": "x\n"})
+	_, addr := ParseAddr(ed.srv.Path())
+
+	idle, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	// The server accepts on its own goroutine; give it a moment to take the
+	// idle connection before probing, so the test is about the reservation and
+	// not about accept ordering.
+	time.Sleep(200 * time.Millisecond)
+
+	id, err := ed.srv.Participants.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ed.srv.Participants.Release(id)
+	if id != FirstAgent {
+		t.Fatalf("an idle unauthenticated connection reserved author id %d: an attacker can burn the one-byte space without the token", id)
+	}
+}
+
+// A request the caller was told had timed out must not run later. submit used
+// to answer the timeout and leave the request parked, so the event thread took
+// and executed it afterwards — an apply reported as failed would still land.
+// This server has no event thread, so the request is still parked when the
+// deadline passes; the test then plays the event thread and shows Take hands
+// nothing back.
+func TestATimedOutRequestDoesNotRunLater(t *testing.T) {
+	srv, err := ListenAll([]string{"tcp://127.0.0.1:0"}, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.mu.Lock()
+	srv.replyTimeout = 100 * time.Millisecond
+	srv.mu.Unlock()
+	t.Setenv(TokenEnv, srv.Token())
+
+	c, err := Dial(srv.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Do(Request{Op: "ping"})
+	if err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	if !strings.Contains(res.Err, "timed out waiting for the editor") {
+		t.Fatalf("reply = %+v, want the reply timeout", res)
+	}
+	// The event thread's only chance to run it is Take; it must not be there.
+	if took := srv.Take(); len(took) != 0 {
+		t.Fatalf("the timed-out request is still parked and would execute later: %+v", took[0].Req)
 	}
 }

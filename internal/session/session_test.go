@@ -18,7 +18,9 @@ func workspace(t *testing.T, files ...string) string {
 	return root
 }
 
-func TestRoundTrip(t *testing.T) {
+// Encode/Decode is the codec the store uses, so the round trip is the same
+// JSON the legacy file carried, minus the file.
+func TestEncodeDecodeRoundTrip(t *testing.T) {
 	root := workspace(t, "a.go", "sub/b.go")
 	want := State{
 		Tabs: []Tab{
@@ -29,32 +31,16 @@ func TestRoundTrip(t *testing.T) {
 		Expanded: []string{filepath.Join(root, "sub")},
 		Focus:    "sidebar",
 	}
-	if err := Save(root, want); err != nil {
+	blob, err := Encode(want)
+	if err != nil {
 		t.Fatal(err)
 	}
-	got := Load(root)
+	got := Decode(blob, root)
 	if len(got.Tabs) != 2 || got.Tabs[0] != want.Tabs[0] || got.Tabs[1] != want.Tabs[1] {
 		t.Errorf("tabs = %+v", got.Tabs)
 	}
 	if got.Active != 1 || got.Focus != "sidebar" || len(got.Expanded) != 1 {
 		t.Errorf("got %+v", got)
-	}
-}
-
-// The state dir is .raj even in a repository: whether the workspace is a
-// checkout does not change where the editor keeps its scratch state.
-func TestFileLocation(t *testing.T) {
-	root := t.TempDir()
-	if got := File(root); !strings.HasSuffix(got, filepath.Join(".raj", "session.json")) {
-		t.Errorf("without .git: %s", got)
-	}
-	os.MkdirAll(filepath.Join(root, ".git"), 0o755)
-	if got := File(root); !strings.HasSuffix(got, filepath.Join(".raj", "session.json")) ||
-		strings.Contains(got, filepath.Join(".git", "raj")) {
-		t.Errorf("with .git: %s", got)
-	}
-	if File("") != "" {
-		t.Error("no root should mean no file")
 	}
 }
 
@@ -152,12 +138,9 @@ func TestStateDirForRootsKeyedByTheWholeSet(t *testing.T) {
 }
 
 // A session is a hint. Every one of these used to be a way to fail at startup
-// over a scratch file, which is a much worse outcome than a lost scroll.
-func TestLoadIsNeverFatal(t *testing.T) {
+// over a scratch blob, which is a much worse outcome than a lost scroll.
+func TestDecodeIsNeverFatal(t *testing.T) {
 	root := workspace(t)
-	path := File(root)
-	os.MkdirAll(filepath.Dir(path), 0o700)
-
 	for _, body := range []string{
 		"",
 		"not json at all",
@@ -165,18 +148,13 @@ func TestLoadIsNeverFatal(t *testing.T) {
 		`{"version": 1, "tabs": null, "active": 42}`,
 		`{"version": 1, "tabs": [{"path": ""}], "active": -1}`,
 	} {
-		os.WriteFile(path, []byte(body), 0o644)
-		st := Load(root)
+		st := Decode([]byte(body), root)
 		if len(st.Tabs) != 0 {
 			t.Errorf("%q restored tabs: %+v", body, st.Tabs)
 		}
 		if st.Active != 0 {
 			t.Errorf("%q left Active at %d", body, st.Active)
 		}
-	}
-	os.Remove(path)
-	if st := Load(root); len(st.Tabs) != 0 {
-		t.Error("a missing file restored something")
 	}
 }
 
@@ -186,15 +164,18 @@ func TestValidateDropsWhatIsGone(t *testing.T) {
 	dir := filepath.Join(root, "adir")
 	os.MkdirAll(dir, 0o755)
 
-	Save(root, State{Tabs: []Tab{
+	blob, err := Encode(State{Tabs: []Tab{
 		{Path: gone}, // deleted since
 		{Path: dir},  // now a directory
 		{Path: filepath.Join(root, "kept.go")},
 		{Path: filepath.Join(root, "kept.go")}, // duplicate
 		{Path: "relative.go"},                  // not absolute
 	}, Expanded: []string{dir, filepath.Join(root, "nodir")}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	st := Load(root)
+	st := Decode(blob, root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Path != filepath.Join(root, "kept.go") {
 		t.Errorf("tabs = %+v", st.Tabs)
 	}
@@ -209,8 +190,11 @@ func TestValidateRejectsPathsOutsideTheWorkspace(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "elsewhere.go")
 	os.WriteFile(outside, []byte("x"), 0o644)
 
-	Save(root, State{Tabs: []Tab{{Path: outside}, {Path: "/etc/passwd"}}})
-	if st := Load(root); len(st.Tabs) != 0 {
+	blob, err := Encode(State{Tabs: []Tab{{Path: outside}, {Path: "/etc/passwd"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := Decode(blob, root); len(st.Tabs) != 0 {
 		t.Errorf("restored a tab outside the workspace: %+v", st.Tabs)
 	}
 }
@@ -220,9 +204,12 @@ func TestValidateRejectsPathsOutsideTheWorkspace(t *testing.T) {
 func TestCursorPastEndIsClamped(t *testing.T) {
 	root := workspace(t, "a.go")
 	path := filepath.Join(root, "a.go")
-	Save(root, State{Tabs: []Tab{{Path: path, Cursor: 9999, Top: 500}}})
+	blob, err := Encode(State{Tabs: []Tab{{Path: path, Cursor: 9999, Top: 500}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	st := Load(root)
+	st := Decode(blob, root)
 	if len(st.Tabs) != 1 {
 		t.Fatalf("tabs = %+v", st.Tabs)
 	}
@@ -233,26 +220,16 @@ func TestCursorPastEndIsClamped(t *testing.T) {
 
 func TestActiveIsClampedToTheKeptTabs(t *testing.T) {
 	root := workspace(t, "a.go")
-	Save(root, State{Tabs: []Tab{
+	blob, err := Encode(State{Tabs: []Tab{
 		{Path: filepath.Join(root, "gone.go")},
 		{Path: filepath.Join(root, "a.go")},
 	}, Active: 1})
-	st := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := Decode(blob, root)
 	if len(st.Tabs) != 1 || st.Active != 0 {
 		t.Errorf("active = %d over %d tabs", st.Active, len(st.Tabs))
-	}
-}
-
-// An interrupted write must leave the previous session, not a truncated file
-// that fails to parse — which is why Save renames rather than writing in place.
-func TestSaveIsAtomic(t *testing.T) {
-	root := workspace(t, "a.go")
-	Save(root, State{Tabs: []Tab{{Path: filepath.Join(root, "a.go"), Cursor: 5}}})
-	if entries, _ := os.ReadDir(filepath.Dir(File(root))); len(entries) != 1 {
-		t.Errorf("left %d files behind, want only session.json", len(entries))
-	}
-	if st := Load(root); len(st.Tabs) != 1 || st.Tabs[0].Cursor != 5 {
-		t.Errorf("got %+v", st)
 	}
 }
 
@@ -263,24 +240,28 @@ func TestRatioRoundTrip(t *testing.T) {
 	root := workspace(t, "a.go")
 	path := filepath.Join(root, "a.go")
 
-	Save(root, State{Tabs: []Tab{{Path: path, Cursor: 3, Top: 10, Ratio: 0.5}}})
-	data, _ := os.ReadFile(File(root))
-	if !strings.Contains(string(data), "ratio") {
-		t.Error("a nonzero ratio was omitted from the saved JSON")
+	blob, err := Encode(State{Tabs: []Tab{{Path: path, Cursor: 3, Top: 10, Ratio: 0.5}}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	st := Load(root)
+	if !strings.Contains(string(blob), "ratio") {
+		t.Error("a nonzero ratio was omitted from the encoded JSON")
+	}
+	st := Decode(blob, root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Ratio != 0.5 || st.Tabs[0].Top != 10 {
 		t.Errorf("tabs = %+v, want ratio 0.5, top 10", st.Tabs)
 	}
 
 	// Zero ratio is the same as no ratio: omitted from the JSON, read back
 	// as zero.
-	Save(root, State{Tabs: []Tab{{Path: path, Cursor: 3, Top: 10}}})
-	data, _ = os.ReadFile(File(root))
-	if strings.Contains(string(data), "ratio") {
+	blob, err = Encode(State{Tabs: []Tab{{Path: path, Cursor: 3, Top: 10}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(blob), "ratio") {
 		t.Error("a zero ratio was written into the JSON")
 	}
-	if st := Load(root); len(st.Tabs) != 1 || st.Tabs[0].Ratio != 0 {
+	if st := Decode(blob, root); len(st.Tabs) != 1 || st.Tabs[0].Ratio != 0 {
 		t.Errorf("zero-ratio round trip = %+v", st.Tabs)
 	}
 }
@@ -290,12 +271,9 @@ func TestRatioRoundTrip(t *testing.T) {
 func TestLegacyJSONWithoutRatio(t *testing.T) {
 	root := workspace(t, "a.go")
 	path := filepath.Join(root, "a.go")
-	p := File(root)
-	os.MkdirAll(filepath.Dir(p), 0o700)
 	body := `{"version":1,"tabs":[{"path":"` + path + `","cursor":3,"top":7,"wrap":true}],"active":0}`
-	os.WriteFile(p, []byte(body), 0o644)
 
-	st := Load(root)
+	st := Decode([]byte(body), root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Top != 7 || st.Tabs[0].Ratio != 0 {
 		t.Errorf("legacy tab = %+v, want top 7, ratio 0", st.Tabs)
 	}
@@ -309,33 +287,32 @@ func TestHintsRoundTripAndAbsence(t *testing.T) {
 	path := filepath.Join(root, "a.go")
 
 	off := false
-	if err := Save(root, State{Tabs: []Tab{{Path: path, Hints: &off}}}); err != nil {
+	blob, err := Encode(State{Tabs: []Tab{{Path: path, Hints: &off}}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ := os.ReadFile(File(root))
-	if !strings.Contains(string(data), `"hints": false`) {
-		t.Errorf("an explicit false was omitted from the saved JSON: %s", data)
+	if !strings.Contains(string(blob), `"hints": false`) {
+		t.Errorf("an explicit false was omitted from the encoded JSON: %s", blob)
 	}
-	st := Load(root)
+	st := Decode(blob, root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Hints == nil || *st.Tabs[0].Hints {
 		t.Fatalf("tabs = %+v, want an explicit false", st.Tabs)
 	}
 
 	on := true
-	Save(root, State{Tabs: []Tab{{Path: path, Hints: &on}}})
-	st = Load(root)
+	blob, err = Encode(State{Tabs: []Tab{{Path: path, Hints: &on}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st = Decode(blob, root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Hints == nil || !*st.Tabs[0].Hints {
 		t.Fatalf("tabs = %+v, want an explicit true", st.Tabs)
 	}
 
-	// Absence is the app default: a file written before the field existed
-	// loads with Hints nil.
-	p := File(root)
+	// Absence is the app default: a blob written before the field existed
+	// decodes with Hints nil.
 	body := `{"version":1,"tabs":[{"path":"` + path + `","cursor":0,"top":0,"wrap":true}],"active":0}`
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	st = Load(root)
+	st = Decode([]byte(body), root)
 	if len(st.Tabs) != 1 || st.Tabs[0].Hints != nil {
 		t.Errorf("tabs = %+v, want Hints nil so the app default applies", st.Tabs)
 	}

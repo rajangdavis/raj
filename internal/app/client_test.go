@@ -84,7 +84,7 @@ func newClientHarness(t *testing.T) *clientHarness {
 }
 
 // The client builds its tabs from the daemon snapshots: the text is the agreed
-// view, the pending proposal rides with it, and Review is the default mode.
+// view, the pending proposal rides with it, and Edit is the default mode.
 // Without client mode the app would open the path from the local temp root,
 // where no such file exists, and show nothing.
 func TestClientLoadsDaemonDocument(t *testing.T) {
@@ -98,8 +98,8 @@ func TestClientLoadsDaemonDocument(t *testing.T) {
 	if got, want := p.File.Text(), "// proposed\nhello\nworld\n"; got != want {
 		t.Errorf("text = %q, want %q", got, want)
 	}
-	if ch.cli.mode != ModeReview {
-		t.Errorf("mode = %v, want Review", ch.cli.mode)
+	if ch.cli.mode != ModeEdit {
+		t.Errorf("mode = %v, want Edit", ch.cli.mode)
 	}
 	if pending := p.File.Session().Pending(); len(pending) == 0 {
 		t.Error("the daemon proposal did not ride with the snapshot")
@@ -366,6 +366,130 @@ func TestAttachOldServerKeepsLaunchRoots(t *testing.T) {
 	}
 }
 
+// A client launched at a parent of the daemon workspace renders the daemon's
+// workspace. The reported set can arrive as the launch root unioned with the
+// daemon's, because the mapper rebases one root beside the launch root, and two
+// nested roots cannot both be drawn: the old code refused the set and left the
+// launch root, so A was neither a root row nor a directory the client could
+// see. The daemon's own set wins instead, and the view roots stay put.
+func TestAttachParentOfWorkspaceAdoptsTheWorkspace(t *testing.T) {
+	launch := t.TempDir()
+	workspace := filepath.Join(launch, "A")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemonFile := filepath.Join(workspace, "a.go")
+	if err := os.WriteFile(daemonFile, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A Unix-socket harness cannot make control.Client infer a mapper, which is
+	// the only way a daemon set rebases onto the launch root, so the union the
+	// client can end up passing is scripted directly here.
+	a := scriptedAttach(t, launch, []string{launch, workspace})
+
+	if got := a.visible.All(); !sameStrings(got, []string{workspace}) {
+		t.Fatalf("visible roots = %q, want the daemon's %q", got, []string{workspace})
+	}
+	if got := a.Explorer.Tree.Roots; !sameStrings(got, []string{workspace}) {
+		t.Errorf("explorer roots = %q, want the daemon's %q", got, []string{workspace})
+	}
+	if got := a.Search.Roots; !sameStrings(got, []string{workspace}) {
+		t.Errorf("search roots = %q, want the daemon's %q", got, []string{workspace})
+	}
+	if got := a.Picker.Roots; !sameStrings(got, []string{workspace}) {
+		t.Errorf("picker roots = %q, want the daemon's %q", got, []string{workspace})
+	}
+	// A itself is not swallowed: the daemon's file is a top-level tree row
+	// because the workspace root, not a nested child of the launch directory,
+	// is the rendered root.
+	shown := false
+	for _, e := range a.Explorer.Tree.Entries() {
+		if e.Path == daemonFile {
+			shown = true
+		}
+	}
+	if !shown {
+		t.Errorf("the daemon file %s is not in the tree: %+v", daemonFile, a.Explorer.Tree.Entries())
+	}
+	// Only the visible set moved; the store stays keyed by the launch roots.
+	if got := a.roots.All(); !sameStrings(got, []string{launch}) {
+		t.Errorf("view roots = %q, want the launch root %q", got, launch)
+	}
+}
+
+// The reverse nesting ends at the daemon's workspace too: a client launched in
+// a child of the daemon root adopts the parent, not the child. Without the fix
+// the nested union is refused and the launch child stays.
+func TestAttachChildOfWorkspaceAdoptsTheWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	launch := filepath.Join(workspace, "sub")
+	if err := os.MkdirAll(launch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemonFile := filepath.Join(workspace, "a.go")
+	if err := os.WriteFile(daemonFile, []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := scriptedAttach(t, launch, []string{workspace, launch})
+
+	if got := a.visible.All(); !sameStrings(got, []string{workspace}) {
+		t.Fatalf("visible roots = %q, want the daemon's %q", got, []string{workspace})
+	}
+	if got := a.Explorer.Tree.Roots; !sameStrings(got, []string{workspace}) {
+		t.Errorf("explorer roots = %q, want the daemon's %q", got, []string{workspace})
+	}
+	if got := a.roots.All(); !sameStrings(got, []string{launch}) {
+		t.Errorf("view roots = %q, want the launch root %q", got, launch)
+	}
+}
+
+// adoptVisibleRoots is the decision the two tests above drive through the
+// attach path. Pinned directly here so every case, including the ones the
+// in-process harness cannot produce through a Unix socket, is covered: the
+// daemon's set wins when it nests with the launch root in either direction,
+// while a disjoint or identical set is adopted exactly as before.
+func TestAdoptVisibleRootsReconcilesNesting(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other := t.TempDir()
+
+	cases := []struct {
+		name string
+		view string
+		set  []string
+		want []string
+		ok   bool
+	}{
+		{"daemon nested in launch", parent, []string{parent, child}, []string{child}, true},
+		{"launch nested in daemon", child, []string{parent, child}, []string{parent}, true},
+		{"daemon alone nested in launch", parent, []string{child}, []string{child}, true},
+		{"disjoint", parent, []string{other}, []string{other}, true},
+		{"identical", parent, []string{parent}, []string{parent}, true},
+		{"empty", parent, nil, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fh := ui.NewFakeHost(120, 24)
+			t.Cleanup(func() { fh.Close() })
+			a := New(fh, tc.view, 2)
+			t.Cleanup(a.CloseState)
+			if got := a.adoptVisibleRoots(tc.set); got != tc.ok {
+				t.Fatalf("adoptVisibleRoots(%v) = %v, want %v", tc.set, got, tc.ok)
+			}
+			if tc.ok {
+				if got := a.visible.All(); !sameStrings(got, tc.want) {
+					t.Errorf("visible = %q, want %q", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // recordingConn is the decision connection a forwarded local edit talks to. It
 // records the verbs, answers a claim with any scripted overlap and a who list,
 // and advances the version on apply, so a test can assert the span, the base and
@@ -399,6 +523,7 @@ func (r *recordingConn) Do(req control.Request) (control.Response, error) {
 
 func (r *recordingConn) ResolveRoots(string) (control.Mapper, error) { return control.Mapper{}, nil }
 func (r *recordingConn) Roots() []string                             { return nil }
+func (r *recordingConn) Kind() control.Kind                          { return "" }
 func (r *recordingConn) Close() error                                { return nil }
 
 func (r *recordingConn) lastApply() (control.Request, bool) {
@@ -450,10 +575,10 @@ func waitClientIdle(t *testing.T, a *App, path string) {
 	}
 }
 
-// Review is the only read-only state: a client that leaves it is a normal
-// editor, so a typed rune lands locally (and is forwarded) instead of being
-// refused. The precondition is asserted before the action so a passing test
-// cannot be the wrong mode.
+// Review is the only read-only state, and an attached client starts in Edit:
+// a typed rune lands locally (and is forwarded) instead of being refused.
+// Review is entered here deliberately, not assumed as the default, so the
+// refusal half is about Review and not about the old default.
 func TestAttachedClientEditsOutsideReview(t *testing.T) {
 	ch := newClientHarness(t)
 	ch.cli.drain()
@@ -465,6 +590,7 @@ func TestAttachedClientEditsOutsideReview(t *testing.T) {
 	path := p.File.Path
 	useDecide(t, ch, &recordingConn{})
 
+	ch.cli.EnterReview()
 	if ch.cli.mode != ModeReview {
 		t.Fatalf("mode = %v, want Review", ch.cli.mode)
 	}
@@ -651,5 +777,31 @@ func TestClientClaimOverlapNotesAnAgent(t *testing.T) {
 	ch.cli.clientMu.Unlock()
 	if !strings.Contains(note, "agent claude has claimed") {
 		t.Errorf("note = %q, want the agent overlap warning", note)
+	}
+}
+
+// The invariant this behaviour rests on: a client on the editor's own machine
+// connects on the local socket, is granted KindHuman, and stays fully editable.
+// This drives the real Unix-socket daemon, so the granted kind makes the whole
+// trip -- server hello reply, client learning the grant, and the attach mode
+// choice -- rather than being asserted only at the decision function.
+func TestAttachedLocalClientStartsEditable(t *testing.T) {
+	ch := newClientHarness(t)
+	ch.cli.drain()
+
+	if ch.cli.client == nil {
+		t.Fatal("client attached with no watch connection")
+	}
+	if got := ch.cli.client.Kind(); got != control.KindHuman {
+		t.Fatalf("granted kind = %q, want %q", got, control.KindHuman)
+	}
+	if ch.cli.mode != ModeEdit {
+		t.Errorf("mode = %v, want Edit for a local client", ch.cli.mode)
+	}
+	if ch.cli.attachedAsAgent {
+		t.Error("a local client was flagged as an agent")
+	}
+	if strings.Contains(ch.cli.status, "attached as an agent") {
+		t.Errorf("a local client shows the agent note: %q", ch.cli.status)
 	}
 }

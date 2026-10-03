@@ -1,6 +1,9 @@
 package piecetable
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // snapshotFixture builds the state the round trip must preserve: base text, a
 // user insert, an agent edit that is Proposed across an insert and a delete, a
@@ -130,5 +133,59 @@ func TestSnapshotRefusesGarbage(t *testing.T) {
 	mismatch.Base = []byte("y")
 	if _, err := Restore(mismatch); err == nil {
 		t.Error("base/store mismatch accepted")
+	}
+}
+
+// TestSnapshotRefusesCraftedInsert pins the high finding. A journal op whose
+// inserted piece carries start near MaxInt and length 1 makes start+length wrap
+// to MinInt; the old signed guard r.Start+r.Length > len(store) therefore
+// passed and the reader later sliced the store with high < low. Restore must
+// refuse the record in checkRecs instead, before any replay.
+func TestSnapshotRefusesCraftedInsert(t *testing.T) {
+	s := NewSession(NewDoc("x", 0))
+	snap, err := s.SnapshotState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap.Journal = []Op{{
+		Seq: 0,
+		Ins: []PieceRec{{Buf: 0, Start: math.MaxInt64, Length: 1}},
+	}}
+	if _, err := Restore(snap); err == nil {
+		t.Fatal("Restore accepted a piece whose start+length overflows int")
+	}
+}
+
+// TestStoreSliceRefusesOverflowingSpan pins the other half of the same defect:
+// Store.Slice's own guard used the overflowing addition, so a start near MaxInt
+// with length 1 panicked with high < low rather than returning nil.
+func TestStoreSliceRefusesOverflowingSpan(t *testing.T) {
+	s := NewStore([]byte("abc"))
+	if got := s.Slice(Original, math.MaxInt64, 1); got != nil {
+		t.Errorf("Slice(MaxInt64, 1) = %q, want nil", got)
+	}
+	if got := s.Slice(Original, 1, -1); got != nil {
+		t.Errorf("Slice(1, -1) = %q, want nil", got)
+	}
+}
+
+// TestSnapshotRefusesGroupReuse pins the Restore half of the audit: NextGroup is
+// the session's next change-set id, and a crafted value below the highest id in
+// the journal makes the next edit join an existing group. Restore must refuse
+// it rather than overwriting the counter replayed from the ops.
+func TestSnapshotRefusesGroupReuse(t *testing.T) {
+	s := NewSession(NewDoc("hello\n", 0))
+	s.Insert(Agent, 0, "X") // group 1
+	s.Insert(Agent, 0, "Y") // group 2
+	snap, err := s.SnapshotState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.NextGroup < 2 {
+		t.Fatalf("fixture next group = %d, want at least 2", snap.NextGroup)
+	}
+	snap.NextGroup = 1
+	if _, err := Restore(snap); err == nil {
+		t.Fatal("Restore accepted a next group that reuses an existing change set")
 	}
 }

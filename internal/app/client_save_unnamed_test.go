@@ -10,9 +10,9 @@ import (
 )
 
 // clientUnnamedPane makes the attached client's active buffer an unnamed one
-// and types into it. Leaving Review is the client's edit path, so the mode is
-// set directly, exactly as TestAttachedClientEditsOutsideReview does; the typed
-// text is what the old empty-path save sent nowhere and then clobbered.
+// and types into it. The client starts in Edit, so the typed text lands locally;
+// it is never forwarded because an unnamed buffer has no path. The typed text is
+// what the old empty-path save sent nowhere and then clobbered.
 func clientUnnamedPane(t *testing.T, ch *clientHarness) *editor.Pane {
 	t.Helper()
 	runClient(t, ch, func() { ch.cli.newFile() })
@@ -20,7 +20,6 @@ func clientUnnamedPane(t *testing.T, ch *clientHarness) *editor.Pane {
 	if p == nil || p.File.Path != "" {
 		t.Fatalf("setup: active client buffer = %+v, want an unnamed buffer", p)
 	}
-	ch.cli.mode = ModeEdit
 	ch.cli.focusEditor()
 	ch.cli.typeText("precious")
 	if got := p.File.Text(); got != "precious" {
@@ -29,13 +28,13 @@ func clientUnnamedPane(t *testing.T, ch *clientHarness) *editor.Pane {
 	return p
 }
 
-// The data-loss bug: an attached client's save on an unnamed buffer sent an
-// empty path, which the daemon resolved to the buffer the user was looking at
-// -- some other file -- saving that and then refetching it over the pane. The
-// typed text, which flushClientEdit never forwarded because the path was empty,
-// was gone. The save must instead answer for a path: no daemon file is written
-// and the pane text is left as typed.
-func TestAttachedUnnamedSaveNeverTouchesDaemonFile(t *testing.T) {
+// An attached client's save on an unnamed buffer asks where the file should go
+// and writes it on the daemon: the client owns no bytes, so the create and the
+// write run in the daemon's workspace. The data-loss bug it replaces sent an
+// empty path, which the daemon resolved to the buffer the user was looking at --
+// some other file -- saving that and then refetching it over the pane. No daemon
+// file is touched before the path answer, and the pane keeps the typed text.
+func TestAttachedUnnamedSaveAsWritesDaemonFile(t *testing.T) {
 	srv := controlHarness(t, "hello\n")
 	srv.typeText("X") // the daemon buffer is dirty, so an empty-path save would write it
 	ch := attachClient(t, srv)
@@ -49,28 +48,54 @@ func TestAttachedUnnamedSaveNeverTouchesDaemonFile(t *testing.T) {
 	p := clientUnnamedPane(t, ch)
 	runClient(t, ch, func() { ch.cli.saveActive(nil) })
 
-	// No daemon file was written. The old empty-path save wrote the daemon's
-	// dirty text over disk; the fix must leave the disk alone.
+	// The save answers with a Save as prompt before writing anything. The old
+	// refusal named the missing path; the rule now is the prompt.
+	if !ch.cli.Prompt.Open {
+		t.Fatalf("attached unnamed save did not ask for a path; status = %q", ch.cli.status)
+	}
+	if got := ch.cli.Prompt.Title(); got != "Save as" {
+		t.Fatalf("prompt = %q, want Save as", got)
+	}
+	newPath := filepath.Join(srv.primaryRoot(), "typed.txt")
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("a daemon file existed before the path answer: %v", err)
+	}
+	diskMid, err := os.ReadFile(daemonPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(diskMid) != string(diskBefore) {
+		t.Errorf("the prompt alone touched the daemon file: disk = %q, want %q", diskMid, diskBefore)
+	}
+
+	// Answering the prompt creates the file in the daemon's workspace with the
+	// typed text, and leaves the pane showing that text under the new path.
+	ch.cli.typeText("typed.txt")
+	runClient(t, ch, func() { ch.cli.press("enter") })
+
+	data, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("the daemon workspace has no saved file: %v", err)
+	}
+	if string(data) != "precious" {
+		t.Errorf("daemon file = %q, want precious", data)
+	}
+	if p.File.Path != newPath {
+		t.Errorf("pane path = %q, want the daemon path %q", p.File.Path, newPath)
+	}
+	if got := p.File.Text(); got != "precious" {
+		t.Errorf("pane text = %q, want precious -- the save replaced it", got)
+	}
+	// The daemon's own dirty buffer was not the save target.
 	diskAfter, err := os.ReadFile(daemonPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(diskAfter) != string(diskBefore) {
-		t.Errorf("the client's unnamed save wrote the daemon file: disk = %q, want %q", diskAfter, diskBefore)
+		t.Errorf("the client's unnamed save wrote the daemon's active file: disk = %q, want %q", diskAfter, diskBefore)
 	}
-	// The pane still shows the typed text. The old read-back replaced it with
-	// the daemon file's content.
-	if got := p.File.Text(); got != "precious" {
-		t.Errorf("pane text = %q, want precious -- the save replaced it", got)
-	}
-	// The user was given a path answer: a Save as prompt or a refusal naming
-	// the missing path. Silence would be the one unacceptable outcome.
-	if ch.cli.Prompt.Open {
-		if got := ch.cli.Prompt.Title(); got != "Save as" {
-			t.Errorf("prompt = %q, want Save as", got)
-		}
-	} else if !strings.Contains(ch.cli.status, "path") {
-		t.Errorf("save gave no path answer: prompt=%v status=%q", ch.cli.Prompt.Open, ch.cli.status)
+	if !strings.Contains(ch.cli.status, "saved") {
+		t.Errorf("status = %q, want a save confirmation", ch.cli.status)
 	}
 }
 

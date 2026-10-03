@@ -324,6 +324,10 @@ func (f *fakeEditor) run(req Request) Response {
 		// assert mode run reached the server.
 		f.lastHook = Request{Op: "hook", HookMode: "run", HookName: req.HookName, HookParams: req.HookParams, Author: req.Author}
 		return Dispatch(f.policy, req)
+	case "proveprep":
+		// connection.prove's event-thread half: materialise the seam and hand
+		// back its directory. memHost.ProveTree stands in for the git tree.
+		return Dispatch(f.policy, req)
 	case "git":
 		f.lastGit = req
 		if f.gitStarted != nil {

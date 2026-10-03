@@ -134,6 +134,15 @@ type Request struct {
 	// HookRunID names an in-flight run for `hook cancel`. It is the id the
 	// final frame's stamp reported and `hook ps` lists.
 	HookRunID uint64
+	// HookPrepared, HookRunDir and HookRevision are set in-process by
+	// connection.prove, never decoded from a frame: they point a hook run at a
+	// tree the event thread already materialised (an intention's seam) instead
+	// of building the live projection, and carry the revision the Gate keys
+	// that tree by. A wire client cannot set them, so it cannot choose a
+	// directory for a hook to run in.
+	HookPrepared bool
+	HookRunDir   string
+	HookRevision uint64
 
 	// LSPMode is the sub-operation of an lsp request: hover, definition,
 	// references, completion, diagnostics, inlay-hints, symbols or
@@ -967,6 +976,15 @@ type Response struct {
 	// agent that thinks it is author 3 when it is author 4 will read its own
 	// text as somebody else's.
 	Author uint8
+	// Kind is the participant kind the editor granted this connection, on the
+	// hello reply and only there. It is the authoritative answer to whether
+	// the connection may write as the person: the request states what it asked
+	// to join as, but only the server knows whether the transport allowed it --
+	// a TCP caller that asks for human is downgraded to agent. It is sparse, so
+	// a reply from a server that does not carry the field, and every reply that
+	// is not a hello, leaves it empty; a client reads missing as unknown and
+	// keeps its existing behaviour rather than guessing a read-only one.
+	Kind string
 	// Searcher is returned by the internal "searchsnapshot" op. It never crosses the
 	// wire: it is how the event thread hands a consistent view of the open
 	// buffers to a walk that runs off it.
@@ -1014,6 +1032,11 @@ type Response struct {
 	// none.
 	HookParamValues []hooks.ParamValue `json:"-"`
 
+	// HookPrepared marks a hook prep whose tree the event thread already
+	// materialised (an intention seam) rather than the live projection, so the
+	// run path uses Root as its directory and builds no scratch tree. It is
+	// in-process only: EncodeResponse has no line for it, so it never crosses.
+	HookPrepared bool
 	// HookRevision is the projection revision the run was admitted at. It
 	// crosses on the final frame too, for a caller that only reads the reply.
 	HookRevision uint64
@@ -1150,6 +1173,11 @@ type Pending struct {
 	Req  Request
 	done chan Response
 	once sync.Once
+	// dropped is set by submit when the reply deadline passes before the event
+	// thread has taken this. Take discards a dropped pending instead of running
+	// it, so a request the caller was told had failed cannot land afterwards.
+	// Guarded by Server.mu, which serializes it against Take.
+	dropped bool
 }
 
 // Reply answers a request. Safe to call more than once and from any goroutine;
@@ -1230,6 +1258,14 @@ type Server struct {
 	// query under, with the zero value leaving it on gitTimeout. Read only by
 	// the connection goroutine that owns the query, so no lock is needed.
 	gitQueryTimeout time.Duration
+
+	// replyTimeout is a test seam: the deadline a parked request waits for the
+	// event thread, with the zero value leaving it on ReplyTimeout. A test that
+	// parks a request with no event thread would otherwise wait the full five
+	// seconds to drive the timeout. Read under mu in submit and written under
+	// mu by a test, so the seam has a happens-before edge with the connections
+	// ListenAll has already started.
+	replyTimeout time.Duration
 
 	// watch generation. gen moves on the event thread; a parked watch compares
 	// it against the Gen its request carried and wakes when they differ. The
@@ -1744,25 +1780,30 @@ func (s *Server) serve(conn net.Conn, network string) {
 		}
 	}()
 	defer conn.Close()
-	// Each connection is one writer, assigned an author id for its lifetime.
-	// Attribution is therefore a property of who is connected rather than of
-	// what a request claims, and two agents cannot land in one another's spans.
-	// Provisional until the client identifies itself. A connection that never
-	// says who it is still gets an id, so an anonymous one-off client works —
-	// it just does not survive a reconnect as the same writer.
-	author, err := s.reserveAuthor()
-	if err != nil {
-		// No id to attribute this connection to. Refusing is the only safe
-		// answer: falling back to a shared id would put two writers on one
-		// author, which is the collision the registry exists to prevent.
-		return
+	// A connection is assigned an author id only once it has proved it may
+	// talk to us. The id is one byte out of a space of a few hundred, so
+	// handing one to a peer that has not passed the token check lets
+	// unauthenticated connections starve every real writer. The token check is
+	// below; the reservation is immediately after it.
+	//
+	// A TCP peer that opens a connection and never speaks is cut off by the
+	// handshake deadline, so silence does not hold the connection either. The
+	// local Unix socket is the person's own and gets no deadline.
+	if network == "tcp" {
+		conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	}
-	// bound is whether hello has rebound this connection to a durable identity.
-	// Until then author is a reserved id with no row and Release is what frees
+	// author is zero until the first authorised frame reserves it. bound is
+	// whether hello has since rebound the connection to a durable identity:
+	// until then author is a reserved id with no row and Release is what frees
 	// it; after, Leave marks the durable row disconnected and keeps it for
 	// attribution. The defer reads both when it runs.
+	var author uint8
+	reserved := false
 	bound := false
 	defer func() {
+		if !reserved {
+			return
+		}
 		if bound {
 			s.Participants.Leave(author)
 		} else {
@@ -1780,9 +1821,19 @@ func (s *Server) serve(conn net.Conn, network string) {
 	done := make(chan struct{})
 	safe.Go(func() {
 		defer close(done)
+		// Once the socket has failed, keep draining out instead of returning.
+		// A handler still emitting frames — a streamed search, a program of
+		// verbs — blocks on the channel the moment it is full, and a writer
+		// that returned would leave it blocked for ever, so wg.Wait never
+		// returns and the connection never releases its author id and hook
+		// gate. The bytes have nowhere to go, so the frames are dropped.
+		failed := false
 		for f := range out {
+			if failed {
+				continue
+			}
 			if WriteFrame(conn, f.h, f.body) != nil {
-				return
+				failed = true
 			}
 		}
 	})
@@ -1809,18 +1860,40 @@ func (s *Server) serve(conn net.Conn, network string) {
 			c.send(Response{ID: f.Header.ID, Err: derr.Error(), Final: true})
 			continue
 		}
-		// Every request stamps the participant's last activity, so the
-		// derived working state reads this connection's own traffic and the
-		// serve loop stays a cheap lock-guarded map write.
-		s.Participants.Touch(author)
 		if !s.authorised(req, network) {
 			// One refusal, then the connection ends. The token is 32 random
 			// bytes, so this is not rate limiting against a guesser — it is
 			// refusing to stay in a conversation with something that cannot
-			// say who it is.
+			// say who it is. No author id is reserved for this frame: an
+			// unauthenticated peer must not consume one of the few bytes.
 			c.send(Response{ID: req.ID, Err: errUnauthorised, Final: true})
 			break
 		}
+		// The caller has proved it holds the token, so it has earned an author
+		// id. Reserving here rather than at accept is what keeps an idle
+		// unauthenticated connection from burning an id it never uses. There
+		// is no id to be had: refuse the connection rather than share one.
+		if !reserved {
+			id, rerr := s.reserveAuthor()
+			if rerr != nil {
+				c.send(Response{ID: req.ID, Err: rerr.Error(), Final: true})
+				break
+			}
+			author = id
+			reserved = true
+			c.mu.Lock()
+			c.author = id
+			c.mu.Unlock()
+			if network == "tcp" {
+				// The connection is trusted now; a long recv or a slow
+				// request must not be cut off by the handshake deadline.
+				conn.SetReadDeadline(time.Time{})
+			}
+		}
+		// Every request stamps the participant's last activity, so the
+		// derived working state reads this connection's own traffic and the
+		// serve loop stays a cheap lock-guarded map write.
+		s.Participants.Touch(author)
 		if req.Op == "token" {
 			// "token" is answered on the reading goroutine, like hello and
 			// cancel: the secret is the server's own and no document state is
@@ -1856,7 +1929,10 @@ func (s *Server) serve(conn net.Conn, network string) {
 			}
 			if identity == "" {
 				// Anonymous on a local socket keeps its provisional id: the
-				// filesystem permissions already decided who may connect.
+				// filesystem permissions already decided who may connect. It
+				// holds no participant row, so there is no granted kind to
+				// name; a client reads the absent field as unknown and keeps
+				// its editable default, which is right on this socket.
 				c.send(Response{ID: req.ID, OK: true, Final: true,
 					Participants: s.Roster()})
 				continue
@@ -1912,7 +1988,7 @@ func (s *Server) serve(conn net.Conn, network string) {
 			c.author = id
 			c.mu.Unlock()
 			c.send(Response{ID: req.ID, OK: true, Final: true, Identity: minted,
-				Participants: s.Roster()})
+				Kind: string(kind), Participants: s.Roster()})
 			continue
 		}
 		if req.Op == "cancel" {
@@ -1955,6 +2031,14 @@ func (s *Server) serve(conn net.Conn, network string) {
 // with a silent phase longer than the client's idle - would otherwise look like
 // a dead peer to the client's per-frame idle deadline.
 const heartbeatEvery = 5 * time.Second
+
+// handshakeTimeout bounds how long a TCP connection may stay silent before its
+// first frame passes the token check. A remote peer that opens a connection
+// and never speaks would otherwise hold a goroutine for the server's life;
+// clearing the deadline after the first authorised frame means a long recv or
+// a slow request is not cut off once the peer has proved itself. The local
+// Unix socket is the person's own and gets no deadline.
+const handshakeTimeout = 10 * time.Second
 
 type outFrame struct {
 	h    Header
@@ -2194,6 +2278,14 @@ func (c *connection) one(req Request, emit func(Response)) {
 		// guards read.
 		if m, ok := hookModeByName[req.HookMode]; ok && m.conn != nil {
 			m.conn(c, req, emit)
+			return
+		}
+	case "intent":
+		// prove materialises the seam on the event thread and then runs the
+		// check hook through the one hook runner, off it; every other intent
+		// mode falls through to the event thread as before.
+		if isProveIntent(req.HookJSON) {
+			c.prove(req, emit)
 			return
 		}
 	case "git":
@@ -2442,7 +2534,8 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 			caller = LocalHuman
 		}
 	}
-	prep := c.srv.submit(Request{ID: req.ID, Op: "hookprep", HookName: req.HookName, HookParams: req.HookParams, Author: caller})
+	prep := c.srv.submit(Request{ID: req.ID, Op: "hookprep", HookName: req.HookName, HookParams: req.HookParams, Author: caller,
+		HookPrepared: req.HookPrepared, HookRunDir: req.HookRunDir, HookRevision: req.HookRevision})
 	if prep.Err != "" {
 		prep.ID, prep.Final = req.ID, true
 		emit(prep)
@@ -2494,38 +2587,46 @@ func (c *connection) runHook(req Request, emit func(Response)) {
 	// when a step is a shell action; a chain of leaves resolves the root from
 	// the run context and needs no working directory either.
 	noTree := prep.HookBuiltin != "" || (len(prep.HookSteps) > 0 && !stepsNeedTree(prep.HookSteps))
-	switch {
-	case noTree:
-		// No tree: an in-process action receives its args and the run context,
-		// nothing else.
-	case prep.HookTree == string(hooks.TreeWorkspace):
-		svc := git.New(prep.Root)
-		view, verr := svc.View(ctx)
-		if verr != nil {
-			emit(Response{ID: req.ID, Err: verr.Error(), Final: true})
-			return
+	if prep.HookPrepared {
+		// The event thread already materialised this run's tree (an intention
+		// seam): run in it and remove it when the run finishes. Detach is off
+		// for a prepared run, so this defer always fires.
+		runDir = prep.Root
+		defer func() { _ = os.RemoveAll(prep.Root) }()
+	} else {
+		switch {
+		case noTree:
+			// No tree: an in-process action receives its args and the run context,
+			// nothing else.
+		case prep.HookTree == string(hooks.TreeWorkspace):
+			svc := git.New(prep.Root)
+			view, verr := svc.View(ctx)
+			if verr != nil {
+				emit(Response{ID: req.ID, Err: verr.Error(), Final: true})
+				return
+			}
+			dirty, derr := svc.StatusDigest(ctx)
+			if derr != nil {
+				emit(Response{ID: req.ID, Err: derr.Error(), Final: true})
+				return
+			}
+			prov = Provenance{Head: view.Head, DirtyDigest: dirty}
+		default:
+			m, p, merr := materialiseWith(ctx, git.New(prep.Root), prep.Projection, git.MaterialiseOptions{})
+			if merr != nil {
+				emit(Response{ID: req.ID, Err: merr.Error(), Final: true})
+				return
+			}
+			if prep.HookDetach {
+				// The scratch tree must outlive the request for a detached run, so
+				// the completion goroutine removes it; a synchronous run removes it
+				// on return.
+				cleanup = func() { _ = m.Remove() }
+			} else {
+				defer m.Remove()
+			}
+			prov, runDir = p, m.Dir
 		}
-		dirty, derr := svc.StatusDigest(ctx)
-		if derr != nil {
-			emit(Response{ID: req.ID, Err: derr.Error(), Final: true})
-			return
-		}
-		prov = Provenance{Head: view.Head, DirtyDigest: dirty}
-	default:
-		m, p, merr := materialiseWith(ctx, git.New(prep.Root), prep.Projection, git.MaterialiseOptions{})
-		if merr != nil {
-			emit(Response{ID: req.ID, Err: merr.Error(), Final: true})
-			return
-		}
-		if prep.HookDetach {
-			// The scratch tree must outlive the request for a detached run, so
-			// the completion goroutine removes it; a synchronous run removes it
-			// on return.
-			cleanup = func() { _ = m.Remove() }
-		} else {
-			defer m.Remove()
-		}
-		prov, runDir = p, m.Dir
 	}
 
 	if prep.HookDetach {
@@ -3245,15 +3346,26 @@ func (s *Server) submit(req Request) Response {
 		return Response{ID: req.ID, Err: "editor is shutting down"}
 	}
 	s.queue = append(s.queue, p)
+	wait := s.replyTimeout
 	s.mu.Unlock()
+	if wait <= 0 {
+		wait = ReplyTimeout
+	}
 
 	s.Notify()
 	select {
 	case r := <-p.done:
 		return r
-	case <-time.After(ReplyTimeout):
-		// Mark it answered so the event thread's later Reply does not block on
-		// a channel nobody is reading.
+	case <-time.After(wait):
+		// The event thread did not run this in time. Mark it dropped, under the
+		// lock Take reads it with, so a request the caller was told had failed
+		// is not executed afterwards: a late apply would land text the client
+		// believes never happened. Marking it answered also keeps the event
+		// thread's later Reply, if a Take won the race, from blocking on a
+		// channel nobody is reading.
+		s.mu.Lock()
+		p.dropped = true
+		s.mu.Unlock()
 		p.once.Do(func() {})
 		return Response{ID: req.ID, Err: "timed out waiting for the editor"}
 	}
@@ -3266,8 +3378,19 @@ func (s *Server) Take() []*Pending {
 	if len(s.queue) == 0 {
 		return nil
 	}
-	out := s.queue
+	out := make([]*Pending, 0, len(s.queue))
+	for _, p := range s.queue {
+		// A pending the waiter already gave up on must not run: the client was
+		// told the request failed, and running it now would mutate state the
+		// client believes is untouched.
+		if !p.dropped {
+			out = append(out, p)
+		}
+	}
 	s.queue = nil
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }
 

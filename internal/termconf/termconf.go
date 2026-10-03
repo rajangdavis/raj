@@ -179,7 +179,7 @@ func Install(t Target) (string, error) {
 // keybinding file is a terminal with some of raj's chords and not others, which
 // is harder to diagnose than not having installed it at all.
 func write(path, content string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".raj-config-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}

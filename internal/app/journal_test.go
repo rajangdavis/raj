@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1561,5 +1562,67 @@ func TestJournalRestoresAJoinedAuthorWithoutAWrite(t *testing.T) {
 	// The restored id is not handed to a different identity.
 	if joined, err := a.control.Participants.Join("other", "other", control.KindAgent); err != nil || joined == id {
 		t.Errorf("Join(other) = %d, %v; the restored id %d was recycled", joined, err, id)
+	}
+}
+
+// TestBuildSessionRefusesOverflowingJournalPiece pins the legacy op-log half of
+// the audit: fromJournalPieces converts a uint64 length to int, buildSession
+// validated no piece, and journal.Open checks only a crc32, so a crafted op
+// with start near MaxInt (or a length that does not fit int) reached the
+// replayer. The log round-trips through the real writer and reader here, and
+// buildSession must refuse it before replay.
+func TestBuildSessionRefusesOverflowingJournalPiece(t *testing.T) {
+	base := []byte("abc")
+	path := filepath.Join(t.TempDir(), "crafted.log")
+	w, err := journal.Create(path, journal.Header{Root: t.TempDir(), Identity: "test"})
+	if err != nil {
+		t.Fatalf("create journal: %v", err)
+	}
+	if err := w.Append(journal.Base{Path: "a.go", Hash: hashBytes(base), Bytes: base}); err != nil {
+		t.Fatalf("append base: %v", err)
+	}
+	if err := w.Append(journal.Op{
+		Seq: 0, Author: uint8(piecetable.Agent), Pos: 0,
+		Ins: []journal.Piece{{Buf: uint8(piecetable.Original), Start: math.MaxInt64, Length: 1}},
+	}); err != nil {
+		t.Fatalf("append op: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	l, err := journal.Open(path)
+	if err != nil {
+		t.Fatalf("journal.Open rejected the checksum-clean crafted log: %v", err)
+	}
+	if sess := buildSession(l); sess != nil {
+		t.Fatal("buildSession accepted a piece whose start+length overflows int")
+	}
+
+	// A length that does not fit int at all is refused the same way: the
+	// uint64 -> int conversion would turn it negative.
+	path2 := filepath.Join(t.TempDir(), "crafted2.log")
+	w2, err := journal.Create(path2, journal.Header{Root: t.TempDir(), Identity: "test"})
+	if err != nil {
+		t.Fatalf("create journal: %v", err)
+	}
+	if err := w2.Append(journal.Base{Path: "a.go", Hash: hashBytes(base), Bytes: base}); err != nil {
+		t.Fatalf("append base: %v", err)
+	}
+	if err := w2.Append(journal.Op{
+		Seq: 0, Author: uint8(piecetable.Agent), Pos: 0,
+		Ins: []journal.Piece{{Buf: uint8(piecetable.Original), Start: 0, Length: ^uint64(0)}},
+	}); err != nil {
+		t.Fatalf("append huge: %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	l2, err := journal.Open(path2)
+	if err != nil {
+		t.Fatalf("journal.Open: %v", err)
+	}
+	if sess := buildSession(l2); sess != nil {
+		t.Fatal("buildSession accepted a piece length that does not fit int")
 	}
 }

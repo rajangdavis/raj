@@ -3,6 +3,7 @@ package app
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -934,6 +935,9 @@ func buildSession(l *journal.Log) *piecetable.Session {
 			}
 			doc.Store().Append(piecetable.Author(v.Author), v.Blob)
 		case journal.Op:
+			if v.Pos > uint64(math.MaxInt) || !checkJournalRecs(v.Del, doc.Store()) || !checkJournalRecs(v.Ins, doc.Store()) {
+				return nil
+			}
 			if _, seen := groupTask[v.Group]; !seen {
 				if task := authorTask[v.Author]; task != "" {
 					groupTask[v.Group] = task
@@ -1154,4 +1158,32 @@ func fromJournalPieces(ps []journal.Piece) []piecetable.PieceRec {
 		out[i] = piecetable.PieceRec{Buf: int(p.Buf), Start: int(p.Start), Length: int(p.Length)}
 	}
 	return out
+}
+
+// journalPieceFits reports whether a persisted piece's uint64 span converts to
+// int without changing sign. A value above MaxInt becomes a negative int and
+// would address a slice before its start.
+func journalPieceFits(p journal.Piece) bool {
+	return p.Start <= uint64(math.MaxInt) && p.Length <= uint64(math.MaxInt)
+}
+
+// checkJournalRecs refuses a persisted piece that cannot address its author's
+// store. buildSession calls it before replaying any op, so a crafted log is
+// refused rather than replayed into a slice panic. The bound is addition-free
+// because start+length can overflow.
+func checkJournalRecs(ps []journal.Piece, store *piecetable.Store) bool {
+	for _, p := range ps {
+		if !journalPieceFits(p) {
+			return false
+		}
+		a := piecetable.Author(p.Buf)
+		if int(a) >= store.Authors() {
+			return false
+		}
+		n := store.Len(a)
+		if int(p.Start) > n || int(p.Length) > n-int(p.Start) {
+			return false
+		}
+	}
+	return true
 }

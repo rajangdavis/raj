@@ -39,8 +39,6 @@ is_allowed() {
   case $1 in
     # bin/ — build output: the binary and the Linux cross-build land here.
     bin/*) ;;
-    # .raj/ — raj's own per-workspace state (session, hook store); not source.
-    .raj/*) ;;
     # docs/dev/ — the dev-process docs are deliberately out of the product.
     docs/dev/*) ;;
     # scripts/raj-cycle.sh — the dev cycle driver is out of the product.

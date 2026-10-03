@@ -350,6 +350,29 @@ func TestTooNewSchemaIsRefused(t *testing.T) {
 	}
 }
 
+// TestNegativeSchemaVersionIsRefused pins the medium finding: migrate refused a
+// version newer than this build but not one below zero, and applyMigration
+// indexes migrations[from], so a database recording -1 panicked Open at
+// startup. It must be refused with an error instead.
+func TestNegativeSchemaVersionIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s := mustOpen(t, path)
+	if _, err := s.db.Exec(updateSchemaVersion, -1); err != nil {
+		t.Fatalf("record negative version: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	bad, err := Open(path)
+	if err == nil {
+		bad.Close()
+		t.Fatal("Open accepted a negative schema version")
+	}
+	if !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("Open error = %v; want a refusal naming the negative version", err)
+	}
+}
+
 // TestCloseIsIdempotent covers the second Close: it must be a no-op.
 func TestCloseIsIdempotent(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "state.db"))

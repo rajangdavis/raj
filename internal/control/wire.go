@@ -689,7 +689,8 @@ func EncodeResponse(res Response) (Header, []byte) {
 		Entries:     res.Entries,
 		Land:        res.Land,
 
-		Token: res.Token, SrcVersion: res.SrcVersion, Identity: res.Identity}
+		Token: res.Token, SrcVersion: res.SrcVersion, Identity: res.Identity,
+		Kind: res.Kind}
 	// The hook run stamp and in-memory state are assigned here rather than in
 	// the literal, so the existing literal keeps its alignment and the new
 	// fields read as one group.
@@ -755,7 +756,8 @@ func DecodeResponse(f Frame) (Response, error) {
 		Entries:       f.Header.Entries,
 		Land:          f.Header.Land,
 
-		Token: f.Header.Token, SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity}
+		Token: f.Header.Token, SrcVersion: f.Header.SrcVersion, Identity: f.Header.Identity,
+		Kind: f.Header.Kind}
 	res.HookName = f.Header.HookName
 	res.HookRunID = f.Header.HookRunID
 	res.HookRevision = f.Header.HookRevision

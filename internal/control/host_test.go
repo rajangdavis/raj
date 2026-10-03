@@ -366,7 +366,7 @@ func (h *memHost) Save(path string, force bool) (uint64, error) {
 
 // Reload answers the reload verb with the in-memory disk: memHost has no
 // filesystem, so disk stands in for the bytes raj last read or wrote.
-func (h *memHost) Reload(path string) error {
+func (h *memHost) Reload(path string, author uint8) error {
 	if _, ok := h.docs[path]; !ok {
 		return ErrNoBuffer
 	}
@@ -657,7 +657,7 @@ func (h *memHost) Close(path string) error {
 // real host's close-without-save. It writes nothing: disk keeps the bytes it
 // had, and no Save is called, which is what makes discarding safe for the file
 // the buffer was loaded from.
-func (h *memHost) CloseDiscard(path string) (bool, error) {
+func (h *memHost) CloseDiscard(path string, author uint8) (bool, error) {
 	if _, ok := h.docs[path]; !ok {
 		return false, ErrNoBuffer
 	}
@@ -670,6 +670,106 @@ func (h *memHost) CloseDiscard(path string) (bool, error) {
 	// one.
 	_, remains := h.disk[path]
 	return remains, nil
+}
+
+// A rename into or out of .git is refused for everyone before any proposal is
+// recorded: moving an executable into .git/hooks is a code-execution path.
+func TestGuardRenameRefusesProtectedPaths(t *testing.T) {
+	g, h, p := claimGuard(t, "a.go")
+	old := p["a.go"]
+	if _, _, _, err := g.Claim(FirstAgent, []string{old}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	git := filepath.Join(g.Root(), ".git", "hooks", "pre-commit")
+	if err := g.Rename(old, git, FirstAgent); err == nil || !strings.Contains(err.Error(), "protected") {
+		t.Fatalf("agent rename into .git = %v, want a protected-path refusal", err)
+	}
+	if err := g.Rename(git, filepath.Join(g.Root(), "x.go"), LocalHuman); err == nil || !strings.Contains(err.Error(), "protected") {
+		t.Fatalf("human rename out of .git = %v, want a protected-path refusal", err)
+	}
+	if len(h.renames) != 0 {
+		t.Errorf("a protected rename reached the host: %+v", h.renames)
+	}
+}
+
+// The land mode of the intent door is the human one-gesture approval; an agent
+// reaching it through `intent` is refused in the same words the `land` verb
+// uses. Before the change dispatchIntent gated only publish --approve.
+func TestDispatchIntentLandRefusesAnAgent(t *testing.T) {
+	g, _ := guarded(t)
+	res := Dispatch(g, Request{Op: "intent", Author: FirstAgent,
+		HookJSON: `{"mode":"land","task":"t"}`})
+	if res.OK || res.Err == "" {
+		t.Fatalf("agent intent land = %+v, want a refusal", res)
+	}
+	if !strings.Contains(res.Err, "one-gesture approval") {
+		t.Errorf("refusal = %q, want the land contract wording", res.Err)
+	}
+}
+
+// The human may still reach `intent land`: it passes the gate and reaches the
+// host, which reports its own missing implementation rather than the refusal.
+func TestDispatchIntentLandAllowsAHuman(t *testing.T) {
+	g, _ := guarded(t)
+	res := Dispatch(g, Request{Op: "intent", Author: LocalHuman,
+		HookJSON: `{"mode":"land","task":"t"}`})
+	if strings.Contains(res.Err, "one-gesture approval") {
+		t.Fatalf("human intent land was refused by the gate: %+v", res)
+	}
+}
+
+// proveprep is the internal two-phase op behind `intent prove`; a raw intent
+// frame must not reach it, so it cannot ask for a scratch tree.
+func TestDispatchIntentRefusesTheProveprepMode(t *testing.T) {
+	g, _ := guarded(t)
+	res := Dispatch(g, Request{Op: "intent", Author: FirstAgent,
+		HookJSON: `{"mode":"proveprep","name":"X"}`})
+	if res.OK || !strings.Contains(res.Err, "internal") {
+		t.Fatalf("wire proveprep = %+v, want the internal refusal", res)
+	}
+}
+
+// `intent prove` over the real socket goes through the one hook runner: the
+// check hook runs in the materialised seam, the run is recorded in the shared
+// hook log with a run id, and the proof is the runner verdict rather than a
+// direct exec on the event thread.
+func TestIntentProveRunsThroughHookRunner(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	ed := newFakeEditor(t, map[string]string{"/w/a.go": "x\n"})
+	ed.mu.Lock()
+	ed.policyMem.hooks = []HookRow{{Name: "check",
+		Action: `["sh","-c","touch ` + marker + `"]`, Trigger: "agent", Agent: true, Enabled: true}}
+	ed.mu.Unlock()
+
+	out, errs, code := run(t, "intent", "prove", "X")
+	if code != 0 {
+		t.Fatalf("intent prove exited %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "pass") || !strings.Contains(out, "X") {
+		t.Errorf("prove output = %q, want a passing proof for X", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the check hook did not run through the runner: %v", err)
+	}
+	runs := ed.srv.HookLog.List()
+	if len(runs) == 0 {
+		t.Fatal("the proof was not recorded in the hook run log")
+	}
+	last := runs[len(runs)-1]
+	if last.Hook != "check" || last.Exit != 0 || last.ID == 0 {
+		t.Errorf("run log = %+v, want a check run with an id and exit 0", last)
+	}
+}
+
+// ProveTree is the fake host stand-in: it returns a fresh empty directory so a
+// prove prep has somewhere to point. Tests that need a real seam use the app
+// package harness, where ProveTree goes through git.
+func (h *memHost) ProveTree(name string) (string, string, error) {
+	dir, err := os.MkdirTemp("", "raj-prove-")
+	if err != nil {
+		return "", "", err
+	}
+	return dir, "tree-" + name, nil
 }
 
 func guarded(t *testing.T) (*Guard, *memHost) {
@@ -2215,10 +2315,11 @@ func TestClaimRefusesPathsOutsideRoot(t *testing.T) {
 	}
 }
 
-// A rename is claim-gated on the OLD name and moves the working set with it, so
-// the claim names the file that exists after the rename. No read-before-write
-// is required: no offset is at stake.
-func TestGuardRenameMovesTheClaimSet(t *testing.T) {
+// An agent's rename is a proposal: nothing moves on disk until a human
+// approves, and the claim set follows only then. This is the D-A1 pin; before
+// the change the Guard called Host.Rename at once. A rename is claim-gated on
+// the OLD name, and no read-before-write is required: no offset is at stake.
+func TestGuardRenameProposesForAnAgent(t *testing.T) {
 	g, h, p := claimGuard(t, "a.go")
 	old, newPath := p["a.go"], filepath.Join(g.Root(), "b.go")
 	if _, _, _, err := g.Claim(FirstAgent, []string{old}, false, false); err != nil {
@@ -2226,6 +2327,13 @@ func TestGuardRenameMovesTheClaimSet(t *testing.T) {
 	}
 	if err := g.Rename(old, newPath, FirstAgent); err != nil {
 		t.Fatalf("rename: %v", err)
+	}
+	if len(h.renames) != 0 {
+		t.Fatalf("an agent's rename moved the file: %+v", h.renames)
+	}
+	// The human approves: now it moves and the working set follows.
+	if err := g.ApproveRename(old, newPath, LocalHuman); err != nil {
+		t.Fatalf("approve: %v", err)
 	}
 	if len(h.renames) != 1 || h.renames[0].old != old || h.renames[0].new != newPath {
 		t.Errorf("host got %+v, want %s -> %s", h.renames, old, newPath)
@@ -2293,7 +2401,7 @@ func TestGuardRenameAllowsACaseOnlyChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(g.Root(), "A.go")
-	if err := g.Rename(p["a.go"], dst, FirstAgent); err != nil {
+	if err := g.Rename(p["a.go"], dst, LocalHuman); err != nil {
 		t.Fatalf("case-only rename: %v", err)
 	}
 	if len(h.renames) != 1 || h.renames[0].new != dst {
@@ -2306,7 +2414,7 @@ func TestDispatchRename(t *testing.T) {
 	g, h, p := claimGuard(t, "a.go")
 	old, newPath := p["a.go"], filepath.Join(g.Root(), "b.go")
 	Dispatch(g, Request{Op: "claim", Author: FirstAgent, Paths: []string{old}})
-	res := Dispatch(g, Request{Op: "rename", Path: old, NewPath: newPath, Author: FirstAgent})
+	res := Dispatch(g, Request{Op: "rename", Path: old, NewPath: newPath, Author: LocalHuman})
 	if !res.OK {
 		t.Fatalf("dispatch rename = %+v", res)
 	}

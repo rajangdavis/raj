@@ -116,6 +116,7 @@ var verbs = []verb{
 	// connection.git ask the event thread for these in-process; no header
 	// spells them, so wire 0.
 	{name: "hookprep", handle: dispatchHookPrep},
+	{name: "proveprep", handle: dispatchProvePrep},
 	{name: "searchsnapshot", handle: dispatchSearchSnapshot},
 	// gitprep is the event-thread half of git: it resolves the read-only
 	// service, and connection.git runs the query off the thread. No program

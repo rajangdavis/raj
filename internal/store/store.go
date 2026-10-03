@@ -308,6 +308,9 @@ func migrate(db *sql.DB) error {
 	if version > schemaVersion {
 		return fmt.Errorf("store: schema version %d is newer than this build supports (%d): refusing to downgrade", version, schemaVersion)
 	}
+	if version < 0 {
+		return fmt.Errorf("store: schema version %d is negative: refusing to migrate", version)
+	}
 	for v := version; v < schemaVersion; v++ {
 		if v >= len(migrations) {
 			return fmt.Errorf("store: no migration from version %d (current %d)", v, schemaVersion)
@@ -323,6 +326,9 @@ func migrate(db *sql.DB) error {
 // version in the same transaction, so a crash leaves the database at the old
 // version with no partial step committed.
 func applyMigration(db *sql.DB, from int) error {
+	if from < 0 || from >= len(migrations) {
+		return fmt.Errorf("store: no migration from version %d", from)
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("store: migrate v%d: begin: %w", from, err)

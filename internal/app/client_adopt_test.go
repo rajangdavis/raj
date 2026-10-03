@@ -100,11 +100,13 @@ func TestClientAdoptsHostProposal(t *testing.T) {
 	if pending := pane.File.Session().Pending(); len(pending) == 0 {
 		t.Error("the adopted tab has no pending set")
 	}
-	// Make the adopted tab active, draw so the handle has a row, then open the
-	// drawer: the review gate reads the active pane pending count, and the
-	// panel only exists while the drawer is open.
+	// Make the adopted tab active, draw so the handle has a row, then enter
+	// Review and open the drawer: the review gate reads the active pane's
+	// pending count and the mode, and the panel only exists while the drawer
+	// is open. Review is entered deliberately; the client default is Edit.
 	ch.cli.Tabs.Focus(pane)
 	ch.cli.Draw()
+	ch.cli.EnterReview()
 	openPhoneDrawer(ch.cli)
 	found := false
 	for _, b := range ch.cli.drawerPanel {

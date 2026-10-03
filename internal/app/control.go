@@ -414,9 +414,9 @@ func (h host) Buffers() []control.Buffer {
 	panes := append(append([]*editor.Pane{}, h.a.Tabs.All()...), h.a.headless...)
 	out := make([]control.Buffer, 0, len(panes))
 	for _, p := range panes {
-		// A read-only view is a local artifact of a diff pane, keyed on a
-		// synthetic .raj-seam path that names nothing a socket client could
-		// read. It is not a file's text, so it is not a buffer on the wire.
+		// A read-only view is a local artifact of a seam pane, keyed on a
+		// synthetic path that names nothing a socket client could read. It
+		// is not a file's text, so it is not a buffer on the wire.
 		if p.File.IsReadOnly() {
 			continue
 		}
@@ -795,9 +795,52 @@ func (h host) Close(path string) error {
 // closeDoc forgets the journal, the LSP document and the diagnostics the same
 // way an ordinary close does. It deliberately skips the dirty guard Close
 // keeps, which is the point — the caller has decided to drop the work.
-func (h host) CloseDiscard(path string) (bool, error) {
+// foreignRunAuthor returns the first author of an unsaved run in p that is not
+// author, and whether one exists. Base text (piecetable.Original) is not
+// unsaved and is ignored. It is the D-A2 check: reload and close --discard may
+// drop only the caller's own unsaved text.
+func foreignRunAuthor(p *editor.Pane, author uint8) (uint8, bool) {
+	comp := p.File.Session().Project(piecetable.Annotated)
+	text := comp.Text()
+	for _, s := range comp.Buffer().Spans(0, len(text)) {
+		if s.Len <= 0 || s.Author == piecetable.Original {
+			continue
+		}
+		if uint8(s.Author) != author {
+			return uint8(s.Author), true
+		}
+	}
+	return 0, false
+}
+
+// refuseForeignText refuses when p holds an unsaved run the caller did not
+// write. Reload and close --discard discard unsaved text, so an agent may drop
+// only its own; any of the user's text (or another writer's) is a refusal with
+// the reason, naming the user when the run is a person's.
+func (h host) refuseForeignText(p *editor.Pane, author uint8) error {
+	if h.a.authorIsHuman(author) {
+		// A person may reload or discard their own workspace, including text
+		// typed at the keyboard as another human row: the refusal exists to
+		// keep an agent from dropping the user's text, not to stop the user.
+		return nil
+	}
+	id, ok := foreignRunAuthor(p, author)
+	if !ok {
+		return nil
+	}
+	who := fmt.Sprintf("author %d", id)
+	if h.a.authorIsHuman(id) {
+		who = "the user"
+	}
+	return fmt.Errorf("%s holds unsaved text written by %s; reload and close --discard may drop only the caller's own unsaved text", p.File.Name(), who)
+}
+
+func (h host) CloseDiscard(path string, author uint8) (bool, error) {
 	p, err := h.find(path)
 	if err != nil {
+		return false, err
+	}
+	if err := h.refuseForeignText(p, author); err != nil {
 		return false, err
 	}
 	// No dirty check: discarding the unsaved edits is the point, and the
@@ -873,6 +916,12 @@ func (h host) Mkdir(path string) error {
 // on-disk bytes and the buffer would otherwise be reconciled by nobody.
 func (h host) Rename(old, new string) error {
 	old, new = h.canonicalPath(old), h.canonicalPath(new)
+	if err := control.CheckProtected(old); err != nil {
+		return err
+	}
+	if err := control.CheckProtected(new); err != nil {
+		return err
+	}
 	p, err := h.find(old)
 	if err != nil {
 		// Not open: nothing follows the name but the file itself.
@@ -923,7 +972,7 @@ func renameFile(old, new string) error {
 	if !strings.EqualFold(old, new) || old == new {
 		return os.Rename(old, new)
 	}
-	tmp := new + ".raj-rename"
+	tmp := new + ".rename-tmp"
 	if err := os.Rename(old, tmp); err != nil {
 		return err
 	}
@@ -2122,12 +2171,17 @@ func saveRefusal(err error) (string, []uint64) {
 }
 
 // Reload takes the version on disk for a buffer, matching the editor Reload
-// gesture. The socket has no human to ask, so it never prompts: a dirty buffer
-// is reloaded and its unsaved changes are discarded, and the status line says
-// so.
-func (h host) Reload(path string) error {
+// gesture. The socket has no human to ask, so it never prompts: a buffer whose
+// unsaved runs are all the caller's own is reloaded and those runs are
+// discarded, and the status line says so. A buffer holding the user's text (or
+// another writer's) is refused by refuseForeignText, so an agent cannot drop
+// text it did not write.
+func (h host) Reload(path string, author uint8) error {
 	p, err := h.find(path)
 	if err != nil {
+		return err
+	}
+	if err := h.refuseForeignText(p, author); err != nil {
 		return err
 	}
 	dirty := p.File.ViewDirty()

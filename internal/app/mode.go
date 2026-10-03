@@ -34,6 +34,14 @@ func (a *App) toggleReview() {
 		// belong to the review surface, and a walk left armed would keep
 		// intercepting accept/reject in Edit mode.
 		a.walk = nil
+		if a.attachedAsAgent {
+			// This client was not granted the human kind, so leaving the
+			// read-only gate is allowed but its edits still land as the
+			// daemon's proposals, not as its own accepted text. The status
+			// must keep saying so.
+			a.status = attachAgentEditNote
+			return
+		}
 		a.status = "edit mode"
 		return
 	}
@@ -128,8 +136,9 @@ func (a *App) reviewRefuses(action keys.Action, text string) bool {
 // the whole surface, and a read-only view gates the one buffer it is: a seam
 // diff pane holds no file's bytes, so no keystroke may change it. An attached
 // client is not read-only -- its local edits are forwarded to the daemon as
-// the human's own accepted text -- so leaving Review is what makes an ordinary
-// buffer editable.
+// the human's own accepted text -- so a human-kind attach starts in Edit mode;
+// a non-human (TCP) attach starts in Review, and entering Review from anywhere
+// makes an ordinary buffer read-only until the chord leaves it.
 func (a *App) readOnly() bool {
 	if a.mode == ModeReview {
 		return true

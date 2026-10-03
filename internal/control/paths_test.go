@@ -1,6 +1,10 @@
 package control
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // A multi-pair RAJ_ROOT_MAP maps each local mount to its own editor root, so a
 // container with two bind mounts does not have to pretend the tree is one.
@@ -111,5 +115,30 @@ func TestRootsClearsOnSetLessReply(t *testing.T) {
 	}
 	if got := c.Roots(); got != nil {
 		t.Errorf("Roots() = %q after a set-less reply, want nil", got)
+	}
+}
+
+// The reachability boundary for the attach-root collapse: a same-machine
+// client's daemon root exists on disk, so no mapping is inferred and a path
+// already means the daemon's file. The collapse the attach bug feared -- the
+// daemon root rebased onto the launch root, leaving the adopted set identical
+// to the launch set -- needs an inferred pair, and inference only runs when no
+// daemon root resolves locally: then the local workspace root is the intended
+// stand-in for a mount, which is the container case the mapper exists for.
+func TestInferMapperIsIdentityWhenTheDaemonRootExistsLocally(t *testing.T) {
+	launch := t.TempDir()
+	daemonRoot := filepath.Join(launch, "A")
+	if err := os.MkdirAll(daemonRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := inferMapper(launch, []string{daemonRoot})
+	if m.Active() {
+		t.Fatalf("inferred %q across a daemon root that exists here", m)
+	}
+	// The daemon path is unchanged in both directions, so nothing can collapse
+	// it onto the launch root.
+	doc := filepath.Join(daemonRoot, "a.go")
+	if got := m.FromEditor(doc); got != doc {
+		t.Errorf("FromEditor(%q) = %q, want it unchanged", doc, got)
 	}
 }

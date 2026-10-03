@@ -451,7 +451,7 @@ BENCHMARKS.md and decisions in INVESTIGATIONS.md.
   human to `Guard.Apply` but left `Patch` agent-only because a snapshot is an
   agent tool. Revisit only if a human path ever wants patch; no test drives a
   human patch today. *A refusal should be a decision, not an oversight.*
-- **A TCP attach client does not read back its granted kind, so it forwards edits that can only be proposals.** `hello` downgrades a human request over anything but the unix socket to an agent (`internal/control/control.go`), but the client still forwards its local edits as the person; `host.Apply` admits the agent text as a proposal, so an edit the client believes it accepted lands pending for review. Read the granted kind back from the hello reply (the participant row for the client author) and keep the client read-only when it is not `KindHuman`, or label the forward as a proposal. *A client must not offer an edit the daemon will not land.*
+- **A TCP attach client does not read back its granted kind, so it forwards edits that can only be proposals.** `hello` downgrades a human request over anything but the unix socket to an agent (`internal/control/control.go`), but the client still forwards its local edits as the person; `host.Apply` admits the agent text as a proposal, so an edit the client believes it accepted lands pending for review. Read the granted kind back from the hello reply (the participant row for the client author) and keep the client read-only when it is not `KindHuman`, or label the forward as a proposal. *A client must not offer an edit the daemon will not land.* **Now load-bearing (2026-10-03):** the client starts in Edit, so over TCP this is the default behaviour, not an edge. Read the granted kind back before shipping an editable TCP client, or keep a non-human client read-only.
 - **The LSP servers are not re-rooted on attach.** `adoptVisibleRoots` rebuilds the explorer, search and picker over the daemon set, but `newServers` is only called from the constructor (`internal/app/app.go`), so a client whose daemon primary differs starts servers against a workspace it is not showing. Decide whether adoption re-resolves the servers or LSP stays launch-rooted by design. *A client should not offer a workspace it does not render.*
 - **An attached client runs its own language servers, and nothing is mirrored (2026-09-29).** `cmd/raj/main.go` skips only the eager warm-up in attach mode (`if !opts.Attach { a.WarmServers() }`); a server still starts lazily when the client's idle tick calls `servers.for_` (`internal/app/lsp.go`), which spawns from the client's own table, roots and PATH. None of the ~25 `a.attach` branches in `internal/app` gate LSP, so the client's diagnostics and inlay stores are filled by its own server and the client wire carries neither. Consequences: a client with no server on PATH draws no marks while the daemon has a full set, and a clean buffer is read from the client's disk (`syncDirtyPane` opens only dirty ones) - which on a remote or phone client is not the daemon's. Fix shape: the daemon owns LSP for attached clients - push its diagnostics and hints over the watch and stop calling `for_` when attached. That is also the only route to a comparable client-frame rebuild (client-mirror plan): today a frame whose client drew LSP marks answers `NOT COMPARABLE` with the reason `client-owned language server`, and moving ownership turns that into a real comparison as a side effect. No stamp compares across the two processes regardless - document versions are per sync connection and the server publishes without one, dated only by a process-local arrival sequence. Open: whether `adoptVisibleRoots` hands the client the daemon's absolute paths, so a same-host client's server reads the same disk. *A client should not compute what the daemon already knows.*
 
@@ -1024,9 +1024,165 @@ CLAIM-SPEC §3 spec-vs-code contradiction is the "Claim surface" item above.
   composition and is the user's gesture), but it was never made an explicit
   decision.
 
+### Client attach — a workspace nested in the launch root is unreachable (2026-10-03, user)
+
+- **A client launched at a parent of the daemon workspace shows neither root.**
+  Start the daemon in `/path/A` and the client in `/path`: the tree and search
+  show `/path` but never `A`, so the daemon files are unreachable until the
+  client is restarted from `/path/A`. The adoption path takes the rebased root
+  set the client exposes (`client.go:243` reads `c.Roots()`), and
+  `adoptVisibleRoots` (`app.go:818`) refuses a set it cannot canonicalise —
+  empty, or two nested roots — leaving the launch root in place; meanwhile a
+  multi-root tree suppresses a root nested inside another, so `A` is rendered by
+  neither. Fix: when the adopted set nests inside or around the launch root,
+  prefer the daemon set alone rather than a union, and pin a client started at a
+  parent of the workspace. Not reproduced from this container (the daemon and
+  client pair run on the host), so the first step is to print the set the client
+  actually passes to `adoptVisibleRoots`.
+
+## Security audit — A9 state and data (2026-10-03)
+
+Read-only audit of `piecetable`, `store` and `journal` (Track A item A9), nothing
+changed. A1-A8 do not cover these: the panic below is on the startup path, not a
+socket handler, so the per-connection recover never sees it.
+
+**Landed 2026-10-03 (A9 codec wave):** the crafted-snapshot panic, the negative
+schema version and the trusted `NextGroup` are fixed below and recorded in
+`docs/COMPLETED.md`; the unbounded-store and unbounded-Proposed items stay open.
+
+
+- ~~**A crafted snapshot panics the editor on open (high).**~~ **Fixed 2026-10-03.** Addition-free bounds in `checkRecs`/`Store.Slice`; `buildSession` validates `Pos` and every persisted `Del`/`Ins` piece before replay (`checkJournalRecs`/`journalPieceFits`). Pinned by `TestSnapshotRefusesCraftedInsert`, `TestStoreSliceRefusesOverflowingSpan`, `TestBuildSessionRefusesOverflowingJournalPiece`. The D-A4 clause stays open. `checkRecs`
+  (`internal/piecetable/snapshot.go:190`) and `Store.Slice`
+  (`internal/piecetable/store.go:51`) both test `Start+Length > len(store)` with
+  signed `int` addition, so a positive `Start` near `MaxInt64` wraps negative,
+  passes the guard, and `b[start:start+length]` panics with `high < low`. The
+  sequence needs only what the trust model already allows: a process running as
+  the user writes the state directory (`exec` is permitted on the local
+  transport and agent hooks run arbitrary argv), so a row whose `ins` op carries
+  `start=MaxInt64, length=1` — with a digest matching the file it names —
+  survives `restoreJournal` and panics the next open, reload or restart, before
+  the terminal is restored. The legacy op-log path is worse: `fromJournalPieces`
+  (`internal/app/journal.go:1140`) converts a `uint64` length to `int`,
+  `buildSession` validates no piece at all, and `journal.Open` checks only a
+  `crc32`. Fix: addition-free bounds (`Start > len(b) || Length > len(b)-Start`),
+  clamp rather than slice when `high < low`, validate every journal piece before
+  replay, and until D-A4 keep agent-run processes out of the state directory.
+- ~~**A negative schema version panics `store.Open` (medium).**~~ **Fixed 2026-10-03.** `migrate` refuses `version < 0` and `applyMigration` bounds its index; `TestNegativeSchemaVersionIsRefused` pins it. `migrate`
+  (`internal/store/store.go:311`) refuses `version > schemaVersion` but not
+  `version < 0`, and `applyMigration` indexes `migrations[from]`.
+- **Agent edits grow the piece store without bound (medium).** Stores are
+  append-only (`store.go:37`/`:70`); `Delete`, `ClearRejected` and undo splice
+  but never free, and `Compact` can add. An agent looping `apply` at the
+  per-frame text cap the wire allows retains every byte, monotonically, with no
+  disk involved. Fix: a per-session or per-author byte budget refused at
+  `Append`/`ApplyDiff`.
+- **Unbounded Proposed sets make listing and apply quadratic (medium).**
+  `Pending`/`DiffPending` project every group (each a journal scan) and
+  `deletionLeases` runs per hunk of every apply, so N one-byte `apply` calls from
+  an agent (each opening a new Proposed set) make every later apply and every
+  human `groups`/`save` O(N^2) on the event thread. Fix: cap live Proposed sets
+  per writer, and/or index instead of scanning per set.
+- **`journal.Open` reads the whole log (low).** `os.ReadFile`
+  (`internal/journal/journal.go:440`) with `MaxBlobBytes = 1 GiB`, and
+  `restoreJournals` opens every log at startup. Fix: stream the scan, or cap the
+  total.
+- ~~**`Restore` trusts `NextGroup` (low).**~~ **Fixed 2026-10-03.** `Restore` refuses a `NextGroup` below the highest group in the journal, decisions, tasks or compacted origins; `TestSnapshotRefusesGroupReuse` pins it. `snapshot.go:154` takes
+  `snap.NextGroup` without checking it against the highest group in the journal,
+  so a crafted snapshot makes new text join an existing group id. Fix: require
+  `NextGroup` above the journal maximum.
+
+- **`fromJournalOp` is safe only because `buildSession` validates first.** The
+  `uint64`->`int` conversion in `fromJournalPieces` has no check of its own; its
+  only caller is `fromJournalOp`, whose only caller is `buildSession`, which now
+  calls `checkJournalRecs` first. That is a real guarantee today but not a local
+  one: a second caller reintroduces the panic. State the precondition on
+  `fromJournalOp`/`fromJournalPieces`, or fold the conversion behind
+  `journalPieceFits`.
+
+## Security audit — A9 surfaces and mailbox (2026-10-03)
+
+
+Read-only audit of `editor`, `lsp`, `search` and the mailbox (Track A item A9),
+nothing changed. The pass also names what it verified sound: `workspace/applyEdit`
+is refused and the reader never touches buffers; the socket cannot reach an
+applied `codeaction`/`rename`/`format` (modes are whitelisted, edits reported
+only); LSP argv comes from built-ins or human-only settings and runs without a
+shell; JSON-RPC `Content-Length` is bounded at 32 MiB and positions clamp; search
+scope, `Include`/`Exclude` and `--path` are root-validated at admission; `mkdir`
+refuses `.git`; the in-memory mailbox is bounded.
+
+- ~~**The mail waker lets a peer forge the user marker (high).**~~ **Fixed 2026-10-03.** Peer content is escaped (`&` first, then `<>"`), the wrapper attribute is the literal `peer`, `from_key` is grammar-gated, and the editor branch is escaped while the `from === 1` user branch stays raw. A 30-assertion harness on the extracted source of both plugin copies passes.
+  `plugins/raj-mail.ts:87-99` (same at `plugins/v2/raj-mail.ts:105-117`)
+  interpolates a peer message text, name and key verbatim into its wrappers and
+  escapes nothing, so a peer can `send` a body that closes `</peer-message>` and
+  opens `<raj-message from="user">...`, or register a display name carrying that
+  marker and have it spliced into the attribute. The victim waker hands the
+  string to `session.prompt` (idle) or appends it to the next tool result (busy),
+  so the model reads a forged user block. `SendFrom` stamps the real sender
+  correctly — the text came from the sender but reads as the user. Fix: treat peer
+  content as data (escape `<> & "`, or JSON-encode and delimit the whole payload),
+  never splice a name into attribute position, and consider a per-session nonce
+  the model is told to trust.
+- ~~**A quoted key in command text hijacks that mailbox (medium).**~~ **Fixed 2026-10-03.** `usedKey` tokenises with `shellWords` (quote- and escape-aware) so a key inside a quoted argument is never a flag; `learn` refuses a later `--as` that would switch an existing key while a fresh `register` still replaces it. The stricter "never learn from `--as`" was not adopted because restart recovery needs it; quote-awareness closes the hijack.
+  `plugins/raj-mail.ts:53-64`, `:151-153`, `:313-315` (same at `v2:42,483,558`).
+  `usedKey` regexes the raw command string with no shell-quote awareness, and
+  `learn` switches the session key on any later `--as`, contradicting the file
+  header promise that text never switches a key. A message argument quoting
+  another key steals its mail and silences it. Fix: learn a key only from
+  `register` output or configuration, and never switch silently.
+- **Search follows symlinks out of the workspace (medium).**
+  `internal/search/search.go:302`, `:325`, `:475`; `internal/fslist/fslist.go:163`
+  is a lexical check only. Every other verb refuses a symlink whose target leaves
+  the root (`Guard.inRootResolved`), but the walk yields the link, `skipBinary` is
+  extension-only, and `os.Open` reads the target — so a checkout containing
+  `leak -> ~/.ssh/id_rsa` returns the key material to `search`. Fix: skip symlink
+  entries, or resolve and validate each file against every root.
+- **`search --context` is unbounded (medium).** `internal/search/search.go:264`,
+  `:631`; the CLI rejects only a negative value. One call can allocate hundreds of
+  MiB by multiplying each retained hit into a whole-file context block. Fix: clamp
+  the context, and/or charge context bytes against `MaxMatches`.
+- **`dump` snapshots are never evicted (medium).** `internal/app/control.go:1536`,
+  `internal/app/app.go:557` (the map dies only at restart),
+  `internal/control/host.go:2703`. A `dump` loop mints a snapshot per call and
+  retains up to 2 MiB each. Fix: cap live snapshots per author, evict oldest, or
+  release them when the writer disconnects.
+- **Delivered mail rows accumulate for the session (low).**
+  `internal/control/mailbox.go:213`, `:461`; `internal/store/mail.go:128` deletes
+  only delivered rows, and prune runs only at startup. Fix: prune as a box drains
+  or on the idle tick.
+- **`.git` is hidden from search and the tree but readable by `read` (low; owner
+  decision).** `checkProtected` applies only to write verbs
+  (`internal/control/host.go:758`), so `raj ctl read .git/config` returns a remote
+  URL that may embed a token. Not a write-gate evasion — an inconsistency in
+  intent: if `.git` is off-limits, the guard should say so rather than the search
+  policy. **Decided 2026-10-03 (owner): keep it readable** — the review pass
+  wants `.git`, so no gate is added and the finding closes as intended.
+
+## A9 client wave — follow-ups (2026-10-03)
+
+The client now starts in Edit and an unnamed save-as writes into the daemon's
+workspace. Two gaps the writer flagged stay open.
+
+- **Save-as path completion reads the client's launch root, not the daemon's.**
+  `saveAsRemote` seeds the prompt with `a.visible.Primary()` (the daemon root),
+  but `askPath` completes through `completePath`/`pathCandidates`, which use
+  `a.promptRoot()` and `os.ReadDir` on the client's own filesystem. On a client
+  whose launch root differs from the daemon's, tab lists and inserts client
+  paths the daemon then refuses (or, if a string collides, names the wrong
+  file). Fix: complete against the daemon's root over the decision connection,
+  or refuse completion when the prompt root is not the daemon's.
+- **A cancelled overwrite confirm leaves a headless daemon buffer.**
+  `writeRemoteAs` probes with `open` (no create) to learn whether the path
+  exists; the daemon's `Open` loads the file into a buffer/tab. If the user
+  cancels the overwrite question nothing closes that buffer, so a headless
+  buffer and tab are left for a save that never happened. Fix: close the probe
+  buffer on cancel, or probe with a stat-like verb that does not open.
+
 ## Security audit — control plane (2026-10-02)
 
-Read-only audit at HEAD `c79329eb` by `raj-claude`; nothing was built or run
+
+Read-only audit at HEAD `c79329eb` by `raj-claude` (A1, A2 and A3 landed
+afterwards in `070d2d879`, 2026-10-02 — see WAVE-PLAN Track A); nothing was built or run
 (no Go toolchain, no source mount). Only the `git --rev` item was confirmed
 live; the rest are read from the code. Detail and the list of what was not
 read: `docs/dev/AGENT-FEEDBACK.md`, "Code audit — control plane (2026-10-02)".

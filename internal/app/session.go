@@ -2,14 +2,12 @@ package app
 
 import (
 	"math"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"raj/internal/editor"
-	"raj/internal/hidden"
 	"raj/internal/session"
 )
 
@@ -177,9 +175,8 @@ func (a *App) SaveSession() error {
 		return nil
 	}
 	if a.state == nil {
-		// No store: nowhere to persist. The legacy session.json is read by the
-		// one-shot migration but nothing writes it any more, so this is a
-		// no-op rather than a resurrected file fallback.
+		// No store: nowhere to persist. The store is the only source, so
+		// this is a no-op rather than a file fallback.
 		return nil
 	}
 	st := a.SessionState()
@@ -205,154 +202,23 @@ func (a *App) CloseState() {
 	_ = a.state.Close()
 }
 
-// migrateState moves a workspace's legacy .raj state into the XDG state
-// directory the first time a build that keeps state there runs. The store
-// database, the op logs and the trash all move; .raj/hidden is workspace
-// config, not state, and is left for migrateHiddenConfig to copy.
-//
-// It is best-effort and runs before the store opens: the destination is created
-// first, a move whose destination already exists is skipped (which also absorbs
-// a race with another instance migrating at once), and a move that fails leaves
-// the legacy file in place and returns the first error. The caller continues
-// against the new location rather than failing to start.
-//
-// The database's WAL and SHM sidecars move after state.db, and only if the
-// database itself moved: a sidecar without its database is worse than leaving
-// it behind. A crashed writer's sidecars therefore travel with it, and the
-// migrated database keeps its un-checkpointed transactions.
-func migrateState(roots []string) error {
-	dir := session.StateDirForRoots(roots)
-	primary := ""
-	if len(roots) > 0 {
-		primary = roots[0]
-	}
-	legacy := session.Dir(primary)
-	if dir == "" || legacy == "" {
-		return nil
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	var firstErr error
-	note := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	// moveOne relocates one entry and reports whether it moved anything, so
-	// the database's sidecars can be gated on the database itself: a WAL or
-	// SHM that arrived without its database would be worse than leaving it.
-	moveOne := func(name string) bool {
-		src := filepath.Join(legacy, name)
-		dst := filepath.Join(dir, name)
-		if _, err := os.Stat(src); err != nil {
-			return false // nothing legacy of this kind
-		}
-		if _, err := os.Stat(dst); err == nil {
-			return false // already migrated, or another instance got there first
-		}
-		if err := os.Rename(src, dst); err != nil {
-			if os.IsExist(err) || os.IsNotExist(err) {
-				return false // another instance won the race
-			}
-			note(err)
-			return false
-		}
-		return true
-	}
-	if moveOne("state.db") {
-		// The WAL and SHM are part of the database. They follow it only after
-		// the database itself has moved, and each is best-effort: a missing or
-		// already-moved sidecar is not an error, and one that will not move is
-		// reported once and left for inspection.
-		moveOne("state.db-wal")
-		moveOne("state.db-shm")
-	}
-	moveOne("logs")
-	moveOne("trash")
-	return firstErr
-}
+// Nothing in a checkout is adopted as host state: the store is the only
+// source, and seeding host state from a repository must not be possible
+// (D-A3).
 
-// migrateHiddenConfig copies a workspace's legacy .raj/hidden configuration
-// into the XDG workspace file the first time a build that reads it there runs.
-// It is the config counterpart of migrateState, and differs in two ways: it
-// copies rather than moves, so a build rolled back to the old path still finds
-// its config and the legacy file is left in place, and it never overwrites a
-// destination that already exists, so a config already written — by this
-// migration or by the user — wins over a stale legacy one.
-//
-// Best-effort, like migrateState: no legacy file, no destination (no home), or
-// a failure leaves the editor running against whatever configuration it could
-// read, and the caller reports the failure on the status line rather than
-// refusing to start.
-func migrateHiddenConfig(roots []string) error {
-	dst := hidden.WorkspaceFile(roots)
-	if dst == "" {
-		return nil
-	}
-	primary := ""
-	if len(roots) > 0 {
-		primary = roots[0]
-	}
-	if primary == "" {
-		return nil
-	}
-	legacy := filepath.Join(session.Dir(primary), "hidden")
-	data, err := os.ReadFile(legacy)
-	if err != nil {
-		return nil // nothing legacy to migrate
-	}
-	if _, err := os.Stat(dst); err == nil {
-		return nil // already migrated, or another instance got there first
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0o600)
-}
-
-// loadSession reads the remembered state, preferring the store and adopting a
-// session.json left by an older build. A store that is absent or unreadable
-// degrades to the file: persistence is a convenience, never a reason not to
+// loadSession reads the remembered state from the store. The store is the
+// only source. A store that is absent or unreadable is an empty
+// session, because persistence is a convenience and never a reason not to
 // start.
 func (a *App) loadSession() session.State {
 	if a.state == nil {
-		return session.LoadForRoots(a.roots.All())
+		return session.State{}
 	}
 	blob, ok, err := a.state.Session()
-	if err != nil {
-		// A store read that failed still leaves the file as a source, so the
-		// session is not lost to a database problem.
-		return session.LoadForRoots(a.roots.All())
-	}
-	if ok {
-		// The store is the source of truth now, so a session.json left behind
-		// by an earlier migration (or one whose os.Remove failed) would
-		// otherwise linger forever. Best-effort and harmless if it will not go.
-		if path := session.File(a.primaryRoot()); path != "" {
-			_ = os.Remove(path)
-		}
-		return session.DecodeForRoots(blob, a.roots.All())
-	}
-	// No stored session: adopt a session.json from before the store. The
-	// store is populated before the file is removed, so a crash between the
-	// two migrates again rather than losing the state.
-	path := session.File(a.primaryRoot())
-	if path == "" {
+	if err != nil || !ok {
 		return session.State{}
 	}
-	if _, err := os.Stat(path); err != nil {
-		return session.State{}
-	}
-	st := session.LoadForRoots(a.roots.All())
-	if blob, err := session.Encode(st); err == nil {
-		if a.state.PutSession(blob) == nil {
-			// Best-effort: a file that will not go is re-migrated next time,
-			// which is harmless.
-			_ = os.Remove(path)
-		}
-	}
-	return st
+	return session.DecodeForRoots(blob, a.roots.All())
 }
 
 // rememberPosition records where a pane was before it is dropped. An unnamed

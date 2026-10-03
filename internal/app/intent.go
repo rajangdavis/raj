@@ -51,6 +51,11 @@ func (h host) Intent(payload string) (string, error) {
 	return string(out), nil
 }
 
+// ProveTree bridges ProveTree to the app: the event-thread half of `intent
+// prove`, which materialises the seam and hands the directory to the hook
+// runner. It touches no track policy of its own.
+func (h host) ProveTree(name string) (string, string, error) { return h.a.proveTree(name) }
+
 // runIntent dispatches one intent subcommand. Intentions live in the workspace
 // store; the projection and the object writes come from the live buffers and
 // internal/git, so an export sees unsaved proposals.

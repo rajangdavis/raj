@@ -36,6 +36,12 @@ type Client struct {
 	// author is the id the editor assigned this connection, learned from the
 	// first response rather than asked for.
 	author atomic.Uint32
+	// kind is the participant kind the editor granted this connection, learned
+	// from the hello reply the way author is learned from the first response.
+	// It stores a string because Kind's zero value is the empty string, which a
+	// caller reads as unknown -- an older daemon that sends no kind -- rather
+	// than as a granted kind.
+	kind atomic.Value
 	// cur is the id being collected, readable without either lock so that
 	// CancelCurrent works from another goroutine.
 	cur atomic.Int64
@@ -427,6 +433,9 @@ func (c *Client) collectAll(id int, onBatch func([]SearchMatch),
 		if res.Author != 0 {
 			c.author.Store(uint32(res.Author))
 		}
+		if res.Kind != "" {
+			c.kind.Store(res.Kind)
+		}
 		c.localise(&res)
 		// Every reply is authoritative about the set the peer names now: a
 		// frame with no set clears the record rather than leaving a stale one,
@@ -608,6 +617,18 @@ func pathByte(b byte) bool {
 // A caller compares span authors against it to tell its own text from the
 // user's and from another agent's.
 func (c *Client) Author() uint8 { return uint8(c.author.Load()) }
+
+// Kind is the participant kind the editor granted this connection, learned
+// from the hello reply, or "" before a hello or from a server that does not
+// send one. A caller reads "" as unknown and must not treat it as read-only:
+// an older daemon that answers no kind is the fail-open case, and keeping the
+// existing editable behaviour is what lets a local client stay editable.
+func (c *Client) Kind() Kind {
+	if s, ok := c.kind.Load().(string); ok {
+		return Kind(s)
+	}
+	return ""
+}
 
 // Instance is a running editor found by Discover.
 type Instance struct {

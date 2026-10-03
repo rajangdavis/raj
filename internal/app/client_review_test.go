@@ -181,7 +181,8 @@ func TestClientRefusedDecisionSurfacesHostError(t *testing.T) {
 
 // Review is read-only over the client's snapshot copy too: typing is refused
 // with the note, so a review pass cannot become an accidental edit the next
-// watch wake would discard. Leaving Review is the client's edit path, pinned by
+// watch wake would discard. The client starts in Edit; this review is entered
+// deliberately, and leaving it is the edit path pinned by
 // TestAttachedClientEditsOutsideReview.
 func TestClientRefusesTypingInReview(t *testing.T) {
 	ch := newClientHarness(t)
@@ -190,6 +191,7 @@ func TestClientRefusesTypingInReview(t *testing.T) {
 	if p == nil {
 		t.Fatal("client attached with no tab")
 	}
+	ch.cli.EnterReview()
 	if ch.cli.mode != ModeReview {
 		t.Fatalf("mode = %v, want Review", ch.cli.mode)
 	}
@@ -216,6 +218,7 @@ func TestClientRefusesEveryEditGestureInReview(t *testing.T) {
 	if p == nil {
 		t.Fatal("client attached with no tab")
 	}
+	ch.cli.EnterReview()
 	if ch.cli.mode != ModeReview {
 		t.Fatalf("mode = %v, want Review", ch.cli.mode)
 	}
@@ -342,6 +345,9 @@ func TestClientPhoneDrawerRefusedDecisionKeepsSelection(t *testing.T) {
 	if !ch.srv.Pane().File.RejectGroup(id) {
 		t.Fatal("setup: daemon reject failed")
 	}
+	// The review controls show only in Review; the client default is Edit, so
+	// enter Review deliberately before opening the drawer.
+	ch.cli.EnterReview()
 	openPhoneDrawer(ch.cli)
 	rej := -1
 	for i, b := range ch.cli.drawerPanel {

@@ -1436,6 +1436,49 @@ func TestRecoverHookRunsAdoptsLive(t *testing.T) {
 	}
 }
 
+// A pid record whose start token no longer matches the live process is a
+// recycled pid, not the run that wrote it: recovery must log it lost and never
+// re-adopt it, so a stale file cannot make this editor signal a process it did
+// not start.
+func TestRecoverHookRunsDoesNotAdoptRecycledPid(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	token, ok := processStartToken(cmd.Process.Pid)
+	if !ok {
+		t.Skip("no process start token on this platform")
+	}
+	record := `{"pid":` + strconv.Itoa(cmd.Process.Pid) +
+		`,"start_token":` + strconv.FormatInt(token+1, 10) + `,"hook":"cycle"}`
+	if err := os.WriteFile(filepath.Join(dir, "7.pid"), []byte(record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "7.log"), []byte("out"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{HookRuns: hooks.NewRegistry(), HookLog: hooks.NewLog(0)}
+	srv.SetHookDir(dir)
+
+	if run, ok := srv.HookRuns.Get(7); ok {
+		t.Fatalf("recycled pid was re-adopted: %+v", run)
+	}
+	rows := srv.HookLog.List()
+	if len(rows) != 1 || rows[0].ID != 7 || !rows[0].Lost {
+		t.Fatalf("log = %+v, want run 7 logged lost", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "7.pid")); !os.IsNotExist(err) {
+		t.Errorf("the stale pid record survived: %v", err)
+	}
+	// The live process was not signalled: it is still alive.
+	if !hookRunProcessAlive(cmd.Process.Pid) {
+		t.Error("the unrelated live process was killed")
+	}
+}
+
 // TestHookRunDetachedTimeout pins the detached timeout: the watcher kills the
 // run's process group at the hook's deadline and records the run as timed out.
 // Precondition: a detached hook that sleeps far past a 200ms timeout.

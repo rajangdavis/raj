@@ -27,7 +27,7 @@ func TestWriteAtomicReplacesContent(t *testing.T) {
 }
 
 // The whole point of the temp-file dance is that it cleans up after itself; a
-// save that leaves .f.txt.raj-1234 next to the file is its own bug report.
+// save that leaves .f.txt.tmp-1234 next to the file is its own bug report.
 func TestWriteAtomicLeavesNoTempFiles(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.txt")

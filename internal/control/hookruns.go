@@ -96,7 +96,9 @@ func readHookRunExit(dir string, id uint64) (int, bool) {
 // hookRunProcess is the record a detached run writes to <id>.pid: the process
 // id, the start time and absolute deadline in unix nanoseconds (deadline zero
 // when the hook set no timeout), the hook name, and the run start stamp -- who
-// asked, at which revision and git state. A later editor reads it to re-adopt a
+// asked, at which revision and git state. It also carries the OS start-time
+// token that proves the pid is still the process that wrote it. A later editor
+// reads it to re-adopt a
 // run that outlived it, keep the run deadline, report the true duration when it
 // ends, and, when the editor restarted under a run, fill the recovered log
 // entry from the stamp the run recorded rather than from zeros.
@@ -112,6 +114,11 @@ type hookRunProcess struct {
 	// Params are the run's resolved parameter values, recorded so a run
 	// recovered after a restart still names what it ran with.
 	Params []hooks.ParamValue `json:"params,omitempty"`
+	// StartToken identifies the process instance behind PID: an OS start-time
+	// token captured when the run began. It stops a recycled pid from being
+	// re-adopted, watched, or killed as the run that recorded it. Zero when
+	// the OS could not answer.
+	StartToken int64 `json:"start_token,omitempty"`
 }
 
 // readHookRunProcess reads the process record for id. ok is false for an absent
@@ -185,7 +192,7 @@ func pruneHookRunDir(dir string, maxID uint64) {
 			continue
 		}
 		if _, hasExit := readHookRunExit(dir, id); !hasExit {
-			if p, hasPid := readHookRunProcess(dir, id); hasPid && hookRunProcessAlive(p.PID) {
+			if p, hasPid := readHookRunProcess(dir, id); hasPid && hookRunOwnsPid(p) {
 				continue
 			}
 		}
@@ -234,6 +241,59 @@ func (s *Server) addHookResult(r hooks.Result) {
 	}
 }
 
+// processStartToken returns an opaque token that identifies the process
+// instance behind pid: the kernel start time for that pid, in clock ticks,
+// from /proc/<pid>/stat. Two processes that have held the same pid at
+// different times have different tokens, so a pid file whose token no longer
+// matches is stale. ok is false when the OS cannot answer (no /proc, an
+// unreadable or malformed stat line), and a caller must fall back to liveness
+// rather than invent a mismatch.
+func processStartToken(pid int) (int64, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	s := string(data)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 || i+2 >= len(s) {
+		return 0, false
+	}
+	// After the parenthesised comm, field 3 is the state; starttime is field
+	// 22, so it is the 20th whitespace-separated field here.
+	fields := strings.Fields(s[i+2:])
+	if len(fields) < 20 {
+		return 0, false
+	}
+	token, err := strconv.ParseInt(fields[19], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return token, true
+}
+
+// hookRunOwnsPid reports whether pid is still the process instance p recorded.
+// It is the guard every signal and adoption reads: a run is re-adopted,
+// watched, or killed only while the live process is the one the record named.
+// When the record carries no start token (one written by an older build) or
+// the OS cannot answer, it falls back to liveness, which is the pre-token
+// behaviour.
+func hookRunOwnsPid(p hookRunProcess) bool {
+	if !hookRunProcessAlive(p.PID) {
+		return false
+	}
+	if p.StartToken == 0 {
+		return true
+	}
+	token, ok := processStartToken(p.PID)
+	if !ok {
+		return true
+	}
+	return token == p.StartToken
+}
+
 // recoverHookRuns reads what a previous editor left in the run directory. An
 // exit file becomes a recovered run; a pid record whose process is gone with no
 // exit becomes a lost run; a run still alive under its own session is re-adopted
@@ -277,7 +337,7 @@ func (s *Server) recoverHookRuns() {
 				Params: p.Params})
 			_ = os.Remove(hookRunExitPath(dir, id))
 			_ = os.Remove(hookRunPidPath(dir, id))
-		case hasPid && hookRunProcessAlive(p.PID):
+		case hasPid && hookRunOwnsPid(p):
 			// The run outlived the editor that started it: re-register it so
 			// `hook ps` and `cancel` reach it, and watch its exit file so its
 			// completion is logged when it ends.
@@ -310,7 +370,9 @@ func (s *Server) adoptHookRun(dir string, id uint64, p hookRunProcess) {
 		Hook: p.Hook, Started: time.Unix(0, p.Start), PID: p.PID, PGID: p.PID,
 		Cancel: func() {
 			cancelled.Store(true)
-			killProcessGroupID(p.PID)
+			if hookRunOwnsPid(p) {
+				killProcessGroupID(p.PID)
+			}
 		},
 	})
 	go s.watchAdoptedHookRun(dir, id, p, &cancelled)
@@ -327,7 +389,7 @@ func (s *Server) watchAdoptedHookRun(dir string, id uint64, p hookRunProcess, ca
 			s.logAdoptedCompletion(dir, id, p, exit, "")
 			return
 		}
-		if !hookRunProcessAlive(p.PID) {
+		if !hookRunOwnsPid(p) {
 			// The wrapper writes the exit file as it exits; give it one poll
 			// interval to land before settling the run.
 			time.Sleep(hookRunWatchPoll)
@@ -353,7 +415,9 @@ func (s *Server) watchAdoptedHookRun(dir string, id uint64, p hookRunProcess, ca
 				continue
 			}
 			timedOut = true
-			killProcessGroupID(p.PID)
+			if hookRunOwnsPid(p) {
+				killProcessGroupID(p.PID)
+			}
 		}
 		time.Sleep(hookRunWatchPoll)
 	}
@@ -475,8 +539,9 @@ func (c *connection) runHookDetached(req Request, emit func(Response), prep Resp
 	}
 	cmd = proc
 	c.srv.HookRuns.SetProcess(runID, proc.Process.Pid, processGroupID(proc))
+	startToken, _ := processStartToken(proc.Process.Pid)
 	writeHookRunProcess(dir, runID, hookRunProcess{
-		PID: proc.Process.Pid, Start: startedAt.UnixNano(), Deadline: deadline, Hook: req.HookName,
+		PID: proc.Process.Pid, Start: startedAt.UnixNano(), StartToken: startToken, Deadline: deadline, Hook: req.HookName,
 		Author: caller, Revision: prep.HookRevision, Head: prov.Head, Dirty: prov.DirtyDigest,
 		Params: prep.HookParamValues,
 	})

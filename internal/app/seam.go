@@ -84,6 +84,31 @@ func (a *App) materialiseIntention(ctx context.Context, svc *git.Service, set in
 	return &materialisedIntention{dir: dir, tree: tree, base: base}, nil
 }
 
+// proveTree materialises the named intention alone over its base into a scratch
+// directory and returns it with its tree object id. It is the event thread's
+// half of `intent prove`: the caller (connection.prove) runs the check hook
+// there through the one hook runner and removes the directory. A missed name is
+// refused by name, the same as intent.ProveNamed.
+func (a *App) proveTree(name string) (string, string, error) {
+	if name == "" {
+		return "", "", errors.New("intent prove: needs a name")
+	}
+	svc := git.New(a.visible.Primary())
+	set, err := a.intentSet()
+	if err != nil {
+		return "", "", err
+	}
+	in, ok := set[name]
+	if !ok {
+		return "", "", fmt.Errorf("intent prove: no such intention %q", name)
+	}
+	m, err := a.materialiseIntention(context.Background(), svc, set, in)
+	if err != nil {
+		return "", "", err
+	}
+	return m.dir, m.tree, nil
+}
+
 // runCheckHook reads the workspace's check hook and runs its argv in dir. It is
 // the real hook, so a proof and a gate run the same command.
 func (a *App) runCheckHook(ctx context.Context, dir string) (int, string, error) {

@@ -49,7 +49,17 @@ func Prove(in Intention, materialise Materialiser, check Checker) Proof {
 		defer cleanup()
 	}
 	code, out, err := check(dir)
-	if err != nil {
+	return ProofFor(in.Name, code, out, err)
+}
+
+// ProofFor renders a completed check run as a proof: pass on exit 0, fail with
+// the exit and the output tail otherwise. Prove and the control runner share
+// it, so a proof reads the same whichever runner produced it. An empty err is a
+// clean run; a non-nil err is a run that could not start and is reported
+// verbatim.
+func ProofFor(name string, code int, out string, err error) Proof {
+	proof := Proof{Name: name, Check: "fail"}
+	if err != nil && err.Error() != "" {
 		proof.Error = err.Error()
 		return proof
 	}

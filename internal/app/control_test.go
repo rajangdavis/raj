@@ -2415,13 +2415,151 @@ func TestApplyValidatesAgainstTheBaseLength(t *testing.T) {
 	}
 }
 
+// An agent rename is a proposal: nothing moves until a human approves it, and
+// the approval carries the open clean buffer the way a direct human rename
+// does. This is the D-A1 pin; before the change the agent rename moved at once.
+func TestControlRenameProposesForAnAgent(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	agent := h.dial(t)
+	human := h.dialHuman(t)
+	p := h.Tabs.Active()
+	old := p.File.Path
+	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
+
+	r := agent.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	if !r.OK {
+		t.Fatalf("agent rename = %+v, want a proposal", r)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Errorf("the agent rename moved the file without approval: %v", err)
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("the proposal destination exists before approval: %v", err)
+	}
+	if r := human.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath, Approve: true}); !r.OK {
+		t.Fatalf("approve = %+v", r)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("old path still on disk after approval (err=%v)", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Errorf("approved rename did not move the file: %v", err)
+	}
+	if p.File.Path != newPath {
+		t.Errorf("pane path = %q, want %q", p.File.Path, newPath)
+	}
+}
+
+// .git is refused outright, for the human gesture too: moving an executable
+// into .git/hooks is a code-execution path, so it is not a reviewable choice.
+func TestControlRenameRefusesGitForEveryone(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	human := h.dialHuman(t)
+	old := h.Tabs.Active().File.Path
+	dst := filepath.Join(filepath.Dir(old), ".git", "hooks", "pre-commit")
+
+	r := human.do(h, control.Request{Op: "rename", Path: old, NewPath: dst})
+	if r.OK {
+		t.Fatal("a rename into .git was allowed")
+	}
+	if !strings.Contains(r.Err, "protected") {
+		t.Errorf("refusal = %q, want a protected-path refusal", r.Err)
+	}
+}
+
+// D-A2: an agent may reload only its own unsaved text. The user text refuses
+// with the reason, and the buffer is untouched.
+func TestControlReloadRefusesTheUsersText(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "original\n")
+	agent := h.dial(t)
+	h.typeText("mine ") // the user typed this
+	rewriteOnDisk(t, h, "disk\n")
+
+	r := agent.do(h, control.Request{Op: "reload"})
+	if r.OK {
+		t.Fatal("an agent reloaded over the user unsaved text")
+	}
+	if !strings.Contains(strings.ToLower(r.Err), "unsaved") || !strings.Contains(r.Err, "user") {
+		t.Errorf("refusal = %q, want it to name the user unsaved text", r.Err)
+	}
+	if got := h.Pane().File.Text(); !strings.Contains(got, "mine") {
+		t.Errorf("buffer text = %q, want the user text kept", got)
+	}
+}
+
+// An agent may reload its own unsaved text: the gate is about whose text it is,
+// not about cleanliness.
+func TestControlReloadDiscardsTheAgentsOwnText(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "original\n")
+	agent := h.dial(t)
+	read := agent.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := agent.do(h, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "x"}}}); !r.OK {
+		t.Fatalf("agent apply = %+v", r)
+	}
+	rewriteOnDisk(t, h, "disk\n")
+	if r := agent.do(h, control.Request{Op: "reload"}); !r.OK {
+		t.Fatalf("agent reload of its own text = %+v", r)
+	}
+	if got := h.Pane().File.Text(); got != "disk\n" {
+		t.Errorf("reloaded text = %q, want the disk version", got)
+	}
+}
+
+// D-A2: close --discard from an agent refuses when the buffer holds the user
+// text, and the buffer survives.
+func TestControlCloseDiscardRefusesTheUsersText(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	agent := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	h.typeText("mine")
+
+	r := agent.do(h, control.Request{Op: "close", Path: path, Discard: true})
+	if r.OK {
+		t.Fatal("an agent discarded the user unsaved text")
+	}
+	if !strings.Contains(r.Err, "user") {
+		t.Errorf("refusal = %q, want it to name the user", r.Err)
+	}
+	if _, ok := h.paneByPath(path); !ok {
+		t.Error("the refused discard closed the buffer")
+	}
+}
+
+// An agent may discard its own unsaved text: the gate is about whose text it
+// is, not about cleanliness.
+func TestControlCloseDiscardDiscardsTheAgentsOwnText(t *testing.T) {
+	t.Parallel()
+	h := controlHarness(t, "hello\n")
+	agent := h.dial(t)
+	path := h.Tabs.Active().File.Path
+	read := agent.do(h, control.Request{Op: "text"})
+	base := read.Version
+	if r := agent.do(h, control.Request{Op: "apply", Base: &base,
+		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "x"}}}); !r.OK {
+		t.Fatalf("agent apply = %+v", r)
+	}
+	if r := agent.do(h, control.Request{Op: "close", Path: path, Discard: true}); !r.OK {
+		t.Fatalf("agent close -discard of its own text = %+v", r)
+	}
+	if _, ok := h.paneByPath(path); ok {
+		t.Error("close -discard left the buffer open")
+	}
+}
+
 // A rename carries an open clean buffer: the file moves, the pane keeps its
 // text and version, and the path it is keyed on follows. The tab is the same
 // object, so the session records the new name rather than a reopened one.
 func TestControlRenameCarriesACleanBuffer(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "hello\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	p := h.Tabs.Active()
 	old := p.File.Path
 	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
@@ -2457,7 +2595,7 @@ func TestControlRenameCarriesACleanBuffer(t *testing.T) {
 func TestControlRenameRefusesADirtyBuffer(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "hello\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	h.typeText("x")
 	p := h.Tabs.Active()
 	old := p.File.Path
@@ -2480,10 +2618,11 @@ func TestControlRenameRefusesADirtyBuffer(t *testing.T) {
 func TestControlRenameRefusesPendingSets(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "hello world\n")
-	c := h.dial(t)
-	read := c.do(h, control.Request{Op: "text"})
+	agent := h.dial(t)
+	human := h.dialHuman(t)
+	read := agent.do(h, control.Request{Op: "text"})
 	base := read.Version
-	if r := c.do(h, control.Request{
+	if r := agent.do(h, control.Request{
 		Op:    "apply",
 		Base:  &base,
 		Hunks: []control.Hunk{{Start: 0, End: 0, Text: "x"}},
@@ -2494,7 +2633,7 @@ func TestControlRenameRefusesPendingSets(t *testing.T) {
 	old := p.File.Path
 	newPath := filepath.Join(filepath.Dir(old), "renamed.go")
 
-	r := c.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
+	r := human.do(h, control.Request{Op: "rename", Path: old, NewPath: newPath})
 	if r.OK {
 		t.Fatal("a buffer with pending change sets was renamed")
 	}
@@ -2513,7 +2652,7 @@ func TestControlRenameRefusesPendingSets(t *testing.T) {
 func TestControlRenameCarriesANotYetSavedBuffer(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "root\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
 	old := filepath.Join(dir, "fresh.go")
 
@@ -2557,7 +2696,7 @@ func TestControlRenameCarriesANotYetSavedBuffer(t *testing.T) {
 func TestControlCloseDiscardNotesTheFileThatRemains(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "hello\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	path := h.Tabs.Active().File.Path
 	h.typeText("x") // dirty, so a plain close would refuse
 
@@ -2602,7 +2741,7 @@ func TestControlCloseDiscardQuietWhenNothingRemains(t *testing.T) {
 func TestControlRenameMovesAnUnopenedFile(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "root\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	dir := filepath.Dir(h.Tabs.Active().File.Path)
 	old := filepath.Join(dir, "loose.go")
 	if err := os.WriteFile(old, []byte("loose\n"), 0o644); err != nil {
@@ -2650,7 +2789,7 @@ func TestControlRenameRefusesAnUnclaimedOld(t *testing.T) {
 func TestControlRenameCaseOnly(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "hello\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 	p := h.Tabs.Active()
 	old := p.File.Path
 	newPath := filepath.Join(filepath.Dir(old), "TEST.GO")
@@ -3204,7 +3343,7 @@ func TestControlWatchWakesEveryWatcherOnAnEdit(t *testing.T) {
 func TestControlReloadTakesDisk(t *testing.T) {
 	t.Parallel()
 	h := controlHarness(t, "original\n")
-	c := h.dial(t)
+	c := h.dialHuman(t)
 
 	rewriteOnDisk(t, h, "clean-disk\n")
 	if r := c.do(h, control.Request{Op: "reload"}); !r.OK {

@@ -34,16 +34,11 @@ const File = "hidden"
 
 // defaults are the patterns applied before any configuration is read.
 //
-// Three kinds of thing are here: raj's own scratch under .raj — the journal,
-// trash and session — which is the editor's rather than the repository's;
-// version-control metadata, which is not source and is enormous; and
-// dependency or cache directories that are machine-generated. Notably absent
-// is the blanket dotfile rule: a dotfile at the root of a repository is
-// usually configuration someone maintains by hand.
+// Two kinds of thing are here: version-control metadata, which is not source
+// and is enormous; and dependency or cache directories that are
+// machine-generated. Notably absent is the blanket dotfile rule: a dotfile at
+// the root of a repository is usually configuration someone maintains by hand.
 var defaults = []string{
-	// Raj's scratch, now that the workspace configuration has moved to XDG.
-	// Hidden whole: nothing inside .raj is repository content any more.
-	".raj/",
 	".git/",
 	".hg/",
 	".svn/",

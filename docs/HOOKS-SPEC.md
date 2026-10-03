@@ -241,7 +241,7 @@ step is harmless.
 
 - The database is already opened under the workspace state dir keyed by the root
   set (`session.StateDirForRoots`), so these rows are **workspace-specific for
-  free**. No `.raj`, no repo file; `TestFreshLaunchLeavesProjectClean` stays true.
+  free**. No file in the project; `TestFreshLaunchLeavesProjectClean` stays true.
 - If a user-scoped registry is wanted later, add a `scope` column
   (`user` | `workspace`) and read the overlay the way settings already do. Not
   needed for v0.
